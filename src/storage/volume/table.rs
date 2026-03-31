@@ -893,6 +893,78 @@ impl SegmentedTable {
         }
         None
     }
+
+    /// Generic fallback for min_column scan on non-numeric column types.
+    /// Used for Dictionary, Boolean, and Bytes columns where typed direct
+    /// comparison is not practical.
+    #[allow(clippy::too_many_arguments)]
+    fn min_column_scan_generic(
+        &self,
+        vol: &FrozenVolume,
+        cs: &super::manifest::ColdSegment,
+        pi: usize,
+        overall_min: &mut Option<Value>,
+        tombstones: &FxHashMap<i64, u64>,
+        hot_skip: &FxHashSet<i64>,
+        no_tombstones: bool,
+    ) {
+        for i in 0..vol.meta.row_count {
+            if vol.columns[pi].is_null(i) || !cs.is_visible(i) {
+                continue;
+            }
+            let rid = vol.meta.row_ids[i];
+            if hot_skip.contains(&rid) {
+                continue;
+            }
+            if !no_tombstones && self.is_row_tombstoned(tombstones, rid) {
+                continue;
+            }
+            let val = vol.columns[pi].get_value(i);
+            match overall_min {
+                None => *overall_min = Some(val),
+                Some(ref current) => {
+                    if let Ok(std::cmp::Ordering::Less) = val.compare(current) {
+                        *overall_min = Some(val);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Generic fallback for max_column scan on non-numeric column types.
+    #[allow(clippy::too_many_arguments)]
+    fn max_column_scan_generic(
+        &self,
+        vol: &FrozenVolume,
+        cs: &super::manifest::ColdSegment,
+        pi: usize,
+        overall_max: &mut Option<Value>,
+        tombstones: &FxHashMap<i64, u64>,
+        hot_skip: &FxHashSet<i64>,
+        no_tombstones: bool,
+    ) {
+        for i in 0..vol.meta.row_count {
+            if vol.columns[pi].is_null(i) || !cs.is_visible(i) {
+                continue;
+            }
+            let rid = vol.meta.row_ids[i];
+            if hot_skip.contains(&rid) {
+                continue;
+            }
+            if !no_tombstones && self.is_row_tombstoned(tombstones, rid) {
+                continue;
+            }
+            let val = vol.columns[pi].get_value(i);
+            match overall_max {
+                None => *overall_max = Some(val),
+                Some(ref current) => {
+                    if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
+                        *overall_max = Some(val);
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl Table for SegmentedTable {
@@ -1775,8 +1847,17 @@ impl Table for SegmentedTable {
         }
 
         // Need cold rows. Build hot_skip and scan with early termination.
-        let mut result = hot_rows;
-        let remaining = target - result.len();
+        // Optimization: avoid materializing rows that fall within the offset.
+        // Hot rows already collected cover some of the offset+limit range.
+        // For the cold scan, track a skip counter to avoid get_row() for offset rows.
+        let hot_count = hot_rows.len();
+        let cold_skip = offset.saturating_sub(hot_count);
+        let mut result: RowVec = if hot_count > offset {
+            hot_rows.into_iter().skip(offset).collect()
+        } else {
+            RowVec::new()
+        };
+        let remaining = limit.saturating_sub(result.len()) + cold_skip;
 
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
         let mut hot_skip: FxHashSet<i64> =
@@ -1789,6 +1870,7 @@ impl Table for SegmentedTable {
         let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
         let current_schema = self.hot.schema();
         let mut collected = 0usize;
+        let mut cold_skipped = 0usize;
 
         // Zone-map + bloom filter setup for pruning.
         let comparisons = where_expr
@@ -1833,17 +1915,38 @@ impl Table for SegmentedTable {
                 if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
                     continue;
                 }
-                let row = if mapping.is_identity {
-                    vol.get_row(i)
+                // For rows with a WHERE clause, we must evaluate the filter
+                // even during the skip phase to get correct offset counting.
+                if where_expr.is_some() {
+                    let row = if mapping.is_identity {
+                        vol.get_row(i)
+                    } else {
+                        vol.get_row_mapped(i, &mapping)
+                    };
+                    if let Some(expr) = where_expr {
+                        if !expr.evaluate_fast(&row) {
+                            continue;
+                        }
+                    }
+                    // Skip without storing if still in offset range
+                    if cold_skipped < cold_skip {
+                        cold_skipped += 1;
+                    } else {
+                        result.push((row_id, row));
+                    }
                 } else {
-                    vol.get_row_mapped(i, &mapping)
-                };
-                if let Some(expr) = where_expr {
-                    if !expr.evaluate_fast(&row) {
-                        continue;
+                    // No WHERE: skip without materializing the row
+                    if cold_skipped < cold_skip {
+                        cold_skipped += 1;
+                    } else {
+                        let row = if mapping.is_identity {
+                            vol.get_row(i)
+                        } else {
+                            vol.get_row_mapped(i, &mapping)
+                        };
+                        result.push((row_id, row));
                     }
                 }
-                result.push((row_id, row));
                 collected += 1;
                 if collected >= remaining {
                     break 'outer;
@@ -1851,7 +1954,7 @@ impl Table for SegmentedTable {
             }
         }
 
-        Ok(result.into_iter().skip(offset).take(limit).collect())
+        Ok(result)
     }
 
     fn collect_rows_sorted_with_limit(
@@ -2139,42 +2242,223 @@ impl Table for SegmentedTable {
             return Some(overall_min);
         }
 
-        // Tombstones exist: scan columnar data with dedup
+        // Zone-map fast path: when there are no tombstones/pending tombstones
+        // but overlap exists (total_row_count != deduped_row_count), the
+        // visibility bitmap correctly deduplicates rows. Zone-map min/max across
+        // all volumes is a lower/upper bound; the actual min visible across all
+        // volumes is >= zone-map-min. We can use zone maps to prune volumes
+        // that cannot contain a better candidate.
+        let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
+            && !self.segment_mgr.has_pending_tombstones(self.txn_id());
+
+        // Scan columnar data with dedup (typed direct access, no Value alloc)
         let volumes = self.segment_mgr.get_volumes_newest_first();
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+        let tombstones_arc = if no_tombstones {
+            None
+        } else {
+            Some(self.segment_mgr.tombstone_set_arc())
+        };
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+        if !no_tombstones {
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+        }
+
+        let empty_tombstones: FxHashMap<i64, u64> = FxHashMap::default();
+        let tombstones_ref = tombstones_arc.as_deref().unwrap_or(&empty_tombstones);
 
         let mut overall_min = hot_min;
         for (_, cs) in volumes.iter() {
             let vol = &cs.volume;
             let phys = col_name.and_then(|n| vol.column_index(n));
-            for i in 0..vol.meta.row_count {
-                if !cs.is_visible(i) {
-                    continue;
-                }
-                let rid = vol.meta.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
-                    continue;
-                }
-                let val = if let Some(pi) = phys {
-                    if vol.columns[pi].is_null(i) {
-                        continue;
+
+            // Zone-map pruning: skip this volume if its min cannot beat current best
+            if let Some(ref current_best) = overall_min {
+                if let Some(pi) = phys {
+                    if pi < vol.meta.zone_maps.len() {
+                        let zm = &vol.meta.zone_maps[pi];
+                        if !zm.min.is_null() {
+                            if let Ok(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal) =
+                                zm.min.compare(current_best)
+                            {
+                                // Volume's min >= current best: no row in this volume
+                                // can improve the result. If column is missing (phys=None)
+                                // we still need to check default below.
+                                continue;
+                            }
+                        }
                     }
-                    vol.columns[pi].get_value(i)
-                } else if has_non_null_default {
-                    default_val.clone()
-                } else {
-                    continue;
-                };
-                match &overall_min {
-                    None => overall_min = Some(val),
-                    Some(current) => {
-                        if let Ok(std::cmp::Ordering::Less) = val.compare(current) {
-                            overall_min = Some(val);
+                }
+            }
+
+            // Typed direct scan: compare on primitive types to avoid Value alloc
+            if let Some(pi) = phys {
+                match &vol.columns[pi] {
+                    crate::storage::volume::column::ColumnData::Int64 { values, nulls } => {
+                        let mut best_i64 = match &overall_min {
+                            Some(Value::Integer(v)) => Some(*v),
+                            None => None,
+                            _ => {
+                                // Type mismatch: fall through to generic path
+                                self.min_column_scan_generic(
+                                    vol,
+                                    cs,
+                                    pi,
+                                    &mut overall_min,
+                                    tombstones_ref,
+                                    &hot_skip,
+                                    no_tombstones,
+                                );
+                                continue;
+                            }
+                        };
+                        for i in 0..vol.meta.row_count {
+                            if nulls[i] || !cs.is_visible(i) {
+                                continue;
+                            }
+                            let rid = vol.meta.row_ids[i];
+                            if hot_skip.contains(&rid) {
+                                continue;
+                            }
+                            if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                continue;
+                            }
+                            let v = values[i];
+                            if best_i64.is_none() || v < best_i64.unwrap_or(i64::MAX) {
+                                best_i64 = Some(v);
+                            }
+                        }
+                        if let Some(v) = best_i64 {
+                            overall_min = Some(Value::Integer(v));
+                        }
+                    }
+                    crate::storage::volume::column::ColumnData::Float64 { values, nulls } => {
+                        let mut best_f64 = match &overall_min {
+                            Some(Value::Float(v)) => Some(*v),
+                            None => None,
+                            _ => {
+                                self.min_column_scan_generic(
+                                    vol,
+                                    cs,
+                                    pi,
+                                    &mut overall_min,
+                                    tombstones_ref,
+                                    &hot_skip,
+                                    no_tombstones,
+                                );
+                                continue;
+                            }
+                        };
+                        for i in 0..vol.meta.row_count {
+                            if nulls[i] || !cs.is_visible(i) {
+                                continue;
+                            }
+                            let rid = vol.meta.row_ids[i];
+                            if hot_skip.contains(&rid) {
+                                continue;
+                            }
+                            if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                continue;
+                            }
+                            let v = values[i];
+                            // Skip NaN: engine ordering contract treats NaN as > all finite
+                            if v.is_nan() {
+                                continue;
+                            }
+                            if best_f64.is_none() || v < best_f64.unwrap_or(f64::INFINITY) {
+                                best_f64 = Some(v);
+                            }
+                        }
+                        if let Some(v) = best_f64 {
+                            overall_min = Some(Value::Float(v));
+                        }
+                    }
+                    crate::storage::volume::column::ColumnData::TimestampNanos {
+                        values,
+                        nulls,
+                    } => {
+                        let mut best_nanos: Option<i64> = match &overall_min {
+                            Some(Value::Timestamp(dt)) => {
+                                Some(dt.timestamp_nanos_opt().unwrap_or(i64::MAX))
+                            }
+                            None => None,
+                            _ => {
+                                self.min_column_scan_generic(
+                                    vol,
+                                    cs,
+                                    pi,
+                                    &mut overall_min,
+                                    tombstones_ref,
+                                    &hot_skip,
+                                    no_tombstones,
+                                );
+                                continue;
+                            }
+                        };
+                        for i in 0..vol.meta.row_count {
+                            if nulls[i] || !cs.is_visible(i) {
+                                continue;
+                            }
+                            let rid = vol.meta.row_ids[i];
+                            if hot_skip.contains(&rid) {
+                                continue;
+                            }
+                            if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                continue;
+                            }
+                            let v = values[i];
+                            if best_nanos.is_none() || v < best_nanos.unwrap_or(i64::MAX) {
+                                best_nanos = Some(v);
+                            }
+                        }
+                        if let Some(nanos) = best_nanos {
+                            let secs = nanos.div_euclid(1_000_000_000);
+                            let sub_nanos = nanos.rem_euclid(1_000_000_000) as u32;
+                            if let chrono::LocalResult::Single(dt) =
+                                chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, sub_nanos)
+                            {
+                                overall_min = Some(Value::Timestamp(dt));
+                            }
+                        }
+                    }
+                    _ => {
+                        // Dictionary, Boolean, Bytes: use generic get_value path
+                        self.min_column_scan_generic(
+                            vol,
+                            cs,
+                            pi,
+                            &mut overall_min,
+                            tombstones_ref,
+                            &hot_skip,
+                            no_tombstones,
+                        );
+                    }
+                }
+            } else if has_non_null_default {
+                // Column missing from this volume (ALTER TABLE ADD COLUMN):
+                // every visible row has the default value
+                let has_visible = (0..vol.meta.row_count).any(|i| {
+                    if !cs.is_visible(i) {
+                        return false;
+                    }
+                    let rid = vol.meta.row_ids[i];
+                    if hot_skip.contains(&rid) {
+                        return false;
+                    }
+                    if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                        return false;
+                    }
+                    true
+                });
+                if has_visible {
+                    match &overall_min {
+                        None => overall_min = Some(default_val.clone()),
+                        Some(current) => {
+                            if let Ok(std::cmp::Ordering::Less) = default_val.compare(current) {
+                                overall_min = Some(default_val.clone());
+                            }
                         }
                     }
                 }
@@ -2244,42 +2528,212 @@ impl Table for SegmentedTable {
             return Some(overall_max);
         }
 
-        // Tombstones exist: scan columnar data with dedup
+        // See min_column: same zone-map + typed scan strategy for MAX.
+        let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
+            && !self.segment_mgr.has_pending_tombstones(self.txn_id());
+
         let volumes = self.segment_mgr.get_volumes_newest_first();
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+        let tombstones_arc = if no_tombstones {
+            None
+        } else {
+            Some(self.segment_mgr.tombstone_set_arc())
+        };
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+        if !no_tombstones {
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+        }
+
+        let empty_tombstones: FxHashMap<i64, u64> = FxHashMap::default();
+        let tombstones_ref = tombstones_arc.as_deref().unwrap_or(&empty_tombstones);
 
         let mut overall_max = hot_max;
         for (_, cs) in volumes.iter() {
             let vol = &cs.volume;
             let phys = col_name.and_then(|n| vol.column_index(n));
-            for i in 0..vol.meta.row_count {
-                if !cs.is_visible(i) {
-                    continue;
-                }
-                let rid = vol.meta.row_ids[i];
-                if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
-                    continue;
-                }
-                let val = if let Some(pi) = phys {
-                    if vol.columns[pi].is_null(i) {
-                        continue;
+
+            // Zone-map pruning: skip this volume if its max cannot beat current best
+            if let Some(ref current_best) = overall_max {
+                if let Some(pi) = phys {
+                    if pi < vol.meta.zone_maps.len() {
+                        let zm = &vol.meta.zone_maps[pi];
+                        if !zm.max.is_null() {
+                            if let Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) =
+                                zm.max.compare(current_best)
+                            {
+                                // Volume's max <= current best: no row can improve result
+                                continue;
+                            }
+                        }
                     }
-                    vol.columns[pi].get_value(i)
-                } else if has_non_null_default {
-                    default_val.clone()
-                } else {
-                    continue;
-                };
-                match &overall_max {
-                    None => overall_max = Some(val),
-                    Some(current) => {
-                        if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
-                            overall_max = Some(val);
+                }
+            }
+
+            // Typed direct scan: compare on primitive types to avoid Value alloc
+            if let Some(pi) = phys {
+                match &vol.columns[pi] {
+                    crate::storage::volume::column::ColumnData::Int64 { values, nulls } => {
+                        let mut best_i64 = match &overall_max {
+                            Some(Value::Integer(v)) => Some(*v),
+                            None => None,
+                            _ => {
+                                self.max_column_scan_generic(
+                                    vol,
+                                    cs,
+                                    pi,
+                                    &mut overall_max,
+                                    tombstones_ref,
+                                    &hot_skip,
+                                    no_tombstones,
+                                );
+                                continue;
+                            }
+                        };
+                        for i in 0..vol.meta.row_count {
+                            if nulls[i] || !cs.is_visible(i) {
+                                continue;
+                            }
+                            let rid = vol.meta.row_ids[i];
+                            if hot_skip.contains(&rid) {
+                                continue;
+                            }
+                            if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                continue;
+                            }
+                            let v = values[i];
+                            if best_i64.is_none() || v > best_i64.unwrap_or(i64::MIN) {
+                                best_i64 = Some(v);
+                            }
+                        }
+                        if let Some(v) = best_i64 {
+                            overall_max = Some(Value::Integer(v));
+                        }
+                    }
+                    crate::storage::volume::column::ColumnData::Float64 { values, nulls } => {
+                        let mut best_f64 = match &overall_max {
+                            Some(Value::Float(v)) => Some(*v),
+                            None => None,
+                            _ => {
+                                self.max_column_scan_generic(
+                                    vol,
+                                    cs,
+                                    pi,
+                                    &mut overall_max,
+                                    tombstones_ref,
+                                    &hot_skip,
+                                    no_tombstones,
+                                );
+                                continue;
+                            }
+                        };
+                        for i in 0..vol.meta.row_count {
+                            if nulls[i] || !cs.is_visible(i) {
+                                continue;
+                            }
+                            let rid = vol.meta.row_ids[i];
+                            if hot_skip.contains(&rid) {
+                                continue;
+                            }
+                            if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                continue;
+                            }
+                            let v = values[i];
+                            // Skip NaN: engine ordering contract treats NaN as > all finite
+                            if v.is_nan() {
+                                continue;
+                            }
+                            if best_f64.is_none() || v > best_f64.unwrap_or(f64::NEG_INFINITY) {
+                                best_f64 = Some(v);
+                            }
+                        }
+                        if let Some(v) = best_f64 {
+                            overall_max = Some(Value::Float(v));
+                        }
+                    }
+                    crate::storage::volume::column::ColumnData::TimestampNanos {
+                        values,
+                        nulls,
+                    } => {
+                        let mut best_nanos: Option<i64> = match &overall_max {
+                            Some(Value::Timestamp(dt)) => {
+                                Some(dt.timestamp_nanos_opt().unwrap_or(i64::MIN))
+                            }
+                            None => None,
+                            _ => {
+                                self.max_column_scan_generic(
+                                    vol,
+                                    cs,
+                                    pi,
+                                    &mut overall_max,
+                                    tombstones_ref,
+                                    &hot_skip,
+                                    no_tombstones,
+                                );
+                                continue;
+                            }
+                        };
+                        for i in 0..vol.meta.row_count {
+                            if nulls[i] || !cs.is_visible(i) {
+                                continue;
+                            }
+                            let rid = vol.meta.row_ids[i];
+                            if hot_skip.contains(&rid) {
+                                continue;
+                            }
+                            if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                                continue;
+                            }
+                            let v = values[i];
+                            if best_nanos.is_none() || v > best_nanos.unwrap_or(i64::MIN) {
+                                best_nanos = Some(v);
+                            }
+                        }
+                        if let Some(nanos) = best_nanos {
+                            let secs = nanos.div_euclid(1_000_000_000);
+                            let sub_nanos = nanos.rem_euclid(1_000_000_000) as u32;
+                            if let chrono::LocalResult::Single(dt) =
+                                chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, sub_nanos)
+                            {
+                                overall_max = Some(Value::Timestamp(dt));
+                            }
+                        }
+                    }
+                    _ => {
+                        // Dictionary, Boolean, Bytes: use generic get_value path
+                        self.max_column_scan_generic(
+                            vol,
+                            cs,
+                            pi,
+                            &mut overall_max,
+                            tombstones_ref,
+                            &hot_skip,
+                            no_tombstones,
+                        );
+                    }
+                }
+            } else if has_non_null_default {
+                let has_visible = (0..vol.meta.row_count).any(|i| {
+                    if !cs.is_visible(i) {
+                        return false;
+                    }
+                    let rid = vol.meta.row_ids[i];
+                    if hot_skip.contains(&rid) {
+                        return false;
+                    }
+                    if !no_tombstones && self.is_row_tombstoned(tombstones_ref, rid) {
+                        return false;
+                    }
+                    true
+                });
+                if has_visible {
+                    match &overall_max {
+                        None => overall_max = Some(default_val.clone()),
+                        Some(current) => {
+                            if let Ok(std::cmp::Ordering::Greater) = default_val.compare(current) {
+                                overall_max = Some(default_val.clone());
+                            }
                         }
                     }
                 }
@@ -2602,8 +3056,207 @@ impl Table for SegmentedTable {
                 .hot
                 .collect_rows_ordered_by_index(column_name, ascending, limit, offset);
         }
-        // Hot index doesn't cover cold data — can't use index ordering
-        None
+
+        // Snapshot isolation: the merge path doesn't filter by snapshot_seq.
+        // Fall back to the full scan + sort path which handles MVCC correctly.
+        if self.snapshot_seq.is_some() {
+            return None;
+        }
+
+        // Only optimize when ORDER BY column is the INTEGER PRIMARY KEY.
+        // For PK, row_id order == value order, so we can merge sorted sources.
+        let schema = self.hot.schema().clone();
+        let pk_idx = schema.pk_column_index()?;
+        let pk_col = &schema.columns[pk_idx];
+        if pk_col.name_lower != column_name.to_lowercase() {
+            return None;
+        }
+
+        let needed = limit.saturating_add(offset);
+        if needed == 0 {
+            return Some(RowVec::new());
+        }
+
+        // 1. Collect hot rows in PK order. Only materialize `needed` rows
+        //    (not all hot rows). The skip set uses row IDs only (no materialization).
+        let hot_rows =
+            match self
+                .hot
+                .collect_rows_ordered_by_index(column_name, ascending, needed, 0)
+            {
+                Some(rows) => rows,
+                None => {
+                    // Local changes prevent ordered iteration — fall back to collect + sort.
+                    let mut rows = match self.hot.collect_all_rows(None) {
+                        Ok(r) => r,
+                        Err(_) => return None,
+                    };
+                    if ascending {
+                        rows.sort_unstable_by_key(|&(id, _)| id);
+                    } else {
+                        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    }
+                    rows.truncate(needed);
+                    rows
+                }
+            };
+
+        // 2. Build skip set from ALL hot row IDs (no Row materialization).
+        //    Hot rows shadow cold rows regardless of whether they're in the merge set.
+        let mut skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut skip);
+        self.segment_mgr
+            .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+
+        // 3. Get volumes (oldest first — segment_id ascending order).
+        //    We need column data for materialization, so use ensure_columns path.
+        let volumes = self.segment_mgr.get_volumes_newest_first();
+        // volumes is oldest-first after the reverse inside get_volumes_newest_first.
+
+        // 4. K-way merge using per-source cursors.
+        //    Sources: hot_rows (already sorted) + each volume's row_ids (sorted ascending).
+        //    For DESC, we iterate each source from the end.
+
+        // Pre-compute column mappings for each volume.
+        struct VolSource {
+            row_ids: Vec<i64>,
+            cursor: usize,
+            mapping: super::writer::ColumnMapping,
+            volume: Arc<FrozenVolume>,
+            visible: Option<Arc<Vec<u64>>>,
+        }
+
+        let mut vol_sources: Vec<VolSource> = Vec::with_capacity(volumes.len());
+        for (seg_id, cs) in volumes.iter() {
+            // Filter out empty or fully-skipped volumes early via zone-map on row_id range.
+            let vol = &cs.volume;
+            if vol.meta.row_count == 0 {
+                continue;
+            }
+            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
+            vol_sources.push(VolSource {
+                row_ids: vol.meta.row_ids.clone(),
+                cursor: if ascending { 0 } else { vol.meta.row_count },
+                mapping,
+                volume: Arc::clone(&cs.volume),
+                visible: cs.visible.clone(),
+            });
+        }
+
+        let mut result = RowVec::with_capacity(needed.min(1024));
+        let mut skipped = 0usize;
+        let mut hot_cursor: usize = 0;
+
+        loop {
+            if result.len() >= limit {
+                break;
+            }
+
+            // Find the source with the next row_id to emit.
+            // For ASC: smallest row_id. For DESC: largest row_id.
+            let mut best_row_id: Option<i64> = None;
+            // 0 = hot, 1..=num_vol = vol_sources[idx-1]
+            let mut best_source: usize = usize::MAX;
+
+            // Check hot source
+            if hot_cursor < hot_rows.len() {
+                let (rid, _) = &hot_rows[hot_cursor];
+                best_row_id = Some(*rid);
+                best_source = 0;
+            }
+
+            // Check each volume source
+            for (vi, vs) in vol_sources.iter().enumerate() {
+                let rid = if ascending {
+                    if vs.cursor >= vs.row_ids.len() {
+                        continue;
+                    }
+                    vs.row_ids[vs.cursor]
+                } else {
+                    if vs.cursor == 0 {
+                        continue;
+                    }
+                    vs.row_ids[vs.cursor - 1]
+                };
+
+                let dominated = match best_row_id {
+                    None => false,
+                    Some(best) => {
+                        if ascending {
+                            best <= rid
+                        } else {
+                            best >= rid
+                        }
+                    }
+                };
+                if !dominated {
+                    best_row_id = Some(rid);
+                    best_source = vi + 1;
+                }
+            }
+
+            // No more rows from any source.
+            if best_source == usize::MAX {
+                break;
+            }
+
+            if best_source == 0 {
+                // Hot source — row is already materialized and visible.
+                let (rid, row) = hot_rows[hot_cursor].clone();
+                hot_cursor += 1;
+                // Hot rows don't need tombstone/skip checks — they ARE the authoritative version.
+                if skipped < offset {
+                    skipped += 1;
+                } else {
+                    result.push((rid, row));
+                }
+            } else {
+                // Volume source
+                let vs = &mut vol_sources[best_source - 1];
+                let idx = if ascending {
+                    let i = vs.cursor;
+                    vs.cursor += 1;
+                    i
+                } else {
+                    vs.cursor -= 1;
+                    vs.cursor
+                };
+
+                let rid = vs.row_ids[idx];
+
+                // Visibility check: inter-volume dedup bitmap
+                if let Some(ref bits) = vs.visible {
+                    if (bits[idx >> 6] >> (idx & 63)) & 1 == 0 {
+                        continue;
+                    }
+                }
+
+                // Skip if hot shadows this row or if tombstoned
+                if skip.contains(&rid) {
+                    continue;
+                }
+                if self.is_row_tombstoned(&tombstones_arc, rid) {
+                    continue;
+                }
+
+                // Materialize the row
+                let row = if vs.mapping.is_identity {
+                    vs.volume.get_row(idx)
+                } else {
+                    vs.volume.get_row_mapped(idx, &vs.mapping)
+                };
+
+                if skipped < offset {
+                    skipped += 1;
+                } else {
+                    result.push((rid, row));
+                }
+            }
+        }
+
+        Some(result)
     }
 
     fn collect_rows_pk_keyset(
