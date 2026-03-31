@@ -73,14 +73,17 @@ The WAL records these operations:
 
 ### WAL Configuration
 
-Configure WAL behavior using PRAGMA:
+Configure WAL behavior via the connection string (these settings take effect at database open time and cannot be changed at runtime):
+
+```
+file:///path/to/db?sync_mode=normal&wal_flush_trigger=65536
+```
+
+Read current values with PRAGMA:
 
 ```sql
--- Sync mode: 0=None, 1=Normal (default), 2=Full
-PRAGMA sync_mode = 1;
-
--- Buffer size in bytes before automatic WAL flush
-PRAGMA wal_flush_trigger = 32768;
+PRAGMA sync_mode;           -- returns current mode (0, 1, or 2)
+PRAGMA wal_flush_trigger;   -- returns current buffer size
 ```
 
 | Sync Mode | Value | Behavior | Max Data Loss |
@@ -116,6 +119,8 @@ The background checkpoint thread periodically seals hot buffer rows into cold se
 4. **Persist manifest**: The manifest (volume list, tombstones, checkpoint LSN) is written to disk
 
 On clean shutdown, a force checkpoint seals ALL remaining hot rows regardless of threshold.
+
+When snapshot isolation transactions are active, seal uses a cutoff filter: only rows committed before the earliest snapshot's `begin_seq` are sealed. Rows committed after stay in the hot buffer where MVCC visibility handles them correctly. This allows seal and compaction to proceed during long-running snapshot transactions instead of being blocked entirely.
 
 ### Per-Volume Skip Sets (Deduplication)
 
@@ -160,18 +165,24 @@ The compaction process:
 5. Atomically register all new volumes and remove old ones (no visibility gap)
 6. Clear tombstones for row_ids in the merged volumes
 7. Persist manifest before deleting old volume files (crash safety)
-8. Skipped entirely when snapshot isolation transactions are active
+8. Cutoff-filtered during snapshot isolation: only rows committed before the earliest snapshot's begin_seq are compacted. Post-snapshot tombstones are preserved. Volume seal_seq metadata tracks when each volume was created for compaction eligibility
 
 ### What Volumes Optimize
 
-Frozen volumes store data column by column:
+Frozen volumes store data column by column with multiple query acceleration techniques:
 
 - **Startup**: Loading cold data from volumes takes milliseconds instead of seconds
-- **Aggregation without WHERE**: `SELECT MAX(time)` answers from pre-computed statistics in microseconds
-- **COUNT(\*)**: Returns instantly from stored metadata
-- **SUM, MIN, MAX, AVG**: Same instant path when no WHERE clause is present
-
-For queries with WHERE clauses, volumes use zone maps (per-column min/max) to skip data that cannot match, bloom filters for equality predicates on text columns, and binary search on sorted columns to jump directly to matching ranges.
+- **Aggregation without WHERE**: `SELECT SUM(x), MIN(x), MAX(x), AVG(x), COUNT(*)` answers from pre-computed per-volume statistics without scanning any row data
+- **Filtered aggregation (columnar pushdown)**: `SELECT SUM(x) FROM t WHERE col > 10` evaluates predicates and accumulates aggregates directly on raw i64/f64 arrays. Zero Value or Row object construction. Dictionary-encoded text equality predicates resolve to u32 dict_id comparisons
+- **Grouped aggregation**: `SELECT exchange, COUNT(*) FROM t GROUP BY exchange` uses dictionary-indexed accumulator arrays for text columns (zero hashing in the inner loop) and FxHashMap for integer/timestamp columns
+- **DISTINCT**: `SELECT DISTINCT exchange FROM t` extracts unique values from per-volume dictionary metadata without scanning rows
+- **ORDER BY PK + LIMIT**: `SELECT * FROM t ORDER BY id LIMIT 10` uses a k-way merge across sorted volume row_ids and the hot buffer B-tree, stopping after the requested rows
+- **IN list pruning**: `WHERE id IN (1, 2, 3)` derives min/max bounds from the IN values for zone-map pruning
+- **Zone map pruning**: Per-column min/max metadata per volume and per 64K row group. Volumes that cannot match the WHERE clause are skipped entirely
+- **Bloom filters**: Per-column bloom filters for fast equality rejection on text columns
+- **Binary search**: Sorted columns (like the primary key) use binary search to narrow scan ranges within a volume
+- **Parallel scanning**: When the parallel feature is enabled (default), multiple volumes are scanned concurrently using rayon. A threshold guard ensures small queries use the sequential path to avoid scheduling overhead
+- **OFFSET skip**: Large OFFSET values skip row materialization for discarded rows, only constructing Row objects for rows that will be returned
 
 ### Volume File Layout
 
@@ -351,12 +362,16 @@ let results = db.query("SELECT * FROM users", ())?;
 file:///path/to/database?sync_mode=2&checkpoint_interval=60&compact_threshold=4&keep_snapshots=3
 ```
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| sync_mode | WAL sync mode (0, 1, 2) | 1 |
-| checkpoint_interval | Seconds between checkpoints | 60 |
-| compact_threshold | Sub-target volumes per table before merging | 4 |
-| keep_snapshots | Backup snapshots to retain per table | 3 |
+| Parameter | Description | Default | Runtime |
+|-----------|-------------|---------|---------|
+| sync_mode | WAL sync mode: none, normal, full (or 0, 1, 2) | normal | DSN only |
+| sync_interval_ms | Minimum ms between syncs in normal mode | 1000 | DSN only |
+| wal_flush_trigger | Buffer size in bytes before WAL flush | 32768 | DSN only |
+| wal_buffer_size | WAL write buffer size in bytes | 65536 | DSN only |
+| checkpoint_interval | Seconds between checkpoints (0 = disabled) | 60 | PRAGMA |
+| compact_threshold | Sub-target volumes per table before merging | 4 | PRAGMA |
+| target_volume_rows | Target rows per cold volume (min 65536) | 1048576 | PRAGMA |
+| keep_snapshots | Backup snapshots to retain per table | 3 | PRAGMA |
 | checkpoint_on_close | Seal all hot rows on clean shutdown | on |
 | target_volume_rows | Target rows per cold volume (min 65536) | 1048576 |
 

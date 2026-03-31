@@ -27,13 +27,13 @@ Tables in Stoolap are composed of:
 
 - **Metadata** - Schema information, column definitions, and indexes
 - **Hot Buffer** - In-memory row storage for recent writes (row-major, MVCC-managed)
-- **Cold Segments (Frozen Volumes)** - Column-major storage for sealed historical data. Stores timestamps at nanosecond precision. Includes zone maps, bloom filters, dictionary encoding, and CRC32 integrity checks
+- **Cold Segments (Frozen Volumes)** - Column-major storage for sealed historical data. Stores timestamps at nanosecond precision. Includes zone maps, bloom filters, dictionary encoding, CRC32 integrity checks, and columnar aggregate pushdown (aggregates computed directly on raw typed arrays without Row/Value construction)
 - **Tombstones** - Manifest-tracked markers for deleted cold rows, with per-transaction deferred application for isolation
 - **Version Store** - Tracks row versions for MVCC
 - **Indexes** - B-tree, Hash, Bitmap, HNSW, and multi-column indexes (hot data only, cold uses zone maps and bloom filters)
 - **Transaction Manager** - Manages transaction state and visibility
 
-In memory mode, all data lives in the hot buffer. In persistence mode, tables automatically seal hot rows into cold segments when they accumulate enough data (100K rows for first seal, 10K incremental). The query engine merges hot and cold sources transparently. See [Persistence]({{ '/docs/architecture/persistence/' | relative_url }}) for details.
+In memory mode, all data lives in the hot buffer. In persistence mode, tables automatically seal hot rows into cold segments when they accumulate enough data (100K rows for first seal, 10K incremental). The query engine merges hot and cold sources transparently, with multiple acceleration paths: columnar aggregate pushdown evaluates SUM/COUNT/MIN/MAX/AVG directly on raw typed arrays, dictionary-indexed GROUP BY avoids hashing, DISTINCT extracts from volume dictionaries, and ORDER BY on the primary key uses a k-way merge across sorted volumes. See [Persistence]({{ '/docs/architecture/persistence/' | relative_url }}) for details.
 
 ### Data Types
 
