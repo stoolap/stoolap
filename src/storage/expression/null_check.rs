@@ -146,6 +146,12 @@ impl Expression for NullCheckExpr {
         true
     }
 
+    fn is_conjunctive_simple(&self) -> bool {
+        // IS NULL / IS NOT NULL cannot be represented as (col, op, value)
+        // comparisons, so they cannot be evaluated in columnar aggregate pushdown.
+        false
+    }
+
     fn clone_box(&self) -> Box<dyn Expression> {
         Box::new(self.clone())
     }

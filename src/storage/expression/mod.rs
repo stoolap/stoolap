@@ -171,6 +171,14 @@ pub trait Expression: Send + Sync + Debug {
         }
     }
 
+    /// Check whether this expression is a conjunction of simple predicates
+    /// (comparisons, BETWEEN, IN, IS NULL/IS NOT NULL, or ANDs thereof).
+    /// Used to gate columnar aggregate pushdown: only conjunctive-simple
+    /// filters can be evaluated directly on raw typed arrays.
+    fn is_conjunctive_simple(&self) -> bool {
+        false
+    }
+
     /// Clone the expression into a boxed trait object
     fn clone_box(&self) -> Box<dyn Expression>;
 

@@ -947,6 +947,20 @@ pub trait Table: Send + Sync {
         None // Default implementation - override in concrete tables
     }
 
+    /// Compute distinct non-null values for a column by exploiting cold volume
+    /// metadata. For dictionary-encoded TEXT columns with no tombstones, this
+    /// extracts dictionary entries directly (O(unique values) per volume, no
+    /// row scan). Falls back to None when the fast path is not applicable.
+    ///
+    /// # Arguments
+    /// * `col_idx` - Schema column index
+    ///
+    /// # Returns
+    /// Some(Vec<Value>) with distinct non-null values, or None if fast path unavailable
+    fn compute_distinct_values(&self, _col_idx: usize) -> Option<Vec<Value>> {
+        None
+    }
+
     /// Get the count of distinct non-null values from an indexed column.
     /// Used for COUNT(DISTINCT col) optimization without cloning all values.
     ///
@@ -1180,6 +1194,26 @@ pub trait Table: Send + Sync {
     /// * `col_idx` - Column index to find maximum
     fn max_column(&self, _col_idx: usize) -> Option<Option<Value>> {
         None // Default implementation - override in concrete tables
+    }
+
+    /// Compute aggregates with a WHERE filter at the storage level.
+    ///
+    /// This pushes filtered aggregation (e.g. `SELECT SUM(col) FROM t WHERE x > 5`)
+    /// directly into the storage layer, scanning only rows that match the predicate
+    /// and computing aggregates without materializing full Row objects in the executor.
+    ///
+    /// # Arguments
+    /// * `aggregates` - List of (operation, column_index) pairs
+    /// * `where_expr` - Storage expression representing the WHERE clause filter
+    ///
+    /// # Returns
+    /// Some(values) with one Value per aggregate if optimization is available, None otherwise
+    fn compute_filtered_aggregates(
+        &self,
+        _aggregates: &[(AggregateOp, usize)],
+        _where_expr: &dyn Expression,
+    ) -> Option<Vec<crate::core::Value>> {
+        None // Default: not supported
     }
 
     /// Compute grouped aggregates at the storage level.

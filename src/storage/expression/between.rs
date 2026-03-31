@@ -353,6 +353,10 @@ impl Expression for BetweenExpr {
         }
     }
 
+    fn is_conjunctive_simple(&self) -> bool {
+        true
+    }
+
     fn clone_box(&self) -> Box<dyn Expression> {
         Box::new(self.clone())
     }

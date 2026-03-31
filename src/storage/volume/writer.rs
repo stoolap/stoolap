@@ -702,6 +702,19 @@ impl CompressedBlockStore {
         self.blocks.len()
     }
 
+    /// Return the shared dictionary Arc for a dictionary-encoded column.
+    /// Returns None if the column is not dictionary-encoded.
+    /// This avoids decompressing any column blocks.
+    pub fn get_column_dictionary(&self, col_idx: usize) -> Option<&Arc<[SmartString]>> {
+        if col_idx >= self.col_type_tags.len() || self.col_type_tags[col_idx] != COL_DICTIONARY {
+            return None;
+        }
+        self.col_dicts
+            .iter()
+            .find(|(ci, _)| *ci == col_idx)
+            .map(|(_, arc)| arc)
+    }
+
     /// Total compressed bytes in RAM.
     pub fn memory_size(&self) -> usize {
         let mut size = 0;
@@ -904,6 +917,24 @@ impl LazyColumns {
     #[inline]
     pub fn should_use_group_cache(&self) -> bool {
         !self.is_eager.load(std::sync::atomic::Ordering::Relaxed) && self.compressed_store.is_some()
+    }
+
+    /// Return the dictionary for a dictionary-encoded column without
+    /// decompressing column data. Checks loaded OnceLock slots first,
+    /// then falls back to the CompressedBlockStore's pre-built dictionary.
+    /// Returns None for non-dictionary columns or cold-tier volumes.
+    pub fn get_column_dictionary(&self, col_idx: usize) -> Option<Arc<[SmartString]>> {
+        // Fast path: column already loaded in OnceLock
+        if let Some(col) = self.slots.get(col_idx).and_then(|s| s.get()) {
+            if let ColumnData::Dictionary { dictionary, .. } = col {
+                return Some(Arc::clone(dictionary));
+            }
+            return None;
+        }
+        // Slow path: extract from compressed store without decompressing
+        self.compressed_store
+            .as_ref()
+            .and_then(|store| store.get_column_dictionary(col_idx).cloned())
     }
 
     /// Access the compressed store (for V4 write).
@@ -1884,6 +1915,14 @@ impl FrozenVolume {
             // Already has the new name (chained rename handled)
             let _ = idx;
         }
+    }
+
+    /// Return the dictionary for a dictionary-encoded column.
+    /// Avoids decompressing the full column — extracts from the shared
+    /// dictionary stored in the compressed block store or OnceLock slot.
+    /// Returns None for non-dictionary columns or cold-tier volumes.
+    pub fn get_column_dictionary(&self, col_idx: usize) -> Option<Arc<[SmartString]>> {
+        self.columns.get_column_dictionary(col_idx)
     }
 
     /// Estimate the in-memory size of this volume in bytes.

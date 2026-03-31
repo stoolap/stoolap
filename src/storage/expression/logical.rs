@@ -111,6 +111,10 @@ impl Expression for AndExpr {
         Some(&self.expressions)
     }
 
+    fn is_conjunctive_simple(&self) -> bool {
+        self.expressions.iter().all(|e| e.is_conjunctive_simple())
+    }
+
     fn clone_box(&self) -> Box<dyn Expression> {
         Box::new(self.clone())
     }

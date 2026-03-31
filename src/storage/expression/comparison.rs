@@ -431,6 +431,10 @@ impl Expression for ComparisonExpr {
         Some((&self.column, self.operator, &self.original_value))
     }
 
+    fn is_conjunctive_simple(&self) -> bool {
+        true
+    }
+
     fn clone_box(&self) -> Box<dyn Expression> {
         Box::new(self.clone())
     }

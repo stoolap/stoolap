@@ -471,6 +471,12 @@ impl Expression for InListExpr {
         true
     }
 
+    fn is_conjunctive_simple(&self) -> bool {
+        // IN list collect_comparisons returns min/max bounds, not exact values.
+        // Cannot be used for columnar aggregate pushdown (would over-match).
+        false
+    }
+
     fn clone_box(&self) -> Box<dyn Expression> {
         Box::new(self.clone())
     }

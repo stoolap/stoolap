@@ -1886,7 +1886,14 @@ impl Executor {
         }
 
         // Try to get distinct values from the index
-        if let Some(distinct_values) = table.get_partition_values(&column_name) {
+        let distinct_values = table.get_partition_values(&column_name).or_else(|| {
+            // Fallback: dictionary-based extraction from cold volumes
+            let schema = table.schema();
+            let col_idx = *schema.column_index_map().get(&column_name)?;
+            table.compute_distinct_values(col_idx)
+        });
+
+        if let Some(distinct_values) = distinct_values {
             // Build output column name (use alias if present)
             let output_name = match &stmt.columns[0] {
                 Expression::Aliased(aliased) => aliased.alias.value.to_string(),
@@ -1983,12 +1990,27 @@ impl Executor {
         // - SELECT SUM(col), MIN(col), MAX(col) FROM table
         // Must check before any row collection happens
         if classification.has_aggregation && !classification.has_window_functions {
-            // First try global aggregation pushdown (no GROUP BY)
+            // First try global aggregation pushdown (no GROUP BY, no WHERE)
             if let Some(result) =
                 self.try_aggregation_pushdown(table.as_ref(), stmt, ctx, classification)?
             {
                 let columns = CompactArc::new(result.columns().to_vec());
                 return Ok((result, columns, false, None));
+            }
+
+            // Try filtered aggregation pushdown (WHERE + aggregates, no GROUP BY)
+            // Pushes both the filter and aggregation into the storage layer
+            if classification.has_where {
+                if let Some(result) = self.try_filtered_aggregation_pushdown(
+                    table.as_ref(),
+                    stmt,
+                    ctx,
+                    classification,
+                    &all_columns,
+                )? {
+                    let columns = CompactArc::new(result.columns().to_vec());
+                    return Ok((result, columns, false, None));
+                }
             }
 
             // Try storage-level GROUP BY aggregation (no WHERE clause)
