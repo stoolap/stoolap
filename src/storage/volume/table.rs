@@ -2135,7 +2135,7 @@ impl Table for SegmentedTable {
 
         // Resolve column name for per-volume physical index lookup.
         let schema = self.hot.schema();
-        let col_name = schema.columns.get(col_idx).map(|c| c.name.as_str());
+        // Column resolution uses mapping (handles renames/drops) not col_name.
 
         // Stats fast path is only safe when there are no tombstones AND no
         // overlapping row_ids between volumes. After UPDATE + seal, tombstones
@@ -2150,23 +2150,31 @@ impl Table for SegmentedTable {
             // Accumulate integer and float parts separately to avoid precision
             // loss from per-volume i128→f64 conversion. The single final
             // conversion is exact for sums that fit in 53-bit mantissa.
-            let segments = self.segment_mgr.get_segments_ordered_meta();
+            // Use segments_raw (metadata only, no cold volume reload).
+            let segs = self.segment_mgr.segments_raw();
             let mut cold_sum_int: i128 = 0;
             let mut cold_sum_float: f64 = 0.0;
             let mut total_count = hot_count;
-            for vol in &segments {
-                let phys = col_name.and_then(|n| vol.column_index(n));
+            for (seg_id, cs) in segs.iter() {
+                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                let phys = if col_idx < mapping.sources.len() {
+                    match &mapping.sources[col_idx] {
+                        super::writer::ColSource::Volume(vi) => Some(*vi),
+                        super::writer::ColSource::Default(_) => None,
+                    }
+                } else {
+                    None
+                };
                 if let Some(pi) = phys {
-                    if pi < vol.meta.stats.columns.len() {
-                        let (int_part, float_part) = vol.meta.stats.columns[pi].sum_parts();
+                    if pi < cs.volume.meta.stats.columns.len() {
+                        let (int_part, float_part) = cs.volume.meta.stats.columns[pi].sum_parts();
                         cold_sum_int += int_part;
                         cold_sum_float += float_part;
-                        total_count += vol.meta.stats.columns[pi].numeric_count as usize;
+                        total_count += cs.volume.meta.stats.columns[pi].numeric_count as usize;
                     }
                 } else if let Some(def) = default_f64 {
-                    // Old volume missing this column: every row has the default
-                    cold_sum_float += def * vol.meta.row_count as f64;
-                    total_count += vol.meta.row_count;
+                    cold_sum_float += def * cs.volume.meta.row_count as f64;
+                    total_count += cs.volume.meta.row_count;
                 }
             }
             let total_sum = hot_sum + cold_sum_int as f64 + cold_sum_float;
@@ -2185,9 +2193,17 @@ impl Table for SegmentedTable {
         let mut total_sum = hot_sum;
         let mut total_count = hot_count;
 
-        for (_, cs) in volumes.iter() {
+        for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
-            let phys = col_name.and_then(|n| vol.column_index(n));
+            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+            let phys = if col_idx < mapping.sources.len() {
+                match &mapping.sources[col_idx] {
+                    super::writer::ColSource::Volume(vi) => Some(*vi),
+                    super::writer::ColSource::Default(_) => None,
+                }
+            } else {
+                None
+            };
             for i in 0..vol.meta.row_count {
                 if !cs.is_visible(i) {
                     continue;
@@ -2237,7 +2253,7 @@ impl Table for SegmentedTable {
         let hot_min = hot_result?;
 
         let schema = self.hot.schema();
-        let col_name = schema.columns.get(col_idx).map(|c| c.name.as_str());
+        // Column resolution uses mapping (handles renames/drops) not col_name.
         let default_val = self.column_default(col_idx);
         let has_non_null_default = !default_val.is_null();
 
@@ -2247,10 +2263,19 @@ impl Table for SegmentedTable {
 
         if can_use_stats {
             // Fast path: use pre-computed volume stats (zone map min)
-            let segments = self.segment_mgr.get_segments_ordered_meta();
+            let segs = self.segment_mgr.segments_raw();
             let mut overall_min = hot_min;
-            for vol in &segments {
-                let phys = col_name.and_then(|n| vol.column_index(n));
+            for (seg_id, cs) in segs.iter() {
+                let vol = &cs.volume;
+                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                let phys = if col_idx < mapping.sources.len() {
+                    match &mapping.sources[col_idx] {
+                        super::writer::ColSource::Volume(vi) => Some(*vi),
+                        super::writer::ColSource::Default(_) => None,
+                    }
+                } else {
+                    None
+                };
                 let vol_min = if let Some(pi) = phys {
                     if pi < vol.meta.stats.columns.len() {
                         let m = &vol.meta.stats.columns[pi].min;
@@ -2309,9 +2334,17 @@ impl Table for SegmentedTable {
         let tombstones_ref = tombstones_arc.as_deref().unwrap_or(&empty_tombstones);
 
         let mut overall_min = hot_min;
-        for (_, cs) in volumes.iter() {
+        for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
-            let phys = col_name.and_then(|n| vol.column_index(n));
+            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+            let phys = if col_idx < mapping.sources.len() {
+                match &mapping.sources[col_idx] {
+                    super::writer::ColSource::Volume(vi) => Some(*vi),
+                    super::writer::ColSource::Default(_) => None,
+                }
+            } else {
+                None
+            };
 
             // Zone-map pruning: skip this volume if its min cannot beat current best
             if let Some(ref current_best) = overall_min {
@@ -2523,7 +2556,7 @@ impl Table for SegmentedTable {
         let hot_max = hot_result?;
 
         let schema = self.hot.schema();
-        let col_name = schema.columns.get(col_idx).map(|c| c.name.as_str());
+        // Column resolution uses mapping (handles renames/drops) not col_name.
         let default_val = self.column_default(col_idx);
         let has_non_null_default = !default_val.is_null();
 
@@ -2533,10 +2566,20 @@ impl Table for SegmentedTable {
 
         if can_use_stats {
             // Fast path: use pre-computed volume stats (zone map max)
-            let segments = self.segment_mgr.get_segments_ordered_meta();
+            // Use segments_raw (metadata only, no cold volume reload).
+            let segs = self.segment_mgr.segments_raw();
             let mut overall_max = hot_max;
-            for vol in &segments {
-                let phys = col_name.and_then(|n| vol.column_index(n));
+            for (seg_id, cs) in segs.iter() {
+                let vol = &cs.volume;
+                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+                let phys = if col_idx < mapping.sources.len() {
+                    match &mapping.sources[col_idx] {
+                        super::writer::ColSource::Volume(vi) => Some(*vi),
+                        super::writer::ColSource::Default(_) => None,
+                    }
+                } else {
+                    None
+                };
                 let vol_max = if let Some(pi) = phys {
                     if pi < vol.meta.stats.columns.len() {
                         let m = &vol.meta.stats.columns[pi].max;
@@ -2589,9 +2632,17 @@ impl Table for SegmentedTable {
         let tombstones_ref = tombstones_arc.as_deref().unwrap_or(&empty_tombstones);
 
         let mut overall_max = hot_max;
-        for (_, cs) in volumes.iter() {
+        for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
-            let phys = col_name.and_then(|n| vol.column_index(n));
+            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+            let phys = if col_idx < mapping.sources.len() {
+                match &mapping.sources[col_idx] {
+                    super::writer::ColSource::Volume(vi) => Some(*vi),
+                    super::writer::ColSource::Default(_) => None,
+                }
+            } else {
+                None
+            };
 
             // Zone-map pruning: skip this volume if its max cannot beat current best
             if let Some(ref current_best) = overall_max {
@@ -2819,12 +2870,20 @@ impl Table for SegmentedTable {
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
         // Scan cold volumes columnar-only (no Row materialization)
-        let col_name = schema.columns.get(col_idx).map(|c| c.name.as_str());
+        // Column resolution uses mapping (handles renames/drops) not col_name.
         let default_val = self.column_default(col_idx);
         let has_non_null_default = !default_val.is_null();
-        for (_, cs) in volumes.iter() {
+        for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
-            let phys = col_name.and_then(|n| vol.column_index(n));
+            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+            let phys = if col_idx < mapping.sources.len() {
+                match &mapping.sources[col_idx] {
+                    super::writer::ColSource::Volume(vi) => Some(*vi),
+                    super::writer::ColSource::Default(_) => None,
+                }
+            } else {
+                None
+            };
             for i in 0..vol.meta.row_count {
                 if !cs.is_visible(i) {
                     continue;
@@ -2877,12 +2936,20 @@ impl Table for SegmentedTable {
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
-        let col_name = schema.columns.get(col_idx).map(|c| c.name.as_str());
+        // Column resolution uses mapping (handles renames/drops) not col_name.
         let default_val = self.column_default(col_idx);
         let has_non_null_default = !default_val.is_null();
-        for (_, cs) in volumes.iter() {
+        for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
-            let phys = col_name.and_then(|n| vol.column_index(n));
+            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+            let phys = if col_idx < mapping.sources.len() {
+                match &mapping.sources[col_idx] {
+                    super::writer::ColSource::Volume(vi) => Some(*vi),
+                    super::writer::ColSource::Default(_) => None,
+                }
+            } else {
+                None
+            };
             for i in 0..vol.meta.row_count {
                 if !cs.is_visible(i) {
                     continue;
