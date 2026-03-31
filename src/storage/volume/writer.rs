@@ -1275,17 +1275,22 @@ impl VolumeBuilder {
             // Accumulate stats
             self.stats.columns[col_idx].accumulate(value);
 
-            // Update zone map
-            let zm = &mut self.zone_maps[col_idx];
-            if zm.min.is_null() {
-                zm.min = value.clone();
-                zm.max = value.clone();
-            } else {
-                if let Ok(std::cmp::Ordering::Less) = value.compare(&zm.min) {
+            // Update zone map (skip NaN — it breaks min/max tracking and
+            // compare_floats treats NaN as greater-than-all, permanently
+            // corrupting zm.max. Row-group zone maps handle NaN separately.)
+            let is_nan = matches!(value, Value::Float(f) if f.is_nan());
+            if !is_nan {
+                let zm = &mut self.zone_maps[col_idx];
+                if zm.min.is_null() {
                     zm.min = value.clone();
-                }
-                if let Ok(std::cmp::Ordering::Greater) = value.compare(&zm.max) {
                     zm.max = value.clone();
+                } else {
+                    if let Ok(std::cmp::Ordering::Less) = value.compare(&zm.min) {
+                        zm.min = value.clone();
+                    }
+                    if let Ok(std::cmp::Ordering::Greater) = value.compare(&zm.max) {
+                        zm.max = value.clone();
+                    }
                 }
             }
 

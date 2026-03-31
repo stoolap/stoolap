@@ -111,8 +111,14 @@ impl ColumnAggregateStats {
     }
 
     /// Get the sum as f64 (combining integer and float sums).
+    /// Note: loses precision for i128 sums beyond 2^53. Prefer `sum_parts()` when possible.
     pub fn sum_as_f64(&self) -> f64 {
         self.sum_int as f64 + self.sum_float
+    }
+
+    /// Get the separate integer and float sum components (no precision loss).
+    pub fn sum_parts(&self) -> (i128, f64) {
+        (self.sum_int, self.sum_float)
     }
 
     /// Get the average value.

@@ -2004,23 +2004,30 @@ impl Table for SegmentedTable {
             && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count();
 
         if can_use_stats {
-            // Fast path: use pre-computed volume stats
+            // Fast path: use pre-computed volume stats.
+            // Accumulate integer and float parts separately to avoid precision
+            // loss from per-volume i128→f64 conversion. The single final
+            // conversion is exact for sums that fit in 53-bit mantissa.
             let segments = self.segment_mgr.get_segments_ordered_meta();
-            let mut total_sum = hot_sum;
+            let mut cold_sum_int: i128 = 0;
+            let mut cold_sum_float: f64 = 0.0;
             let mut total_count = hot_count;
             for vol in &segments {
                 let phys = col_name.and_then(|n| vol.column_index(n));
                 if let Some(pi) = phys {
                     if pi < vol.meta.stats.columns.len() {
-                        total_sum += vol.meta.stats.columns[pi].sum_as_f64();
+                        let (int_part, float_part) = vol.meta.stats.columns[pi].sum_parts();
+                        cold_sum_int += int_part;
+                        cold_sum_float += float_part;
                         total_count += vol.meta.stats.columns[pi].numeric_count as usize;
                     }
                 } else if let Some(def) = default_f64 {
                     // Old volume missing this column: every row has the default
-                    total_sum += def * vol.meta.row_count as f64;
+                    cold_sum_float += def * vol.meta.row_count as f64;
                     total_count += vol.meta.row_count;
                 }
             }
+            let total_sum = hot_sum + cold_sum_int as f64 + cold_sum_float;
             return Some((total_sum, total_count));
         }
 

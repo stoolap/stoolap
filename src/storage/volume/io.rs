@@ -293,7 +293,6 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     //    Each block is read into a buffer then moved into the store.
     let mut all_blocks: Vec<Vec<Vec<u8>>> = Vec::with_capacity(col_count);
     let mut all_decomp_lens: Vec<Vec<usize>> = Vec::with_capacity(col_count);
-    let mut read_buf: Vec<u8> = Vec::new();
     let mut block_idx = 0usize;
 
     for _col_idx in 0..col_count {
@@ -302,10 +301,10 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
         for _gi in 0..num_groups {
             let comp_len = compressed_lens[block_idx];
             let decomp_len = decompressed_lens_flat[block_idx];
-            read_buf.resize(comp_len, 0);
-            crc_read!(&mut read_buf);
+            let mut block = vec![0u8; comp_len];
+            crc_read!(&mut block);
             block_idx += 1;
-            col_blocks.push(std::mem::take(&mut read_buf));
+            col_blocks.push(block);
             col_lens.push(decomp_len);
         }
         all_blocks.push(col_blocks);
