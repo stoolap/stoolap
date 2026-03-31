@@ -1272,13 +1272,14 @@ impl VolumeBuilder {
                 continue;
             }
 
-            // Accumulate stats
-            self.stats.columns[col_idx].accumulate(value);
-
-            // Update zone map (skip NaN — it breaks min/max tracking and
-            // compare_floats treats NaN as greater-than-all, permanently
-            // corrupting zm.max. Row-group zone maps handle NaN separately.)
+            // Skip NaN for both stats and zone maps — NaN poisons sum_float
+            // (NaN + x = NaN) and corrupts zm.max (compare_floats treats NaN
+            // as greater-than-all). Row-group zone maps handle NaN separately.
             let is_nan = matches!(value, Value::Float(f) if f.is_nan());
+            if !is_nan {
+                self.stats.columns[col_idx].accumulate(value);
+            }
+
             if !is_nan {
                 let zm = &mut self.zone_maps[col_idx];
                 if zm.min.is_null() {

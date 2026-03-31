@@ -2044,6 +2044,7 @@ impl Executor {
                         .with_named_params(named_params);
                     for (_col_idx, col_name, expr_text, check_program) in &compiled_check_exprs {
                         match vm.execute_cow(check_program, &check_ctx) {
+                            Ok(Value::Boolean(true)) => {}
                             Ok(Value::Boolean(false)) => {
                                 return Err(Error::CheckConstraintViolation {
                                     column: col_name.clone(),
@@ -2051,7 +2052,22 @@ impl Executor {
                                 });
                             }
                             Ok(Value::Null(_)) | Err(_) => {}
-                            Ok(_) => {} // Non-boolean truthy values pass (e.g., CHECK(value))
+                            Ok(ref v) => {
+                                // Non-boolean truthiness: zero/empty = false, all else = true.
+                                // Timestamp, Extension, etc. are truthy (non-null existence).
+                                let is_truthy = match v {
+                                    Value::Integer(i) => *i != 0,
+                                    Value::Float(f) => *f != 0.0,
+                                    Value::Text(s) => !s.is_empty(),
+                                    _ => true,
+                                };
+                                if !is_truthy {
+                                    return Err(Error::CheckConstraintViolation {
+                                        column: col_name.clone(),
+                                        expression: expr_text.clone(),
+                                    });
+                                }
+                            }
                         }
                     }
                 }
@@ -2876,7 +2892,7 @@ impl Executor {
                                 Value::Integer(i) => *i != 0,
                                 Value::Float(f) => *f != 0.0,
                                 Value::Text(s) => !s.is_empty(),
-                                _ => false,
+                                _ => true, // Timestamp, Extension, etc. are truthy
                             };
                             if !is_truthy {
                                 return Err(Error::CheckConstraintViolation {
@@ -3091,12 +3107,13 @@ impl Executor {
                         Ok(())
                     }
                     _ => {
-                        // Non-boolean result - treat non-zero/non-empty as true
+                        // Non-boolean truthiness: zero/empty = false, all else = true.
+                        // Timestamp, Extension, etc. are truthy (non-null existence).
                         let is_truthy = match &result {
                             Value::Integer(i) => *i != 0,
                             Value::Float(f) => *f != 0.0,
                             Value::Text(s) => !s.is_empty(),
-                            _ => false,
+                            _ => true,
                         };
                         if is_truthy {
                             Ok(())

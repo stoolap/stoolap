@@ -1563,7 +1563,7 @@ impl WALManager {
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0);
                 let last = self.last_sync_time.load(Ordering::Relaxed);
-                now - last >= 1_000_000_000 // 1 second
+                now - last >= self.sync_interval
             }
             SyncMode::Full => true,
         }

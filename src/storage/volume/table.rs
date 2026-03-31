@@ -3099,6 +3099,12 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        // Multi-column GROUP BY: the ValueMap below is keyed by the first column
+        // only, which incorrectly merges groups that share the first column but
+        // differ in others. Fall back to the full executor path.
+        if group_by_indices.len() > 1 {
+            return None;
+        }
         if !self.segment_mgr.has_segments() {
             return self
                 .hot

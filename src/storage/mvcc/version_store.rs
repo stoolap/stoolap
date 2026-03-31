@@ -5797,12 +5797,15 @@ impl VersionStore {
                 // Check if this version is visible
                 if checker.is_visible(version_txn_id, snapshot_txn_id) {
                     // When cutoff is specified, only include versions from transactions
-                    // that committed before the cutoff to ensure snapshot consistency
+                    // that committed before the cutoff to ensure snapshot consistency.
+                    // CRITICAL: Do NOT walk the prev chain. The extraction snapshot
+                    // captures the HEAD txn_id, and remove_sealed_rows compares against
+                    // it. If we extract an older version but the HEAD txn_id matches,
+                    // the HEAD is removed from hot, permanently losing the newer version.
+                    // The row stays entirely in hot where MVCC handles visibility.
                     if use_cutoff && !checker.is_committed_before(version_txn_id, commit_seq_cutoff)
                     {
-                        // This transaction committed after our snapshot point, try older version
-                        current = e.prev.as_ref().map(|arc| arc.as_ref());
-                        continue;
+                        break;
                     }
 
                     // Skip if deleted and deletion is visible (and within cutoff if specified)

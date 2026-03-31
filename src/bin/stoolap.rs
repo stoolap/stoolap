@@ -971,21 +971,33 @@ fn main() {
                 };
                 let table_names: Vec<String> = if let Some(start) = content.find("\"tables\":[") {
                     let after = &content[start + 10..];
-                    if let Some(end) = after.find(']') {
-                        after[..end]
-                            .split(',')
-                            .filter_map(|s| {
-                                let trimmed = s.trim().trim_matches('"');
-                                if trimmed.is_empty() {
-                                    None
-                                } else {
-                                    Some(trimmed.to_string())
+                    // Parse JSON string values properly (handle escaped quotes/backslashes)
+                    let mut names = Vec::new();
+                    let mut i = 0;
+                    let bytes = after.as_bytes();
+                    while i < bytes.len() {
+                        if bytes[i] == b']' {
+                            break;
+                        }
+                        if bytes[i] == b'"' {
+                            i += 1;
+                            let mut name = String::new();
+                            while i < bytes.len() && bytes[i] != b'"' {
+                                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                                    i += 1; // skip backslash, take next char
                                 }
-                            })
-                            .collect()
-                    } else {
-                        Vec::new()
+                                name.push(bytes[i] as char);
+                                i += 1;
+                            }
+                            if !name.is_empty() {
+                                names.push(name);
+                            }
+                            i += 1; // skip closing quote
+                        } else {
+                            i += 1;
+                        }
                     }
+                    names
                 } else {
                     Vec::new()
                 };
@@ -994,11 +1006,14 @@ fn main() {
                     continue;
                 }
 
-                // Verify all table snapshots exist for this timestamp
-                let all_exist = table_names.iter().all(|table| {
-                    let snapshot_file = snap_dir.join(table).join(format!("snapshot-{}.bin", ts));
-                    snapshot_file.exists()
-                });
+                // Verify all table snapshots AND DDL blob exist for this timestamp
+                let ddl_file = snap_dir.join(format!("ddl-{}.bin", ts));
+                let all_exist = ddl_file.exists()
+                    && table_names.iter().all(|table| {
+                        let snapshot_file =
+                            snap_dir.join(table).join(format!("snapshot-{}.bin", ts));
+                        snapshot_file.exists()
+                    });
 
                 if all_exist {
                     if !args.quiet {

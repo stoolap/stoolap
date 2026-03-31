@@ -4247,7 +4247,11 @@ impl MVCCEngine {
                 timestamp,
                 table_list
                     .iter()
-                    .map(|t| format!("\"{}\"", t))
+                    .map(|t| {
+                        // Escape JSON-special characters in table names
+                        let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
+                        format!("\"{}\"", escaped)
+                    })
                     .collect::<Vec<_>>()
                     .join(",")
             );
@@ -4879,10 +4883,15 @@ impl MVCCEngine {
 
         // Force checkpoint to persist restored data to volumes BEFORE accepting
         // transactions. WAL was truncated, so data is only in memory until this
-        // checkpoint. A crash before this would lose the restored data.
-        if let Err(e) = self.checkpoint_cycle_inner(true) {
-            eprintln!("Warning: Post-restore checkpoint failed: {}", e);
-        }
+        // checkpoint. If this fails, the restored data is non-durable — return
+        // an error so the caller knows the restore did not complete safely.
+        self.checkpoint_cycle_inner(true).map_err(|e| {
+            // Resume transactions so the database is usable even if non-durable
+            self.registry.start_accepting_transactions();
+            Error::Internal {
+                message: format!("Restore data not persisted (crash may lose it): {}", e),
+            }
+        })?;
         self.compact_after_checkpoint_forced();
 
         // Resume accepting transactions only after data is persisted
@@ -5646,11 +5655,8 @@ impl MVCCEngine {
             _ => return Ok(()),
         };
 
-        // Compute commit-sequence cutoff for snapshot-safe seal.
-        // When snapshot transactions are active, only seal rows committed before
-        // the earliest snapshot's begin_seq. Rows committed after stay in hot
-        // where MVCC visibility handles them correctly.
-        let min_snap_begin_seq = self.registry.get_min_snapshot_begin_seq();
+        // Snapshot-safe seal: cutoff is computed per-table (below) to minimize
+        // the TOCTOU window between the check and extraction.
 
         // Collect table names that might need sealing.
         // Acquire each lock separately and drop before the next to avoid
@@ -5735,9 +5741,11 @@ impl MVCCEngine {
             // The snapshot records each row's txn_id at extraction time.
             // remove_sealed_rows compares against it to detect concurrent
             // commits that modified a row after extraction.
-            // When snapshot transactions are active, only extract rows committed
-            // before the earliest snapshot (cutoff-filtered seal).
-            let (mut all_rows, extraction_snapshot) = if let Some(cutoff) = min_snap_begin_seq {
+            // Re-check snapshot state per-table to close the TOCTOU window
+            // between the top-of-function check and extraction. A snapshot that
+            // starts between those points would otherwise cause phantom reads.
+            let per_table_cutoff = self.registry.get_min_snapshot_begin_seq();
+            let (mut all_rows, extraction_snapshot) = if let Some(cutoff) = per_table_cutoff {
                 store.extract_for_seal_with_cutoff(cutoff)
             } else {
                 let read_txn_id = INVALID_TRANSACTION_ID + 1;
@@ -5825,7 +5833,7 @@ impl MVCCEngine {
                         // - With cutoff: volume has rows committed before cutoff, so use cutoff
                         // - Without cutoff: all committed rows, use current sequence
                         // Compaction skips volumes with seal_seq >= min_snap_begin_seq.
-                        let current_seal_seq = min_snap_begin_seq
+                        let current_seal_seq = per_table_cutoff
                             .map(|s| s as u64)
                             .unwrap_or_else(|| self.registry.get_current_sequence() as u64);
                         for (volume, _path, volume_id) in &sealed_volumes {

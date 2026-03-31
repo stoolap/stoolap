@@ -3391,10 +3391,19 @@ impl Executor {
                 let can_incremental = wf_info.frame.as_ref().is_none_or(|f| {
                     let start_ok = matches!(f.start, WindowFrameBound::UnboundedPreceding);
                     let end_ok = f.end.as_ref().is_none_or(|e| {
-                        !matches!(
-                            e,
-                            WindowFrameBound::Preceding(_) | WindowFrameBound::UnboundedPreceding
-                        )
+                        match e {
+                            // PRECEDING end: frame can shrink, not monotonic
+                            WindowFrameBound::Preceding(_)
+                            | WindowFrameBound::UnboundedPreceding => false,
+                            // RANGE FOLLOWING: NULL ORDER BY values cause fallback to partition_len,
+                            // then later rows compute smaller frame_end — not monotonic with NULLs
+                            WindowFrameBound::Following(_)
+                                if matches!(f.unit, WindowFrameUnit::Range) =>
+                            {
+                                false
+                            }
+                            _ => true,
+                        }
                     });
                     start_ok && end_ok
                 });
