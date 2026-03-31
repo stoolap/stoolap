@@ -351,6 +351,33 @@ impl TransactionRegistry {
         Vec::new()
     }
 
+    /// Get the minimum begin_seq among active snapshot isolation transactions.
+    /// Returns None if no snapshot transactions are active (seal/compaction can proceed freely).
+    /// Returns Some(min_begin_seq) otherwise — only rows committed before this seq are safe to seal.
+    pub fn get_min_snapshot_begin_seq(&self) -> Option<i64> {
+        let global = self.global_isolation_level.load(Ordering::Relaxed);
+        let transactions = self.transactions.lock();
+
+        if global == 1 {
+            return transactions
+                .values()
+                .filter(|s| s.is_active_or_committing())
+                .map(|s| s.begin_seq())
+                .min();
+        }
+
+        if self.override_count.load(Ordering::Relaxed) > 0 {
+            let overrides = self.isolation_overrides.lock();
+            return transactions
+                .iter()
+                .filter(|(id, s)| s.is_active_or_committing() && overrides.get(*id) == Some(&1))
+                .map(|(_, s)| s.begin_seq())
+                .min();
+        }
+
+        None
+    }
+
     /// Begins a new transaction.
     pub fn begin_transaction(&self) -> (i64, i64) {
         if !self.accepting.load(Ordering::Acquire) {

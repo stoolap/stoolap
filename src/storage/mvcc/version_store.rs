@@ -2080,6 +2080,26 @@ impl VersionStore {
         (rows, ExtractionSnapshot { inner: snapshot })
     }
 
+    /// Extract committed rows for seal, filtered by commit_seq cutoff.
+    /// Only includes rows committed before `commit_seq_cutoff`, ensuring
+    /// snapshot isolation transactions that began before the cutoff can still
+    /// see those rows after they move to cold storage.
+    pub fn extract_for_seal_with_cutoff(
+        &self,
+        commit_seq_cutoff: i64,
+    ) -> (RowVec, ExtractionSnapshot) {
+        let snapshot = self.versions.read().clone();
+        let mut rows = RowVec::with_capacity(self.committed_row_count());
+        self.for_each_committed_version_with_cutoff(
+            |row_id, version| {
+                rows.push((row_id, version.data.clone()));
+                true
+            },
+            commit_seq_cutoff,
+        );
+        (rows, ExtractionSnapshot { inner: snapshot })
+    }
+
     /// Internal implementation for getting all visible rows
     #[inline]
     fn get_all_visible_rows_internal(&self, txn_id: i64) -> RowVec {

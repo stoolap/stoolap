@@ -85,3 +85,116 @@ fn test_snapshot_isolation_cold_delete() {
     tx.rollback().unwrap();
     db.close().ok();
 }
+
+/// Verify that seal proceeds during active snapshot transactions (cutoff-filtered seal).
+/// Pre-snapshot rows are sealed to cold; post-snapshot rows stay in hot.
+/// Both the snapshot and auto-commit queries see correct data.
+#[test]
+fn test_seal_proceeds_during_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}", dir.path().to_str().unwrap());
+    let db = Database::open(&dsn).unwrap();
+
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)", ())
+        .unwrap();
+
+    // Insert 200 rows (enough to cross seal threshold)
+    for i in 1..=200 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10), ())
+            .unwrap();
+    }
+
+    // Start snapshot BEFORE checkpoint
+    let mut snap = db
+        .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+        .unwrap();
+
+    // Snapshot sees 200 rows
+    let count_before: i64 = snap.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(count_before, 200);
+
+    // Insert more rows from auto-commit (AFTER snapshot started)
+    for i in 201..=250 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10), ())
+            .unwrap();
+    }
+
+    // Checkpoint: seal should proceed (pre-snapshot rows go cold)
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    // Snapshot should still see exactly 200 rows (not the 50 new ones)
+    let count_after: i64 = snap.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(
+        count_after, 200,
+        "snapshot should see 200 rows after checkpoint, not {}",
+        count_after
+    );
+
+    // Auto-commit should see all 250
+    let count_auto: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(count_auto, 250);
+
+    // Verify snapshot data integrity (spot check)
+    let val: i64 = snap
+        .query_one("SELECT val FROM t WHERE id = 100", ())
+        .unwrap();
+    assert_eq!(val, 1000);
+
+    // New rows should not be visible in snapshot
+    let new_row_count: i64 = snap
+        .query_one("SELECT COUNT(*) FROM t WHERE id > 200", ())
+        .unwrap();
+    assert_eq!(
+        new_row_count, 0,
+        "snapshot should not see post-snapshot rows"
+    );
+
+    snap.rollback().unwrap();
+    db.close().ok();
+}
+
+/// Verify that updates to pre-snapshot cold rows are invisible to the snapshot
+/// even after the updated rows are sealed again.
+#[test]
+fn test_snapshot_update_cold_then_reseal() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}", dir.path().to_str().unwrap());
+    let db = Database::open(&dsn).unwrap();
+
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", ())
+        .unwrap();
+
+    for i in 1..=200 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, 'v{}')", i, i), ())
+            .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    // Start snapshot
+    let mut snap = db
+        .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+        .unwrap();
+
+    // Update a cold row from auto-commit
+    db.execute("UPDATE t SET val = 'updated' WHERE id = 1", ())
+        .unwrap();
+
+    // Second checkpoint (seal the update)
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    // Snapshot should still see the original value
+    let val: String = snap
+        .query_one("SELECT val FROM t WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(
+        val, "v1",
+        "snapshot should see original 'v1', not 'updated'"
+    );
+
+    // Auto-commit should see the update
+    let auto_val: String = db.query_one("SELECT val FROM t WHERE id = 1", ()).unwrap();
+    assert_eq!(auto_val, "updated");
+
+    snap.rollback().unwrap();
+    db.close().ok();
+}

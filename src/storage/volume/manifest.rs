@@ -93,9 +93,10 @@ pub struct SegmentMeta {
     pub max_row_id: i64,
     /// WAL LSN at which this segment was created (for recovery).
     pub creation_lsn: u64,
-    /// Dead field, always 0. Kept for V6 manifest binary layout compatibility.
-    /// Remove this field when bumping to V7.
-    pub compaction_epoch: u64,
+    /// Commit sequence at which this volume was sealed. Used to gate compaction:
+    /// volumes with seal_seq > min_snapshot_begin_seq are not compacted.
+    /// Old volumes (pre-tracking) have seal_seq=0, treated as "always safe".
+    pub seal_seq: u64,
     /// Schema version when this segment was created. Used with dropped_columns
     /// to correctly mask stale data only from volumes older than a column drop.
     pub schema_version: u64,
@@ -200,7 +201,7 @@ impl TableManifest {
             buf.write_all(&seg.min_row_id.to_le_bytes())?;
             buf.write_all(&seg.max_row_id.to_le_bytes())?;
             buf.write_all(&seg.creation_lsn.to_le_bytes())?;
-            buf.write_all(&seg.compaction_epoch.to_le_bytes())?;
+            buf.write_all(&seg.seal_seq.to_le_bytes())?;
             buf.write_all(&seg.schema_version.to_le_bytes())?;
 
             // File path as UTF-8 string
@@ -319,7 +320,7 @@ impl TableManifest {
             let min_row_id = read_i64(data, &mut pos)?;
             let max_row_id = read_i64(data, &mut pos)?;
             let creation_lsn = read_u64(data, &mut pos)?;
-            let compaction_epoch = read_u64(data, &mut pos)?;
+            let seal_seq = read_u64(data, &mut pos)?;
             let schema_version = read_u64(data, &mut pos)?;
 
             let path_len = read_u32(data, &mut pos)? as usize;
@@ -340,7 +341,7 @@ impl TableManifest {
                 min_row_id,
                 max_row_id,
                 creation_lsn,
-                compaction_epoch,
+                seal_seq,
                 schema_version,
             });
         }
@@ -2676,7 +2677,7 @@ mod tests {
             min_row_id: 1,
             max_row_id: 1000,
             creation_lsn: 100,
-            compaction_epoch: 0,
+            seal_seq: 0,
             schema_version: 0,
         });
         m.add_segment(SegmentMeta {
@@ -2686,7 +2687,7 @@ mod tests {
             min_row_id: 1001,
             max_row_id: 1500,
             creation_lsn: 200,
-            compaction_epoch: 0,
+            seal_seq: 0,
             schema_version: 0,
         });
         assert_eq!(m.segments.len(), 2);
@@ -2706,7 +2707,7 @@ mod tests {
             min_row_id: 1,
             max_row_id: 100,
             creation_lsn: 0,
-            compaction_epoch: 0,
+            seal_seq: 0,
             schema_version: 0,
         });
         m.add_segment(SegmentMeta {
@@ -2716,7 +2717,7 @@ mod tests {
             min_row_id: 101,
             max_row_id: 200,
             creation_lsn: 0,
-            compaction_epoch: 0,
+            seal_seq: 0,
             schema_version: 0,
         });
 
@@ -2738,7 +2739,7 @@ mod tests {
             min_row_id: 1,
             max_row_id: 10000,
             creation_lsn: 10,
-            compaction_epoch: 0,
+            seal_seq: 0,
             schema_version: 3,
         });
         m.add_segment(SegmentMeta {
@@ -2748,7 +2749,7 @@ mod tests {
             min_row_id: 10001,
             max_row_id: 15000,
             creation_lsn: 30,
-            compaction_epoch: 0,
+            seal_seq: 0,
             schema_version: 5,
         });
 
@@ -2785,7 +2786,7 @@ mod tests {
             min_row_id: 1,
             max_row_id: 100,
             creation_lsn: 0,
-            compaction_epoch: 0,
+            seal_seq: 0,
             schema_version: 0,
         });
 
@@ -2819,7 +2820,7 @@ mod tests {
             min_row_id: 1,
             max_row_id: 10,
             creation_lsn: 0,
-            compaction_epoch: 0,
+            seal_seq: 0,
             schema_version: 0,
         };
         mgr.register_segment(1, volume, meta, None);
@@ -2855,7 +2856,7 @@ mod tests {
                 min_row_id: 1,
                 max_row_id: 10,
                 creation_lsn: 0,
-                compaction_epoch: 0,
+                seal_seq: 0,
                 schema_version: 0,
             },
             None,
@@ -2903,7 +2904,7 @@ mod tests {
                     min_row_id: seg_id as i64,
                     max_row_id: seg_id as i64,
                     creation_lsn: 0,
-                    compaction_epoch: 0,
+                    seal_seq: 0,
                     schema_version: 0,
                 },
                 None,
@@ -2929,7 +2930,7 @@ mod tests {
             min_row_id: 1,
             max_row_id: 10,
             creation_lsn: 0,
-            compaction_epoch: 0,
+            seal_seq: 0,
             schema_version: 0,
         });
         mgr.add_tombstones(&[5], 1);
@@ -2975,7 +2976,7 @@ mod tests {
                 min_row_id: 1,
                 max_row_id: 100,
                 creation_lsn: 0,
-                compaction_epoch: 0,
+                seal_seq: 0,
                 schema_version: 0,
             },
             None,

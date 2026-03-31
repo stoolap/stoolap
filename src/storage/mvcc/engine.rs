@@ -2964,6 +2964,16 @@ impl MVCCEngine {
         volume: Arc<crate::storage::volume::writer::FrozenVolume>,
         seg_id: u64,
     ) {
+        self.register_volume_with_id_and_seal_seq(table_name, volume, seg_id, 0);
+    }
+
+    fn register_volume_with_id_and_seal_seq(
+        &self,
+        table_name: &str,
+        volume: Arc<crate::storage::volume::writer::FrozenVolume>,
+        seg_id: u64,
+        seal_seq: u64,
+    ) {
         use crate::storage::volume::manifest::SegmentMeta;
         let mgr = self.get_or_create_segment_manager(table_name);
         let min_id = volume.meta.row_ids.first().copied().unwrap_or(0);
@@ -2981,7 +2991,7 @@ impl MVCCEngine {
                 min_row_id: min_id,
                 max_row_id: max_id,
                 creation_lsn: 0,
-                compaction_epoch: 0,
+                seal_seq,
                 schema_version: self.schema_epoch.load(Ordering::Acquire),
             },
             None,
@@ -5206,14 +5216,11 @@ impl MVCCEngine {
             .unwrap_or((4, 1_048_576));
         let compact_threshold = compact_threshold.max(2);
 
-        // Skip compaction entirely when snapshot transactions are active.
-        // Compaction physically removes rows from old volumes. A snapshot
-        // that began before a tombstone's commit_seq should still see the
-        // old cold row, but compaction drops it unconditionally. Same guard
-        // as seal_hot_buffers uses.
-        if !self.registry.get_snapshot_transaction_ids().is_empty() {
-            return Ok(());
-        }
+        // Compaction seal_seq gating: only compact volumes sealed before the
+        // earliest snapshot's begin_seq. Volumes sealed after may contain rows
+        // that a snapshot transaction needs to see. When no snapshots are active,
+        // all volumes are eligible for compaction.
+        let compact_seal_seq_limit = self.registry.get_min_snapshot_begin_seq().map(|s| s as u64);
 
         let tables_to_compact: Vec<String> = {
             let mgrs = self.segment_managers.read().unwrap();
@@ -5281,6 +5288,15 @@ impl MVCCEngine {
 
                 let mut merge_indices: Vec<usize> = Vec::new();
                 for (idx, seg) in manifest.segments.iter().enumerate() {
+                    // Skip volumes sealed after the earliest snapshot began.
+                    // seal_seq = cutoff used during extraction. A volume with
+                    // seal_seq <= limit contains only pre-snapshot data (safe).
+                    // seal_seq > limit means the volume may have post-snapshot data.
+                    if let Some(limit) = compact_seal_seq_limit {
+                        if seg.seal_seq > 0 && seg.seal_seq > limit {
+                            continue;
+                        }
+                    }
                     if seg.row_count < target_volume_rows {
                         // Sub-target: merge together to reach target size
                         merge_indices.push(idx);
@@ -5288,16 +5304,23 @@ impl MVCCEngine {
                         // Oversized: needs splitting
                         merge_indices.push(idx);
                     } else if !ts.is_empty() {
-                        // At-target: include only if it has tombstoned rows.
-                        // Tombstones mean rows in this volume were updated/deleted
-                        // and newer versions live in sub-target volumes.
+                        // At-target: include only if it has tombstoned rows that
+                        // compaction can actually apply. When snapshots are active,
+                        // only count tombstones with commit_seq < limit (post-snapshot
+                        // tombstones will be preserved, so rewriting is pointless).
                         if let Some(cs) = segs.get(&seg.segment_id) {
                             let tombstone_count = cs
                                 .volume
                                 .meta
                                 .row_ids
                                 .iter()
-                                .filter(|rid| ts.contains_key(rid))
+                                .filter(|rid| {
+                                    if let Some(limit) = compact_seal_seq_limit {
+                                        ts.get(rid).is_some_and(|&commit_seq| commit_seq < limit)
+                                    } else {
+                                        ts.contains_key(rid)
+                                    }
+                                })
                                 .count();
                             if tombstone_count > 0 {
                                 merge_indices.push(idx);
@@ -5361,10 +5384,36 @@ impl MVCCEngine {
             let mut seen = FxHashSet::default();
             let mut live_refs: Vec<(i64, usize, usize)> = Vec::new(); // (row_id, vol_idx, row_idx)
 
+            // When snapshots are active, build a filtered tombstone set containing
+            // only tombstones that were actually applied (commit_seq < limit).
+            // Post-snapshot tombstones are preserved so snapshot reads stay correct.
+            let applied_tombstones: Arc<FxHashMap<i64, u64>> =
+                if let Some(limit) = compact_seal_seq_limit {
+                    let filtered: FxHashMap<i64, u64> = tombstones
+                        .iter()
+                        .filter(|(_, &seq)| seq < limit)
+                        .map(|(&rid, &seq)| (rid, seq))
+                        .collect();
+                    Arc::new(filtered)
+                } else {
+                    Arc::clone(&tombstones)
+                };
+
             for (vol_idx, (_seg_id, vol)) in volumes.iter().enumerate() {
                 for i in 0..vol.meta.row_count {
                     let row_id = vol.meta.row_ids[i];
-                    if tombstones.contains_key(&row_id) && !seen.contains(&row_id) {
+                    // Apply tombstone only if it was committed before the earliest
+                    // snapshot (safe to physically remove). Tombstones created after
+                    // are preserved — the row stays in the merged volume so snapshots
+                    // can still see it via versioned tombstone filtering.
+                    let is_tombstoned = if let Some(limit) = compact_seal_seq_limit {
+                        tombstones
+                            .get(&row_id)
+                            .is_some_and(|&commit_seq| commit_seq < limit)
+                    } else {
+                        tombstones.contains_key(&row_id)
+                    };
+                    if is_tombstoned && !seen.contains(&row_id) {
                         continue;
                     }
                     if seen.insert(row_id) {
@@ -5383,9 +5432,9 @@ impl MVCCEngine {
                     .flat_map(|(_, vol)| vol.meta.row_ids.iter().copied())
                     .collect();
                 mgr.replace_segments_atomic_remove_only(&old_ids);
-                // Only clear tombstones that existed at snapshot time.
-                // Tombstones added later (by concurrent seal) are preserved.
-                mgr.remove_tombstones_matching_snapshot(&tombstones, &merged_row_ids);
+                // Only clear tombstones that were actually applied during compaction.
+                // Post-snapshot tombstones are preserved for snapshot visibility.
+                mgr.remove_tombstones_matching_snapshot(&applied_tombstones, &merged_row_ids);
 
                 // Persist manifest BEFORE deleting files (same safety as non-empty path).
                 if let Err(e) = mgr.persist_manifest_only() {
@@ -5491,7 +5540,7 @@ impl MVCCEngine {
                                 min_row_id: min_id,
                                 max_row_id: max_id,
                                 creation_lsn: 0,
-                                compaction_epoch: 0,
+                                seal_seq: 0,
                                 schema_version: self.schema_epoch.load(Ordering::Acquire),
                             },
                         ));
@@ -5527,7 +5576,7 @@ impl MVCCEngine {
                     .iter()
                     .flat_map(|(_, vol)| vol.meta.row_ids.iter().copied())
                     .collect();
-                mgr.remove_tombstones_matching_snapshot(&tombstones, &merged_row_ids);
+                mgr.remove_tombstones_matching_snapshot(&applied_tombstones, &merged_row_ids);
             }
 
             // CRITICAL: Persist manifest BEFORE deleting old files.
@@ -5597,9 +5646,11 @@ impl MVCCEngine {
             _ => return Ok(()),
         };
 
-        // Snapshot transaction IDs (computed once, used per-table below)
-        let snapshot_txn_ids = self.registry.get_snapshot_transaction_ids();
-        let has_snapshot_txns = !snapshot_txn_ids.is_empty();
+        // Compute commit-sequence cutoff for snapshot-safe seal.
+        // When snapshot transactions are active, only seal rows committed before
+        // the earliest snapshot's begin_seq. Rows committed after stay in hot
+        // where MVCC visibility handles them correctly.
+        let min_snap_begin_seq = self.registry.get_min_snapshot_begin_seq();
 
         // Collect table names that might need sealing.
         // Acquire each lock separately and drop before the next to avoid
@@ -5663,15 +5714,7 @@ impl MVCCEngine {
                 .collect()
         };
 
-        // Step 3: Skip ALL tables when snapshot transactions are active.
-        // Cold volumes have no MVCC visibility information, so rows sealed
-        // during a snapshot transaction would become visible to it on the
-        // cold scan path, violating snapshot isolation.
-        if has_snapshot_txns {
-            return Ok(());
-        }
-
-        // Step 4: Look up schemas (separate lock acquisition)
+        // Step 3: Look up schemas (separate lock acquisition)
         let table_names: Vec<(String, CompactArc<Schema>, Arc<VersionStore>, bool)> = {
             let schemas = self.schemas.read().unwrap();
             candidates
@@ -5688,12 +5731,18 @@ impl MVCCEngine {
         const REMOVE_BATCH_SIZE: usize = 50_000;
 
         for (table_name, schema, store, has_segments) in table_names {
-            let read_txn_id = INVALID_TRANSACTION_ID + 1;
             // Extract rows AND a CowBTree snapshot (O(1) Arc clone).
             // The snapshot records each row's txn_id at extraction time.
             // remove_sealed_rows compares against it to detect concurrent
             // commits that modified a row after extraction.
-            let (mut all_rows, extraction_snapshot) = store.extract_for_seal(read_txn_id);
+            // When snapshot transactions are active, only extract rows committed
+            // before the earliest snapshot (cutoff-filtered seal).
+            let (mut all_rows, extraction_snapshot) = if let Some(cutoff) = min_snap_begin_seq {
+                store.extract_for_seal_with_cutoff(cutoff)
+            } else {
+                let read_txn_id = INVALID_TRANSACTION_ID + 1;
+                store.extract_for_seal(read_txn_id)
+            };
             // On close (force_seal_all), seal ALL rows regardless of threshold.
             if !self.force_seal_all.load(Ordering::Acquire) {
                 let threshold = if has_segments {
@@ -5772,12 +5821,19 @@ impl MVCCEngine {
 
                         mgr.set_seal_overlap(total_rows);
 
-                        // Register all sealed volumes
+                        // Stamp seal_seq to reflect what data the volume contains:
+                        // - With cutoff: volume has rows committed before cutoff, so use cutoff
+                        // - Without cutoff: all committed rows, use current sequence
+                        // Compaction skips volumes with seal_seq >= min_snap_begin_seq.
+                        let current_seal_seq = min_snap_begin_seq
+                            .map(|s| s as u64)
+                            .unwrap_or_else(|| self.registry.get_current_sequence() as u64);
                         for (volume, _path, volume_id) in &sealed_volumes {
-                            self.register_volume_with_id(
+                            self.register_volume_with_id_and_seal_seq(
                                 &table_name,
                                 Arc::clone(volume),
                                 *volume_id,
+                                current_seal_seq,
                             );
                         }
 

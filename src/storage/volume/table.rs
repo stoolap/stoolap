@@ -3330,7 +3330,7 @@ mod tests {
                 max_row_id: max_id,
                 schema_version: 0,
                 creation_lsn: 0,
-                compaction_epoch: 0,
+                seal_seq: 0,
             },
             None,
         );

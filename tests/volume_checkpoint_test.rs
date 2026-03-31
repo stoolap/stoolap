@@ -688,20 +688,20 @@ fn test_snapshot_transaction_blocks_compaction() {
     assert_eq!(snapshot_count, 30);
 
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    assert_eq!(
-        list_volume_files(&db_path, "t").len(),
-        3,
-        "compaction should be skipped while a snapshot transaction is active"
-    );
-
-    snapshot_tx.rollback().unwrap();
-
-    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    // With cutoff-filtered compaction, pre-snapshot volumes (seal_seq < begin_seq)
+    // are eligible for compaction. All 3 volumes were sealed before the snapshot,
+    // so compaction merges them into 1.
     assert_eq!(
         list_volume_files(&db_path, "t").len(),
         1,
-        "compaction should run after the snapshot transaction ends"
+        "compaction should proceed for pre-snapshot volumes"
     );
+
+    // Snapshot should still see all 30 rows after compaction
+    let count_after: i64 = snapshot_tx.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(count_after, 30, "snapshot data integrity after compaction");
+
+    snapshot_tx.rollback().unwrap();
 
     db.close().unwrap();
 }
