@@ -1173,14 +1173,16 @@ fn main() {
 
     // Handle file flag - execute SQL from file
     if let Some(ref filename) = args.file {
-        if let Err(e) = execute_from_file(
+        let result = execute_from_file(
             &db,
             filename,
             args.json_output,
             args.quiet,
             args.limit,
             args.timeout_ms,
-        ) {
+        );
+        drop(db); // ensure close_engine() runs before exit
+        if let Err(e) = result {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
@@ -1191,13 +1193,15 @@ fn main() {
     let is_pipe = !std::io::stdin().is_terminal();
 
     if is_pipe {
-        if let Err(e) = execute_piped_input(
+        let result = execute_piped_input(
             &db,
             args.json_output,
             args.quiet,
             args.limit,
             args.timeout_ms,
-        ) {
+        );
+        drop(db); // ensure close_engine() runs before exit
+        if let Err(e) = result {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
@@ -1220,6 +1224,8 @@ fn main() {
     };
 
     if let Err(e) = cli.run() {
+        // Drop cli (and db) before exiting so close_engine() runs
+        drop(cli);
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }

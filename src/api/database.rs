@@ -438,51 +438,75 @@ impl Database {
                     // Checkpoint interval in seconds: checkpoint_interval=60
                     // Also accepts snapshot_interval for backward compatibility
                     "checkpoint_interval" | "snapshot_interval" => {
-                        if let Ok(secs) = value.parse::<u32>() {
-                            config.persistence.checkpoint_interval = secs;
-                        }
+                        config.persistence.checkpoint_interval =
+                            value.parse::<u32>().map_err(|_| {
+                                Error::invalid_argument(format!(
+                                    "invalid checkpoint_interval: '{}'",
+                                    value
+                                ))
+                            })?;
                     }
                     // Compaction threshold: compact_threshold=4
                     "compact_threshold" => {
-                        if let Ok(count) = value.parse::<u32>() {
-                            config.persistence.compact_threshold = count;
-                        }
+                        config.persistence.compact_threshold =
+                            value.parse::<u32>().map_err(|_| {
+                                Error::invalid_argument(format!(
+                                    "invalid compact_threshold: '{}'",
+                                    value
+                                ))
+                            })?;
                     }
                     // Number of backup snapshots to keep: keep_snapshots=3
                     "keep_snapshots" => {
-                        if let Ok(count) = value.parse::<u32>() {
-                            config.persistence.keep_snapshots = count;
-                        }
+                        config.persistence.keep_snapshots = value.parse::<u32>().map_err(|_| {
+                            Error::invalid_argument(format!("invalid keep_snapshots: '{}'", value))
+                        })?;
                     }
                     // WAL flush trigger in bytes: wal_flush_trigger=32768
                     "wal_flush_trigger" => {
-                        if let Ok(bytes) = value.parse::<usize>() {
-                            config.persistence.wal_flush_trigger = bytes;
-                        }
+                        config.persistence.wal_flush_trigger =
+                            value.parse::<usize>().map_err(|_| {
+                                Error::invalid_argument(format!(
+                                    "invalid wal_flush_trigger: '{}'",
+                                    value
+                                ))
+                            })?;
                     }
                     // WAL buffer size in bytes: wal_buffer_size=65536
                     "wal_buffer_size" => {
-                        if let Ok(bytes) = value.parse::<usize>() {
-                            config.persistence.wal_buffer_size = bytes;
-                        }
+                        config.persistence.wal_buffer_size =
+                            value.parse::<usize>().map_err(|_| {
+                                Error::invalid_argument(format!(
+                                    "invalid wal_buffer_size: '{}'",
+                                    value
+                                ))
+                            })?;
                     }
                     // WAL max size in bytes: wal_max_size=67108864
                     "wal_max_size" => {
-                        if let Ok(bytes) = value.parse::<usize>() {
-                            config.persistence.wal_max_size = bytes;
-                        }
+                        config.persistence.wal_max_size = value.parse::<usize>().map_err(|_| {
+                            Error::invalid_argument(format!("invalid wal_max_size: '{}'", value))
+                        })?;
                     }
                     // Commit batch size: commit_batch_size=100
                     "commit_batch_size" => {
-                        if let Ok(size) = value.parse::<u32>() {
-                            config.persistence.commit_batch_size = size;
-                        }
+                        config.persistence.commit_batch_size =
+                            value.parse::<u32>().map_err(|_| {
+                                Error::invalid_argument(format!(
+                                    "invalid commit_batch_size: '{}'",
+                                    value
+                                ))
+                            })?;
                     }
                     // Sync interval in ms: sync_interval_ms=10
                     "sync_interval_ms" | "sync_interval" => {
-                        if let Ok(ms) = value.parse::<u32>() {
-                            config.persistence.sync_interval_ms = ms;
-                        }
+                        config.persistence.sync_interval_ms =
+                            value.parse::<u32>().map_err(|_| {
+                                Error::invalid_argument(format!(
+                                    "invalid sync_interval_ms: '{}'",
+                                    value
+                                ))
+                            })?;
                     }
                     // WAL compression: wal_compression=on|off
                     "wal_compression" => {
@@ -504,15 +528,23 @@ impl Database {
                     }
                     // Compression threshold in bytes: compression_threshold=64
                     "compression_threshold" => {
-                        if let Ok(bytes) = value.parse::<usize>() {
-                            config.persistence.compression_threshold = bytes;
-                        }
+                        config.persistence.compression_threshold =
+                            value.parse::<usize>().map_err(|_| {
+                                Error::invalid_argument(format!(
+                                    "invalid compression_threshold: '{}'",
+                                    value
+                                ))
+                            })?;
                     }
                     // Target rows per volume: target_volume_rows=1048576
                     "target_volume_rows" => {
-                        if let Ok(rows) = value.parse::<usize>() {
-                            config.persistence.target_volume_rows = rows.max(65_536);
-                        }
+                        let rows = value.parse::<usize>().map_err(|_| {
+                            Error::invalid_argument(format!(
+                                "invalid target_volume_rows: '{}'",
+                                value
+                            ))
+                        })?;
+                        config.persistence.target_volume_rows = rows.max(65_536);
                     }
                     // Checkpoint on close: checkpoint_on_close=off
                     // Set to off to simulate crashes in tests (WAL not truncated)
@@ -522,21 +554,32 @@ impl Database {
                     }
                     // Cleanup interval in seconds: cleanup_interval=60
                     "cleanup_interval" => {
-                        if let Ok(secs) = value.parse::<u64>() {
-                            config.cleanup.interval_secs = secs;
-                        }
+                        config.cleanup.interval_secs = value.parse::<u64>().map_err(|_| {
+                            Error::invalid_argument(format!(
+                                "invalid cleanup_interval: '{}'",
+                                value
+                            ))
+                        })?;
                     }
                     // Deleted row retention in seconds: deleted_row_retention=300
                     "deleted_row_retention" => {
-                        if let Ok(secs) = value.parse::<u64>() {
-                            config.cleanup.deleted_row_retention_secs = secs;
-                        }
+                        config.cleanup.deleted_row_retention_secs =
+                            value.parse::<u64>().map_err(|_| {
+                                Error::invalid_argument(format!(
+                                    "invalid deleted_row_retention: '{}'",
+                                    value
+                                ))
+                            })?;
                     }
                     // Transaction retention in seconds: transaction_retention=3600
                     "transaction_retention" => {
-                        if let Ok(secs) = value.parse::<u64>() {
-                            config.cleanup.transaction_retention_secs = secs;
-                        }
+                        config.cleanup.transaction_retention_secs =
+                            value.parse::<u64>().map_err(|_| {
+                                Error::invalid_argument(format!(
+                                    "invalid transaction_retention: '{}'",
+                                    value
+                                ))
+                            })?;
                     }
                     // Disable cleanup: cleanup=off
                     "cleanup" => {
