@@ -73,6 +73,11 @@ pub struct InListExpr {
     aliases: FxHashMap<String, String>,
     /// Original column name if using alias
     original_column: Option<String>,
+
+    /// Cached min/max of non-null values for zone-map pruning.
+    /// Computed once in build_hash_sets. Enables volume-level skipping.
+    cached_min: Option<Value>,
+    cached_max: Option<Value>,
 }
 
 impl InListExpr {
@@ -87,6 +92,8 @@ impl InListExpr {
             hashed: HashedValues::None,
             has_null,
             aliases: FxHashMap::default(),
+            cached_min: None,
+            cached_max: None,
             original_column: None,
         }
     }
@@ -103,6 +110,8 @@ impl InListExpr {
             has_null,
             aliases: FxHashMap::default(),
             original_column: None,
+            cached_min: None,
+            cached_max: None,
         }
     }
 
@@ -211,6 +220,32 @@ impl InListExpr {
                 self.hashed = HashedValues::Mixed;
             }
         }
+
+        // Compute min/max for zone-map pruning
+        let mut min_val: Option<Value> = None;
+        let mut max_val: Option<Value> = None;
+        for v in &self.values {
+            if v.is_null() {
+                continue;
+            }
+            match (&min_val, &max_val) {
+                (None, _) => {
+                    min_val = Some(v.clone());
+                    max_val = Some(v.clone());
+                }
+                (Some(cur_min), Some(cur_max)) => {
+                    if let Ok(std::cmp::Ordering::Less) = v.compare(cur_min) {
+                        min_val = Some(v.clone());
+                    }
+                    if let Ok(std::cmp::Ordering::Greater) = v.compare(cur_max) {
+                        max_val = Some(v.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.cached_min = min_val;
+        self.cached_max = max_val;
     }
 
     /// Check if integer is in list - O(1) with hash set, O(n) fallback
@@ -395,6 +430,15 @@ impl Expression for InListExpr {
         self.build_hash_sets();
     }
 
+    fn collect_column_indices(&self, out: &mut Vec<usize>) -> bool {
+        if let Some(idx) = self.col_index {
+            out.push(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     fn is_prepared(&self) -> bool {
         self.col_index.is_some()
     }
@@ -403,8 +447,34 @@ impl Expression for InListExpr {
         Some(&self.column)
     }
 
+    fn collect_comparisons(&self) -> Vec<(&str, crate::core::Operator, &Value)> {
+        // For NOT IN, pruning is not safe (we want rows NOT matching)
+        if self.not {
+            return vec![];
+        }
+        // Return Gte(min) + Lte(max) bounds from the IN values.
+        // This enables zone-map pruning: volumes entirely below min or above max
+        // are skipped. For sorted columns, binary search narrows the scan range
+        // to [min, max] within surviving volumes.
+        match (&self.cached_min, &self.cached_max) {
+            (Some(min), Some(max)) => {
+                vec![
+                    (&self.column, crate::core::Operator::Gte, min),
+                    (&self.column, crate::core::Operator::Lte, max),
+                ]
+            }
+            _ => vec![],
+        }
+    }
+
     fn can_use_index(&self) -> bool {
         true
+    }
+
+    fn is_conjunctive_simple(&self) -> bool {
+        // IN list collect_comparisons returns min/max bounds, not exact values.
+        // Cannot be used for columnar aggregate pushdown (would over-match).
+        false
     }
 
     fn clone_box(&self) -> Box<dyn Expression> {

@@ -53,7 +53,8 @@ const _: () = assert!(
 );
 
 /// Minimum keys per node (except root).
-const MIN_KEYS: usize = MAX_KEYS / 2;
+/// Must satisfy: 2 * MIN_KEYS + 1 <= MAX_KEYS (merge invariant).
+const MIN_KEYS: usize = (MAX_KEYS - 1) / 2;
 
 /// Header: 8 bytes
 /// [ len (u16) | is_leaf (u8) | pad (1) | drop_count (4) ]

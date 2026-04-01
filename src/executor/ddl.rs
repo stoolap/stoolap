@@ -27,6 +27,7 @@ use crate::core::{
     DataType, Error, ForeignKeyAction, ForeignKeyConstraint, Result, Row, SchemaBuilder, Value,
 };
 use crate::parser::ast::*;
+use crate::storage::expression::Expression;
 use crate::storage::traits::{Engine, QueryResult};
 
 /// Validate a foreign key reference and build a `ForeignKeyConstraint`.
@@ -971,8 +972,12 @@ impl Executor {
                 if let Some(ref col_name) = stmt.column_name {
                     table.drop_column(&col_name.value)?;
 
-                    // Refresh engine's schema cache from version store
+                    // Refresh schema cache FIRST so invalidate_mappings sees the post-drop schema
                     self.engine.refresh_schema_cache(table_name)?;
+
+                    // Record column drop in manifest and recompute cold volume mappings
+                    self.engine
+                        .propagate_column_drop(table_name, &col_name.value);
 
                     // Record ALTER TABLE DROP COLUMN to WAL for persistence
                     self.engine
@@ -986,6 +991,13 @@ impl Executor {
             AlterTableOperation::RenameColumn => match (&stmt.column_name, &stmt.new_column_name) {
                 (Some(old_name), Some(new_name)) => {
                     table.rename_column(&old_name.value, &new_name.value)?;
+
+                    // Propagate rename alias to cold volumes
+                    self.engine.propagate_column_alias(
+                        table_name,
+                        &new_name.value,
+                        &old_name.value,
+                    );
 
                     // Refresh engine's schema cache from version store
                     self.engine.refresh_schema_cache(table_name)?;
@@ -1010,6 +1022,27 @@ impl Executor {
                         .constraints
                         .iter()
                         .any(|c| matches!(c, ColumnConstraint::NotNull));
+
+                    // Validate existing data satisfies NOT NULL before applying.
+                    // Use IS NULL filter + limit 1 for streaming early-exit scan
+                    // instead of materializing the full table.
+                    if !nullable {
+                        let schema = table.schema();
+                        if schema.get_column_index(&col_def.name.value).is_some() {
+                            let col_name = col_def.name.value.to_string();
+                            let mut filter = crate::storage::expression::ComparisonExpr::new(
+                                col_name.clone(),
+                                crate::core::Operator::IsNull,
+                                Value::Null(data_type),
+                            );
+                            filter.prepare_for_schema(schema);
+                            let nulls =
+                                table.collect_rows_with_limit_unordered(Some(&filter), 1, 0)?;
+                            if !nulls.is_empty() {
+                                return Err(Error::not_null_constraint(col_name));
+                            }
+                        }
+                    }
 
                     table.modify_column(&col_def.name.value, data_type, nullable)?;
 

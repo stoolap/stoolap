@@ -40,6 +40,7 @@ Stoolap is designed around practical embedded database needs:
 |---------|:-------:|:------:|:------:|:----------:|
 | AS OF Time-Travel Queries | ✅ | ❌ | ❌ | ❌* |
 | MVCC Transactions | ✅ | ❌ | ✅ | ✅ |
+| Hot/Cold Columnar Storage | ✅ | ❌ | ✅ | ❌ |
 | Cost-Based Optimizer | ✅ | ❌ | ✅ | ✅ |
 | Adaptive Query Execution | ✅ | ❌ | ❌ | ❌ |
 | Semantic Query Caching | ✅ | ❌ | ❌ | ❌ |
@@ -55,7 +56,7 @@ Stoolap is designed around practical embedded database needs:
 
 ```toml
 [dependencies]
-stoolap = "0.3"
+stoolap = "0.4"
 ```
 
 Build from source:
@@ -69,7 +70,7 @@ cargo build --release
 ### Rust API
 
 ```rust
-use stoolap::api::Database;
+use stoolap::Database;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::open_in_memory()?;
@@ -207,7 +208,7 @@ For built-in semantic text embeddings, enable the `semantic` feature:
 
 ```toml
 [dependencies]
-stoolap = { version = "0.3", features = ["semantic"] }
+stoolap = { version = "0.4", features = ["semantic"] }
 ```
 
 ```sql
@@ -218,10 +219,27 @@ See [Vector Search](https://stoolap.io/docs/data-types/vector-search/) and [Sema
 
 ## Storage and Durability
 
-- Write-Ahead Logging (WAL)
-- Periodic snapshots
-- Crash recovery and index persistence
-- Configurable sync and compression behavior
+Stoolap uses a hot/cold volume storage architecture inspired by Apache Iceberg and Delta Lake:
+
+- **Hot buffer**: in-memory MVCC store with WAL for active writes
+- **Cold volumes**: immutable columnar files with zone maps, bloom filters, dictionary encoding, and LZ4 compression
+- **Adaptive compaction**: background thread merges cold volumes with size-aware, fully dynamic merge strategy
+- **Crash recovery**: atomic manifest writes, fsync-before-rename, WAL replay from checkpoint LSN
+- **Column pruning**: cold scans materialize only columns referenced by filters and projections
+
+```
+file://./mydb?sync_mode=normal&compression=on&checkpoint_interval=60
+```
+
+| DSN Parameter | Default | Description |
+|---------------|---------|-------------|
+| `sync_mode` | `normal` | `none` (no fsync, data durable at checkpoint), `normal` (fsync every 1s), `full` (fsync every write) |
+| `compression` | `on` | LZ4 for both WAL and volumes |
+| `wal_compression` | `on` | LZ4 for WAL entries only |
+| `volume_compression` | `on` | LZ4 for cold volume files only |
+| `checkpoint_interval` | `60` | Seconds between checkpoint cycles |
+| `compact_threshold` | `4` | Sub-target volumes per table before merging |
+| `target_volume_rows` | `1048576` | Target rows per cold volume |
 
 ## Performance
 

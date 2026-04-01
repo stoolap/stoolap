@@ -142,6 +142,15 @@ impl Expression for CastExpr {
         self.col_index = find_column_index(schema, &self.column);
     }
 
+    fn collect_column_indices(&self, out: &mut Vec<usize>) -> bool {
+        if let Some(idx) = self.col_index {
+            out.push(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     fn is_prepared(&self) -> bool {
         self.col_index.is_some()
     }
@@ -379,6 +388,10 @@ impl Expression for CompoundExpr {
         }
         self.cast_expr.prepare_for_schema(schema);
         self.is_optimized = true;
+    }
+
+    fn collect_column_indices(&self, out: &mut Vec<usize>) -> bool {
+        self.cast_expr.collect_column_indices(out)
     }
 
     fn is_prepared(&self) -> bool {

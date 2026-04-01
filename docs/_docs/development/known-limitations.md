@@ -20,7 +20,6 @@ See [JSON Support]({{ '/docs/data-types/json-support/' | relative_url }}) for su
 ## Foreign Keys
 
 - **Single-column only**: Composite foreign keys (referencing multiple columns) are not yet supported.
-- **No recursive CASCADE**: ON UPDATE CASCADE does not recursively cascade to grandchild tables when the child's FK column is also its PK.
 - **Self-referencing insertion order**: Self-referencing foreign keys require careful ordering of inserts.
 
 See [Foreign Keys]({{ '/docs/sql-features/foreign-keys/' | relative_url }}) for full FK documentation.
@@ -28,7 +27,6 @@ See [Foreign Keys]({{ '/docs/sql-features/foreign-keys/' | relative_url }}) for 
 ## Date and Time
 
 - **UTC only**: Timestamps are normalized to UTC internally. There are no explicit functions for time zone conversion.
-- **Approximate intervals**: INTERVAL calculations for months and years use approximations (30 days per month, 365 days per year) rather than calendar-aware calculations.
 
 See [Date and Time Handling]({{ '/docs/data-types/date-and-time/' | relative_url }}) for supported date/time features.
 
@@ -51,7 +49,6 @@ See [Views]({{ '/docs/sql-features/views/' | relative_url }}) for view documenta
 ## ALTER TABLE
 
 - **Blocking**: ALTER TABLE operations may temporarily block concurrent writes.
-- **No existing data validation**: MODIFY COLUMN can change nullability (add or remove NOT NULL), but does not validate that existing data satisfies the new constraint.
 - **No composite PK changes**: Composite primary key modifications are not supported.
 
 See [ALTER TABLE]({{ '/docs/sql-features/alter-table/' | relative_url }}) for full syntax.
@@ -73,6 +70,30 @@ See [Upsert]({{ '/docs/sql-features/on-duplicate-key-update/' | relative_url }})
 | WAL / Snapshots | Not available (no crash recovery needed) |
 
 See [WebAssembly]({{ '/docs/drivers/wasm/' | relative_url }}) for WASM usage.
+
+## Cold Segments (Frozen Volumes)
+
+- **AS OF on cold rows**: Historical point-in-time queries (AS OF TRANSACTION) are not supported on tables with cold segments because cold rows lack version chains. AS OF CURRENT queries work correctly.
+- **Compaction memory**: Compaction materializes the full cold dataset in memory before rewriting. For tables with millions of cold rows, this causes a temporary memory spike. Similarly, parallel GROUP BY on 4+ volumes materializes one group map per volume simultaneously before merging.
+- **Skip-set cloning**: Each scan builds per-volume skip sets by cloning cumulative row_id sets. For tables with many volumes, this is O(N*V). Compaction keeps volume counts low (default threshold: 4).
+- **WAL growth under continuous writes**: WAL truncation requires all hot buffers to be empty. Under continuous writes, new rows may arrive between the seal pass and the truncation check. The checkpoint cycle force-seals small tables below the normal threshold, but truly continuous writes can delay truncation until a quiet period or clean close.
+- **Snapshot transactions limit seal throughput**: Active snapshot isolation transactions use cutoff-filtered seal: only rows committed before the earliest snapshot's begin_seq are sealed. Rows committed after remain in the hot buffer. Under long-running snapshots with high write throughput, the hot buffer grows proportionally to the writes since the snapshot started. Compaction similarly filters: only volumes sealed before the snapshot and tombstones committed before the snapshot are physically applied.
+
+- **Multi-column DISTINCT on large tables**: `SELECT DISTINCT col1, col2 FROM t` on tables with cold volumes does not use dictionary extraction and falls through to a full row scan. Single-column DISTINCT uses dictionary metadata.
+- **Window functions + LIMIT on large tables**: Window functions materialize all rows before LIMIT is applied. `ROW_NUMBER() OVER (...) LIMIT 10` on a large table processes every row. Workaround: use PARTITION BY to enable the streaming window path.
+
+See [Persistence]({{ '/docs/architecture/persistence/' | relative_url }}) for full details.
+
+## Cold Segments (Accepted Tradeoffs)
+
+These are deliberate design decisions, not bugs:
+
+- **Binary search only for Integer/Timestamp columns**: Float, Text, and Boolean columns in cold segments fall back to linear scan with zone map pruning. Binary search is only available on sorted i64-based columns.
+- **ALTER TABLE only modifies hot schema**: Cold volumes retain their original schema. Column additions, drops, and renames are normalized at scan time. DROP COLUMN does not reclaim cold storage space until the next compaction cycle.
+
+## Transactions
+
+- **No primary key updates**: UPDATE on primary key columns is rejected with an error. The engine uses row_id == pk_value as a core invariant. Use DELETE + INSERT to change a row's primary key value.
 
 ## General SQL
 

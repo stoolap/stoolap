@@ -1006,8 +1006,11 @@ impl Hash for Value {
                 state.write_u64(wymix(if *b { 5 } else { 4 }, WY_P1));
             }
             Value::Timestamp(t) => {
-                // Pre-mix timestamp nanos
-                let nanos = t.timestamp_nanos_opt().unwrap_or(i64::MAX);
+                // Hash at full nanosecond precision. Volume segments now store
+                // timestamps as i64 nanoseconds, so no precision loss occurs.
+                let nanos = t
+                    .timestamp_nanos_opt()
+                    .unwrap_or_else(|| t.timestamp().saturating_mul(1_000_000_000));
                 state.write_u64(wymix(3 ^ (nanos as u64), WY_P1));
             }
             Value::Extension(data) => {

@@ -125,6 +125,15 @@ impl Expression for NullCheckExpr {
         self.col_index = find_column_index(schema, &self.column);
     }
 
+    fn collect_column_indices(&self, out: &mut Vec<usize>) -> bool {
+        if let Some(idx) = self.col_index {
+            out.push(idx);
+            true
+        } else {
+            false
+        }
+    }
+
     fn is_prepared(&self) -> bool {
         self.col_index.is_some()
     }
@@ -135,6 +144,12 @@ impl Expression for NullCheckExpr {
 
     fn can_use_index(&self) -> bool {
         true
+    }
+
+    fn is_conjunctive_simple(&self) -> bool {
+        // IS NULL / IS NOT NULL cannot be represented as (col, op, value)
+        // comparisons, so they cannot be evaluated in columnar aggregate pushdown.
+        false
     }
 
     fn clone_box(&self) -> Box<dyn Expression> {

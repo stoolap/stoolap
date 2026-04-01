@@ -61,8 +61,8 @@ pub use crate::storage::index::{
 pub use engine::{CleanupHandle, MVCCEngine};
 pub use persistence::{
     deserialize_row_version, deserialize_value, serialize_row_version, serialize_value,
-    IndexMetadata, PersistenceManager, PersistenceMeta, DEFAULT_KEEP_SNAPSHOTS,
-    DEFAULT_SNAPSHOT_INTERVAL,
+    serialize_value_into, IndexMetadata, PersistenceManager, PersistenceMeta,
+    DEFAULT_CHECKPOINT_INTERVAL, DEFAULT_KEEP_SNAPSHOTS,
 };
 pub use registry::{TransactionRegistry, INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID};
 pub use scanner::{EmptyScanner, MVCCScanner, RangeScanner, SingleRowScanner};
@@ -70,10 +70,12 @@ pub use snapshot::{DiskVersionStore, SnapshotReader, SnapshotWriter};
 pub use streaming_result::{AggregationScanner, StreamingResult, VisibleRowInfo};
 pub use table::MVCCTable;
 pub use timestamp::get_fast_timestamp;
-pub use transaction::{MvccTransaction, TransactionEngineOperations, TransactionState};
+pub use transaction::{
+    MvccTransaction, SealFenceGuard, TransactionEngineOperations, TransactionState,
+};
 pub use version_store::{
     clear_version_map_pools, AggregateOp, AggregateResult, RowIndex, RowVersion,
-    TransactionVersionStore, VersionStore, VisibilityChecker, WriteSetEntry,
+    SealedIndexCleanup, TransactionVersionStore, VersionStore, VisibilityChecker, WriteSetEntry,
 };
 pub use wal_manager::{
     CheckpointMetadata, WALEntry, WALManager, WALOperationType, DEFAULT_WAL_BUFFER_SIZE,

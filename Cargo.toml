@@ -1,6 +1,6 @@
 [package]
 name = "stoolap"
-version = "0.3.7"
+version = "0.4.0"
 edition = "2021"
 authors = ["Stoolap Contributors"]
 description = "High-performance embedded SQL database with MVCC, time-travel queries, and full ACID compliance"
@@ -34,7 +34,7 @@ thiserror = "2.0"
 anyhow = "1.0"
 
 # Concurrency
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 dashmap = "6"
 crossbeam = "0.8"
 rayon = { version = "1.8", optional = true }
@@ -63,7 +63,10 @@ sha1 = "0.10"
 sha2 = "0.10"
 
 # Compression
-lz4_flex = "0.12"
+lz4_flex = "0.13"
+
+# Test support
+tempfile = { version = "3.9", optional = true }
 
 # Utilities
 bytes = "1.5"
@@ -135,6 +138,7 @@ semantic = ["candle-core", "candle-nn", "candle-transformers", "tokenizers", "hf
 ann-benchmark = ["dep:ureq", "dep:flate2"]
 test-failpoints = []
 stress-tests = []
+test-filedb = ["dep:tempfile"]  # Routes memory:// databases to temp file-backed databases for testing volume storage
 
 [[example]]
 name = "benchmark_sqlite"

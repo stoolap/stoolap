@@ -139,6 +139,17 @@ fn try_extract_literal(expr: &Expression) -> Option<Value> {
     }
 }
 
+/// Pre-compiled upsert expressions built once per INSERT statement and reused for every
+/// conflicting row. Without this, `apply_on_duplicate_update` recompiles expressions and
+/// re-parses CHECK constraint SQL on every conflict, causing O(n) allocation churn.
+struct CompiledUpsert {
+    /// (column_index, column_type, vector_dimensions, compiled_program)
+    compiled_updates: Vec<(usize, DataType, u16, super::expression::SharedProgram)>,
+    /// (column_index, column_name, check_expression_text, compiled_check_program)
+    /// The program is executed with a single-column row containing the new value.
+    compiled_checks: Vec<(usize, String, String, super::expression::SharedProgram)>,
+}
+
 impl Executor {
     /// Select row_ids for DML operations using the full SELECT executor.
     /// This reuses all SELECT optimizations (indexes, semi-joins, parallel execution, etc.)
@@ -300,6 +311,19 @@ impl Executor {
         // Drop the lock before doing work
         drop(active_tx);
 
+        // Acquire per-table upsert mutex for ON CONFLICT DO UPDATE only.
+        // Serializes check+insert+commit to prevent TOCTOU races where two
+        // concurrent upserts both detect the same conflict and try to UPDATE
+        // the same row (second would hit an unhandled WriteConflict).
+        // DO NOTHING needs no lock: it never writes to the conflicting row,
+        // and commit-time unique violations are handled by returning 0 rows.
+        // Plain INSERTs proceed lock-free (UniqueConstraint error is correct).
+        let _upsert_guard = if stmt.on_duplicate {
+            table.acquire_upsert_lock()
+        } else {
+            None
+        };
+
         // Pre-compute schema information to avoid repeated borrows during insert
         let schema_column_count: usize;
         let column_indices: Vec<usize>;
@@ -418,6 +442,18 @@ impl Executor {
             // Get schema for conflict handling (needed for duplicate row lookup and target matching)
             let select_schema = if stmt.on_duplicate || stmt.do_nothing {
                 Some(self.engine.get_table_schema(table_name)?)
+            } else {
+                None
+            };
+
+            // Pre-compile upsert expressions once for all conflicting rows in this batch.
+            // Without this, compile_upsert work repeats for every conflict (O(n) cost).
+            let compiled_upsert = if stmt.on_duplicate {
+                if let Some(ref s) = select_schema {
+                    Some(Self::compile_upsert(s, stmt)?)
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -550,25 +586,33 @@ impl Executor {
                             if !conflict_matches_target(&stmt.conflict_target, schema_ref, e) {
                                 return Err(Error::PrimaryKeyConstraint { row_id });
                             }
-                            if let Some(updated_row) = self.apply_on_duplicate_update(
+                            match self.apply_on_duplicate_update(
                                 &mut table,
                                 schema_ref,
                                 row_id,
                                 None,
                                 row_values,
                                 stmt,
+                                compiled_upsert.as_ref(),
                                 ctx,
                                 has_returning,
-                            )? {
-                                returning_rows.push(updated_row);
+                            ) {
+                                Ok(Some(updated_row)) => {
+                                    returning_rows.push(updated_row);
+                                    rows_affected += 1;
+                                }
+                                Ok(None) => {
+                                    rows_affected += 1;
+                                }
+                                Err(e) => return Err(e),
                             }
-                            rows_affected += 1;
                         }
                         Err(
                             ref e @ Error::UniqueConstraint {
                                 ref index,
                                 ref column,
                                 ref value,
+                                row_id: conflict_rid,
                             },
                         ) => {
                             if !conflict_matches_target(&stmt.conflict_target, schema_ref, e) {
@@ -576,30 +620,51 @@ impl Executor {
                                     index: index.clone(),
                                     column: column.clone(),
                                     value: value.clone(),
+                                    row_id: conflict_rid,
                                 });
                             }
-                            if let Some(row_id) = self.find_row_by_unique_index(
-                                &*table, schema_ref, index, column, row_values,
-                            )? {
-                                if let Some(updated_row) = self.apply_on_duplicate_update(
-                                    &mut table,
-                                    schema_ref,
-                                    row_id,
-                                    Some(column),
-                                    row_values,
-                                    stmt,
-                                    ctx,
-                                    has_returning,
-                                )? {
-                                    returning_rows.push(updated_row);
-                                }
-                                rows_affected += 1;
+                            // Use row_id from the error if available (cold segment check
+                            // already found it). Only fall back to re-search if row_id < 0
+                            // (hot index path sets row_id = -1 when unknown).
+                            let found_row_id = if conflict_rid >= 0 {
+                                Ok(Some(conflict_rid))
                             } else {
-                                return Err(Error::UniqueConstraint {
-                                    index: index.clone(),
-                                    column: column.clone(),
-                                    value: value.clone(),
-                                });
+                                self.find_row_by_unique_index(
+                                    &*table, schema_ref, index, column, row_values,
+                                )
+                            };
+                            match found_row_id {
+                                Ok(Some(row_id)) => {
+                                    match self.apply_on_duplicate_update(
+                                        &mut table,
+                                        schema_ref,
+                                        row_id,
+                                        Some(column),
+                                        row_values,
+                                        stmt,
+                                        compiled_upsert.as_ref(),
+                                        ctx,
+                                        has_returning,
+                                    ) {
+                                        Ok(Some(updated_row)) => {
+                                            returning_rows.push(updated_row);
+                                            rows_affected += 1;
+                                        }
+                                        Ok(None) => {
+                                            rows_affected += 1;
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                                Ok(None) => {
+                                    return Err(Error::UniqueConstraint {
+                                        index: index.clone(),
+                                        column: column.clone(),
+                                        value: value.clone(),
+                                        row_id: -1,
+                                    });
+                                }
+                                Err(e) => return Err(e),
                             }
                         }
                         Err(e) => return Err(e),
@@ -632,9 +697,30 @@ impl Executor {
 
             // Commit if this is a standalone (auto-commit) transaction
             if should_auto_commit {
-                // Just commit the transaction - it will commit all tables via commit_all_tables()
                 if let Some(mut tx) = standalone_tx {
-                    tx.commit()?;
+                    match tx.commit() {
+                        Ok(()) => {}
+                        Err(e)
+                            if (stmt.on_duplicate || stmt.do_nothing)
+                                && e.is_pk_or_unique_violation() =>
+                        {
+                            if stmt.on_duplicate && ctx.query_depth == 0 {
+                                // Commit-time PK/unique violation during upsert:
+                                // a concurrent plain INSERT committed first. Retry once.
+                                drop(_upsert_guard);
+                                let retry_ctx = ctx.with_incremented_query_depth();
+                                return self.execute_insert(stmt, &retry_ctx);
+                            }
+                            if stmt.do_nothing {
+                                // DO NOTHING: returning 0 rows is the correct semantic
+                                rows_affected = 0;
+                                returning_rows.clear();
+                            } else {
+                                return Err(e);
+                            }
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
 
@@ -655,6 +741,14 @@ impl Executor {
         if stmt.do_nothing || stmt.on_duplicate {
             // ON DUPLICATE KEY UPDATE requires schema (CompactArc ref-count bump, not deep clone)
             let schema = self.engine.get_table_schema(table_name)?;
+
+            // Pre-compile upsert expressions once for all conflicting rows in this batch.
+            // Without this, compile_upsert work repeats for every conflict (O(n) cost).
+            let compiled_upsert = if stmt.on_duplicate {
+                Some(Self::compile_upsert(&schema, stmt)?)
+            } else {
+                None
+            };
 
             for value_row in &stmt.values {
                 if value_row.len() != column_indices.len() {
@@ -771,25 +865,33 @@ impl Executor {
                             if !conflict_matches_target(&stmt.conflict_target, &schema, e) {
                                 return Err(Error::PrimaryKeyConstraint { row_id });
                             }
-                            if let Some(updated_row) = self.apply_on_duplicate_update(
+                            match self.apply_on_duplicate_update(
                                 &mut table,
                                 &schema,
                                 row_id,
                                 None,
                                 &row_values,
                                 stmt,
+                                compiled_upsert.as_ref(),
                                 ctx,
                                 has_returning,
-                            )? {
-                                returning_rows.push(updated_row);
+                            ) {
+                                Ok(Some(updated_row)) => {
+                                    returning_rows.push(updated_row);
+                                    rows_affected += 1;
+                                }
+                                Ok(None) => {
+                                    rows_affected += 1;
+                                }
+                                Err(e) => return Err(e),
                             }
-                            rows_affected += 1;
                         }
                         Err(
                             ref e @ Error::UniqueConstraint {
                                 ref index,
                                 ref column,
                                 ref value,
+                                row_id: conflict_rid,
                             },
                         ) => {
                             if !conflict_matches_target(&stmt.conflict_target, &schema, e) {
@@ -797,34 +899,52 @@ impl Executor {
                                     index: index.clone(),
                                     column: column.clone(),
                                     value: value.clone(),
+                                    row_id: conflict_rid,
                                 });
                             }
-                            if let Some(row_id) = self.find_row_by_unique_index(
-                                &*table,
-                                &schema,
-                                index,
-                                column,
-                                &row_values,
-                            )? {
-                                if let Some(updated_row) = self.apply_on_duplicate_update(
-                                    &mut table,
-                                    &schema,
-                                    row_id,
-                                    Some(column),
-                                    &row_values,
-                                    stmt,
-                                    ctx,
-                                    has_returning,
-                                )? {
-                                    returning_rows.push(updated_row);
-                                }
-                                rows_affected += 1;
+                            let found_row_id = if conflict_rid >= 0 {
+                                Ok(Some(conflict_rid))
                             } else {
-                                return Err(Error::UniqueConstraint {
-                                    index: index.clone(),
-                                    column: column.clone(),
-                                    value: value.clone(),
-                                });
+                                self.find_row_by_unique_index(
+                                    &*table,
+                                    &schema,
+                                    index,
+                                    column,
+                                    &row_values,
+                                )
+                            };
+                            match found_row_id {
+                                Ok(Some(row_id)) => {
+                                    match self.apply_on_duplicate_update(
+                                        &mut table,
+                                        &schema,
+                                        row_id,
+                                        Some(column),
+                                        &row_values,
+                                        stmt,
+                                        compiled_upsert.as_ref(),
+                                        ctx,
+                                        has_returning,
+                                    ) {
+                                        Ok(Some(updated_row)) => {
+                                            returning_rows.push(updated_row);
+                                            rows_affected += 1;
+                                        }
+                                        Ok(None) => {
+                                            rows_affected += 1;
+                                        }
+                                        Err(e) => return Err(e),
+                                    }
+                                }
+                                Ok(None) => {
+                                    return Err(Error::UniqueConstraint {
+                                        index: index.clone(),
+                                        column: column.clone(),
+                                        value: value.clone(),
+                                        row_id: -1,
+                                    });
+                                }
+                                Err(e) => return Err(e),
                             }
                         }
                         Err(e) => return Err(e),
@@ -932,9 +1052,28 @@ impl Executor {
 
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
-            // Commit the transaction - it will commit all tables via commit_all_tables()
             if let Some(mut tx) = standalone_tx {
-                tx.commit()?;
+                match tx.commit() {
+                    Ok(()) => {}
+                    Err(e)
+                        if (stmt.on_duplicate || stmt.do_nothing)
+                            && e.is_pk_or_unique_violation() =>
+                    {
+                        if stmt.on_duplicate && ctx.query_depth == 0 {
+                            drop(_upsert_guard);
+                            let retry_ctx = ctx.with_incremented_query_depth();
+                            return self.execute_insert(stmt, &retry_ctx);
+                        }
+                        if stmt.do_nothing {
+                            // DO NOTHING: returning 0 rows is the correct semantic
+                            rows_affected = 0;
+                            returning_rows.clear();
+                        } else {
+                            return Err(e);
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
 
@@ -1437,22 +1576,49 @@ impl Executor {
         };
         let has_fk_updates = !fk_cols_in_update.is_empty();
 
-        // Check if this table is referenced by child tables (for PK update enforcement)
-        let referencing_fks_for_update = if schema.pk_column_index().is_some() {
+        // Reject UPDATE on primary key columns. The engine assumes row_id == pk_value
+        // throughout ~50 code paths (lookups, range scans, ORDER BY, FK cascade, WAL
+        // recovery, etc.). Allowing PK mutation silently corrupts lookups.
+        // This matches SQLite's behavior for rowid tables.
+        if let Some(pk_idx) = schema.pk_column_index() {
             let col_map = schema.column_index_map();
-            let pk_idx = schema.pk_column_index().unwrap();
-            let pk_being_updated = stmt.updates.iter().any(|(col_name, _)| {
+            for col_name in stmt.updates.keys() {
                 let col_lower = col_name.to_lowercase();
-                col_map.get(col_lower.as_str()).copied() == Some(pk_idx)
-            });
-            if pk_being_updated {
-                super::foreign_key::find_referencing_fks(&self.engine, table_name)
-            } else {
-                Arc::new(Vec::new())
+                if col_map.get(col_lower.as_str()).copied() == Some(pk_idx) {
+                    let pk_col_name = &schema.columns[pk_idx].name;
+                    return Err(crate::core::Error::invalid_argument(format!(
+                        "cannot UPDATE primary key column '{}'. Use DELETE + INSERT instead",
+                        pk_col_name
+                    )));
+                }
             }
-        } else {
-            Arc::new(Vec::new())
-        };
+        }
+
+        // Check if this table is referenced by child tables via columns being updated.
+        // This handles CASCADE/RESTRICT/SET NULL for UNIQUE columns referenced by child FKs.
+        let all_referencing_fks =
+            super::foreign_key::find_referencing_fks(&self.engine, table_name);
+        let referencing_fks_for_update: Arc<Vec<(String, crate::core::ForeignKeyConstraint)>> =
+            if all_referencing_fks.is_empty() {
+                Arc::new(Vec::new())
+            } else {
+                let col_map = schema.column_index_map();
+                let updated_cols: Vec<usize> = stmt
+                    .updates
+                    .keys()
+                    .filter_map(|c| col_map.get(c.to_lowercase().as_str()).copied())
+                    .collect();
+                let relevant: Vec<_> = all_referencing_fks
+                    .iter()
+                    .filter(|(_, fk)| {
+                        col_map
+                            .get(fk.referenced_column.to_lowercase().as_str())
+                            .is_some_and(|&idx| updated_cols.contains(&idx))
+                    })
+                    .cloned()
+                    .collect();
+                Arc::new(relevant)
+            };
 
         // Get FK schema via engine (CompactArc ref-count bump, no deep clone)
         let fk_update_schema = if has_fk_updates {
@@ -1621,9 +1787,81 @@ impl Executor {
         // Use RefCell to collect updated rows for RETURNING clause and FK validation
         use std::cell::RefCell;
         let returning_rows: RefCell<Vec<Row>> = RefCell::new(Vec::new());
-        // Collect new FK values and PK old/new pairs from setter for post-update validation
+        // Collect new FK values and referenced-column old/new pairs from setter
         let fk_new_values: RefCell<Vec<Row>> = RefCell::new(Vec::new());
-        let pk_changes: RefCell<Vec<(Value, Value)>> = RefCell::new(Vec::new());
+        // (referenced_col_idx, old_value, new_value) for FK cascade enforcement
+        let ref_col_changes: RefCell<Vec<(usize, Value, Value)>> = RefCell::new(Vec::new());
+
+        // Pre-compute referenced column indices for FK cascade enforcement.
+        // Shared by both correlated and non-correlated update paths.
+        let ref_col_indices_for_fk: Vec<usize> = if !referencing_fks_for_update.is_empty() {
+            let col_map = schema.column_index_map();
+            referencing_fks_for_update
+                .iter()
+                .filter_map(|(_, fk)| {
+                    col_map
+                        .get(fk.referenced_column.to_lowercase().as_str())
+                        .copied()
+                })
+                .collect::<rustc_hash::FxHashSet<usize>>()
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Pre-partition FKs by referenced column index for post-update dispatch.
+        // This avoids re-borrowing schema after table.update().
+        let fks_by_ref_col: FxHashMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
+            if !referencing_fks_for_update.is_empty() {
+                let col_map = schema.column_index_map();
+                let mut map: FxHashMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
+                    FxHashMap::default();
+                for (tbl, fk) in referencing_fks_for_update.iter() {
+                    if let Some(&idx) = col_map.get(fk.referenced_column.to_lowercase().as_str()) {
+                        map.entry(idx).or_default().push((tbl.clone(), fk.clone()));
+                    }
+                }
+                map
+            } else {
+                FxHashMap::default()
+            };
+
+        // Pre-check RESTRICT constraints and CASCADE depth BEFORE writing parent rows.
+        // Only scan rows if the FK tree actually has RESTRICT or exceeds depth limits.
+        // Pure CASCADE/SET NULL trees within depth limits skip this scan entirely.
+        if !fks_by_ref_col.is_empty() {
+            let any_needs_precheck = fks_by_ref_col
+                .values()
+                .any(|fks| super::foreign_key::fk_tree_needs_precheck(&self.engine, fks));
+            if any_needs_precheck {
+                let parent_rows = table.collect_all_rows(where_expr.as_deref())?;
+                for (_rid, row) in parent_rows.iter() {
+                    if needs_memory_filter {
+                        if let Some(ref mem_where) = memory_where_clause {
+                            evaluator.set_row_array(row);
+                            match evaluator.evaluate_bool(mem_where) {
+                                Ok(true) => {}
+                                _ => continue,
+                            }
+                        }
+                    }
+                    for (&col_idx, fks_for_col) in &fks_by_ref_col {
+                        if let Some(old_val) = row.get(col_idx) {
+                            if !old_val.is_null() {
+                                super::foreign_key::pre_check_restrict_for_update(
+                                    &self.engine,
+                                    table.txn_id(),
+                                    table_name,
+                                    old_val,
+                                    fks_for_col,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Create a setter function that applies updates using pre-computed indices
         // If we need memory filtering, include the WHERE check in the setter
@@ -1747,9 +1985,38 @@ impl Executor {
                 let pk_value = row.get(pk_idx).cloned().unwrap_or(Value::null_unknown());
 
                 if let Some(updates) = precomputed.get(&pk_value) {
+                    // Capture old values of referenced columns before applying changes
+                    let ref_old: Vec<(usize, Value)> = if !ref_col_indices_for_fk.is_empty() {
+                        ref_col_indices_for_fk
+                            .iter()
+                            .filter_map(|&ci| row.get(ci).map(|v| (ci, v.clone())))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
                     for (idx, new_value) in updates {
                         let _ = row.set(*idx, new_value.clone());
                     }
+
+                    // Track referenced column changes for FK cascade
+                    for (ci, old_val) in &ref_old {
+                        if let Some(new_val) = row.get(*ci) {
+                            if old_val != new_val {
+                                ref_col_changes.borrow_mut().push((
+                                    *ci,
+                                    old_val.clone(),
+                                    new_val.clone(),
+                                ));
+                            }
+                        }
+                    }
+
+                    // Collect row for child FK parent-existence validation
+                    if has_fk_updates {
+                        fk_new_values.borrow_mut().push(row.clone());
+                    }
+
                     // Collect row for RETURNING clause
                     if has_returning {
                         returning_rows.borrow_mut().push(row.clone());
@@ -1807,13 +2074,38 @@ impl Executor {
                         .collect()
                 };
 
+            // Pre-compile CHECK constraints for columns being updated (once, not per row)
+            let compiled_check_exprs: Vec<(usize, String, String, SharedProgram)> =
+                compiled_updates
+                    .iter()
+                    .filter_map(|(idx, _dt, _, _)| {
+                        schema.columns[*idx].check_expr.as_ref().and_then(|expr| {
+                            let col_name = schema.columns[*idx].name.clone();
+                            let expr_text = expr.clone();
+                            compile_expression(
+                                &crate::parser::parse_sql(&format!("SELECT {}", expr))
+                                    .ok()?
+                                    .into_iter()
+                                    .next()
+                                    .and_then(|s| match s {
+                                        crate::parser::ast::Statement::Select(sel) => {
+                                            sel.columns.into_iter().next()
+                                        }
+                                        _ => None,
+                                    })?,
+                                &column_names,
+                            )
+                            .ok()
+                            .map(|program| (*idx, col_name, expr_text, program))
+                        })
+                    })
+                    .collect();
+
             // Create VM once and reuse for all rows
             let mut vm = ExprVM::new();
             // Extract params before the closure so they can be captured
             let params = ctx.params();
             let named_params = ctx.named_params();
-            // Pre-compute PK column index for FK enforcement inside closure
-            let pk_col_idx_for_fk = schema.pk_column_index();
             let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                 // If we need in-memory WHERE filtering, check the condition first
                 if needs_memory_filter {
@@ -1860,15 +2152,54 @@ impl Executor {
                 // Now apply all the computed values to the row
                 let changed = !updates_to_apply.is_empty();
 
-                // Track PK old value before applying changes (for FK enforcement)
-                let pk_old = if changed && !referencing_fks_for_update.is_empty() {
-                    pk_col_idx_for_fk.and_then(|pk_idx| row.get(pk_idx).cloned())
-                } else {
-                    None
-                };
+                // Capture old values of referenced columns before applying changes
+                let ref_old_values: Vec<(usize, Value)> =
+                    if changed && !ref_col_indices_for_fk.is_empty() {
+                        ref_col_indices_for_fk
+                            .iter()
+                            .filter_map(|&ci| row.get(ci).map(|v| (ci, v.clone())))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
 
                 for (idx, new_value) in updates_to_apply {
                     let _ = row.set(idx, new_value);
+                }
+
+                // Validate CHECK constraints on updated columns (precompiled, no per-row parsing)
+                if changed && !compiled_check_exprs.is_empty() {
+                    let check_ctx = ExecuteContext::new(&row)
+                        .with_params(params)
+                        .with_named_params(named_params);
+                    for (_col_idx, col_name, expr_text, check_program) in &compiled_check_exprs {
+                        match vm.execute_cow(check_program, &check_ctx) {
+                            Ok(Value::Boolean(true)) => {}
+                            Ok(Value::Boolean(false)) => {
+                                return Err(Error::CheckConstraintViolation {
+                                    column: col_name.clone(),
+                                    expression: expr_text.clone(),
+                                });
+                            }
+                            Ok(Value::Null(_)) | Err(_) => {}
+                            Ok(ref v) => {
+                                // Non-boolean truthiness: zero/empty = false, all else = true.
+                                // Timestamp, Extension, etc. are truthy (non-null existence).
+                                let is_truthy = match v {
+                                    Value::Integer(i) => *i != 0,
+                                    Value::Float(f) => *f != 0.0,
+                                    Value::Text(s) => !s.is_empty(),
+                                    _ => true,
+                                };
+                                if !is_truthy {
+                                    return Err(Error::CheckConstraintViolation {
+                                        column: col_name.clone(),
+                                        expression: expr_text.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Collect FK values for post-update validation
@@ -1876,12 +2207,16 @@ impl Executor {
                     fk_new_values.borrow_mut().push(row.clone());
                 }
 
-                // Track PK changes for referencing FK enforcement
-                if let Some(old_pk) = pk_old {
-                    if let Some(pk_idx) = pk_col_idx_for_fk {
-                        if let Some(new_pk) = row.get(pk_idx) {
-                            if &old_pk != new_pk {
-                                pk_changes.borrow_mut().push((old_pk, new_pk.clone()));
+                // Track referenced column changes for FK cascade enforcement
+                if !ref_old_values.is_empty() {
+                    for (ci, old_val) in &ref_old_values {
+                        if let Some(new_val) = row.get(*ci) {
+                            if old_val != new_val {
+                                ref_col_changes.borrow_mut().push((
+                                    *ci,
+                                    old_val.clone(),
+                                    new_val.clone(),
+                                ));
                             }
                         }
                     }
@@ -1931,18 +2266,21 @@ impl Executor {
             }
         }
 
-        // Post-update PK change enforcement: enforce referencing FK actions
-        if !referencing_fks_for_update.is_empty() {
-            let changes = pk_changes.into_inner();
-            for (old_pk, new_pk) in &changes {
-                super::foreign_key::enforce_update_actions(
-                    &self.engine,
-                    table.txn_id(),
-                    table_name,
-                    old_pk,
-                    new_pk,
-                    &referencing_fks_for_update,
-                )?;
+        // Post-update referenced-column change enforcement: apply CASCADE/SET NULL.
+        // RESTRICT constraints were already pre-checked above, so this should not
+        // fail for RESTRICT. CASCADE/SET NULL failures are propagated as errors.
+        if !fks_by_ref_col.is_empty() {
+            let changes = ref_col_changes.into_inner();
+            for (col_idx, old_val, new_val) in &changes {
+                if let Some(fks_for_col) = fks_by_ref_col.get(col_idx) {
+                    super::foreign_key::enforce_update_actions(
+                        &self.engine,
+                        table.txn_id(),
+                        old_val,
+                        new_val,
+                        fks_for_col,
+                    )?;
+                }
             }
         }
 
@@ -2462,6 +2800,92 @@ impl Executor {
         )))
     }
 
+    /// Build a `CompiledUpsert` from `schema` and `stmt` once per INSERT statement.
+    /// This avoids re-compiling update expressions and re-parsing CHECK constraint SQL
+    /// for every conflicting row in an upsert batch.
+    fn compile_upsert(
+        schema: &crate::core::Schema,
+        stmt: &InsertStatement,
+    ) -> Result<CompiledUpsert> {
+        use super::expression::{compile_expression, CompileContext, ExprCompiler, SharedProgram};
+        use crate::functions::registry::global_registry;
+        use crate::parser::parse_sql;
+
+        let col_map = schema.column_index_map();
+
+        // Resolve each update column to its schema index, type, and AST expression.
+        let update_specs: Vec<(usize, DataType, u16, &Expression)> = stmt
+            .update_columns
+            .iter()
+            .zip(stmt.update_expressions.iter())
+            .filter_map(|(col, expr)| {
+                col_map.get(col.value_lower.as_str()).map(|&idx| {
+                    (
+                        idx,
+                        schema.columns[idx].data_type,
+                        schema.columns[idx].vector_dimensions,
+                        expr,
+                    )
+                })
+            })
+            .collect();
+
+        let column_names: Vec<String> = schema.column_names_owned().to_vec();
+
+        // Build EXCLUDED column name list for the second row source.
+        let excluded_columns: Vec<String> = column_names
+            .iter()
+            .map(|c| format!("excluded.{}", c))
+            .collect();
+
+        // Compile each update expression with EXCLUDED as the second row source.
+        let mut compiled_updates: Vec<(usize, DataType, u16, SharedProgram)> =
+            Vec::with_capacity(update_specs.len());
+        for (idx, col_type, vec_dims, expr) in &update_specs {
+            let compile_ctx = CompileContext::new(&column_names, global_registry())
+                .with_second_row(&excluded_columns);
+            let compiler = ExprCompiler::new(&compile_ctx);
+            match compiler.compile(expr) {
+                Ok(program) => {
+                    compiled_updates.push((*idx, *col_type, *vec_dims, CompactArc::new(program)));
+                }
+                Err(e) => {
+                    return Err(Error::internal(format!(
+                        "failed to compile ON CONFLICT update expression: {}",
+                        e
+                    )));
+                }
+            }
+        }
+
+        // Compile CHECK constraints for columns being updated.
+        // Store as SharedProgram (not ExpressionEval) so the struct can be shared
+        // immutably — the VM used to execute the program lives in the setter closure.
+        let compiled_checks: Vec<(usize, String, String, SharedProgram)> = update_specs
+            .iter()
+            .filter_map(|(idx, _, _, _)| {
+                let col = &schema.columns[*idx];
+                col.check_expr.as_ref().and_then(|check_expr| {
+                    let sql = format!("SELECT {}", check_expr);
+                    let stmts = parse_sql(&sql).ok()?;
+                    if let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() {
+                        let expr = select.columns.first()?;
+                        let columns = vec![col.name.to_string()];
+                        let program = compile_expression(expr, &columns).ok()?;
+                        Some((*idx, col.name.to_string(), check_expr.to_string(), program))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect();
+
+        Ok(CompiledUpsert {
+            compiled_updates,
+            compiled_checks,
+        })
+    }
+
     /// Apply ON DUPLICATE KEY UPDATE to an existing row.
     /// `insert_values` contains the attempted insert row — accessible via `EXCLUDED.column`
     /// in update expressions (PostgreSQL-style).
@@ -2477,6 +2901,7 @@ impl Executor {
         conflict_column: Option<&str>,
         insert_values: &[Value],
         stmt: &InsertStatement,
+        compiled: Option<&CompiledUpsert>,
         ctx: &ExecutionContext,
         capture_row: bool,
     ) -> Result<Option<Row>> {
@@ -2524,80 +2949,19 @@ impl Executor {
             None
         };
 
-        // OPTIMIZATION: Pre-compute column indices and types to avoid per-row linear search
-        // Use cached column_index_map for O(1) lookups
-        let col_map = schema.column_index_map();
-        let update_specs: Vec<(usize, crate::core::DataType, u16, &Expression)> = stmt
-            .update_columns
-            .iter()
-            .zip(stmt.update_expressions.iter())
-            .filter_map(|(col, expr)| {
-                col_map.get(col.value_lower.as_str()).map(|&idx| {
-                    (
-                        idx,
-                        schema.columns[idx].data_type,
-                        schema.columns[idx].vector_dimensions,
-                        expr,
-                    )
-                })
-            })
-            .collect();
+        use super::expression::{ExecuteContext, ExprVM};
 
-        let column_names: Vec<String> = schema.column_names_owned().to_vec();
-
-        // Build EXCLUDED columns for the second row source (insert values)
-        // This allows EXCLUDED.column to reference the attempted insert values
-        let excluded_columns: Vec<String> = column_names
-            .iter()
-            .map(|c| format!("excluded.{}", c))
-            .collect();
-
-        // Pre-compile update expressions with EXCLUDED as a second row source
-        use super::expression::{
-            CompileContext, ExecuteContext, ExprCompiler, ExprVM, SharedProgram,
-        };
-        use crate::functions::registry::global_registry;
-
-        let mut compiled_updates: Vec<(usize, crate::core::DataType, u16, SharedProgram)> =
-            Vec::with_capacity(update_specs.len());
-        for (idx, col_type, vec_dims, expr) in &update_specs {
-            let ctx = CompileContext::new(&column_names, global_registry())
-                .with_second_row(&excluded_columns);
-            let compiler = ExprCompiler::new(&ctx);
-            match compiler.compile(expr) {
-                Ok(program) => {
-                    compiled_updates.push((*idx, *col_type, *vec_dims, CompactArc::new(program)));
-                }
-                Err(e) => {
-                    return Err(Error::internal(format!(
-                        "failed to compile ON CONFLICT update expression: {}",
-                        e
-                    )));
-                }
+        // Use pre-compiled programs when provided (normal fast path).
+        // Fall back to inline compilation only when called without a CompiledUpsert
+        // (backward-compatibility / single-row callers).
+        let inline_compiled: Option<CompiledUpsert>;
+        let effective = match compiled {
+            Some(c) => c,
+            None => {
+                inline_compiled = Some(Self::compile_upsert(schema, stmt)?);
+                inline_compiled.as_ref().unwrap()
             }
-        }
-
-        // Pre-compile CHECK constraints for columns being updated (once, not per-row)
-        use super::expression::ExpressionEval;
-        use crate::parser::parse_sql;
-        let mut compiled_checks: Vec<(usize, String, String, ExpressionEval)> = update_specs
-            .iter()
-            .filter_map(|(idx, _, _, _)| {
-                let col = &schema.columns[*idx];
-                col.check_expr.as_ref().and_then(|check_expr| {
-                    let sql = format!("SELECT {}", check_expr);
-                    let stmts = parse_sql(&sql).ok()?;
-                    if let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() {
-                        let expr = select.columns.first()?;
-                        let columns = vec![col.name.to_string()];
-                        let eval = ExpressionEval::compile(expr, &columns).ok()?;
-                        Some((*idx, col.name.to_string(), check_expr.to_string(), eval))
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect();
+        };
 
         // Build the EXCLUDED row from insert_values
         let excluded_row = Row::from_values(insert_values.to_vec());
@@ -2625,8 +2989,8 @@ impl Executor {
                     exec_ctx = exec_ctx.with_named_params(named_params);
                 }
 
-                let mut updates = Vec::with_capacity(compiled_updates.len());
-                for (idx, col_type, vec_dims, program) in &compiled_updates {
+                let mut updates = Vec::with_capacity(effective.compiled_updates.len());
+                for (idx, col_type, vec_dims, program) in &effective.compiled_updates {
                     if let Ok(v) = vm.execute_cow(program, &exec_ctx) {
                         let coerced = v.into_coerce_to_type(*col_type);
                         // Validate vector dimensions
@@ -2653,18 +3017,19 @@ impl Executor {
             // Apply updates and validate CHECK constraints on each new value
             let changed = !updates_to_apply.is_empty();
             for (idx, new_value) in updates_to_apply {
-                // Validate CHECK constraint using pre-compiled evaluator
-                for (check_idx, col_name, check_expr, eval) in &mut compiled_checks {
+                // Validate CHECK constraint using pre-compiled program via existing VM
+                for (check_idx, col_name, check_expr, program) in &effective.compiled_checks {
                     if *check_idx == idx && !new_value.is_null() {
                         let check_row = Row::from_values(vec![new_value.clone()]);
-                        if let Ok(result) = eval.eval(&check_row) {
+                        let check_ctx = ExecuteContext::new(&check_row);
+                        if let Ok(result) = vm.execute_cow(program, &check_ctx) {
                             let is_truthy = match &result {
                                 Value::Boolean(b) => *b,
                                 Value::Null(_) => true, // NULL passes CHECK (SQL standard)
                                 Value::Integer(i) => *i != 0,
                                 Value::Float(f) => *f != 0.0,
                                 Value::Text(s) => !s.is_empty(),
-                                _ => false,
+                                _ => true, // Timestamp, Extension, etc. are truthy
                             };
                             if !is_truthy {
                                 return Err(Error::CheckConstraintViolation {
@@ -2686,8 +3051,14 @@ impl Executor {
             Ok((row, changed))
         };
 
-        // Update the row
-        table.update(where_expr.as_deref(), &mut setter)?;
+        // Prefer direct row_id lookup when we have a concrete conflicting row_id.
+        // This avoids a second scan on non-PK upserts after conflict resolution.
+        // row_id < 0 means "unknown" (sentinel from UniqueConstraint error).
+        if row_id >= 0 {
+            table.update_by_row_ids(&[row_id], &mut setter)?;
+        } else {
+            table.update(where_expr.as_deref(), &mut setter)?;
+        }
 
         Ok(captured_row)
     }
@@ -2719,10 +3090,17 @@ impl Executor {
             if let Some(&row_id) = row_ids.first() {
                 return Ok(Some(row_id));
             }
-            return Ok(None);
+            // Hot index didn't find it — fall through to scan-based lookup
+            // which searches both hot buffer AND cold segments.
         }
 
-        // Fallback: scan with filter expression (only if index not found by name)
+        if let Some(row_id) =
+            table.find_unique_conflict_row_id(index_name, column_name, row_values)?
+        {
+            return Ok(Some(row_id));
+        }
+
+        // Fallback: scan with filter expression (searches hot + cold via SegmentedTable)
         let col_names: Vec<&str> = column_name.split(", ").collect();
 
         let mut comparisons: Vec<Box<dyn StorageExpr>> = Vec::with_capacity(col_names.len());
@@ -2752,19 +3130,30 @@ impl Executor {
             Box::new(and_expr)
         };
 
-        let column_indices: Vec<usize> = (0..schema.columns.len()).collect();
+        // Only project the PK column (if any) — we only need the row_id,
+        // not the full row. This avoids materializing all columns.
+        let pk_idx = schema.pk_column_index();
+        let column_indices: Vec<usize> = if let Some(pk) = pk_idx {
+            vec![pk]
+        } else {
+            vec![0]
+        };
         let mut scanner = table.scan(&column_indices, Some(&*scan_expr))?;
 
         let result = if scanner.next() {
-            let row = scanner.take_row();
-            if let Some(pk_idx) = schema.pk_column_index() {
-                if let Some(Value::Integer(id)) = row.get(pk_idx) {
+            let row_id = scanner.current_row_id();
+            if row_id >= 0 {
+                Some(row_id)
+            } else if pk_idx.is_some() {
+                // PK column is at index 0 in our minimal projection
+                let row = scanner.row();
+                if let Some(Value::Integer(id)) = row.get(0) {
                     Some(*id)
                 } else {
-                    None
+                    Some(row_id)
                 }
             } else {
-                Some(i64::MIN)
+                Some(row_id)
             }
         } else {
             None
@@ -2855,12 +3244,13 @@ impl Executor {
                         Ok(())
                     }
                     _ => {
-                        // Non-boolean result - treat non-zero/non-empty as true
+                        // Non-boolean truthiness: zero/empty = false, all else = true.
+                        // Timestamp, Extension, etc. are truthy (non-null existence).
                         let is_truthy = match &result {
                             Value::Integer(i) => *i != 0,
                             Value::Float(f) => *f != 0.0,
                             Value::Text(s) => !s.is_empty(),
-                            _ => false,
+                            _ => true,
                         };
                         if is_truthy {
                             Ok(())

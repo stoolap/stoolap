@@ -578,15 +578,45 @@ impl QueryClassification {
             }
             Expression::Prefix(prefix) => Self::expression_has_window_function(&prefix.right),
             Expression::Cast(cast) => Self::expression_has_window_function(&cast.expr),
+            Expression::Distinct(d) => Self::expression_has_window_function(&d.expr),
+            Expression::FunctionCall(func) => func
+                .arguments
+                .iter()
+                .any(Self::expression_has_window_function),
             Expression::Case(case) => {
-                case.when_clauses.iter().any(|w| {
-                    Self::expression_has_window_function(&w.condition)
-                        || Self::expression_has_window_function(&w.then_result)
-                }) || case
-                    .else_value
+                case.value
                     .as_ref()
-                    .is_some_and(|e| Self::expression_has_window_function(e))
+                    .is_some_and(|v| Self::expression_has_window_function(v))
+                    || case.when_clauses.iter().any(|w| {
+                        Self::expression_has_window_function(&w.condition)
+                            || Self::expression_has_window_function(&w.then_result)
+                    })
+                    || case
+                        .else_value
+                        .as_ref()
+                        .is_some_and(|e| Self::expression_has_window_function(e))
             }
+            Expression::Between(b) => {
+                Self::expression_has_window_function(&b.expr)
+                    || Self::expression_has_window_function(&b.lower)
+                    || Self::expression_has_window_function(&b.upper)
+            }
+            Expression::In(i) => {
+                Self::expression_has_window_function(&i.left)
+                    || Self::expression_has_window_function(&i.right)
+            }
+            Expression::Like(l) => {
+                Self::expression_has_window_function(&l.left)
+                    || Self::expression_has_window_function(&l.pattern)
+                    || l.escape
+                        .as_ref()
+                        .is_some_and(|e| Self::expression_has_window_function(e))
+            }
+            Expression::List(l) => l.elements.iter().any(Self::expression_has_window_function),
+            Expression::ExpressionList(l) => l
+                .expressions
+                .iter()
+                .any(Self::expression_has_window_function),
             _ => false,
         }
     }

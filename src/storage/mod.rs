@@ -27,6 +27,7 @@ pub mod index;
 pub mod mvcc;
 pub mod statistics;
 pub mod traits;
+pub mod volume;
 
 // Re-export main expression types at storage level for convenience
 pub use expression::{
@@ -67,8 +68,8 @@ pub use mvcc::{
 // Re-export Persistence types
 pub use mvcc::{
     deserialize_row_version, deserialize_value, serialize_row_version, serialize_value,
-    IndexMetadata, PersistenceManager, PersistenceMeta, DEFAULT_KEEP_SNAPSHOTS,
-    DEFAULT_SNAPSHOT_INTERVAL,
+    serialize_value_into, IndexMetadata, PersistenceManager, PersistenceMeta,
+    DEFAULT_CHECKPOINT_INTERVAL, DEFAULT_KEEP_SNAPSHOTS,
 };
 
 // Re-export Zone Map types

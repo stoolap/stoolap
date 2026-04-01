@@ -28,6 +28,18 @@ use crate::core::{Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
+/// Classification of a window expression's PARTITION BY for index optimization.
+#[allow(dead_code)]
+enum WindowPartitionKind {
+    /// Not a window expression at all (plain column, function, etc.)
+    NotAWindow,
+    /// Window expression whose partition clause is incompatible with per-partition
+    /// index fetch (global window, multi-column, complex expression, window ref).
+    Incompatible,
+    /// Window with a single simple column PARTITION BY.
+    SimpleColumn(String),
+}
+
 use super::context::{
     cache_in_subquery, extract_table_names_for_cache, get_cached_in_subquery, ExecutionContext,
 };
@@ -735,43 +747,106 @@ impl Executor {
     /// Extract window PARTITION BY information for optimization
     /// Returns column_name if a simple single-column PARTITION BY is found
     pub(crate) fn extract_window_partition_info(stmt: &SelectStatement) -> Option<String> {
-        // Look for window functions in SELECT columns
+        // All window functions (including nested ones) must share the same single
+        // simple partition column. If any window is unpartitioned (global), uses
+        // complex expressions, or partitions by a different column, bail out.
+        let mut canonical: Option<String> = None;
         for col_expr in &stmt.columns {
-            if let Some(info) = Self::find_window_partition_in_expr(col_expr) {
-                return Some(info);
+            if !Self::collect_window_partitions(col_expr, &mut canonical) {
+                return None;
             }
         }
-        None
+        canonical
     }
 
-    /// Find window PARTITION BY info in an expression
-    fn find_window_partition_in_expr(expr: &Expression) -> Option<String> {
+    /// Recursively walk an expression tree, classifying every Window node found.
+    /// Returns false (bail out) if any window is incompatible with the optimization.
+    /// Updates `canonical` with the shared partition column.
+    fn collect_window_partitions(expr: &Expression, canonical: &mut Option<String>) -> bool {
         match expr {
             Expression::Window(window_expr) => {
-                // Only optimize single-column PARTITION BY
-                if window_expr.partition_by.len() != 1 {
-                    return None;
+                if window_expr.partition_by.is_empty()
+                    || window_expr.partition_by.len() != 1
+                    || window_expr.window_ref.is_some()
+                {
+                    return false;
                 }
-
-                // Check if using a window reference (can't analyze those)
-                if window_expr.window_ref.is_some() {
-                    return None;
-                }
-
-                // Get PARTITION BY column
-                let partition_col = &window_expr.partition_by[0];
-                let column_name = match partition_col {
+                let col_name = match &window_expr.partition_by[0] {
                     Expression::Identifier(id) => id.value.to_string(),
                     Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
-                    _ => return None, // Complex expression, can't optimize
+                    _ => return false,
                 };
-
-                Some(column_name)
+                match canonical {
+                    None => *canonical = Some(col_name),
+                    Some(c) if !c.eq_ignore_ascii_case(&col_name) => return false,
+                    _ => {}
+                }
+                true
             }
             Expression::Aliased(aliased) => {
-                Self::find_window_partition_in_expr(&aliased.expression)
+                Self::collect_window_partitions(&aliased.expression, canonical)
             }
-            _ => None,
+            Expression::Infix(infix) => {
+                Self::collect_window_partitions(&infix.left, canonical)
+                    && Self::collect_window_partitions(&infix.right, canonical)
+            }
+            Expression::Prefix(prefix) => Self::collect_window_partitions(&prefix.right, canonical),
+            Expression::Case(case) => {
+                if let Some(v) = &case.value {
+                    if !Self::collect_window_partitions(v, canonical) {
+                        return false;
+                    }
+                }
+                for w in &case.when_clauses {
+                    if !Self::collect_window_partitions(&w.condition, canonical)
+                        || !Self::collect_window_partitions(&w.then_result, canonical)
+                    {
+                        return false;
+                    }
+                }
+                if let Some(e) = &case.else_value {
+                    if !Self::collect_window_partitions(e, canonical) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Expression::Cast(cast) => Self::collect_window_partitions(&cast.expr, canonical),
+            Expression::FunctionCall(func) => {
+                for arg in &func.arguments {
+                    if !Self::collect_window_partitions(arg, canonical) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Expression::Between(between) => {
+                Self::collect_window_partitions(&between.expr, canonical)
+                    && Self::collect_window_partitions(&between.lower, canonical)
+                    && Self::collect_window_partitions(&between.upper, canonical)
+            }
+            Expression::In(in_expr) => {
+                Self::collect_window_partitions(&in_expr.left, canonical)
+                    && Self::collect_window_partitions(&in_expr.right, canonical)
+            }
+            Expression::Like(l) => {
+                Self::collect_window_partitions(&l.left, canonical)
+                    && Self::collect_window_partitions(&l.pattern, canonical)
+                    && l.escape
+                        .as_ref()
+                        .is_none_or(|e| Self::collect_window_partitions(e, canonical))
+            }
+            Expression::Distinct(d) => Self::collect_window_partitions(&d.expr, canonical),
+            Expression::List(l) => l
+                .elements
+                .iter()
+                .all(|e| Self::collect_window_partitions(e, canonical)),
+            Expression::ExpressionList(l) => l
+                .expressions
+                .iter()
+                .all(|e| Self::collect_window_partitions(e, canonical)),
+            // Leaf nodes that cannot contain window expressions
+            _ => true,
         }
     }
 

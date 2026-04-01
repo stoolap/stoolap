@@ -112,7 +112,7 @@ typedef struct StoolapValue {
  * ========================================================================= */
 
 /**
- * Returns the stoolap version string (e.g. "0.3.7").
+ * Returns the stoolap version string (e.g. "0.4.0").
  * The returned pointer is static and must NOT be freed.
  */
 const char* stoolap_version(void);
@@ -156,7 +156,7 @@ const char* stoolap_version(void);
  *                  sync_mode=none|normal|full
  *                  compression=on|off
  *                  wal_flush_trigger=<bytes>
- *                  snapshot_interval=<seconds>
+ *                  checkpoint_interval=<seconds>
  *                Example: "file:///tmp/mydb?sync_mode=full&compression=on"
  * @param out_db  On success, receives the database handle.
  * @return STOOLAP_OK on success. On failure, *out_db is NULL.

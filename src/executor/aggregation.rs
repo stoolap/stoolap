@@ -4271,7 +4271,23 @@ impl Executor {
             vec![None; aggregations.len()]
         };
 
-        let mut expr_vm = if has_expr_group_by || has_agg_expression {
+        // Pre-compile FILTER expressions for aggregate functions
+        let has_filters = aggregations.iter().any(|a| a.filter.is_some());
+        let compiled_filters: Vec<Option<SharedProgram>> = if has_filters {
+            aggregations
+                .iter()
+                .map(|agg| {
+                    agg.filter
+                        .as_ref()
+                        .map(|f| compile_expression(f, columns))
+                        .transpose()
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            vec![None; aggregations.len()]
+        };
+
+        let mut expr_vm = if has_expr_group_by || has_agg_expression || has_filters {
             Some(ExprVM::new())
         } else {
             None
@@ -4313,6 +4329,18 @@ impl Executor {
 
                     for (i, agg) in aggregations.iter().enumerate() {
                         if let Some(ref mut func) = agg_funcs[i] {
+                            // Check FILTER clause first - skip row if filter is false
+                            if let Some(ref filter_program) = compiled_filters[i] {
+                                if let Some(ref mut vm) = expr_vm {
+                                    match vm.execute_cow(filter_program, &exec_ctx) {
+                                        Ok(Value::Boolean(true)) => {}
+                                        _ => continue,
+                                    }
+                                } else {
+                                    continue;
+                                }
+                            }
+
                             if let Some(ref expr_program) = compiled_agg_expressions[i] {
                                 if let Some(ref mut vm) = expr_vm {
                                     if let Ok(val) = vm.execute_cow(expr_program, &exec_ctx) {
@@ -4471,6 +4499,18 @@ impl Executor {
 
                             for (i, agg) in aggregations.iter().enumerate() {
                                 if let Some(ref mut func) = agg_funcs[i] {
+                                    // Check FILTER clause first - skip row if filter is false
+                                    if let Some(ref filter_program) = compiled_filters[i] {
+                                        if let Some(ref mut vm) = expr_vm {
+                                            match vm.execute_cow(filter_program, &exec_ctx) {
+                                                Ok(Value::Boolean(true)) => {}
+                                                _ => continue,
+                                            }
+                                        } else {
+                                            continue;
+                                        }
+                                    }
+
                                     if let Some(ref expr_program) = compiled_agg_expressions[i] {
                                         if let Some(ref mut vm) = expr_vm {
                                             if let Ok(val) = vm.execute_cow(expr_program, &exec_ctx)
@@ -5221,6 +5261,193 @@ impl Executor {
         ))))
     }
 
+    /// Try to push filtered aggregation (WHERE + aggregates) directly to the storage layer.
+    ///
+    /// This handles queries like:
+    /// - `SELECT COUNT(*) FROM orders WHERE status = 'shipped'`
+    /// - `SELECT SUM(amount), AVG(amount) FROM sales WHERE region = 'US'`
+    ///
+    /// The WHERE clause is converted to a storage expression and passed alongside the
+    /// aggregate operations to `Table::compute_filtered_aggregates`, which can scan and
+    /// aggregate in a single pass without materializing Row objects in the executor.
+    ///
+    /// # Eligibility
+    /// - Must have WHERE and aggregation, no HAVING/window functions/joins/GROUP BY
+    /// - No DISTINCT aggregates, no subqueries or parameters in WHERE
+    /// - All SELECT columns must be pure aggregate function calls
+    ///
+    /// # Returns
+    /// - `Ok(Some(result))` if the pushdown was applied
+    /// - `Ok(None)` if the query is not eligible (falls through to next path)
+    pub(crate) fn try_filtered_aggregation_pushdown(
+        &self,
+        table: &dyn crate::storage::traits::Table,
+        stmt: &SelectStatement,
+        ctx: &super::context::ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
+        columns: &[String],
+    ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
+        use crate::storage::mvcc::version_store::AggregateOp;
+
+        // --- Eligibility checks ---
+
+        if !classification.has_where {
+            return Ok(None);
+        }
+        if !classification.has_aggregation {
+            return Ok(None);
+        }
+        if classification.has_having {
+            return Ok(None);
+        }
+        if classification.has_window_functions {
+            return Ok(None);
+        }
+        if classification.has_joins {
+            return Ok(None);
+        }
+        if classification.has_group_by {
+            return Ok(None);
+        }
+        // Parameters are not yet resolved in storage expressions
+        if classification.where_has_parameters {
+            return Ok(None);
+        }
+        // Subqueries in WHERE cannot be pushed to storage
+        if classification.where_has_subqueries {
+            return Ok(None);
+        }
+
+        // All SELECT columns must be pure aggregate function calls
+        for col in &stmt.columns {
+            if !Self::is_pure_aggregate_expression(col) {
+                return Ok(None);
+            }
+        }
+
+        // Parse aggregations to validate and extract details
+        let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
+
+        // Must have only aggregations, no regular columns
+        if !non_agg_columns.is_empty() || aggregations.is_empty() {
+            return Ok(None);
+        }
+
+        // Check all aggregations are simple (no expression, no ORDER BY, no FILTER, no DISTINCT)
+        for agg in &aggregations {
+            if agg.expression.is_some() || !agg.order_by.is_empty() || agg.filter.is_some() {
+                return Ok(None);
+            }
+            if agg.distinct {
+                return Ok(None);
+            }
+            match agg.name.as_str() {
+                "COUNT" | "SUM" | "MIN" | "MAX" | "AVG" => {}
+                _ => return Ok(None),
+            }
+        }
+
+        // --- Convert WHERE clause to storage expression ---
+
+        let where_expr = match stmt.where_clause.as_ref() {
+            Some(expr) => expr,
+            None => return Ok(None),
+        };
+
+        let schema = table.schema();
+        let (storage_expr, needs_memory_filter) =
+            super::pushdown::try_pushdown(where_expr, schema, Some(ctx));
+
+        // Bail when the WHERE clause is only partially pushed to storage.
+        // The residual predicate would be ignored, producing wrong aggregates.
+        if needs_memory_filter {
+            return Ok(None);
+        }
+
+        let storage_expr = match storage_expr {
+            Some(expr) => expr,
+            None => return Ok(None), // Cannot convert WHERE to storage expression
+        };
+
+        // --- Build (AggregateOp, column_index) pairs ---
+
+        let col_map: FxHashMap<&str, usize> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), i))
+            .collect();
+
+        let mut agg_ops: Vec<(AggregateOp, usize)> = Vec::with_capacity(aggregations.len());
+        let mut result_columns: Vec<String> = Vec::with_capacity(aggregations.len());
+
+        for agg in &aggregations {
+            result_columns.push(agg.get_column_name());
+
+            let (op, col_idx) = match agg.name.as_str() {
+                "COUNT" => {
+                    if agg.column == "*" {
+                        (AggregateOp::CountStar, 0)
+                    } else if let Some(&idx) = col_map.get(agg.column_lower.as_str()) {
+                        (AggregateOp::Count, idx)
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                "SUM" => {
+                    if let Some(&idx) = col_map.get(agg.column_lower.as_str()) {
+                        (AggregateOp::Sum, idx)
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                "AVG" => {
+                    if let Some(&idx) = col_map.get(agg.column_lower.as_str()) {
+                        (AggregateOp::Avg, idx)
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                "MIN" => {
+                    if let Some(&idx) = col_map.get(agg.column_lower.as_str()) {
+                        (AggregateOp::Min, idx)
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                "MAX" => {
+                    if let Some(&idx) = col_map.get(agg.column_lower.as_str()) {
+                        (AggregateOp::Max, idx)
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            };
+            agg_ops.push((op, col_idx));
+        }
+
+        // --- Call storage-level filtered aggregation ---
+
+        let values = match table.compute_filtered_aggregates(&agg_ops, storage_expr.as_ref()) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // --- Build result ---
+
+        let mut result_values: CompactVec<Value> = CompactVec::with_capacity(values.len());
+        for v in values {
+            result_values.push(v);
+        }
+        let row = Row::from_compact_vec(result_values);
+        let mut rows = RowVec::with_capacity(1);
+        rows.push((0, row));
+        Ok(Some(Box::new(super::result::ExecutorResult::new(
+            result_columns,
+            rows,
+        ))))
+    }
+
     /// Try to compute global aggregates using streaming (no row materialization).
     ///
     /// This is a fallback for queries that can't use direct aggregation pushdown,
@@ -5525,6 +5752,9 @@ impl Executor {
             }
         }
 
+        if let Some(e) = scanner.err() {
+            return Err(crate::core::Error::internal(format!("scan error: {}", e)));
+        }
         scanner.close()?;
 
         // Build intermediate result columns (raw aggregate values)
@@ -6469,9 +6699,15 @@ impl Executor {
             }
         };
 
-        // Extract table name
+        // Extract table name (bail out for AS OF temporal queries)
         let table_name = match stmt.table_expr.as_deref() {
-            Some(Expression::TableSource(ts)) => ts.name.value_lower.clone(),
+            Some(Expression::TableSource(ts)) => {
+                if ts.as_of.is_some() {
+                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    return None;
+                }
+                ts.name.value_lower.clone()
+            }
             _ => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;
@@ -6781,9 +7017,15 @@ impl Executor {
             }
         };
 
-        // Extract table name
+        // Extract table name (bail out for AS OF temporal queries)
         let table_name = match stmt.table_expr.as_deref() {
-            Some(Expression::TableSource(ts)) => ts.name.value_lower.clone(),
+            Some(Expression::TableSource(ts)) => {
+                if ts.as_of.is_some() {
+                    *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                    return None;
+                }
+                ts.name.value_lower.clone()
+            }
             _ => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;

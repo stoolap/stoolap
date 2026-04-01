@@ -277,7 +277,13 @@ impl Transaction {
         // INSERT delegation is required for correct handling of partial column lists,
         // default values, type coercion, RETURNING, ON DUPLICATE KEY, and FK validation.
         // Must handle before borrowing self.tx since we need to take ownership.
-        if matches!(statement, Statement::Select(_) | Statement::Insert(_)) {
+        if matches!(
+            statement,
+            Statement::Select(_)
+                | Statement::Insert(_)
+                | Statement::Update(_)
+                | Statement::Delete(_)
+        ) {
             let tx = self.tx.take().ok_or(Error::TransactionNotStarted)?;
             let executor = Executor::new(self.engine.clone());
             executor.install_transaction(tx);

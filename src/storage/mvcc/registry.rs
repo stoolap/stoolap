@@ -308,6 +308,76 @@ impl TransactionRegistry {
         false
     }
 
+    /// Check if any active transaction uses snapshot isolation.
+    /// Used by seal_hot_buffers to avoid breaking snapshot isolation guarantees.
+    pub fn has_active_snapshot_transactions(&self) -> bool {
+        let global = self.global_isolation_level.load(Ordering::Relaxed);
+        if global == 1 {
+            // Global snapshot isolation — any active transaction uses it
+            return !self.transactions.lock().is_empty();
+        }
+        if self.override_count.load(Ordering::Relaxed) > 0 {
+            // Lock order: transactions FIRST, then isolation_overrides
+            // (matches get_snapshot_transaction_ids to prevent ABBA deadlock)
+            let transactions = self.transactions.lock();
+            let overrides = self.isolation_overrides.lock();
+            for txn_id in transactions.keys() {
+                if overrides.get(txn_id) == Some(&1) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Get transaction IDs of all active snapshot-isolation transactions.
+    pub fn get_snapshot_transaction_ids(&self) -> Vec<i64> {
+        let global = self.global_isolation_level.load(Ordering::Relaxed);
+        let transactions = self.transactions.lock();
+
+        if global == 1 {
+            // All active transactions use snapshot isolation
+            return transactions.keys().collect();
+        }
+
+        if self.override_count.load(Ordering::Relaxed) > 0 {
+            let overrides = self.isolation_overrides.lock();
+            return transactions
+                .keys()
+                .filter(|txn_id| overrides.get(*txn_id) == Some(&1))
+                .collect();
+        }
+
+        Vec::new()
+    }
+
+    /// Get the minimum begin_seq among active snapshot isolation transactions.
+    /// Returns None if no snapshot transactions are active (seal/compaction can proceed freely).
+    /// Returns Some(min_begin_seq) otherwise — only rows committed before this seq are safe to seal.
+    pub fn get_min_snapshot_begin_seq(&self) -> Option<i64> {
+        let global = self.global_isolation_level.load(Ordering::Relaxed);
+        let transactions = self.transactions.lock();
+
+        if global == 1 {
+            return transactions
+                .values()
+                .filter(|s| s.is_active_or_committing())
+                .map(|s| s.begin_seq())
+                .min();
+        }
+
+        if self.override_count.load(Ordering::Relaxed) > 0 {
+            let overrides = self.isolation_overrides.lock();
+            return transactions
+                .iter()
+                .filter(|(id, s)| s.is_active_or_committing() && overrides.get(*id) == Some(&1))
+                .map(|(_, s)| s.begin_seq())
+                .min();
+        }
+
+        None
+    }
+
     /// Begins a new transaction.
     pub fn begin_transaction(&self) -> (i64, i64) {
         if !self.accepting.load(Ordering::Acquire) {
@@ -621,6 +691,16 @@ impl TransactionRegistry {
             .unwrap_or(0)
     }
 
+    /// Gets the commit sequence for a transaction that is currently committing.
+    /// Returns 0 if the transaction is not found or not in committing state.
+    pub fn get_committing_sequence(&self, txn_id: i64) -> i64 {
+        self.transactions
+            .lock()
+            .get(txn_id)
+            .map(|e| e.commit_seq())
+            .unwrap_or(0)
+    }
+
     /// Gets the current sequence number.
     pub fn get_current_sequence(&self) -> i64 {
         self.next_sequence.load(Ordering::Acquire)
@@ -629,6 +709,35 @@ impl TransactionRegistry {
     /// Gets the current commit sequence number.
     pub fn current_commit_sequence(&self) -> i64 {
         self.next_sequence.load(Ordering::Acquire)
+    }
+
+    /// Gets a snapshot-safe commit sequence cutoff.
+    ///
+    /// Returns the minimum commit_seq among all in-flight (committing)
+    /// transactions minus 1, or `current_commit_sequence()` if none are
+    /// in-flight. This guarantees all commits with seq ≤ the returned
+    /// value have fully completed (versions applied, tombstones applied,
+    /// removed from transactions map).
+    pub fn safe_snapshot_cutoff(&self) -> i64 {
+        let txns = self.transactions.lock();
+        let mut min_committing = i64::MAX;
+        for (_, entry) in txns.iter() {
+            if entry.status() == TxnStatus::Committing {
+                let seq = entry.commit_seq();
+                if seq > 0 && seq < min_committing {
+                    min_committing = seq;
+                }
+            }
+        }
+        // Read next_sequence WHILE holding the lock to prevent a concurrent
+        // start_commit from bumping the sequence between the scan and this read.
+        let current = self.next_sequence.load(Ordering::Acquire);
+        drop(txns);
+        if min_committing == i64::MAX {
+            current
+        } else {
+            min_committing - 1
+        }
     }
 
     /// Runs garbage collection.
@@ -772,6 +881,22 @@ impl TransactionRegistry {
     #[inline]
     pub fn active_count(&self) -> usize {
         self.active_txn_count.load(Ordering::Relaxed)
+    }
+
+    /// Returns all currently active transaction IDs.
+    ///
+    /// Used by cleanup routines to identify which transactions still hold
+    /// resources (e.g., pending cold deletes in segment managers).
+    pub fn active_transaction_ids(&self) -> Vec<i64> {
+        self.transactions
+            .lock()
+            .iter()
+            .filter(|(_, s)| {
+                let status = s.status();
+                status == TxnStatus::Active || status == TxnStatus::Committing
+            })
+            .map(|(id, _)| id)
+            .collect()
     }
 
     /// Gets the count of entries in snapshot_seqs.

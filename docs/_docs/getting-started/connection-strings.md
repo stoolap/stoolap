@@ -46,7 +46,8 @@ file:///path/to/data
 
 Data persisted to disk:
 - WAL (Write-Ahead Logging) for crash recovery
-- Periodic snapshots for fast recovery
+- Immutable cold volumes for fast startup on large tables
+- Optional backup snapshots for disaster recovery
 - Same MVCC features as memory mode
 - Survives process restarts
 
@@ -62,23 +63,30 @@ file:///tmp/test_db
 Configuration can be set via query parameters in the connection string:
 
 ```
-file:///path/to/data?sync_mode=normal&snapshot_interval=60
+file:///path/to/data?sync_mode=normal&checkpoint_interval=60
 ```
 
 | Option | Values | Default | Description |
 |--------|--------|---------|-------------|
-| `sync` / `sync_mode` | none, normal, full (or 0, 1, 2) | normal | WAL synchronization mode |
-| `snapshot_interval` | Integer (seconds) | 300 | Time between automatic snapshots |
-| `keep_snapshots` | Integer | 5 | Number of snapshots to retain |
+| `sync` / `sync_mode` | none/off, normal, full (or 0, 1, 2) | normal | WAL synchronization mode. none/off=no fsync (data durable at checkpoint), normal=fsync every 1s, full=fsync every write |
+| `checkpoint_interval` | Integer (seconds) | 60 | Time between automatic checkpoint cycles |
+| `compact_threshold` | Integer (min 2) | 4 | Sub-target volumes per table before merging |
+| `keep_snapshots` | Integer | 3 | Backup snapshots to retain per table |
 | `wal_flush_trigger` | Integer (bytes) | 32768 | Size in bytes before WAL flush |
 | `wal_buffer_size` | Integer (bytes) | 65536 | WAL write buffer size |
 | `wal_max_size` | Integer (bytes) | 67108864 | Maximum WAL file size (64MB) |
-| `commit_batch_size` | Integer | 100 | Operations batched per commit flush |
-| `sync_interval_ms` | Integer (ms) | 10 | Background sync interval |
-| `wal_compression` | on/off | on | Enable WAL compression |
-| `snapshot_compression` | on/off | on | Enable snapshot compression |
-| `compression` | on/off | on | Enable both WAL and snapshot compression |
-| `compression_threshold` | Integer (bytes) | 64 | Minimum size for compression |
+| `wal_compression` | on/off | on | Enable LZ4 compression for WAL entries |
+| `volume_compression` | on/off | on | Enable LZ4 compression for cold volume files |
+| `compression` | on/off | on | Enable LZ4 compression for both WAL and volumes |
+| `compression_threshold` | Integer (bytes) | 64 | Minimum size for WAL compression |
+| `checkpoint_on_close` | on/off | on | Seal all hot rows to volumes on clean shutdown |
+| `commit_batch_size` | Integer | 100 | Commits to batch before sync |
+| `sync_interval_ms` / `sync_interval` | Integer (ms) | 1000 | Minimum time between syncs in normal mode |
+| `target_volume_rows` | Integer | 1048576 | Target rows per cold volume (min: 65536). Controls compaction split boundary. |
+
+Legacy parameter names are accepted for backward compatibility:
+- `snapshot_interval` maps to `checkpoint_interval`
+- `snapshot_compression` maps to `compression` (sets both WAL and volume)
 
 ### Cleanup Options
 
@@ -101,9 +109,9 @@ file:///data/mydb?cleanup=off
 
 | Mode | Value | Description |
 |------|-------|-------------|
-| none | 0 | No sync (fastest, risk of data loss) |
-| normal | 1 | Sync on flush (balanced) |
-| full | 2 | Sync every write (maximum durability) |
+| none | 0 | No fsync. Data is durable only after checkpoint writes volumes to disk. |
+| normal | 1 | Fsync every 1 second (configurable via `sync_interval_ms`). DDL fsyncs immediately. Comparable to SQLite WAL + synchronous=NORMAL. |
+| full | 2 | Fsync on every write operation. Maximum durability. |
 
 ## Usage Examples
 
@@ -123,7 +131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::open("file:///data/mydb")?;
 
     // With configuration options
-    let db = Database::open("file:///data/mydb?sync_mode=full&snapshot_interval=60")?;
+    let db = Database::open("file:///data/mydb?sync_mode=full&checkpoint_interval=60")?;
 
     // Execute SQL
     db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ())?;
@@ -149,12 +157,36 @@ stoolap
 # Persistent database
 stoolap --db "file:///data/mydb"
 
-# With configuration
+# With configuration via DSN
 stoolap --db "file:///data/mydb?sync_mode=full"
+
+# With configuration via CLI flags
+stoolap --db "file:///data/mydb" --sync full --checkpoint-interval 30
 
 # Execute a query directly
 stoolap --db "file:///data/mydb" -e "SELECT * FROM users"
+
+# Execute from a SQL file
+stoolap --db "file:///data/mydb" -f script.sql
 ```
+
+### Backup and Restore
+
+```bash
+# Create a backup snapshot
+stoolap --db "file:///data/mydb" --snapshot
+
+# Restore from a specific backup by timestamp (recommended)
+stoolap --db "file:///data/mydb" --restore "20260315-100000.000"
+
+# Restore from latest backup
+stoolap --db "file:///data/mydb" --restore
+
+# Recovery from corrupted volumes/manifests (cleans up first)
+stoolap --db "file:///data/mydb" --reset-volumes --restore
+```
+
+The `--restore` command opens the database and replaces current data with snapshot data. If volumes or manifests are corrupted, use `--reset-volumes --restore` which removes bad on-disk state before opening.
 
 ## PRAGMA Configuration
 
@@ -163,16 +195,25 @@ You can also configure settings after connection using PRAGMA commands:
 ```sql
 -- Set configuration values
 PRAGMA sync_mode = 2;
-PRAGMA snapshot_interval = 60;
+PRAGMA checkpoint_interval = 60;
+PRAGMA compact_threshold = 4;
 PRAGMA keep_snapshots = 5;
 PRAGMA wal_flush_trigger = 500;
 
 -- Read current values
 PRAGMA sync_mode;
-PRAGMA snapshot_interval;
+PRAGMA checkpoint_interval;
+PRAGMA keep_snapshots;
 
--- Create a snapshot manually
-PRAGMA snapshot;
+-- Create a backup snapshot
+PRAGMA SNAPSHOT;
+
+-- Restore from a backup snapshot
+PRAGMA RESTORE;
+PRAGMA RESTORE = '20260315-100000.000';
+
+-- Run checkpoint cycle manually
+PRAGMA CHECKPOINT;
 
 -- Manual cleanup (works on all platforms including WASM)
 VACUUM;
@@ -187,5 +228,6 @@ See the [PRAGMA Commands]({% link _docs/sql-commands/pragma-commands.md %}) docu
 1. **Development**: Use `memory://` for fast iteration and testing
 2. **Production**: Use `file://` with appropriate `sync_mode`
 3. **Critical data**: Set `sync_mode=full` for maximum durability
-4. **High throughput**: Use `sync_mode=normal` with periodic `PRAGMA snapshot`
-5. **Limited disk space**: Reduce `keep_snapshots` to retain fewer snapshots
+4. **High throughput**: Use `sync_mode=normal` with the default checkpoint cycle
+5. **Backup**: Use `PRAGMA SNAPSHOT` or `--snapshot` for backups, `keep_snapshots` to control retention
+6. **Recovery**: Use `--reset-volumes --restore` from CLI to recover from corrupted state

@@ -715,3 +715,271 @@ fn test_window_functions_with_partition() {
 
     assert_eq!(row_count, 7, "Expected 7 rows, got {}", row_count);
 }
+
+#[test]
+fn test_row_number_partition_by_function_expression() {
+    let db = Database::open_in_memory().unwrap();
+
+    db.execute(
+        "CREATE TABLE metrics (
+            id INTEGER PRIMARY KEY,
+            measurement TEXT,
+            field TEXT,
+            value FLOAT,
+            timestamp TIMESTAMP
+        )",
+        (),
+    )
+    .unwrap();
+
+    // Insert data across multiple 30-minute time buckets
+    // Bucket 1: 10:00-10:29 (2 rows for field_a, 1 for field_b)
+    db.execute(
+        "INSERT INTO metrics VALUES
+            (1, 'account', 'field_a', 1.0, '2026-03-29T10:00:00Z'),
+            (2, 'account', 'field_a', 2.0, '2026-03-29T10:15:00Z'),
+            (3, 'account', 'field_b', 3.0, '2026-03-29T10:05:00Z')",
+        (),
+    )
+    .unwrap();
+
+    // Bucket 2: 10:30-10:59 (2 rows for field_a, 1 for field_b)
+    db.execute(
+        "INSERT INTO metrics VALUES
+            (4, 'account', 'field_a', 4.0, '2026-03-29T10:30:00Z'),
+            (5, 'account', 'field_a', 5.0, '2026-03-29T10:45:00Z'),
+            (6, 'account', 'field_b', 6.0, '2026-03-29T10:35:00Z')",
+        (),
+    )
+    .unwrap();
+
+    // Bucket 3: 11:00-11:29 (1 row for field_a)
+    db.execute(
+        "INSERT INTO metrics VALUES
+            (7, 'account', 'field_a', 7.0, '2026-03-29T11:00:00Z')",
+        (),
+    )
+    .unwrap();
+
+    // Use ROW_NUMBER with TIME_TRUNC in PARTITION BY via CTE
+    let result = db
+        .query(
+            "WITH bucketed AS (
+                SELECT
+                    TIME_TRUNC('30m', timestamp) as _time,
+                    field as _field,
+                    value as _value,
+                    timestamp,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY TIME_TRUNC('30m', timestamp), field
+                        ORDER BY timestamp DESC
+                    ) as rn
+                FROM metrics
+                WHERE measurement = 'account'
+            )
+            SELECT _time, _field, _value
+            FROM bucketed
+            WHERE rn = 1
+            ORDER BY _field, _time",
+            (),
+        )
+        .unwrap();
+
+    // Expected: one row per (time_bucket, field) combination with the latest value
+    // Bucket 10:00 + field_a -> value 2.0 (latest at 10:15)
+    // Bucket 10:00 + field_b -> value 3.0
+    // Bucket 10:30 + field_a -> value 5.0 (latest at 10:45)
+    // Bucket 10:30 + field_b -> value 6.0
+    // Bucket 11:00 + field_a -> value 7.0
+    // Total: 5 rows
+    let mut row_count = 0;
+    for row in result {
+        let _row = row.expect("Failed to get row");
+        row_count += 1;
+    }
+    assert_eq!(
+        row_count, 5,
+        "PARTITION BY TIME_TRUNC() should create separate partitions per time bucket"
+    );
+}
+
+#[test]
+fn test_partition_by_arithmetic_expression() {
+    let db = Database::open_in_memory().unwrap();
+
+    db.execute(
+        "CREATE TABLE scores (id INTEGER PRIMARY KEY, category INTEGER, score INTEGER)",
+        (),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO scores VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 3, 50), (6, 3, 60)",
+        (),
+    )
+    .unwrap();
+
+    // PARTITION BY with arithmetic expression: category / 2
+    // category 1 -> 0, category 2 -> 1, category 3 -> 1
+    // So partition 0 has 2 rows, partition 1 has 4 rows
+    let result = db
+        .query(
+            "SELECT category, score, ROW_NUMBER() OVER (PARTITION BY category / 2 ORDER BY score) as rn FROM scores ORDER BY category, score",
+            (),
+        )
+        .unwrap();
+
+    let mut rows = vec![];
+    for row in result {
+        let row = row.expect("Failed to get row");
+        let cat: i64 = row.get(0).unwrap();
+        let rn: i64 = row.get(2).unwrap();
+        rows.push((cat, rn));
+    }
+
+    // category=1 -> partition 0, rn=1,2
+    // category=2 -> partition 1, rn=1,2
+    // category=3 -> partition 1, rn=3,4
+    assert_eq!(rows.len(), 6);
+    assert_eq!(rows[0], (1, 1)); // cat=1, rn=1
+    assert_eq!(rows[1], (1, 2)); // cat=1, rn=2
+    assert_eq!(rows[2], (2, 1)); // cat=2, rn=1
+    assert_eq!(rows[3], (2, 2)); // cat=2, rn=2
+    assert_eq!(rows[4], (3, 3)); // cat=3, rn=3
+    assert_eq!(rows[5], (3, 4)); // cat=3, rn=4
+}
+
+#[test]
+fn test_multiple_window_functions_with_limit() {
+    // Tests PARTITION BY + LIMIT streaming path with multiple window functions.
+    // Previously, only the first window function was computed and its value was
+    // reused for all window columns.
+    let db = Database::open_in_memory().unwrap();
+
+    db.execute(
+        "CREATE TABLE sales (id INTEGER PRIMARY KEY, dept TEXT, amount INTEGER)",
+        (),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO sales VALUES (1, 'A', 100), (2, 'A', 200), (3, 'A', 300),
+         (4, 'B', 400), (5, 'B', 500)",
+        (),
+    )
+    .unwrap();
+
+    // Query with two different window functions + LIMIT (triggers streaming path)
+    let result = db
+        .query(
+            "SELECT dept, amount,
+                    ROW_NUMBER() OVER (PARTITION BY dept ORDER BY amount) as rn,
+                    SUM(amount) OVER (PARTITION BY dept ORDER BY amount) as running_sum
+             FROM sales
+             LIMIT 3",
+            (),
+        )
+        .unwrap();
+
+    let mut rows = vec![];
+    for row in result {
+        let row = row.expect("Failed to get row");
+        let dept: String = row.get(0).unwrap();
+        let amount: i64 = row.get(1).unwrap();
+        let rn: i64 = row.get(2).unwrap();
+        let running_sum: i64 = row.get(3).unwrap();
+        rows.push((dept, amount, rn, running_sum));
+    }
+
+    assert_eq!(rows.len(), 3);
+    // Each window function should have its own distinct values
+    for (_, _, rn, running_sum) in &rows {
+        // ROW_NUMBER values should be small positive integers
+        assert!(*rn >= 1 && *rn <= 3);
+        // Running sum should be >= the amount (accumulates)
+        assert!(*running_sum >= *rn);
+        // They should NOT be equal (which would happen if the same value was reused)
+    }
+}
+
+#[test]
+fn test_window_with_order_by_and_limit() {
+    // Tests that top-level ORDER BY is applied before LIMIT, even with PARTITION BY.
+    // Previously, the streaming path would truncate to LIMIT first, then ORDER BY
+    // would sort only the truncated set.
+    let db = Database::open_in_memory().unwrap();
+
+    db.execute(
+        "CREATE TABLE scores (id INTEGER PRIMARY KEY, dept TEXT, score INTEGER)",
+        (),
+    )
+    .unwrap();
+
+    db.execute(
+        "INSERT INTO scores VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 50), (4, 'B', 40)",
+        (),
+    )
+    .unwrap();
+
+    // ORDER BY score DESC LIMIT 1 should return the global highest score (50)
+    let result = db
+        .query(
+            "SELECT dept, score, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY score) as rn
+             FROM scores
+             ORDER BY score DESC
+             LIMIT 1",
+            (),
+        )
+        .unwrap();
+
+    let mut rows = vec![];
+    for row in result {
+        let row = row.expect("Failed to get row");
+        let score: i64 = row.get(1).unwrap();
+        rows.push(score);
+    }
+
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0], 50,
+        "ORDER BY score DESC LIMIT 1 should return the global top score"
+    );
+}
+
+#[test]
+fn test_multiple_windows_in_single_expression() {
+    // Tests that an expression containing two window functions evaluates correctly.
+    // Previously, only the first window was captured and its value was reused for both.
+    let db = Database::open_in_memory().unwrap();
+
+    db.execute("CREATE TABLE vals (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+
+    db.execute("INSERT INTO vals VALUES (1, 10), (2, 20), (3, 30)", ())
+        .unwrap();
+
+    // ROW_NUMBER() produces 1,2,3 and SUM(v) OVER() produces 60 for all rows.
+    // The expression should compute ROW_NUMBER() + SUM(v) OVER() for each row.
+    let result = db
+        .query(
+            "SELECT v, ROW_NUMBER() OVER (ORDER BY v) + SUM(v) OVER () as combined FROM vals ORDER BY v",
+            (),
+        )
+        .unwrap();
+
+    let mut rows = vec![];
+    for row in result {
+        let row = row.expect("Failed to get row");
+        let v: i64 = row.get(0).unwrap();
+        let combined: i64 = row.get(1).unwrap();
+        rows.push((v, combined));
+    }
+
+    assert_eq!(rows.len(), 3);
+    // ROW_NUMBER()=1 + SUM=60 = 61
+    assert_eq!(rows[0], (10, 61));
+    // ROW_NUMBER()=2 + SUM=60 = 62
+    assert_eq!(rows[1], (20, 62));
+    // ROW_NUMBER()=3 + SUM=60 = 63
+    assert_eq!(rows[2], (30, 63));
+}

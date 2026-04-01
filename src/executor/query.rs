@@ -1886,7 +1886,14 @@ impl Executor {
         }
 
         // Try to get distinct values from the index
-        if let Some(distinct_values) = table.get_partition_values(&column_name) {
+        let distinct_values = table.get_partition_values(&column_name).or_else(|| {
+            // Fallback: dictionary-based extraction from cold volumes
+            let schema = table.schema();
+            let col_idx = *schema.column_index_map().get(&column_name)?;
+            table.compute_distinct_values(col_idx)
+        });
+
+        if let Some(distinct_values) = distinct_values {
             // Build output column name (use alias if present)
             let output_name = match &stmt.columns[0] {
                 Expression::Aliased(aliased) => aliased.alias.value.to_string(),
@@ -1983,12 +1990,27 @@ impl Executor {
         // - SELECT SUM(col), MIN(col), MAX(col) FROM table
         // Must check before any row collection happens
         if classification.has_aggregation && !classification.has_window_functions {
-            // First try global aggregation pushdown (no GROUP BY)
+            // First try global aggregation pushdown (no GROUP BY, no WHERE)
             if let Some(result) =
                 self.try_aggregation_pushdown(table.as_ref(), stmt, ctx, classification)?
             {
                 let columns = CompactArc::new(result.columns().to_vec());
                 return Ok((result, columns, false, None));
+            }
+
+            // Try filtered aggregation pushdown (WHERE + aggregates, no GROUP BY)
+            // Pushes both the filter and aggregation into the storage layer
+            if classification.has_where {
+                if let Some(result) = self.try_filtered_aggregation_pushdown(
+                    table.as_ref(),
+                    stmt,
+                    ctx,
+                    classification,
+                    &all_columns,
+                )? {
+                    let columns = CompactArc::new(result.columns().to_vec());
+                    return Ok((result, columns, false, None));
+                }
             }
 
             // Try storage-level GROUP BY aggregation (no WHERE clause)
@@ -3243,13 +3265,14 @@ impl Executor {
             let mut rows = RowVec::with_capacity(64);
             let mut row_count = 0u64;
             while scanner.next() {
-                // Check for cancellation every 100 rows
                 row_count += 1;
                 if row_count.is_multiple_of(100) {
                     ctx.check_cancelled()?;
                 }
-                // Use row_count as synthetic row ID for scanner-based paths
                 rows.push((row_count as i64, scanner.take_row()));
+            }
+            if let Some(e) = scanner.err() {
+                return Err(crate::core::Error::internal(format!("scan error: {}", e)));
             }
             (rows, None, None)
         } else {
@@ -3333,7 +3356,10 @@ impl Executor {
                             (
                                 all_rows,
                                 None,
-                                Some(WindowPreGroupedState { partition_map }),
+                                Some(WindowPreGroupedState {
+                                    partition_map,
+                                    partition_column: col_lower.clone(),
+                                }),
                             )
                         } else {
                             (table.collect_all_rows(None)?, None, None)
@@ -7866,15 +7892,24 @@ impl Executor {
 
         match pragma_name.as_str() {
             "SNAPSHOT" => {
-                // Handle PRAGMA SNAPSHOT - creates a manual snapshot
+                // PRAGMA SNAPSHOT: Create a full backup snapshot of all tables.
+                // Writes .bin files to snapshots/ directory. keep_snapshots limits retention.
                 if stmt.value.is_some() {
                     return Err(Error::internal("PRAGMA SNAPSHOT does not accept values"));
                 }
 
-                // Create a snapshot
+                {
+                    let active_tx = self.active_transaction.lock().unwrap();
+                    if active_tx.is_some() {
+                        return Err(Error::internal(
+                            "PRAGMA SNAPSHOT cannot run inside a transaction. \
+                             Commit or rollback first.",
+                        ));
+                    }
+                }
+
                 self.engine.create_snapshot()?;
 
-                // Return success result
                 let columns = vec!["result".to_string()];
                 let mut rows = RowVec::with_capacity(1);
                 rows.push((
@@ -7884,45 +7919,189 @@ impl Executor {
                 Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
             "CHECKPOINT" => {
-                // Alias for SNAPSHOT (SQLite-style)
+                // PRAGMA CHECKPOINT: Run the checkpoint cycle (seal hot to volumes,
+                // persist manifests, compact, WAL truncate).
                 if stmt.value.is_some() {
                     return Err(Error::internal("PRAGMA CHECKPOINT does not accept values"));
                 }
 
-                self.engine.create_snapshot()?;
+                {
+                    let active_tx = self.active_transaction.lock().unwrap();
+                    if active_tx.is_some() {
+                        return Err(Error::internal(
+                            "PRAGMA CHECKPOINT cannot run inside a transaction. \
+                             Commit or rollback first.",
+                        ));
+                    }
+                }
+
+                self.engine.force_checkpoint_cycle()?;
 
                 let columns = vec!["result".to_string()];
                 let mut rows = RowVec::with_capacity(1);
                 rows.push((
                     0,
-                    Row::from_values(vec![Value::text("Checkpoint created successfully")]),
+                    Row::from_values(vec![Value::text("Checkpoint completed successfully")]),
                 ));
                 Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
-            "SNAPSHOT_INTERVAL" => {
+            "RESTORE" => {
+                // PRAGMA RESTORE: Restore database from latest backup snapshot.
+                // PRAGMA RESTORE = 'YYYYMMDD-HHMMSS.fff': Restore from specific snapshot.
+                {
+                    let active_tx = self.active_transaction.lock().unwrap();
+                    if active_tx.is_some() {
+                        return Err(Error::internal(
+                            "PRAGMA RESTORE cannot run inside a transaction. \
+                             Commit or rollback first.",
+                        ));
+                    }
+                }
+
+                let timestamp = if let Some(ref value) = stmt.value {
+                    Some(self.extract_pragma_string_value(value)?)
+                } else {
+                    None
+                };
+
+                let result_msg = self.engine.restore_snapshot(timestamp.as_deref())?;
+
+                // Clear all query caches since all data has changed
+                self.semantic_cache.clear();
+                self.query_cache.clear();
+                crate::executor::context::clear_scalar_subquery_cache();
+                crate::executor::context::clear_in_subquery_cache();
+                crate::executor::context::clear_semi_join_cache();
+
+                let columns = vec!["result".to_string()];
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((0, Row::from_values(vec![Value::text(&result_msg)])));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
+            "DEDUP_SEGMENTS" => {
+                let columns = vec!["message".to_string()];
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![Value::text(
+                        "Dedup segments is no longer needed (handled automatically)",
+                    )]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
+            "SNAPSHOT_INTERVAL" | "CHECKPOINT_INTERVAL" => {
                 let config = self.engine.config();
                 let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
                 if let Some(ref value) = stmt.value {
-                    // Set mode: PRAGMA snapshot_interval = 60
+                    // Set mode: PRAGMA checkpoint_interval = 60
                     let new_value = self.extract_pragma_int_value(value)?;
+                    if new_value < 0 {
+                        return Err(Error::internal("checkpoint_interval must be non-negative"));
+                    }
                     let mut new_config = config.clone();
-                    new_config.persistence.snapshot_interval = new_value as u32;
+                    new_config.persistence.checkpoint_interval = new_value as u32;
                     self.engine.update_engine_config(new_config)?;
                     let mut rows = RowVec::with_capacity(1);
                     rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
                 } else {
-                    // Read mode: PRAGMA snapshot_interval
+                    // Read mode: PRAGMA checkpoint_interval
                     let mut rows = RowVec::with_capacity(1);
                     rows.push((
                         0,
                         Row::from_values(vec![Value::Integer(
-                            config.persistence.snapshot_interval as i64,
+                            config.persistence.checkpoint_interval as i64,
                         )]),
                     ));
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
+            }
+            "COMPACT_THRESHOLD" => {
+                let config = self.engine.config();
+                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
+
+                if let Some(ref value) = stmt.value {
+                    let new_value = self.extract_pragma_int_value(value)?;
+                    if new_value < 0 {
+                        return Err(Error::internal("compact_threshold must be non-negative"));
+                    }
+                    let mut new_config = config.clone();
+                    new_config.persistence.compact_threshold = new_value as u32;
+                    self.engine.update_engine_config(new_config)?;
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
+                } else {
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((
+                        0,
+                        Row::from_values(vec![Value::Integer(
+                            config.persistence.compact_threshold as i64,
+                        )]),
+                    ));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
+                }
+            }
+            "TARGET_VOLUME_ROWS" => {
+                let config = self.engine.config();
+                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
+
+                if let Some(ref value) = stmt.value {
+                    let new_value = self.extract_pragma_int_value(value)?;
+                    if new_value < 65536 {
+                        return Err(Error::internal("target_volume_rows must be at least 65536"));
+                    }
+                    let mut new_config = config.clone();
+                    new_config.persistence.target_volume_rows = new_value as usize;
+                    self.engine.update_engine_config(new_config)?;
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
+                } else {
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((
+                        0,
+                        Row::from_values(vec![Value::Integer(
+                            config.persistence.target_volume_rows as i64,
+                        )]),
+                    ));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
+                }
+            }
+            "SYNC_MODE" => {
+                let config = self.engine.config();
+                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
+
+                if stmt.value.is_some() {
+                    return Err(Error::NotSupported(
+                        "sync_mode cannot be changed at runtime. Set it in the connection string: file:///path?sync_mode=none|normal|full".to_string(),
+                    ));
+                }
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![Value::Integer(config.persistence.sync_mode as i64)]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
+            "WAL_FLUSH_TRIGGER" => {
+                let config = self.engine.config();
+                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
+
+                if stmt.value.is_some() {
+                    return Err(Error::NotSupported(
+                        "wal_flush_trigger cannot be changed at runtime. Set it in the connection string: file:///path?wal_flush_trigger=N".to_string(),
+                    ));
+                }
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![Value::Integer(
+                        config.persistence.wal_flush_trigger as i64,
+                    )]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
             "KEEP_SNAPSHOTS" => {
                 let config = self.engine.config();
@@ -7930,6 +8109,9 @@ impl Executor {
 
                 if let Some(ref value) = stmt.value {
                     let new_value = self.extract_pragma_int_value(value)?;
+                    if new_value < 0 {
+                        return Err(Error::internal("keep_snapshots must be non-negative"));
+                    }
                     let mut new_config = config.clone();
                     new_config.persistence.keep_snapshots = new_value as u32;
                     self.engine.update_engine_config(new_config)?;
@@ -7947,58 +8129,42 @@ impl Executor {
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
             }
-            "SYNC_MODE" => {
-                let config = self.engine.config();
-                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
-
-                if let Some(ref value) = stmt.value {
-                    let new_value = self.extract_pragma_int_value(value)?;
-                    let mut new_config = config.clone();
-                    new_config.persistence.sync_mode = match new_value {
-                        0 => crate::storage::SyncMode::None,
-                        1 => crate::storage::SyncMode::Normal,
-                        2 => crate::storage::SyncMode::Full,
-                        _ => {
-                            return Err(Error::internal(
-                                "sync_mode must be 0 (none), 1 (normal), or 2 (full)",
-                            ))
-                        }
-                    };
-                    self.engine.update_engine_config(new_config)?;
-                    let mut rows = RowVec::with_capacity(1);
-                    rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
-                    Ok(Box::new(ExecutorResult::new(columns, rows)))
-                } else {
-                    let mut rows = RowVec::with_capacity(1);
-                    rows.push((
-                        0,
-                        Row::from_values(vec![Value::Integer(config.persistence.sync_mode as i64)]),
+            "VOLUME_STATS" => {
+                if stmt.value.is_some() {
+                    return Err(Error::internal(
+                        "PRAGMA VOLUME_STATS does not accept values",
                     ));
-                    Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
-            }
-            "WAL_FLUSH_TRIGGER" => {
-                let config = self.engine.config();
-                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
 
-                if let Some(ref value) = stmt.value {
-                    let new_value = self.extract_pragma_int_value(value)?;
-                    let mut new_config = config.clone();
-                    new_config.persistence.wal_flush_trigger = new_value as usize;
-                    self.engine.update_engine_config(new_config)?;
-                    let mut rows = RowVec::with_capacity(1);
-                    rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
-                    Ok(Box::new(ExecutorResult::new(columns, rows)))
-                } else {
-                    let mut rows = RowVec::with_capacity(1);
+                let columns = vec![
+                    "table_name".to_string(),
+                    "segment_id".to_string(),
+                    "tier".to_string(),
+                    "row_count".to_string(),
+                    "memory_bytes".to_string(),
+                    "idle_cycles".to_string(),
+                    "tombstones".to_string(),
+                ];
+
+                let stats = self.engine.volume_stats();
+                let mut rows = RowVec::with_capacity(stats.len());
+                for (i, (table, seg_id, tier, row_count, mem, idle, ts)) in
+                    stats.into_iter().enumerate()
+                {
                     rows.push((
-                        0,
-                        Row::from_values(vec![Value::Integer(
-                            config.persistence.wal_flush_trigger as i64,
-                        )]),
+                        i as i64,
+                        Row::from_values(vec![
+                            Value::text(&table),
+                            Value::Integer(seg_id as i64),
+                            Value::text(tier),
+                            Value::Integer(row_count as i64),
+                            Value::Integer(mem as i64),
+                            Value::Integer(idle as i64),
+                            Value::Integer(ts as i64),
+                        ]),
                     ));
-                    Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
             "VACUUM" => {
                 if stmt.value.is_some() {
@@ -8071,6 +8237,15 @@ impl Executor {
             crate::parser::Expression::IntegerLiteral(lit) => Ok(lit.value),
             crate::parser::Expression::FloatLiteral(lit) => Ok(lit.value as i64),
             _ => Err(Error::internal("PRAGMA value must be an integer")),
+        }
+    }
+
+    fn extract_pragma_string_value(&self, value: &crate::parser::Expression) -> Result<String> {
+        match value {
+            crate::parser::Expression::StringLiteral(lit) => Ok(lit.value.to_string()),
+            _ => Err(Error::internal(
+                "PRAGMA value must be a quoted string, e.g. 'YYYYMMDD-HHMMSS.fff'",
+            )),
         }
     }
 
