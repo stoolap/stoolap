@@ -3924,18 +3924,29 @@ impl Table for SegmentedTable {
                     {
                         continue;
                     }
-                    if let Some(pi) = pk_idx {
-                        if pi < vol.meta.column_types.len()
-                            && matches!(
-                                vol.meta.column_types[pi],
-                                DataType::Integer | DataType::Timestamp
-                            )
-                            && pi < vol.columns.len()
-                            && !vol.columns[pi].is_null(i)
-                        {
-                            let pk_val = vol.columns[pi].get_i64(i);
-                            if hot_pks.contains(&pk_val) {
-                                continue;
+                    if let Some(si) = pk_idx {
+                        // Resolve PK schema index to physical volume index via mapping
+                        let phys_pk = if si < mapping.sources.len() {
+                            match &mapping.sources[si] {
+                                super::writer::ColSource::Volume(vi) => Some(*vi),
+                                super::writer::ColSource::Default(_) => None,
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(pi) = phys_pk {
+                            if pi < vol.meta.column_types.len()
+                                && matches!(
+                                    vol.meta.column_types[pi],
+                                    DataType::Integer | DataType::Timestamp
+                                )
+                                && pi < vol.columns.len()
+                                && !vol.columns[pi].is_null(i)
+                            {
+                                let pk_val = vol.columns[pi].get_i64(i);
+                                if hot_pks.contains(&pk_val) {
+                                    continue;
+                                }
                             }
                         }
                     }
