@@ -3133,13 +3133,12 @@ impl Table for SegmentedTable {
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-        let current_schema = self.hot.schema();
 
         let default_val = self.column_default(col_idx);
         let has_non_null_default = !default_val.is_null();
-        for (seg_id, cs) in volumes.iter() {
+        for (_seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
+            let mapping = &cs.mapping;
             // Resolve partition column through mapping (handles DROP COLUMN ordinal shifts)
             let phys_col = if col_idx < mapping.sources.len() {
                 match &mapping.sources[col_idx] {
@@ -3171,7 +3170,7 @@ impl Table for SegmentedTable {
                 let row = if mapping.is_identity {
                     vol.get_row(i)
                 } else {
-                    vol.get_row_mapped(i, &mapping)
+                    vol.get_row_mapped(i, mapping)
                 };
                 groups.entry(val).or_default().push((rid, row));
             }
@@ -3216,13 +3215,12 @@ impl Table for SegmentedTable {
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-        let current_schema = self.hot.schema();
 
         let default_val = self.column_default(col_idx);
         let has_non_null_default = !default_val.is_null();
         for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
+            let mapping = &cs.mapping;
             // Resolve partition column through mapping (handles DROP COLUMN ordinal shifts)
             let phys_col = if col_idx < mapping.sources.len() {
                 match &mapping.sources[col_idx] {
@@ -3279,7 +3277,7 @@ impl Table for SegmentedTable {
                     let row = if mapping.is_identity {
                         vol.get_row(i)
                     } else {
-                        vol.get_row_mapped(i, &mapping)
+                        vol.get_row_mapped(i, mapping)
                     };
                     result.push((rid, row));
                 }
