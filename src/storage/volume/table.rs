@@ -1782,13 +1782,14 @@ impl Table for SegmentedTable {
 
         // Phase 1: Build authority map (row_id → volume index).
         // Iterates cold row_ids newest-first so newer volumes win dedup.
-        // Uses has_row_id() B-tree point lookup for hot check instead
-        // of collecting all hot row_ids. Cost: O(cold_ids) integer ops.
+        // Collect hot row_ids from actual hot scan results to prevent the
+        // seal race (remove_sealed_rows between check and hot scan).
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
-        let mut pending_tomb: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(1_000, Default::default());
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut pending_tomb);
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
         let total_cold_rows: usize = volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
         let mut authority: FxHashMap<i64, usize> = FxHashMap::with_capacity_and_hasher(
@@ -1797,10 +1798,7 @@ impl Table for SegmentedTable {
         );
         for (nf_idx, (_seg_id, cs)) in volumes.iter().enumerate() {
             for &rid in &cs.volume.meta.row_ids {
-                if self.hot.has_row_id(rid)
-                    || self.is_row_tombstoned(&tombstones_arc, rid)
-                    || pending_tomb.contains(&rid)
-                {
+                if hot_skip.contains(&rid) || self.is_row_tombstoned(&tombstones_arc, rid) {
                     continue;
                 }
                 authority.entry(rid).or_insert(nf_idx);
@@ -3143,9 +3141,13 @@ impl Table for SegmentedTable {
             let vol = &cs.volume;
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
             // Resolve partition column through mapping (handles DROP COLUMN ordinal shifts)
-            let phys_col = match &mapping.sources[col_idx] {
-                super::writer::ColSource::Volume(idx) => Some(*idx),
-                super::writer::ColSource::Default(_) => None,
+            let phys_col = if col_idx < mapping.sources.len() {
+                match &mapping.sources[col_idx] {
+                    super::writer::ColSource::Volume(idx) => Some(*idx),
+                    super::writer::ColSource::Default(_) => None,
+                }
+            } else {
+                None
             };
 
             for i in 0..vol.meta.row_count {
@@ -3222,9 +3224,13 @@ impl Table for SegmentedTable {
             let vol = &cs.volume;
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
             // Resolve partition column through mapping (handles DROP COLUMN ordinal shifts)
-            let phys_col = match &mapping.sources[col_idx] {
-                super::writer::ColSource::Volume(idx) => Some(*idx),
-                super::writer::ColSource::Default(_) => None,
+            let phys_col = if col_idx < mapping.sources.len() {
+                match &mapping.sources[col_idx] {
+                    super::writer::ColSource::Volume(idx) => Some(*idx),
+                    super::writer::ColSource::Default(_) => None,
+                }
+            } else {
+                None
             };
             // Skip volume if missing column and default doesn't match target
             if phys_col.is_none() && (!has_non_null_default || &default_val != partition_value) {

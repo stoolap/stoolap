@@ -519,6 +519,10 @@ impl VolumeScanner {
                 }
             }
             self.needed_cols = Some(mask);
+        } else {
+            // Cannot determine filter columns — materialize all columns
+            // so the filter evaluates against real data, not Null.
+            self.needed_cols = None;
         }
 
         // Pre-compute row group skip decisions from per-group zone maps.

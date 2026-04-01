@@ -812,12 +812,24 @@ pub(crate) fn deserialize_column_block_into(
                     "missing bytes_offsets_out buffer",
                 )
             })?;
+            if offset_count != row_count {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "bytes offset_count {} != row_count {}",
+                        offset_count, row_count
+                    ),
+                ));
+            }
             let base = bytes_data.len() as u64;
             bytes_offsets.reserve(offset_count);
             for _ in 0..offset_count {
                 let off = read_u64(data, &mut pos)?;
                 let len = read_u64(data, &mut pos)?;
-                bytes_offsets.push((off + base, len));
+                let adjusted = off.checked_add(base).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "bytes offset overflow")
+                })?;
+                bytes_offsets.push((adjusted, len));
             }
             let data_len = read_u64(data, &mut pos)? as usize;
             if pos + data_len > data.len() {
@@ -827,6 +839,31 @@ pub(crate) fn deserialize_column_block_into(
                 ));
             }
             bytes_data.extend_from_slice(&data[pos..pos + data_len]);
+            // Validate offsets against the data blob
+            for (i, &(off, len)) in bytes_offsets
+                .iter()
+                .skip(bytes_offsets.len() - offset_count)
+                .enumerate()
+            {
+                let end = off.checked_add(len).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("bytes offset overflow at row {}", i),
+                    )
+                })?;
+                if (end as usize) > bytes_data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "bytes offset {}+{} exceeds data length {} at row {}",
+                            off,
+                            len,
+                            bytes_data.len(),
+                            i
+                        ),
+                    ));
+                }
+            }
         }
         _ => {
             return Err(io::Error::new(

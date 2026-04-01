@@ -5084,7 +5084,7 @@ impl MVCCEngine {
     /// last epoch transition: hot → warm (drop decompressed) → cold (drop compressed).
     #[cfg(not(target_arch = "wasm32"))]
     fn evict_idle_volumes(&self) {
-        let epoch = self.eviction_epoch.fetch_add(1, Ordering::Relaxed);
+        let epoch = self.eviction_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         // Publish to global so scanners stamp volumes with the correct epoch.
         // Use fetch_max so multiple engines only move the global forward.
         crate::storage::volume::writer::GLOBAL_EVICTION_EPOCH.fetch_max(epoch, Ordering::Relaxed);

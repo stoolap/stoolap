@@ -5355,8 +5355,14 @@ impl Executor {
         };
 
         let schema = table.schema();
-        let (storage_expr, _needs_memory_filter) =
+        let (storage_expr, needs_memory_filter) =
             super::pushdown::try_pushdown(where_expr, schema, Some(ctx));
+
+        // Bail when the WHERE clause is only partially pushed to storage.
+        // The residual predicate would be ignored, producing wrong aggregates.
+        if needs_memory_filter {
+            return Ok(None);
+        }
 
         let storage_expr = match storage_expr {
             Some(expr) => expr,
