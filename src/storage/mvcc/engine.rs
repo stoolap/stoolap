@@ -466,6 +466,7 @@ pub struct MVCCEngine {
     compaction_running: Arc<AtomicBool>,
     /// Global epoch counter for volume eviction. Incremented each checkpoint
     /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
+    #[cfg(not(target_arch = "wasm32"))]
     eviction_epoch: AtomicU64,
 }
 
@@ -530,6 +531,7 @@ impl MVCCEngine {
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
             compaction_running: Arc::new(AtomicBool::new(false)),
+            #[cfg(not(target_arch = "wasm32"))]
             eviction_epoch: AtomicU64::new(0),
         }
     }
@@ -5080,6 +5082,7 @@ impl MVCCEngine {
 
     /// Evict idle volume data to save memory. Volumes not accessed since the
     /// last epoch transition: hot → warm (drop decompressed) → cold (drop compressed).
+    #[cfg(not(target_arch = "wasm32"))]
     fn evict_idle_volumes(&self) {
         let epoch = self.eviction_epoch.fetch_add(1, Ordering::Relaxed);
         // Publish to global so scanners stamp volumes with the correct epoch.

@@ -819,13 +819,13 @@ impl SegmentedTable {
 
         // Parallel or sequential volume processing.
         // Only use rayon when enough non-pruned volumes justify the scheduling overhead.
-        let total_cold_rows: usize = pruned_volumes
+        let _total_cold_rows: usize = pruned_volumes
             .iter()
             .map(|(_, cs)| cs.volume.meta.row_count)
             .sum();
         #[cfg(feature = "parallel")]
         let per_volume_rows: Vec<RowVec> =
-            if pruned_volumes.len() >= 4 && total_cold_rows >= 100_000 {
+            if pruned_volumes.len() >= 4 && _total_cold_rows >= 100_000 {
                 use rayon::prelude::*;
                 pruned_volumes
                     .par_iter()
@@ -4712,9 +4712,9 @@ impl Table for SegmentedTable {
 
         // Parallel or sequential volume processing.
         // Only use rayon when total cold rows justify the scheduling overhead.
-        let total_cold_rows: usize = volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
+        let _total_cold_rows: usize = volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
         #[cfg(feature = "parallel")]
-        let volume_accums: Vec<Vec<Accum>> = if volumes.len() >= 4 && total_cold_rows >= 100_000 {
+        let volume_accums: Vec<Vec<Accum>> = if volumes.len() >= 4 && _total_cold_rows >= 100_000 {
             use rayon::prelude::*;
             volumes
                 .par_iter()
@@ -5461,9 +5461,9 @@ impl Table for SegmentedTable {
 
         // Sequential: merge each volume's groups immediately (O(1) extra maps).
         // Parallel: collect per-volume maps then merge (O(volumes) extra maps).
-        let total_cold_rows: usize = volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
+        let _total_cold_rows: usize = volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
         #[cfg(feature = "parallel")]
-        let use_parallel = volumes.len() >= 4 && total_cold_rows >= 100_000;
+        let use_parallel = volumes.len() >= 4 && _total_cold_rows >= 100_000;
         #[cfg(not(feature = "parallel"))]
         let use_parallel = false;
 
