@@ -228,6 +228,8 @@ Performs manual cleanup of deleted rows, old version chains, stale transaction m
 PRAGMA vacuum;
 ```
 
+**Note:** This PRAGMA cannot run inside an explicit transaction.
+
 ## Connection String Parameters
 
 All PRAGMA values can also be set via the connection string:

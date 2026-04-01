@@ -68,7 +68,7 @@ file:///path/to/data?sync_mode=normal&checkpoint_interval=60
 
 | Option | Values | Default | Description |
 |--------|--------|---------|-------------|
-| `sync` / `sync_mode` | none, normal, full (or 0, 1, 2) | normal | WAL synchronization mode. none=no fsync (data durable at checkpoint), normal=fsync every 1s, full=fsync every write |
+| `sync` / `sync_mode` | none/off, normal, full (or 0, 1, 2) | normal | WAL synchronization mode. none/off=no fsync (data durable at checkpoint), normal=fsync every 1s, full=fsync every write |
 | `checkpoint_interval` | Integer (seconds) | 60 | Time between automatic checkpoint cycles |
 | `compact_threshold` | Integer (min 2) | 4 | Sub-target volumes per table before merging |
 | `keep_snapshots` | Integer | 3 | Backup snapshots to retain per table |
@@ -81,7 +81,7 @@ file:///path/to/data?sync_mode=normal&checkpoint_interval=60
 | `compression_threshold` | Integer (bytes) | 64 | Minimum size for WAL compression |
 | `checkpoint_on_close` | on/off | on | Seal all hot rows to volumes on clean shutdown |
 | `commit_batch_size` | Integer | 100 | Commits to batch before sync |
-| `sync_interval_ms` | Integer (ms) | 1000 | Minimum time between syncs in normal mode |
+| `sync_interval_ms` / `sync_interval` | Integer (ms) | 1000 | Minimum time between syncs in normal mode |
 | `target_volume_rows` | Integer | 1048576 | Target rows per cold volume (min: 65536). Controls compaction split boundary. |
 
 Legacy parameter names are accepted for backward compatibility:

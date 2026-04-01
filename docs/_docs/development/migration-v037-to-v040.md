@@ -41,13 +41,6 @@ When you open a v0.3.7 database with v0.4.0 for the first time, the engine perfo
 5. Creates `manifest.bin` for each table
 6. Removes the `snapshots/` directory entirely
 
-You will see these messages on stderr:
-
-```
-[migration] Converting legacy snapshots to volumes...
-[migration] Legacy snapshot migration complete.
-```
-
 ### Data Safety
 
 - **Zero data loss**: All rows from snapshots and WAL are preserved
@@ -92,12 +85,6 @@ The migration is I/O bound. SSD storage significantly reduces migration time.
 | `wal_compression` | on | LZ4 compression for WAL entries |
 | `volume_compression` | on | LZ4 compression for cold volume files |
 | `compression` | on | Shorthand: sets both `wal_compression` and `volume_compression` |
-
-### Removed Parameters
-
-| v0.3.7 Parameter | Reason |
-|------------------|--------|
-| `snapshot_compression` | Replaced by `compression` (sets both WAL and volume). Use `wal_compression` or `volume_compression` for independent control |
 
 ### DSN Example
 
