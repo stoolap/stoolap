@@ -1015,3 +1015,110 @@ fn test_order_by_new_column_mixed_data() {
         db.close().unwrap();
     }
 }
+
+/// Test: CREATE INDEX on a column added after cold volumes exist (schema evolution).
+/// Before the fix, validate_cold_unique and populate_index_from_cold used raw schema
+/// column indices as physical volume indices, reading the wrong column data after
+/// DROP COLUMN + ADD COLUMN.
+#[test]
+fn test_create_index_after_drop_add_column_with_cold_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}/schema_idx", dir.path().display());
+
+    let db = Database::open(&dsn).unwrap();
+
+    // Create table with 3 columns: id, name, email
+    db.execute(
+        "CREATE TABLE t_idx (id INTEGER PRIMARY KEY, name TEXT, email TEXT)",
+        (),
+    )
+    .unwrap();
+
+    // Insert data and seal into cold volume
+    db.execute(
+        "INSERT INTO t_idx VALUES (1, 'Alice', 'alice@test.com')",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t_idx VALUES (2, 'Bob', 'bob@test.com')", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO t_idx VALUES (3, 'Carol', 'carol@test.com')",
+        (),
+    )
+    .unwrap();
+
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    // Schema evolution: drop email, add phone
+    // After this, schema is: id(0), name(1), phone(2)
+    // But cold volume still has: id(0), name(1), email(2)
+    db.execute("ALTER TABLE t_idx DROP COLUMN email", ())
+        .unwrap();
+    db.execute("ALTER TABLE t_idx ADD COLUMN phone TEXT", ())
+        .unwrap();
+
+    // Insert new row with phone value (goes to hot buffer)
+    db.execute("INSERT INTO t_idx VALUES (4, 'Dave', '555-1234')", ())
+        .unwrap();
+
+    // CREATE INDEX on the new column should use column mapping,
+    // not raw schema index (which would incorrectly read old email data)
+    db.execute("CREATE INDEX idx_phone ON t_idx (phone)", ())
+        .expect("CREATE INDEX after schema evolution should succeed");
+
+    // Verify data is correct: cold rows have NULL phone, hot row has value
+    let phone: String = db
+        .query_one("SELECT COALESCE(phone, 'none') FROM t_idx WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(phone, "none", "Cold row should have NULL phone");
+
+    let phone: String = db
+        .query_one("SELECT phone FROM t_idx WHERE id = 4", ())
+        .unwrap();
+    assert_eq!(phone, "555-1234", "Hot row should have phone value");
+
+    db.close().unwrap();
+}
+
+/// Test: CREATE UNIQUE INDEX after schema evolution validates correctly.
+/// Cold rows should have NULL for the new column (not old column's data).
+#[test]
+fn test_create_unique_index_after_schema_evolution() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}/schema_uniq", dir.path().display());
+
+    let db = Database::open(&dsn).unwrap();
+
+    db.execute(
+        "CREATE TABLE t_uniq (id INTEGER PRIMARY KEY, col_a TEXT, col_b TEXT)",
+        (),
+    )
+    .unwrap();
+
+    // Insert rows with duplicate col_b values and seal
+    db.execute("INSERT INTO t_uniq VALUES (1, 'x', 'dup')", ())
+        .unwrap();
+    db.execute("INSERT INTO t_uniq VALUES (2, 'y', 'dup')", ())
+        .unwrap();
+
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    // Drop col_b (which had duplicates), add col_c
+    db.execute("ALTER TABLE t_uniq DROP COLUMN col_b", ())
+        .unwrap();
+    db.execute("ALTER TABLE t_uniq ADD COLUMN col_c TEXT", ())
+        .unwrap();
+
+    // Insert rows with unique col_c values
+    db.execute("INSERT INTO t_uniq VALUES (3, 'z', 'unique_val')", ())
+        .unwrap();
+
+    // CREATE UNIQUE INDEX on col_c should succeed:
+    // Cold rows have NULL col_c (skipped by unique check), hot row has unique value.
+    // Without the fix, this would read old col_b data ('dup','dup') and wrongly fail.
+    db.execute("CREATE UNIQUE INDEX idx_uniq_c ON t_uniq (col_c)", ())
+        .expect("Unique index on new column should succeed (cold rows are NULL)");
+
+    db.close().unwrap();
+}

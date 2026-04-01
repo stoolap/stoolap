@@ -296,3 +296,106 @@ fn test_interval_with_hours() {
 
     assert_eq!(count, 1, "Expected 1 row");
 }
+
+/// Test calendar-aware month addition: Jan 31 + 1 month = Feb 28 (not Mar 2/3)
+#[test]
+fn test_interval_month_calendar_aware() {
+    let db = Database::open("memory://interval_month_cal").expect("Failed to create database");
+
+    let ts: String = db
+        .query_one(
+            "SELECT TIMESTAMP '2025-01-31 10:30:00' + INTERVAL '1 month'",
+            (),
+        )
+        .expect("Failed to execute query");
+
+    // Jan 31 + 1 month should clamp to Feb 28 (2025 is not a leap year)
+    assert_eq!(ts, "2025-02-28T10:30:00Z");
+}
+
+/// Test calendar-aware month addition on leap year: Jan 31 + 1 month = Feb 29
+#[test]
+fn test_interval_month_leap_year() {
+    let db = Database::open("memory://interval_month_leap").expect("Failed to create database");
+
+    let ts: String = db
+        .query_one(
+            "SELECT TIMESTAMP '2024-01-31 15:00:00' + INTERVAL '1 month'",
+            (),
+        )
+        .expect("Failed to execute query");
+
+    // 2024 is a leap year, so Jan 31 + 1 month = Feb 29
+    assert_eq!(ts, "2024-02-29T15:00:00Z");
+}
+
+/// Test calendar-aware year addition preserves month/day
+#[test]
+fn test_interval_year_calendar_aware() {
+    let db = Database::open("memory://interval_year_cal").expect("Failed to create database");
+
+    let ts: String = db
+        .query_one(
+            "SELECT TIMESTAMP '2024-02-29 12:00:00' + INTERVAL '1 year'",
+            (),
+        )
+        .expect("Failed to execute query");
+
+    // Feb 29 2024 (leap) + 1 year = Feb 28 2025 (non-leap, day clamped)
+    assert_eq!(ts, "2025-02-28T12:00:00Z");
+}
+
+/// Test subtracting months works correctly
+#[test]
+fn test_interval_subtract_months() {
+    let db = Database::open("memory://interval_sub_month").expect("Failed to create database");
+
+    let ts: String = db
+        .query_one(
+            "SELECT TIMESTAMP '2025-03-31 08:00:00' - INTERVAL '1 month'",
+            (),
+        )
+        .expect("Failed to execute query");
+
+    // Mar 31 - 1 month = Feb 28 (2025 is not a leap year)
+    assert_eq!(ts, "2025-02-28T08:00:00Z");
+}
+
+/// Test adding multiple months crosses year boundary correctly
+#[test]
+fn test_interval_months_cross_year() {
+    let db = Database::open("memory://interval_cross_year").expect("Failed to create database");
+
+    let ts: String = db
+        .query_one(
+            "SELECT TIMESTAMP '2025-11-15 00:00:00' + INTERVAL '3 months'",
+            (),
+        )
+        .expect("Failed to execute query");
+
+    // Nov 15 + 3 months = Feb 15 next year
+    assert_eq!(ts, "2026-02-15T00:00:00Z");
+}
+
+/// Test that INTERVAL '12 months' equals INTERVAL '1 year'
+#[test]
+fn test_interval_12_months_equals_1_year() {
+    let db = Database::open("memory://interval_12m_1y").expect("Failed to create database");
+
+    let ts_months: String = db
+        .query_one(
+            "SELECT TIMESTAMP '2025-06-15 12:00:00' + INTERVAL '12 months'",
+            (),
+        )
+        .expect("Failed");
+
+    let ts_year: String = db
+        .query_one(
+            "SELECT TIMESTAMP '2025-06-15 12:00:00' + INTERVAL '1 year'",
+            (),
+        )
+        .expect("Failed");
+
+    assert_eq!(ts_months, ts_year);
+    assert_eq!(ts_months, "2026-06-15T12:00:00Z");
+}

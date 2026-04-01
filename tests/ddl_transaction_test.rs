@@ -243,3 +243,74 @@ fn test_mixed_ddl_and_dml_rollback() {
         .expect("Should be able to query existing table");
     assert_eq!(value, "original", "Value should be rolled back to original");
 }
+
+/// Test: MODIFY COLUMN to NOT NULL fails when existing rows have NULLs
+#[test]
+fn test_modify_column_not_null_rejects_existing_nulls() {
+    let db = Database::open("memory://modify_not_null_reject").expect("Failed to create database");
+
+    db.execute(
+        "CREATE TABLE t_nullable (id INTEGER PRIMARY KEY, val TEXT)",
+        (),
+    )
+    .expect("Failed to create table");
+
+    db.execute("INSERT INTO t_nullable VALUES (1, NULL)", ())
+        .expect("Failed to insert");
+    db.execute("INSERT INTO t_nullable VALUES (2, 'hello')", ())
+        .expect("Failed to insert");
+
+    // Should fail because row 1 has NULL in val
+    let result = db.execute("ALTER TABLE t_nullable MODIFY COLUMN val TEXT NOT NULL", ());
+    assert!(result.is_err(), "Should reject NOT NULL when NULLs exist");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("not null constraint"),
+        "Error should mention not null constraint, got: {}",
+        err
+    );
+}
+
+/// Test: MODIFY COLUMN to NOT NULL succeeds when no NULLs exist
+#[test]
+fn test_modify_column_not_null_succeeds_without_nulls() {
+    let db = Database::open("memory://modify_not_null_success").expect("Failed to create database");
+
+    db.execute(
+        "CREATE TABLE t_non_null (id INTEGER PRIMARY KEY, val TEXT)",
+        (),
+    )
+    .expect("Failed to create table");
+
+    db.execute("INSERT INTO t_non_null VALUES (1, 'a')", ())
+        .expect("Failed to insert");
+    db.execute("INSERT INTO t_non_null VALUES (2, 'b')", ())
+        .expect("Failed to insert");
+
+    // Should succeed because no NULLs
+    db.execute("ALTER TABLE t_non_null MODIFY COLUMN val TEXT NOT NULL", ())
+        .expect("MODIFY COLUMN should succeed when no NULLs exist");
+
+    // Verify the constraint is now enforced on new inserts
+    let result = db.execute("INSERT INTO t_non_null VALUES (3, NULL)", ());
+    assert!(
+        result.is_err(),
+        "INSERT with NULL should fail after NOT NULL constraint"
+    );
+}
+
+/// Test: MODIFY COLUMN to NOT NULL on empty table succeeds
+#[test]
+fn test_modify_column_not_null_empty_table() {
+    let db = Database::open("memory://modify_not_null_empty").expect("Failed to create database");
+
+    db.execute(
+        "CREATE TABLE t_empty (id INTEGER PRIMARY KEY, val TEXT)",
+        (),
+    )
+    .expect("Failed to create table");
+
+    // Empty table, no NULLs to violate
+    db.execute("ALTER TABLE t_empty MODIFY COLUMN val TEXT NOT NULL", ())
+        .expect("Should succeed on empty table");
+}

@@ -209,6 +209,13 @@ pub trait SubqueryExecutor {
 /// Capacity for reusable args buffer (most functions have <= 4 args)
 const ARGS_BUFFER_CAPACITY: usize = 8;
 
+/// Parsed interval value: either a fixed-length duration or a calendar-relative month count.
+/// Months/years require calendar-aware arithmetic (leap years, variable month lengths).
+enum IntervalValue {
+    Duration(chrono::Duration),
+    Months(i64),
+}
+
 pub struct ExprVM {
     /// Evaluation stack (reused between executions)
     /// Uses SmallVec to avoid heap allocation for simple expressions (stack depth <= 16)
@@ -3489,29 +3496,80 @@ impl ExprVM {
 
         // Parse interval string
         // Formats: "1 day", "2 hours", "30 minutes", "1 year", "1 month", etc.
-        let duration = self.parse_interval(interval_str);
-
-        match duration {
-            Some(d) => {
+        match self.parse_interval(interval_str) {
+            Some(IntervalValue::Duration(d)) => {
                 if add {
                     Value::Timestamp(timestamp + d)
                 } else {
                     Value::Timestamp(timestamp - d)
                 }
             }
+            Some(IntervalValue::Months(months)) => {
+                let months = if add { months } else { -months };
+                match Self::calendar_add_months(timestamp, months) {
+                    Some(result) => Value::Timestamp(result),
+                    None => Value::Null(DataType::Timestamp),
+                }
+            }
             None => Value::Null(DataType::Timestamp),
         }
     }
 
-    /// Parse interval string into Duration
-    fn parse_interval(&self, s: &str) -> Option<chrono::Duration> {
+    /// Calendar-aware month addition preserving time-of-day and nanoseconds.
+    fn calendar_add_months(
+        ts: chrono::DateTime<chrono::Utc>,
+        months: i64,
+    ) -> Option<chrono::DateTime<chrono::Utc>> {
+        use chrono::{Datelike, NaiveDate, Timelike};
+
+        let total_months = (ts.year() as i64) * 12 + (ts.month() as i64) - 1 + months;
+        let new_year_i64 = total_months.div_euclid(12);
+        let new_month = (total_months.rem_euclid(12) + 1) as u32;
+
+        let new_year = i32::try_from(new_year_i64).ok()?;
+        if !(1..=9999).contains(&new_year) {
+            return None;
+        }
+
+        // Clamp day to valid range for the new month
+        let max_day = match new_month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if (new_year % 4 == 0 && new_year % 100 != 0) || (new_year % 400 == 0) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 30,
+        };
+        let day = ts.day().min(max_day);
+
+        // Rebuild date preserving original time including nanoseconds
+        let date = NaiveDate::from_ymd_opt(new_year, new_month, day)?;
+        let time = ts.time();
+        let naive = date.and_hms_nano_opt(
+            time.hour(),
+            time.minute(),
+            time.second(),
+            ts.timestamp_subsec_nanos(),
+        )?;
+        Some(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            naive,
+            chrono::Utc,
+        ))
+    }
+
+    /// Parsed interval: either a fixed duration or a calendar-relative month count.
+    fn parse_interval(&self, s: &str) -> Option<IntervalValue> {
         let s = s.trim();
         let parts: Vec<&str> = s.split_whitespace().collect();
 
         if parts.len() < 2 {
             // Try parsing as just a number (days)
             if let Ok(n) = s.parse::<i64>() {
-                return Some(chrono::Duration::days(n));
+                return Some(IntervalValue::Duration(chrono::Duration::days(n)));
             }
             return None;
         }
@@ -3522,35 +3580,39 @@ impl ExprVM {
         // Case-insensitive unit matching without allocation
         // Handle both singular and plural forms
         if unit.eq_ignore_ascii_case("year") || unit.eq_ignore_ascii_case("years") {
-            Some(chrono::Duration::days(value * 365))
+            Some(IntervalValue::Months(value * 12))
         } else if unit.eq_ignore_ascii_case("month") || unit.eq_ignore_ascii_case("months") {
-            Some(chrono::Duration::days(value * 30))
+            Some(IntervalValue::Months(value))
         } else if unit.eq_ignore_ascii_case("week") || unit.eq_ignore_ascii_case("weeks") {
-            Some(chrono::Duration::weeks(value))
+            Some(IntervalValue::Duration(chrono::Duration::weeks(value)))
         } else if unit.eq_ignore_ascii_case("day") || unit.eq_ignore_ascii_case("days") {
-            Some(chrono::Duration::days(value))
+            Some(IntervalValue::Duration(chrono::Duration::days(value)))
         } else if unit.eq_ignore_ascii_case("hour") || unit.eq_ignore_ascii_case("hours") {
-            Some(chrono::Duration::hours(value))
+            Some(IntervalValue::Duration(chrono::Duration::hours(value)))
         } else if unit.eq_ignore_ascii_case("minute")
             || unit.eq_ignore_ascii_case("minutes")
             || unit.eq_ignore_ascii_case("min")
         {
-            Some(chrono::Duration::minutes(value))
+            Some(IntervalValue::Duration(chrono::Duration::minutes(value)))
         } else if unit.eq_ignore_ascii_case("second")
             || unit.eq_ignore_ascii_case("seconds")
             || unit.eq_ignore_ascii_case("sec")
         {
-            Some(chrono::Duration::seconds(value))
+            Some(IntervalValue::Duration(chrono::Duration::seconds(value)))
         } else if unit.eq_ignore_ascii_case("millisecond")
             || unit.eq_ignore_ascii_case("milliseconds")
             || unit.eq_ignore_ascii_case("ms")
         {
-            Some(chrono::Duration::milliseconds(value))
+            Some(IntervalValue::Duration(chrono::Duration::milliseconds(
+                value,
+            )))
         } else if unit.eq_ignore_ascii_case("microsecond")
             || unit.eq_ignore_ascii_case("microseconds")
             || unit.eq_ignore_ascii_case("us")
         {
-            Some(chrono::Duration::microseconds(value))
+            Some(IntervalValue::Duration(chrono::Duration::microseconds(
+                value,
+            )))
         } else {
             None
         }

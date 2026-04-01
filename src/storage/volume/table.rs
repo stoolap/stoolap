@@ -174,8 +174,11 @@ impl SegmentedTable {
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
-        for (_, cs) in volumes.iter() {
+        for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
+            // Use column mapping to translate schema indices to physical volume indices.
+            // After DROP COLUMN + ADD COLUMN, schema positions may not match volume layout.
+            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
             for i in 0..vol.meta.row_count {
                 if !cs.is_visible(i) {
                     continue;
@@ -191,8 +194,12 @@ impl SegmentedTable {
                 let values: Vec<Value> = col_indices
                     .iter()
                     .map(|&ci| {
-                        if ci < vol.columns.len() {
-                            vol.columns[ci].get_value(i)
+                        use super::writer::ColSource;
+                        if ci < mapping.sources.len() {
+                            match &mapping.sources[ci] {
+                                ColSource::Volume(phys) => vol.columns[*phys].get_value(i),
+                                ColSource::Default(v) => v.clone(),
+                            }
                         } else {
                             self.column_default(ci)
                         }
@@ -219,9 +226,8 @@ impl SegmentedTable {
         Ok(())
     }
 
-    /// Populate an HNSW index from cold segment data.
+    /// Populate an index from cold segment data.
     /// Called after index creation on the hot store.
-    /// Populate an HNSW (or unique HNSW) index from cold segment data.
     /// Propagates errors so unique-constraint violations are not swallowed.
     fn populate_index_from_cold(&self, name: &str, columns: &[&str]) -> Result<()> {
         let index = match self.hot.get_index(name) {
@@ -243,8 +249,10 @@ impl SegmentedTable {
         }
         let volumes = self.segment_mgr.get_volumes_newest_first();
         let ts = self.segment_mgr.tombstone_set_arc();
-        for (_, cs) in volumes.iter() {
+        for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
+            // Use column mapping to translate schema indices to physical volume indices.
+            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
             for i in 0..vol.meta.row_count {
                 if !cs.is_visible(i) {
                     continue;
@@ -256,8 +264,12 @@ impl SegmentedTable {
                 let values: Vec<Value> = col_indices
                     .iter()
                     .map(|&ci| {
-                        if ci < vol.columns.len() {
-                            vol.columns[ci].get_value(i)
+                        use super::writer::ColSource;
+                        if ci < mapping.sources.len() {
+                            match &mapping.sources[ci] {
+                                ColSource::Volume(phys) => vol.columns[*phys].get_value(i),
+                                ColSource::Default(v) => v.clone(),
+                            }
                         } else {
                             self.column_default(ci)
                         }
