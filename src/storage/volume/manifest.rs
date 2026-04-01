@@ -356,7 +356,10 @@ impl TableManifest {
             tombstones.reserve(tombstone_count);
             for _ in 0..tombstone_count {
                 if pos + 16 > data_end {
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "manifest truncated at tombstone entry",
+                    ));
                 }
                 let row_id = read_i64(data, &mut pos)?;
                 let commit_seq = read_u64(data, &mut pos)?;
@@ -371,27 +374,39 @@ impl TableManifest {
             column_renames.reserve(rename_count);
             for _ in 0..rename_count {
                 if pos + 2 > data_end {
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "manifest truncated at column rename entry",
+                    ));
                 }
                 let old_len = u16::from_le_bytes(data[pos..pos + 2].try_into().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "truncated rename old_name len")
                 })?) as usize;
                 pos += 2;
                 if pos + old_len > data_end {
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "manifest truncated at column rename old_name",
+                    ));
                 }
                 let old_name = std::str::from_utf8(&data[pos..pos + old_len])
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                 pos += old_len;
                 if pos + 2 > data_end {
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "manifest truncated at column rename new_name len",
+                    ));
                 }
                 let new_len = u16::from_le_bytes(data[pos..pos + 2].try_into().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "truncated rename new_name len")
                 })?) as usize;
                 pos += 2;
                 if pos + new_len > data_end {
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "manifest truncated at column rename new_name",
+                    ));
                 }
                 let new_name = std::str::from_utf8(&data[pos..pos + new_len])
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -406,14 +421,20 @@ impl TableManifest {
             let count = read_u32(data, &mut pos)? as usize;
             for _ in 0..count {
                 if pos + 2 > data_end {
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "manifest truncated at dropped column entry",
+                    ));
                 }
                 let nlen = u16::from_le_bytes(data[pos..pos + 2].try_into().map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "truncated dropped col name")
                 })?) as usize;
                 pos += 2;
                 if pos + nlen > data_end {
-                    break;
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "manifest truncated at dropped column name",
+                    ));
                 }
                 let name = std::str::from_utf8(&data[pos..pos + nlen])
                     .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -468,10 +489,12 @@ impl TableManifest {
         // NTFS metadata is flushed with the file's sync_all().
         #[cfg(not(windows))]
         if let Some(parent) = path.parent() {
-            let d = std::fs::File::open(parent)
-                .map_err(|e| io::Error::other(format!("failed to open dir for fsync: {}", e)))?;
-            d.sync_all()
-                .map_err(|e| io::Error::other(format!("failed to fsync dir: {}", e)))?;
+            let d = std::fs::File::open(parent).map_err(|e| {
+                crate::core::Error::internal(format!("failed to open dir for fsync: {}", e))
+            })?;
+            d.sync_all().map_err(|e| {
+                crate::core::Error::internal(format!("failed to fsync manifest dir: {}", e))
+            })?;
         }
         Ok(())
     }

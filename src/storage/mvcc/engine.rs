@@ -5225,12 +5225,6 @@ impl MVCCEngine {
             .unwrap_or((4, 1_048_576));
         let compact_threshold = compact_threshold.max(2);
 
-        // Compaction seal_seq gating: only compact volumes sealed before the
-        // earliest snapshot's begin_seq. Volumes sealed after may contain rows
-        // that a snapshot transaction needs to see. When no snapshots are active,
-        // all volumes are eligible for compaction.
-        let compact_seal_seq_limit = self.registry.get_min_snapshot_begin_seq().map(|s| s as u64);
-
         let tables_to_compact: Vec<String> = {
             let mgrs = self.segment_managers.read().unwrap();
             mgrs.iter()
@@ -5277,6 +5271,12 @@ impl MVCCEngine {
             };
 
             let mgr = self.get_or_create_segment_manager(table_name);
+
+            // Per-table snapshot gating: capture the current min snapshot begin_seq
+            // for each table to close the TOCTOU window. A snapshot starting between
+            // tables must not cause earlier compacted tables to lose visible rows.
+            let compact_seal_seq_limit =
+                self.registry.get_min_snapshot_begin_seq().map(|s| s as u64);
 
             // Targeted compaction: only rewrite volumes that need work.
             // At-target volumes are left untouched to minimize disk I/O.

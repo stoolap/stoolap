@@ -531,9 +531,12 @@ pub(crate) fn serialize_column_block(col: &ColumnData, start: usize, end: usize)
                 let new_off = new_data.len() as u64;
                 if len > 0 && (off as usize) < data.len() {
                     let end_pos = ((off + len) as usize).min(data.len());
+                    let actual_len = (end_pos - off as usize) as u64;
                     new_data.extend_from_slice(&data[off as usize..end_pos]);
+                    new_offsets.push((new_off, actual_len));
+                } else {
+                    new_offsets.push((new_off, 0));
                 }
-                new_offsets.push((new_off, len));
             }
             buf.write_all(&(new_offsets.len() as u64).to_le_bytes())
                 .unwrap();
@@ -869,9 +872,24 @@ pub(crate) fn deserialize_column_block(
         COL_DICTIONARY => {
             let nulls = read_nulls(data, &mut pos, row_count)?;
             let ids = read_u32_bulk(data, &mut pos, row_count)?;
+            let dict = dictionary.unwrap_or_else(|| Arc::from(Vec::<SmartString>::new()));
+            // Validate dictionary IDs to prevent panics on corrupted volumes
+            for (i, &id) in ids.iter().enumerate() {
+                if !nulls[i] && (id as usize) >= dict.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "dictionary ID {} at row {} exceeds dictionary length {}",
+                            id,
+                            i,
+                            dict.len()
+                        ),
+                    ));
+                }
+            }
             Ok(ColumnData::Dictionary {
                 ids,
-                dictionary: dictionary.unwrap_or_else(|| Arc::from(Vec::<SmartString>::new())),
+                dictionary: dict,
                 nulls,
             })
         }
@@ -892,6 +910,29 @@ pub(crate) fn deserialize_column_block(
                 ));
             }
             let blob = data[pos..pos + data_len].to_vec();
+            // Validate offsets to prevent panics on corrupted volumes
+            for (i, &(off, len)) in offsets.iter().enumerate() {
+                if !nulls[i] {
+                    let end = off.checked_add(len).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("bytes offset overflow at row {}", i),
+                        )
+                    })?;
+                    if (end as usize) > blob.len() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "bytes offset {}+{} exceeds data length {} at row {}",
+                                off,
+                                len,
+                                blob.len(),
+                                i
+                            ),
+                        ));
+                    }
+                }
+            }
             Ok(ColumnData::Bytes {
                 data: blob,
                 offsets,

@@ -65,8 +65,10 @@ impl ColumnAggregateStats {
                 self.numeric_count += 1;
             }
             Value::Float(f) => {
-                self.sum_float += *f;
-                self.numeric_count += 1;
+                if !f.is_nan() {
+                    self.sum_float += *f;
+                    self.numeric_count += 1;
+                }
             }
             _ => {}
         }
