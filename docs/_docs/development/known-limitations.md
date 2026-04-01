@@ -20,7 +20,7 @@ See [JSON Support]({{ '/docs/data-types/json-support/' | relative_url }}) for su
 ## Foreign Keys
 
 - **Single-column only**: Composite foreign keys (referencing multiple columns) are not yet supported.
-- **No recursive CASCADE**: ~~ON UPDATE CASCADE does not recursively cascade to grandchild tables when the child's FK column is also its PK.~~ Fixed: ON UPDATE CASCADE now recursively cascades through the full foreign key chain.
+- **Recursive CASCADE**: ON UPDATE CASCADE now recursively cascades through the full foreign key chain, including grandchild tables.
 - **Self-referencing insertion order**: Self-referencing foreign keys require careful ordering of inserts.
 
 See [Foreign Keys]({{ '/docs/sql-features/foreign-keys/' | relative_url }}) for full FK documentation.
@@ -98,6 +98,7 @@ These are deliberate design decisions, not bugs:
 
 ## Transactions
 
+- **No primary key updates**: UPDATE on primary key columns is rejected with an error. The engine uses row_id == pk_value as a core invariant. Use DELETE + INSERT to change a row's primary key value.
 - **Multi-table partial commit**: If a transaction modifies multiple tables and one table's commit fails (e.g., write conflict or unique constraint violation), tables that already committed cannot be rolled back. The transaction is force-completed and the error is returned to the caller. Single-table transactions are not affected.
 
 ## General SQL

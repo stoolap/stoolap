@@ -565,6 +565,20 @@ impl Executor {
         let pk_idx = pk_indices[0];
         let pk_column = &schema.columns[pk_idx].name;
 
+        // Reject UPDATE on primary key column (row_id == pk_value invariant)
+        {
+            let col_map = schema.column_index_map();
+            for col_name in stmt.updates.keys() {
+                let col_lower = col_name.to_lowercase();
+                if col_map.get(col_lower.as_str()).copied() == Some(pk_idx) {
+                    return Some(Err(crate::core::Error::invalid_argument(format!(
+                        "cannot UPDATE primary key column '{}'. Use DELETE + INSERT instead",
+                        pk_column
+                    ))));
+                }
+            }
+        }
+
         // Bail if table has FK constraints (child table) or is referenced by other tables (parent table)
         // FK enforcement requires cross-table lookups — fall back to normal path
         if !schema.foreign_keys.is_empty()

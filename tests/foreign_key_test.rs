@@ -698,7 +698,7 @@ fn test_fk_set_null_rollback_atomicity() {
 // =====================================================================
 
 #[test]
-fn test_fk_cascade_update_rollback_atomicity() {
+fn test_fk_cascade_update_pk_rejected() {
     let db = setup();
     setup_parent_child(&db);
     db.execute(
@@ -708,12 +708,17 @@ fn test_fk_cascade_update_rollback_atomicity() {
     db.execute("INSERT INTO children VALUES (1, 1, 'Child1')", ())
         .unwrap();
 
-    db.execute("BEGIN", ()).unwrap();
-    db.execute("UPDATE parents SET id = 100 WHERE id = 1", ())
-        .unwrap();
-    db.execute("ROLLBACK", ()).unwrap();
+    // PK updates are rejected (row_id == pk_value invariant)
+    let result = db.execute("UPDATE parents SET id = 100 WHERE id = 1", ());
+    assert!(result.is_err(), "UPDATE on PK should be rejected");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("primary key"),
+        "Error should mention primary key, got: {}",
+        err
+    );
 
-    // After rollback, parent id should still be 1 and child's parent_id should still be 1
+    // Data should be unchanged
     assert_eq!(count(&db, "SELECT COUNT(*) FROM parents WHERE id = 1"), 1);
     assert_eq!(
         count(&db, "SELECT COUNT(*) FROM children WHERE parent_id = 1"),
@@ -1285,4 +1290,277 @@ fn test_fk_update_constant_no_dirty_state_in_explicit_txn() {
     );
 
     db.execute("ROLLBACK", ()).unwrap();
+}
+
+/// Test recursive ON UPDATE CASCADE through grandparent -> parent -> child chain.
+/// The cascade column is a UNIQUE non-PK column, so updates are allowed.
+#[test]
+fn test_recursive_on_update_cascade() {
+    let db = setup();
+
+    // Three-level chain: regions -> countries -> cities
+    // The cascaded column must be UNIQUE in the child for the grandchild FK to reference it.
+    db.execute(
+        "CREATE TABLE regions (id INTEGER PRIMARY KEY, code INTEGER UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE countries (id INTEGER PRIMARY KEY, region_code INTEGER UNIQUE REFERENCES regions(code) ON UPDATE CASCADE)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE cities (id INTEGER PRIMARY KEY, region_code INTEGER REFERENCES countries(region_code) ON UPDATE CASCADE)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO regions VALUES (1, 100)", ())
+        .unwrap();
+    db.execute("INSERT INTO countries VALUES (1, 100)", ())
+        .unwrap();
+    db.execute("INSERT INTO cities VALUES (1, 100)", ())
+        .unwrap();
+
+    // Update region code — should cascade to countries AND cities
+    db.execute("UPDATE regions SET code = 200 WHERE id = 1", ())
+        .expect("CASCADE update should succeed");
+
+    let country_code = count(&db, "SELECT region_code FROM countries WHERE id = 1");
+    assert_eq!(country_code, 200, "Country should have cascaded to 200");
+
+    let city_code = count(&db, "SELECT region_code FROM cities WHERE id = 1");
+    assert_eq!(
+        city_code, 200,
+        "City should have recursively cascaded to 200"
+    );
+}
+
+/// Test that ON UPDATE CASCADE with grandchild RESTRICT blocks the update.
+#[test]
+fn test_recursive_on_update_cascade_blocked_by_restrict() {
+    let db = setup();
+
+    db.execute(
+        "CREATE TABLE r_parent (id INTEGER PRIMARY KEY, code INTEGER UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE r_child (id INTEGER PRIMARY KEY, pcode INTEGER UNIQUE REFERENCES r_parent(code) ON UPDATE CASCADE)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE r_grandchild (id INTEGER PRIMARY KEY, pcode INTEGER REFERENCES r_child(pcode) ON UPDATE RESTRICT)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO r_parent VALUES (1, 10)", ())
+        .unwrap();
+    db.execute("INSERT INTO r_child VALUES (1, 10)", ())
+        .unwrap();
+    db.execute("INSERT INTO r_grandchild VALUES (1, 10)", ())
+        .unwrap();
+
+    // Update parent code — child CASCADE would propagate, but grandchild RESTRICT blocks
+    let result = db.execute("UPDATE r_parent SET code = 20 WHERE id = 1", ());
+    assert!(
+        result.is_err(),
+        "Grandchild RESTRICT should block recursive cascade"
+    );
+
+    // All values should be unchanged
+    let parent_code = count(&db, "SELECT code FROM r_parent WHERE id = 1");
+    assert_eq!(parent_code, 10, "Parent should be unchanged");
+}
+
+/// SET NULL on child must still enforce deeper RESTRICT on grandchild.
+/// Chain: A(code UNIQUE) -> B(code SET NULL) -> C(code RESTRICT)
+#[test]
+fn test_set_null_with_deeper_restrict() {
+    let db = setup();
+
+    db.execute(
+        "CREATE TABLE sn_a (id INTEGER PRIMARY KEY, code INTEGER UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE sn_b (id INTEGER PRIMARY KEY, code INTEGER UNIQUE REFERENCES sn_a(code) ON UPDATE SET NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE sn_c (id INTEGER PRIMARY KEY, code INTEGER REFERENCES sn_b(code) ON UPDATE RESTRICT)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO sn_a VALUES (1, 10)", ()).unwrap();
+    db.execute("INSERT INTO sn_b VALUES (1, 10)", ()).unwrap();
+    db.execute("INSERT INTO sn_c VALUES (1, 10)", ()).unwrap();
+
+    // Update A.code -> B does SET NULL (code becomes NULL) -> C still has 10
+    // C references B(code), but B.code is now NULL so C.code=10 points at nothing.
+    // The pre-check should catch this via RESTRICT on C.
+    let result = db.execute("UPDATE sn_a SET code = 20 WHERE id = 1", ());
+    assert!(
+        result.is_err(),
+        "Deeper RESTRICT behind SET NULL should block the update"
+    );
+
+    // All values unchanged
+    let a_code = count(&db, "SELECT code FROM sn_a WHERE id = 1");
+    assert_eq!(a_code, 10, "A should be unchanged");
+}
+
+/// Multi-column referenced updates dispatch to the correct child FK.
+/// parent(a UNIQUE, b UNIQUE) with child_a -> a and child_b -> b.
+#[test]
+fn test_multi_column_cascade_dispatches_correctly() {
+    let db = setup();
+
+    db.execute(
+        "CREATE TABLE mc_parent (id INTEGER PRIMARY KEY, a INTEGER UNIQUE, b INTEGER UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE mc_child_a (id INTEGER PRIMARY KEY, pa INTEGER REFERENCES mc_parent(a) ON UPDATE CASCADE)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE mc_child_b (id INTEGER PRIMARY KEY, pb INTEGER REFERENCES mc_parent(b) ON UPDATE CASCADE)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO mc_parent VALUES (1, 10, 20)", ())
+        .unwrap();
+    db.execute("INSERT INTO mc_child_a VALUES (1, 10)", ())
+        .unwrap();
+    db.execute("INSERT INTO mc_child_b VALUES (1, 20)", ())
+        .unwrap();
+
+    // Update both referenced columns in one statement
+    db.execute("UPDATE mc_parent SET a = 11, b = 22 WHERE id = 1", ())
+        .expect("Multi-column cascade should succeed");
+
+    let child_a = count(&db, "SELECT pa FROM mc_child_a WHERE id = 1");
+    assert_eq!(child_a, 11, "child_a should cascade from 10 to 11");
+
+    let child_b = count(&db, "SELECT pb FROM mc_child_b WHERE id = 1");
+    assert_eq!(child_b, 22, "child_b should cascade from 20 to 22");
+}
+
+/// RESTRICT pre-check preserves statement atomicity in explicit transactions:
+/// a failed UPDATE must not leave dirty parent rows.
+#[test]
+fn test_restrict_precheck_no_dirty_state_in_explicit_txn() {
+    let db = setup();
+
+    db.execute(
+        "CREATE TABLE sp (id INTEGER PRIMARY KEY, code INTEGER UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE sc (id INTEGER PRIMARY KEY, code INTEGER REFERENCES sp(code) ON UPDATE RESTRICT)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO sp VALUES (1, 10)", ()).unwrap();
+    db.execute("INSERT INTO sc VALUES (1, 10)", ()).unwrap();
+
+    db.execute("BEGIN", ()).unwrap();
+    let result = db.execute("UPDATE sp SET code = 20 WHERE id = 1", ());
+    assert!(result.is_err(), "RESTRICT should reject");
+
+    // Parent must NOT be dirty inside the transaction
+    let code = count(&db, "SELECT code FROM sp WHERE id = 1");
+    assert_eq!(code, 10, "Parent should be unchanged after failed UPDATE");
+
+    db.execute("ROLLBACK", ()).unwrap();
+}
+
+/// No-op UPDATE (WHERE matches zero rows) must not trigger false RESTRICT rejection.
+#[test]
+fn test_noop_update_no_false_restrict_rejection() {
+    let db = setup();
+
+    db.execute(
+        "CREATE TABLE np (id INTEGER PRIMARY KEY, code INTEGER UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE nc (id INTEGER PRIMARY KEY, code INTEGER REFERENCES np(code) ON UPDATE RESTRICT)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO np VALUES (1, 10)", ()).unwrap();
+    db.execute("INSERT INTO nc VALUES (1, 10)", ()).unwrap();
+
+    // WHERE matches zero rows: id + 1 = 999 is false for id=1
+    let result = db.execute(
+        "UPDATE np SET code = 20 WHERE code = 10 AND id + 1 = 999",
+        (),
+    );
+    assert!(
+        result.is_ok(),
+        "No-op update should succeed, got: {:?}",
+        result.unwrap_err()
+    );
+
+    let code = count(&db, "SELECT code FROM np WHERE id = 1");
+    assert_eq!(code, 10, "Row unchanged");
+}
+
+/// Correlated UPDATE must validate FK parent existence.
+#[test]
+fn test_correlated_update_validates_fk_parent() {
+    let db = setup();
+
+    db.execute(
+        "CREATE TABLE fk_parent (id INTEGER PRIMARY KEY, name TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE fk_child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES fk_parent(id))",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE mapping (id INTEGER PRIMARY KEY, new_pid INTEGER)",
+        (),
+    )
+    .unwrap();
+
+    db.execute("INSERT INTO fk_parent VALUES (1, 'Parent1')", ())
+        .unwrap();
+    db.execute("INSERT INTO fk_child VALUES (1, 1)", ())
+        .unwrap();
+    // Map child 1 to non-existent parent 999
+    db.execute("INSERT INTO mapping VALUES (1, 999)", ())
+        .unwrap();
+
+    let result = db.execute(
+        "UPDATE fk_child SET pid = (SELECT new_pid FROM mapping WHERE mapping.id = fk_child.id) WHERE id = 1",
+        (),
+    );
+    assert!(
+        result.is_err(),
+        "Correlated UPDATE to non-existent parent should fail"
+    );
+
+    // Child should be unchanged
+    let pid = count(&db, "SELECT pid FROM fk_child WHERE id = 1");
+    assert_eq!(pid, 1, "Child should still reference parent 1");
 }

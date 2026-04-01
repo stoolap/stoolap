@@ -225,12 +225,128 @@ pub(crate) fn enforce_delete_actions_iter<'a>(
     Ok(total_affected)
 }
 
-/// Enforce referential actions for UPDATE of a parent PK.
-/// All operations participate in the caller's transaction via `txn_id`.
-pub(crate) fn enforce_update_actions(
+/// Pre-check RESTRICT constraints and CASCADE depth before writing parent rows.
+/// Walks the full FK tree (including recursive grandchild RESTRICT behind CASCADE/SET NULL)
+/// to detect violations before any rows are modified, preserving statement atomicity.
+/// Returns true if the tree has constraints that need row-level pre-checking.
+pub(crate) fn pre_check_restrict_for_update(
     engine: &MVCCEngine,
     txn_id: i64,
     parent_table: &str,
+    old_value: &Value,
+    referencing_fks: &[(String, ForeignKeyConstraint)],
+) -> Result<()> {
+    pre_check_restrict_recursive(engine, txn_id, parent_table, old_value, referencing_fks, 0)
+}
+
+/// Check if the FK tree rooted at these referencing FKs needs row-level pre-checking.
+/// Returns true if any path contains RESTRICT/NoAction or exceeds CASCADE depth.
+/// This is a metadata-only walk (no row scans) used to skip the expensive pre-scan
+/// when the tree is pure CASCADE/SET NULL within depth limits.
+pub(crate) fn fk_tree_needs_precheck(
+    engine: &MVCCEngine,
+    referencing_fks: &[(String, ForeignKeyConstraint)],
+) -> bool {
+    fk_tree_needs_precheck_recursive(engine, referencing_fks, 0)
+}
+
+fn fk_tree_needs_precheck_recursive(
+    engine: &MVCCEngine,
+    referencing_fks: &[(String, ForeignKeyConstraint)],
+    depth: usize,
+) -> bool {
+    if depth >= MAX_CASCADE_DEPTH {
+        return true; // depth limit will be hit → needs pre-check
+    }
+    for (child_table_name, fk) in referencing_fks {
+        match fk.on_update {
+            ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
+                return true;
+            }
+            ForeignKeyAction::Cascade | ForeignKeyAction::SetNull => {
+                let grandchild_fks = find_referencing_fks(engine, child_table_name);
+                let child_fk_col = &fk.column_name;
+                let relevant: Vec<_> = grandchild_fks
+                    .iter()
+                    .filter(|(_, gfk)| gfk.referenced_column == *child_fk_col)
+                    .cloned()
+                    .collect();
+                if !relevant.is_empty()
+                    && fk_tree_needs_precheck_recursive(engine, &relevant, depth + 1)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn pre_check_restrict_recursive(
+    engine: &MVCCEngine,
+    txn_id: i64,
+    parent_table: &str,
+    old_value: &Value,
+    referencing_fks: &[(String, ForeignKeyConstraint)],
+    depth: usize,
+) -> Result<()> {
+    for (child_table_name, fk) in referencing_fks {
+        // Check if child rows actually reference old_value before doing anything.
+        // If no matching rows exist, neither RESTRICT nor CASCADE applies.
+        if !child_rows_exist(engine, txn_id, child_table_name, fk, old_value)? {
+            continue;
+        }
+        match fk.on_update {
+            ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
+                return Err(Error::foreign_key_violation(
+                    child_table_name,
+                    &fk.column_name,
+                    parent_table,
+                    &fk.referenced_column,
+                    format!(
+                        "cannot update row with {} = {} — still referenced by table '{}'",
+                        fk.referenced_column, old_value, child_table_name
+                    ),
+                ));
+            }
+            ForeignKeyAction::Cascade | ForeignKeyAction::SetNull => {
+                // Child rows exist and will be cascaded. Check depth limit
+                // now — if exceeded, the actual cascade would fail too.
+                if depth >= MAX_CASCADE_DEPTH {
+                    return Err(Error::internal(format!(
+                        "foreign key CASCADE depth limit ({}) exceeded — possible circular reference",
+                        MAX_CASCADE_DEPTH
+                    )));
+                }
+                let grandchild_fks = find_referencing_fks(engine, child_table_name);
+                let child_fk_col = &fk.column_name;
+                let relevant: Vec<_> = grandchild_fks
+                    .iter()
+                    .filter(|(_, gfk)| gfk.referenced_column == *child_fk_col)
+                    .cloned()
+                    .collect();
+                if !relevant.is_empty() {
+                    pre_check_restrict_recursive(
+                        engine,
+                        txn_id,
+                        child_table_name,
+                        old_value,
+                        &relevant,
+                        depth + 1,
+                    )?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Enforce referential actions for UPDATE of a referenced column.
+/// RESTRICT is already handled by pre_check_restrict_for_update before
+/// the parent row is written. This function only dispatches CASCADE/SET NULL.
+pub(crate) fn enforce_update_actions(
+    engine: &MVCCEngine,
+    txn_id: i64,
     old_pk_value: &Value,
     new_pk_value: &Value,
     referencing_fks: &[(String, ForeignKeyConstraint)],
@@ -246,18 +362,8 @@ pub(crate) fn enforce_update_actions(
 
         match action {
             ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
-                if child_rows_exist(engine, txn_id, child_table_name, fk, old_pk_value)? {
-                    return Err(Error::foreign_key_violation(
-                        child_table_name,
-                        &fk.column_name,
-                        parent_table,
-                        &fk.referenced_column,
-                        format!(
-                            "cannot update row with {} = {} — still referenced by table '{}'",
-                            fk.referenced_column, old_pk_value, child_table_name
-                        ),
-                    ));
-                }
+                // RESTRICT is already enforced by pre_check_restrict_for_update
+                // before the parent row is written. Nothing to do here.
             }
             ForeignKeyAction::Cascade => {
                 let affected = cascade_update(
@@ -450,6 +556,7 @@ fn cascade_delete_recursive(
 }
 
 /// CASCADE UPDATE: update FK column in all child rows from old to new value.
+/// Recursively cascades to grandchild tables (up to MAX_CASCADE_DEPTH).
 /// Operates within the caller's transaction (no independent commit).
 fn cascade_update(
     engine: &MVCCEngine,
@@ -459,12 +566,68 @@ fn cascade_update(
     old_value: &Value,
     new_value: &Value,
 ) -> Result<i32> {
-    let mut child = engine.get_table_for_txn(txn_id, child_table)?;
+    cascade_update_recursive(engine, txn_id, child_table, fk, old_value, new_value, 0)
+}
 
+fn cascade_update_recursive(
+    engine: &MVCCEngine,
+    txn_id: i64,
+    child_table: &str,
+    fk: &ForeignKeyConstraint,
+    old_value: &Value,
+    new_value: &Value,
+    depth: usize,
+) -> Result<i32> {
+    // Early exit: if no child rows reference old_value, cascade stops here.
+    // No depth check, RESTRICT check, or writes needed.
+    if !child_rows_exist(engine, txn_id, child_table, fk, old_value)? {
+        return Ok(0);
+    }
+
+    // Child rows exist. Check depth limit before doing any work.
+    if depth >= MAX_CASCADE_DEPTH {
+        return Err(Error::internal(format!(
+            "foreign key CASCADE depth limit ({}) exceeded — possible circular reference",
+            MAX_CASCADE_DEPTH
+        )));
+    }
+
+    // Find grandchild FKs that reference the column being updated
+    let grandchild_fks = find_referencing_fks(engine, child_table);
+    let child_fk_col = &fk.column_name;
+
+    let relevant_grandchild_fks: Vec<_> = grandchild_fks
+        .iter()
+        .filter(|(_, gfk)| gfk.referenced_column == *child_fk_col)
+        .collect();
+
+    // Pre-check: verify grandchild RESTRICT constraints BEFORE updating child rows
+    if !relevant_grandchild_fks.is_empty() {
+        for (grandchild_table, grandchild_fk) in &relevant_grandchild_fks {
+            if matches!(
+                grandchild_fk.on_update,
+                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction
+            ) && child_rows_exist(engine, txn_id, grandchild_table, grandchild_fk, old_value)?
+            {
+                return Err(Error::foreign_key_violation(
+                    grandchild_table,
+                    &grandchild_fk.column_name,
+                    child_table,
+                    &grandchild_fk.referenced_column,
+                    format!(
+                        "cannot cascade-update row with {} = {} — still referenced by table '{}'",
+                        grandchild_fk.referenced_column, old_value, grandchild_table
+                    ),
+                ));
+            }
+        }
+    }
+
+    // Now update the matching child rows (safe — RESTRICT checks passed above)
+    let mut child = engine.get_table_for_txn(txn_id, child_table)?;
     let col_idx = fk.column_index;
     let new_val = new_value.clone();
 
-    // Build a storage expression for FK column = old_value
     let child_schema = child.schema();
     let col_name = &child_schema.columns[col_idx].name;
     let mut expr = crate::storage::expression::ComparisonExpr::new(
@@ -478,9 +641,52 @@ fn cascade_update(
         let _ = row.set(col_idx, new_val.clone());
         Ok((row, true))
     })?;
-    // Do NOT commit here — changes committed atomically with parent transaction.
 
-    Ok(count)
+    let mut total = count;
+
+    if !relevant_grandchild_fks.is_empty() && count > 0 {
+        for (grandchild_table, grandchild_fk) in &relevant_grandchild_fks {
+            match grandchild_fk.on_update {
+                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
+                    // Already checked above
+                }
+                ForeignKeyAction::Cascade => {
+                    let affected = cascade_update_recursive(
+                        engine,
+                        txn_id,
+                        grandchild_table,
+                        grandchild_fk,
+                        old_value,
+                        new_value,
+                        depth + 1,
+                    )?;
+                    total = total.saturating_add(affected);
+                }
+                ForeignKeyAction::SetNull => {
+                    // SET NULL changes the grandchild's FK column from old_value to NULL.
+                    // Deeper descendants that reference the grandchild's column must see
+                    // this as an update from old_value → NULL and be cascaded accordingly.
+                    let null_val = Value::null(
+                        engine.get_table_schema(grandchild_table)?.columns
+                            [grandchild_fk.column_index]
+                            .data_type,
+                    );
+                    let affected = cascade_update_recursive(
+                        engine,
+                        txn_id,
+                        grandchild_table,
+                        grandchild_fk,
+                        old_value,
+                        &null_val,
+                        depth + 1,
+                    )?;
+                    total = total.saturating_add(affected);
+                }
+            }
+        }
+    }
+
+    Ok(total)
 }
 
 /// SET NULL: set FK column to NULL in all child rows referencing the given parent PK value.

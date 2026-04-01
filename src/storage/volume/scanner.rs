@@ -646,7 +646,13 @@ impl VolumeScanner {
     fn load_group_cache(&mut self, group_idx: usize) {
         let store = match self.volume.columns.compressed_store() {
             Some(s) => s,
-            None => return,
+            None => {
+                // No compressed store: clear stale cache so materialize_row
+                // falls through to the full-column path instead of using
+                // a cache from a previous group with wrong group_start.
+                self.group_cache = None;
+                return;
+            }
         };
         let col_count = self.volume.columns.len();
         let group_start = group_idx * super::column::ROW_GROUP_SIZE;

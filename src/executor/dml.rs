@@ -1576,22 +1576,49 @@ impl Executor {
         };
         let has_fk_updates = !fk_cols_in_update.is_empty();
 
-        // Check if this table is referenced by child tables (for PK update enforcement)
-        let referencing_fks_for_update = if schema.pk_column_index().is_some() {
+        // Reject UPDATE on primary key columns. The engine assumes row_id == pk_value
+        // throughout ~50 code paths (lookups, range scans, ORDER BY, FK cascade, WAL
+        // recovery, etc.). Allowing PK mutation silently corrupts lookups.
+        // This matches SQLite's behavior for rowid tables.
+        if let Some(pk_idx) = schema.pk_column_index() {
             let col_map = schema.column_index_map();
-            let pk_idx = schema.pk_column_index().unwrap();
-            let pk_being_updated = stmt.updates.iter().any(|(col_name, _)| {
+            for col_name in stmt.updates.keys() {
                 let col_lower = col_name.to_lowercase();
-                col_map.get(col_lower.as_str()).copied() == Some(pk_idx)
-            });
-            if pk_being_updated {
-                super::foreign_key::find_referencing_fks(&self.engine, table_name)
-            } else {
-                Arc::new(Vec::new())
+                if col_map.get(col_lower.as_str()).copied() == Some(pk_idx) {
+                    let pk_col_name = &schema.columns[pk_idx].name;
+                    return Err(crate::core::Error::invalid_argument(format!(
+                        "cannot UPDATE primary key column '{}'. Use DELETE + INSERT instead",
+                        pk_col_name
+                    )));
+                }
             }
-        } else {
-            Arc::new(Vec::new())
-        };
+        }
+
+        // Check if this table is referenced by child tables via columns being updated.
+        // This handles CASCADE/RESTRICT/SET NULL for UNIQUE columns referenced by child FKs.
+        let all_referencing_fks =
+            super::foreign_key::find_referencing_fks(&self.engine, table_name);
+        let referencing_fks_for_update: Arc<Vec<(String, crate::core::ForeignKeyConstraint)>> =
+            if all_referencing_fks.is_empty() {
+                Arc::new(Vec::new())
+            } else {
+                let col_map = schema.column_index_map();
+                let updated_cols: Vec<usize> = stmt
+                    .updates
+                    .keys()
+                    .filter_map(|c| col_map.get(c.to_lowercase().as_str()).copied())
+                    .collect();
+                let relevant: Vec<_> = all_referencing_fks
+                    .iter()
+                    .filter(|(_, fk)| {
+                        col_map
+                            .get(fk.referenced_column.to_lowercase().as_str())
+                            .is_some_and(|&idx| updated_cols.contains(&idx))
+                    })
+                    .cloned()
+                    .collect();
+                Arc::new(relevant)
+            };
 
         // Get FK schema via engine (CompactArc ref-count bump, no deep clone)
         let fk_update_schema = if has_fk_updates {
@@ -1760,9 +1787,81 @@ impl Executor {
         // Use RefCell to collect updated rows for RETURNING clause and FK validation
         use std::cell::RefCell;
         let returning_rows: RefCell<Vec<Row>> = RefCell::new(Vec::new());
-        // Collect new FK values and PK old/new pairs from setter for post-update validation
+        // Collect new FK values and referenced-column old/new pairs from setter
         let fk_new_values: RefCell<Vec<Row>> = RefCell::new(Vec::new());
-        let pk_changes: RefCell<Vec<(Value, Value)>> = RefCell::new(Vec::new());
+        // (referenced_col_idx, old_value, new_value) for FK cascade enforcement
+        let ref_col_changes: RefCell<Vec<(usize, Value, Value)>> = RefCell::new(Vec::new());
+
+        // Pre-compute referenced column indices for FK cascade enforcement.
+        // Shared by both correlated and non-correlated update paths.
+        let ref_col_indices_for_fk: Vec<usize> = if !referencing_fks_for_update.is_empty() {
+            let col_map = schema.column_index_map();
+            referencing_fks_for_update
+                .iter()
+                .filter_map(|(_, fk)| {
+                    col_map
+                        .get(fk.referenced_column.to_lowercase().as_str())
+                        .copied()
+                })
+                .collect::<rustc_hash::FxHashSet<usize>>()
+                .into_iter()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Pre-partition FKs by referenced column index for post-update dispatch.
+        // This avoids re-borrowing schema after table.update().
+        let fks_by_ref_col: FxHashMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
+            if !referencing_fks_for_update.is_empty() {
+                let col_map = schema.column_index_map();
+                let mut map: FxHashMap<usize, Vec<(String, crate::core::ForeignKeyConstraint)>> =
+                    FxHashMap::default();
+                for (tbl, fk) in referencing_fks_for_update.iter() {
+                    if let Some(&idx) = col_map.get(fk.referenced_column.to_lowercase().as_str()) {
+                        map.entry(idx).or_default().push((tbl.clone(), fk.clone()));
+                    }
+                }
+                map
+            } else {
+                FxHashMap::default()
+            };
+
+        // Pre-check RESTRICT constraints and CASCADE depth BEFORE writing parent rows.
+        // Only scan rows if the FK tree actually has RESTRICT or exceeds depth limits.
+        // Pure CASCADE/SET NULL trees within depth limits skip this scan entirely.
+        if !fks_by_ref_col.is_empty() {
+            let any_needs_precheck = fks_by_ref_col
+                .values()
+                .any(|fks| super::foreign_key::fk_tree_needs_precheck(&self.engine, fks));
+            if any_needs_precheck {
+                let parent_rows = table.collect_all_rows(where_expr.as_deref())?;
+                for (_rid, row) in parent_rows.iter() {
+                    if needs_memory_filter {
+                        if let Some(ref mem_where) = memory_where_clause {
+                            evaluator.set_row_array(row);
+                            match evaluator.evaluate_bool(mem_where) {
+                                Ok(true) => {}
+                                _ => continue,
+                            }
+                        }
+                    }
+                    for (&col_idx, fks_for_col) in &fks_by_ref_col {
+                        if let Some(old_val) = row.get(col_idx) {
+                            if !old_val.is_null() {
+                                super::foreign_key::pre_check_restrict_for_update(
+                                    &self.engine,
+                                    table.txn_id(),
+                                    table_name,
+                                    old_val,
+                                    fks_for_col,
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Create a setter function that applies updates using pre-computed indices
         // If we need memory filtering, include the WHERE check in the setter
@@ -1886,9 +1985,38 @@ impl Executor {
                 let pk_value = row.get(pk_idx).cloned().unwrap_or(Value::null_unknown());
 
                 if let Some(updates) = precomputed.get(&pk_value) {
+                    // Capture old values of referenced columns before applying changes
+                    let ref_old: Vec<(usize, Value)> = if !ref_col_indices_for_fk.is_empty() {
+                        ref_col_indices_for_fk
+                            .iter()
+                            .filter_map(|&ci| row.get(ci).map(|v| (ci, v.clone())))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
                     for (idx, new_value) in updates {
                         let _ = row.set(*idx, new_value.clone());
                     }
+
+                    // Track referenced column changes for FK cascade
+                    for (ci, old_val) in &ref_old {
+                        if let Some(new_val) = row.get(*ci) {
+                            if old_val != new_val {
+                                ref_col_changes.borrow_mut().push((
+                                    *ci,
+                                    old_val.clone(),
+                                    new_val.clone(),
+                                ));
+                            }
+                        }
+                    }
+
+                    // Collect row for child FK parent-existence validation
+                    if has_fk_updates {
+                        fk_new_values.borrow_mut().push(row.clone());
+                    }
+
                     // Collect row for RETURNING clause
                     if has_returning {
                         returning_rows.borrow_mut().push(row.clone());
@@ -1978,8 +2106,6 @@ impl Executor {
             // Extract params before the closure so they can be captured
             let params = ctx.params();
             let named_params = ctx.named_params();
-            // Pre-compute PK column index for FK enforcement inside closure
-            let pk_col_idx_for_fk = schema.pk_column_index();
             let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                 // If we need in-memory WHERE filtering, check the condition first
                 if needs_memory_filter {
@@ -2026,12 +2152,16 @@ impl Executor {
                 // Now apply all the computed values to the row
                 let changed = !updates_to_apply.is_empty();
 
-                // Track PK old value before applying changes (for FK enforcement)
-                let pk_old = if changed && !referencing_fks_for_update.is_empty() {
-                    pk_col_idx_for_fk.and_then(|pk_idx| row.get(pk_idx).cloned())
-                } else {
-                    None
-                };
+                // Capture old values of referenced columns before applying changes
+                let ref_old_values: Vec<(usize, Value)> =
+                    if changed && !ref_col_indices_for_fk.is_empty() {
+                        ref_col_indices_for_fk
+                            .iter()
+                            .filter_map(|&ci| row.get(ci).map(|v| (ci, v.clone())))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
 
                 for (idx, new_value) in updates_to_apply {
                     let _ = row.set(idx, new_value);
@@ -2077,12 +2207,16 @@ impl Executor {
                     fk_new_values.borrow_mut().push(row.clone());
                 }
 
-                // Track PK changes for referencing FK enforcement
-                if let Some(old_pk) = pk_old {
-                    if let Some(pk_idx) = pk_col_idx_for_fk {
-                        if let Some(new_pk) = row.get(pk_idx) {
-                            if &old_pk != new_pk {
-                                pk_changes.borrow_mut().push((old_pk, new_pk.clone()));
+                // Track referenced column changes for FK cascade enforcement
+                if !ref_old_values.is_empty() {
+                    for (ci, old_val) in &ref_old_values {
+                        if let Some(new_val) = row.get(*ci) {
+                            if old_val != new_val {
+                                ref_col_changes.borrow_mut().push((
+                                    *ci,
+                                    old_val.clone(),
+                                    new_val.clone(),
+                                ));
                             }
                         }
                     }
@@ -2132,18 +2266,21 @@ impl Executor {
             }
         }
 
-        // Post-update PK change enforcement: enforce referencing FK actions
-        if !referencing_fks_for_update.is_empty() {
-            let changes = pk_changes.into_inner();
-            for (old_pk, new_pk) in &changes {
-                super::foreign_key::enforce_update_actions(
-                    &self.engine,
-                    table.txn_id(),
-                    table_name,
-                    old_pk,
-                    new_pk,
-                    &referencing_fks_for_update,
-                )?;
+        // Post-update referenced-column change enforcement: apply CASCADE/SET NULL.
+        // RESTRICT constraints were already pre-checked above, so this should not
+        // fail for RESTRICT. CASCADE/SET NULL failures are propagated as errors.
+        if !fks_by_ref_col.is_empty() {
+            let changes = ref_col_changes.into_inner();
+            for (col_idx, old_val, new_val) in &changes {
+                if let Some(fks_for_col) = fks_by_ref_col.get(col_idx) {
+                    super::foreign_key::enforce_update_actions(
+                        &self.engine,
+                        table.txn_id(),
+                        old_val,
+                        new_val,
+                        fks_for_col,
+                    )?;
+                }
             }
         }
 
