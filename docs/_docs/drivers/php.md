@@ -306,6 +306,48 @@ try {
 | `array` / `object` | `JSON` | Auto-encoded/decoded |
 | `DateTimeInterface` | `TIMESTAMP` | Converted to nanoseconds |
 
+## PHP-FPM / Web Server Support
+
+Stoolap uses exclusive file locking, so only one OS process can open a database at a time. The PHP extension solves this transparently for multi-process environments (php-fpm, Apache mod_php) with a built-in daemon proxy.
+
+When loaded under php-fpm, CGI, or Apache, the extension automatically forks a background daemon process. PHP workers communicate with the daemon via shared memory + kernel wait primitives (futex on Linux, __ulock on macOS) for near-zero IPC overhead (~0.5μs per call). No configuration required.
+
+### Architecture
+
+```
+php-fpm master
+  ├── worker 1 ──┐
+  ├── worker 2 ──┼── shared memory + futex/ulock ──► stoolap daemon
+  ├── worker 3 ──┤                                    ├── DB: file:///data/app
+  └── worker N ──┘                                    └── DB: memory://cache
+```
+
+- One daemon process serves all workers and all databases
+- Each worker gets a `clone()`'d database handle via the daemon
+- Daemon auto-starts with php-fpm and auto-exits when php-fpm stops
+- All Stoolap features work identically in daemon mode (transactions, prepared statements, batch operations)
+
+### IPC Overhead
+
+| Operation | Direct (CLI) | Daemon (FPM) | Overhead |
+|---|---|---|---|
+| SELECT by PK | 0.5 μs | 1.0 μs | ~0.5 μs |
+| UPDATE by PK | 0.8 μs | 1.2 μs | ~0.5 μs |
+| Prepared execute | 0.6 μs | 1.1 μs | ~0.5 μs |
+| Prepared queryOne | 1.1 μs | 1.7 μs | ~0.6 μs |
+
+Analytical queries (GROUP BY, JOIN, window functions) are unaffected since they're dominated by engine execution time, not IPC.
+
+### Environment Variables
+
+| Variable | Values | Description |
+|---|---|---|
+| `STOOLAP_DAEMON` | `1` / `on` | Force daemon mode (useful for CLI testing) |
+| `STOOLAP_DAEMON` | `0` / `off` | Force direct mode (disable daemon) |
+| `STOOLAP_DAEMON_DEBUG` | `1` | Enable daemon stderr logging |
+
+When not set, daemon mode is auto-detected from the SAPI name (fpm, cgi, apache).
+
 ## Building from Source
 
 Requires:
