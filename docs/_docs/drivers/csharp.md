@@ -40,10 +40,10 @@ Requires **.NET 8 SDK or newer**.
 
 The driver searches for `libstoolap.{dylib,so,dll}` in this order:
 
-1. Absolute path in the `STOOLAP_LIB_PATH` environment variable
-2. NuGet runtime-specific folder `runtimes/<rid>/native/` (handled automatically by the SDK)
-3. The assembly's base directory (next to `Stoolap.dll`)
-4. The OS loader search path (`LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, `PATH`, `/usr/local/lib`, etc.)
+1. Absolute path in the `STOOLAP_LIB_PATH` environment variable.
+2. The RID-specific folder `runtimes/<rid>/native/` next to the running assembly. This is the canonical NuGet layout and is the resolver's preferred location, both for packed-package consumers and for project-reference consumers (the build targets copy the host platform's binary into this subfolder).
+3. The assembly's base directory next to `Stoolap.dll`. **Skipped on Windows**, where the case-insensitive filesystem would cause `stoolap.dll` (native) to collide with `Stoolap.dll` (managed). Windows users with a custom native location should use `STOOLAP_LIB_PATH`.
+4. The OS loader search path (`LD_LIBRARY_PATH`, `DYLD_LIBRARY_PATH`, `PATH`, `/usr/local/lib`, etc.).
 
 ```bash
 export STOOLAP_LIB_PATH=/absolute/path/to/libstoolap.dylib
@@ -225,7 +225,8 @@ tx.Commit();
 | Method | Returns | Description |
 |--------|---------|-------------|
 | `Execute(sql, params)` | `long` | Execute DDL/DML |
-| `Query(sql, params)` | `QueryResult` | Execute query |
+| `Query(sql, params)` | `QueryResult` | Materialized query (binary fetch-all) |
+| `QueryStream(sql, params)` | `Rows` | Streaming row reader inside the transaction |
 | `Execute(stmt, params)` | `long` | Execute a prepared statement in this transaction |
 | `Query(stmt, params)` | `QueryResult` | Query a prepared statement in this transaction |
 | `Commit()` | `void` | Commit the transaction |
@@ -457,7 +458,7 @@ Inside the ADO.NET layer, the same exception propagates through `DbCommand.Execu
 
 ## Testing
 
-The repository ships with 132 xUnit tests across seven test files:
+The repository ships with a full xUnit suite across eleven test files, covering both target frameworks (`net8.0` and `net9.0`):
 
 - `SmokeTests.cs`. Open/close, execute, query, streaming, prepared statements, transactions, clone, NULL parameters.
 - `ParameterBinderTests.cs`. Scratch-buffer fast path, HGlobal slow path, boundary cases, all primitive types, stackalloc capacity transitions.
@@ -469,6 +470,7 @@ The repository ships with 132 xUnit tests across seven test files:
 - `ErrorHandlingTests.cs`. Invalid SQL, missing tables, duplicate tables, disposed objects, transaction-after-end, null arguments.
 - `TypeRoundTripTests.cs`. Every Stoolap type through both the binary and streaming read paths, including 100 K-byte strings, Unicode payloads, timestamps, vectors, JSON, and NULL.
 - `AdoTests.cs`. ADO.NET connection lifecycle, reader streaming, transaction rollback.
+- `RegressionTests.cs`. Driver-contract regressions: `HasRows` accuracy on empty results, `GetFieldType` schema stability before `Read()`, transaction-foreign-connection rejection, transactional `ExecuteReader` streaming behavior.
 
 Run the full suite:
 
@@ -482,13 +484,13 @@ Requires:
 
 - [Rust](https://rustup.rs) (stable)
 - [.NET 8 SDK](https://dotnet.microsoft.com/download) or newer
-- The stoolap source (by default expected at `../stoolap/`)
 
 ```bash
 git clone https://github.com/stoolap/stoolap-csharp.git
 cd stoolap-csharp
 
-# Build the native library for the host platform
+# Build the native library for the host platform.
+# Auto-clones the stoolap engine at the pinned ref if no source is found.
 ./build/build-native.sh
 
 # Build and test everything
@@ -499,13 +501,15 @@ dotnet test  -c Release
 dotnet run --project benchmark/Stoolap.Benchmark.csproj -c Release
 ```
 
-The build script detects the host OS/arch and drops the resulting native binary into `runtimes/<rid>/native/`, which is the standard NuGet convention. This is the same layout the published package uses to ship per-platform binaries.
+The build script resolves the stoolap source in this order:
 
-Override the stoolap source location with the `STOOLAP_ROOT` environment variable:
+1. `$STOOLAP_ROOT` if set and points at a Cargo project.
+2. `../stoolap` (a sibling checkout next to this repo).
+3. Auto-clones `github.com/stoolap/stoolap` at the version pinned in `STOOLAP_ENGINE_REF` (default `v0.4.0`) into `build/.stoolap-engine/`. The clone is gitignored and reused on subsequent runs.
 
-```bash
-STOOLAP_ROOT=/workspace/stoolap ./build/build-native.sh
-```
+It then runs `cargo build --release --features ffi`, detects the host OS/arch, and drops the resulting binary into `runtimes/<rid>/native/`, the standard NuGet convention. This is the same layout the published package uses to ship per-platform binaries.
+
+The repo also includes a `global.json` pinning the .NET SDK to 9.0 with `latestFeature` rollforward, so the multi-target `net8.0;net9.0` build works from a single SDK install.
 
 ## License
 
