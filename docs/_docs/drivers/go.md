@@ -8,17 +8,18 @@ icon: go
 
 # Go Driver
 
-Go driver for Stoolap built on the Rust engine via C FFI (cgo). Provides two ways to use Stoolap from Go:
+Native Go driver for Stoolap. Loads `libstoolap` at runtime via direct ABI calls. No C compiler, no CGO required. Provides two ways to use Stoolap from Go:
 
 - **Direct API** for maximum performance and control
 - **`database/sql`** driver for standard Go database access
 
-For a pure Go driver with no CGO dependency, see [Go WASM Driver]({{ '/docs/drivers/go-wasm/' | relative_url }}).
+For a pure Go driver with no shared library dependency, see [Go WASM Driver]({{ '/docs/drivers/go-wasm/' | relative_url }}).
 
 ## Requirements
 
 - Go 1.24+
-- CGO enabled (`CGO_ENABLED=1`, the default)
+- `CGO_ENABLED=0` works (no C compiler needed)
+- `CGO_ENABLED=1` also works (if linked with other CGO code)
 
 ## Installation
 
@@ -29,18 +30,17 @@ go get github.com/stoolap/stoolap-go
 Prebuilt shared libraries for macOS (arm64), Linux (x64), and Windows (x64) are bundled
 in the module. No extra downloads or environment variables needed, just `go get` and build.
 
-The compiled Go binary dynamically links against `libstoolap`. For deployment, place the
-shared library next to your executable or in a system library path.
+The binary dynamically loads `libstoolap` at runtime via `dlopen`. For deployment, place the
+shared library next to your executable or set the `STOOLAP_LIB` environment variable.
 
 ### Other Platforms
 
 For platforms without a bundled library (e.g. Linux arm64, macOS x64), download from the
-[releases page](https://github.com/stoolap/stoolap-go/releases) or build from source,
-then build with the `stoolap_use_lib` tag:
+[releases page](https://github.com/stoolap/stoolap-go/releases) or build from source, then:
 
 ```bash
-export LIBRARY_PATH=/path/to/stoolap/target/release
-go build -tags stoolap_use_lib ./...
+export STOOLAP_LIB=/path/to/libstoolap.so
+go build ./...
 ```
 
 ## Quick Start
@@ -54,7 +54,7 @@ import (
     "context"
     "fmt"
 
-    stoolap "github.com/stoolap/stoolap-go"
+    "github.com/stoolap/stoolap-go"
 )
 
 func main() {
@@ -73,9 +73,8 @@ func main() {
     defer rows.Close()
 
     for rows.Next() {
-        var id int64
+        var id, age int64
         var name string
-        var age int64
         rows.Scan(&id, &name, &age)
         fmt.Printf("id=%d name=%s age=%d\n", id, name, age)
     }
@@ -92,7 +91,7 @@ import (
     "database/sql"
     "fmt"
 
-    _ "github.com/stoolap/stoolap-go/pkg/driver"
+    _ "github.com/stoolap/stoolap-go"
 )
 
 func main() {
@@ -111,9 +110,8 @@ func main() {
     defer rows.Close()
 
     for rows.Next() {
-        var id int64
+        var id, age int64
         var name string
-        var age int64
         rows.Scan(&id, &name, &age)
         fmt.Printf("id=%d name=%s age=%d\n", id, name, age)
     }
@@ -133,31 +131,21 @@ See [Connection String Reference]({{ '/docs/getting-started/connection-strings/'
 
 ## Parameters
 
-Use positional parameters `$1`, `$2`, etc. with `driver.NamedValue`:
+Use positional parameters `$1`, `$2`, etc. with the direct API:
 
 ```go
-import "database/sql/driver"
+db.ExecParams(ctx, "INSERT INTO users VALUES ($1, $2, $3)",
+    []any{int64(1), "Alice", int64(30)})
 
-ctx := context.Background()
-
-db.ExecContext(ctx, "INSERT INTO users VALUES ($1, $2, $3)",
-    driver.NamedValue{Ordinal: 1, Value: int64(1)},
-    driver.NamedValue{Ordinal: 2, Value: "Alice"},
-    driver.NamedValue{Ordinal: 3, Value: int64(30)},
-)
-
-row := db.QueryRow(ctx, "SELECT name FROM users WHERE id = $1",
-    driver.NamedValue{Ordinal: 1, Value: int64(1)},
-)
-var name string
-row.Scan(&name)
+rows, _ := db.QueryParams(ctx, "SELECT name FROM users WHERE id = $1",
+    []any{int64(1)})
 ```
 
-With `database/sql`, use standard positional arguments:
+With `database/sql`, use standard `?` positional arguments:
 
 ```go
-db.ExecContext(ctx, "INSERT INTO users VALUES ($1, $2, $3)", 1, "Alice", 30)
-rows, _ := db.QueryContext(ctx, "SELECT name FROM users WHERE id = $1", 1)
+db.ExecContext(ctx, "INSERT INTO users VALUES (?, ?, ?)", 1, "Alice", 30)
+rows, _ := db.QueryContext(ctx, "SELECT name FROM users WHERE id = ?", 1)
 ```
 
 ## Transactions
@@ -165,15 +153,13 @@ rows, _ := db.QueryContext(ctx, "SELECT name FROM users WHERE id = $1", 1)
 ### Default Isolation (Read Committed)
 
 ```go
-tx, err := db.Begin()
+tx, err := db.Begin(ctx)
 if err != nil {
     panic(err)
 }
 
-tx.ExecContext(ctx, "INSERT INTO users VALUES ($1, $2)",
-    driver.NamedValue{Ordinal: 1, Value: int64(1)},
-    driver.NamedValue{Ordinal: 2, Value: "Alice"},
-)
+tx.ExecParams(ctx, "INSERT INTO users VALUES ($1, $2)",
+    []any{int64(1), "Alice"})
 
 if err := tx.Commit(); err != nil {
     panic(err)
@@ -192,7 +178,7 @@ if err != nil {
 defer tx.Rollback()
 
 // All reads within this transaction see the same snapshot
-rows, _ := tx.QueryContext(ctx, "SELECT * FROM users")
+rows, _ := tx.Query(ctx, "SELECT * FROM users")
 // ...
 tx.Commit()
 ```
@@ -207,55 +193,16 @@ tx.Commit()
 Parse once, execute many times:
 
 ```go
-stmt, err := db.Prepare("INSERT INTO users VALUES ($1, $2)")
+stmt, err := db.Prepare(ctx, "INSERT INTO users VALUES ($1, $2)")
 if err != nil {
     panic(err)
 }
 defer stmt.Close()
 
 for i := int64(1); i <= 1000; i++ {
-    stmt.ExecContext(ctx,
-        driver.NamedValue{Ordinal: 1, Value: i},
-        driver.NamedValue{Ordinal: 2, Value: "User"},
-    )
+    stmt.ExecContext(ctx, []any{i, "User"})
 }
 ```
-
-### Prepared Statements in Transactions
-
-For transactional atomicity with parse-once performance, prepare statements via `Tx.Prepare()`. This uses `stoolap_tx_stmt_exec`/`stoolap_tx_stmt_query` internally, ensuring all operations participate in the transaction's commit/rollback.
-
-```go
-stmt, err := db.Prepare("INSERT INTO orders VALUES ($1, $2, $3)")
-if err != nil {
-    panic(err)
-}
-defer stmt.Close()
-
-tx, err := db.Begin()
-if err != nil {
-    panic(err)
-}
-
-txStmt, err := tx.Prepare("INSERT INTO orders VALUES ($1, $2, $3)")
-if err != nil {
-    tx.Rollback()
-    panic(err)
-}
-defer txStmt.Close()
-
-for i := int64(0); i < 1000; i++ {
-    txStmt.ExecContext(ctx,
-        driver.NamedValue{Ordinal: 1, Value: i},
-        driver.NamedValue{Ordinal: 2, Value: int64(1)},
-        driver.NamedValue{Ordinal: 3, Value: 99.99},
-    )
-}
-
-tx.Commit() // all 1000 rows committed atomically
-```
-
-**Important**: Do not use `stmt.ExecContext()` (DB-level prepared statement) inside a transaction block. It creates its own standalone auto-committing transaction per call, so rollback will not undo those operations. Always use `tx.Prepare()` for transaction-bound statements.
 
 ## NULL Handling
 
@@ -269,15 +216,18 @@ var (
     active sql.NullBool
     ts     sql.NullTime
 )
-row := db.QueryRow(ctx, "SELECT name, age, score, active, created_at FROM users WHERE id = $1",
-    driver.NamedValue{Ordinal: 1, Value: int64(1)},
-)
-row.Scan(&name, &age, &score, &active, &ts)
+rows, _ := db.QueryParams(ctx,
+    "SELECT name, age, score, active, created_at FROM users WHERE id = $1",
+    []any{int64(1)})
+defer rows.Close()
 
-if name.Valid {
-    fmt.Println("Name:", name.String)
-} else {
-    fmt.Println("Name is NULL")
+if rows.Next() {
+    rows.Scan(&name, &age, &score, &active, &ts)
+    if name.Valid {
+        fmt.Println("Name:", name.String)
+    } else {
+        fmt.Println("Name is NULL")
+    }
 }
 ```
 
@@ -302,9 +252,14 @@ JSON values are stored and retrieved as strings:
 db.Exec(ctx, "CREATE TABLE docs (id INTEGER PRIMARY KEY, data JSON)")
 db.Exec(ctx, `INSERT INTO docs VALUES (1, '{"name":"Alice","age":30}')`)
 
+rows, _ := db.Query(ctx, "SELECT data FROM docs WHERE id = 1")
+defer rows.Close()
+
 var data string
-db.QueryRow(ctx, "SELECT data FROM docs WHERE id = 1").Scan(&data)
-// data = `{"name":"Alice","age":30}`
+if rows.Next() {
+    rows.Scan(&data)
+    // data = `{"name":"Alice","age":30}`
+}
 ```
 
 ## Vector Search
@@ -326,14 +281,17 @@ for i, f := range vec {
     binary.LittleEndian.PutUint32(buf[i*4:], math.Float32bits(f))
 }
 
-db.ExecContext(ctx, "INSERT INTO vectors VALUES ($1, $2)",
-    driver.NamedValue{Ordinal: 1, Value: int64(1)},
-    driver.NamedValue{Ordinal: 2, Value: buf},
-)
+db.ExecParams(ctx, "INSERT INTO vectors VALUES ($1, $2)",
+    []any{int64(1), buf})
 
 // Read back
 var blob []byte
-db.QueryRow(ctx, "SELECT embedding FROM vectors WHERE id = 1").Scan(&blob)
+rows, _ := db.QueryParams(ctx, "SELECT embedding FROM vectors WHERE id = $1",
+    []any{int64(1)})
+defer rows.Close()
+if rows.Next() {
+    rows.Scan(&blob)
+}
 
 // Decode packed f32 bytes back to float32 slice
 result := make([]float32, len(blob)/4)
@@ -344,18 +302,19 @@ for i := range result {
 
 ## Bulk Fetch
 
-`FetchAll()` fetches all remaining rows into a single packed binary buffer, avoiding per-row FFI overhead:
+`FetchAll()` fetches all remaining rows in a single native call and returns them as `[][]any`, minimizing per-row FFI overhead:
 
 ```go
 rows, _ := db.Query(ctx, "SELECT id, name, age FROM users")
 defer rows.Close()
 
-buf, err := rows.FetchAll()
+allRows, err := rows.FetchAll()
 if err != nil {
     panic(err)
 }
-// buf contains all rows in packed binary format
-// See the C API docs for the binary format specification
+for _, row := range allRows {
+    // row[0] = id, row[1] = name, row[2] = age
+}
 ```
 
 ## Cloning for Concurrency
@@ -377,7 +336,8 @@ for i := 0; i < 4; i++ {
         clone, _ := db.Clone()
         defer clone.Close()
 
-        clone.Exec(ctx, fmt.Sprintf("INSERT INTO t VALUES (%d, 'worker-%d')", workerID, workerID))
+        clone.ExecParams(ctx, "INSERT INTO t VALUES ($1, $2)",
+            []any{int64(workerID), fmt.Sprintf("worker-%d", workerID)})
     }(i)
 }
 wg.Wait()
@@ -397,8 +357,6 @@ The `database/sql` driver handles this automatically. Each connection in the poo
 | JSON | `string` | `sql.NullString` |
 | VECTOR/BLOB | `[]byte` | `[]byte` (nil for NULL) |
 
-Scan supports type coercion: INTEGER columns can scan into `*string`, FLOAT into `*int64`, etc.
-
 ## Thread Safety
 
 - **Direct API**: A single `DB` handle must not be shared across goroutines. Use `Clone()` for per-goroutine handles.
@@ -409,62 +367,54 @@ Scan supports type coercion: INTEGER columns can scan into `*string`, FLOAT into
 
 ### Package Functions
 
-| Function | Returns | Description |
-|----------|---------|-------------|
-| `Version()` | `string` | Stoolap library version |
-| `Open(dsn)` | `*DB, error` | Open a database connection |
+```go
+func Version() (string, error)
+func Open(dsn string) (*DB, error)
+func OpenMemory() (*DB, error)
+```
 
 ### DB
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `Close()` | `error` | Close the connection |
-| `Clone()` | `*DB, error` | Clone handle for multi-goroutine use |
-| `Exec(ctx, query)` | `sql.Result, error` | Execute without parameters |
-| `ExecContext(ctx, query, args...)` | `sql.Result, error` | Execute with parameters |
-| `Query(ctx, query)` | `Rows, error` | Query without parameters |
-| `QueryContext(ctx, query, args...)` | `Rows, error` | Query with parameters |
-| `QueryRow(ctx, query, args...)` | `Row` | Query expecting at most one row |
-| `Begin()` | `Tx, error` | Begin transaction (Read Committed) |
-| `BeginTx(ctx, opts)` | `Tx, error` | Begin transaction with options |
-| `Prepare(query)` | `Stmt, error` | Create a prepared statement |
-| `PrepareContext(ctx, query)` | `Stmt, error` | Create a prepared statement with context |
+```go
+func (db *DB) Close() error
+func (db *DB) Clone() (*DB, error)
+func (db *DB) Exec(ctx context.Context, query string) (sql.Result, error)
+func (db *DB) ExecParams(ctx context.Context, query string, args []any) (sql.Result, error)
+func (db *DB) Query(ctx context.Context, query string) (*Rows, error)
+func (db *DB) QueryParams(ctx context.Context, query string, args []any) (*Rows, error)
+func (db *DB) Prepare(ctx context.Context, query string) (*Stmt, error)
+func (db *DB) Begin(ctx context.Context) (*Tx, error)
+func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error)
+```
 
 ### Rows
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `Next()` | `bool` | Advance to next row |
-| `Scan(dest...)` | `error` | Read current row columns |
-| `Close()` | `error` | Close result set |
-| `Columns()` | `[]string` | Get column names |
-| `FetchAll()` | `[]byte, error` | Fetch all remaining rows as packed binary |
-
-### Row
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `Scan(dest...)` | `error` | Read the row columns (`sql.ErrNoRows` if empty) |
-
-### Tx
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `Commit()` | `error` | Commit the transaction |
-| `Rollback()` | `error` | Rollback the transaction |
-| `ExecContext(ctx, query, args...)` | `sql.Result, error` | Execute within the transaction |
-| `QueryContext(ctx, query, args...)` | `Rows, error` | Query within the transaction |
-| `Prepare(query)` | `Stmt, error` | Prepare statement bound to the transaction |
-| `ID()` | `int64` | Get the transaction ID |
+```go
+func (r *Rows) Next() bool
+func (r *Rows) Scan(dest ...any) error
+func (r *Rows) Columns() []string
+func (r *Rows) Close() error
+func (r *Rows) FetchAll() ([][]any, error)
+```
 
 ### Stmt
 
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `ExecContext(ctx, args...)` | `sql.Result, error` | Execute the prepared statement |
-| `QueryContext(ctx, args...)` | `Rows, error` | Query with the prepared statement |
-| `SQL()` | `string` | Get the SQL text |
-| `Close()` | `error` | Destroy the prepared statement |
+```go
+func (s *Stmt) ExecContext(ctx context.Context, args []any) (sql.Result, error)
+func (s *Stmt) QueryContext(ctx context.Context, args []any) (*Rows, error)
+func (s *Stmt) Close() error
+```
+
+### Tx
+
+```go
+func (tx *Tx) Exec(ctx context.Context, query string) (sql.Result, error)
+func (tx *Tx) ExecParams(ctx context.Context, query string, args []any) (sql.Result, error)
+func (tx *Tx) Query(ctx context.Context, query string) (*Rows, error)
+func (tx *Tx) QueryParams(ctx context.Context, query string, args []any) (*Rows, error)
+func (tx *Tx) Commit() error
+func (tx *Tx) Rollback() error
+```
 
 ## database/sql Driver
 
@@ -488,6 +438,12 @@ The driver is registered as `"stoolap"` and implements the following `database/s
 | `driver.StmtExecContext` | Prepared exec with context |
 | `driver.StmtQueryContext` | Prepared query with context |
 | `driver.Rows` | Result set iteration |
+
+## Architecture
+
+The driver loads `libstoolap` at runtime via `dlopen` and dispatches FFI calls through hand-written assembly trampolines entered via `runtime.asmcgocall`. This bypasses the standard CGO overhead (~40ns per call) and achieves near-native performance (~3ns per call).
+
+On Linux, a minimal fake-cgo runtime preserves glibc thread-local storage so the shared library's thread-local state works correctly without requiring `CGO_ENABLED=1`. On macOS and Windows, the native OS loader handles this directly.
 
 ## Building from Source
 
