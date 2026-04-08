@@ -2,7 +2,7 @@
 layout: doc
 title: Go Driver
 category: Drivers
-order: 4
+order: 2
 icon: go
 ---
 

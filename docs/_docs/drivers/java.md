@@ -2,7 +2,7 @@
 layout: doc
 title: Java Driver
 category: Drivers
-order: 8
+order: 4
 icon: java
 ---
 
