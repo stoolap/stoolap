@@ -73,7 +73,7 @@
     <text x="502" y="58" text-anchor="middle" class="comp-title">CLI Interface</text>
 
     <rect x="607" y="38" width="177" height="30" rx="5" class="comp-bg" />
-    <text x="695" y="58" text-anchor="middle" class="comp-title">Connection Mgr</text>
+    <text x="695" y="58" text-anchor="middle" class="comp-title">Drivers</text>
   </g>
 
   <!-- Arrow: API → Query -->
@@ -131,15 +131,15 @@
     <rect x="26" y="62" width="78" height="20" rx="3" class="tag-bg" /><text x="65" y="76" text-anchor="middle" class="tag">Transaction</text>
     <rect x="110" y="62" width="78" height="20" rx="3" class="tag-bg" /><text x="149" y="76" text-anchor="middle" class="tag">Version Store</text>
     <rect x="26" y="86" width="78" height="20" rx="3" class="tag-bg" /><text x="65" y="100" text-anchor="middle" class="tag">Snapshot</text>
-    <rect x="110" y="86" width="78" height="20" rx="3" class="tag-bg" /><text x="149" y="100" text-anchor="middle" class="tag">Registry</text>
+    <rect x="110" y="86" width="78" height="20" rx="3" class="tag-bg" /><text x="149" y="100" text-anchor="middle" class="tag">Tombstones</text>
 
     <!-- Row Storage -->
     <rect x="213" y="36" width="185" height="82" rx="5" class="comp-bg" />
     <text x="305" y="54" text-anchor="middle" class="comp-title">Row Storage</text>
-    <rect x="223" y="62" width="78" height="20" rx="3" class="tag-bg" /><text x="262" y="76" text-anchor="middle" class="tag">Table</text>
-    <rect x="307" y="62" width="78" height="20" rx="3" class="tag-bg" /><text x="346" y="76" text-anchor="middle" class="tag">Schema</text>
+    <rect x="223" y="62" width="78" height="20" rx="3" class="tag-bg" /><text x="262" y="76" text-anchor="middle" class="tag">Hot Buffer</text>
+    <rect x="307" y="62" width="78" height="20" rx="3" class="tag-bg" /><text x="346" y="76" text-anchor="middle" class="tag">Cold Volumes</text>
     <rect x="223" y="86" width="78" height="20" rx="3" class="tag-bg" /><text x="262" y="100" text-anchor="middle" class="tag">Scanner</text>
-    <rect x="307" y="86" width="78" height="20" rx="3" class="tag-bg" /><text x="346" y="100" text-anchor="middle" class="tag">Expression</text>
+    <rect x="307" y="86" width="78" height="20" rx="3" class="tag-bg" /><text x="346" y="100" text-anchor="middle" class="tag">Schema</text>
 
     <!-- Index Manager -->
     <rect x="410" y="36" width="185" height="82" rx="5" class="comp-bg" />
@@ -147,11 +147,12 @@
     <rect x="420" y="62" width="52" height="20" rx="3" class="tag-bg" /><text x="446" y="76" text-anchor="middle" class="tag">B-tree</text>
     <rect x="478" y="62" width="52" height="20" rx="3" class="tag-bg" /><text x="504" y="76" text-anchor="middle" class="tag">Hash</text>
     <rect x="536" y="62" width="52" height="20" rx="3" class="tag-bg" /><text x="562" y="76" text-anchor="middle" class="tag">Bitmap</text>
-    <rect x="440" y="86" width="100" height="20" rx="3" class="tag-bg" /><text x="490" y="100" text-anchor="middle" class="tag">Multi-Column</text>
+    <rect x="424" y="86" width="74" height="20" rx="3" class="tag-bg" /><text x="461" y="100" text-anchor="middle" class="tag">Zone Maps</text>
+    <rect x="504" y="86" width="74" height="20" rx="3" class="tag-bg" /><text x="541" y="100" text-anchor="middle" class="tag">Bloom</text>
 
     <!-- Functions -->
     <rect x="607" y="36" width="177" height="82" rx="5" class="comp-bg" />
-    <text x="695" y="54" text-anchor="middle" class="comp-title">Functions (110)</text>
+    <text x="695" y="54" text-anchor="middle" class="comp-title">Functions (131)</text>
     <rect x="617" y="62" width="74" height="20" rx="3" class="tag-bg" /><text x="654" y="76" text-anchor="middle" class="tag">Scalar</text>
     <rect x="697" y="62" width="74" height="20" rx="3" class="tag-bg" /><text x="734" y="76" text-anchor="middle" class="tag">Aggregate</text>
     <rect x="617" y="86" width="74" height="20" rx="3" class="tag-bg" /><text x="654" y="100" text-anchor="middle" class="tag">Window</text>
@@ -172,13 +173,13 @@
     <text x="108" y="53" text-anchor="middle" class="comp-title">Write-Ahead Log</text>
 
     <rect x="213" y="34" width="185" height="28" rx="5" class="comp-bg" />
-    <text x="305" y="53" text-anchor="middle" class="comp-title">Snapshots</text>
+    <text x="305" y="53" text-anchor="middle" class="comp-title">Volumes</text>
 
     <rect x="410" y="34" width="185" height="28" rx="5" class="comp-bg" />
-    <text x="502" y="53" text-anchor="middle" class="comp-title">Crash Recovery</text>
+    <text x="502" y="53" text-anchor="middle" class="comp-title">Manifest</text>
 
     <rect x="607" y="34" width="177" height="28" rx="5" class="comp-bg" />
-    <text x="695" y="53" text-anchor="middle" class="comp-title">File Lock</text>
+    <text x="695" y="53" text-anchor="middle" class="comp-title">Compaction</text>
   </g>
 
   <!-- ════════════ RETURN FLOW ════════════ -->
