@@ -320,6 +320,13 @@ impl NamedParams {
         }
     }
 
+    /// Create empty named params with pre-allocated capacity
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            params: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+        }
+    }
+
     /// Add a named parameter (builder style)
     pub fn add<T: ToParam>(mut self, name: impl Into<String>, value: T) -> Self {
         self.params.insert(name.into(), value.to_param());

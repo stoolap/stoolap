@@ -2,7 +2,7 @@
 layout: doc
 title: C API (FFI)
 category: Drivers
-order: 9
+order: 10
 icon: c
 ---
 
@@ -89,7 +89,7 @@ The API uses four opaque handle types. Each handle is created by a specific func
 | `StoolapDB` | `stoolap_open`, `stoolap_open_in_memory`, `stoolap_clone` | `stoolap_close` | NULL-safe close (no-op) |
 | `StoolapStmt` | `stoolap_prepare` | `stoolap_stmt_finalize` | NULL-safe finalize (no-op). Keeps the database engine alive. |
 | `StoolapTx` | `stoolap_begin`, `stoolap_begin_with_isolation` | `stoolap_tx_commit` or `stoolap_tx_rollback` | Handle consumed on commit/rollback regardless of success or failure. Keeps the database engine alive. |
-| `StoolapRows` | `stoolap_query*`, `stoolap_stmt_query`, `stoolap_tx_query*` | `stoolap_rows_close` | Must be closed even after `STOOLAP_DONE`. NULL-safe close (no-op) |
+| `StoolapRows` | `stoolap_query*`, `stoolap_stmt_query`, `stoolap_tx_query*`, `stoolap_tx_stmt_query*` | `stoolap_rows_close` | Must be closed even after `STOOLAP_DONE`. NULL-safe close (no-op) |
 
 **Important**: `stoolap_tx_commit()` and `stoolap_tx_rollback()` free the transaction handle whether they succeed or fail. After calling either function, the `StoolapTx` pointer is invalid.
 
@@ -460,6 +460,67 @@ float vec[] = { 1.0f, 2.0f, 3.0f };
 StoolapValue v_blob = { .value_type = STOOLAP_TYPE_BLOB, 0, { .blob = { (const uint8_t*)vec, sizeof(vec) } } };
 ```
 
+### Named Parameters (StoolapNamedParam)
+
+Named parameters use `:name` syntax in SQL. Pass an array of `StoolapNamedParam` structs instead of positional `StoolapValue` arrays:
+
+```c
+typedef struct StoolapNamedParam {
+    const char* name;       /* Parameter name (without ':' prefix) */
+    int32_t     name_len;   /* Length of name in bytes */
+    int32_t     _padding;   /* must be 0 */
+    StoolapValue value;     /* Parameter value */
+} StoolapNamedParam;
+```
+
+```c
+/* Execute with named parameters */
+StoolapNamedParam params[2] = {
+    { "id",   2, 0, { .value_type = STOOLAP_TYPE_INTEGER, 0, { .integer = 1 } } },
+    { "name", 4, 0, { .value_type = STOOLAP_TYPE_TEXT,    0, { .text = { "Alice", 5 } } } },
+};
+stoolap_exec_named(db, "INSERT INTO t VALUES (:id, :name)", params, 2, NULL);
+
+/* Query with named parameters */
+StoolapNamedParam qp[1] = {
+    { "id", 2, 0, { .value_type = STOOLAP_TYPE_INTEGER, 0, { .integer = 1 } } },
+};
+StoolapRows* rows = NULL;
+stoolap_query_named(db, "SELECT name FROM t WHERE id = :id", qp, 1, &rows);
+/* ... iterate rows ... */
+stoolap_rows_close(rows);
+```
+
+Named parameters also work within transactions and with prepared statements:
+
+```c
+/* Transaction with named params */
+StoolapTx* tx = NULL;
+stoolap_begin(db, &tx);
+stoolap_tx_exec_named(tx, "INSERT INTO t VALUES (:id, :name)", params, 2, NULL);
+stoolap_tx_commit(tx);
+
+/* Prepared statement + named params in a transaction */
+StoolapStmt* stmt = NULL;
+stoolap_prepare(db, "INSERT INTO t VALUES (:id, :name)", &stmt);
+
+StoolapTx* tx2 = NULL;
+stoolap_begin(db, &tx2);
+for (int i = 0; i < 100; i++) {
+    char name[32];
+    snprintf(name, sizeof(name), "User_%d", i);
+    StoolapNamedParam p[2] = {
+        { "id",   2, 0, { .value_type = STOOLAP_TYPE_INTEGER, 0, { .integer = i } } },
+        { "name", 4, 0, { .value_type = STOOLAP_TYPE_TEXT,    0, { .text = { name, strlen(name) } } } },
+    };
+    stoolap_tx_stmt_exec_named(tx2, stmt, p, 2, NULL);
+}
+stoolap_tx_commit(tx2);
+stoolap_stmt_finalize(stmt);
+```
+
+The parameter name must be valid UTF-8 and match the `:name` placeholder in the SQL (without the `:` prefix). Names with invalid UTF-8 or zero length are silently skipped.
+
 Text and JSON parameters do not need to be null-terminated. The `len` field specifies the byte length. Both must be valid UTF-8.
 
 JSON parameters are validated with a full parse. Malformed JSON (including empty strings) is rejected and treated as NULL.
@@ -497,7 +558,7 @@ if (stoolap_open("bad://dsn", &db) != STOOLAP_OK) {
 | `stoolap_errmsg(db)` | After `stoolap_exec*`, `stoolap_query*`, `stoolap_prepare` fail |
 | `stoolap_errmsg(NULL)` | After `stoolap_open*` fails, or after `stoolap_tx_commit`/`stoolap_tx_rollback` fails |
 | `stoolap_stmt_errmsg(stmt)` | After `stoolap_stmt_exec`, `stoolap_stmt_query` fail |
-| `stoolap_tx_errmsg(tx)` | After `stoolap_tx_exec*`, `stoolap_tx_query*` fail |
+| `stoolap_tx_errmsg(tx)` | After `stoolap_tx_exec*`, `stoolap_tx_query*`, `stoolap_tx_stmt_*_named` fail |
 | `stoolap_rows_errmsg(rows)` | After `stoolap_rows_next` returns `STOOLAP_ERROR` |
 
 If no error has occurred, all `*_errmsg()` functions return an empty string (`""`), never NULL.
@@ -630,6 +691,7 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 |----------|---------|-------------|
 | `stoolap_exec(db, sql, &affected)` | `int32_t` | Execute without parameters |
 | `stoolap_exec_params(db, sql, params, len, &affected)` | `int32_t` | Execute with positional parameters |
+| `stoolap_exec_named(db, sql, params, len, &affected)` | `int32_t` | Execute with named parameters |
 
 ### Query
 
@@ -637,6 +699,7 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 |----------|---------|-------------|
 | `stoolap_query(db, sql, &rows)` | `int32_t` | Query without parameters |
 | `stoolap_query_params(db, sql, params, len, &rows)` | `int32_t` | Query with positional parameters |
+| `stoolap_query_named(db, sql, params, len, &rows)` | `int32_t` | Query with named parameters |
 
 ### Prepared Statements
 
@@ -656,11 +719,15 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 | `stoolap_begin(db, &tx)` | `int32_t` | Begin with READ COMMITTED |
 | `stoolap_begin_with_isolation(db, level, &tx)` | `int32_t` | Begin with specific isolation level |
 | `stoolap_tx_exec(tx, sql, &affected)` | `int32_t` | Execute in transaction |
-| `stoolap_tx_exec_params(tx, sql, params, len, &affected)` | `int32_t` | Execute with parameters in transaction |
+| `stoolap_tx_exec_params(tx, sql, params, len, &affected)` | `int32_t` | Execute with positional parameters in transaction |
+| `stoolap_tx_exec_named(tx, sql, params, len, &affected)` | `int32_t` | Execute with named parameters in transaction |
 | `stoolap_tx_query(tx, sql, &rows)` | `int32_t` | Query in transaction |
-| `stoolap_tx_query_params(tx, sql, params, len, &rows)` | `int32_t` | Query with parameters in transaction |
+| `stoolap_tx_query_params(tx, sql, params, len, &rows)` | `int32_t` | Query with positional parameters in transaction |
+| `stoolap_tx_query_named(tx, sql, params, len, &rows)` | `int32_t` | Query with named parameters in transaction |
 | `stoolap_tx_stmt_exec(tx, stmt, params, len, &affected)` | `int32_t` | Execute prepared statement in transaction |
+| `stoolap_tx_stmt_exec_named(tx, stmt, params, len, &affected)` | `int32_t` | Execute prepared statement with named params in transaction |
 | `stoolap_tx_stmt_query(tx, stmt, params, len, &rows)` | `int32_t` | Query with prepared statement in transaction |
+| `stoolap_tx_stmt_query_named(tx, stmt, params, len, &rows)` | `int32_t` | Query with prepared statement and named params in transaction |
 | `stoolap_tx_commit(tx)` | `int32_t` | Commit and free handle |
 | `stoolap_tx_rollback(tx)` | `int32_t` | Rollback and free handle |
 | `stoolap_tx_errmsg(tx)` | `const char*` | Last error message |

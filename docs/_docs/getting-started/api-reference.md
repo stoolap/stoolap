@@ -368,6 +368,23 @@ let rows = tx.query_prepared(&lookup, (42,))?;
 tx.commit()?;
 ```
 
+Pre-parsed statements also work with named parameters, combining parse-once performance with `:name`-style bindings:
+
+```rust
+let insert = db.prepare("INSERT INTO users VALUES (:id, :name, :age)")?;
+
+let mut tx = db.begin()?;
+tx.execute_prepared_named(&insert, named_params!{ id: 1, name: "Alice", age: 30 })?;
+tx.execute_prepared_named(&insert, named_params!{ id: 2, name: "Bob", age: 25 })?;
+tx.commit()?;
+
+// Query variant
+let lookup = db.prepare("SELECT * FROM users WHERE id = :id")?;
+let mut tx = db.begin()?;
+let rows = tx.query_prepared_named(&lookup, named_params!{ id: 1 })?;
+tx.commit()?;
+```
+
 ### SQL-based Transactions
 
 ```rust
@@ -678,6 +695,8 @@ fn main() -> Result<()> {
 | `query_named(sql, params)` | `Result<Rows>` | Query with named params |
 | `execute_prepared(stmt, params)` | `Result<i64>` | Execute pre-parsed statement |
 | `query_prepared(stmt, params)` | `Result<Rows>` | Query with pre-parsed statement |
+| `execute_prepared_named(stmt, params)` | `Result<i64>` | Execute pre-parsed statement with named params |
+| `query_prepared_named(stmt, params)` | `Result<Rows>` | Query pre-parsed statement with named params |
 | `commit()` | `Result<()>` | Commit |
 | `rollback()` | `Result<()>` | Rollback |
 | `id()` | `i64` | Transaction ID |

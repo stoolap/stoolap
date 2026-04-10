@@ -58,6 +58,18 @@ pub struct StoolapBlobData {
     pub len: i64,
 }
 
+/// FFI-safe named parameter: a key-value pair for `:name`-style bindings.
+#[repr(C)]
+pub struct StoolapNamedParam {
+    /// Parameter name (without the `:` prefix). Not necessarily null-terminated.
+    pub name: *const c_char,
+    /// Length of `name` in bytes.
+    pub name_len: i32,
+    pub _padding: i32,
+    /// Parameter value.
+    pub value: StoolapValue,
+}
+
 /// Opaque handle wrapping a [`Database`] connection.
 pub struct StoolapDB {
     pub(crate) db: Database,

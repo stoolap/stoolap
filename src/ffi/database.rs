@@ -23,7 +23,7 @@ use crate::api::Database;
 use crate::common::version::VERSION;
 
 use super::error;
-use super::types::{StoolapDB, StoolapRows, StoolapValue};
+use super::types::{StoolapDB, StoolapNamedParam, StoolapRows, StoolapValue};
 use super::value;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
 
@@ -440,6 +440,141 @@ pub unsafe extern "C" fn stoolap_query_params(
 
     result.unwrap_or_else(|_| {
         handle.set_error("panic during stoolap_query_params");
+        STOOLAP_ERROR
+    })
+}
+
+/// Execute a SQL statement with named parameters.
+///
+/// # Safety
+///
+/// - `db` must be a valid `StoolapDB` pointer.
+/// - `sql` must be a valid null-terminated UTF-8 string.
+/// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
+/// - `rows_affected` may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_exec_named(
+    db: *mut StoolapDB,
+    sql: *const c_char,
+    params: *const StoolapNamedParam,
+    params_len: i32,
+    rows_affected: *mut i64,
+) -> i32 {
+    let handle = match db.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    if sql.is_null() {
+        handle.set_error("SQL string is NULL");
+        return STOOLAP_ERROR;
+    }
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let sql_str = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                return STOOLAP_ERROR;
+            }
+        };
+
+        let named = value::named_params_from_ffi(params, params_len);
+
+        match handle.db.execute_named(sql_str, named) {
+            Ok(affected) => {
+                if !rows_affected.is_null() {
+                    *rows_affected = affected;
+                }
+                STOOLAP_OK
+            }
+            Err(e) => {
+                handle.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_exec_named");
+        STOOLAP_ERROR
+    })
+}
+
+/// Execute a query with named parameters, returning a result set.
+///
+/// # Safety
+///
+/// - `db` must be a valid `StoolapDB` pointer.
+/// - `sql` must be a valid null-terminated UTF-8 string.
+/// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
+/// - `out_rows` must be a valid pointer to a `*mut StoolapRows`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_query_named(
+    db: *mut StoolapDB,
+    sql: *const c_char,
+    params: *const StoolapNamedParam,
+    params_len: i32,
+    out_rows: *mut *mut StoolapRows,
+) -> i32 {
+    if out_rows.is_null() {
+        return STOOLAP_ERROR;
+    }
+    *out_rows = std::ptr::null_mut();
+
+    let handle = match db.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    if sql.is_null() {
+        handle.set_error("SQL string is NULL");
+        return STOOLAP_ERROR;
+    }
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let sql_str = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                return STOOLAP_ERROR;
+            }
+        };
+
+        let named = value::named_params_from_ffi(params, params_len);
+
+        match handle.db.query_named(sql_str, named) {
+            Ok(rows) => {
+                let column_names: Vec<CString> = rows
+                    .columns()
+                    .iter()
+                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
+                    .collect();
+                let affected = rows.rows_affected();
+
+                let rows_handle = Box::new(StoolapRows {
+                    rows: Some(rows),
+                    has_row: false,
+                    last_error: None,
+                    column_names: Arc::new(column_names),
+                    text_cache: Vec::new(),
+                    text_cache_dirty: false,
+                    rows_affected: affected,
+                });
+                *out_rows = Box::into_raw(rows_handle);
+                STOOLAP_OK
+            }
+            Err(e) => {
+                handle.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_query_named");
         STOOLAP_ERROR
     })
 }

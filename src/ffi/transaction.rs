@@ -22,7 +22,9 @@ use std::sync::Arc;
 use crate::api::Database;
 use crate::core::types::IsolationLevel;
 
-use super::types::{StoolapDB, StoolapRows, StoolapStmt, StoolapTx, StoolapValue};
+use super::types::{
+    StoolapDB, StoolapNamedParam, StoolapRows, StoolapStmt, StoolapTx, StoolapValue,
+};
 use super::value;
 use super::{
     STOOLAP_ERROR, STOOLAP_ISOLATION_READ_COMMITTED, STOOLAP_ISOLATION_SNAPSHOT, STOOLAP_OK,
@@ -602,6 +604,352 @@ pub unsafe extern "C" fn stoolap_tx_stmt_query(
 
     result.unwrap_or_else(|_| {
         handle.set_error("panic during stoolap_tx_stmt_query");
+        STOOLAP_ERROR
+    })
+}
+
+/// Execute a SQL statement with named parameters within a transaction.
+///
+/// # Safety
+///
+/// - `tx` must be a valid `StoolapTx` pointer.
+/// - `sql` must be a valid null-terminated UTF-8 string.
+/// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
+/// - `rows_affected` may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_tx_exec_named(
+    tx: *mut StoolapTx,
+    sql: *const c_char,
+    params: *const StoolapNamedParam,
+    params_len: i32,
+    rows_affected: *mut i64,
+) -> i32 {
+    let handle = match tx.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    if sql.is_null() {
+        handle.set_error("SQL string is NULL");
+        return STOOLAP_ERROR;
+    }
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let inner_tx = match &mut handle.tx {
+            Some(t) => t,
+            None => {
+                handle.set_error("transaction already ended");
+                return STOOLAP_ERROR;
+            }
+        };
+
+        let sql_str = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                return STOOLAP_ERROR;
+            }
+        };
+
+        let named = value::named_params_from_ffi(params, params_len);
+
+        match inner_tx.execute_named(sql_str, named) {
+            Ok(affected) => {
+                if !rows_affected.is_null() {
+                    *rows_affected = affected;
+                }
+                STOOLAP_OK
+            }
+            Err(e) => {
+                handle.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_tx_exec_named");
+        STOOLAP_ERROR
+    })
+}
+
+/// Query with named parameters within a transaction.
+///
+/// # Safety
+///
+/// - `tx` must be a valid `StoolapTx` pointer.
+/// - `sql` must be a valid null-terminated UTF-8 string.
+/// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
+/// - `out_rows` must be a valid pointer to a `*mut StoolapRows`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_tx_query_named(
+    tx: *mut StoolapTx,
+    sql: *const c_char,
+    params: *const StoolapNamedParam,
+    params_len: i32,
+    out_rows: *mut *mut StoolapRows,
+) -> i32 {
+    if out_rows.is_null() {
+        return STOOLAP_ERROR;
+    }
+    *out_rows = std::ptr::null_mut();
+
+    let handle = match tx.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    if sql.is_null() {
+        handle.set_error("SQL string is NULL");
+        return STOOLAP_ERROR;
+    }
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let inner_tx = match &mut handle.tx {
+            Some(t) => t,
+            None => {
+                handle.set_error("transaction already ended");
+                return STOOLAP_ERROR;
+            }
+        };
+
+        let sql_str = match CStr::from_ptr(sql).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                handle.set_error(&format!("invalid UTF-8 in SQL: {}", e));
+                return STOOLAP_ERROR;
+            }
+        };
+
+        let named = value::named_params_from_ffi(params, params_len);
+
+        match inner_tx.query_named(sql_str, named) {
+            Ok(rows) => {
+                let column_names: Vec<CString> = rows
+                    .columns()
+                    .iter()
+                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
+                    .collect();
+                let affected = rows.rows_affected();
+
+                let rows_handle = Box::new(StoolapRows {
+                    rows: Some(rows),
+                    has_row: false,
+                    last_error: None,
+                    column_names: Arc::new(column_names),
+                    text_cache: Vec::new(),
+                    text_cache_dirty: false,
+                    rows_affected: affected,
+                });
+                *out_rows = Box::into_raw(rows_handle);
+                STOOLAP_OK
+            }
+            Err(e) => {
+                handle.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_tx_query_named");
+        STOOLAP_ERROR
+    })
+}
+
+/// Execute a prepared statement with named parameters within a transaction.
+///
+/// # Safety
+///
+/// - `tx` must be a valid `StoolapTx` pointer.
+/// - `stmt` must be a valid `StoolapStmt` pointer.
+/// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
+/// - `rows_affected` may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_tx_stmt_exec_named(
+    tx: *mut StoolapTx,
+    stmt: *const StoolapStmt,
+    params: *const StoolapNamedParam,
+    params_len: i32,
+    rows_affected: *mut i64,
+) -> i32 {
+    let handle = match tx.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    let stmt_handle = match stmt.as_ref() {
+        Some(h) => h,
+        None => {
+            handle.set_error("statement handle is NULL");
+            return STOOLAP_ERROR;
+        }
+    };
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let inner_tx = match &mut handle.tx {
+            Some(t) => t,
+            None => {
+                handle.set_error("transaction already ended");
+                return STOOLAP_ERROR;
+            }
+        };
+
+        let named = value::named_params_from_ffi(params, params_len);
+
+        let ast_stmt = match stmt_handle.stmt.ast_statement() {
+            Some(s) => s,
+            None => {
+                // Multi-statement SQL: fall back to SQL-based execution
+                let sql_str = stmt_handle.sql_cstr.to_str().unwrap_or("");
+                match inner_tx.execute_named(sql_str, named) {
+                    Ok(affected) => {
+                        if !rows_affected.is_null() {
+                            *rows_affected = affected;
+                        }
+                        return STOOLAP_OK;
+                    }
+                    Err(e) => {
+                        handle.set_error(&e.to_string());
+                        return STOOLAP_ERROR;
+                    }
+                }
+            }
+        };
+
+        match inner_tx.execute_prepared_named(ast_stmt, named) {
+            Ok(affected) => {
+                if !rows_affected.is_null() {
+                    *rows_affected = affected;
+                }
+                STOOLAP_OK
+            }
+            Err(e) => {
+                handle.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_tx_stmt_exec_named");
+        STOOLAP_ERROR
+    })
+}
+
+/// Query using a prepared statement with named parameters within a transaction.
+///
+/// # Safety
+///
+/// - `tx` must be a valid `StoolapTx` pointer.
+/// - `stmt` must be a valid `StoolapStmt` pointer.
+/// - `params` must point to `params_len` valid `StoolapNamedParam` structs (or be NULL).
+/// - `out_rows` must be a valid pointer to a `*mut StoolapRows`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_tx_stmt_query_named(
+    tx: *mut StoolapTx,
+    stmt: *const StoolapStmt,
+    params: *const StoolapNamedParam,
+    params_len: i32,
+    out_rows: *mut *mut StoolapRows,
+) -> i32 {
+    if out_rows.is_null() {
+        return STOOLAP_ERROR;
+    }
+    *out_rows = std::ptr::null_mut();
+
+    let handle = match tx.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error = None;
+
+    let stmt_handle = match stmt.as_ref() {
+        Some(h) => h,
+        None => {
+            handle.set_error("statement handle is NULL");
+            return STOOLAP_ERROR;
+        }
+    };
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let inner_tx = match &mut handle.tx {
+            Some(t) => t,
+            None => {
+                handle.set_error("transaction already ended");
+                return STOOLAP_ERROR;
+            }
+        };
+
+        let named = value::named_params_from_ffi(params, params_len);
+
+        let ast_stmt = match stmt_handle.stmt.ast_statement() {
+            Some(s) => s,
+            None => {
+                // Multi-statement SQL: fall back to SQL-based execution
+                let sql_str = stmt_handle.sql_cstr.to_str().unwrap_or("");
+                match inner_tx.query_named(sql_str, named) {
+                    Ok(rows) => {
+                        let column_names: Vec<CString> = rows
+                            .columns()
+                            .iter()
+                            .map(|name| CString::new(name.as_str()).unwrap_or_default())
+                            .collect();
+                        let affected = rows.rows_affected();
+
+                        let rows_handle = Box::new(StoolapRows {
+                            rows: Some(rows),
+                            has_row: false,
+                            last_error: None,
+                            column_names: Arc::new(column_names),
+                            text_cache: Vec::new(),
+                            text_cache_dirty: false,
+                            rows_affected: affected,
+                        });
+                        *out_rows = Box::into_raw(rows_handle);
+                        return STOOLAP_OK;
+                    }
+                    Err(e) => {
+                        handle.set_error(&e.to_string());
+                        return STOOLAP_ERROR;
+                    }
+                }
+            }
+        };
+
+        match inner_tx.query_prepared_named(ast_stmt, named) {
+            Ok(rows) => {
+                let column_names: Vec<CString> = rows
+                    .columns()
+                    .iter()
+                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
+                    .collect();
+                let affected = rows.rows_affected();
+
+                let rows_handle = Box::new(StoolapRows {
+                    rows: Some(rows),
+                    has_row: false,
+                    last_error: None,
+                    column_names: Arc::new(column_names),
+                    text_cache: Vec::new(),
+                    text_cache_dirty: false,
+                    rows_affected: affected,
+                });
+                *out_rows = Box::into_raw(rows_handle);
+                STOOLAP_OK
+            }
+            Err(e) => {
+                handle.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_tx_stmt_query_named");
         STOOLAP_ERROR
     })
 }

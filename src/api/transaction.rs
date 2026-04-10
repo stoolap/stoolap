@@ -237,6 +237,34 @@ impl Transaction {
         Ok(Rows::new(result))
     }
 
+    /// Execute a pre-parsed statement with named parameters.
+    ///
+    /// Combines `execute_prepared` (skip parsing) with `execute_named` (named params).
+    pub fn execute_prepared_named(
+        &mut self,
+        statement: &Statement,
+        params: NamedParams,
+    ) -> Result<i64> {
+        self.check_active()?;
+        let ctx = ExecutionContext::with_named_params(params.into_inner());
+        let result = self.execute_statement(statement, &ctx)?;
+        Ok(result.rows_affected())
+    }
+
+    /// Query using a pre-parsed statement with named parameters.
+    ///
+    /// Combines `query_prepared` (skip parsing) with `query_named` (named params).
+    pub fn query_prepared_named(
+        &mut self,
+        statement: &Statement,
+        params: NamedParams,
+    ) -> Result<Rows> {
+        self.check_active()?;
+        let ctx = ExecutionContext::with_named_params(params.into_inner());
+        let result = self.execute_statement(statement, &ctx)?;
+        Ok(Rows::new(result))
+    }
+
     /// Internal SQL execution
     fn execute_sql(&mut self, sql: &str, params: ParamVec) -> Result<Box<dyn QueryResult>> {
         let ctx = if params.is_empty() {

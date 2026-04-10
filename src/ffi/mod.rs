@@ -33,8 +33,8 @@ pub use rows::*;
 pub use statement::*;
 pub use transaction::*;
 pub use types::{
-    StoolapBlobData, StoolapDB, StoolapRows, StoolapStmt, StoolapTextData, StoolapTx, StoolapValue,
-    StoolapValueData,
+    StoolapBlobData, StoolapDB, StoolapNamedParam, StoolapRows, StoolapStmt, StoolapTextData,
+    StoolapTx, StoolapValue, StoolapValueData,
 };
 
 // Status codes

@@ -14,10 +14,11 @@
 
 //! Conversion between FFI `StoolapValue` and Rust `Value`.
 
+use crate::api::params::NamedParams;
 use crate::api::ParamVec;
 use crate::core::Value;
 
-use super::types::StoolapValue;
+use super::types::{StoolapNamedParam, StoolapValue};
 use super::{
     STOOLAP_TYPE_BLOB, STOOLAP_TYPE_BOOLEAN, STOOLAP_TYPE_FLOAT, STOOLAP_TYPE_INTEGER,
     STOOLAP_TYPE_JSON, STOOLAP_TYPE_NULL, STOOLAP_TYPE_TEXT, STOOLAP_TYPE_TIMESTAMP,
@@ -112,4 +113,31 @@ pub(crate) unsafe fn params_to_vec(params: *const StoolapValue, len: i32) -> Par
     }
     let slice = std::slice::from_raw_parts(params, len as usize);
     slice.iter().map(|v| ffi_value_to_rust(v)).collect()
+}
+
+/// Convert an FFI named-parameter array to [`NamedParams`].
+///
+/// # Safety
+///
+/// `params` must point to `len` valid `StoolapNamedParam` structs (or be null if `len <= 0`).
+/// Each `name` pointer must be valid for `name_len` bytes.
+pub(crate) unsafe fn named_params_from_ffi(
+    params: *const StoolapNamedParam,
+    len: i32,
+) -> NamedParams {
+    if params.is_null() || len <= 0 {
+        return NamedParams::new();
+    }
+    let slice = std::slice::from_raw_parts(params, len as usize);
+    let mut named = NamedParams::with_capacity(slice.len());
+    for p in slice {
+        if p.name.is_null() || p.name_len <= 0 {
+            continue;
+        }
+        let name_bytes = std::slice::from_raw_parts(p.name as *const u8, p.name_len as usize);
+        if let Ok(name) = std::str::from_utf8(name_bytes) {
+            named.insert(name, ffi_value_to_rust(&p.value));
+        }
+    }
+    named
 }
