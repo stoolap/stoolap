@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Stoolap kite logo">
+  <rect width="512" height="512" rx="112" fill="#f6faef"/>
+  <path d="M256 72 416 256 256 440 96 256Z" fill="#95b746"/>
+  <path d="M256 72 416 256 256 256Z" fill="#0b4328" opacity=".92"/>
+  <path d="M96 256h320" stroke="#0b4328" stroke-width="24" stroke-linecap="round"/>
+  <circle cx="256" cy="256" r="34" fill="#f6faef" stroke="#0b4328" stroke-width="18"/>
+</svg>

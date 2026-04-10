@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Stoolap petal logo">
+  <rect width="512" height="512" rx="112" fill="#f6faef"/>
+  <g transform="translate(256 256)">
+    <path d="M0-162c46 0 82 35 82 82 0 42-31 73-82 126-51-53-82-84-82-126 0-47 36-82 82-82Z" fill="#95b746"/>
+    <path d="M162 0c0 46-35 82-82 82-42 0-73-31-126-82 53-51 84-82 126-82 47 0 82 36 82 82Z" fill="#207e53"/>
+    <path d="M0 162c-46 0-82-35-82-82 0-42 31-73 82-126 51 53 82 84 82 126 0 47-36 82-82 82Z" fill="#0b4328"/>
+    <circle r="42" fill="#f6faef" stroke="#0b4328" stroke-width="16"/>
+  </g>
+</svg>

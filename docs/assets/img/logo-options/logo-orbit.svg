@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Stoolap orbit logo">
+  <defs>
+    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#95b746"/>
+      <stop offset="1" stop-color="#0b4328"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="#f6faef"/>
+  <circle cx="256" cy="256" r="128" fill="none" stroke="url(#g)" stroke-width="40"/>
+  <circle cx="332" cy="180" r="36" fill="#95b746"/>
+  <path d="M168 336c24 30 55 44 94 44 44 0 76-15 103-52" fill="none" stroke="#0b4328" stroke-width="28" stroke-linecap="round"/>
+</svg>
