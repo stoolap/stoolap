@@ -1633,8 +1633,8 @@ impl Parser {
             false
         };
 
-        // Parse table name
-        if !self.expect_peek(TokenType::Identifier) {
+        // Parse table name (allow non-reserved keywords like COPY as table names)
+        if !self.expect_peek_identifier_like() {
             return None;
         }
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());

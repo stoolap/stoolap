@@ -245,6 +245,26 @@ impl Parser {
         self.peek_token.token_type == TokenType::Operator && self.peek_token.literal == op
     }
 
+    /// Check if the peek token can be used as an identifier (true identifier or non-reserved keyword)
+    pub(crate) fn peek_token_is_identifier_like(&self) -> bool {
+        match self.peek_token.token_type {
+            TokenType::Identifier => true,
+            TokenType::Keyword => !Self::is_reserved_keyword(&self.peek_token.literal),
+            _ => false,
+        }
+    }
+
+    /// Expect the peek token to be an identifier (or non-reserved keyword) and advance
+    pub(crate) fn expect_peek_identifier_like(&mut self) -> bool {
+        if self.peek_token_is_identifier_like() {
+            self.next_token();
+            true
+        } else {
+            self.peek_error(TokenType::Identifier);
+            false
+        }
+    }
+
     /// Expect the peek token to be of a specific type and advance
     pub(crate) fn expect_peek(&mut self, t: TokenType) -> bool {
         if self.peek_token_is(t) {
