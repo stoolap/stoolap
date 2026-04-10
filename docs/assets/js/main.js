@@ -64,7 +64,16 @@
       var current = document.documentElement.getAttribute('data-theme') || 'light';
       var next = current === 'dark' ? 'light' : 'dark';
       document.documentElement.setAttribute('data-theme', next);
-      localStorage.setItem('theme', next);
+
+      // If the chosen theme matches the current system preference, clear the
+      // stored override so future system changes are followed automatically.
+      var systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+      var systemTheme = systemDark ? 'dark' : 'light';
+      if (next === systemTheme) {
+        localStorage.removeItem('theme');
+      } else {
+        localStorage.setItem('theme', next);
+      }
     });
   }
 

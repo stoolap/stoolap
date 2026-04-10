@@ -15,28 +15,29 @@
   <meta name="theme-color" content="#0f7d3c">
   {% seo %}
 
-  <!-- Simple theme initialization -->
+  <!-- Theme initialization: respect system preference, allow manual override -->
   <script>
-    // Check for saved theme preference first
-    const storedTheme = localStorage.getItem('theme');
-    
-    // If no stored preference, use default theme (light)
-    // Only use system preference for initial setting if no explicit user choice has been made
-    if (storedTheme) {
-      // Use the user's explicitly chosen theme
-      document.documentElement.setAttribute('data-theme', storedTheme);
-    } else {
-      // If user hasn't made a choice yet, we can optionally use system preference
-      // For now, start with light mode to avoid the "always defaults to dark" problem
-      document.documentElement.setAttribute('data-theme', 'light');
-      
-      // If you want to respect system preferences for first-time visitors,
-      // uncomment this block instead:
-      /*
-      const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-      document.documentElement.setAttribute('data-theme', prefersDark ? 'dark' : 'light');
-      */
-    }
+    (function() {
+      var stored = localStorage.getItem('theme');
+      var mq = window.matchMedia('(prefers-color-scheme: dark)');
+
+      function applyTheme(theme) {
+        document.documentElement.setAttribute('data-theme', theme);
+      }
+
+      if (stored) {
+        applyTheme(stored);
+      } else {
+        applyTheme(mq.matches ? 'dark' : 'light');
+      }
+
+      // Follow live system changes unless the user has manually chosen a theme
+      mq.addEventListener('change', function(e) {
+        if (!localStorage.getItem('theme')) {
+          applyTheme(e.matches ? 'dark' : 'light');
+        }
+      });
+    })();
   </script>
 </head>
 <body class="preload">
