@@ -1302,6 +1302,7 @@ pub enum Statement {
     Explain(ExplainStatement),
     Analyze(AnalyzeStatement),
     Vacuum(VacuumStatement),
+    Copy(CopyStatement),
 }
 
 impl fmt::Display for Statement {
@@ -1336,6 +1337,7 @@ impl fmt::Display for Statement {
             Statement::Explain(s) => write!(f, "{}", s),
             Statement::Analyze(s) => write!(f, "{}", s),
             Statement::Vacuum(s) => write!(f, "{}", s),
+            Statement::Copy(s) => write!(f, "{}", s),
         }
     }
 }
@@ -1906,6 +1908,65 @@ impl fmt::Display for VacuumStatement {
         } else {
             write!(f, "VACUUM")
         }
+    }
+}
+
+/// Copy format for COPY FROM
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFormat {
+    Csv,
+    Json,
+}
+
+impl fmt::Display for CopyFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CopyFormat::Csv => write!(f, "CSV"),
+            CopyFormat::Json => write!(f, "JSON"),
+        }
+    }
+}
+
+/// COPY table [(columns)] FROM 'file_path' [WITH (options)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyStatement {
+    pub token: Token,
+    pub table_name: Identifier,
+    pub columns: Vec<Identifier>,
+    pub file_path: String,
+    pub format: CopyFormat,
+    pub header: bool,
+    pub delimiter: u8,
+    pub null_string: Option<String>,
+}
+
+impl fmt::Display for CopyStatement {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "COPY {}", self.table_name)?;
+        if !self.columns.is_empty() {
+            write!(f, " (")?;
+            for (i, col) in self.columns.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "{}", col)?;
+            }
+            write!(f, ")")?;
+        }
+        write!(f, " FROM '{}'", self.file_path)?;
+        write!(f, " WITH (FORMAT {}", self.format)?;
+        if self.format == CopyFormat::Csv {
+            if self.header {
+                write!(f, ", HEADER true")?;
+            }
+            if self.delimiter != b',' {
+                write!(f, ", DELIMITER '{}'", self.delimiter as char)?;
+            }
+        }
+        if let Some(ref ns) = self.null_string {
+            write!(f, ", NULL '{}'", ns)?;
+        }
+        write!(f, ")")
     }
 }
 

@@ -59,6 +59,7 @@ pub mod semantic_cache;
 pub mod statistics;
 
 mod aggregation;
+mod copy;
 mod cte;
 mod ddl;
 mod dml;
@@ -653,6 +654,7 @@ impl Executor {
             Statement::Explain(stmt) => self.execute_explain(stmt, &ctx),
             Statement::Analyze(stmt) => self.execute_analyze(stmt, &ctx),
             Statement::Vacuum(stmt) => self.execute_vacuum(stmt, &ctx),
+            Statement::Copy(stmt) => self.execute_copy(stmt, &ctx),
         }
     }
 

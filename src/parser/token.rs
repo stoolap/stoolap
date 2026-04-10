@@ -378,6 +378,10 @@ pub static KEYWORDS: &[&str] = &[
     "NEXT",
     "ONLY",
     "VACUUM",
+    "COPY",
+    "FORMAT",
+    "HEADER",
+    "DELIMITER",
 ];
 
 /// Compiled keyword set for O(1) lookups

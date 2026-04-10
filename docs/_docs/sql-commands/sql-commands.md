@@ -472,6 +472,101 @@ TRUNCATE TABLE logs;
 - TRUNCATE will fail if another transaction has uncommitted changes on the table
 - TRUNCATE will fail if the table is referenced by foreign key constraints with existing child rows
 
+### COPY FROM
+
+The COPY statement imports data from CSV or JSON files directly into a table, bypassing per-row SQL parsing for significantly faster bulk loading.
+
+#### Basic Syntax
+
+```sql
+-- Minimal (defaults to CSV with header)
+COPY table_name FROM 'file_path';
+
+-- With explicit format and options
+COPY table_name [(column1, column2, ...)]
+FROM 'file_path'
+WITH (FORMAT CSV|JSON [, HEADER true|false] [, DELIMITER 'c'] [, NULL 'string']);
+```
+
+#### Parameters
+
+- **table_name**: Target table for the imported data
+- **(column1, column2, ...)**: Optional column list. When omitted, CSV headers are matched by name, or all columns are filled in order
+- **file_path**: Absolute or relative path to the data file
+- **FORMAT**: `CSV` (default) or `JSON`
+- **HEADER**: `true` (default) or `false`. When true, the first CSV row is treated as column headers
+- **DELIMITER**: Single character field separator for CSV (default `,`). Common alternatives: `|`, `;`, `\t`
+- **NULL**: String that represents NULL values (default is empty string for CSV)
+
+#### CSV Examples
+
+```sql
+-- Import with header row (columns matched by name)
+COPY users FROM '/data/users.csv' WITH (FORMAT CSV, HEADER true);
+
+-- Pipe-delimited file
+COPY logs FROM '/data/logs.txt' WITH (FORMAT CSV, DELIMITER '|');
+
+-- No header, import into specific columns (positional)
+COPY products (id, name, price) FROM '/data/products.csv'
+WITH (FORMAT CSV, HEADER false);
+
+-- Custom NULL marker
+COPY sensors FROM '/data/readings.csv'
+WITH (FORMAT CSV, HEADER true, NULL 'NA');
+```
+
+#### JSON Examples
+
+COPY supports two JSON formats: JSON arrays and JSON Lines (one object per line).
+
+```sql
+-- JSON array: [{"id": 1, "name": "Alice"}, {"id": 2, "name": "Bob"}]
+COPY users FROM '/data/users.json' WITH (FORMAT JSON);
+
+-- JSON Lines: {"id": 1, "name": "Alice"}
+--             {"id": 2, "name": "Bob"}
+COPY users FROM '/data/users.jsonl' WITH (FORMAT JSON);
+
+-- Only import specific columns (unmatched JSON keys are ignored)
+COPY users (id, name) FROM '/data/users.json' WITH (FORMAT JSON);
+```
+
+For JSON imports, keys are matched to column names case-insensitively. Missing keys receive DEFAULT values. Extra keys in JSON objects are silently ignored.
+
+#### Type Coercion
+
+All field values are automatically coerced to the target column type:
+
+| Target Type | Accepted Values |
+|---|---|
+| INTEGER | Numeric strings (`"42"`, `"-7"`) |
+| FLOAT | Numeric strings (`"3.14"`, `"1e10"`) |
+| BOOLEAN | `true`/`false`, `t`/`f`, `yes`/`no`, `y`/`n`, `1`/`0` (case-insensitive) |
+| TIMESTAMP | ISO 8601 strings (`"2024-01-15T10:30:00"`) |
+| TEXT | Any string value |
+| JSON | Valid JSON strings |
+
+A type conversion failure on any row aborts the entire import with an error.
+
+#### Performance
+
+COPY is faster than INSERT because it skips SQL parsing, expression compilation, and per-row transaction overhead. All rows are inserted in a single auto-commit transaction.
+
+| Method | Relative Speed |
+|---|---|
+| COPY FROM | 1.0x (baseline) |
+| Bulk INSERT VALUES (1000-row chunks, single txn) | ~1.5x slower |
+| INSERT per row (single txn) | ~4x slower |
+| INSERT per row (auto-commit) | ~5x slower |
+
+#### Important Notes
+
+- COPY FROM cannot be used inside an explicit transaction (BEGIN/COMMIT)
+- The entire file is imported atomically. If any row fails, all rows are rolled back
+- CHECK constraints and foreign key constraints are validated per row
+- DEFAULT expressions are evaluated for columns not present in the import
+
 ## Data Definition Language (DDL)
 
 ### CREATE TABLE

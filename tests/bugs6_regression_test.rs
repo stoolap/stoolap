@@ -494,8 +494,8 @@ fn test_bugs6_date_arithmetic_consistency() {
 }
 
 // =============================================================================
-// BUG #23: Double negation --val causes parse error
-// Problem: --val was being treated as a line comment instead of two minus operators
+// BUG #23 (revised): -- is always a line comment per SQL standard (SQL:2023 5.2).
+// Double negation must use `- -val` or `- (-val)` with explicit spacing.
 // =============================================================================
 
 #[test]
@@ -507,10 +507,10 @@ fn test_bugs6_double_negation() {
     db.execute("INSERT INTO t23 VALUES (1, 10)", ())
         .expect("Failed to insert data");
 
-    // Double negation should work
+    // Double negation with `- -` (space separated)
     let mut rows = db
         .query(
-            "SELECT id, val, -val as neg, --val as double_neg FROM t23",
+            "SELECT id, val, -val as neg, - -val as double_neg FROM t23",
             (),
         )
         .expect("Double negation query should work");
@@ -525,19 +525,26 @@ fn test_bugs6_double_negation() {
 fn test_bugs6_double_negation_with_literal() {
     let db = setup_db();
 
-    // --5 should evaluate to 5
+    // - -5 should evaluate to 5
     let mut rows = db
-        .query("SELECT --5", ())
+        .query("SELECT - -5", ())
         .expect("Double negation of literal should work");
     let row = rows.next().unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 5);
 
-    // --10 + 5 should evaluate to 15
+    // - -10 + 5 should evaluate to 15
     let mut rows = db
-        .query("SELECT --10 + 5", ())
+        .query("SELECT - -10 + 5", ())
         .expect("Double negation expression should work");
     let row = rows.next().unwrap().unwrap();
     assert_eq!(row.get::<i64>(0).unwrap(), 15);
+
+    // --5 is now a comment, so SELECT --5 returns nothing (no columns)
+    let result = db.query("SELECT --5", ());
+    assert!(
+        result.is_err(),
+        "--5 should be treated as a comment, not double negation"
+    );
 }
 
 #[test]

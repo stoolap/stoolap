@@ -76,6 +76,7 @@ indexmap = "2.1"
 rustc-hash = "1.1"
 memchr = "2.6"
 regex = "1.10"
+csv = "1.3"  # CSV parsing for COPY FROM
 radsort = "0.1"  # Radix sort - O(n) for integer keys
 rand = "0.9"  # Random number generation for RANDOM() function
 ahash = "0.8"  # Fast hash for hash indexes (DOS-resistant)

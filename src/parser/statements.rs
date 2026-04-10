@@ -110,6 +110,7 @@ impl Parser {
                 "DESCRIBE" | "DESC" => self.parse_describe_statement().map(Statement::Describe),
                 "EXPLAIN" => self.parse_explain_statement().map(Statement::Explain),
                 "ANALYZE" => self.parse_analyze_statement().map(Statement::Analyze),
+                "COPY" => self.parse_copy_statement().map(Statement::Copy),
                 _ => {
                     // Try to parse as expression statement
                     self.parse_expression_statement().map(Statement::Expression)
@@ -2950,6 +2951,184 @@ impl Parser {
         }
 
         list
+    }
+
+    /// Parse a COPY statement
+    /// COPY table [(columns)] FROM 'file_path' [WITH (FORMAT CSV|JSON [, HEADER true|false] [, DELIMITER 'c'] [, NULL 'str'])]
+    fn parse_copy_statement(&mut self) -> Option<CopyStatement> {
+        let token = self.cur_token.clone();
+
+        // Parse table name
+        self.next_token();
+        if !self.cur_token_is(TokenType::Identifier) && !self.cur_token_is(TokenType::Keyword) {
+            self.add_error(format!(
+                "expected table name after COPY, got {:?} at {}",
+                self.cur_token.token_type, self.cur_token.position
+            ));
+            return None;
+        }
+        let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
+
+        // Parse optional column list
+        let mut columns = Vec::new();
+        if self.peek_token_is_punctuator("(") {
+            self.next_token(); // consume (
+            columns = self.parse_identifier_list();
+            if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
+                self.add_error(format!("expected ')' at {}", self.cur_token.position));
+                return None;
+            }
+        }
+
+        // Expect FROM keyword
+        if !self.expect_keyword("FROM") {
+            return None;
+        }
+
+        // Parse file path (string literal)
+        self.next_token();
+        if !self.cur_token_is(TokenType::String) {
+            self.add_error(format!(
+                "expected file path string after FROM, got {:?} at {}",
+                self.cur_token.token_type, self.cur_token.position
+            ));
+            return None;
+        }
+        let file_path = {
+            let lit = &self.cur_token.literal;
+            if lit.len() >= 2
+                && (lit.starts_with('\'') || lit.starts_with('"'))
+                && lit.ends_with(lit.chars().next().unwrap())
+            {
+                lit[1..lit.len() - 1].to_string()
+            } else {
+                lit.to_string()
+            }
+        };
+
+        // Default options
+        let mut format = None;
+        let mut header = true;
+        let mut delimiter = b',';
+        let mut null_string = None;
+
+        // Parse optional WITH (options)
+        if self.peek_token_is_keyword("WITH") {
+            self.next_token(); // consume WITH
+
+            if !self.peek_token_is_punctuator("(") {
+                self.add_error(format!(
+                    "expected '(' after WITH at {}",
+                    self.peek_token.position
+                ));
+                return None;
+            }
+            self.next_token(); // consume (
+
+            // Parse key-value options
+            loop {
+                self.next_token();
+                if self.cur_token_is(TokenType::Punctuator) && self.cur_token.literal == ")" {
+                    break;
+                }
+
+                let key = self.cur_token.literal.to_uppercase();
+                match key.as_str() {
+                    "FORMAT" => {
+                        self.next_token();
+                        let fmt_str = self.cur_token.literal.to_uppercase();
+                        match fmt_str.as_str() {
+                            "CSV" => format = Some(CopyFormat::Csv),
+                            "JSON" => format = Some(CopyFormat::Json),
+                            _ => {
+                                self.add_error(format!(
+                                    "unsupported COPY format '{}', expected CSV or JSON",
+                                    fmt_str
+                                ));
+                                return None;
+                            }
+                        }
+                    }
+                    "HEADER" => {
+                        self.next_token();
+                        let val = self.cur_token.literal.to_uppercase();
+                        header = val == "TRUE" || val == "ON" || val == "1";
+                    }
+                    "DELIMITER" => {
+                        self.next_token();
+                        let delim_str = &self.cur_token.literal;
+                        // Strip quotes if present
+                        let raw = if delim_str.len() >= 2
+                            && (delim_str.starts_with('\'') || delim_str.starts_with('"'))
+                        {
+                            &delim_str[1..delim_str.len() - 1]
+                        } else {
+                            delim_str.as_str()
+                        };
+                        if raw.len() != 1 {
+                            self.add_error(format!(
+                                "DELIMITER must be a single character, got '{}'",
+                                raw
+                            ));
+                            return None;
+                        }
+                        delimiter = raw.as_bytes()[0];
+                    }
+                    "NULL" => {
+                        self.next_token();
+                        let ns = &self.cur_token.literal;
+                        null_string = Some(
+                            if ns.len() >= 2
+                                && (ns.starts_with('\'') || ns.starts_with('"'))
+                                && ns.ends_with(ns.chars().next().unwrap())
+                            {
+                                ns[1..ns.len() - 1].to_string()
+                            } else {
+                                ns.to_string()
+                            },
+                        );
+                    }
+                    _ => {
+                        self.add_error(format!("unknown COPY option '{}'", key));
+                        return None;
+                    }
+                }
+
+                // Expect comma or closing paren
+                if self.peek_token_is_punctuator(",") {
+                    self.next_token(); // consume comma
+                } else if self.peek_token_is_punctuator(")") {
+                    self.next_token(); // consume )
+                    break;
+                } else if !self.peek_token_is(TokenType::Eof) {
+                    self.add_error(format!(
+                        "expected ',' or ')' after COPY option, got {:?} at {}",
+                        self.peek_token.token_type, self.peek_token.position
+                    ));
+                    return None;
+                }
+            }
+        }
+
+        // FORMAT is required
+        let format = match format {
+            Some(f) => f,
+            None => {
+                // Default to CSV if no WITH clause
+                CopyFormat::Csv
+            }
+        };
+
+        Some(CopyStatement {
+            token,
+            table_name,
+            columns,
+            file_path,
+            format,
+            header,
+            delimiter,
+            null_string,
+        })
     }
 }
 

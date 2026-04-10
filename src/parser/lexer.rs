@@ -119,40 +119,6 @@ impl Lexer {
         self.decode_char_at(self.read_position).0
     }
 
-    /// Peek at a character N positions ahead without advancing
-    /// N=1 means peek at read_position, N=2 means one character after that, etc.
-    fn peek_char_n(&self, n: usize) -> char {
-        if n == 0 {
-            return self.ch;
-        }
-
-        let mut pos = self.read_position;
-        for i in 1..n {
-            if pos >= self.input.len() {
-                return '\0';
-            }
-            let (_, len) = self.decode_char_at(pos);
-            pos += len;
-            if i == n - 1 {
-                break;
-            }
-        }
-        self.decode_char_at(pos).0
-    }
-
-    /// Check if a character marks the start of a line comment after --
-    /// Returns true only if the character is whitespace, newline, or end of input
-    fn is_comment_start_after_dashes(&self) -> bool {
-        let char_after_second_dash = self.peek_char_n(2);
-        // -- followed by whitespace, newline, or EOF is a comment
-        // -- followed by digit, letter, or underscore is double negation
-        char_after_second_dash == '\0'
-            || char_after_second_dash == ' '
-            || char_after_second_dash == '\t'
-            || char_after_second_dash == '\n'
-            || char_after_second_dash == '\r'
-    }
-
     /// Get the next token
     pub fn next_token(&mut self) -> Token {
         self.skip_whitespace();
@@ -189,10 +155,7 @@ impl Lexer {
                 Token::new(TokenType::Identifier, literal, pos)
             }
 
-            // Negative number (but not if we're looking at --digit which is double negation)
-            // This is handled by falling through to the operator case for the first -,
-            // then treating the second - as an operator, then reading the digit as a number.
-            // We don't handle negative numbers at lexer level - parser handles unary minus.
+            // Negative numbers: parser handles unary minus, not the lexer.
 
             // Number literal
             c if c.is_ascii_digit() => {
@@ -210,10 +173,9 @@ impl Lexer {
                 Token::new(TokenType::Comment, literal, pos)
             }
 
-            // Single line comment (--)
-            // Only treat as comment if followed by whitespace/newline/EOF
-            // Otherwise, treat as two minus operators (for double negation like --val)
-            '-' if self.peek_char() == '-' && self.is_comment_start_after_dashes() => {
+            // Single line comment (--) per SQL standard (SQL:2023 section 5.2)
+            // Double negation should be written as `- -val` or `- (-val)`
+            '-' if self.peek_char() == '-' => {
                 let literal = self.read_line_comment();
                 Token::new(TokenType::Comment, literal, pos)
             }
@@ -729,8 +691,7 @@ mod tests {
         assert_eq!(token.token_type, TokenType::Float);
         assert_eq!(token.literal, "45.67");
 
-        // Note: Negative numbers are now tokenized as operator + number
-        // (to support double negation like --val)
+        // Negative numbers are tokenized as operator + number (parser handles unary minus)
         let token = lexer.next_token();
         assert_eq!(token.token_type, TokenType::Operator);
         assert_eq!(token.literal, "-");
@@ -828,75 +789,53 @@ mod tests {
     }
 
     #[test]
-    fn test_double_negation() {
-        // --5 should tokenize as two minus operators followed by integer 5
-        let mut lexer = Lexer::new("SELECT --5");
+    fn test_double_dash_is_always_comment() {
+        // Per SQL standard (SQL:2023 5.2), -- always starts a line comment
+        // regardless of what follows the dashes.
 
+        // --5 is a comment, not double negation
+        let mut lexer = Lexer::new("SELECT --5");
         let token = lexer.next_token();
         assert_eq!(token.token_type, TokenType::Keyword);
         assert_eq!(token.literal, "SELECT");
-
         let token = lexer.next_token();
-        assert_eq!(
-            token.token_type,
-            TokenType::Operator,
-            "Expected Operator, got {:?} with literal '{}'",
-            token.token_type,
-            token.literal
-        );
-        assert_eq!(token.literal, "-");
+        assert_eq!(token.token_type, TokenType::Comment);
 
-        let token = lexer.next_token();
-        assert_eq!(
-            token.token_type,
-            TokenType::Operator,
-            "Expected Operator, got {:?} with literal '{}'",
-            token.token_type,
-            token.literal
-        );
-        assert_eq!(token.literal, "-");
-
-        let token = lexer.next_token();
-        assert_eq!(token.token_type, TokenType::Integer);
-        assert_eq!(token.literal, "5");
-
-        // --val should tokenize as two minus operators followed by identifier val
+        // --val is a comment, not double negation
         let mut lexer = Lexer::new("SELECT --val");
         let token = lexer.next_token();
         assert_eq!(token.token_type, TokenType::Keyword);
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Comment);
+
+        // --comment at start of input is a comment
+        let mut lexer = Lexer::new("--comment\nSELECT 1");
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Comment);
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Keyword);
         assert_eq!(token.literal, "SELECT");
 
-        let token = lexer.next_token();
-        assert_eq!(
-            token.token_type,
-            TokenType::Operator,
-            "Expected Operator for first -, got {:?} with literal '{}'",
-            token.token_type,
-            token.literal
-        );
-        assert_eq!(token.literal, "-");
-
-        let token = lexer.next_token();
-        assert_eq!(
-            token.token_type,
-            TokenType::Operator,
-            "Expected Operator for second -, got {:?} with literal '{}'",
-            token.token_type,
-            token.literal
-        );
-        assert_eq!(token.literal, "-");
-
-        let token = lexer.next_token();
-        assert_eq!(token.token_type, TokenType::Identifier);
-        assert_eq!(token.literal, "val");
-
-        // -- with space should still be comment
+        // -- with space is still a comment
         let mut lexer = Lexer::new("SELECT -- comment");
         let token = lexer.next_token();
         assert_eq!(token.token_type, TokenType::Keyword);
-
         let token = lexer.next_token();
         assert_eq!(token.token_type, TokenType::Comment);
+
+        // Double negation must use `- -` with a space
+        let mut lexer = Lexer::new("SELECT - -5");
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Keyword);
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Operator);
+        assert_eq!(token.literal, "-");
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Operator);
+        assert_eq!(token.literal, "-");
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Integer);
+        assert_eq!(token.literal, "5");
     }
 
     #[test]
