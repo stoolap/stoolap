@@ -357,6 +357,43 @@ The `database/sql` driver handles this automatically. Each connection in the poo
 | JSON | `string` | `sql.NullString` |
 | VECTOR/BLOB | `[]byte` | `[]byte` (nil for NULL) |
 
+## Error Handling
+
+All errors returned by the stoolap engine are typed as `*stoolap.Error`, which carries a categorized error code:
+
+```go
+var stErr *stoolap.Error
+if errors.As(err, &stErr) {
+    switch stErr.Code() {
+    case stoolap.ErrUniqueConstraint:
+        // handle duplicate
+    case stoolap.ErrPrimaryKeyConstraint:
+        // handle primary key violation
+    case stoolap.ErrTableNotFound:
+        // handle missing table
+    }
+}
+```
+
+Use `IsConstraintViolation()` to check for any constraint error (unique, primary key, not null, check, foreign key):
+
+```go
+if errors.As(err, &stErr) && stErr.IsConstraintViolation() {
+    // handle any constraint violation
+}
+```
+
+| ErrorCode | Description |
+|-----------|-------------|
+| `ErrGeneral` | Uncategorized error |
+| `ErrUniqueConstraint` | Unique index violation |
+| `ErrPrimaryKeyConstraint` | Primary key violation |
+| `ErrNotNullConstraint` | NOT NULL violation |
+| `ErrCheckConstraint` | CHECK constraint violation |
+| `ErrForeignKeyViolation` | Foreign key violation |
+| `ErrTableNotFound` | Table does not exist |
+| `ErrTableExists` | Table already exists |
+
 ## Thread Safety
 
 - **Direct API**: A single `DB` handle must not be shared across goroutines. Use `Clone()` for per-goroutine handles.
