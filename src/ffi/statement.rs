@@ -135,6 +135,109 @@ pub unsafe extern "C" fn stoolap_stmt_exec(
     })
 }
 
+/// Execute a prepared statement as a batch: opens a transaction, executes
+/// the statement once per parameter row, then commits. One FFI call replaces
+/// `2 + N` calls (begin + N × exec + commit).
+///
+/// `params` is a flat array of `row_count * params_per_row` StoolapValue
+/// structs laid out row-major: row0_p0, row0_p1, ..., rowN_pK.
+///
+/// On error the transaction is rolled back and the error is stored on `db`.
+///
+/// # Safety
+///
+/// - `db` must be a valid `StoolapDB` pointer.
+/// - `stmt` must be a valid `StoolapStmt` pointer prepared from `db`.
+/// - `params` must point to `row_count * params_per_row` valid `StoolapValue`
+///   structs (or be NULL when `row_count == 0`).
+/// - `total_affected` may be NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_stmt_exec_batch(
+    db: *mut StoolapDB,
+    stmt: *const StoolapStmt,
+    params: *const StoolapValue,
+    params_per_row: i32,
+    row_count: i32,
+    total_affected: *mut i64,
+) -> i32 {
+    let db_handle = match db.as_mut() {
+        Some(h) => h,
+        None => {
+            super::error::set_global_error("db handle is NULL");
+            return STOOLAP_ERROR;
+        }
+    };
+    db_handle.last_error = None;
+
+    let stmt_handle = match stmt.as_ref() {
+        Some(h) => h,
+        None => {
+            db_handle.set_error("statement handle is NULL");
+            return STOOLAP_ERROR;
+        }
+    };
+
+    if row_count <= 0 {
+        if !total_affected.is_null() {
+            *total_affected = 0;
+        }
+        return STOOLAP_OK;
+    }
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let mut tx = match db_handle.db.begin() {
+            Ok(t) => t,
+            Err(e) => {
+                db_handle.set_error(&e.to_string());
+                return STOOLAP_ERROR;
+            }
+        };
+
+        let ast_stmt = stmt_handle.stmt.ast_statement();
+        let ppr = params_per_row as usize;
+        let mut total: i64 = 0;
+
+        for r in 0..(row_count as usize) {
+            let row_params = params.add(r * ppr);
+            let param_vec = value::params_to_vec(row_params, params_per_row);
+
+            let exec_result = if let Some(ast) = ast_stmt {
+                tx.execute_prepared(ast, param_vec)
+            } else {
+                let sql_str = stmt_handle.sql_cstr.to_str().unwrap_or("");
+                tx.execute(sql_str, param_vec)
+            };
+
+            match exec_result {
+                Ok(affected) => total += affected,
+                Err(e) => {
+                    let _ = tx.rollback();
+                    db_handle.set_error(&e.to_string());
+                    return STOOLAP_ERROR;
+                }
+            }
+        }
+
+        match tx.commit() {
+            Ok(_) => {
+                if !total_affected.is_null() {
+                    *total_affected = total;
+                }
+                STOOLAP_OK
+            }
+            Err(e) => {
+                db_handle.set_error(&e.to_string());
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        db_handle.set_error("panic during stoolap_stmt_exec_batch");
+        STOOLAP_ERROR
+    })
+}
+
 /// Query using a prepared statement with parameters.
 ///
 /// # Safety

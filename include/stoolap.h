@@ -270,6 +270,26 @@ int32_t stoolap_stmt_exec(
 );
 
 /**
+ * Execute a prepared statement as a batch inside a single transaction.
+ *
+ * @param db             Database handle (used to begin the transaction).
+ * @param stmt           Prepared statement to execute for each row.
+ * @param params         Flat row-major array of row_count * params_per_row values.
+ * @param params_per_row Number of parameters per row.
+ * @param row_count      Number of rows to execute.
+ * @param total_affected On success, receives the total rows affected.
+ * @return STOOLAP_OK on success. On error the transaction is rolled back.
+ */
+int32_t stoolap_stmt_exec_batch(
+    StoolapDB* db,
+    const StoolapStmt* stmt,
+    const StoolapValue* params,
+    int32_t params_per_row,
+    int32_t row_count,
+    int64_t* total_affected
+);
+
+/**
  * Query using a prepared statement with parameters.
  * On success, *out_rows must be closed with stoolap_rows_close().
  */

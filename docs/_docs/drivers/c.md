@@ -2,7 +2,7 @@
 layout: doc
 title: C API (FFI)
 category: Drivers
-order: 10
+order: 9
 icon: c
 ---
 
@@ -275,12 +275,49 @@ printf("SQL: %s\n", stoolap_stmt_sql(lookup));
 stoolap_stmt_finalize(lookup);
 ```
 
+### Batch Execution
+
+`stoolap_stmt_exec_batch()` executes a prepared statement once per parameter row inside a single transaction. It replaces `2 + N` FFI calls (begin + N executions + commit) with a single call, reducing per-call overhead for bulk inserts and updates.
+
+Parameters are passed as a flat row-major array: all values for row 0, then all values for row 1, and so on.
+
+```c
+StoolapStmt* stmt = NULL;
+stoolap_prepare(db, "INSERT INTO t VALUES ($1, $2)", &stmt);
+
+/* 3 rows, 2 params each = 6 StoolapValue structs */
+StoolapValue params[6] = {
+    /* Row 0 */
+    { .value_type = STOOLAP_TYPE_INTEGER, 0, { .integer = 1 } },
+    { .value_type = STOOLAP_TYPE_TEXT,    0, { .text = { "Alice", 5 } } },
+    /* Row 1 */
+    { .value_type = STOOLAP_TYPE_INTEGER, 0, { .integer = 2 } },
+    { .value_type = STOOLAP_TYPE_TEXT,    0, { .text = { "Bob", 3 } } },
+    /* Row 2 */
+    { .value_type = STOOLAP_TYPE_INTEGER, 0, { .integer = 3 } },
+    { .value_type = STOOLAP_TYPE_TEXT,    0, { .text = { "Charlie", 7 } } },
+};
+
+int64_t total = 0;
+if (stoolap_stmt_exec_batch(db, stmt, params, 2, 3, &total) != STOOLAP_OK) {
+    fprintf(stderr, "Batch failed: %s\n", stoolap_errmsg(db));
+}
+/* total == 3 */
+
+stoolap_stmt_finalize(stmt);
+```
+
+On success, all rows are committed atomically. On any error, the entire batch is rolled back and the error is available via `stoolap_errmsg(db)`.
+
+The `total_affected` pointer may be NULL if you do not need the count. When `row_count` is 0, the function returns `STOOLAP_OK` immediately without opening a transaction.
+
 ### Statement Functions
 
 | Function | Returns | Description |
 |----------|---------|-------------|
 | `stoolap_prepare(db, sql, &stmt)` | `int32_t` | Prepare a SQL statement |
 | `stoolap_stmt_exec(stmt, params, len, &affected)` | `int32_t` | Execute with parameters |
+| `stoolap_stmt_exec_batch(db, stmt, params, params_per_row, row_count, &total)` | `int32_t` | Execute batch in a single transaction |
 | `stoolap_stmt_query(stmt, params, len, &rows)` | `int32_t` | Query with parameters |
 | `stoolap_stmt_sql(stmt)` | `const char*` | Get the SQL text |
 | `stoolap_stmt_finalize(stmt)` | `void` | Destroy the statement (NULL-safe) |
@@ -707,6 +744,7 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 |----------|---------|-------------|
 | `stoolap_prepare(db, sql, &stmt)` | `int32_t` | Prepare a SQL statement |
 | `stoolap_stmt_exec(stmt, params, len, &affected)` | `int32_t` | Execute prepared statement |
+| `stoolap_stmt_exec_batch(db, stmt, params, params_per_row, row_count, &total)` | `int32_t` | Execute batch in a single transaction |
 | `stoolap_stmt_query(stmt, params, len, &rows)` | `int32_t` | Query with prepared statement |
 | `stoolap_stmt_sql(stmt)` | `const char*` | Get SQL text (valid until finalize) |
 | `stoolap_stmt_finalize(stmt)` | `void` | Destroy statement (NULL-safe) |

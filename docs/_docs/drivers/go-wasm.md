@@ -2,7 +2,7 @@
 layout: doc
 title: Go WASM Driver
 category: Drivers
-order: 9
+order: 11
 icon: go
 ---
 

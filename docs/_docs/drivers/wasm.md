@@ -2,7 +2,7 @@
 layout: doc
 title: WebAssembly (WASM)
 category: Drivers
-order: 8
+order: 10
 icon: wasm
 ---
 
