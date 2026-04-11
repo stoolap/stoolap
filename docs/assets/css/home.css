@@ -63,6 +63,23 @@
   background: linear-gradient(180deg, #0a1a28 0%, #0f2535 35%, #163348 65%, #1a3b50 100%);
 }
 
+.hero-watermark {
+  position: absolute;
+  right: 2%;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 65%;
+  max-width: 750px;
+  height: auto;
+  z-index: 1;
+  color: rgba(0, 0, 0, 0.04);
+  pointer-events: none;
+}
+
+[data-theme="dark"] .hero-watermark {
+  color: rgba(255, 255, 255, 0.04);
+}
+
 .hero-inner {
   position: relative;
   z-index: 2;
