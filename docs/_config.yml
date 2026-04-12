@@ -5,7 +5,6 @@ url: https://stoolap.io
 baseurl: ""
 permalink: pretty
 logo: /assets/img/logo.svg
-image: /assets/img/og-image.png
 twitter:
   card: summary_large_image
 github:
@@ -47,6 +46,7 @@ defaults:
       path: ""
     values:
       layout: "default"
+      image: /assets/img/og-image.png
 
 plugins:
   - jekyll-sitemap
