@@ -5,6 +5,9 @@ url: https://stoolap.io
 baseurl: ""
 permalink: pretty
 logo: /assets/img/logo.svg
+image: /assets/img/og-image.png
+twitter:
+  card: summary_large_image
 github:
   repository_url: https://github.com/stoolap/stoolap
 
