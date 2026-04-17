@@ -24,6 +24,7 @@
     initSvgThemeSync();
     initCodeTabs();
     initHeroTerminal();
+    initHeroBadges();
     initScrollToTop();
     initSearch();
 
@@ -329,6 +330,63 @@
         });
       });
     });
+  }
+
+  /* ── Hero Badges: fetch live GitHub stars + latest release ── */
+  function initHeroBadges() {
+    var starsEl = document.getElementById('heroStars');
+    var versionEl = document.getElementById('heroVersion');
+    if (!starsEl && !versionEl) return;
+
+    var cacheKey = 'stoolap.heroBadges';
+    var cacheTtl = 6 * 60 * 60 * 1000; // 6 hours
+
+    function formatStars(n) {
+      if (n >= 1000) return (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k';
+      return String(n);
+    }
+
+    function render(data) {
+      if (starsEl && typeof data.stars === 'number') {
+        starsEl.textContent = formatStars(data.stars) + ' stars';
+      }
+      if (versionEl && typeof data.version === 'string') {
+        versionEl.textContent = data.version;
+      }
+    }
+
+    try {
+      var cached = localStorage.getItem(cacheKey);
+      if (cached) {
+        var parsed = JSON.parse(cached);
+        if (parsed && Date.now() - parsed.t < cacheTtl && parsed.d) {
+          render(parsed.d);
+          return;
+        }
+      }
+    } catch (e) { /* ignore */ }
+
+    var reqs = [
+      fetch('https://api.github.com/repos/stoolap/stoolap').then(function (r) { return r.ok ? r.json() : null; }),
+      fetch('https://api.github.com/repos/stoolap/stoolap/releases/latest').then(function (r) { return r.ok ? r.json() : null; })
+    ];
+
+    Promise.all(reqs).then(function (results) {
+      var repo = results[0];
+      var release = results[1];
+      var data = {};
+      if (repo && typeof repo.stargazers_count === 'number') {
+        data.stars = repo.stargazers_count;
+      }
+      if (release && release.tag_name) {
+        data.version = release.tag_name;
+      }
+      if (Object.keys(data).length === 0) return;
+      render(data);
+      try {
+        localStorage.setItem(cacheKey, JSON.stringify({ d: data, t: Date.now() }));
+      } catch (e) { /* ignore */ }
+    }).catch(function () { /* leave defaults */ });
   }
 
   /* ── Hero Terminal Typing Animation ── */

@@ -12,8 +12,22 @@ title: High-performance embedded SQL database in Rust
     <path d="M187.699 388.313C188.586 391.313 187.871 392.508 186.154 395.438C137.205 478.98 84.0701 625.513 188.023 690.835C221.449 711.841 274.916 704.483 312.815 697.027C328.141 695.933 343.324 691.801 358.259 688.342C462.409 664.222 556.004 621.443 664.589 618.803C781.966 615.951 879.253 660.269 980.777 714.238C1018.14 733.802 1055.07 754.193 1091.53 775.398C1150.07 809.065 1209.08 841.91 1268.54 873.924C1285 882.82 1301.6 892.559 1318.13 901.131C1356.48 920.59 1395.11 939.494 1434.02 957.836C1452.59 966.494 1499.53 984.099 1512.96 995.784C1513.32 996.104 1513.68 996.424 1514.04 996.745L1514.04 1000.2C1505.38 1005.59 1462.64 1008.04 1453.43 1008.22C1453.43 1008.22 1407.74 1007.85 1395.74 1006.26C1319.87 996.193 1250.39 978.636 1177.9 954.032C1094.02 925.566 1011.21 890.186 928.79 857.269C856.23 828.291 782.994 797.103 705.417 783.968C548.972 756.975 407.779 845.617 261.042 883.833C184.094 903.872 64.631 933.234 30.9401 832.629C29.1028 827.143 23.0863 805.069 23.7715 786.502C23.7715 786.502 23.318 770.798 25.6812 755.156C37.855 674.575 73.4059 591.54 110.513 519.45C133.196 475.383 159.945 429.809 187.699 388.313Z" fill="currentColor" fill-rule="nonzero" stroke="none"/>
   </svg>
   <div class="container hero-inner">
-    <h1 class="hero-heading">The SQL Database That<br><span class="hero-accent">Ships With Your App</span></h1>
-    <p class="hero-tagline">Pure Rust. Zero C dependencies. ACID transactions, cost-based optimizer, parallel execution, vector search with HNSW indexes, and 118 built-in functions. Compiles to WebAssembly.</p>
+    <h1 class="hero-heading">The SQL database that<br><span class="hero-accent">ships with your app.</span></h1>
+    <p class="hero-tagline">Embedded. Pure Rust. MVCC, vector search, and parallel execution in a single binary.</p>
+    <div class="hero-badges" aria-label="Project status">
+      <a class="hero-badge" href="{{ site.github.repository_url }}" target="_blank" rel="noopener" aria-label="GitHub stars">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 .587l3.668 7.568L24 9.75l-6 5.848 1.416 8.253L12 19.771l-7.416 3.998L6 15.598 0 9.75l8.332-1.595z"/></svg>
+        <span id="heroStars">GitHub</span>
+      </a>
+      <span class="hero-badge hero-badge-static" aria-label="Written in Rust">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M12 0a12 12 0 1 0 0 24 12 12 0 0 0 0-24zm-.19 3.68c.37 0 .68.32.68.71 0 .4-.31.71-.68.71a.7.7 0 0 1-.68-.71c0-.39.31-.71.68-.71zm7.36 5.86l.95.57-.34.98-.97-.21-.54 1.3 1.02.73-.52.89-1.04-.37-1.01 1.01.37 1.04-.89.52-.73-1.02-1.3.54.21.97-.98.34-.57-.95-1.02.06-.06 1.02-1.02-.06-.06-1.02-.95-.57.21-.97-1.3-.54-.73 1.02-.89-.52.37-1.04-1.01-1.01-1.04.37-.52-.89 1.02-.73-.54-1.3-.97.21-.34-.98.95-.57-.06-1.02-.95-.57.34-.98.97.21.54-1.3-1.02-.73.52-.89 1.04.37 1.01-1.01-.37-1.04.89-.52.73 1.02 1.3-.54-.21-.97.98-.34.57.95 1.02-.06.06-1.02 1.02.06.06 1.02.95.57-.21.97 1.3.54.73-1.02.89.52-.37 1.04 1.01 1.01 1.04-.37.52.89-1.02.73.54 1.3.97-.21.34.98-.95.57.06 1.02zm-7.17-3.59a4.92 4.92 0 1 0 0 9.84 4.92 4.92 0 0 0 0-9.84z"/></svg>
+        Pure Rust
+      </span>
+      <a class="hero-badge" href="{{ '/changelog/' | relative_url }}" aria-label="Latest release">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+        <span id="heroVersion">{{ site.stoolap_version | default: "v0.4.0" }}</span>
+      </a>
+    </div>
     <div class="hero-terminal" id="heroTerminal" aria-hidden="true">
       <div class="hero-term-output" id="heroTermOutput"></div>
       <div class="hero-term-input">
@@ -29,6 +43,58 @@ title: High-performance embedded SQL database in Rust
       <a href="{{ site.github.repository_url }}" class="btn-hero-ghost" target="_blank" rel="noopener">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
         GitHub
+      </a>
+    </div>
+  </div>
+</section>
+
+<!-- Drivers - available languages -->
+<section class="drivers-section">
+  <div class="container">
+    <div class="drivers-header">
+      <h2 class="section-heading">Use it from your favorite language.</h2>
+      <p class="section-sub">Stoolap ships with first-party drivers for every major language. Embed it directly, or talk to it from the language you already write.</p>
+    </div>
+    <div class="drivers-grid">
+      <a class="driver-card" href="{{ '/docs/drivers/python/' | relative_url }}">
+        {% include driver-icons.html icon="python" %}
+        <span class="driver-name">Python</span>
+      </a>
+      <a class="driver-card" href="{{ '/docs/drivers/go/' | relative_url }}">
+        {% include driver-icons.html icon="go" %}
+        <span class="driver-name">Go</span>
+      </a>
+      <a class="driver-card" href="{{ '/docs/drivers/nodejs/' | relative_url }}">
+        {% include driver-icons.html icon="nodejs" %}
+        <span class="driver-name">Node.js</span>
+      </a>
+      <a class="driver-card" href="{{ '/docs/drivers/java/' | relative_url }}">
+        {% include driver-icons.html icon="java" %}
+        <span class="driver-name">Java</span>
+      </a>
+      <a class="driver-card" href="{{ '/docs/drivers/csharp/' | relative_url }}">
+        {% include driver-icons.html icon="csharp" %}
+        <span class="driver-name">C#</span>
+      </a>
+      <a class="driver-card" href="{{ '/docs/drivers/php/' | relative_url }}">
+        {% include driver-icons.html icon="php" %}
+        <span class="driver-name">PHP</span>
+      </a>
+      <a class="driver-card" href="{{ '/docs/drivers/ruby/' | relative_url }}">
+        {% include driver-icons.html icon="ruby" %}
+        <span class="driver-name">Ruby</span>
+      </a>
+      <a class="driver-card" href="{{ '/docs/drivers/swift/' | relative_url }}">
+        {% include driver-icons.html icon="swift" %}
+        <span class="driver-name">Swift</span>
+      </a>
+      <a class="driver-card" href="{{ '/docs/drivers/c/' | relative_url }}">
+        {% include driver-icons.html icon="c" %}
+        <span class="driver-name">C</span>
+      </a>
+      <a class="driver-card" href="{{ '/docs/drivers/wasm/' | relative_url }}">
+        {% include driver-icons.html icon="wasm" %}
+        <span class="driver-name">WebAssembly</span>
       </a>
     </div>
   </div>
@@ -179,27 +245,27 @@ title: High-performance embedded SQL database in Rust
   </div>
 </section>
 
-<!-- Try It Live - Playground CTA -->
+<!-- Try It Live - Inline Interactive Playground -->
 <section class="try-live">
   <div class="container">
-    <div class="try-live-inner">
-      <div class="try-live-text">
-        <h2>Try It in Your Browser</h2>
-        <p>Stoolap compiles to WebAssembly. Run real SQL queries right now, no installation, no server. Everything runs locally.</p>
-        <a href="{{ '/playground' | relative_url }}" class="btn-hero-primary">Open Playground</a>
-      </div>
-      <div class="try-live-preview">
-        <div class="try-preview-term">
-          <div class="hero-term-chrome">
-            <span class="term-dot" style="background:#ff5f56"></span>
-            <span class="term-dot" style="background:#ffbd2e"></span>
-            <span class="term-dot" style="background:#27c93f"></span>
-          </div>
-          <pre class="hero-term-body"><span class="t-muted">stoolap&gt;</span> <span class="t-purple">WITH RECURSIVE</span> fib(n, a, b) <span class="t-purple">AS</span> (
+    <div class="try-live-header">
+      <h2 class="section-heading">Run real SQL right now.</h2>
+      <p class="section-sub">Stoolap compiles to WebAssembly. The playground below runs entirely in your browser. No server, no installation, nothing leaves your machine.</p>
+    </div>
+
+    <div class="home-playground" id="home-playground">
+      <!-- Preview state (shown before user clicks to load WASM) -->
+      <div class="home-pg-preview" id="home-pg-preview">
+        <div class="pg-chrome">
+          <span class="pg-dot" style="background:#ff5f56"></span>
+          <span class="pg-dot" style="background:#ffbd2e"></span>
+          <span class="pg-dot" style="background:#27c93f"></span>
+          <span class="pg-label">stoolap / Playground</span>
+        </div>
+        <pre class="home-pg-preview-body"><span class="t-muted">stoolap&gt;</span> <span class="t-purple">WITH RECURSIVE</span> fib(n, a, b) <span class="t-purple">AS</span> (
     <span class="t-purple">SELECT</span> <span class="t-orange">1</span>, <span class="t-orange">0</span>, <span class="t-orange">1</span>
     <span class="t-purple">UNION ALL</span>
-    <span class="t-purple">SELECT</span> n+<span class="t-orange">1</span>, b, a+b <span class="t-purple">FROM</span> fib
-    <span class="t-purple">WHERE</span> n < <span class="t-orange">10</span>
+    <span class="t-purple">SELECT</span> n+<span class="t-orange">1</span>, b, a+b <span class="t-purple">FROM</span> fib <span class="t-purple">WHERE</span> n &lt; <span class="t-orange">10</span>
 )
 <span class="t-purple">SELECT</span> n, a <span class="t-purple">AS</span> fibonacci <span class="t-purple">FROM</span> fib;
 <span class="t-dim">+----+-----------+
@@ -212,11 +278,75 @@ title: High-performance embedded SQL database in Rust
 |  5 |         3 |
 +----+-----------+
 (10 rows, 0.1ms)</span></pre>
+        <div class="home-pg-cta">
+          <button type="button" class="btn-pg-launch" id="home-pg-launch" aria-label="Launch interactive playground">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+            <span>Launch interactive playground</span>
+            <span class="btn-pg-size">~6&thinsp;MB</span>
+          </button>
+          <a href="{{ '/playground' | relative_url }}" class="btn-pg-ghost">Open full page &rarr;</a>
+        </div>
+      </div>
+
+      <!-- Live playground (hidden until user clicks launch) -->
+      <div class="home-pg-live" id="home-pg-live" hidden>
+        <div class="playground-terminal" id="playground">
+          <div class="pg-chrome">
+            <span class="pg-dot" style="background:#ff5f56"></span>
+            <span class="pg-dot" style="background:#ffbd2e"></span>
+            <span class="pg-dot" style="background:#27c93f"></span>
+            <span class="pg-label">stoolap / Playground</span>
+            <div class="pg-chrome-actions">
+              <button class="pg-btn" id="btn-clear" title="Clear output (Ctrl+L)">Clear</button>
+              <button class="pg-btn" id="btn-reset" title="Reset database">Reset</button>
+              <a class="pg-btn" href="{{ '/playground' | relative_url }}" title="Open full-page playground">Expand &rarr;</a>
+            </div>
+          </div>
+          <div class="pg-body" id="pg-output">
+            <div class="pg-loading" id="pg-loading">
+              <div class="pg-spinner"></div>
+              <span>Loading Stoolap WASM&hellip;</span>
+            </div>
+          </div>
+          <div class="pg-input-area">
+            <span class="pg-prompt" id="pg-prompt">stoolap&gt;</span>
+            <textarea class="pg-input" id="pg-input" rows="1" spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off" placeholder="Enter SQL..." aria-label="SQL input" disabled></textarea>
+          </div>
+          <div class="playground-hints">
+            <div class="hint-grid">
+              <button class="hint-chip" data-sql="SHOW TABLES;">SHOW TABLES</button>
+              <button class="hint-chip" data-sql="SELECT * FROM users;">SELECT * FROM users</button>
+              <button class="hint-chip" data-sql="SELECT name, email, ROW_NUMBER() OVER (ORDER BY age DESC) AS rank FROM users;">Window Functions</button>
+              <button class="hint-chip" data-sql="WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 10) SELECT n, n*n AS square FROM seq;">Recursive CTE</button>
+              <button class="hint-chip" data-sql="SELECT title, ROUND(VEC_DISTANCE_COSINE(embedding, '[0.90, 0.15, 0.10, 0.10]'), 4) AS distance FROM documents ORDER BY distance LIMIT 5;">Vector k-NN</button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
   </div>
 </section>
+
+<!-- Inline playground needs its CSS and loader -->
+<link rel="stylesheet" href="{{ '/assets/css/playground.css' | relative_url }}">
+<script>
+  (function () {
+    var launch = document.getElementById('home-pg-launch');
+    if (!launch) return;
+    launch.addEventListener('click', function () {
+      var preview = document.getElementById('home-pg-preview');
+      var live = document.getElementById('home-pg-live');
+      if (!preview || !live) return;
+      preview.hidden = true;
+      live.hidden = false;
+      // Dynamically import the existing playground module. It auto-inits.
+      var s = document.createElement('script');
+      s.type = 'module';
+      s.src = "{{ '/assets/js/playground.js' | relative_url }}";
+      document.body.appendChild(s);
+    }, { once: true });
+  })();
+</script>
 
 <!-- Code Examples -->
 <section class="code-examples">
