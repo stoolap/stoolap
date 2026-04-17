@@ -413,13 +413,12 @@ impl Executor {
                         // First, try matching against SELECT expressions directly
                         for (i, select_expr) in stmt.columns.iter().enumerate() {
                             match select_expr {
-                                Expression::QualifiedIdentifier(sel_qid) => {
+                                Expression::QualifiedIdentifier(sel_qid)
                                     // Direct match: ORDER BY c.name matches SELECT c.name
                                     if sel_qid.qualifier.value_lower == qid.qualifier.value_lower
-                                        && sel_qid.name.value_lower == qid.name.value_lower
-                                    {
-                                        return Some(i);
-                                    }
+                                        && sel_qid.name.value_lower == qid.name.value_lower =>
+                                {
+                                    return Some(i);
                                 }
                                 Expression::Aliased(aliased) => {
                                     // Check if the aliased expression matches
@@ -901,15 +900,15 @@ impl Executor {
                             for (i, sel) in sel_exprs.iter().enumerate() {
                                 if let Expression::Aliased(aliased) = sel {
                                     match &*aliased.expression {
-                                        Expression::Identifier(sel_id) => {
-                                            if sel_id.value_lower == id.value_lower {
-                                                return Some(i);
-                                            }
+                                        Expression::Identifier(sel_id)
+                                            if sel_id.value_lower == id.value_lower =>
+                                        {
+                                            return Some(i);
                                         }
-                                        Expression::QualifiedIdentifier(qid) => {
-                                            if qid.name.value_lower == id.value_lower {
-                                                return Some(i);
-                                            }
+                                        Expression::QualifiedIdentifier(qid)
+                                            if qid.name.value_lower == id.value_lower =>
+                                        {
+                                            return Some(i);
                                         }
                                         _ => {}
                                     }
@@ -933,12 +932,12 @@ impl Executor {
                         if let Some(sel_exprs) = select_exprs {
                             for (i, sel) in sel_exprs.iter().enumerate() {
                                 match sel {
-                                    Expression::QualifiedIdentifier(sel_qi) => {
-                                        if sel_qi.qualifier.value_lower == qi.qualifier.value_lower
-                                            && sel_qi.name.value_lower == qi.name.value_lower
-                                        {
-                                            return Some(i);
-                                        }
+                                    Expression::QualifiedIdentifier(sel_qi)
+                                        if sel_qi.qualifier.value_lower
+                                            == qi.qualifier.value_lower
+                                            && sel_qi.name.value_lower == qi.name.value_lower =>
+                                    {
+                                        return Some(i);
                                     }
                                     Expression::Aliased(aliased) => {
                                         if let Expression::QualifiedIdentifier(sel_qi) =
@@ -1298,14 +1297,14 @@ impl Executor {
                     _ => {}
                 }
             }
-            Expression::Between(between) if !between.not => {
-                if Self::is_tvf_column(&between.expr, col_name) {
-                    if let Some(lo) = Self::try_eval_to_i64(&between.lower, ctx) {
-                        *min_bound = Some(min_bound.map_or(lo, |cur| cur.max(lo)));
-                    }
-                    if let Some(hi) = Self::try_eval_to_i64(&between.upper, ctx) {
-                        *max_bound = Some(max_bound.map_or(hi, |cur| cur.min(hi)));
-                    }
+            Expression::Between(between)
+                if !between.not && Self::is_tvf_column(&between.expr, col_name) =>
+            {
+                if let Some(lo) = Self::try_eval_to_i64(&between.lower, ctx) {
+                    *min_bound = Some(min_bound.map_or(lo, |cur| cur.max(lo)));
+                }
+                if let Some(hi) = Self::try_eval_to_i64(&between.upper, ctx) {
+                    *max_bound = Some(max_bound.map_or(hi, |cur| cur.min(hi)));
                 }
             }
             _ => {}
@@ -1634,14 +1633,13 @@ impl Executor {
         // Check if any ORDER BY column is not in SELECT
         for ob in &stmt.order_by {
             match &ob.expression {
-                Expression::Identifier(id) => {
+                Expression::Identifier(id)
                     if !select_columns.contains(id.value_lower.as_str())
                         && all_columns
                             .iter()
-                            .any(|c| c.eq_ignore_ascii_case(id.value_lower.as_str()))
-                    {
-                        return true;
-                    }
+                            .any(|c| c.eq_ignore_ascii_case(id.value_lower.as_str())) =>
+                {
+                    return true;
                 }
                 Expression::QualifiedIdentifier(qi) => {
                     let full_name = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
@@ -3556,13 +3554,12 @@ impl Executor {
             // Append DISTINCT ON columns not already in output
             for expr in &stmt.distinct_on {
                 match expr {
-                    Expression::Identifier(id) => {
+                    Expression::Identifier(id)
                         if !output_columns
                             .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&id.value_lower))
-                        {
-                            output_columns.push(id.value.to_string());
-                        }
+                            .any(|c| c.eq_ignore_ascii_case(&id.value_lower)) =>
+                    {
+                        output_columns.push(id.value.to_string());
                     }
                     Expression::QualifiedIdentifier(qi) => {
                         let full_name =
@@ -4861,13 +4858,12 @@ impl Executor {
             // Append extra ORDER BY columns not in SELECT
             for ob in &stmt.order_by {
                 match &ob.expression {
-                    Expression::Identifier(id) => {
+                    Expression::Identifier(id)
                         if !output_columns
                             .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&id.value_lower))
-                        {
-                            output_columns.push(id.value.to_string());
-                        }
+                            .any(|c| c.eq_ignore_ascii_case(&id.value_lower)) =>
+                    {
+                        output_columns.push(id.value.to_string());
                     }
                     Expression::QualifiedIdentifier(qi) => {
                         let full = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
@@ -7265,15 +7261,14 @@ impl Executor {
         let mut extra_order_indices: Vec<usize> = Vec::new();
         for ob in order_by {
             match &ob.expression {
-                Expression::Identifier(id) => {
+                Expression::Identifier(id)
                     if !select_column_names
                         .iter()
-                        .any(|s| s == id.value_lower.as_str())
-                    {
-                        if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
-                            if !extra_order_indices.contains(&idx) {
-                                extra_order_indices.push(idx);
-                            }
+                        .any(|s| s == id.value_lower.as_str()) =>
+                {
+                    if let Some(&idx) = col_index_map_lower.get(id.value_lower.as_str()) {
+                        if !extra_order_indices.contains(&idx) {
+                            extra_order_indices.push(idx);
                         }
                     }
                 }

@@ -4164,10 +4164,8 @@ impl VersionStore {
         // Helper to update accumulator with a value
         fn update_accumulator(acc: &mut AggregateAccumulator, op: &AggregateOp, val: &Value) {
             match (acc, op) {
-                (AggregateAccumulator::Count(c), AggregateOp::Count) => {
-                    if !val.is_null() {
-                        *c += 1;
-                    }
+                (AggregateAccumulator::Count(c), AggregateOp::Count) if !val.is_null() => {
+                    *c += 1;
                 }
                 (AggregateAccumulator::Count(c), AggregateOp::CountStar) => {
                     *c += 1;
@@ -4184,30 +4182,22 @@ impl VersionStore {
                     }
                     _ => {}
                 },
-                (AggregateAccumulator::Min(min), AggregateOp::Min) => {
-                    if !val.is_null() {
-                        match min {
-                            None => *min = Some(val.clone()),
-                            Some(current) => {
-                                if let Ok(std::cmp::Ordering::Less) = val.compare(current) {
-                                    *min = Some(val.clone());
-                                }
-                            }
+                (AggregateAccumulator::Min(min), AggregateOp::Min) if !val.is_null() => match min {
+                    None => *min = Some(val.clone()),
+                    Some(current) => {
+                        if let Ok(std::cmp::Ordering::Less) = val.compare(current) {
+                            *min = Some(val.clone());
                         }
                     }
-                }
-                (AggregateAccumulator::Max(max), AggregateOp::Max) => {
-                    if !val.is_null() {
-                        match max {
-                            None => *max = Some(val.clone()),
-                            Some(current) => {
-                                if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
-                                    *max = Some(val.clone());
-                                }
-                            }
+                },
+                (AggregateAccumulator::Max(max), AggregateOp::Max) if !val.is_null() => match max {
+                    None => *max = Some(val.clone()),
+                    Some(current) => {
+                        if let Ok(std::cmp::Ordering::Greater) = val.compare(current) {
+                            *max = Some(val.clone());
                         }
                     }
-                }
+                },
                 (AggregateAccumulator::Avg(int_sum, float_sum, cnt), AggregateOp::Avg) => match val
                 {
                     Value::Integer(i) => {
@@ -6762,14 +6752,13 @@ impl TransactionVersionStore {
             if let Some(read_version) = &write_entry.read_version {
                 // UPDATE path: check that the row hasn't been modified concurrently
                 match self.parent_store.get_latest_version_id(row_id) {
-                    Some(latest_txn_id) => {
-                        if latest_txn_id != read_version.txn_id {
-                            return Err(Error::internal(format!(
-                                "write conflict: row {} was modified by another transaction",
-                                row_id
-                            )));
-                        }
+                    Some(latest_txn_id) if latest_txn_id != read_version.txn_id => {
+                        return Err(Error::internal(format!(
+                            "write conflict: row {} was modified by another transaction",
+                            row_id
+                        )));
                     }
+                    Some(_) => {}
                     None => {
                         // Row is absent from the hot B-tree. This happens when seal
                         // moved the row to cold storage between our read and commit.

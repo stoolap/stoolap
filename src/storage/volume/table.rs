@@ -3337,7 +3337,7 @@ impl Table for SegmentedTable {
                     if ascending {
                         rows.sort_unstable_by_key(|&(id, _)| id);
                     } else {
-                        rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                        rows.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
                     }
                     rows.truncate(needed);
                     rows
@@ -4050,13 +4050,11 @@ impl Table for SegmentedTable {
             let col_type = schema.columns[col_idx].data_type;
             let target = match (col_type, value) {
                 (DataType::Integer, Value::Integer(i)) => TypedTarget::Int64(*i),
-                (DataType::Integer, Value::Float(f)) => {
+                (DataType::Integer, Value::Float(f))
                     // Float literal on integer column: convert to i64 if exact, bail otherwise
-                    if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 {
-                        TypedTarget::Int64(*f as i64)
-                    } else {
-                        return None;
-                    }
+                    if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 =>
+                {
+                    TypedTarget::Int64(*f as i64)
                 }
                 (DataType::Timestamp, Value::Timestamp(t)) => {
                     TypedTarget::Int64(t.timestamp_nanos_opt().unwrap_or(0))
@@ -4366,10 +4364,8 @@ impl Table for SegmentedTable {
                             }
                         } else if let Some(ref def) = pa.default_val {
                             match def {
-                                Value::Integer(v) => {
-                                    if acc.min_i64.is_none_or(|cur| *v < cur) {
-                                        acc.min_i64 = Some(*v);
-                                    }
+                                Value::Integer(v) if acc.min_i64.is_none_or(|cur| *v < cur) => {
+                                    acc.min_i64 = Some(*v);
                                 }
                                 Value::Timestamp(t) => {
                                     let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {
@@ -4414,10 +4410,8 @@ impl Table for SegmentedTable {
                             }
                         } else if let Some(ref def) = pa.default_val {
                             match def {
-                                Value::Integer(v) => {
-                                    if acc.max_i64.is_none_or(|cur| *v > cur) {
-                                        acc.max_i64 = Some(*v);
-                                    }
+                                Value::Integer(v) if acc.max_i64.is_none_or(|cur| *v > cur) => {
+                                    acc.max_i64 = Some(*v);
                                 }
                                 Value::Timestamp(t) => {
                                     let nanos = t.timestamp_nanos_opt().unwrap_or_else(|| {

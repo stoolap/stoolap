@@ -1394,12 +1394,8 @@ impl VolumeBuilder {
                 }
                 StorageKind::Bytes(idx, _) => {
                     let bytes = match value {
-                        Value::Extension(data) => {
-                            if data.len() > 1 {
-                                &data[1..] // skip type tag
-                            } else {
-                                &[]
-                            }
+                        Value::Extension(data) if data.len() > 1 => {
+                            &data[1..] // skip type tag
                         }
                         _ => &[],
                     };

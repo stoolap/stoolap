@@ -395,20 +395,16 @@ impl QueryCache {
                 // Check if compiled lookup references this table
                 if let Ok(compiled) = plan.compiled.read() {
                     match &*compiled {
-                        CompiledExecution::PkLookup(lookup) => {
-                            if lookup.table_name == *table_lower {
-                                return false; // Remove this plan
-                            }
+                        CompiledExecution::PkLookup(lookup)
+                            if lookup.table_name == *table_lower =>
+                        {
+                            return false; // Remove this plan
                         }
-                        CompiledExecution::CountDistinct(cd) => {
-                            if cd.table_name == *table_lower {
-                                return false; // Remove this plan
-                            }
+                        CompiledExecution::CountDistinct(cd) if cd.table_name == *table_lower => {
+                            return false; // Remove this plan
                         }
-                        CompiledExecution::CountStar(cs) => {
-                            if cs.table_name == *table_lower {
-                                return false; // Remove this plan
-                            }
+                        CompiledExecution::CountStar(cs) if cs.table_name == *table_lower => {
+                            return false; // Remove this plan
                         }
                         _ => {}
                     }

@@ -534,7 +534,7 @@ impl WorkloadLearner {
             .map(|(k, v)| (k.clone(), v.load(Ordering::Relaxed)))
             .collect();
 
-        tables.sort_by(|a, b| b.1.cmp(&a.1));
+        tables.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.1));
         tables.truncate(limit);
         tables
     }

@@ -5384,7 +5384,7 @@ impl MVCCEngine {
                     continue;
                 }
                 // Sort by segment_id descending (newest first) for correct dedup.
-                vols.sort_by(|a, b| b.0.cmp(&a.0));
+                vols.sort_by_key(|entry| std::cmp::Reverse(entry.0));
                 let ts = mgr.tombstone_set_arc();
                 (old_ids, Arc::new(vols), ts)
             };

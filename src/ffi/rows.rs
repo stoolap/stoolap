@@ -301,13 +301,8 @@ pub unsafe extern "C" fn stoolap_rows_column_bool(rows: *const StoolapRows, inde
     };
 
     match get_current_value(handle, index) {
-        Some(val) => {
-            if val.as_boolean().unwrap_or(false) {
-                1
-            } else {
-                0
-            }
-        }
+        Some(val) if val.as_boolean().unwrap_or(false) => 1,
+        Some(_) => 0,
         None => 0,
     }
 }

@@ -64,12 +64,11 @@ impl ColumnAggregateStats {
                 self.sum_int += *i as i128;
                 self.numeric_count += 1;
             }
-            Value::Float(f) => {
-                if !f.is_nan() {
-                    self.sum_float += *f;
-                    self.numeric_count += 1;
-                }
+            Value::Float(f) if !f.is_nan() => {
+                self.sum_float += *f;
+                self.numeric_count += 1;
             }
+            Value::Float(_) => {}
             _ => {}
         }
 

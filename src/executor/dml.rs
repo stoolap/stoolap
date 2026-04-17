@@ -1561,8 +1561,8 @@ impl Executor {
             let col_map = schema.column_index_map();
             let updated_col_indices: Vec<usize> = stmt
                 .updates
-                .iter()
-                .filter_map(|(col_name, _)| {
+                .keys()
+                .filter_map(|col_name| {
                     let col_lower = col_name.to_lowercase();
                     col_map.get(col_lower.as_str()).copied()
                 })

@@ -688,11 +688,10 @@ fn test_crash_soak_multi_table() {
                 .unwrap();
 
             let seed = cycle * 9973 + 2741;
-            let mut order_id = 1i64;
             let mut item_id = 1i64;
 
             let order_count = 20 + (seed % 80) as i64;
-            for i in 0..order_count {
+            for (order_id, i) in (1i64..).zip(0..order_count) {
                 let op_seed = seed.wrapping_mul(53).wrapping_add(i as u64);
                 let customer = (op_seed % 10) as i64 + 1;
                 let amount = (op_seed % 1000) as i64;
@@ -718,7 +717,6 @@ fn test_crash_soak_multi_table() {
                     .unwrap();
                     item_id += 1;
                 }
-                order_id += 1;
             }
 
             db.close().unwrap();

@@ -169,10 +169,8 @@ impl Executor {
                         }
                     } else {
                         let right_rows = Self::materialize_result(right_result)?;
-                        let mut row_id = result_rows.len() as i64;
-                        for (_, row) in right_rows {
+                        for (row_id, (_, row)) in (result_rows.len() as i64..).zip(right_rows) {
                             result_rows.push((row_id, row));
-                            row_id += 1;
                         }
                     }
                 }

@@ -92,69 +92,52 @@ impl JoinType {
         // Fast path: check first byte to avoid scanning entire string
         let bytes = s.as_bytes();
         for (i, &b) in bytes.iter().enumerate() {
+            // Case-insensitive byte matching: ASCII letters | 32 lowercases.
+            // Each arm is gated by a guard so clippy's collapsible_match is satisfied.
             match b | 32 {
-                // Case-insensitive: 'L' | 32 = 'l'
-                b'l' => {
-                    // Check for "left" (4 chars)
-                    if i + 4 <= bytes.len()
-                        && (bytes[i + 1] | 32) == b'e'
-                        && (bytes[i + 2] | 32) == b'f'
-                        && (bytes[i + 3] | 32) == b't'
-                    {
-                        return JoinType::Left;
-                    }
+                b'l' if i + 4 <= bytes.len()
+                    && (bytes[i + 1] | 32) == b'e'
+                    && (bytes[i + 2] | 32) == b'f'
+                    && (bytes[i + 3] | 32) == b't' =>
+                {
+                    return JoinType::Left;
                 }
-                b'r' => {
-                    // Check for "right" (5 chars)
-                    if i + 5 <= bytes.len()
-                        && (bytes[i + 1] | 32) == b'i'
-                        && (bytes[i + 2] | 32) == b'g'
-                        && (bytes[i + 3] | 32) == b'h'
-                        && (bytes[i + 4] | 32) == b't'
-                    {
-                        return JoinType::Right;
-                    }
+                b'r' if i + 5 <= bytes.len()
+                    && (bytes[i + 1] | 32) == b'i'
+                    && (bytes[i + 2] | 32) == b'g'
+                    && (bytes[i + 3] | 32) == b'h'
+                    && (bytes[i + 4] | 32) == b't' =>
+                {
+                    return JoinType::Right;
                 }
-                b'f' => {
-                    // Check for "full" (4 chars)
-                    if i + 4 <= bytes.len()
-                        && (bytes[i + 1] | 32) == b'u'
-                        && (bytes[i + 2] | 32) == b'l'
-                        && (bytes[i + 3] | 32) == b'l'
-                    {
-                        return JoinType::Full;
-                    }
+                b'f' if i + 4 <= bytes.len()
+                    && (bytes[i + 1] | 32) == b'u'
+                    && (bytes[i + 2] | 32) == b'l'
+                    && (bytes[i + 3] | 32) == b'l' =>
+                {
+                    return JoinType::Full;
                 }
-                b'c' => {
-                    // Check for "cross" (5 chars)
-                    if i + 5 <= bytes.len()
-                        && (bytes[i + 1] | 32) == b'r'
-                        && (bytes[i + 2] | 32) == b'o'
-                        && (bytes[i + 3] | 32) == b's'
-                        && (bytes[i + 4] | 32) == b's'
-                    {
-                        return JoinType::Cross;
-                    }
+                b'c' if i + 5 <= bytes.len()
+                    && (bytes[i + 1] | 32) == b'r'
+                    && (bytes[i + 2] | 32) == b'o'
+                    && (bytes[i + 3] | 32) == b's'
+                    && (bytes[i + 4] | 32) == b's' =>
+                {
+                    return JoinType::Cross;
                 }
-                b's' => {
-                    // Check for "semi" (4 chars)
-                    if i + 4 <= bytes.len()
-                        && (bytes[i + 1] | 32) == b'e'
-                        && (bytes[i + 2] | 32) == b'm'
-                        && (bytes[i + 3] | 32) == b'i'
-                    {
-                        return JoinType::Semi;
-                    }
+                b's' if i + 4 <= bytes.len()
+                    && (bytes[i + 1] | 32) == b'e'
+                    && (bytes[i + 2] | 32) == b'm'
+                    && (bytes[i + 3] | 32) == b'i' =>
+                {
+                    return JoinType::Semi;
                 }
-                b'a' => {
-                    // Check for "anti" (4 chars)
-                    if i + 4 <= bytes.len()
-                        && (bytes[i + 1] | 32) == b'n'
-                        && (bytes[i + 2] | 32) == b't'
-                        && (bytes[i + 3] | 32) == b'i'
-                    {
-                        return JoinType::Anti;
-                    }
+                b'a' if i + 4 <= bytes.len()
+                    && (bytes[i + 1] | 32) == b'n'
+                    && (bytes[i + 2] | 32) == b't'
+                    && (bytes[i + 3] | 32) == b'i' =>
+                {
+                    return JoinType::Anti;
                 }
                 _ => {}
             }

@@ -178,11 +178,7 @@ impl Executor {
 
         // Calculate average row size
         let total_size: usize = rows.iter().map(|r| self.estimate_row_size(r)).sum();
-        let avg_row_size = if actual_row_count > 0 {
-            total_size / actual_row_count
-        } else {
-            0
-        };
+        let avg_row_size = total_size.checked_div(actual_row_count).unwrap_or(0);
 
         // Estimate page count (assuming 8KB pages)
         let page_count = (total_size / 8192).max(1);

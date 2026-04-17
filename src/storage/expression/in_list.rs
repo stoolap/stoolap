@@ -157,14 +157,13 @@ impl InListExpr {
                         Value::Integer(i) => {
                             set.insert(*i);
                         }
-                        Value::Float(f) => {
-                            // Only include if it's a whole number
-                            if f.fract() == 0.0 {
-                                set.insert(*f as i64);
-                            } else {
-                                all_int = false;
-                                break;
-                            }
+                        // Only include floats if they are whole numbers.
+                        Value::Float(f) if f.fract() == 0.0 => {
+                            set.insert(*f as i64);
+                        }
+                        Value::Float(_) => {
+                            all_int = false;
+                            break;
                         }
                         Value::Null(_) => {} // Skip nulls
                         _ => {

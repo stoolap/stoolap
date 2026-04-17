@@ -3797,10 +3797,7 @@ impl Executor {
 
         // Convert groups to Vec for parallel processing
         // Flatten buckets: each bucket may contain multiple groups (hash collisions)
-        let groups_vec: Vec<GroupEntry> = groups
-            .into_iter()
-            .flat_map(|(_hash, bucket)| bucket)
-            .collect();
+        let groups_vec: Vec<GroupEntry> = groups.into_values().flatten().collect();
 
         // Pre-compile aggregate filter and expression programs for VM-based evaluation
         // CRITICAL: Propagate errors instead of silently ignoring compilation failures
@@ -6980,15 +6977,14 @@ impl Executor {
                             0 => aliased.alias.value.to_string(),
                             1 => match &func.arguments[0] {
                                 Expression::Star(_) => aliased.alias.value.to_string(),
-                                Expression::IntegerLiteral(lit) => {
-                                    if lit.value == 1 {
-                                        aliased.alias.value.to_string()
-                                    } else {
-                                        *compiled_guard = CompiledExecution::NotOptimizable(
-                                            self.engine.schema_epoch(),
-                                        );
-                                        return None;
-                                    }
+                                Expression::IntegerLiteral(lit) if lit.value == 1 => {
+                                    aliased.alias.value.to_string()
+                                }
+                                Expression::IntegerLiteral(_) => {
+                                    *compiled_guard = CompiledExecution::NotOptimizable(
+                                        self.engine.schema_epoch(),
+                                    );
+                                    return None;
                                 }
                                 _ => {
                                     *compiled_guard = CompiledExecution::NotOptimizable(
