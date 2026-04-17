@@ -216,13 +216,14 @@ impl Executor {
             indexes.keys().cloned().collect::<Vec<_>>()
         };
 
-        // Build rows with: table_name, index_name, column_name, index_type, is_unique
+        // Build rows with: table_name, index_name, column_name, index_type, is_unique, options
         let columns = vec![
             "table_name".to_string(),
             "index_name".to_string(),
             "column_name".to_string(),
             "index_type".to_string(),
             "is_unique".to_string(),
+            "options".to_string(),
         ];
 
         let mut rows = RowVec::with_capacity(index_names.len());
@@ -243,6 +244,21 @@ impl Executor {
                 let is_unique = index.is_unique();
                 let index_type = index.index_type().as_str().to_uppercase();
 
+                // Build options string for HNSW indexes
+                let options = if index_type == "HNSW" {
+                    let metric = match index.hnsw_distance_metric() {
+                        Some(0) => "l2",
+                        Some(1) => "cosine",
+                        Some(2) => "ip",
+                        _ => "cosine",
+                    };
+                    let m = index.hnsw_m().unwrap_or(16);
+                    let ef = index.hnsw_ef_construction().unwrap_or(200);
+                    format!("metric={}, m={}, ef_construction={}", metric, m, ef)
+                } else {
+                    String::new()
+                };
+
                 rows.push((
                     row_id,
                     Row::from_values(vec![
@@ -251,6 +267,7 @@ impl Executor {
                         Value::Text(SmartString::from_string(column_name)),
                         Value::Text(SmartString::from_string(index_type)),
                         Value::Boolean(is_unique),
+                        Value::Text(SmartString::from_string(options)),
                     ]),
                 ));
                 row_id += 1;
