@@ -20,7 +20,7 @@
 use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Error, Result, Row, Schema, Value};
 use crate::parser::ast::{CopyFormat, CopyStatement};
-use crate::storage::traits::{Engine, QueryResult, WriteTable};
+use crate::storage::traits::{Engine, QueryResult, Table};
 
 use super::context::{
     invalidate_in_subquery_cache_for_table, invalidate_scalar_subquery_cache_for_table,
@@ -127,7 +127,7 @@ impl Executor {
         }
 
         // Create a standalone auto-commit transaction
-        let mut tx = self.engine.begin_writable_transaction_internal()?;
+        let mut tx = self.engine.begin_transaction()?;
         let mut table = tx.get_table(table_name)?;
 
         // Pre-compute schema information
@@ -235,7 +235,7 @@ impl Executor {
     fn copy_from_csv(
         &self,
         stmt: &CopyStatement,
-        table: &mut Box<dyn WriteTable>,
+        table: &mut Box<dyn Table>,
         column_indices: &[usize],
         column_names: &[String],
         all_column_types: &[DataType],
@@ -354,7 +354,7 @@ impl Executor {
     fn copy_from_json(
         &self,
         stmt: &CopyStatement,
-        table: &mut Box<dyn WriteTable>,
+        table: &mut Box<dyn Table>,
         column_indices: &[usize],
         column_types: &[DataType],
         column_names: &[String],
@@ -433,7 +433,7 @@ impl Executor {
     fn insert_json_row(
         &self,
         obj: &serde_json::Map<String, serde_json::Value>,
-        table: &mut Box<dyn WriteTable>,
+        table: &mut Box<dyn Table>,
         default_row: &[Value],
         col_name_lower_map: &[(String, usize)],
         use_columns: bool,

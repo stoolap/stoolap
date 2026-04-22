@@ -38,7 +38,7 @@ use crate::storage::mvcc::zonemap::TableZoneMap;
 use crate::storage::statistics::{
     Histogram, HistogramOp, TableStats, SYS_COLUMN_STATS, SYS_TABLE_STATS,
 };
-use crate::storage::traits::ReadTable;
+use crate::storage::traits::{Engine, Table, Transaction};
 
 /// Query planner that integrates statistics-based optimization
 pub struct QueryPlanner {
@@ -165,7 +165,7 @@ impl QueryPlanner {
     ///
     /// If ANALYZE hasn't been run, computes basic statistics from the table.
     /// This ensures the optimizer always has some statistics to work with.
-    pub fn get_table_stats_with_fallback(&self, table: &dyn ReadTable) -> TableStats {
+    pub fn get_table_stats_with_fallback(&self, table: &dyn Table) -> TableStats {
         let table_name = table.name();
 
         // Try to get analyzed stats first
@@ -243,14 +243,13 @@ impl QueryPlanner {
 
     /// Get zone maps for a table (from table, not system tables)
     /// Uses Arc to avoid cloning on high QPS workloads
-    pub fn get_zone_maps(&self, table: &dyn ReadTable) -> Option<std::sync::Arc<TableZoneMap>> {
+    pub fn get_zone_maps(&self, table: &dyn Table) -> Option<std::sync::Arc<TableZoneMap>> {
         table.get_zone_maps()
     }
 
     /// Load statistics from system tables
     fn load_stats_from_system_tables(&self, table_name: &str) -> Result<TableStats> {
-        use crate::storage::traits::ReadEngine;
-        let tx = ReadEngine::begin_read_transaction(self.engine.as_ref())?;
+        let tx = self.engine.begin_transaction()?;
 
         // Check if system tables exist
         let tables = tx.list_tables()?;
@@ -312,12 +311,8 @@ impl QueryPlanner {
     ///
     /// Table schema is:
     /// id (0), table_name (1), row_count (2), page_count (3), avg_row_size (4), last_analyzed (5)
-    fn read_table_stats(
-        &self,
-        tx: &dyn crate::storage::traits::ReadTransaction,
-        table_name: &str,
-    ) -> Result<TableStats> {
-        let stats_table = match tx.get_read_table(SYS_TABLE_STATS) {
+    fn read_table_stats(&self, tx: &dyn Transaction, table_name: &str) -> Result<TableStats> {
+        let stats_table = match tx.get_table(SYS_TABLE_STATS) {
             Ok(t) => t,
             Err(_) => return Ok(TableStats::default()),
         };
@@ -350,12 +345,12 @@ impl QueryPlanner {
     /// min_value (5), max_value (6), avg_width (7), histogram (8)
     fn read_column_stats(
         &self,
-        tx: &dyn crate::storage::traits::ReadTransaction,
+        tx: &dyn Transaction,
         table_name: &str,
     ) -> Result<StringMap<ColumnStatsCache>> {
         let mut stats = StringMap::new();
 
-        let stats_table = match tx.get_read_table(SYS_COLUMN_STATS) {
+        let stats_table = match tx.get_table(SYS_COLUMN_STATS) {
             Ok(t) => t,
             Err(_) => return Ok(stats),
         };
@@ -544,7 +539,7 @@ impl QueryPlanner {
     /// This enables early exit optimization for range queries on ordered data.
     pub fn can_prune_entire_scan(
         &self,
-        table: &dyn ReadTable,
+        table: &dyn Table,
         expr: &dyn crate::storage::expression::Expression,
     ) -> bool {
         let zone_maps = match table.get_zone_maps() {

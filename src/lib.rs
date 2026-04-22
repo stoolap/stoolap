@@ -104,29 +104,9 @@ pub use storage::{Config, PersistenceConfig, SyncMode};
 
 // Re-export storage traits
 pub use storage::{
-    EmptyResult, EmptyScanner, Engine, Index, MemoryResult, QueryResult, ReadEngine, ReadTable,
-    ReadTransaction, Scanner, TemporalType, VecScanner, WriteTable, WriteTransaction,
+    EmptyResult, EmptyScanner, Engine, Index, MemoryResult, QueryResult, Scanner, Table,
+    TemporalType, Transaction, VecScanner,
 };
-
-// Backwards-compatibility aliases at the crate root for the trait names that
-// existed before the read/write split. Code using `use stoolap::{Table,
-// Transaction};` continues to compile against the writable surface (the
-// conservative choice — old code that called write methods keeps working).
-// New code should prefer the explicit `WriteTable` / `WriteTransaction` (or
-// `ReadTable` / `ReadTransaction` for read-only paths). Mirrors the aliases
-// in `stoolap::storage`.
-#[allow(deprecated)]
-#[deprecated(
-    since = "0.4.0",
-    note = "Renamed to `WriteTable`. For read-only access prefer `ReadTable`."
-)]
-pub use storage::Table;
-#[allow(deprecated)]
-#[deprecated(
-    since = "0.4.0",
-    note = "Renamed to `WriteTransaction`. For read-only access prefer `ReadTransaction`."
-)]
-pub use storage::Transaction;
 
 // Re-export MVCC types
 pub use storage::{
@@ -172,8 +152,8 @@ pub use executor::{
 
 // Re-export API types
 pub use api::{
-    Database, FromRow, FromValue, NamedParams, ParamVec, Params, ReadOnlyDatabase, ResultRow, Rows,
-    Statement, ToParam, Transaction as ApiTransaction,
+    Database, FromRow, FromValue, NamedParams, ParamVec, Params, ResultRow, Rows, Statement,
+    ToParam, Transaction as ApiTransaction,
 };
 
 #[cfg(any(test, feature = "test-failpoints"))]

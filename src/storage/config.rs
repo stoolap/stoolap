@@ -312,20 +312,6 @@ pub struct Config {
 
     /// Configuration for background cleanup operations
     pub cleanup: CleanupConfig,
-
-    /// If true, the engine opens in read-only mode:
-    /// - Acquires the file lock in shared mode (multiple readers coexist,
-    ///   but a writer cannot open while readers are active)
-    /// - Skips background checkpoint thread (no WAL truncation, no
-    ///   sealing, no compaction)
-    /// - Does not write to WAL on commit (read-only transactions have
-    ///   nothing to write)
-    ///
-    /// Read-only callers should NOT set this directly via `Database::open`.
-    /// Use `Database::open_read_only(dsn)` which constructs a Config with
-    /// this flag set and returns a `ReadOnlyDatabase` handle whose API
-    /// surface refuses write SQL via the parser-level gate.
-    pub(crate) read_only: bool,
 }
 
 impl Config {
@@ -338,7 +324,6 @@ impl Config {
                 ..Default::default()
             },
             cleanup: CleanupConfig::default(),
-            read_only: false,
         }
     }
 
@@ -348,7 +333,6 @@ impl Config {
             path: Some(path.into()),
             persistence: PersistenceConfig::default(),
             cleanup: CleanupConfig::default(),
-            read_only: false,
         }
     }
 

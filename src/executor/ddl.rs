@@ -408,7 +408,7 @@ impl Executor {
                 || !table_unique_constraints.is_empty()
                 || !fk_index_columns.is_empty();
             if needs_indexes {
-                let tx = self.engine.begin_writable_transaction_internal()?;
+                let tx = self.engine.begin_transaction()?;
                 let table = tx.get_table(table_name)?;
 
                 for col_name in &unique_columns {
@@ -536,7 +536,7 @@ impl Executor {
         // Insert the rows into the new table
         let rows_count = rows.len();
         if !rows.is_empty() {
-            let mut tx = self.engine.begin_writable_transaction_internal()?;
+            let mut tx = self.engine.begin_transaction()?;
             let mut table = tx.get_table(table_name)?;
 
             for row in rows {
@@ -643,7 +643,7 @@ impl Executor {
         let is_unique = stmt.is_unique;
 
         // Get table to validate columns exist
-        let tx = self.engine.begin_writable_transaction_internal()?;
+        let tx = self.engine.begin_transaction()?;
         let table = tx.get_table(table_name)?;
         let schema = table.schema();
 
@@ -880,7 +880,7 @@ impl Executor {
         self.engine.record_drop_index(&table_name, index_name)?;
 
         // Now apply the in-memory change
-        let tx = self.engine.begin_writable_transaction_internal()?;
+        let tx = self.engine.begin_transaction()?;
         let table = tx.get_table(&table_name)?;
         table.drop_index(index_name)?;
 
@@ -901,7 +901,7 @@ impl Executor {
         }
 
         // Get the table for modifications
-        let mut tx = self.engine.begin_writable_transaction_internal()?;
+        let mut tx = self.engine.begin_transaction()?;
         let mut table = tx.get_table(table_name)?;
 
         // Process the single ALTER TABLE operation

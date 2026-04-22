@@ -303,25 +303,6 @@ pub enum Error {
     /// Query cancelled
     #[error("query cancelled")]
     QueryCancelled,
-
-    /// Write operation rejected on a read-only database handle
-    #[error("read-only database handle does not permit {0}")]
-    ReadOnlyViolation(String),
-}
-
-/// Mask the query-string portion of a DSN before embedding it in an error
-/// message. Today no DSN query parameter contains secrets, but if a future
-/// flag does (e.g. `?password=...` for an authenticated remote DSN), the
-/// raw DSN appearing in error logs would leak it. Replacing the query
-/// portion with `?***` keeps the scheme + path visible (which is what
-/// operators need to identify the database) while preventing accidental
-/// secret disclosure. Pure-`memory://` and parameterless `file://` DSNs
-/// pass through unchanged.
-pub(crate) fn mask_dsn_query(dsn: &str) -> std::borrow::Cow<'_, str> {
-    match dsn.find('?') {
-        Some(idx) => std::borrow::Cow::Owned(format!("{}?***", &dsn[..idx])),
-        None => std::borrow::Cow::Borrowed(dsn),
-    }
 }
 
 impl Error {
@@ -419,54 +400,6 @@ impl Error {
     /// Create a new InvalidArgument error
     pub fn invalid_argument(message: impl Into<String>) -> Self {
         Error::InvalidArgument(message.into())
-    }
-
-    /// Build a `ReadOnlyViolation` with the canonical message format.
-    ///
-    /// The format is `"<layer>: <op> rejected on read-only handle"`. All
-    /// layers (parser write_reason gate, executor begin_transaction gate,
-    /// MVCCEngine inherent-method gate, Database forwarder gate, and the
-    /// prepare/cached_plan early refusal) construct their errors via
-    /// this helper so logs / grep / monitoring can pattern-match a
-    /// single shape.
-    ///
-    /// `layer` is a stable identifier for where the gate fired
-    /// ("parser", "executor", "engine", "database").
-    /// `op` is the SQL keyword or method name being rejected
-    /// ("INSERT", "BEGIN", "create_snapshot", "vacuum", ...).
-    pub fn read_only_violation_at(layer: &str, op: &str) -> Self {
-        Error::ReadOnlyViolation(format!("{}: {} rejected on read-only handle", layer, op))
-    }
-
-    /// Build a `ReadOnlyViolation` for the registry mode-mismatch case at
-    /// `Database::open`.
-    ///
-    /// Distinct from `read_only_violation_at` because this is a "wrong
-    /// mode for this DSN" condition, not a "rejected on read-only handle"
-    /// condition. The caller can drop the existing handle and retry. The
-    /// canonical shape is
-    /// `"registry: cannot open '<dsn>' as <requested> while it is already
-    ///   open as <cached>"` so logs / grep can pattern-match a stable
-    /// prefix.
-    pub fn read_only_mode_mismatch(dsn: &str, cached_ro: bool, requested_ro: bool) -> Self {
-        let mode = |ro: bool| if ro { "read-only" } else { "writable" };
-        Error::ReadOnlyViolation(format!(
-            "registry: cannot open '{}' as {} while it is already open as {}",
-            mask_dsn_query(dsn),
-            mode(requested_ro),
-            mode(cached_ro)
-        ))
-    }
-
-    /// Returns `true` if this error is a `ReadOnlyViolation` (write
-    /// rejected because the handle / engine / mount is read-only, or a
-    /// registry mode-mismatch).
-    ///
-    /// Useful for callers writing retry / fallback logic that wants to
-    /// avoid pattern-matching the variant directly. Pattern matching
-    /// still works; this is purely an ergonomics helper.
-    pub fn is_read_only_violation(&self) -> bool {
-        matches!(self, Error::ReadOnlyViolation(_))
     }
 
     /// Check if this is a "not found" type error

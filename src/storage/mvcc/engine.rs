@@ -53,9 +53,7 @@ use crate::storage::mvcc::{
     TransactionEngineOperations, TransactionRegistry, TransactionVersionStore, VersionStore,
     INVALID_TRANSACTION_ID,
 };
-use crate::storage::traits::{
-    Engine, Index, ReadEngine, ReadTable, ReadTransaction, WriteTable, WriteTransaction,
-};
+use crate::storage::traits::{Engine, Index, Table, Transaction};
 
 /// Type alias for a single table entry in the transaction version store
 type TxnTableEntry = (SmartString, Arc<RwLock<TransactionVersionStore>>);
@@ -466,11 +464,6 @@ pub struct MVCCEngine {
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
     compaction_running: Arc<AtomicBool>,
-    /// Recorded persistence-init failure on a read-only open. Surfaced
-    /// from `open_engine()` as a hard error instead of silently coming
-    /// up with an empty in-memory engine. Always `None` for writable
-    /// opens (those preserve the historical warn-and-degrade behaviour).
-    persistence_init_error: Mutex<Option<Error>>,
     /// Global epoch counter for volume eviction. Incremented each checkpoint
     /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
     #[cfg(not(target_arch = "wasm32"))]
@@ -496,37 +489,17 @@ fn parse_volume_id(path: &std::path::Path) -> Option<u64> {
 }
 
 impl MVCCEngine {
-    /// Creates a new MVCC engine with the given configuration.
-    ///
-    /// Persistence init failures are recorded on the engine and surfaced
-    /// from `open_engine()` when the engine was opened read-only. For
-    /// writable opens the historical "warn and fall back to in-memory"
-    /// behaviour is preserved (changing it would silently break callers
-    /// that rely on degraded operation when the data dir is temporarily
-    /// unavailable). For read-only opens silent degradation is
-    /// catastrophic — a `Connected to database` followed by
-    /// `table not found` against an unintentionally-empty engine — so
-    /// the failure is fatal.
+    /// Creates a new MVCC engine with the given configuration
     pub fn new(config: Config) -> Self {
         let path = config.path.clone().unwrap_or_default();
-        let read_only = config.read_only;
 
         // Initialize persistence manager if path is provided and persistence is enabled
-        let mut persistence_init_error: Option<Error> = None;
         let persistence = if !path.is_empty() && config.persistence.enabled {
-            match PersistenceManager::new(Some(Path::new(&path)), &config.persistence, read_only) {
+            match PersistenceManager::new(Some(Path::new(&path)), &config.persistence) {
                 Ok(pm) => Some(pm),
                 Err(e) => {
-                    if read_only {
-                        // Hold the error; surface it from open_engine so
-                        // the caller sees a Result<()> failure rather than
-                        // a silently-empty engine.
-                        persistence_init_error = Some(e);
-                        None
-                    } else {
-                        eprintln!("Warning: Failed to initialize persistence: {}", e);
-                        None
-                    }
+                    eprintln!("Warning: Failed to initialize persistence: {}", e);
+                    None
                 }
             }
         } else {
@@ -558,7 +531,6 @@ impl MVCCEngine {
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
             compaction_running: Arc::new(AtomicBool::new(false)),
-            persistence_init_error: Mutex::new(persistence_init_error),
             #[cfg(not(target_arch = "wasm32"))]
             eviction_epoch: AtomicU64::new(0),
         }
@@ -576,28 +548,9 @@ impl MVCCEngine {
             return Ok(()); // Already open
         }
 
-        // Surface a deferred persistence-init failure recorded by `new()`.
-        // For read-only opens, persistence init failure is fatal: silent
-        // fallback to an in-memory engine would let the caller see a
-        // "successful" open against a completely empty engine and only
-        // discover the missing data later via `table not found`.
-        if let Some(err) = self.persistence_init_error.lock().unwrap().take() {
-            // Reset the open flag since we're failing.
-            self.open.store(false, Ordering::Release);
-            return Err(err);
-        }
-
-        // Acquire file lock for disk-based databases to prevent concurrent access.
-        // Read-only engines acquire a SHARED lock so multiple readers can coexist
-        // (and so we don't contend with another writer that holds the exclusive
-        // lock). Writers always take exclusive.
+        // Acquire file lock for disk-based databases to prevent concurrent access
         if self.path != "memory://" {
-            let read_only = self.config.read().unwrap().read_only;
-            let lock = if read_only {
-                FileLock::acquire_shared(&self.path)?
-            } else {
-                FileLock::acquire(&self.path)?
-            };
+            let lock = FileLock::acquire(&self.path)?;
             let mut file_lock = self.file_lock.lock().unwrap();
             *file_lock = Some(lock);
         }
@@ -690,19 +643,9 @@ impl MVCCEngine {
                 // generated row_id doesn't collide with cold rows.
                 self.sync_auto_increment_from_segments();
 
-                // Migration and post-recovery seal both write to disk
-                // (sealed volumes, manifest updates, snapshots/ removal).
-                // Read-only engines must not perform any of this — a
-                // shared-lock reader cannot be allowed to mutate the
-                // on-disk layout. The hot rows from WAL replay stay in
-                // memory; queries will pay O(hot_size) until the next
-                // writer checkpoints, which is the correct trade-off
-                // for a reader.
-                let read_only = self.is_read_only_mode();
-
                 // Migration: if we loaded from legacy snapshots, seal all data
                 // into volumes and remove the old snapshots/ directory.
-                if has_legacy_snapshots && !read_only {
+                if has_legacy_snapshots {
                     // Clear loading flag temporarily so checkpoint can write WAL
                     self.loading_from_disk.store(false, Ordering::Release);
 
@@ -743,11 +686,7 @@ impl MVCCEngine {
                 // the first background checkpoint fires (up to 60s later).
                 // Sealing here drains the hot buffer while no concurrent reads
                 // exist, so there's no seal_overlap performance impact.
-                //
-                // Skipped on read-only engines: sealing writes new volume
-                // files and persists manifests, which a shared-lock reader
-                // is not permitted to do.
-                if !read_only {
+                {
                     self.loading_from_disk.store(false, Ordering::Release);
                     let has_hot_rows = {
                         let stores = self.version_stores.read().unwrap();
@@ -799,13 +738,6 @@ impl MVCCEngine {
     pub fn start_cleanup(self: &Arc<Self>) {
         let config = self.config.read().unwrap();
         if !config.cleanup.enabled {
-            return;
-        }
-        // Read-only engines have no DML and no checkpoint work; skip the
-        // background cleanup thread entirely. Saves a thread per
-        // ReadOnlyDatabase open and avoids any cleanup-related write
-        // attempts on a read-only file lock.
-        if config.read_only {
             return;
         }
 
@@ -2113,11 +2045,8 @@ impl MVCCEngine {
         // Run a final checkpoint to seal ALL remaining hot rows into volumes.
         // Use force_seal=true to bypass thresholds — on close, we want all data
         // in volumes so startup is fast and doesn't depend on WAL replay.
-        // Skipped when checkpoint_on_close is false (crash simulation in tests),
-        // and ALWAYS skipped on read-only engines (no DML to seal, no WAL to
-        // truncate, and the shared file lock doesn't permit writes anyway).
-        let checkpoint_on_close = self.config.read().unwrap().persistence.checkpoint_on_close
-            && !self.is_read_only_mode();
+        // Skipped when checkpoint_on_close is false (crash simulation in tests).
+        let checkpoint_on_close = self.config.read().unwrap().persistence.checkpoint_on_close;
         if checkpoint_on_close {
             if let Some(ref pm) = *self.persistence {
                 if pm.is_enabled() {
@@ -2185,47 +2114,6 @@ impl MVCCEngine {
         self.open.load(Ordering::Acquire)
     }
 
-    /// Returns true if this engine was opened in read-only mode.
-    ///
-    /// Used by `Database::open` to refuse to share an existing read-only
-    /// engine as a writable handle (which would bypass `ReadOnlyDatabase`'s
-    /// gates), and by `MVCCEngine::begin_transaction` as defense-in-depth
-    /// against any caller obtaining a `Box<dyn WriteTransaction>` from an
-    /// engine that was never meant to write.
-    pub fn is_read_only_mode(&self) -> bool {
-        self.config.read().unwrap().read_only
-    }
-
-    /// Defense-in-depth gate for write-intent inherent methods on
-    /// `MVCCEngine` reachable through `Database::engine()`.
-    ///
-    /// Public methods like `create_table`, `drop_table_internal`,
-    /// `create_view`, `update_engine_config`, `vacuum`, etc. would
-    /// otherwise let an external caller mutate engine state on a
-    /// `?read_only=true` `Database` even though the SQL surface and the
-    /// `Engine::begin_transaction` trait method are gated. Calling this
-    /// helper at the top of each write-intent method closes that back
-    /// door without disrupting internal callers (which all go through the
-    /// executor's read-only check at the SQL surface, so they never
-    /// reach here on a read-only engine in the first place — the gate
-    /// fires only when the call originates from outside the executor).
-    ///
-    /// `#[track_caller]` captures the call-site `file:line` automatically,
-    /// so the error message identifies which method tripped the gate
-    /// without callers having to pass a method-name string. Avoids the
-    /// drift risk of hand-maintained per-method labels.
-    #[track_caller]
-    fn ensure_writable(&self) -> Result<()> {
-        if self.is_read_only_mode() {
-            let loc = std::panic::Location::caller();
-            return Err(Error::read_only_violation_at(
-                "engine",
-                &format!("{}:{}", loc.file(), loc.line()),
-            ));
-        }
-        Ok(())
-    }
-
     /// Per-table, per-volume statistics for PRAGMA VOLUME_STATS.
     /// Returns (table_name, segment_id, tier, row_count, memory_bytes, idle_cycles, tombstones).
     pub fn volume_stats(&self) -> Vec<(String, u64, &'static str, usize, usize, u64, usize)> {
@@ -2264,7 +2152,6 @@ impl MVCCEngine {
 
     /// Updates the engine configuration
     pub fn update_engine_config(&self, config: Config) -> Result<()> {
-        self.ensure_writable()?;
         let current = self.config.read().unwrap();
         if config.path != current.path {
             return Err(Error::internal("cannot change database path after opening"));
@@ -2550,7 +2437,7 @@ impl MVCCEngine {
     }
 
     /// Serialize a schema to binary format for WAL
-    pub(crate) fn serialize_schema(schema: &Schema) -> Vec<u8> {
+    pub fn serialize_schema(schema: &Schema) -> Vec<u8> {
         let mut buf = Vec::new();
 
         // Table name
@@ -2635,14 +2522,24 @@ impl MVCCEngine {
         buf
     }
 
+    /// Returns all table names (lowercase) currently in the engine
+    pub fn get_all_table_names(&self) -> Vec<String> {
+        self.schemas.read().unwrap().keys().cloned().collect()
+    }
+
+    /// Returns all schemas currently in the engine (CompactArc ref-count bump only)
+    pub fn get_all_schemas(&self) -> Vec<crate::common::CompactArc<Schema>> {
+        self.schemas.read().unwrap().values().cloned().collect()
+    }
+
     /// Get a table handle for an existing transaction by txn_id.
     /// This allows FK enforcement to participate in the caller's transaction,
     /// ensuring CASCADE effects are atomic and uncommitted rows are visible.
-    pub(crate) fn get_table_for_txn(
+    pub fn get_table_for_txn(
         &self,
         txn_id: i64,
         table_name: &str,
-    ) -> Result<Box<dyn crate::storage::traits::WriteTable>> {
+    ) -> Result<Box<dyn crate::storage::traits::Table>> {
         EngineOperations::new(self).get_table_for_transaction(txn_id, table_name)
     }
 
@@ -2650,7 +2547,7 @@ impl MVCCEngine {
     /// Uses a cached reverse mapping that is rebuilt only when schema_epoch changes.
     /// Returns Arc-wrapped Vec for zero-copy sharing (ref-count bump only).
     /// Zero cost for databases without FK constraints.
-    pub(crate) fn find_referencing_fks(
+    pub fn find_referencing_fks(
         &self,
         parent_table: &str,
     ) -> Arc<Vec<(String, ForeignKeyConstraint)>> {
@@ -2706,7 +2603,6 @@ impl MVCCEngine {
 
     /// Creates a new table
     pub fn create_table(&self, schema: Schema) -> Result<Schema> {
-        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2758,7 +2654,6 @@ impl MVCCEngine {
 
     /// Drops a table
     pub fn drop_table_internal(&self, name: &str) -> Result<()> {
-        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2817,7 +2712,7 @@ impl MVCCEngine {
     }
 
     /// Gets a version store for a table
-    pub(crate) fn get_version_store(&self, name: &str) -> Result<Arc<VersionStore>> {
+    pub fn get_version_store(&self, name: &str) -> Result<Arc<VersionStore>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2839,7 +2734,6 @@ impl MVCCEngine {
         data_type: DataType,
         nullable: bool,
     ) -> Result<()> {
-        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2905,7 +2799,6 @@ impl MVCCEngine {
         default_expr: Option<String>,
         vector_dimensions: u16,
     ) -> Result<()> {
-        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2965,7 +2858,7 @@ impl MVCCEngine {
 
     /// Refresh the engine's schema cache for a table from the version store
     /// This is used after DDL operations that modify the table's schema directly
-    pub(crate) fn refresh_schema_cache(&self, table_name: &str) -> Result<()> {
+    pub fn refresh_schema_cache(&self, table_name: &str) -> Result<()> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3420,7 +3313,6 @@ impl MVCCEngine {
 
     /// Drops a column from a table
     pub fn drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
-        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3478,7 +3370,6 @@ impl MVCCEngine {
 
     /// Renames a column in a table
     pub fn rename_column(&self, table_name: &str, old_name: &str, new_name: &str) -> Result<()> {
-        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3540,7 +3431,7 @@ impl MVCCEngine {
     }
 
     /// Record a column drop so old cold volumes don't leak stale data.
-    pub(crate) fn propagate_column_drop(&self, table_name: &str, col_name: &str) {
+    pub fn propagate_column_drop(&self, table_name: &str, col_name: &str) {
         let table_name_lower = table_name.to_lowercase();
         let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
         let current_epoch = self.schema_epoch.load(Ordering::Acquire);
@@ -3554,7 +3445,7 @@ impl MVCCEngine {
 
     /// Record a column rename and propagate alias to all cold volumes.
     /// Persists in the manifest so aliases survive restart.
-    pub(crate) fn propagate_column_alias(&self, table_name: &str, new_name: &str, old_name: &str) {
+    pub fn propagate_column_alias(&self, table_name: &str, new_name: &str, old_name: &str) {
         let table_name_lower = table_name.to_lowercase();
         let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
         if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
@@ -3573,7 +3464,6 @@ impl MVCCEngine {
         data_type: DataType,
         nullable: bool,
     ) -> Result<()> {
-        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3626,7 +3516,7 @@ impl MVCCEngine {
 
     /// Modifies a column's type, nullable, and vector dimensions
     /// Used by WAL replay to restore ALTER TABLE MODIFY COLUMN with full dimension info
-    pub(crate) fn modify_column_with_dimensions(
+    pub fn modify_column_with_dimensions(
         &self,
         table_name: &str,
         column_name: &str,
@@ -3687,7 +3577,6 @@ impl MVCCEngine {
 
     /// Renames a table
     pub fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
-        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3835,7 +3724,6 @@ impl MVCCEngine {
     pub fn create_view(&self, name: &str, query: String, if_not_exists: bool) -> Result<()> {
         use crate::storage::mvcc::wal_manager::WALOperationType;
 
-        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3882,7 +3770,6 @@ impl MVCCEngine {
     pub fn drop_view(&self, name: &str, if_exists: bool) -> Result<()> {
         use crate::storage::mvcc::wal_manager::WALOperationType;
 
-        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6026,54 +5913,20 @@ impl MVCCEngine {
     }
 }
 
-impl ReadEngine for MVCCEngine {
-    fn begin_read_transaction(&self) -> Result<Box<dyn ReadTransaction>> {
-        // Writable transaction satisfies the read trait via the
-        // WriteTransaction: ReadTransaction supertrait. The caller
-        // sees only the read surface through the trait object.
-        //
-        // Read-only engines must still serve read transactions, but the
-        // public Engine::begin_transaction is gated on `is_read_only_mode`
-        // and would refuse here. Use the internal writable entry point;
-        // the resulting Box<dyn WriteTransaction> is cast to the read
-        // surface via the supertrait.
-        let tx: Box<dyn WriteTransaction> = self.begin_writable_transaction_internal()?;
-        Ok(tx)
+impl Engine for MVCCEngine {
+    fn open(&mut self) -> Result<()> {
+        MVCCEngine::open_engine(self)
     }
 
-    fn begin_read_transaction_with_level(
-        &self,
-        level: IsolationLevel,
-    ) -> Result<Box<dyn ReadTransaction>> {
-        let tx: Box<dyn WriteTransaction> =
-            self.begin_writable_transaction_with_level_internal(level)?;
-        Ok(tx)
-    }
-}
-
-impl MVCCEngine {
-    /// Begin a writable transaction, bypassing the read-only mode gate.
-    ///
-    /// Internal-only entry point for trusted write-intent callers: DML
-    /// (`INSERT`/`UPDATE`/`DELETE`), DDL, COPY, ANALYZE, and the executor's
-    /// public `begin_transaction` (which has already checked the
-    /// `Executor::read_only` flag at its API surface). The verbose name
-    /// is deliberate: any new caller using this method should be
-    /// challenged in code review to confirm the call site really needs
-    /// to write — read-only access should go through
-    /// [`ReadEngine::begin_read_transaction`] instead.
-    ///
-    /// External callers (anyone going through `Engine::begin_transaction`)
-    /// hit the read-only gate in the trait impl below — no escape hatch.
-    pub(crate) fn begin_writable_transaction_internal(&self) -> Result<Box<dyn WriteTransaction>> {
-        self.begin_writable_transaction_with_level_internal(self.get_isolation_level())
+    fn close(&mut self) -> Result<()> {
+        MVCCEngine::close_engine(self)
     }
 
-    /// `begin_writable_transaction_internal` with an explicit isolation level.
-    pub(crate) fn begin_writable_transaction_with_level_internal(
-        &self,
-        level: IsolationLevel,
-    ) -> Result<Box<dyn WriteTransaction>> {
+    fn begin_transaction(&self) -> Result<Box<dyn Transaction>> {
+        self.begin_transaction_with_level(self.get_isolation_level())
+    }
+
+    fn begin_transaction_with_level(&self, level: IsolationLevel) -> Result<Box<dyn Transaction>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6099,37 +5952,6 @@ impl MVCCEngine {
         txn.set_engine_operations(engine_ops);
 
         Ok(Box::new(txn))
-    }
-}
-
-impl Engine for MVCCEngine {
-    fn open(&mut self) -> Result<()> {
-        MVCCEngine::open_engine(self)
-    }
-
-    fn close(&mut self) -> Result<()> {
-        MVCCEngine::close_engine(self)
-    }
-
-    fn begin_transaction(&self) -> Result<Box<dyn WriteTransaction>> {
-        self.begin_transaction_with_level(self.get_isolation_level())
-    }
-
-    fn begin_transaction_with_level(
-        &self,
-        level: IsolationLevel,
-    ) -> Result<Box<dyn WriteTransaction>> {
-        // Read-only gate at the public Engine trait surface. Without this,
-        // `Database::engine().begin_transaction()` on a `?read_only=true`
-        // handle would still return a writable transaction (the engine
-        // would happily mint one), bypassing every other gate. Trusted
-        // internal callers go through
-        // `begin_writable_transaction_with_level_internal` and are not
-        // affected.
-        if self.is_read_only_mode() {
-            return Err(Error::read_only_violation_at("engine", "begin_transaction"));
-        }
-        self.begin_writable_transaction_with_level_internal(level)
     }
 
     fn path(&self) -> Option<&str> {
@@ -6248,33 +6070,20 @@ impl Engine for MVCCEngine {
     }
 
     fn checkpoint_cycle(&self) -> Result<()> {
-        self.ensure_writable()?;
         MVCCEngine::checkpoint_cycle(self)
     }
 
     fn force_checkpoint_cycle(&self) -> Result<()> {
-        self.ensure_writable()?;
         MVCCEngine::checkpoint_cycle_inner(self, true)?;
         self.compact_after_checkpoint_forced();
         Ok(())
     }
 
     fn create_snapshot(&self) -> Result<()> {
-        // Snapshot writes new files to disk. A read-only engine refuses
-        // even though the I/O layer would also fail with EROFS / EACCES —
-        // a clear `ReadOnlyViolation` here beats a confusing late error
-        // and is consistent with how the SQL `PRAGMA SNAPSHOT` is gated
-        // by the parser write-reason classifier.
-        self.ensure_writable()?;
         MVCCEngine::create_backup_snapshot(self)
     }
 
     fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
-        // Restore is destructive: it replaces engine state in-place from
-        // a backup. Refusing on read-only engines is mandatory, not
-        // defense-in-depth — the on-disk replacement bypasses anything
-        // the read-only file-lock contract was supposed to guarantee.
-        self.ensure_writable()?;
         MVCCEngine::restore_from_snapshot(self, timestamp)
     }
 
@@ -6637,14 +6446,9 @@ impl Engine for MVCCEngine {
 // =============================================================================
 
 impl MVCCEngine {
-    /// Cleanup old transactions that have been idle for too long.
-    ///
-    /// Silent no-op on a read-only engine (returns 0). Read-only engines
-    /// have no committed-transaction churn to clean and must not mutate
-    /// the registry. The same `is_read_only_mode` short-circuit applies
-    /// to every `cleanup_*` family method below.
+    /// Cleanup old transactions that have been idle for too long
     pub fn cleanup_old_transactions(&self, max_age: std::time::Duration) -> i32 {
-        if !self.is_open() || self.is_read_only_mode() {
+        if !self.is_open() {
             return 0;
         }
         self.registry.cleanup_old_transactions(max_age)
@@ -6652,7 +6456,7 @@ impl MVCCEngine {
 
     /// Cleanup deleted rows older than retention period from all tables
     pub fn cleanup_deleted_rows(&self, max_age: std::time::Duration) -> i32 {
-        if !self.is_open() || self.is_read_only_mode() {
+        if !self.is_open() {
             return 0;
         }
 
@@ -6668,7 +6472,7 @@ impl MVCCEngine {
 
     /// Cleanup old previous versions that are no longer needed from all tables
     pub fn cleanup_old_previous_versions(&self) -> i32 {
-        if !self.is_open() || self.is_read_only_mode() {
+        if !self.is_open() {
             return 0;
         }
 
@@ -6683,8 +6487,7 @@ impl MVCCEngine {
     }
 
     /// No-op: in the new tombstone design, cold deletes are not tracked
-    /// per-transaction. Kept for API compatibility. Always a no-op,
-    /// regardless of read-only mode.
+    /// per-transaction. Kept for API compatibility.
     pub fn cleanup_abandoned_cold_deletes(&self) {
         // Intentionally empty.
     }
@@ -6706,7 +6509,6 @@ impl MVCCEngine {
         table_name: Option<&str>,
         retention: std::time::Duration,
     ) -> crate::core::Result<(i32, i32, i32)> {
-        self.ensure_writable()?;
         if !self.is_open() {
             return Ok((0, 0, 0));
         }
@@ -6740,11 +6542,6 @@ impl MVCCEngine {
     /// Start periodic cleanup of old transactions and deleted rows
     ///
     /// Returns a handle that can be used to stop the cleanup thread.
-    /// On a read-only engine this is a silent no-op: the returned handle
-    /// has no underlying thread, matching the behaviour of `start_cleanup`
-    /// which also skips the background loop on read-only opens. Callers
-    /// can drop or `stop()` the handle the same way; nothing else
-    /// changes from their perspective.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn start_periodic_cleanup(
         self: &Arc<Self>,
@@ -6755,14 +6552,6 @@ impl MVCCEngine {
         use std::thread;
 
         let stop_flag = Arc::new(AtomicBool::new(false));
-
-        if self.is_read_only_mode() {
-            return CleanupHandle {
-                stop_flag,
-                thread: None,
-            };
-        }
-
         let stop_flag_clone = Arc::clone(&stop_flag);
         let engine = Arc::clone(self);
 
@@ -7095,11 +6884,7 @@ impl EngineOperations {
 }
 
 impl TransactionEngineOperations for EngineOperations {
-    fn get_table_for_transaction(
-        &self,
-        txn_id: i64,
-        table_name: &str,
-    ) -> Result<Box<dyn WriteTable>> {
+    fn get_table_for_transaction(&self, txn_id: i64, table_name: &str) -> Result<Box<dyn Table>> {
         // Use Cow to avoid allocation when table_name is already lowercase (common case)
         let table_name_lower = to_lowercase_cow(table_name);
 
@@ -7182,7 +6967,7 @@ impl TransactionEngineOperations for EngineOperations {
         Ok(Box::new(table))
     }
 
-    fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn WriteTable>> {
+    fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn Table>> {
         let table_name = name.to_lowercase();
 
         // Create version store for this table (before acquiring locks)
@@ -7373,7 +7158,7 @@ impl TransactionEngineOperations for EngineOperations {
         Ok(())
     }
 
-    fn commit_table(&self, txn_id: i64, table: &dyn WriteTable) -> Result<()> {
+    fn commit_table(&self, txn_id: i64, table: &dyn Table) -> Result<()> {
         // Skip WAL writes during recovery replay
         if self.should_skip_wal() {
             return Ok(());
@@ -7412,7 +7197,7 @@ impl TransactionEngineOperations for EngineOperations {
         Ok(())
     }
 
-    fn rollback_table(&self, _txn_id: i64, table: &dyn WriteTable) {
+    fn rollback_table(&self, _txn_id: i64, table: &dyn Table) {
         // The Table trait now has a rollback method.
         // This callback is for any engine-level rollback actions.
         let _ = table;
@@ -7451,7 +7236,7 @@ impl TransactionEngineOperations for EngineOperations {
         Ok(())
     }
 
-    fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn WriteTable>>> {
+    fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn Table>>> {
         let mut tables = Vec::new();
 
         // O(1) lookup for this transaction's tables (hot changes)
@@ -7475,7 +7260,7 @@ impl TransactionEngineOperations for EngineOperations {
                             Arc::clone(txn_store),
                         );
 
-                        tables.push(Box::new(table) as Box<dyn WriteTable>);
+                        tables.push(Box::new(table) as Box<dyn Table>);
                     }
                 }
             }

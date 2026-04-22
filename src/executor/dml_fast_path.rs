@@ -377,7 +377,7 @@ impl Executor {
         updates: Vec<(usize, Value)>,
     ) -> Result<Box<dyn QueryResult>> {
         // Create auto-commit transaction
-        let tx = self.engine.begin_writable_transaction_internal()?;
+        let tx = self.engine.begin_transaction()?;
         let mut table = tx.get_table(table_name)?;
 
         // Build WHERE expression for PK lookup
@@ -425,7 +425,7 @@ impl Executor {
         pk_value: i64,
     ) -> Result<Box<dyn QueryResult>> {
         // Create auto-commit transaction
-        let tx = self.engine.begin_writable_transaction_internal()?;
+        let tx = self.engine.begin_transaction()?;
         let mut table = tx.get_table(table_name)?;
 
         // Build WHERE expression for PK lookup

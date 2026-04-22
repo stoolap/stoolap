@@ -22,9 +22,7 @@ use std::sync::Arc;
 
 use crate::core::{Error, IsolationLevel, Result, Schema, SchemaColumn};
 use crate::storage::mvcc::{get_fast_timestamp, TransactionRegistry};
-use crate::storage::traits::{
-    QueryResult, ReadTable, ReadTransaction, WriteTable, WriteTransaction,
-};
+use crate::storage::traits::{QueryResult, Table, Transaction};
 use crate::storage::Expression;
 
 /// DDL state captured at savepoint creation time.
@@ -66,7 +64,7 @@ pub struct MvccTransaction {
     /// Transaction state
     state: TransactionState,
     /// Tables accessed in this transaction
-    tables: FxHashMap<String, Box<dyn WriteTable>>,
+    tables: FxHashMap<String, Box<dyn Table>>,
     /// Transaction-specific isolation level (if different from engine default)
     isolation_level: Option<IsolationLevel>,
     /// Reference to the transaction registry
@@ -91,14 +89,10 @@ pub struct MvccTransaction {
 /// without creating circular dependencies.
 pub trait TransactionEngineOperations: Send + Sync {
     /// Get a table by name, initializing transaction-local version store
-    fn get_table_for_transaction(
-        &self,
-        txn_id: i64,
-        table_name: &str,
-    ) -> Result<Box<dyn WriteTable>>;
+    fn get_table_for_transaction(&self, txn_id: i64, table_name: &str) -> Result<Box<dyn Table>>;
 
     /// Create a new table
-    fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn WriteTable>>;
+    fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn Table>>;
 
     /// Drop a table
     fn drop_table(&self, name: &str) -> Result<()>;
@@ -110,10 +104,10 @@ pub trait TransactionEngineOperations: Send + Sync {
     fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()>;
 
     /// Commit table changes
-    fn commit_table(&self, txn_id: i64, table: &dyn WriteTable) -> Result<()>;
+    fn commit_table(&self, txn_id: i64, table: &dyn Table) -> Result<()>;
 
     /// Rollback table changes
-    fn rollback_table(&self, txn_id: i64, table: &dyn WriteTable);
+    fn rollback_table(&self, txn_id: i64, table: &dyn Table);
 
     /// Record commit in WAL
     fn record_commit(&self, txn_id: i64) -> Result<()>;
@@ -122,7 +116,7 @@ pub trait TransactionEngineOperations: Send + Sync {
     fn record_rollback(&self, txn_id: i64) -> Result<()>;
 
     /// Get all tables with pending changes for a transaction
-    fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn WriteTable>>>;
+    fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn Table>>>;
 
     /// Check if transaction has any pending DML changes (without allocating)
     fn has_pending_dml_changes(&self, txn_id: i64) -> bool;
@@ -145,7 +139,7 @@ pub trait TransactionEngineOperations: Send + Sync {
 
     /// Defer table cleanup to background thread (avoids synchronous deallocation)
     /// Default implementation drops synchronously
-    fn defer_table_cleanup(&self, _tables: Vec<Box<dyn WriteTable>>) {
+    fn defer_table_cleanup(&self, _tables: Vec<Box<dyn Table>>) {
         // Default: just drop synchronously (tables dropped when _tables goes out of scope)
     }
 
@@ -409,7 +403,7 @@ impl MvccTransaction {
     }
 }
 
-impl ReadTransaction for MvccTransaction {
+impl Transaction for MvccTransaction {
     fn id(&self) -> i64 {
         self.id
     }
@@ -426,7 +420,7 @@ impl ReadTransaction for MvccTransaction {
         self.state = TransactionState::Committing;
 
         // Check if read-only: no DDL changes and no DML changes
-        // Use has_pending_dml_changes() to avoid allocating Vec<Box<dyn WriteTable>>
+        // Use has_pending_dml_changes() to avoid allocating Vec<Box<dyn Table>>
         let has_dml_changes = self
             .engine_operations
             .as_ref()
@@ -581,66 +575,7 @@ impl ReadTransaction for MvccTransaction {
         Ok(())
     }
 
-    fn list_tables(&self) -> Result<Vec<String>> {
-        self.check_active()?;
-
-        let ops = self.get_engine_ops()?;
-        ops.list_tables()
-    }
-
-    fn get_read_table(&self, name: &str) -> Result<Box<dyn ReadTable>> {
-        let write: Box<dyn WriteTable> = self.get_table(name)?;
-        Ok(write)
-    }
-
-    fn select(
-        &self,
-        table_name: &str,
-        columns_to_fetch: &[String],
-        expr: Option<&dyn Expression>,
-        _original_columns: Option<&[String]>,
-    ) -> Result<Box<dyn QueryResult>> {
-        self.check_active()?;
-
-        let table = self.get_table(table_name)?;
-        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
-        table.select(&col_refs, expr)
-    }
-
-    fn select_with_aliases(
-        &self,
-        table_name: &str,
-        columns_to_fetch: &[String],
-        expr: Option<&dyn Expression>,
-        aliases: &FxHashMap<String, String>,
-        _original_columns: Option<&[String]>,
-    ) -> Result<Box<dyn QueryResult>> {
-        self.check_active()?;
-
-        let table = self.get_table(table_name)?;
-        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
-        table.select_with_aliases(&col_refs, expr, aliases)
-    }
-
-    fn select_as_of(
-        &self,
-        table_name: &str,
-        columns_to_fetch: &[String],
-        expr: Option<&dyn Expression>,
-        temporal_type: &str,
-        temporal_value: i64,
-        _original_columns: Option<&[String]>,
-    ) -> Result<Box<dyn QueryResult>> {
-        self.check_active()?;
-
-        let table = self.get_table(table_name)?;
-        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
-        table.select_as_of(&col_refs, expr, temporal_type, temporal_value)
-    }
-}
-
-impl WriteTransaction for MvccTransaction {
-    fn create_table(&mut self, name: &str, schema: Schema) -> Result<Box<dyn WriteTable>> {
+    fn create_table(&mut self, name: &str, schema: Schema) -> Result<Box<dyn Table>> {
         self.check_active()?;
 
         let ops = self.get_engine_ops()?;
@@ -693,7 +628,7 @@ impl WriteTransaction for MvccTransaction {
         Ok(())
     }
 
-    fn get_table(&self, name: &str) -> Result<Box<dyn WriteTable>> {
+    fn get_table(&self, name: &str) -> Result<Box<dyn Table>> {
         self.check_active()?;
 
         // Note: Cached tables would require Clone on Table trait, which isn't object-safe.
@@ -703,6 +638,13 @@ impl WriteTransaction for MvccTransaction {
         // Get from engine
         let ops = self.get_engine_ops()?;
         ops.get_table_for_transaction(self.id, name)
+    }
+
+    fn list_tables(&self) -> Result<Vec<String>> {
+        self.check_active()?;
+
+        let ops = self.get_engine_ops()?;
+        ops.list_tables()
     }
 
     fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<()> {
@@ -798,6 +740,51 @@ impl WriteTransaction for MvccTransaction {
 
         let mut table = self.get_table(table_name)?;
         table.modify_column(&column.name, column.data_type, column.nullable)
+    }
+
+    fn select(
+        &self,
+        table_name: &str,
+        columns_to_fetch: &[String],
+        expr: Option<&dyn Expression>,
+        _original_columns: Option<&[String]>,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.check_active()?;
+
+        let table = self.get_table(table_name)?;
+        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
+        table.select(&col_refs, expr)
+    }
+
+    fn select_with_aliases(
+        &self,
+        table_name: &str,
+        columns_to_fetch: &[String],
+        expr: Option<&dyn Expression>,
+        aliases: &FxHashMap<String, String>,
+        _original_columns: Option<&[String]>,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.check_active()?;
+
+        let table = self.get_table(table_name)?;
+        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
+        table.select_with_aliases(&col_refs, expr, aliases)
+    }
+
+    fn select_as_of(
+        &self,
+        table_name: &str,
+        columns_to_fetch: &[String],
+        expr: Option<&dyn Expression>,
+        temporal_type: &str,
+        temporal_value: i64,
+        _original_columns: Option<&[String]>,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.check_active()?;
+
+        let table = self.get_table(table_name)?;
+        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
+        table.select_as_of(&col_refs, expr, temporal_type, temporal_value)
     }
 }
 

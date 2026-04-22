@@ -29,7 +29,7 @@ use crate::storage::statistics::{
     is_stats_table, Histogram, DEFAULT_HISTOGRAM_BUCKETS, DEFAULT_SAMPLE_SIZE, SYS_COLUMN_STATS,
     SYS_TABLE_STATS,
 };
-use crate::storage::traits::{QueryResult, ReadEngine, WriteTransaction};
+use crate::storage::traits::{Engine, QueryResult, Transaction};
 
 use super::context::ExecutionContext;
 use super::result::ExecutorResult;
@@ -54,7 +54,7 @@ impl Executor {
             vec![table_name.to_string()]
         } else {
             // Analyze all tables - need a transaction to list tables
-            let tx = self.engine.begin_read_transaction()?;
+            let tx = self.engine.begin_transaction()?;
             let all_tables = tx.list_tables()?;
             all_tables
                 .into_iter()
@@ -71,7 +71,7 @@ impl Executor {
             }
 
             // Begin a transaction for this table's analysis
-            let mut tx = self.engine.begin_writable_transaction_internal()?;
+            let mut tx = self.engine.begin_transaction()?;
 
             let success = match self.analyze_table(&mut *tx, table_name) {
                 Ok(_) => {
@@ -108,7 +108,7 @@ impl Executor {
         use crate::storage::statistics::{CREATE_COLUMN_STATS_SQL, CREATE_TABLE_STATS_SQL};
 
         // Check if tables exist first - need a transaction
-        let tx = self.engine.begin_read_transaction()?;
+        let tx = self.engine.begin_transaction()?;
         let tables = tx.list_tables()?;
         let has_table_stats = tables
             .iter()
@@ -147,7 +147,7 @@ impl Executor {
     }
 
     /// Analyze a single table and update statistics
-    fn analyze_table(&self, tx: &mut dyn WriteTransaction, table_name: &str) -> Result<()> {
+    fn analyze_table(&self, tx: &mut dyn Transaction, table_name: &str) -> Result<()> {
         let table = tx.get_table(table_name)?;
         let schema = table.schema().clone();
 

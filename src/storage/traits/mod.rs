@@ -18,7 +18,7 @@
 //!
 //! - [`Engine`] - The main storage engine interface
 //! - [`Transaction`] - Transaction operations and DDL/DML
-//! - [`ReadTable`] / [`WriteTable`] - Table operations split into read-only and writable surfaces
+//! - [`Table`] - Table operations (insert, update, delete, scan)
 //! - [`Index`] - Index operations (find, range queries)
 //! - [`QueryResult`] - Query result iteration
 //! - [`Scanner`] - Row scanning interface
@@ -32,9 +32,9 @@ pub mod table;
 pub mod transaction;
 
 // Re-export main traits
-pub use engine::{Engine, ReadEngine};
+pub use engine::Engine;
 pub use index_trait::Index;
 pub use result::{EmptyResult, MemoryResult, QueryResult};
 pub use scanner::{EmptyScanner, Scanner, VecScanner};
-pub use table::{ReadTable, ScanPlan, WriteTable};
-pub use transaction::{ReadTransaction, TemporalType, WriteTransaction};
+pub use table::{ScanPlan, Table};
+pub use transaction::{TemporalType, Transaction};

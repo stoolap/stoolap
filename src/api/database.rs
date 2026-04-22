@@ -50,6 +50,7 @@ use crate::core::{DataType, Error, IsolationLevel, Result, Value};
 use crate::executor::context::ExecutionContextBuilder;
 use crate::executor::{CachedPlanRef, ExecutionContext, Executor};
 use crate::storage::mvcc::engine::MVCCEngine;
+use crate::storage::traits::Engine;
 use crate::storage::{Config, SyncMode};
 
 use super::params::{NamedParams, Params};
@@ -61,117 +62,36 @@ use super::transaction::Transaction;
 pub const MEMORY_SCHEME: &str = "memory";
 pub const FILE_SCHEME: &str = "file";
 
-/// Global database registry to ensure single instance per DSN.
-///
-/// Stores `Weak<EngineEntry>` so the registry never keeps an engine alive
-/// past its last user-visible handle. When the last `Database` /
-/// `ReadOnlyDatabase` for a DSN drops, `Arc<EngineEntry>` count hits zero,
-/// `EngineEntry::drop` closes the engine, and the registry's `Weak`
-/// silently expires. The next `open(dsn)` finds the dead `Weak`, fails to
-/// upgrade, and creates a fresh `EngineEntry`.
-static DATABASE_REGISTRY: std::sync::LazyLock<
-    RwLock<FxHashMap<String, std::sync::Weak<EngineEntry>>>,
-> = std::sync::LazyLock::new(|| RwLock::new(FxHashMap::default()));
+/// Global database registry to ensure single instance per DSN
+static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<FxHashMap<String, Arc<DatabaseInner>>>> =
+    std::sync::LazyLock::new(|| RwLock::new(FxHashMap::default()));
 
-/// Engine-level shared state, keyed by DSN in the registry.
-///
-/// Multiple user-visible handles (`Database` clones, sibling `Database::open`
-/// calls, `ReadOnlyDatabase` views) all hold `Arc<EngineEntry>`. The Arc
-/// count *is* the count of live user handles for this DSN — there is no
-/// other path to an `Arc<EngineEntry>`, no internal clone leaks into other
-/// subsystems (the executor and query planner hold `Arc<MVCCEngine>`, not
-/// `Arc<EngineEntry>`).
-///
-/// `EngineEntry::drop` is the single point that closes the engine, so the
-/// engine is closed iff every user handle has been dropped — independent of
-/// which order they drop in.
-pub(crate) struct EngineEntry {
-    pub(crate) engine: Arc<MVCCEngine>,
-    pub(crate) dsn: String,
-    /// Semantic-cache shared across every per-handle `Executor` for this
-    /// engine. Each `Database` clone / sibling `Database::open(dsn)` call
-    /// gets its own `Executor` (for transaction-state isolation), but
-    /// every executor holds an `Arc::clone` of this cache. That way a
-    /// DML invalidation on one handle's executor reaches the cached
-    /// SELECT results held by every sibling reader. Per-handle caches
-    /// would silently serve stale rows after a peer's commit.
-    pub(crate) semantic_cache: Arc<crate::executor::SemanticCache>,
-    /// Query planner shared across every per-handle `Executor` for this
-    /// engine. Same shape as `semantic_cache` and same reason: ANALYZE
-    /// invalidates the planner's stats cache, and a per-handle planner
-    /// would leave sibling handles on pre-ANALYZE estimates until the
-    /// 5-minute TTL expires. Sharing keeps every reader's plan choices
-    /// in sync with the writer's `ANALYZE`.
-    pub(crate) query_planner: Arc<crate::executor::QueryPlanner>,
-    /// Temp directory for test-filedb feature. Deleted with the entry.
+/// Inner database state (shared between Database instances with same DSN)
+pub(crate) struct DatabaseInner {
+    engine: Arc<MVCCEngine>,
+    executor: Mutex<Executor>,
+    dsn: String,
+    /// Whether this DatabaseInner owns the engine (created it via open()).
+    /// Cloned DatabaseInners share the engine but don't own it.
+    owns_engine: bool,
+    /// Temp directory for test-filedb feature. Deleted on drop.
     #[cfg(feature = "test-filedb")]
     _temp_dir: Option<tempfile::TempDir>,
-}
-
-impl Drop for EngineEntry {
-    fn drop(&mut self) {
-        // Clear all thread-local caches to release references to engine internals
-        // (cached Arc<dyn Index>, closures). Done once per engine close.
-        crate::executor::clear_all_thread_local_caches();
-        let _ = self.engine.close_engine();
-
-        // Reap our dead `Weak` from the registry. Without this, every
-        // dropped DSN leaves a permanent (DSN string -> dead Weak) entry
-        // behind, so a long-lived process opening many ephemeral DSNs
-        // grows the registry monotonically and pays for the dead entries
-        // on every `open()` lookup.
-        //
-        // We're inside `Drop` for the entry whose Arc count just hit 0,
-        // so any `Weak` pointing at us is now dead. We only remove the
-        // entry if the registry still has a *dead* weak for our DSN — if
-        // a fresh entry was inserted concurrently between our drop and
-        // this lock acquire, its weak is live and we leave it alone.
-        //
-        // `try_write` to avoid blocking on a held registry lock; the
-        // entry will be reaped on the next `open()` of the same DSN
-        // either way.
-        if let Ok(mut registry) = DATABASE_REGISTRY.try_write() {
-            if let Some(weak) = registry.get(&self.dsn) {
-                if weak.strong_count() == 0 {
-                    registry.remove(&self.dsn);
-                }
-            }
-        }
-    }
-}
-
-/// Per-handle database state.
-///
-/// Each user-visible handle (a `Database`, every `Database::clone`, every
-/// sibling from `Database::open(dsn)`, every `ReadOnlyDatabase`) owns its
-/// own `DatabaseInner` — primarily for executor isolation, so a `BEGIN` on
-/// one handle doesn't leak into another. Engine-level shared state lives on
-/// the `Arc<EngineEntry>` field, which is what the registry counts.
-pub(crate) struct DatabaseInner {
-    entry: Arc<EngineEntry>,
-    executor: Mutex<Executor>,
 }
 
 /// Type alias for Statement to use (avoids exposing DatabaseInner directly)
 pub(crate) type DatabaseInnerHandle = DatabaseInner;
 
-impl DatabaseInner {
-    /// Build a fresh per-handle inner around an existing engine entry.
-    /// Picks a writable or read-only executor to match the engine mode,
-    /// and shares the engine entry's semantic cache and query planner so
-    /// DML invalidation and ANALYZE reach every sibling reader.
-    fn new_with_entry(entry: Arc<EngineEntry>) -> Self {
-        let engine = Arc::clone(&entry.engine);
-        let semantic_cache = Arc::clone(&entry.semantic_cache);
-        let query_planner = Arc::clone(&entry.query_planner);
-        let executor = if entry.engine.is_read_only_mode() {
-            Executor::with_shared_semantic_cache_read_only(engine, semantic_cache, query_planner)
-        } else {
-            Executor::with_shared_semantic_cache(engine, semantic_cache, query_planner)
-        };
-        Self {
-            entry,
-            executor: Mutex::new(executor),
+impl Drop for DatabaseInner {
+    fn drop(&mut self) {
+        // Clear all thread-local caches to release references to engine internals
+        // This prevents memory leaks from cached Arc<dyn Index> and closures
+        crate::executor::clear_all_thread_local_caches();
+
+        // Only close the engine if we own it (created via open(), not clone()).
+        // Cloned databases share the engine but don't close it on drop.
+        if self.owns_engine {
+            let _ = self.engine.close_engine();
         }
     }
 }
@@ -225,75 +145,24 @@ impl Database {
     pub(crate) fn inner_arc(&self) -> &Arc<DatabaseInner> {
         &self.inner
     }
-}
 
-impl Database {
-    /// Best-effort cleanup of a registry entry pointing to the same engine
-    /// the caller holds.
+    /// Try to remove `inner` from the global registry.
     ///
-    /// With the `Weak<EngineEntry>` registry the entry self-expires once the
-    /// last user handle drops, so this method is no longer load-bearing for
-    /// correctness. It is retained for the FFI's explicit `stoolap_close`
-    /// flow to keep the registry tidy.
+    /// Only removes the entry when:
+    /// 1. The registry entry points to the same `DatabaseInner` (`ptr_eq`), and
+    /// 2. `strong_count == 2`: the caller's reference + registry are the only
+    ///    remaining references. After the caller drops, only the registry holds
+    ///    a reference, so it is safe to clean up.
     ///
-    /// Removal is only safe when the engine is about to die after the
-    /// caller's `Arc<DatabaseInner>` is dropped, i.e. when:
-    /// - `Arc::strong_count(inner) == 1`: nobody else holds *this*
-    ///   `DatabaseInner` (FFI prepared-statement / transaction keepalives
-    ///   clone the same `Arc<DatabaseInner>`, so they bump this count
-    ///   without bumping `entry.strong_count` — checking only the entry
-    ///   would orphan a still-live engine from the registry); AND
-    /// - `Arc::strong_count(&inner.entry) == 1`: no sibling `DatabaseInner`
-    ///   from a different `Database::open(dsn)` / clone holds the entry.
-    ///
-    /// If either count is greater than 1, the engine will outlive this
-    /// caller — leave the registry alone so a subsequent `open(dsn)` can
-    /// still find it. Otherwise the next `open(dsn)` would create a fresh
-    /// engine (empty for `memory://`, file-lock conflict for `file://`)
-    /// while the prior engine is still in use through a stale handle.
-    #[cfg(feature = "ffi")]
+    /// This correctly handles both shared-DSN scenarios (two `stoolap_open()`
+    /// calls with the same DSN) and clone scenarios (keepalive Arcs).
     pub(crate) fn try_unregister_arc(inner: &Arc<DatabaseInner>) {
-        if Arc::strong_count(inner) > 1 {
-            // Other Arc<DatabaseInner> clones (FFI stmt/tx keepalive) keep
-            // this exact DatabaseInner — and therefore its entry — alive.
-            return;
-        }
-        if Arc::strong_count(&inner.entry) > 1 {
-            // Sibling DatabaseInners share the same engine entry.
-            return;
-        }
         if let Ok(mut registry) = DATABASE_REGISTRY.write() {
-            if let Some(weak) = registry.get(&inner.entry.dsn) {
-                match weak.upgrade() {
-                    Some(reg_entry) if Arc::ptr_eq(&reg_entry, &inner.entry) => {
-                        registry.remove(&inner.entry.dsn);
-                    }
-                    None => {
-                        // Dead entry — clean it up.
-                        registry.remove(&inner.entry.dsn);
-                    }
-                    _ => {}
+            if let Some(entry) = registry.get(&inner.dsn) {
+                if Arc::ptr_eq(entry, inner) && Arc::strong_count(inner) == 2 {
+                    registry.remove(&inner.dsn);
                 }
             }
-        }
-    }
-}
-
-impl Database {
-    /// Build a new `Database` handle that shares the engine entry of
-    /// `existing` but has its own `DatabaseInner` and its own executor
-    /// (independent transaction state).
-    ///
-    /// Used by both `Clone for Database` and the registry-hit fast path in
-    /// `Database::open`. Each handle gets its own executor so a `BEGIN` on
-    /// one handle does not leak into another, and each handle bumps the
-    /// engine entry's strong count by one — so `Arc::strong_count(&entry)`
-    /// is exactly the count of live user handles for the DSN, which is
-    /// what `close()` and `try_unregister_arc` use to decide when to
-    /// release engine resources.
-    fn share_entry(entry: Arc<EngineEntry>) -> Database {
-        Database {
-            inner: Arc::new(DatabaseInner::new_with_entry(entry)),
         }
     }
 }
@@ -305,18 +174,41 @@ impl Clone for Database {
     /// but shares the same underlying storage engine. This ensures proper transaction
     /// isolation - a BEGIN on one handle won't affect reads on another handle.
     fn clone(&self) -> Self {
-        Database::share_entry(Arc::clone(&self.inner.entry))
+        // Create a new executor with the same engine (shares data) but independent
+        // transaction state (no dirty reads across handles)
+        let engine = Arc::clone(&self.inner.engine);
+        let executor = crate::executor::Executor::new(Arc::clone(&engine));
+
+        let inner = Arc::new(DatabaseInner {
+            engine,
+            executor: Mutex::new(executor),
+            dsn: self.inner.dsn.clone(),
+            owns_engine: false,
+            #[cfg(feature = "test-filedb")]
+            _temp_dir: None, // Clones don't own the temp dir
+        });
+
+        Database { inner }
     }
 }
 
-// `Database` has no `Drop` impl: dropping it drops `inner` which drops the
-// per-handle `Arc<EngineEntry>`. When the *last* user handle for a DSN
-// drops, the entry's strong count hits zero and `EngineEntry::drop` closes
-// the engine. The registry's `Weak` then silently expires; the next
-// `Database::open(dsn)` will see a dead Weak, fail the upgrade, and create
-// a fresh entry. No registry-removal logic is needed in `Drop for
-// Database` — relying on it was the source of the round-5 bug where a
-// sibling's drop unregistered the engine while peers were still using it.
+impl Drop for Database {
+    fn drop(&mut self) {
+        // Only remove from registry if:
+        // 1. The registry entry is OUR Arc (ptr_eq check) - prevents open_in_memory()
+        //    from accidentally removing a different DatabaseInner with same DSN
+        // 2. We're the last non-registry holder (strong_count == 2)
+        if let Ok(mut registry) = DATABASE_REGISTRY.write() {
+            if let Some(entry) = registry.get(&self.inner.dsn) {
+                if Arc::ptr_eq(entry, &self.inner) && Arc::strong_count(&self.inner) == 2 {
+                    registry.remove(&self.inner.dsn);
+                }
+            }
+        }
+        // Note: Thread-local cache clearing and engine closure happen in DatabaseInner::drop()
+        // when the last Arc<DatabaseInner> is dropped.
+    }
+}
 
 impl Database {
     /// Open a database connection
@@ -340,42 +232,15 @@ impl Database {
     /// Opening the same DSN multiple times returns the same engine instance.
     /// This ensures consistency and prevents data corruption.
     pub fn open(dsn: &str) -> Result<Self> {
-        // Parse the DSN's read_only flag upfront so registry sharing knows
-        // whether the new request matches the cached engine's mode.
-        let requested_ro = Self::dsn_requests_read_only(dsn)?;
-
-        // Read-only is meaningless on `memory://`: a fresh in-memory engine
-        // has nothing to read. Reject early with a clear diagnostic instead
-        // of silently constructing an engine that can never serve a useful
-        // query. Use `file://` for read-only deployments.
-        if requested_ro && dsn.starts_with(MEMORY_SCHEME) {
-            return Err(Error::invalid_argument(
-                "read_only is not supported on memory:// (a fresh in-memory \
-                 engine has no data to read); use file:// for read-only \
-                 deployments",
-            ));
-        }
-
         // Check if we already have an engine for this DSN
         {
             let registry = DATABASE_REGISTRY
                 .read()
                 .map_err(|_| Error::LockAcquisitionFailed("registry read".to_string()))?;
-            if let Some(weak) = registry.get(dsn) {
-                if let Some(entry) = weak.upgrade() {
-                    let cached_ro = entry.engine.is_read_only_mode();
-                    // Mode mismatch is rejected: a read-only-cached engine
-                    // cannot serve a writable request (would bypass the file
-                    // lock and WAL guarantees), and a writable-cached engine
-                    // serving a read-only request would hand out a
-                    // write-capable executor in disguise.
-                    if cached_ro != requested_ro {
-                        return Err(Error::read_only_mode_mismatch(dsn, cached_ro, requested_ro));
-                    }
-                    // Independent per-handle state, shared engine entry.
-                    return Ok(Self::share_entry(entry));
-                }
-                // Dead Weak — fall through to create a fresh engine entry.
+            if let Some(inner) = registry.get(dsn) {
+                return Ok(Database {
+                    inner: Arc::clone(inner),
+                });
             }
         }
 
@@ -385,15 +250,10 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
 
         // Double-check after acquiring write lock
-        if let Some(weak) = registry.get(dsn) {
-            if let Some(entry) = weak.upgrade() {
-                let cached_ro = entry.engine.is_read_only_mode();
-                if cached_ro != requested_ro {
-                    return Err(Error::read_only_mode_mismatch(dsn, cached_ro, requested_ro));
-                }
-                return Ok(Self::share_entry(entry));
-            }
-            // Dead Weak — will be overwritten by the insert below.
+        if let Some(inner) = registry.get(dsn) {
+            return Ok(Database {
+                inner: Arc::clone(inner),
+            });
         }
 
         // Parse the DSN
@@ -431,38 +291,7 @@ impl Database {
             }
             FILE_SCHEME => {
                 // Parse optional query parameters
-                let (clean_path, config) = Self::parse_file_config(&path)?;
-
-                // If the DSN requested read-only mode, refuse to materialize
-                // a fresh database. Same guard as `Database::open_read_only`:
-                // the path must already exist as a directory containing a
-                // recognizable stoolap layout (`wal/` or `volumes/`).
-                // Without this, `open("file://.../missing?read_only=true")`
-                // would silently create an empty DB via PersistenceManager.
-                if config.read_only {
-                    let path_obj = std::path::Path::new(&clean_path);
-                    if !path_obj.exists() {
-                        return Err(Error::internal(format!(
-                            "cannot open '{}' read-only: path does not exist",
-                            clean_path
-                        )));
-                    }
-                    if !path_obj.is_dir() {
-                        return Err(Error::internal(format!(
-                            "cannot open '{}' read-only: not a directory",
-                            clean_path
-                        )));
-                    }
-                    let has_wal = path_obj.join("wal").exists();
-                    let has_volumes = path_obj.join("volumes").exists();
-                    if !has_wal && !has_volumes {
-                        return Err(Error::internal(format!(
-                            "cannot open '{}' read-only: not a stoolap database \
-                             (no wal/ or volumes/ directory)",
-                            clean_path
-                        )));
-                    }
-                }
+                let (_clean_path, config) = Self::parse_file_config(&path)?;
 
                 let engine = MVCCEngine::new(config);
                 engine.open_engine()?;
@@ -479,26 +308,22 @@ impl Database {
             }
         };
 
-        // Build the engine entry. The executor is created per-handle in
-        // `share_entry` and inherits the engine's read-only mode (so a DSN
-        // with `?read_only=true` mirrors the parser write gate plus the DML
-        // auto-commit guard on every handle constructed from this entry).
-        let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
-        let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
-        let entry = Arc::new(EngineEntry {
+        // Create executor (uses shared default function registry)
+        let executor = Executor::new(Arc::clone(&engine));
+
+        let inner = Arc::new(DatabaseInner {
             engine,
+            executor: Mutex::new(executor),
             dsn: dsn.to_string(),
-            semantic_cache,
-            query_planner,
+            owns_engine: true,
             #[cfg(feature = "test-filedb")]
             _temp_dir: _temp_dir_holder,
         });
 
-        // Store a Weak in the registry so it self-expires when the last
-        // user handle drops.
-        registry.insert(dsn.to_string(), Arc::downgrade(&entry));
+        // Store in registry
+        registry.insert(dsn.to_string(), Arc::clone(&inner));
 
-        Ok(Self::share_entry(entry))
+        Ok(Database { inner })
     }
 
     /// Open an in-memory database
@@ -508,169 +333,6 @@ impl Database {
     /// would share the same instance).
     pub fn open_in_memory() -> Result<Self> {
         Self::create_in_memory_engine()
-    }
-
-    /// Open a read-only handle over an existing database.
-    ///
-    /// Opens the database normally (or reuses an existing registry entry) and
-    /// wraps the engine in a `ReadOnlyDatabase` that rejects all write SQL at
-    /// query time.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let rodb = Database::open_read_only("file:///tmp/mydb")?;
-    /// for row in rodb.query("SELECT * FROM users", ())? {
-    ///     let row = row?;
-    ///     println!("{:?}", row);
-    /// }
-    /// ```
-    pub fn open_read_only(dsn: &str) -> Result<crate::api::ReadOnlyDatabase> {
-        // Read-only is meaningless on `memory://`: a fresh in-memory engine
-        // has nothing to read. Reject early. (Mirrored on `Database::open`
-        // for the `?read_only=true` query-param path.)
-        if dsn.starts_with(MEMORY_SCHEME) {
-            return Err(Error::invalid_argument(
-                "open_read_only is not supported on memory:// (a fresh \
-                 in-memory engine has no data to read); use file:// for \
-                 read-only deployments",
-            ));
-        }
-
-        // If the DSN is already open in this process (writable or read-only),
-        // share the existing engine entry. The parser-level write gate on
-        // ReadOnlyDatabase still rejects all write SQL, regardless of the
-        // underlying engine's mode.
-        {
-            let registry = DATABASE_REGISTRY
-                .read()
-                .map_err(|_| Error::LockAcquisitionFailed("registry read".to_string()))?;
-            if let Some(weak) = registry.get(dsn) {
-                if let Some(entry) = weak.upgrade() {
-                    return Ok(crate::api::ReadOnlyDatabase::from_entry(entry));
-                }
-            }
-        }
-
-        // Need to create a new engine in read-only mode (acquires LOCK_SH,
-        // skips background cleanup). Acquire registry write lock.
-        let mut registry = DATABASE_REGISTRY
-            .write()
-            .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
-
-        // Double-check after acquiring write lock.
-        if let Some(weak) = registry.get(dsn) {
-            if let Some(entry) = weak.upgrade() {
-                return Ok(crate::api::ReadOnlyDatabase::from_entry(entry));
-            }
-        }
-
-        let (scheme, path) = Self::parse_dsn(dsn)?;
-
-        #[cfg(feature = "test-filedb")]
-        let _temp_dir_holder: Option<tempfile::TempDir> = None;
-
-        // memory:// was rejected at the top of this function. Only file://
-        // reaches the engine-construction match.
-        let engine = match scheme.as_str() {
-            FILE_SCHEME => {
-                let (clean_path, mut config) = Self::parse_file_config(&path)?;
-                config.read_only = true;
-
-                // Read-only opens must not create a new database. Refuse if
-                // the directory doesn't already exist (or exists but lacks a
-                // recognizable stoolap layout). Without this check,
-                // PersistenceManager::new would `create_dir_all` and lay
-                // down a fresh WAL, silently turning `open_read_only` into
-                // a write that creates an empty DB.
-                let path_obj = std::path::Path::new(&clean_path);
-                if !path_obj.exists() {
-                    return Err(Error::internal(format!(
-                        "cannot open '{}' read-only: path does not exist",
-                        clean_path
-                    )));
-                }
-                if !path_obj.is_dir() {
-                    return Err(Error::internal(format!(
-                        "cannot open '{}' read-only: not a directory",
-                        clean_path
-                    )));
-                }
-                // A stoolap database always has a `wal` subdirectory once
-                // it has been written to. If neither `wal/` nor `volumes/`
-                // exists, the directory is not a stoolap database and we
-                // refuse to materialize one in read-only mode.
-                let has_wal = path_obj.join("wal").exists();
-                let has_volumes = path_obj.join("volumes").exists();
-                if !has_wal && !has_volumes {
-                    return Err(Error::internal(format!(
-                        "cannot open '{}' read-only: not a stoolap database \
-                         (no wal/ or volumes/ directory)",
-                        clean_path
-                    )));
-                }
-
-                let engine = MVCCEngine::new(config);
-                engine.open_engine()?;
-                let engine = Arc::new(engine);
-                // start_cleanup is a no-op when config.read_only is set,
-                // but call it for symmetry with the writable path.
-                engine.start_cleanup();
-                engine
-            }
-            _ => {
-                return Err(Error::parse(format!(
-                    "Unsupported scheme '{}'. Use 'memory://' or 'file://path'",
-                    scheme
-                )));
-            }
-        };
-
-        let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
-        let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
-        let entry = Arc::new(EngineEntry {
-            engine,
-            dsn: dsn.to_string(),
-            semantic_cache,
-            query_planner,
-            #[cfg(feature = "test-filedb")]
-            _temp_dir: _temp_dir_holder,
-        });
-
-        registry.insert(dsn.to_string(), Arc::downgrade(&entry));
-
-        Ok(crate::api::ReadOnlyDatabase::from_entry(entry))
-    }
-
-    /// Return a read-only view over this database.
-    ///
-    /// The returned handle shares the same underlying engine and sees the same
-    /// committed data. Write SQL submitted through the `ReadOnlyDatabase`
-    /// handle is rejected at query time.
-    ///
-    /// The returned handle holds an Arc to this Database's engine entry, so
-    /// the engine stays open as long as either handle is alive.
-    ///
-    /// # Transaction visibility
-    ///
-    /// The returned `ReadOnlyDatabase` has its own executor with independent
-    /// transaction state — it is a *view*, not a connection sharing this
-    /// `Database`'s session. In particular:
-    ///
-    /// - An uncommitted `BEGIN` on this `Database` (e.g. via [`Self::begin`])
-    ///   is **not** visible through the read-only view. Writes inside the
-    ///   open transaction are not observed until they commit.
-    /// - A `BEGIN` issued via SQL on the read-only view starts a separate
-    ///   read-only transaction snapshot; it does not interact with any
-    ///   transaction on this `Database`.
-    /// - Default isolation level is independent: changing it on one handle
-    ///   has no effect on the other.
-    ///
-    /// If you need a read-only handle that observes uncommitted writes from a
-    /// specific transaction, do the read inside that same `Transaction`
-    /// (which is gated by the parser at SQL time but allowed for read SQL).
-    pub fn as_read_only(&self) -> crate::api::ReadOnlyDatabase {
-        crate::api::ReadOnlyDatabase::from_entry(Arc::clone(&self.inner.entry))
     }
 
     #[cfg(feature = "test-filedb")]
@@ -683,16 +345,15 @@ impl Database {
         engine.open_engine()?;
         let engine = Arc::new(engine);
         engine.start_cleanup();
-        let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
-        let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
-        let entry = Arc::new(EngineEntry {
+        let executor = Executor::new(Arc::clone(&engine));
+        let inner = Arc::new(DatabaseInner {
             engine,
+            executor: Mutex::new(executor),
             dsn: "memory://".to_string(),
-            semantic_cache,
-            query_planner,
+            owns_engine: true,
             _temp_dir: Some(tmp),
         });
-        Ok(Self::share_entry(entry))
+        Ok(Database { inner })
     }
 
     #[cfg(not(feature = "test-filedb"))]
@@ -701,76 +362,17 @@ impl Database {
         engine.open_engine()?;
         let engine = Arc::new(engine);
         engine.start_cleanup();
-        let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
-        let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
-        let entry = Arc::new(EngineEntry {
+        let executor = Executor::new(Arc::clone(&engine));
+        let inner = Arc::new(DatabaseInner {
             engine,
+            executor: Mutex::new(executor),
             dsn: "memory://".to_string(),
-            semantic_cache,
-            query_planner,
+            owns_engine: true,
         });
-        Ok(Self::share_entry(entry))
+        Ok(Database { inner })
     }
 
     /// Parse a DSN into scheme and path
-    /// Returns true if the DSN's query string requests read-only mode
-    /// (`?read_only=true`, `?readonly=true`, or `?mode=ro`).
-    ///
-    /// Used by `Database::open` to make the registry-share decision before
-    /// constructing the engine. For DSNs without a query string, returns
-    /// `false`. For DSNs with conflicting / malformed values, returns the
-    /// same parse error that `parse_file_config` would return.
-    fn dsn_requests_read_only(dsn: &str) -> Result<bool> {
-        // Find the query string portion; identical scan logic to parse_dsn
-        // but without requiring a valid scheme (parse_dsn runs separately).
-        //
-        // Must mirror `parse_file_config`'s precedence: scan ALL params and
-        // let the LAST recognized read-only flag win, regardless of which
-        // key it used (`read_only`, `readonly`, `mode`). Returning on the
-        // first match would disagree with the actual config — the same DSN
-        // would then open with one mode while the registry's mode-mismatch
-        // check at the next `open(dsn)` call computed the other, refusing
-        // a perfectly idempotent reopen.
-        let query = match dsn.find('?') {
-            Some(idx) => &dsn[idx + 1..],
-            None => return Ok(false),
-        };
-        let mut last: Option<bool> = None;
-        for param in query.split('&') {
-            let mut parts = param.splitn(2, '=');
-            let key = parts.next().unwrap_or("");
-            let value = parts.next().unwrap_or("");
-            match key {
-                "read_only" | "readonly" => {
-                    last = Some(match value.to_lowercase().as_str() {
-                        "true" | "1" | "yes" | "on" => true,
-                        "false" | "0" | "no" | "off" => false,
-                        _ => {
-                            return Err(Error::invalid_argument(format!(
-                                "invalid {}: '{}' (expected true/false)",
-                                key, value
-                            )))
-                        }
-                    });
-                }
-                "mode" => {
-                    last = Some(match value.to_lowercase().as_str() {
-                        "ro" => true,
-                        "rw" => false,
-                        _ => {
-                            return Err(Error::invalid_argument(format!(
-                                "invalid mode: '{}' (expected ro/rw)",
-                                value
-                            )))
-                        }
-                    });
-                }
-                _ => {}
-            }
-        }
-        Ok(last.unwrap_or(false))
-    }
-
     fn parse_dsn(dsn: &str) -> Result<(String, String)> {
         let idx = dsn
             .find("://")
@@ -895,30 +497,6 @@ impl Database {
                                     value
                                 ))
                             })?;
-                    }
-                    // Open in read-only mode: read_only=true
-                    //
-                    // When set, the engine acquires the file lock in shared
-                    // mode (multiple readers coexist), skips the background
-                    // checkpoint thread, and the executor refuses any write
-                    // SQL via the parser-level gate plus the DML auto-commit
-                    // guard. Equivalent to calling `Database::open_read_only`
-                    // except the returned handle has the writable `Database`
-                    // type — write attempts fail at runtime with
-                    // `Error::ReadOnlyViolation`.
-                    "read_only" | "readonly" | "mode" => {
-                        // For "mode" the value is "ro" / "rw" (sqlite-style);
-                        // for "read_only"/"readonly" it's "true"/"false"/"1"/"0".
-                        config.read_only = match value.to_lowercase().as_str() {
-                            "true" | "1" | "yes" | "on" | "ro" => true,
-                            "false" | "0" | "no" | "off" | "rw" => false,
-                            _ => {
-                                return Err(Error::invalid_argument(format!(
-                                    "invalid {}: '{}' (expected true/false or ro/rw)",
-                                    key, value
-                                )));
-                            }
-                        };
                     }
                     // Sync interval in ms: sync_interval_ms=10
                     "sync_interval_ms" | "sync_interval" => {
@@ -1438,134 +1016,35 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let tx = executor.begin_transaction_with_isolation(isolation)?;
-        // Pass the engine entry (not just the engine Arc) so live
-        // transactions count toward `Arc::strong_count(&entry)`. Without
-        // this, `db.close()` could fire `engine.close_engine()` while a
-        // transaction is alive — close() would see the entry's count as 1
-        // (only db.inner.entry) and conclude no other peer needs the
-        // engine. The transaction's `Arc<MVCCEngine>` clone wouldn't
-        // affect that count, leaving the txn with a closed engine.
-        let entry = Arc::clone(&self.inner.entry);
-        Ok(Transaction::new(tx, entry))
+        let engine = executor.engine().clone();
+        Ok(Transaction::new(tx, engine))
     }
 
     /// Get the underlying storage engine
     ///
     /// This is primarily for advanced use cases and testing.
-    ///
-    /// # Read-only handles
-    ///
-    /// On a `Database` opened with `?read_only=true` / `?mode=ro`, every
-    /// write-intent method on the returned `MVCCEngine` is gated and
-    /// returns `Error::ReadOnlyViolation`:
-    ///
-    /// - `Engine::begin_transaction` / `begin_transaction_with_level`
-    ///   (the trait methods reachable through `engine.begin_transaction()`).
-    /// - `Engine::create_snapshot` / `restore_snapshot`.
-    /// - `MVCCEngine::create_table`, `drop_table_internal`, `create_view`,
-    ///   `drop_view`, `rename_table`, `create_column`,
-    ///   `create_column_with_default`, `drop_column`, `rename_column`,
-    ///   `modify_column`, `update_engine_config`, `vacuum`.
-    /// - `MVCCEngine::cleanup_old_transactions`,
-    ///   `cleanup_deleted_rows`, `cleanup_old_previous_versions` are
-    ///   silent no-ops returning `0` on read-only engines.
-    /// - `MVCCEngine::start_periodic_cleanup` returns a no-op
-    ///   `CleanupHandle` (no thread is spawned).
-    ///
-    /// Other engine methods (`is_open`, `is_read_only_mode`, `path`,
-    /// `volume_stats`, `config`, view lookup, `oldest_loaded_snapshot_timestamp`,
-    /// the `ReadEngine::begin_read_transaction*` family) work normally on
-    /// both writable and read-only handles.
-    ///
-    /// Internal-only methods like `propagate_column_*`,
-    /// `refresh_schema_cache`, `modify_column_with_dimensions`,
-    /// `get_table_for_txn`, `find_referencing_fks`, `get_version_store`
-    /// are not part of the public surface — they are `pub(crate)` and
-    /// not reachable through this accessor.
     pub fn engine(&self) -> &Arc<MVCCEngine> {
-        &self.inner.entry.engine
-    }
-
-    /// Returns `true` if this `Database` was opened in read-only mode
-    /// (`?read_only=true` / `?mode=ro`).
-    ///
-    /// Equivalent to `db.engine().is_read_only_mode()` — provided as a
-    /// direct accessor so callers don't have to reach into the engine.
-    /// Useful for branching in user code that wants to skip work it
-    /// knows would be refused (e.g. issuing PRAGMA SNAPSHOT only when
-    /// writable).
-    pub fn is_read_only(&self) -> bool {
-        self.inner.entry.engine.is_read_only_mode()
-    }
-
-    /// Get the engine as a read-only trait object.
-    ///
-    /// Returns `Arc<dyn ReadEngine>` instead of the concrete `Arc<MVCCEngine>`
-    /// returned by [`Self::engine`]. The trait object exposes only
-    /// `begin_read_transaction` / `begin_read_transaction_with_level`
-    /// (plus `Engine::table_exists` via the supertrait). Callers holding
-    /// the trait object cannot reach `Engine::begin_transaction` or any
-    /// inherent write method on `MVCCEngine` — the read-only contract is
-    /// enforced at the type level rather than at runtime.
-    ///
-    /// Works on writable Databases too: returning the read surface is
-    /// always safe regardless of mode. Cheap (one Arc clone). Use this
-    /// in libraries that want to accept "any database that can serve
-    /// reads" without coupling to the writable surface.
-    pub fn read_engine(&self) -> Arc<dyn crate::storage::traits::ReadEngine> {
-        Arc::clone(&self.inner.entry.engine) as Arc<dyn crate::storage::traits::ReadEngine>
+        &self.inner.engine
     }
 
     /// Close the database connection
     ///
-    /// When this handle is the last one for its DSN, closes the engine
-    /// immediately so the file lock is released for other processes. If
-    /// another `Database` clone, sibling `Database::open(dsn)` handle, or
-    /// `ReadOnlyDatabase` view still references the same engine, the close
-    /// is *deferred* until that last handle drops. This preserves the
-    /// lifetime contract for `as_read_only()` / `open_read_only()` and
-    /// makes `close()` safe to call on one of several handles without
-    /// pulling the rug out from under in-flight queries on the others.
+    /// This removes the database from the global registry and closes the engine,
+    /// releasing the file lock immediately so another process can open the database.
     ///
-    /// Note: The engine is also closed automatically when the last handle
-    /// is dropped.
+    /// Note: The engine is also closed automatically when all Database instances
+    /// are dropped.
     pub fn close(&self) -> Result<()> {
-        // Last-handle detection uses the engine entry's strong count.
-        // Each user-visible handle (Database, clone, sibling open, RO)
-        // owns one Arc<EngineEntry>; nothing else holds an Arc to the
-        // entry (the registry stores a Weak; the executor and lazy
-        // QueryPlanner clone Arc<MVCCEngine>, not Arc<EngineEntry>). So
-        // `strong_count == 1` means "this handle is the only one alive
-        // for the DSN", and the engine can close now without disturbing
-        // siblings.
-        //
-        // The strong_count check MUST happen under the registry write
-        // lock. Otherwise a concurrent `Database::open(dsn)` could read
-        // the registry, upgrade the still-live Weak, and return a fresh
-        // handle to its caller — between our check and our `close_engine`
-        // call — leaving that caller holding a Database whose engine is
-        // closed under it.
-        let mut registry = match DATABASE_REGISTRY.write() {
-            Ok(g) => g,
-            Err(_) => return Err(Error::LockAcquisitionFailed("registry write".to_string())),
-        };
-        if Arc::strong_count(&self.inner.entry) != 1 {
-            return Ok(());
-        }
-        // Proactively clear the registry's dead-soon Weak so the next
-        // `open(dsn)` doesn't have to upgrade-and-fail.
-        if let Some(weak) = registry.get(&self.inner.entry.dsn) {
-            let same = weak
-                .upgrade()
-                .map(|reg| Arc::ptr_eq(&reg, &self.inner.entry))
-                .unwrap_or(true);
-            if same {
-                registry.remove(&self.inner.entry.dsn);
-            }
-        }
-        drop(registry);
-        // Idempotent — safe to call multiple times.
-        self.inner.entry.engine.close_engine()?;
+        // Remove from registry
+        let mut registry = DATABASE_REGISTRY
+            .write()
+            .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
+
+        registry.remove(&self.inner.dsn);
+
+        // Close the engine immediately to release the file lock
+        // This is idempotent - calling close_engine() multiple times is safe
+        self.inner.engine.close_engine()?;
 
         Ok(())
     }
@@ -1643,18 +1122,14 @@ impl Database {
 
     /// Check if a table exists
     pub fn table_exists(&self, name: &str) -> Result<bool> {
-        use crate::storage::traits::ReadEngine;
-        // Read-only path: a `ReadTransaction` is enough for `get_read_table`,
-        // and it works on both writable and read-only engines without any
-        // gate bypass.
-        let engine = &self.inner.entry.engine;
-        let tx = ReadEngine::begin_read_transaction(engine.as_ref())?;
-        Ok(tx.get_read_table(name).is_ok())
+        let engine = &self.inner.engine;
+        let tx = engine.begin_transaction()?;
+        Ok(tx.get_table(name).is_ok())
     }
 
     /// Get the DSN this database was opened with
     pub fn dsn(&self) -> &str {
-        &self.inner.entry.dsn
+        &self.inner.dsn
     }
 
     /// Set the default isolation level for new transactions
@@ -1675,18 +1150,9 @@ impl Database {
     /// Normal persistence uses the checkpoint cycle (seal to volumes + WAL).
     ///
     /// Note: This is a no-op for in-memory databases.
-    ///
-    /// Returns `Error::ReadOnlyViolation` when called on a read-only handle
-    /// (`?read_only=true` / `?mode=ro`). The engine layer also refuses, but
-    /// catching it here keeps the error message tied to the user-facing
-    /// `Database::create_snapshot` rather than the lower-level
-    /// `MVCCEngine::create_snapshot`.
     pub fn create_snapshot(&self) -> Result<()> {
         use crate::storage::Engine;
-        if self.inner.entry.engine.is_read_only_mode() {
-            return Err(Error::read_only_violation_at("database", "create_snapshot"));
-        }
-        self.inner.entry.engine.create_snapshot()
+        self.inner.engine.create_snapshot()
     }
 
     /// Restore the database from a backup snapshot.
@@ -1698,20 +1164,9 @@ impl Database {
     /// This is a destructive operation that replaces all current data
     /// with the snapshot data. Indexes and views are restored from
     /// ddl-{timestamp}.bin or preserved from current in-memory state.
-    ///
-    /// Returns `Error::ReadOnlyViolation` when called on a read-only handle
-    /// (`?read_only=true` / `?mode=ro`). Restore overwrites engine state
-    /// in place, which is fundamentally incompatible with the read-only
-    /// contract regardless of the on-disk write permissions.
     pub fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
         use crate::storage::Engine;
-        if self.inner.entry.engine.is_read_only_mode() {
-            return Err(Error::read_only_violation_at(
-                "database",
-                "restore_snapshot",
-            ));
-        }
-        let result = self.inner.entry.engine.restore_snapshot(timestamp)?;
+        let result = self.inner.engine.restore_snapshot(timestamp)?;
         // Clear all query caches since all data has changed.
         let executor = self
             .inner
@@ -1770,7 +1225,7 @@ impl Database {
     /// Get the oldest snapshot timestamp loaded during startup.
     /// Returns None if no snapshots were loaded.
     pub fn oldest_loaded_snapshot_timestamp(&self) -> Option<String> {
-        self.inner.entry.engine.oldest_loaded_snapshot_timestamp()
+        self.inner.engine.oldest_loaded_snapshot_timestamp()
     }
 }
 

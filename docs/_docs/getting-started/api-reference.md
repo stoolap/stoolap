@@ -34,22 +34,9 @@ let db = Database::open("file:///path/to/database")?;
 
 // File-based with configuration
 let db = Database::open("file:///path/to/db?sync=full&checkpoint_interval=60")?;
-
-// Read-only via DSN flag (writable handle type, but every write SQL returns Error::ReadOnlyViolation)
-let db = Database::open("file:///path/to/database?read_only=true")?;
-// SQLite-style alias
-let db = Database::open("file:///path/to/database?mode=ro")?;
-
-// Read-only via dedicated entry point (returns a ReadOnlyDatabase)
-let ro = Database::open_read_only("file:///path/to/database")?;
-
-// Wrap an existing writable handle as read-only (shares the engine)
-let ro = db.as_read_only();
 ```
 
 `open_in_memory()` creates a unique, isolated instance each time. `open("memory://")` returns the same shared engine for the same DSN.
-
-Read-only opens take a *shared* file lock (`LOCK_SH`) so multiple reader processes can coexist; a writable open is refused while any reader is alive (and vice versa). `open_read_only` refuses to materialize a fresh database: the path must already exist as a stoolap directory. Read-only opens succeed on directories mounted read-only at the kernel level even without a pre-shipped `db.lock`.
 
 ### Connection String Options
 
@@ -70,8 +57,6 @@ Read-only opens take a *shared* file lock (`LOCK_SH`) so multiple reader process
 | `volume_compression` | `on` | LZ4 compression for cold volume files |
 | `checkpoint_on_close` | `on` | Seal all hot rows to volumes on clean shutdown |
 | `target_volume_rows` | `1048576` | Target rows per cold volume. Controls compaction split boundary. |
-| `read_only` / `readonly` | `false` | Open in read-only mode: shared file lock, no background cleanup, all write SQL refused with `ReadOnlyViolation`. |
-| `mode` | `rw` | SQLite-style alias for `read_only`. `mode=ro` matches `read_only=true`. |
 
 ### execute()
 
@@ -659,10 +644,8 @@ fn main() -> Result<()> {
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `open(dsn)` | `Result<Database>` | Open or reuse a database by DSN. Honors `?read_only=true` / `?mode=ro`. |
+| `open(dsn)` | `Result<Database>` | Open or reuse a database by DSN |
 | `open_in_memory()` | `Result<Database>` | Open a unique in-memory database |
-| `open_read_only(dsn)` | `Result<ReadOnlyDatabase>` | Open an existing database read-only (shared file lock; refuses to create a fresh DB) |
-| `as_read_only()` | `ReadOnlyDatabase` | Return a read-only view sharing this Database's engine |
 | `execute(sql, params)` | `Result<i64>` | Execute DDL/DML, return rows affected |
 | `query(sql, params)` | `Result<Rows>` | Execute SELECT, return row iterator |
 | `query_one(sql, params)` | `Result<T>` | Query single value |
@@ -685,40 +668,10 @@ fn main() -> Result<()> {
 | `close()` | `Result<()>` | Close database, release file lock |
 | `table_exists(name)` | `Result<bool>` | Check if table exists |
 | `dsn()` | `&str` | Get the DSN |
-| `is_read_only()` | `bool` | Whether this handle was opened read-only |
 | `set_default_isolation_level(level)` | `Result<()>` | Set default isolation |
 | `create_snapshot()` | `Result<()>` | Create point-in-time snapshot |
 | `semantic_cache_stats()` | `Result<Stats>` | Get cache statistics |
 | `clear_semantic_cache()` | `Result<()>` | Clear query cache |
-
-### ReadOnlyDatabase
-
-Returned by `Database::open_read_only(dsn)` and `Database::as_read_only()`. Every write SQL through this handle is rejected at parse time with `Error::ReadOnlyViolation`. Read SQL (SELECT, SHOW, EXPLAIN, BEGIN/COMMIT/ROLLBACK, SAVEPOINT) is allowed.
-
-`ReadOnlyDatabase` is a *view*, not a connection sharing a session with the source `Database`. Each handle owns its own executor and transaction state, so an uncommitted `BEGIN` on the source `Database` is **not** visible through `as_read_only()`. To observe uncommitted writes, run the read SQL inside the same `Transaction`.
-
-For prepared-statement ergonomics on a `ReadOnlyDatabase`, use `cached_plan(sql)` plus `query_plan` / `query_named_plan`. The `prepare()` API on `Database` is not mirrored on `ReadOnlyDatabase` (it requires a back-reference the read-only handle does not carry); `cached_plan` covers the same parse-once / execute-many use case.
-
-| Method | Returns | Description |
-|--------|---------|-------------|
-| `query(sql, params)` | `Result<Rows>` | Execute a read-only query |
-| `query_named(sql, params)` | `Result<Rows>` | Read-only query with named params |
-| `cached_plan(sql)` | `Result<CachedPlanRef>` | Parse once and cache; refuses write SQL |
-| `query_plan(plan, params)` | `Result<Rows>` | Execute a cached plan with positional params |
-| `query_named_plan(plan, params)` | `Result<Rows>` | Execute a cached plan with named params |
-| `dsn()` | `&str` | Get the DSN |
-| `table_exists(name)` | `Result<bool>` | Check if a table exists |
-
-```rust
-let ro = Database::open_read_only("file:///data/mydb")?;
-let plan = ro.cached_plan("SELECT name FROM users WHERE age > $1")?;
-for age in [18, 25, 40] {
-    for row in ro.query_plan(&plan, (age,))? {
-        let row = row?;
-        println!("{}", row.get::<String>("name")?);
-    }
-}
-```
 
 ### Statement
 

@@ -313,18 +313,8 @@ pub struct PersistenceManager {
 }
 
 impl PersistenceManager {
-    /// Create a new persistence manager.
-    ///
-    /// `read_only` controls whether on-disk state is mutated during init:
-    /// - `false` (writable): the persistence dir and `wal/` subdir are
-    ///   created if missing, the WAL file is opened with append access,
-    ///   and a fresh WAL file is created when none exists.
-    /// - `true` (read-only): existing on-disk state is opened read-only.
-    ///   No directories are created. WAL files are opened without
-    ///   `append`/`create` so chmod-restricted or read-only-mounted
-    ///   databases work. If no WAL files exist, the manager comes up
-    ///   with no WAL and skips replay (volumes-only path).
-    pub fn new(path: Option<&Path>, config: &PersistenceConfig, read_only: bool) -> Result<Self> {
+    /// Create a new persistence manager
+    pub fn new(path: Option<&Path>, config: &PersistenceConfig) -> Result<Self> {
         // Memory-only mode if no path provided
         if path.is_none() || !config.enabled {
             return Ok(Self {
@@ -341,20 +331,14 @@ impl PersistenceManager {
 
         let path = path.unwrap();
 
-        // Create base directory only when writable. Read-only opens
-        // require the directory to already exist (Database::open_read_only
-        // checks this above us); calling create_dir_all on a read-only
-        // mount would fail with EROFS / EACCES even when the dir is
-        // already there.
-        if !read_only {
-            fs::create_dir_all(path).map_err(|e| {
-                Error::internal(format!("failed to create persistence directory: {}", e))
-            })?;
-        }
+        // Create base directory
+        fs::create_dir_all(path).map_err(|e| {
+            Error::internal(format!("failed to create persistence directory: {}", e))
+        })?;
 
         // Initialize WAL with config (including fast sync settings)
         let wal_path = path.join("wal");
-        let wal = WALManager::with_config(&wal_path, config.sync_mode, Some(config), read_only)?;
+        let wal = WALManager::with_config(&wal_path, config.sync_mode, Some(config))?;
 
         // Get initial LSN from WAL
         let initial_lsn = wal.current_lsn();
@@ -1119,7 +1103,7 @@ mod tests {
     #[test]
     fn test_persistence_manager_disabled() {
         let config = PersistenceConfig::default();
-        let pm = PersistenceManager::new(None, &config, false).unwrap();
+        let pm = PersistenceManager::new(None, &config).unwrap();
         assert!(!pm.is_enabled());
     }
 
@@ -1130,7 +1114,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let pm = PersistenceManager::new(Some(dir.path()), &config, false).unwrap();
+        let pm = PersistenceManager::new(Some(dir.path()), &config).unwrap();
         assert!(pm.is_enabled());
         assert_eq!(pm.current_lsn(), 0);
     }
@@ -1143,7 +1127,7 @@ mod tests {
             sync_mode: SyncMode::Full,
             ..Default::default()
         };
-        let pm = PersistenceManager::new(Some(dir.path()), &config, false).unwrap();
+        let pm = PersistenceManager::new(Some(dir.path()), &config).unwrap();
 
         // Record DDL (auto-committed, so 2 entries: DDL + commit marker)
         pm.record_ddl_operation("test", WALOperationType::CreateTable, b"schema_data")
@@ -1226,7 +1210,7 @@ mod tests {
 
         // Write some entries with commits
         {
-            let pm = PersistenceManager::new(Some(dir.path()), &config, false).unwrap();
+            let pm = PersistenceManager::new(Some(dir.path()), &config).unwrap();
             pm.start().unwrap();
 
             for i in 1..=5 {
@@ -1242,7 +1226,7 @@ mod tests {
 
         // Replay entries using two-phase recovery
         {
-            let pm = PersistenceManager::new(Some(dir.path()), &config, false).unwrap();
+            let pm = PersistenceManager::new(Some(dir.path()), &config).unwrap();
             let mut data_count = 0;
             let mut commit_count = 0;
 
@@ -1271,7 +1255,7 @@ mod tests {
             ..Default::default()
         };
 
-        let pm = PersistenceManager::new(Some(dir.path()), &config, false).unwrap();
+        let pm = PersistenceManager::new(Some(dir.path()), &config).unwrap();
         pm.start().unwrap();
 
         // Add some entries

@@ -45,7 +45,7 @@ type PartitionKey = SmallVec<[Value; 4]>;
 
 use crate::functions::WindowFunction;
 use crate::parser::ast::*;
-use crate::storage::traits::{QueryResult, ReadTable};
+use crate::storage::traits::{QueryResult, Table};
 
 use super::context::ExecutionContext;
 use super::expression::{ExpressionEval, MultiExpressionEval};
@@ -835,7 +835,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        table: &dyn ReadTable,
+        table: &dyn Table,
         base_columns: &[String],
         partition_col: &str,
         limit: usize,
