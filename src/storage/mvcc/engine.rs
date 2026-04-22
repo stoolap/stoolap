@@ -6248,10 +6248,12 @@ impl Engine for MVCCEngine {
     }
 
     fn checkpoint_cycle(&self) -> Result<()> {
+        self.ensure_writable()?;
         MVCCEngine::checkpoint_cycle(self)
     }
 
     fn force_checkpoint_cycle(&self) -> Result<()> {
+        self.ensure_writable()?;
         MVCCEngine::checkpoint_cycle_inner(self, true)?;
         self.compact_after_checkpoint_forced();
         Ok(())

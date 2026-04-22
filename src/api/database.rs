@@ -1538,24 +1538,34 @@ impl Database {
         // `strong_count == 1` means "this handle is the only one alive
         // for the DSN", and the engine can close now without disturbing
         // siblings.
-        if Arc::strong_count(&self.inner.entry) == 1 {
-            // Proactively clear the registry's dead-soon Weak so the next
-            // `open(dsn)` doesn't have to upgrade-and-fail. Optional —
-            // registry self-cleans via Weak expiry.
-            if let Ok(mut registry) = DATABASE_REGISTRY.write() {
-                if let Some(weak) = registry.get(&self.inner.entry.dsn) {
-                    let same = weak
-                        .upgrade()
-                        .map(|reg| Arc::ptr_eq(&reg, &self.inner.entry))
-                        .unwrap_or(true);
-                    if same {
-                        registry.remove(&self.inner.entry.dsn);
-                    }
-                }
-            }
-            // Idempotent — safe to call multiple times.
-            self.inner.entry.engine.close_engine()?;
+        //
+        // The strong_count check MUST happen under the registry write
+        // lock. Otherwise a concurrent `Database::open(dsn)` could read
+        // the registry, upgrade the still-live Weak, and return a fresh
+        // handle to its caller — between our check and our `close_engine`
+        // call — leaving that caller holding a Database whose engine is
+        // closed under it.
+        let mut registry = match DATABASE_REGISTRY.write() {
+            Ok(g) => g,
+            Err(_) => return Err(Error::LockAcquisitionFailed("registry write".to_string())),
+        };
+        if Arc::strong_count(&self.inner.entry) != 1 {
+            return Ok(());
         }
+        // Proactively clear the registry's dead-soon Weak so the next
+        // `open(dsn)` doesn't have to upgrade-and-fail.
+        if let Some(weak) = registry.get(&self.inner.entry.dsn) {
+            let same = weak
+                .upgrade()
+                .map(|reg| Arc::ptr_eq(&reg, &self.inner.entry))
+                .unwrap_or(true);
+            if same {
+                registry.remove(&self.inner.entry.dsn);
+            }
+        }
+        drop(registry);
+        // Idempotent — safe to call multiple times.
+        self.inner.entry.engine.close_engine()?;
 
         Ok(())
     }

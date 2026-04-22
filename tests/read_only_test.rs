@@ -2552,3 +2552,140 @@ fn open_read_only_works_on_read_only_dir() {
         std::panic::resume_unwind(e);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Round-15 follow-up: post-merge review fixes
+// ---------------------------------------------------------------------------
+
+#[test]
+fn engine_checkpoint_cycle_refused_on_read_only_handle() {
+    // Round-15 #1: `Engine::checkpoint_cycle` and `force_checkpoint_cycle`
+    // mutate persistent state (seal hot rows, persist manifest, truncate
+    // WAL). Sibling Engine write methods (`create_snapshot`,
+    // `restore_snapshot`) gate with `ensure_writable`; checkpoint must too,
+    // otherwise a Rust caller doing
+    // `Database::open("file:///path?read_only=true").engine().checkpoint_cycle()`
+    // can drive a write path under LOCK_SH.
+    use stoolap::storage::Engine;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("ckpt_gate.db");
+
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.close().unwrap();
+    }
+
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+    let db = Database::open(&dsn_ro).unwrap();
+    let engine = db.engine();
+
+    let err = match engine.checkpoint_cycle() {
+        Ok(_) => panic!("checkpoint_cycle on read-only engine must fail"),
+        Err(e) => e,
+    };
+    assert!(
+        err.is_read_only_violation(),
+        "expected ReadOnlyViolation from checkpoint_cycle, got: {err:?}"
+    );
+
+    let err = match engine.force_checkpoint_cycle() {
+        Ok(_) => panic!("force_checkpoint_cycle on read-only engine must fail"),
+        Err(e) => e,
+    };
+    assert!(
+        err.is_read_only_violation(),
+        "expected ReadOnlyViolation from force_checkpoint_cycle, got: {err:?}"
+    );
+}
+
+#[test]
+fn close_strong_count_check_holds_registry_lock() {
+    // Round-15 #2: `Database::close()` previously read `strong_count` of
+    // the engine entry OUTSIDE the registry write lock. Race window:
+    //   T1 close(): count == 1 -> proceed
+    //   T2 open(dsn): registry read lock -> upgrade Weak (count = 2) ->
+    //                 returns a fresh handle to its caller
+    //   T1 close(): registry write lock -> remove entry -> close_engine()
+    //   T2: holds Database whose engine is now closed
+    //
+    // Fix: take the registry write lock first, then check strong_count
+    // under it; once we hold it no `open()` can take the read lock to
+    // upgrade.
+    //
+    // Direct race-condition tests are flaky, but the invariant we care
+    // about is observable: if an `open(dsn)` succeeds while a peer is
+    // calling `close()`, the returned handle must serve queries (engine
+    // not closed under it).
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
+    use std::thread;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("close_race.db");
+
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3)", ())
+            .unwrap();
+        db.close().unwrap();
+    }
+
+    let dsn = format!("file://{}", path.display());
+    let stop = StdArc::new(AtomicBool::new(false));
+
+    let dsn_a = dsn.clone();
+    let stop_a = StdArc::clone(&stop);
+    let opener = thread::spawn(move || {
+        while !stop_a.load(Ordering::Relaxed) {
+            if let Ok(db) = Database::open(&dsn_a) {
+                let mut rows = match db.query("SELECT COUNT(*) FROM t", ()) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let row = match rows.next() {
+                    Some(Ok(r)) => r,
+                    Some(Err(_)) => return false,
+                    None => continue,
+                };
+                let _: i64 = row.get(0).unwrap();
+                let _ = db.close();
+            }
+        }
+        true
+    });
+
+    let dsn_b = dsn.clone();
+    let stop_b = StdArc::clone(&stop);
+    let closer = thread::spawn(move || -> bool {
+        while !stop_b.load(Ordering::Relaxed) {
+            let db = match Database::open(&dsn_b) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if db.close().is_err() {
+                return false;
+            }
+        }
+        true
+    });
+
+    thread::sleep(std::time::Duration::from_millis(500));
+    stop.store(true, Ordering::Relaxed);
+    let opener_ok = opener.join().unwrap();
+    let closer_ok = closer.join().unwrap();
+
+    assert!(
+        opener_ok,
+        "opener thread observed an engine closed under it during open/query"
+    );
+    assert!(
+        closer_ok,
+        "closer thread saw a close() error from a freshly-opened handle"
+    );
+}
