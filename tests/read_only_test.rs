@@ -810,7 +810,13 @@ fn read_only_mode_mismatch_masks_dsn_query_string() {
         Ok(_) => panic!("mode mismatch must error"),
         Err(e) => e,
     };
-    let msg = format!("{err:?}");
+    // Pull the inner message out by variant rather than formatting the
+    // Error: Debug-formatting escapes backslashes on Windows paths and
+    // breaks the path-substring check.
+    let msg = match err {
+        Error::ReadOnlyViolation(m) => m,
+        other => panic!("expected ReadOnlyViolation, got: {other:?}"),
+    };
     assert!(
         !msg.contains("hunter2"),
         "DSN query string with secret leaked into error message: {msg}"
