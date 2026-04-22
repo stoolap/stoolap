@@ -30,7 +30,7 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::storage::expression::ConstBoolExpr;
-use crate::storage::traits::{Index, Table};
+use crate::storage::traits::{Index, ReadTable};
 
 use super::hash_join::JoinType;
 
@@ -72,7 +72,7 @@ pub struct IndexNestedLoopJoinOperator {
     outer: Box<dyn Operator>,
 
     // Inner table (accessed via index)
-    inner_table: Box<dyn Table>,
+    inner_table: Box<dyn ReadTable>,
 
     // Join configuration
     join_type: JoinType,
@@ -121,7 +121,7 @@ impl IndexNestedLoopJoinOperator {
     /// * `residual_filter` - Optional additional filter after key match
     pub fn new(
         outer: Box<dyn Operator>,
-        inner_table: Box<dyn Table>,
+        inner_table: Box<dyn ReadTable>,
         inner_schema: Vec<ColumnInfo>,
         join_type: JoinType,
         outer_key_idx: usize,
@@ -483,7 +483,7 @@ pub struct BatchIndexNestedLoopJoinOperator {
     outer: Box<dyn Operator>,
 
     // Inner table
-    inner_table: Box<dyn Table>,
+    inner_table: Box<dyn ReadTable>,
 
     // Join configuration
     join_type: JoinType,
@@ -513,7 +513,7 @@ impl BatchIndexNestedLoopJoinOperator {
     /// Create a new batch index nested loop join operator.
     pub fn new(
         outer: Box<dyn Operator>,
-        inner_table: Box<dyn Table>,
+        inner_table: Box<dyn ReadTable>,
         inner_schema: Vec<ColumnInfo>,
         join_type: JoinType,
         outer_key_idx: usize,

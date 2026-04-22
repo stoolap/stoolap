@@ -983,9 +983,9 @@ pub struct WALManager {
 }
 
 impl WALManager {
-    /// Create a new WAL manager with default config
+    /// Create a new WAL manager with default config (writable).
     pub fn new(path: impl AsRef<Path>, sync_mode: SyncMode) -> Result<Self> {
-        Self::with_config(path, sync_mode, None)
+        Self::with_config(path, sync_mode, None, false)
     }
 
     /// Recover from any interrupted WAL truncation operations
@@ -1085,16 +1085,59 @@ impl WALManager {
         path: impl AsRef<Path>,
         sync_mode: SyncMode,
         config: Option<&PersistenceConfig>,
+        read_only: bool,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
-        // Create WAL directory if it doesn't exist
-        fs::create_dir_all(&path)
-            .map_err(|e| Error::internal(format!("failed to create WAL directory: {}", e)))?;
+        // Create WAL directory only on writable opens. On a read-only
+        // mount the dir must already exist (caller verifies); calling
+        // create_dir_all would fail with EROFS / EACCES.
+        if !read_only {
+            fs::create_dir_all(&path)
+                .map_err(|e| Error::internal(format!("failed to create WAL directory: {}", e)))?;
+        }
 
         // CRITICAL: Recover from any interrupted truncation before proceeding
-        // This ensures data integrity if a crash happened during WAL truncation
-        Self::recover_interrupted_truncation(&path)?;
+        // This ensures data integrity if a crash happened during WAL truncation.
+        // Skipped on read-only opens (recovery would write to disk).
+        if !read_only {
+            Self::recover_interrupted_truncation(&path)?;
+        }
+
+        // Pick how to open existing WAL files. Writable opens want
+        // `read + append` (and create if missing). Read-only opens want
+        // `read` only — no append (would require write perm), no create
+        // (would create state on a read-only mount).
+        let open_existing_wal = |wal_path: &Path| -> std::io::Result<File> {
+            if read_only {
+                OpenOptions::new().read(true).open(wal_path)
+            } else {
+                OpenOptions::new().read(true).append(true).open(wal_path)
+            }
+        };
+
+        // Read-only opens distinguish "wal/ missing" (acceptable —
+        // volumes-only deployments are valid; checkpointed databases
+        // shipped without a WAL fall in this bucket) from "wal/ exists
+        // but unreadable" (fatal — silently coming up with no WAL would
+        // let the engine appear "successfully open" while missing every
+        // uncheckpointed change).
+        if read_only {
+            match fs::read_dir(&path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // No wal/ at all. Caller relies on volumes / fresh
+                    // engine. Continue with no WAL.
+                }
+                Err(e) => {
+                    return Err(Error::internal(format!(
+                        "read-only open: cannot read WAL directory '{}': {}",
+                        path.display(),
+                        e
+                    )));
+                }
+            }
+        }
 
         let mut wal_file: Option<File> = None;
         let mut initial_lsn: u64 = 0;
@@ -1108,7 +1151,7 @@ impl WALManager {
                 initial_lsn = checkpoint.lsn;
 
                 let wal_path = path.join(&checkpoint.wal_file);
-                if let Ok(file) = OpenOptions::new().read(true).append(true).open(&wal_path) {
+                if let Ok(file) = open_existing_wal(&wal_path) {
                     wal_file = Some(file);
                 }
             }
@@ -1125,6 +1168,28 @@ impl WALManager {
                         && name.ends_with(".log")
                     {
                         wal_files.push(name);
+                    }
+                }
+            }
+
+            // Read-only opens with WAL files present that we cannot open:
+            // surface the failure rather than silently coming up with no
+            // WAL. (For writable opens, the create-new-WAL path below
+            // takes over.)
+            if read_only && !wal_files.is_empty() && wal_file.is_none() {
+                // Re-attempt the open of the newest file to capture the
+                // OS error. Sorting first so we pick the same file the
+                // happy path would have used.
+                let mut sorted = wal_files.clone();
+                sorted.sort_by_key(|name| Self::extract_lsn_from_filename(name).unwrap_or(0));
+                if let Some(newest) = sorted.last() {
+                    let wal_path = path.join(newest);
+                    if let Err(e) = open_existing_wal(&wal_path) {
+                        return Err(Error::internal(format!(
+                            "read-only open: cannot read WAL file '{}': {}",
+                            wal_path.display(),
+                            e
+                        )));
                     }
                 }
             }
@@ -1147,7 +1212,7 @@ impl WALManager {
                     }
                 }
 
-                if let Ok(file) = OpenOptions::new().read(true).append(true).open(&wal_path) {
+                if let Ok(file) = open_existing_wal(&wal_path) {
                     // Find last LSN in file
                     if let Ok(last_lsn) = find_last_lsn(&path.join(newest)) {
                         if last_lsn > initial_lsn {
@@ -1159,8 +1224,12 @@ impl WALManager {
             }
         }
 
-        // Create new WAL file if none exists
-        if wal_file.is_none() {
+        // Create new WAL file if none exists. Writable opens only —
+        // a read-only mount can't create a file, and a read-only handle
+        // has no business appending to the WAL anyway. If no WAL files
+        // were found in read-only mode, wal_file stays None and replay
+        // is a no-op (volumes alone supply the engine state).
+        if wal_file.is_none() && !read_only {
             let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
             wal_filename = format!("wal-{}-lsn-0.log", timestamp);
             let wal_path = path.join(&wal_filename);
@@ -3541,7 +3610,7 @@ mod tests {
             ..Default::default()
         };
 
-        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config)).unwrap();
+        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config), false).unwrap();
 
         // Initial state
         assert_eq!(wal.current_sequence(), 0);
@@ -3600,7 +3669,7 @@ mod tests {
             ..Default::default()
         };
 
-        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config)).unwrap();
+        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config), false).unwrap();
 
         // Write entries before rotation
         for i in 1..=3 {
@@ -3665,7 +3734,7 @@ mod tests {
         wal.close().unwrap();
 
         // Reopen and replay - should get all committed entries from BOTH files
-        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config)).unwrap();
+        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config), false).unwrap();
 
         let mut row_ids = Vec::new();
         let mut commit_count = 0;

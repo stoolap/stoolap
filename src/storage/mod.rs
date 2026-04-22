@@ -47,9 +47,26 @@ pub use config::{CleanupConfig, Config, PersistenceConfig, SyncMode};
 
 // Re-export trait types
 pub use traits::{
-    EmptyResult, EmptyScanner, Engine, Index, MemoryResult, QueryResult, Scanner, Table,
-    TemporalType, Transaction, VecScanner,
+    EmptyResult, EmptyScanner, Engine, Index, MemoryResult, QueryResult, ReadEngine, ReadTable,
+    ReadTransaction, Scanner, TemporalType, VecScanner, WriteTable, WriteTransaction,
 };
+
+// Backwards-compatibility aliases for the trait names that existed before
+// the read/write split. External crates that imported `stoolap::storage::Table`
+// or `stoolap::storage::Transaction` continue to compile against the writable
+// surface (which is the conservative choice — old code that called write
+// methods keeps working). New code should prefer the explicit `WriteTable` /
+// `WriteTransaction` (or `ReadTable` / `ReadTransaction` for read-only paths).
+#[deprecated(
+    since = "0.4.0",
+    note = "Renamed to `WriteTable`. For read-only access prefer `ReadTable`."
+)]
+pub use traits::WriteTable as Table;
+#[deprecated(
+    since = "0.4.0",
+    note = "Renamed to `WriteTransaction`. For read-only access prefer `ReadTransaction`."
+)]
+pub use traits::WriteTransaction as Transaction;
 
 // Re-export MVCC types
 pub use mvcc::{

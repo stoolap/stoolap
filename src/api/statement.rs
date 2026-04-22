@@ -93,8 +93,20 @@ impl Statement {
                 .lock()
                 .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
-            // Check if already cached (e.g. same SQL prepared twice)
+            // Check if already cached (e.g. same SQL prepared twice).
+            //
+            // On a read-only executor, refuse write-intent SQL up front —
+            // even on a cache hit produced by an earlier writable caller.
+            // Without this, `prepare()` would succeed against a read-only
+            // Database and the refusal would only fire later at
+            // `execute()` / `query()`, which is harder to debug than the
+            // immediate rejection.
             if let Some(cached) = executor.query_cache().get(&sql) {
+                if executor.is_read_only() {
+                    if let Some(reason) = cached.statement.write_reason() {
+                        return Err(Error::read_only_violation_at("parser", reason));
+                    }
+                }
                 Some(cached)
             } else {
                 let mut parser = Parser::new(&sql);
@@ -112,6 +124,12 @@ impl Statement {
                             sql
                         )));
                     }
+                    // Same read-only refusal for the freshly-parsed path.
+                    if executor.is_read_only() {
+                        if let Some(reason) = stmt.write_reason() {
+                            return Err(Error::read_only_violation_at("parser", reason));
+                        }
+                    }
                     let (has_params, param_count) = crate::executor::count_parameters(&stmt);
                     let stmt_arc = Arc::new(stmt);
                     let cached =
@@ -128,6 +146,16 @@ impl Statement {
                                 "invalid SQL: unrecognised statement: {}",
                                 sql
                             )));
+                        }
+                    }
+                    // Multi-statement SQL on a read-only executor: refuse
+                    // any program containing at least one write-intent
+                    // statement. Single fresh parse — no re-parse needed.
+                    if executor.is_read_only() {
+                        for s in &program.statements {
+                            if let Some(reason) = s.write_reason() {
+                                return Err(Error::read_only_violation_at("parser", reason));
+                            }
                         }
                     }
                     // Multi-statement SQL: validated but not cacheable

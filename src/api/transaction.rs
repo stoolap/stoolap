@@ -42,10 +42,9 @@ use crate::executor::Executor;
 use crate::parser::ast::{Expression, Statement};
 use crate::parser::Parser;
 use crate::storage::expression::Expression as StorageExprTrait;
-use crate::storage::mvcc::engine::MVCCEngine;
-use crate::storage::traits::{QueryResult, Transaction as StorageTransaction};
+use crate::storage::traits::{QueryResult, WriteTransaction as StorageTransaction};
 
-use super::database::FromValue;
+use super::database::{EngineEntry, FromValue};
 use super::params::Params;
 use super::rows::Rows;
 
@@ -53,19 +52,27 @@ use super::rows::Rows;
 ///
 /// Provides ACID guarantees for a series of database operations.
 /// Must be explicitly committed or rolled back.
+///
+/// Holds an `Arc<EngineEntry>` (not just `Arc<MVCCEngine>`) so the
+/// engine entry's strong count reflects this transaction. Without
+/// that, `Database::close()` — which decides whether to close the
+/// engine using `Arc::strong_count(&entry)` — could fire
+/// `engine.close_engine()` while a transaction is alive, and the next
+/// statement on the transaction would error with `EngineNotOpen`. The
+/// engine itself is reachable via `entry.engine`.
 pub struct Transaction {
     tx: Option<Box<dyn StorageTransaction>>,
-    engine: Arc<MVCCEngine>,
+    entry: Arc<EngineEntry>,
     committed: bool,
     rolled_back: bool,
 }
 
 impl Transaction {
     /// Create a new transaction wrapper
-    pub(crate) fn new(tx: Box<dyn StorageTransaction>, engine: Arc<MVCCEngine>) -> Self {
+    pub(crate) fn new(tx: Box<dyn StorageTransaction>, entry: Arc<EngineEntry>) -> Self {
         Self {
             tx: Some(tx),
-            engine,
+            entry,
             committed: false,
             rolled_back: false,
         }
@@ -313,7 +320,15 @@ impl Transaction {
                 | Statement::Delete(_)
         ) {
             let tx = self.tx.take().ok_or(Error::TransactionNotStarted)?;
-            let executor = Executor::new(self.engine.clone());
+            // Use the engine entry's shared semantic cache and query
+            // planner so DML / ANALYZE inside this transaction
+            // invalidate the cache and stats that sibling handles see,
+            // not just per-call local state that drops at end-of-method.
+            let executor = Executor::with_shared_semantic_cache(
+                self.entry.engine.clone(),
+                Arc::clone(&self.entry.semantic_cache),
+                Arc::clone(&self.entry.query_planner),
+            );
             executor.install_transaction(tx);
             let result = executor.execute_statement(statement, ctx);
             // Reclaim the transaction regardless of success/failure
