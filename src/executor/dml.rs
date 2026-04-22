@@ -25,7 +25,7 @@ use crate::common::SmartString;
 use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueMap};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
-use crate::storage::traits::{Engine, QueryResult, Table};
+use crate::storage::traits::{Engine, QueryResult, ReadTable, WriteTable};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -165,7 +165,7 @@ impl Executor {
         table_name: &str,
         where_clause: &Expression,
         schema: &Schema,
-        table: &dyn Table,
+        table: &dyn ReadTable,
         ctx: &ExecutionContext,
     ) -> Result<Option<Vec<i64>>> {
         // Check if this is a single-column INTEGER PRIMARY KEY
@@ -303,7 +303,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.engine.begin_writable_transaction_internal()?;
                 let table = tx.get_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -1126,7 +1126,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.engine.begin_writable_transaction_internal()?;
                 let table = tx.get_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -1539,7 +1539,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.engine.begin_writable_transaction_internal()?;
                 let table = tx.get_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -2375,7 +2375,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.engine.begin_writable_transaction_internal()?;
                 let table = tx.get_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -2754,7 +2754,7 @@ impl Executor {
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
-                let tx = self.engine.begin_transaction()?;
+                let tx = self.engine.begin_writable_transaction_internal()?;
                 let table = tx.get_table(table_name)?;
                 (table, true, Some(tx))
             };
@@ -2895,7 +2895,7 @@ impl Executor {
     #[allow(clippy::too_many_arguments)]
     fn apply_on_duplicate_update(
         &self,
-        table: &mut Box<dyn Table>,
+        table: &mut Box<dyn WriteTable>,
         schema: &crate::core::Schema,
         row_id: i64,
         conflict_column: Option<&str>,
@@ -3067,7 +3067,7 @@ impl Executor {
     /// Uses direct index lookup (O(1) hash) instead of full table scan.
     fn find_row_by_unique_index(
         &self,
-        table: &dyn Table,
+        table: &dyn WriteTable,
         schema: &crate::core::Schema,
         index_name: &str,
         column_name: &str,

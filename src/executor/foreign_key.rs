@@ -771,8 +771,9 @@ pub(crate) fn check_no_referencing_rows(
                 .collect_rows_with_limit_unordered(Some(&not_null_expr), 1, 0)?
                 .is_empty()
         } else {
-            let tx = engine.begin_transaction()?;
-            let child = tx.get_table(child_table)?;
+            use crate::storage::traits::ReadEngine;
+            let tx = ReadEngine::begin_read_transaction(engine)?;
+            let child = tx.get_read_table(child_table)?;
             !child
                 .collect_rows_with_limit_unordered(Some(&not_null_expr), 1, 0)?
                 .is_empty()

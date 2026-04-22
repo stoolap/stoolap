@@ -27,7 +27,7 @@ use crate::common::SmartString;
 use crate::core::{Error, Result, Value, ValueMap, ValueSet};
 use crate::parser::ast::*;
 use crate::parser::token::TokenType;
-use crate::storage::traits::Engine;
+use crate::storage::traits::{Engine, ReadEngine};
 
 use super::context::{
     cache_batch_aggregate, cache_batch_aggregate_info, cache_count_counter,
@@ -2963,11 +2963,11 @@ impl Executor {
             if limit > 0 && limit <= SMALL_LIMIT_THRESHOLD {
                 // Check if inner table has an index on correlation column
                 // Without index, per-row evaluation would be slow
-                let txn = match self.engine.begin_transaction() {
+                let txn = match self.engine.begin_read_transaction() {
                     Ok(t) => t,
                     Err(_) => return false,
                 };
-                let inner_table = match txn.get_table(&info.inner_table) {
+                let inner_table = match txn.get_read_table(&info.inner_table) {
                     Ok(t) => t,
                     Err(_) => return false,
                 };
@@ -3143,8 +3143,8 @@ impl Executor {
         _ctx: &ExecutionContext,
     ) -> Result<crate::core::RowVec> {
         // Direct table access - much faster than going through execute_select
-        let txn = self.engine.begin_transaction()?;
-        let inner_table = txn.get_table(&info.inner_table)?;
+        let txn = self.engine.begin_read_transaction()?;
+        let inner_table = txn.get_read_table(&info.inner_table)?;
 
         // Convert non-correlated WHERE to storage expression for pushdown
         let storage_expr = info

@@ -66,14 +66,19 @@ PERSISTENCE DSN PARAMETERS:\n\
   commit_batch_size=COUNT     Commits to batch before sync (default: 100)\n\
   sync_interval_ms=MS         Min time between syncs in normal mode (default: 1000)\n\
   compression_threshold=BYTES Min size to compress (default: 64)\n\
-  target_volume_rows=ROWS     Target rows per cold volume (default: 1048576)\n\n\
+  target_volume_rows=ROWS     Target rows per cold volume (default: 1048576)\n\
+  read_only=true|false        Open in read-only mode (default: false)\n\
+                              Shared file lock; writes refused.\n\
+                              Equivalent: --read-only, ?mode=ro\n\n\
 EXAMPLES:\n\
   stoolap -d memory://                                    In-memory database\n\
   stoolap -d file:///tmp/mydb                             Persistent database\n\
   stoolap -d file:///tmp/mydb?sync_mode=full               Maximum durability\n\
   stoolap -d file:///tmp/mydb?sync_mode=none&compression=off  Max performance\n\
   stoolap -d file:///tmp/mydb --profile durable           Use durable preset\n\
-  stoolap -d file:///tmp/mydb --sync full --compression off\n\n\
+  stoolap -d file:///tmp/mydb --sync full --compression off\n\
+  stoolap -d file:///tmp/mydb --read-only                 Open read-only (LOCK_SH)\n\
+  stoolap -d file:///tmp/mydb?read_only=true              Same via DSN flag\n\n\
 BACKUP & RESTORE:\n\
   stoolap -d file:///tmp/mydb --snapshot                  Create backup snapshot\n\
   stoolap -d file:///tmp/mydb --restore                   Restore from latest snapshot\n\
@@ -162,6 +167,28 @@ struct Args {
     /// Long-running queries will be cancelled after this time.
     #[arg(short = 't', long = "timeout", value_name = "MS", default_value = "0")]
     timeout_ms: u64,
+
+    /// Open the database in read-only mode.
+    ///
+    /// Acquires a shared file lock (multiple readers can coexist), skips the
+    /// background cleanup thread, and rejects every write SQL statement
+    /// (INSERT/UPDATE/DELETE/DDL/maintenance PRAGMA) with `ReadOnlyViolation`.
+    /// Equivalent to passing `?read_only=true` in the DSN. For file:// the
+    /// path must already exist and contain a stoolap database; a fresh DB is
+    /// never created on disk in read-only mode.
+    ///
+    /// Mutually exclusive with --restore (which writes snapshot data to
+    /// disk before opening), --snapshot (which writes new files), and
+    /// --reset-volumes (which deletes on-disk state). Combining any of
+    /// those with --read-only would either fail later inside the engine
+    /// or leave the user with a confusing read-only handle on
+    /// freshly-restored data.
+    #[arg(
+        long = "read-only",
+        alias = "readonly",
+        conflicts_with_all = ["restore", "snapshot", "reset_volumes"]
+    )]
+    read_only: bool,
 }
 
 /// CLI state for interactive mode
@@ -651,8 +678,15 @@ impl Cli {
 fn build_dsn(args: &Args) -> String {
     let mut dsn = args.db_path.clone();
 
-    // Only add params for file:// databases
+    // Persistence params only make sense for file://. memory:// gets the
+    // read-only flag handled below (it's the only flag that's meaningful
+    // for both schemes).
     if !dsn.starts_with("file://") {
+        if args.read_only {
+            let separator = if dsn.contains('?') { "&" } else { "?" };
+            dsn.push_str(separator);
+            dsn.push_str("read_only=true");
+        }
         return dsn;
     }
 
@@ -735,6 +769,14 @@ fn build_dsn(args: &Args) -> String {
         params.push("checkpoint_on_close=off".to_string());
     }
 
+    // Read-only mode (CLI flag → DSN param). Lets `--read-only` work without
+    // the user editing the DSN. If the DSN already carries `read_only=` /
+    // `readonly=` / `mode=`, the parser uses last-flag-wins, so the CLI
+    // flag (appended last) takes precedence.
+    if args.read_only {
+        params.push("read_only=true".to_string());
+    }
+
     // Append params to DSN
     if !params.is_empty() {
         let separator = if dsn.contains('?') { "&" } else { "?" };
@@ -790,9 +832,17 @@ fn print_persistence_info(args: &Args) {
     if args.no_checkpoint_on_close {
         println!("Persistence: Checkpoint on close = off");
     }
+
+    if args.read_only {
+        println!("Persistence: Read-only mode (shared lock, writes refused)");
+    }
 }
 
 fn main() {
+    // clap handles --read-only / --restore / --snapshot / --reset-volumes
+    // mutual-exclusion via the `conflicts_with_all` attribute on the
+    // --read-only arg, so an invalid combination errors at parse time
+    // with the standard clap diagnostic before we ever reach this point.
     let args = Args::parse();
 
     // Build the DSN with optional query parameters
