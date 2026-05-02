@@ -2354,29 +2354,34 @@ impl SegmentManager {
             return 0;
         }
         let tombstones = Arc::clone(&*self.tombstones.read());
-        if segments.len() == 1 {
-            let total: usize = segments.values().map(|cs| cs.volume.meta.row_count).sum();
-            return total.saturating_sub(tombstones.len());
-        }
 
-        // Fast path: use visibility bitmaps (O(1) per row, zero allocation).
-        // visible=None means all rows visible (no overlap), is_visible() handles both.
-        {
-            let mut count = 0usize;
-            for cs in segments.values() {
-                let vol = &cs.volume;
-                for i in 0..vol.meta.row_count {
-                    if !cs.is_visible(i) {
-                        continue;
-                    }
-                    if !tombstones.is_empty() && tombstones.contains_key(&vol.meta.row_ids[i]) {
-                        continue;
-                    }
-                    count += 1;
+        // The previous single-segment fast path returned
+        // `total - tombstones.len()`, which subtracted EVERY manifest
+        // tombstone from the segment's row count. After compaction
+        // collapses N segments into 1, the manifest may still carry
+        // tombstones for row_ids that the merged volume already
+        // physically excluded; subtracting them under-counts the
+        // current segment by the number of those orphan tombstones.
+        // SWMR readers also see this whenever a writer compacts down
+        // to a single segment between checkpoints, producing the
+        // "COUNT(*) wrong on read-only" bug. The per-row path below
+        // is correct for any segment count, including 1, because
+        // `tombstones.contains_key(rid)` only filters row_ids that
+        // are actually present in this segment.
+        let mut count = 0usize;
+        for cs in segments.values() {
+            let vol = &cs.volume;
+            for i in 0..vol.meta.row_count {
+                if !cs.is_visible(i) {
+                    continue;
                 }
+                if !tombstones.is_empty() && tombstones.contains_key(&vol.meta.row_ids[i]) {
+                    continue;
+                }
+                count += 1;
             }
-            count
         }
+        count
     }
 
     /// Get the cached column mapping for a volume. Computes on first call,

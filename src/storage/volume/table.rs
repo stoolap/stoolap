@@ -1719,15 +1719,34 @@ impl ReadTable for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return self.collect_all_rows(None).map_or(0, |r| r.len());
         }
-        // During seal, rows temporarily exist in both hot and cold.
-        // Use the same O(1) formula with overlap correction. The count
-        // may be off by a few rows during the brief overlap window, but
-        // this avoids an O(total_rows) HashSet collection that made ALL
-        // queries slow during checkpoint.
+        // The `seg + hot - overlap` fast path assumes hot/cold are
+        // disjoint (true for writers because seal moves rows OUT of
+        // hot before they land in cold). SWMR cross-process readers
+        // violate that invariant: their hot buffer is populated by
+        // initial WAL replay at attach and never drains (read-only
+        // opens cannot seal), so when the writer subsequently
+        // checkpoints those same logical rows into a new sealed
+        // segment, the reader sees the row_id in BOTH hot and cold.
+        // `seal_overlap` is only set during the writer's brief seal
+        // critical section, so it stays 0 on the reader and every
+        // replay-then-checkpointed row is double-counted by COUNT(*).
+        //
+        // Whenever both sides are non-empty we cannot tell from the
+        // fast-path formula alone whether hot and cold overlap (the
+        // writer's `set_seal_overlap` is the only signal and it
+        // doesn't fire on readers). The full scan correctly dedupes
+        // via the per-volume scanner skip set, so we use it whenever
+        // hot is non-empty alongside cold. Pure-cold tables (hot
+        // empty) and pure-hot tables (cold empty) keep the O(1)
+        // formula since there can be no overlap to mishandle.
+        let hot_count = self.hot.row_count();
+        if hot_count > 0 && self.segment_mgr.has_segments() {
+            return self.collect_all_rows(None).map_or(0, |r| r.len());
+        }
         let seg = self.segment_mgr.deduped_row_count();
         let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
         let overlap = self.segment_mgr.seal_overlap();
-        seg.saturating_sub(pending) + self.hot.row_count().saturating_sub(overlap)
+        seg.saturating_sub(pending) + hot_count.saturating_sub(overlap)
     }
     fn row_count_hint(&self) -> usize {
         let seg = self.segment_row_count_hint();
@@ -1743,12 +1762,16 @@ impl ReadTable for SegmentedTable {
             return None;
         }
         let hot_count = self.hot.fast_row_count()?;
+        // Same disjoint-set assumption as `row_count` above. Bail to
+        // the slow path when hot AND cold are both non-empty so the
+        // SWMR-reader hot/cold overlap doesn't double-count via the
+        // O(1) formula. Caller (Table::row_count) will then scan.
+        if hot_count > 0 && self.segment_mgr.has_segments() {
+            return None;
+        }
         let seg = self.segment_mgr.deduped_row_count();
         let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
         let overlap = self.segment_mgr.seal_overlap();
-        // During seal, rows temporarily exist in both hot and cold.
-        // Subtract overlap to avoid double-counting. May drift by a few rows
-        // during the brief window, but O(1) vs O(N) is worth it.
         Some(seg.saturating_sub(pending) + hot_count.saturating_sub(overlap))
     }
 
