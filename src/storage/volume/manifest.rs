@@ -2783,7 +2783,7 @@ impl SegmentManager {
             u64,
             Arc<crate::storage::volume::writer::FrozenVolume>,
         > = staged_loads.into_iter().collect();
-        let new_segments_map: FxHashMap<u64, ColdSegment> = {
+        let mut new_segments_map: FxHashMap<u64, ColdSegment> = {
             let segs = self.segments.read();
             let mut new_map: FxHashMap<u64, ColdSegment> = FxHashMap::with_capacity_and_hasher(
                 new_manifest.segments.len(),
@@ -2817,6 +2817,36 @@ impl SegmentManager {
             }
             new_map
         };
+
+        // Recompute per-segment visibility bitmaps for the new map.
+        //
+        // Without this step, kept segments retain `visible` bitmaps
+        // computed against the PRIOR segment set, and newly-loaded
+        // segments get `visible: None` (= all rows visible). Both are
+        // wrong relative to the new set: a row_id that an old segment
+        // contained may now be superseded by a newer segment the
+        // reader just learned about, but the old segment's bitmap
+        // still marks that row visible. The MergingScanner would then
+        // return the same row_id from BOTH segments, producing
+        // duplicate rows in cross-process SWMR readers when a writer
+        // UPSERT lands a new sealed segment between two reader
+        // refreshes.
+        //
+        // Visibility is purely a function of the current segment set
+        // (newest-first dedup by row_id), so recomputing across
+        // reload_from_manifest is exactly what writer-side seal /
+        // compaction paths already do via remove_segments_inner /
+        // replace_segments_atomic.
+        let seg_ids: Vec<u64> = new_manifest
+            .segments
+            .iter()
+            .map(|m| m.segment_id)
+            .collect();
+        compute_visibility_bitmaps(
+            &seg_ids,
+            &mut new_segments_map,
+            &mut self.visibility_seen.lock(),
+        );
 
         // Detect change for the return value BEFORE the swap — compare
         // the new segment-id set to the old one. We can't compare
