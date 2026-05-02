@@ -53,6 +53,15 @@ pub struct ColdSegment {
     pub visible: Option<Arc<Vec<u64>>>,
 }
 
+/// Versioned tombstone map: row_id -> commit_seq at which the tombstone was published.
+pub type TombstoneMap = Arc<FxHashMap<i64, u64>>;
+
+/// Ordered cold-segment list paired with their segment ids.
+pub type SegmentList = Vec<(u64, ColdSegment)>;
+
+/// Shared snapshot of the segment list (Arc-wrapped for cheap cloning).
+pub type SharedSegmentList = Arc<SegmentList>;
+
 impl ColdSegment {
     /// Check whether row at position `idx` in this volume is the authoritative
     /// (newest) copy across all overlapping volumes.
@@ -76,7 +85,29 @@ pub struct ColdSnapshot {
 
 // Manifest file magic: "STMF" (SToolap ManiFest)
 const MANIFEST_MAGIC: [u8; 4] = *b"STMF";
-const MANIFEST_VERSION: u32 = 6;
+/// Current manifest format version.
+///
+/// V7 (SWMR v2) is the single SWMR format. Relative to V6 (the
+/// last released format), V7:
+///   - adds per-segment `visible_at_lsn` so capped read-only
+///     attaches drop post-cap segments,
+///   - widens tombstones from 16-byte `(row_id, commit_seq)`
+///     entries to 24-byte `(row_id, commit_seq, visible_at_lsn)`
+///     triples so capped attaches drop post-cap tombstones,
+///   - adds a per-table `schema_version` (engine's `schema_epoch`
+///     at manifest-write time) so a no-shm reader can detect
+///     ALTER TABLE ADD/MODIFY/DROP/RENAME COLUMN that did not
+///     produce a new segment with a bumped per-segment
+///     `schema_version`.
+///
+/// V6 manifests deserialize: per-segment `visible_at_lsn`
+/// synthesizes from `creation_lsn`, tombstones synthesize
+/// `visible_at_lsn = 0` ("always visible"), and table-level
+/// `schema_version` synthesizes as `0` ("no DDL recorded yet").
+const MANIFEST_VERSION: u32 = 7;
+/// V6 (legacy v0.4.0) manifest version. Deserialize-only; the
+/// next write upgrades in place to V7.
+const MANIFEST_VERSION_V6: u32 = 6;
 
 /// Metadata for a single immutable segment (frozen volume).
 #[derive(Debug, Clone)]
@@ -100,6 +131,25 @@ pub struct SegmentMeta {
     /// Schema version when this segment was created. Used with dropped_columns
     /// to correctly mask stale data only from volumes older than a column drop.
     pub schema_version: u64,
+    /// SWMR v2 Phase F: WAL LSN at which this segment first became
+    /// visible to readers (the LSN of the manifest write that
+    /// introduced it). A snapshot pinned at `visible_commit_lsn = P`
+    /// must NOT see segments with `visible_at_lsn > P`. For segments
+    /// loaded from a V6 manifest this is synthesized from
+    /// `creation_lsn` on read (the closest-available approximation).
+    /// New segments set this to the current WAL LSN at registration.
+    pub visible_at_lsn: u64,
+}
+
+impl SegmentMeta {
+    /// SWMR v2 Phase F: is this segment visible to a reader pinned at
+    /// `pinned_lsn`? `pinned_lsn = 0` means "no LSN pin" — see all
+    /// segments (used by writer-side scans). Otherwise the segment is
+    /// visible iff `visible_at_lsn <= pinned_lsn`.
+    #[inline]
+    pub fn is_visible_to_lsn(&self, pinned_lsn: u64) -> bool {
+        pinned_lsn == 0 || self.visible_at_lsn <= pinned_lsn
+    }
 }
 
 /// The manifest for a single table: tracks all live segments and tombstones.
@@ -116,12 +166,22 @@ pub struct TableManifest {
     pub next_segment_id: u64,
     /// WAL LSN of the last checkpoint that included this manifest.
     pub checkpoint_lsn: u64,
-    /// Tombstone entries: (row_id, commit_seq) pairs for cold rows that have
-    /// been deleted or superseded. The commit_seq records when the tombstone
-    /// was created, enabling snapshot isolation: a snapshot transaction at
-    /// begin_seq=N only sees tombstones with commit_seq <= N.
+    /// Tombstone entries: (row_id, commit_seq, visible_at_lsn) triples
+    /// for cold rows that have been deleted or superseded.
+    ///
+    /// - `commit_seq`: when the tombstone was created in the writer's
+    ///   commit-sequence space. Enables snapshot isolation — a
+    ///   snapshot transaction at `begin_seq = N` only sees tombstones
+    ///   with `commit_seq <= N`.
+    /// - `visible_at_lsn` (V7): the WAL LSN at which this tombstone
+    ///   first became cross-process visible. Capped read-only attaches
+    ///   hide tombstones with `visible_at_lsn > cap` so they can't
+    ///   suppress a cold row that was still visible at the reader's
+    ///   `attach_visible_commit_lsn`. V6-loaded tombstones get
+    ///   `visible_at_lsn = 0` (treated as "always visible").
+    ///
     /// Cleared after compaction processes them.
-    pub tombstones: Vec<(i64, u64)>,
+    pub tombstones: Vec<(i64, u64, u64)>,
     /// Column rename history: (old_name, new_name) pairs.
     /// Applied as aliases to cold volumes on load so pre-rename data
     /// is visible through the new schema column name.
@@ -131,6 +191,18 @@ pub struct TableManifest {
     /// before the drop (schema_version <= drop_version) have stale data masked.
     /// Cleared during compaction (new volumes don't have stale data).
     pub dropped_columns: Vec<(SmartString, u64)>,
+    /// Table-level schema epoch (V7). Set by the writer to its
+    /// engine's `schema_epoch` whenever a DDL operation modifies
+    /// this table — including ADD/MODIFY COLUMN that do not
+    /// produce a new segment. The reader's drift checks
+    /// (`peek_schema_drift`, `reload_from_disk`) compare this
+    /// against the reader's known `schema_epoch`; a higher value
+    /// means the writer has done DDL the reader hasn't applied.
+    /// V6 manifests deserialize with `0` (treated as "no
+    /// recorded DDL", same as a fresh V7 manifest); the next
+    /// manifest write upgrades the file to V7 and stamps the
+    /// current epoch.
+    pub schema_version: u64,
 }
 
 impl TableManifest {
@@ -144,6 +216,7 @@ impl TableManifest {
             tombstones: Vec::new(),
             column_renames: Vec::new(),
             dropped_columns: Vec::new(),
+            schema_version: 0,
         }
     }
 
@@ -187,13 +260,26 @@ impl TableManifest {
         buf.write_all(&MANIFEST_VERSION.to_le_bytes())?;
         buf.write_all(&self.next_segment_id.to_le_bytes())?;
         buf.write_all(&self.checkpoint_lsn.to_le_bytes())?;
+        // V7: table-level schema epoch — see field doc on
+        // `TableManifest::schema_version` for why it's needed
+        // beyond the per-segment `schema_version`.
+        buf.write_all(&self.schema_version.to_le_bytes())?;
 
         // Table name
         let name_bytes = self.table_name.as_bytes();
         buf.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
         buf.write_all(name_bytes)?;
 
-        // Segments
+        // Segments. V7 layout per segment (fixed fields = 64 bytes):
+        //   segment_id: u64
+        //   row_count: u64
+        //   min_row_id: i64
+        //   max_row_id: i64
+        //   creation_lsn: u64
+        //   seal_seq: u64
+        //   schema_version: u64
+        //   visible_at_lsn: u64    (V7; V6 lacks this field)
+        // followed by variable-length file_path (u32 len + utf-8 bytes).
         buf.write_all(&(self.segments.len() as u32).to_le_bytes())?;
         for seg in &self.segments {
             buf.write_all(&seg.segment_id.to_le_bytes())?;
@@ -203,6 +289,7 @@ impl TableManifest {
             buf.write_all(&seg.creation_lsn.to_le_bytes())?;
             buf.write_all(&seg.seal_seq.to_le_bytes())?;
             buf.write_all(&seg.schema_version.to_le_bytes())?;
+            buf.write_all(&seg.visible_at_lsn.to_le_bytes())?;
 
             // File path as UTF-8 string
             let path_str = seg.file_path.to_string_lossy();
@@ -211,11 +298,22 @@ impl TableManifest {
             buf.write_all(path_bytes)?;
         }
 
-        // Tombstones: (row_id, commit_seq) pairs
-        buf.write_all(&(self.tombstones.len() as u64).to_le_bytes())?;
-        for &(row_id, commit_seq) in &self.tombstones {
+        // Tombstones (V7): (row_id, commit_seq, visible_at_lsn) triples.
+        // Skip ephemeral entries with `visible_at_lsn == u64::MAX` —
+        // those are failed-marker tombstones (record_commit IO failure
+        // after partial commit) that must stay in-memory-only. Persisting
+        // them would let a future process recovery resurrect a
+        // markerless commit's deletes after the WAL discarded the txn.
+        let persistable_tombstones: Vec<&(i64, u64, u64)> = self
+            .tombstones
+            .iter()
+            .filter(|(_, _, vis)| *vis != u64::MAX)
+            .collect();
+        buf.write_all(&(persistable_tombstones.len() as u64).to_le_bytes())?;
+        for &&(row_id, commit_seq, visible_at_lsn) in &persistable_tombstones {
             buf.write_all(&row_id.to_le_bytes())?;
             buf.write_all(&commit_seq.to_le_bytes())?;
+            buf.write_all(&visible_at_lsn.to_le_bytes())?;
         }
 
         // Column renames: (old_name, new_name) pairs
@@ -245,7 +343,11 @@ impl TableManifest {
         Ok(buf)
     }
 
-    /// Deserialize a manifest from bytes. Only V6 format is supported.
+    /// Deserialize a manifest from bytes. V6 and V7 are both
+    /// supported. V6 manifests synthesize per-segment `visible_at_lsn`
+    /// from `creation_lsn` (the closest-available approximation; no
+    /// historical SWMR-visible-LSN exists for pre-V7 segments). The
+    /// next manifest write upgrades the file in place to V7.
     pub fn deserialize(data: &[u8]) -> io::Result<Self> {
         if data.len() < 28 {
             return Err(io::Error::new(
@@ -262,15 +364,22 @@ impl TableManifest {
         let mut pos = 4;
 
         let version = read_u32(data, &mut pos)?;
-        if version != MANIFEST_VERSION {
+        if version != MANIFEST_VERSION && version != MANIFEST_VERSION_V6 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "unsupported manifest version {} (expected {})",
-                    version, MANIFEST_VERSION
+                    "unsupported manifest version {} (this build supports V{} and V{})",
+                    version, MANIFEST_VERSION_V6, MANIFEST_VERSION
                 ),
             ));
         }
+        // V7 carries per-segment visible_at_lsn, 24-byte
+        // tombstone triples, and a per-table schema_version.
+        // V6 (legacy v0.4.0) has none of these — they
+        // synthesize on read.
+        let is_v7 = version == MANIFEST_VERSION;
+        let tombstone_has_visible_lsn = is_v7;
+        let has_table_schema_version = is_v7;
 
         // Verify trailing CRC32 before parsing the rest.
         let payload = &data[..data.len() - 4];
@@ -292,6 +401,14 @@ impl TableManifest {
 
         let next_segment_id = read_u64(data, &mut pos)?;
         let checkpoint_lsn = read_u64(data, &mut pos)?;
+        // V7: table-level schema epoch sits between checkpoint_lsn
+        // and the table-name length. V6 defaults to 0 (treated as
+        // "no recorded DDL", same as a fresh V7 write).
+        let table_schema_version = if has_table_schema_version {
+            read_u64(data, &mut pos)?
+        } else {
+            0
+        };
 
         // Table name
         let name_len = read_u32(data, &mut pos)? as usize;
@@ -305,11 +422,14 @@ impl TableManifest {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         pos += name_len;
 
-        // Segments: V6 fixed fields are 56 bytes per segment (before variable-length path)
+        // Segments: V6 fixed = 56 bytes/segment, V7 fixed = 64
+        // bytes/segment (the extra 8 are `visible_at_lsn`). Both end
+        // with a variable-length file_path (u32 len + utf-8 bytes).
+        let seg_fixed_len = if is_v7 { 64 } else { 56 };
         let seg_count = read_u32(data, &mut pos)? as usize;
         let mut segments = Vec::with_capacity(seg_count);
         for _ in 0..seg_count {
-            if pos + 56 > data.len() {
+            if pos + seg_fixed_len > data.len() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "manifest truncated at segment",
@@ -322,6 +442,17 @@ impl TableManifest {
             let creation_lsn = read_u64(data, &mut pos)?;
             let seal_seq = read_u64(data, &mut pos)?;
             let schema_version = read_u64(data, &mut pos)?;
+            // V7 carries visible_at_lsn explicitly. V6 doesn't, so
+            // synthesize from creation_lsn — V6 segments don't have
+            // a precise SWMR-visible LSN, but the writer's checkpoint
+            // ordering guarantees that any reader who could see
+            // creation_lsn (which is bounded by checkpoint_lsn) could
+            // also have seen this segment.
+            let visible_at_lsn = if is_v7 {
+                read_u64(data, &mut pos)?
+            } else {
+                creation_lsn
+            };
 
             let path_len = read_u32(data, &mut pos)? as usize;
             if pos + path_len > data.len() {
@@ -343,19 +474,24 @@ impl TableManifest {
                 creation_lsn,
                 seal_seq,
                 schema_version,
+                visible_at_lsn,
             });
         }
 
         // Last 4 bytes are CRC, so stop before them.
         let data_end = data.len() - 4;
 
-        // Tombstones: (row_id: i64, commit_seq: u64) pairs
-        let mut tombstones = Vec::new();
+        // Tombstones: V7 = (row_id, commit_seq, visible_at_lsn)
+        // 24-byte triples; V6 = (row_id, commit_seq) 16-byte pairs
+        // with synthesized visible_at_lsn=0 ("always visible" — V6
+        // pre-dates capped read-only attaches).
+        let mut tombstones: Vec<(i64, u64, u64)> = Vec::new();
         if pos + 8 <= data_end {
             let tombstone_count = read_u64(data, &mut pos)? as usize;
+            let entry_size = if tombstone_has_visible_lsn { 24 } else { 16 };
             tombstones.reserve(tombstone_count);
             for _ in 0..tombstone_count {
-                if pos + 16 > data_end {
+                if pos + entry_size > data_end {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "manifest truncated at tombstone entry",
@@ -363,7 +499,12 @@ impl TableManifest {
                 }
                 let row_id = read_i64(data, &mut pos)?;
                 let commit_seq = read_u64(data, &mut pos)?;
-                tombstones.push((row_id, commit_seq));
+                let visible_at_lsn = if tombstone_has_visible_lsn {
+                    read_u64(data, &mut pos)?
+                } else {
+                    0
+                };
+                tombstones.push((row_id, commit_seq, visible_at_lsn));
             }
         }
 
@@ -452,6 +593,7 @@ impl TableManifest {
             tombstones,
             column_renames,
             dropped_columns,
+            schema_version: table_schema_version,
         })
     }
 
@@ -672,7 +814,11 @@ impl SegmentManager {
     /// Create from an existing manifest loaded from disk.
     pub fn from_manifest(manifest: TableManifest, volume_dir: Option<PathBuf>) -> Self {
         let table_name = manifest.table_name.clone();
-        let tombstone_map: FxHashMap<i64, u64> = manifest.tombstones.iter().copied().collect();
+        let tombstone_map: FxHashMap<i64, u64> = manifest
+            .tombstones
+            .iter()
+            .map(|&(rid, seq, _vis)| (rid, seq))
+            .collect();
         Self {
             table_name,
             manifest: RwLock::new(manifest),
@@ -811,6 +957,79 @@ impl SegmentManager {
             .collect();
         result.reverse();
         Arc::new(result)
+    }
+
+    /// Atomic snapshot of newest-first volumes AND the tombstone map
+    /// that applies to them. Use this in any scan path that needs both
+    /// pieces of cold state — calling `get_volumes_newest_first()` and
+    /// `tombstone_set_arc()` separately would race against a
+    /// concurrent `reload_from_disk` and yield a mixed snapshot
+    /// (e.g. old volumes with new tombstones), silently resurrecting
+    /// stale rows or hiding live ones.
+    ///
+    /// Atomicity is provided by holding `manifest.read()` across the
+    /// segments + tombstones reads. `reload_from_disk` acquires
+    /// `manifest.write()` FIRST in its three-lock publish, so as long
+    /// as our `manifest.read()` is held, none of the three Arcs can
+    /// be swapped underneath us.
+    pub fn volumes_and_tombstones_newest_first(&self) -> (SharedSegmentList, TombstoneMap) {
+        self.ensure_columns();
+        let mut result = self.build_volumes_and_tombstones();
+        // Race check: same as `get_volumes_newest_first`. Eviction may
+        // have created cold volumes between `ensure_columns` (fast-path
+        // `has_cold=false`) and our snapshot. Retry once.
+        if result.0.iter().any(|(_, cs)| cs.volume.is_cold()) {
+            self.ensure_columns();
+            result = self.build_volumes_and_tombstones();
+            let cold: Vec<(u64, usize)> = result
+                .0
+                .iter()
+                .filter(|(_, cs)| cs.volume.is_cold())
+                .map(|(id, cs)| (*id, cs.volume.meta.row_count))
+                .collect();
+            if !cold.is_empty() {
+                for &(seg_id, rows) in &cold {
+                    eprintln!(
+                        "Warning: table {} seg={}: cold volume excluded ({} rows, reload failed)",
+                        self.table_name, seg_id, rows
+                    );
+                }
+                let (mut vols, ts) = result;
+                vols.retain(|(_, cs)| !cs.volume.is_cold());
+                result = (vols, ts);
+            }
+        }
+        let (mut volumes, ts) = result;
+        for (_, cs) in &volumes {
+            cs.volume.mark_accessed();
+        }
+        volumes.reverse();
+        (Arc::new(volumes), ts)
+    }
+
+    /// Internal helper for `volumes_and_tombstones_newest_first`. Returns
+    /// the raw (oldest-first) volume list and the tombstone Arc captured
+    /// under a single `manifest.read()`.
+    fn build_volumes_and_tombstones(&self) -> (SegmentList, TombstoneMap) {
+        let manifest = self.manifest.read();
+        let segs = Arc::clone(&*self.segments.read());
+        let ts = Arc::clone(&*self.tombstones.read());
+        let result: Vec<(u64, ColdSegment)> = manifest
+            .segments
+            .iter()
+            .filter_map(|m| segs.get(&m.segment_id).map(|cs| (m.segment_id, cs.clone())))
+            .collect();
+        (result, ts)
+    }
+
+    /// Atomic lazy variant of `volumes_and_tombstones_newest_first`. Same
+    /// race-free guarantee, but skips `ensure_columns` (scanner paths
+    /// load surviving volumes on demand via `ensure_volume` after
+    /// zone-map/bloom pruning).
+    pub fn volumes_and_tombstones_newest_first_lazy(&self) -> (SharedSegmentList, TombstoneMap) {
+        let (mut volumes, ts) = self.build_volumes_and_tombstones();
+        volumes.reverse();
+        (Arc::new(volumes), ts)
     }
 
     /// Check if there are any segments. O(1) atomic read, no lock.
@@ -1572,12 +1791,17 @@ impl SegmentManager {
         self.manifest.write().table_name = SmartString::from(new_name);
     }
 
-    /// Add tombstone row_ids with their commit_seq (when the tombstone was created).
+    /// Add tombstone row_ids. `commit_seq` enables snapshot isolation
+    /// (older snapshots only see tombstones with `commit_seq <= their begin_seq`).
+    /// `visible_at_lsn` is the WAL LSN at which the tombstone first
+    /// becomes cross-process visible — capped read-only attaches hide
+    /// tombstones with `visible_at_lsn > attach_visible_commit_lsn` so
+    /// they can't suppress a row that was visible at the cap. Pass
+    /// the writer's `current_wal_lsn()` at tombstone-add time.
+    ///
     /// Lock order: manifest FIRST, then tombstones (matches read paths like
     /// deduped_row_count, total_row_count, check_value_exists_in_segments).
-    /// The commit_seq enables snapshot isolation: older snapshots don't see
-    /// newer tombstones, so the original cold row remains visible to them.
-    pub fn add_tombstones(&self, row_ids: &[i64], commit_seq: u64) {
+    pub fn add_tombstones(&self, row_ids: &[i64], commit_seq: u64, visible_at_lsn: u64) {
         if row_ids.is_empty() {
             return;
         }
@@ -1590,7 +1814,7 @@ impl SegmentManager {
             match ts.entry(rid) {
                 Entry::Vacant(e) => {
                     e.insert(commit_seq);
-                    manifest.tombstones.push((rid, commit_seq));
+                    manifest.tombstones.push((rid, commit_seq, visible_at_lsn));
                     changed = true;
                 }
                 Entry::Occupied(mut e) => {
@@ -1601,13 +1825,18 @@ impl SegmentManager {
                     if *e.get() != commit_seq {
                         let old_seq = *e.get();
                         e.insert(commit_seq);
-                        // Update the manifest entry in-place.
+                        // Update the manifest entry in-place. visible_at_lsn
+                        // also advances to the new value — re-recording a
+                        // tombstone makes it cross-process visible at the
+                        // new LSN, so capped readers below the new LSN
+                        // continue to see the original cold row (correct).
                         if let Some(entry) = manifest
                             .tombstones
                             .iter_mut()
-                            .find(|(r, s)| *r == rid && *s == old_seq)
+                            .find(|(r, s, _)| *r == rid && *s == old_seq)
                         {
                             entry.1 = commit_seq;
+                            entry.2 = visible_at_lsn;
                         }
                         changed = true;
                     }
@@ -1644,7 +1873,7 @@ impl SegmentManager {
         if ts.len() != before {
             manifest
                 .tombstones
-                .retain(|&(rid, _)| !row_ids.contains(&rid));
+                .retain(|&(rid, _, _)| !row_ids.contains(&rid));
             self.cached_deduped_count
                 .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         }
@@ -1674,7 +1903,7 @@ impl SegmentManager {
             !matches!(snapshot.get(rid), Some(snap_seq) if *snap_seq == *seq)
         });
         if ts.len() != before {
-            manifest.tombstones.retain(|&(rid, seq)| {
+            manifest.tombstones.retain(|&(rid, seq, _)| {
                 if !row_ids.contains(&rid) {
                     return true;
                 }
@@ -1756,12 +1985,14 @@ impl SegmentManager {
     /// Commit pending tombstones: move from per-txn pending to shared tombstone set.
     /// The commit_seq is the transaction's commit sequence, used for snapshot
     /// isolation: older snapshots won't see these tombstones.
-    pub fn commit_pending_tombstones(&self, txn_id: i64, commit_seq: u64) {
+    /// `visible_at_lsn` stamps the cross-process visibility frontier
+    /// (typically the writer's `current_wal_lsn` at commit time).
+    pub fn commit_pending_tombstones(&self, txn_id: i64, commit_seq: u64, visible_at_lsn: u64) {
         let pending = self.pending_txn_tombstones.write().remove(&txn_id);
         if let Some(ids) = pending {
             if !ids.is_empty() {
                 let id_vec: Vec<i64> = ids.into_iter().collect();
-                self.add_tombstones(&id_vec, commit_seq);
+                self.add_tombstones(&id_vec, commit_seq, visible_at_lsn);
             }
         }
     }
@@ -1788,22 +2019,26 @@ impl SegmentManager {
     ///
     /// Used for constraint checking (PK/UNIQUE).
     pub fn row_exists(&self, row_id: i64) -> bool {
-        let ts = Arc::clone(&*self.tombstones.read());
-        if ts.contains_key(&row_id) {
-            return false;
-        }
-        // Metadata-only check (binary search on row_ids). Does not access
-        // column data, so no mark_accessed — should not pin volumes.
-        let (seg_ids, segments) = {
+        // Atomic snapshot: capture tombstones AND manifest segment
+        // metadata AND segments map under one `manifest.read()` so a
+        // concurrent read-only `reload_from_disk` can't swap any of
+        // them between reads. Same race as `get_cold_row_normalized`.
+        let (ts, seg_ids, segments) = {
             let manifest = self.manifest.read();
             let seg_ids: Vec<(u64, i64, i64)> = manifest
                 .segments
                 .iter()
                 .map(|m| (m.segment_id, m.min_row_id, m.max_row_id))
                 .collect();
+            let ts = Arc::clone(&*self.tombstones.read());
             let segments = Arc::clone(&*self.segments.read());
-            (seg_ids, segments)
+            (ts, seg_ids, segments)
         };
+        if ts.contains_key(&row_id) {
+            return false;
+        }
+        // Metadata-only check (binary search on row_ids). Does not access
+        // column data, so no mark_accessed — should not pin volumes.
         for (seg_id, min_id, max_id) in &seg_ids {
             if row_id < *min_id || row_id > *max_id {
                 continue;
@@ -1821,11 +2056,9 @@ impl SegmentManager {
     /// Iterates newest-first so overlapping row_ids return the newest version.
     /// Uses metadata-only search, reloads only the target cold volume if needed.
     pub fn get_cold_row(&self, row_id: i64) -> Option<crate::core::Row> {
-        let ts = Arc::clone(&*self.tombstones.read());
-        if ts.contains_key(&row_id) {
-            return None;
-        }
-        let (seg_ids, segments) = {
+        // Atomic snapshot: same lock discipline as
+        // `get_cold_row_normalized` and `row_exists`.
+        let (ts, seg_ids, segments) = {
             let manifest = self.manifest.read();
             let seg_ids: Vec<(u64, i64, i64)> = manifest
                 .segments
@@ -1833,9 +2066,13 @@ impl SegmentManager {
                 .rev()
                 .map(|m| (m.segment_id, m.min_row_id, m.max_row_id))
                 .collect();
+            let ts = Arc::clone(&*self.tombstones.read());
             let segments = Arc::clone(&*self.segments.read());
-            (seg_ids, segments)
+            (ts, seg_ids, segments)
         };
+        if ts.contains_key(&row_id) {
+            return None;
+        }
         for (seg_id, min_id, max_id) in &seg_ids {
             if row_id < *min_id || row_id > *max_id {
                 continue;
@@ -1860,7 +2097,10 @@ impl SegmentManager {
     /// Retry get_cold_row with a fresh consistent snapshot after compaction.
     fn get_cold_row_retry(&self, row_id: i64) -> Option<crate::core::Row> {
         self.ensure_columns();
-        let (seg_ids, segments) = {
+        // Re-check tombstones too: a refresh between the failed
+        // `ensure_volume` and this retry can introduce a tombstone
+        // that hides the row in its new compacted location.
+        let (ts, seg_ids, segments) = {
             let manifest = self.manifest.read();
             let seg_ids: Vec<u64> = manifest
                 .segments
@@ -1868,9 +2108,13 @@ impl SegmentManager {
                 .rev()
                 .map(|m| m.segment_id)
                 .collect();
+            let ts = Arc::clone(&*self.tombstones.read());
             let segments = Arc::clone(&*self.segments.read());
-            (seg_ids, segments)
+            (ts, seg_ids, segments)
         };
+        if ts.contains_key(&row_id) {
+            return None;
+        }
         for seg_id in &seg_ids {
             if let Some(cold) = segments.get(seg_id) {
                 if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
@@ -1892,11 +2136,15 @@ impl SegmentManager {
         row_id: i64,
         schema: &crate::core::Schema,
     ) -> Option<crate::core::Row> {
-        let ts = Arc::clone(&*self.tombstones.read());
-        if ts.contains_key(&row_id) {
-            return None;
-        }
-        let (seg_ids, segments) = {
+        // Atomic snapshot: tombstones + manifest segment metadata +
+        // segments map under a single `manifest.read()`. The previous
+        // flow read tombstones first, then took a separate snapshot —
+        // a concurrent read-only `reload_from_disk` (which acquires
+        // manifest→tombstones→segments writes together) could swap
+        // between the two reads and yield a mixed snapshot, returning
+        // a row using old tombstones with new segments or hiding a
+        // live row using new tombstones with old segments.
+        let (ts, seg_ids, segments) = {
             let manifest = self.manifest.read();
             let seg_ids: Vec<(u64, i64, i64)> = manifest
                 .segments
@@ -1904,15 +2152,30 @@ impl SegmentManager {
                 .rev()
                 .map(|m| (m.segment_id, m.min_row_id, m.max_row_id))
                 .collect();
+            let ts = Arc::clone(&*self.tombstones.read());
             let segments = Arc::clone(&*self.segments.read());
-            (seg_ids, segments)
+            (ts, seg_ids, segments)
         };
+        if ts.contains_key(&row_id) {
+            return None;
+        }
         for (seg_id, min_id, max_id) in &seg_ids {
             if row_id < *min_id || row_id > *max_id {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
                 if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                    // Capture the mapping from the SAME ColdSegment
+                    // we matched on. A live `get_volume_mapping`
+                    // call would race a concurrent
+                    // `reload_from_disk` that replaced or removed
+                    // this segment between our snapshot and now,
+                    // returning either a different segment's
+                    // mapping or the empty identity fallback —
+                    // which would materialize the row from the
+                    // captured volume with the wrong column
+                    // alignment.
+                    let mapping = cold.mapping.clone();
                     let vol = if cold.volume.is_cold() {
                         match self.ensure_volume(*seg_id) {
                             Some(v) => v,
@@ -1925,7 +2188,6 @@ impl SegmentManager {
                         cold.volume.mark_accessed();
                         Arc::clone(&cold.volume)
                     };
-                    let mapping = self.get_volume_mapping(*seg_id, schema);
                     if mapping.is_identity {
                         return Some(vol.get_row(idx));
                     }
@@ -1933,6 +2195,7 @@ impl SegmentManager {
                 }
             }
         }
+        let _ = schema;
         None
     }
 
@@ -1943,7 +2206,11 @@ impl SegmentManager {
         schema: &crate::core::Schema,
     ) -> Option<crate::core::Row> {
         self.ensure_columns();
-        let (seg_ids, segments) = {
+        // Atomic snapshot: same lock discipline as the primary path.
+        // The retry must re-check tombstones too — a refresh between
+        // the failed `ensure_volume` and this retry can introduce a
+        // tombstone that hides the row in its new compacted location.
+        let (ts, seg_ids, segments) = {
             let manifest = self.manifest.read();
             let seg_ids: Vec<u64> = manifest
                 .segments
@@ -1951,14 +2218,21 @@ impl SegmentManager {
                 .rev()
                 .map(|m| m.segment_id)
                 .collect();
+            let ts = Arc::clone(&*self.tombstones.read());
             let segments = Arc::clone(&*self.segments.read());
-            (seg_ids, segments)
+            (ts, seg_ids, segments)
         };
+        if ts.contains_key(&row_id) {
+            return None;
+        }
         for seg_id in &seg_ids {
             if let Some(cold) = segments.get(seg_id) {
                 if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
                     cold.volume.mark_accessed();
-                    let mapping = self.get_volume_mapping(*seg_id, schema);
+                    // Same race-free mapping capture as the
+                    // primary path — see the comment in
+                    // `get_cold_row_normalized` above.
+                    let mapping = cold.mapping.clone();
                     if mapping.is_identity {
                         return Some(cold.volume.get_row(idx));
                     }
@@ -1966,6 +2240,7 @@ impl SegmentManager {
                 }
             }
         }
+        let _ = schema;
         None
     }
 
@@ -2144,6 +2419,21 @@ impl SegmentManager {
         *segs = Arc::new(new_map);
     }
 
+    /// Bump the manifest's table-level `schema_version` to at
+    /// least `version`. Called by the engine after every DDL
+    /// operation that affects this table — including ADD/MODIFY
+    /// COLUMN that don't otherwise touch the manifest. The
+    /// monotonic max ensures concurrent / out-of-order writes
+    /// from different DDL paths can't move the version
+    /// backwards. Persisted on the next manifest write so a
+    /// no-shm reader's drift check sees it.
+    pub fn record_table_schema_version(&self, version: u64) {
+        let mut manifest = self.manifest.write();
+        if version > manifest.schema_version {
+            manifest.schema_version = version;
+        }
+    }
+
     /// Record a column drop so old volumes don't leak stale data.
     /// `schema_version` is the current schema epoch at drop time. Only volumes
     /// with schema_version <= this value will have the column masked.
@@ -2245,6 +2535,323 @@ impl SegmentManager {
         let manager = Self::from_manifest(manifest, Some(volume_dir.to_path_buf()));
 
         Ok(Some(manager))
+    }
+
+    /// Re-read `manifest.bin` from disk and reconcile the in-memory
+    /// state with it. Used by cross-process readers (v1 SWMR) to pick up
+    /// changes the writer has published since this manager was last
+    /// loaded.
+    ///
+    /// `max_known_schema_version` is the engine's current `schema_epoch`
+    /// — the highest schema version this process has WAL-replayed. If
+    /// the new manifest contains any segment with `schema_version >
+    /// max_known_schema_version`, the writer has done DDL events the
+    /// reader hasn't seen and the segment cannot be safely decoded
+    /// against the reader's stale schema. We surface
+    /// `Error::SchemaChanged` and DO NOT mutate state — the reader's
+    /// pre-call snapshot remains intact, and the caller can propagate
+    /// the error so the user knows to reopen the `Database`.
+    ///
+    /// Reconciliation (when no schema drift is detected):
+    /// - Replace `self.manifest` with the freshly-loaded one.
+    /// - Replace `self.tombstones` from the new manifest's tombstone vec.
+    /// - For each segment_id in the new manifest that is NOT already in
+    ///   `self.segments`: load the .vol file from disk via
+    ///   `load_volume_for_existing_segment` so subsequent scans see it.
+    /// - For each segment_id in `self.segments` that is NOT in the new
+    ///   manifest (the writer compacted it away): remove from segments.
+    /// - Invalidate the cached dedup count so the next scan recomputes.
+    ///
+    /// Returns `true` if any segment was added or removed (caller can
+    /// log / invalidate downstream caches if useful), `false` if the
+    /// reload was a no-op.
+    ///
+    /// Concurrent in-flight queries that hold an `Arc<HashMap>` from
+    /// `segments_snapshot()` continue using their old snapshot until
+    /// they finish, then drop their reference. New queries see the
+    /// reconciled state.
+    /// schema-drift pre-check that does NOT mutate
+    /// any in-memory state. Reads `manifest.bin` and returns
+    /// `Err(SchemaChanged)` if any segment in the new manifest has
+    /// `schema_version > max_known_schema_version`. Returns
+    /// `Ok(false)` for no-op (memory-only mgr or missing manifest)
+    /// and `Ok(true)` if a manifest was found and passes the check.
+    ///
+    /// Used by `MVCCEngine::reload_manifests` to verify EVERY
+    /// per-table manifest before mutating any of them, so a later
+    /// table's schema drift can't leave earlier tables half-applied.
+    pub fn peek_schema_drift(&self, max_known_schema_version: u64) -> Result<bool> {
+        let Some(new_manifest) = self.read_manifest_from_disk()? else {
+            return Ok(false);
+        };
+        self.validate_manifest_for_reload(&new_manifest, max_known_schema_version)?;
+        Ok(true)
+    }
+
+    /// Validate a staged manifest read before read-only SWMR reload. This
+    /// performs every check that can fail because the writer's schema is newer
+    /// than this reader's in-memory catalog, without mutating manager state.
+    pub fn validate_manifest_for_reload(
+        &self,
+        new_manifest: &TableManifest,
+        max_known_schema_version: u64,
+    ) -> Result<()> {
+        if let Some(seg) = new_manifest
+            .segments
+            .iter()
+            .find(|s| s.schema_version > max_known_schema_version)
+        {
+            return Err(crate::core::Error::SchemaChanged(format!(
+                "table '{}': segment schema_version={} > reader's schema_epoch={} \
+                 (writer has done DDL since this handle opened); reopen the \
+                 Database / ReadOnlyDatabase to pick up the new schema",
+                self.table_name, seg.schema_version, max_known_schema_version
+            )));
+        }
+        // Table-level schema epoch check: catches ALTER TABLE
+        // ADD/MODIFY COLUMN that didn't produce a new segment
+        // (and so the per-segment `schema_version` check above
+        // doesn't fire) and didn't touch dropped_columns or
+        // column_renames (so the metadata check below doesn't
+        // fire either). The writer stamps the manifest's
+        // `schema_version` with its `schema_epoch` on every DDL.
+        // A no-shm reader has no WAL-tail DDL detection, so the
+        // table-level epoch on disk is the only signal that the
+        // writer has done DDL since this handle opened.
+        if new_manifest.schema_version > max_known_schema_version {
+            return Err(crate::core::Error::SchemaChanged(format!(
+                "table '{}': manifest schema_version={} > reader's \
+                 schema_epoch={} (writer has done DDL since this handle \
+                 opened); reopen the Database / ReadOnlyDatabase to pick \
+                 up the new schema",
+                self.table_name, new_manifest.schema_version, max_known_schema_version
+            )));
+        }
+        // Metadata-only ALTER drift: ALTER TABLE DROP/RENAME COLUMN
+        // followed by a checkpoint that produces no new segment
+        // bumps `dropped_columns`/`column_renames` on the manifest
+        // without bumping any segment's `schema_version`. The
+        // segment-version check above misses this case, so a no-shm
+        // reader (no WAL-tail DDL detection) would silently keep
+        // querying through a stale column layout. Compare the
+        // metadata vectors against the in-memory manifest; any
+        // drift in EITHER direction (added entries from a new DDL,
+        // OR cleared entries from a compaction we haven't picked up
+        // yet) means the writer has touched DDL and the reader's
+        // cached schema is suspect.
+        if self.detect_metadata_drift(new_manifest) {
+            return Err(crate::core::Error::SchemaChanged(format!(
+                "table '{}': manifest column metadata changed (writer has \
+                 dropped or renamed columns since this handle opened); \
+                 reopen the Database / ReadOnlyDatabase to pick up the \
+                 new schema",
+                self.table_name
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read only the table manifest's checkpoint frontier without mutating
+    /// this manager. Used by read-only SWMR refresh to reject a cross-table
+    /// manifest snapshot while the writer is between per-table manifest
+    /// renames for the next checkpoint.
+    pub fn peek_checkpoint_lsn(&self) -> Result<Option<u64>> {
+        Ok(self.read_manifest_from_disk()?.map(|m| m.checkpoint_lsn))
+    }
+
+    /// Read this table's `manifest.bin` without mutating the manager.
+    pub fn read_manifest_from_disk(&self) -> Result<Option<TableManifest>> {
+        let vol_dir = match &self.volume_dir {
+            Some(d) => d.clone(),
+            None => return Ok(None),
+        };
+        let table_dir = vol_dir.join(self.table_name.as_str());
+        let manifest_path = table_dir.join("manifest.bin");
+        if !manifest_path.exists() {
+            return Ok(None);
+        }
+        Ok(Some(TableManifest::read_from_disk(&manifest_path)?))
+    }
+
+    /// True when the on-disk manifest's column-DDL metadata
+    /// (dropped / renamed columns) differs from this segment
+    /// manager's in-memory copy. Used by the schema-drift checks
+    /// in [`Self::peek_schema_drift`] and [`Self::reload_from_disk`]
+    /// to catch ALTER TABLE DROP/RENAME COLUMN that did not also
+    /// produce a new segment with a bumped per-segment
+    /// `schema_version` — the segment-version drift check
+    /// otherwise misses it. ADD/MODIFY COLUMN are caught by the
+    /// table-level `schema_version` check below, not here:
+    /// they don't touch dropped_columns or column_renames.
+    fn detect_metadata_drift(&self, new_manifest: &TableManifest) -> bool {
+        let cur = self.manifest.read();
+        cur.dropped_columns != new_manifest.dropped_columns
+            || cur.column_renames != new_manifest.column_renames
+    }
+
+    pub fn reload_from_disk(&self, max_known_schema_version: u64) -> Result<bool> {
+        let Some(new_manifest) = self.read_manifest_from_disk()? else {
+            return Ok(false);
+        };
+        self.reload_from_manifest(new_manifest, max_known_schema_version)
+    }
+
+    /// Reconcile this manager from a manifest that the caller already staged
+    /// from disk. Using staged manifests lets `MVCCEngine::reload_manifests`
+    /// validate a cross-table checkpoint group and then apply the exact same
+    /// manifests, without re-reading a table after the writer has advanced it.
+    pub fn reload_from_manifest(
+        &self,
+        new_manifest: TableManifest,
+        max_known_schema_version: u64,
+    ) -> Result<bool> {
+        let vol_dir = match &self.volume_dir {
+            Some(d) => d.clone(),
+            None => return Ok(false), // memory-only manager
+        };
+        let table_dir = vol_dir.join(self.table_name.as_str());
+        self.validate_manifest_for_reload(&new_manifest, max_known_schema_version)?;
+
+        // Compute the new segment_id set BEFORE swapping anything in,
+        // so we can diff against `self.segments` deterministically.
+        let new_seg_ids: rustc_hash::FxHashSet<u64> =
+            new_manifest.segments.iter().map(|m| m.segment_id).collect();
+        let new_tombstone_map: FxHashMap<i64, u64> = new_manifest
+            .tombstones
+            .iter()
+            .map(|&(rid, seq, _vis)| (rid, seq))
+            .collect();
+
+        // Load all NEW volume files BEFORE swapping
+        // the manifest. The previous flow swapped manifest +
+        // tombstones first, then silently skipped volumes that
+        // failed to load (ENOENT race) — which left the published
+        // manifest referencing segments absent from `self.segments`,
+        // so scans would miss them and the next epoch bump would
+        // mark the state "consumed" without ever retrying. The
+        // race-skip rationale was sound for v1 (writer defers
+        // unlink while readers are live) but the failure mode was
+        // silent.
+        //
+        // New flow: pre-load all NEW segments. If ANY fails (race
+        // or otherwise), return error WITHOUT mutating any state —
+        // the reader's pre-call view stays consistent, and
+        // `refresh()` won't advance the cached epoch, so the next
+        // refresh will retry the whole reconcile.
+        let to_load: Vec<u64> = {
+            let segs = self.segments.read();
+            new_seg_ids
+                .iter()
+                .copied()
+                .filter(|id| !segs.contains_key(id))
+                .collect()
+        };
+        let mut staged_loads: Vec<(u64, Arc<crate::storage::volume::writer::FrozenVolume>)> =
+            Vec::with_capacity(to_load.len());
+        for seg_id in &to_load {
+            let filename = format!("vol_{:016x}.vol", seg_id);
+            let full_path = table_dir.join(filename);
+            match crate::storage::volume::io::read_volume_from_disk(&full_path) {
+                Ok(v) => staged_loads.push((*seg_id, Arc::new(v))),
+                Err(e) => {
+                    return Err(crate::core::Error::internal(format!(
+                        "table '{}': failed to load segment {} (vol_{:016x}.vol): {}; \
+                         declining to publish partial manifest, retry refresh",
+                        self.table_name, seg_id, seg_id, e
+                    )));
+                }
+            }
+        }
+
+        // Build the COMPLETE replacement segment map BEFORE taking
+        // any write lock. The previous flow swapped the manifest, then
+        // removed gone segments under one write lock, then inserted
+        // new segments under another (one per call to
+        // `load_volume_for_existing_segment`). A scan that took
+        // `manifest.read()` and `segments.read()` separately could
+        // observe the new manifest pointing at segment_ids absent
+        // from `segments` (between the manifest swap and the inserts)
+        // OR still-present old segment_ids that the new manifest had
+        // dropped — silently missing or double-counting cold rows.
+        //
+        // New flow: build the full new segments map up front (cheap
+        // — no I/O, just Arc clones for kept segments + ColdSegment
+        // construction for staged volumes), then publish manifest +
+        // tombstones + segments together under ALL THREE write locks.
+        // Readers see one consistent state transition.
+        let staged_map: rustc_hash::FxHashMap<
+            u64,
+            Arc<crate::storage::volume::writer::FrozenVolume>,
+        > = staged_loads.into_iter().collect();
+        let new_segments_map: FxHashMap<u64, ColdSegment> = {
+            let segs = self.segments.read();
+            let mut new_map: FxHashMap<u64, ColdSegment> = FxHashMap::with_capacity_and_hasher(
+                new_manifest.segments.len(),
+                Default::default(),
+            );
+            for seg_meta in &new_manifest.segments {
+                let seg_id = seg_meta.segment_id;
+                if let Some(existing) = segs.get(&seg_id) {
+                    new_map.insert(seg_id, existing.clone());
+                } else if let Some(volume) = staged_map.get(&seg_id) {
+                    let cold = ColdSegment {
+                        mapping: super::writer::ColumnMapping {
+                            sources: (0..volume.columns.len())
+                                .map(super::writer::ColSource::Volume)
+                                .collect(),
+                            is_identity: true,
+                        },
+                        volume: Arc::clone(volume),
+                        schema_version: seg_meta.schema_version,
+                        visible: None,
+                    };
+                    new_map.insert(seg_id, cold);
+                } else {
+                    return Err(crate::core::Error::internal(format!(
+                        "table '{}': segment {} in new manifest is neither in \
+                         current segments nor in staged loads (internal \
+                         invariant violated)",
+                        self.table_name, seg_id
+                    )));
+                }
+            }
+            new_map
+        };
+
+        // Detect change for the return value BEFORE the swap — compare
+        // the new segment-id set to the old one. We can't compare
+        // ColdSegment Arcs because kept segments are Arc-cloned out of
+        // the existing map, so a no-op manifest reload still produces
+        // a fresh map Arc.
+        let changed = {
+            let segs = self.segments.read();
+            new_seg_ids.len() != segs.len() || new_seg_ids.iter().any(|id| !segs.contains_key(id))
+        };
+
+        // Atomic publish: hold all three write locks across the swap so
+        // any scan observes either the FULL old state or the FULL new
+        // state, never a mix. Lock order matches the existing
+        // manifest→tombstones convention used elsewhere
+        // (`add_tombstones`, `clear_tombstones`); segments comes last
+        // since no read path takes it before manifest.
+        let has_any_segments = !new_segments_map.is_empty();
+        {
+            let mut manifest_guard = self.manifest.write();
+            let mut tombstones_guard = self.tombstones.write();
+            let mut segments_guard = self.segments.write();
+            *manifest_guard = new_manifest;
+            *tombstones_guard = Arc::new(new_tombstone_map);
+            *segments_guard = Arc::new(new_segments_map);
+        }
+
+        self.has_segments_flag
+            .store(has_any_segments, std::sync::atomic::Ordering::Relaxed);
+
+        // Recompute dedup cache lazily next time a scan needs it.
+        self.cached_deduped_count
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(changed)
     }
 
     /// Remove all segments and tombstones (for DROP TABLE / TRUNCATE).
@@ -2575,6 +3182,94 @@ impl SegmentManager {
         self.manifest.write()
     }
 
+    /// SWMR v2 P1: drop segments AND tombstones whose
+    /// `visible_at_lsn > cap_lsn` from this manager's manifest,
+    /// segments map, and runtime tombstone map. Used by capped
+    /// read-only attach so the engine never exposes cold rows from
+    /// segments the writer published AFTER our
+    /// `attach_visible_commit_lsn`, AND never hides a cold row via
+    /// a tombstone the writer added after our cap.
+    ///
+    /// Without segment filtering: a writer checkpoint between the
+    /// shm sample and manifest load would expose post-attach cold
+    /// segments. Without tombstone filtering: a writer DELETE on a
+    /// retained pre-cap segment after our cap would hide a row that
+    /// was visible at our cap.
+    ///
+    /// `cap_lsn = u64::MAX` is a no-op (writable open / uncapped).
+    /// V6 manifests have tombstone `visible_at_lsn = 0` (synthesized
+    /// "always visible") and are unaffected by the tombstone filter.
+    pub fn retain_segments_visible_at_or_below(&self, cap_lsn: u64) {
+        if cap_lsn == u64::MAX {
+            return;
+        }
+        // ---- Filter segments ----
+        let removed_seg_ids: Vec<u64> = {
+            let mut manifest = self.manifest.write();
+            let removed: Vec<u64> = manifest
+                .segments
+                .iter()
+                .filter(|s| s.visible_at_lsn > cap_lsn)
+                .map(|s| s.segment_id)
+                .collect();
+            if !removed.is_empty() {
+                manifest.segments.retain(|s| s.visible_at_lsn <= cap_lsn);
+            }
+            removed
+        };
+        if !removed_seg_ids.is_empty() {
+            // Also drop any already-loaded ColdSegment entries for the
+            // removed IDs (rare at attach time but defensive — the
+            // standalone-volume loader runs AFTER manifest load and
+            // checks `manifest_has_segment` before reading from disk).
+            let mut segments = self.segments.write();
+            if removed_seg_ids.iter().any(|id| segments.contains_key(id)) {
+                let mut new_map = (**segments).clone();
+                for id in &removed_seg_ids {
+                    new_map.remove(id);
+                }
+                *segments = Arc::new(new_map);
+            }
+        }
+
+        // ---- Filter tombstones (V7) ----
+        // Drop tombstones whose visibility frontier exceeds the cap.
+        // V6 tombstones synthesized as `visible_at_lsn = 0` slip
+        // through (V6 pre-dates capped attach and is treated as
+        // always visible — that's the correct backward-compat
+        // semantics: legacy data didn't have this discrimination).
+        let removed_tomb_rids: Vec<i64> = {
+            let mut manifest = self.manifest.write();
+            let removed: Vec<i64> = manifest
+                .tombstones
+                .iter()
+                .filter(|(_, _, vis)| *vis > cap_lsn)
+                .map(|(rid, _, _)| *rid)
+                .collect();
+            if !removed.is_empty() {
+                manifest.tombstones.retain(|(_, _, vis)| *vis <= cap_lsn);
+            }
+            removed
+        };
+        if !removed_tomb_rids.is_empty() {
+            let mut ts_guard = self.tombstones.write();
+            let ts = Arc::make_mut(&mut *ts_guard);
+            for rid in &removed_tomb_rids {
+                ts.remove(rid);
+            }
+        }
+
+        if removed_seg_ids.is_empty() && removed_tomb_rids.is_empty() {
+            return;
+        }
+        self.has_segments_flag.store(
+            !self.manifest.read().segments.is_empty(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.cached_deduped_count
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Get the volume directory path.
     pub fn volume_dir(&self) -> Option<&Path> {
         self.volume_dir.as_deref()
@@ -2702,6 +3397,7 @@ mod tests {
             creation_lsn: 100,
             seal_seq: 0,
             schema_version: 0,
+            visible_at_lsn: 0,
         });
         m.add_segment(SegmentMeta {
             segment_id: 2,
@@ -2712,6 +3408,7 @@ mod tests {
             creation_lsn: 200,
             seal_seq: 0,
             schema_version: 0,
+            visible_at_lsn: 0,
         });
         assert_eq!(m.segments.len(), 2);
 
@@ -2732,6 +3429,7 @@ mod tests {
             creation_lsn: 0,
             seal_seq: 0,
             schema_version: 0,
+            visible_at_lsn: 0,
         });
         m.add_segment(SegmentMeta {
             segment_id: 2,
@@ -2742,6 +3440,7 @@ mod tests {
             creation_lsn: 0,
             seal_seq: 0,
             schema_version: 0,
+            visible_at_lsn: 0,
         });
 
         assert_eq!(m.find_segment_for_row_id(50).unwrap().1.segment_id, 1);
@@ -2750,11 +3449,139 @@ mod tests {
     }
 
     #[test]
+    fn segment_meta_is_visible_to_lsn_pin_zero_means_no_constraint() {
+        // SWMR v2 Phase F: a writer-side scan or v1 reader (no LSN
+        // pin) passes pinned_lsn = 0 and must see every segment.
+        let s = SegmentMeta {
+            segment_id: 1,
+            file_path: PathBuf::from("x"),
+            row_count: 0,
+            min_row_id: 0,
+            max_row_id: 0,
+            creation_lsn: 0,
+            seal_seq: 0,
+            schema_version: 0,
+            visible_at_lsn: 999_999,
+        };
+        assert!(
+            s.is_visible_to_lsn(0),
+            "pinned_lsn=0 (no pin) must see every segment"
+        );
+    }
+
+    #[test]
+    fn segment_meta_is_visible_to_lsn_filters_late_arrivals() {
+        // SWMR v2 Phase F: a snapshot-pinned reader (pinned_lsn > 0)
+        // sees segments with visible_at_lsn <= pinned_lsn but NOT
+        // segments published after the pin was taken.
+        let early = SegmentMeta {
+            segment_id: 1,
+            file_path: PathBuf::from("e"),
+            row_count: 0,
+            min_row_id: 0,
+            max_row_id: 0,
+            creation_lsn: 0,
+            seal_seq: 0,
+            schema_version: 0,
+            visible_at_lsn: 100,
+        };
+        let late = SegmentMeta {
+            visible_at_lsn: 200,
+            ..early.clone()
+        };
+        assert!(early.is_visible_to_lsn(150), "early visible at pin=150");
+        assert!(!late.is_visible_to_lsn(150), "late NOT visible at pin=150");
+        assert!(late.is_visible_to_lsn(200), "late visible at its own LSN");
+        assert!(late.is_visible_to_lsn(300), "late visible at pin > LSN");
+    }
+
+    #[test]
+    fn manifest_v6_deserialize_synthesizes_visible_at_lsn_from_creation_lsn() {
+        // SWMR v2 Phase F: a V6 manifest on disk must still load. The
+        // writer upgrades to V7 on the next persist.
+        //
+        // Build a V6 manifest by hand to avoid needing an actual
+        // pre-V7 binary.
+        use std::io::Write as _;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.write_all(&MANIFEST_MAGIC).unwrap();
+        buf.write_all(&MANIFEST_VERSION_V6.to_le_bytes()).unwrap();
+        buf.write_all(&5u64.to_le_bytes()).unwrap(); // next_segment_id
+        buf.write_all(&42u64.to_le_bytes()).unwrap(); // checkpoint_lsn
+
+        // Table name
+        let name = b"v6_table";
+        buf.write_all(&(name.len() as u32).to_le_bytes()).unwrap();
+        buf.write_all(name).unwrap();
+
+        // One segment in V6 layout (56 fixed bytes + variable path).
+        buf.write_all(&1u32.to_le_bytes()).unwrap(); // seg count
+        buf.write_all(&7u64.to_le_bytes()).unwrap(); // segment_id
+        buf.write_all(&100u64.to_le_bytes()).unwrap(); // row_count
+        buf.write_all(&1i64.to_le_bytes()).unwrap(); // min_row_id
+        buf.write_all(&100i64.to_le_bytes()).unwrap(); // max_row_id
+        buf.write_all(&555u64.to_le_bytes()).unwrap(); // creation_lsn
+        buf.write_all(&0u64.to_le_bytes()).unwrap(); // seal_seq
+        buf.write_all(&3u64.to_le_bytes()).unwrap(); // schema_version
+                                                     // No visible_at_lsn in V6.
+        let path = b"vol_007.vol";
+        buf.write_all(&(path.len() as u32).to_le_bytes()).unwrap();
+        buf.write_all(path).unwrap();
+
+        // Empty tombstones / renames / dropped
+        buf.write_all(&0u64.to_le_bytes()).unwrap(); // tombstone count
+        buf.write_all(&0u32.to_le_bytes()).unwrap(); // rename count
+        buf.write_all(&0u32.to_le_bytes()).unwrap(); // dropped count
+
+        // Trailing CRC32 over the payload.
+        let crc = crc32fast::hash(&buf);
+        buf.write_all(&crc.to_le_bytes()).unwrap();
+
+        let m = TableManifest::deserialize(&buf).expect("V6 manifest must parse");
+        assert_eq!(m.table_name.as_str(), "v6_table");
+        assert_eq!(m.segments.len(), 1);
+        let s = &m.segments[0];
+        assert_eq!(s.segment_id, 7);
+        assert_eq!(s.creation_lsn, 555);
+        assert_eq!(
+            s.visible_at_lsn, s.creation_lsn,
+            "V6 → V7 read must synthesize visible_at_lsn from creation_lsn"
+        );
+
+        // Re-serialize → V7 (current format). Verify it round-trips
+        // and the version bytes flipped.
+        let v7_bytes = m.serialize().unwrap();
+        let version = u32::from_le_bytes(v7_bytes[4..8].try_into().unwrap());
+        assert_eq!(version, MANIFEST_VERSION, "writer upgrades V6 → V7");
+        let m2 = TableManifest::deserialize(&v7_bytes).expect("V7 round-trip");
+        assert_eq!(m2.segments[0].visible_at_lsn, 555);
+    }
+
+    #[test]
+    fn manifest_v7_round_trip_preserves_visible_at_lsn() {
+        let mut m = TableManifest::new("v7_table");
+        m.add_segment(SegmentMeta {
+            segment_id: 1,
+            file_path: PathBuf::from("a.vol"),
+            row_count: 10,
+            min_row_id: 1,
+            max_row_id: 10,
+            creation_lsn: 100,
+            seal_seq: 0,
+            schema_version: 1,
+            visible_at_lsn: 200,
+        });
+        let bytes = m.serialize().unwrap();
+        let m2 = TableManifest::deserialize(&bytes).unwrap();
+        assert_eq!(m2.segments[0].visible_at_lsn, 200);
+    }
+
+    #[test]
     fn test_manifest_serialize_roundtrip() {
         let mut m = TableManifest::new("my_table");
         m.next_segment_id = 5;
         m.checkpoint_lsn = 42;
-        m.tombstones = vec![(10, 0), (20, 0), (30, 0)];
+        m.tombstones = vec![(10, 0, 0), (20, 0, 0), (30, 0, 0)];
         m.add_segment(SegmentMeta {
             segment_id: 1,
             file_path: PathBuf::from("seg_0001.vol"),
@@ -2764,6 +3591,7 @@ mod tests {
             creation_lsn: 10,
             seal_seq: 0,
             schema_version: 3,
+            visible_at_lsn: 0,
         });
         m.add_segment(SegmentMeta {
             segment_id: 3,
@@ -2774,6 +3602,7 @@ mod tests {
             creation_lsn: 30,
             seal_seq: 0,
             schema_version: 5,
+            visible_at_lsn: 0,
         });
 
         let data = m.serialize().unwrap();
@@ -2792,7 +3621,7 @@ mod tests {
         assert_eq!(loaded.segments[1].creation_lsn, 30);
         assert_eq!(loaded.segments[0].schema_version, 3);
         assert_eq!(loaded.segments[1].schema_version, 5);
-        assert_eq!(loaded.tombstones, vec![(10, 0), (20, 0), (30, 0)]);
+        assert_eq!(loaded.tombstones, vec![(10, 0, 0), (20, 0, 0), (30, 0, 0)]);
     }
 
     #[test]
@@ -2801,7 +3630,7 @@ mod tests {
         let path = dir.path().join("manifest.bin");
 
         let mut m = TableManifest::new("disk_test");
-        m.tombstones = vec![(5, 0), (10, 0)];
+        m.tombstones = vec![(5, 0, 0), (10, 0, 0)];
         m.add_segment(SegmentMeta {
             segment_id: 1,
             file_path: PathBuf::from("vol.vol"),
@@ -2811,6 +3640,7 @@ mod tests {
             creation_lsn: 0,
             seal_seq: 0,
             schema_version: 0,
+            visible_at_lsn: 0,
         });
 
         m.write_to_disk(&path).unwrap();
@@ -2818,7 +3648,7 @@ mod tests {
 
         assert_eq!(loaded.table_name.as_str(), "disk_test");
         assert_eq!(loaded.segments.len(), 1);
-        assert_eq!(loaded.tombstones, vec![(5, 0), (10, 0)]);
+        assert_eq!(loaded.tombstones, vec![(5, 0, 0), (10, 0, 0)]);
     }
 
     #[test]
@@ -2845,6 +3675,7 @@ mod tests {
             creation_lsn: 0,
             seal_seq: 0,
             schema_version: 0,
+            visible_at_lsn: 0,
         };
         mgr.register_segment(1, volume, meta, None);
 
@@ -2881,12 +3712,13 @@ mod tests {
                 creation_lsn: 0,
                 seal_seq: 0,
                 schema_version: 0,
+                visible_at_lsn: 0,
             },
             None,
         );
 
         // Tombstone row_id=5 (commit_seq=1)
-        mgr.add_tombstones(&[5], 1);
+        mgr.add_tombstones(&[5], 1, 0);
         assert!(!mgr.row_exists(5));
         assert!(mgr.row_exists(4));
         assert!(mgr.row_exists(6));
@@ -2929,6 +3761,7 @@ mod tests {
                     creation_lsn: 0,
                     seal_seq: 0,
                     schema_version: 0,
+                    visible_at_lsn: 0,
                 },
                 None,
             );
@@ -2955,8 +3788,9 @@ mod tests {
             creation_lsn: 0,
             seal_seq: 0,
             schema_version: 0,
+            visible_at_lsn: 0,
         });
-        mgr.add_tombstones(&[5], 1);
+        mgr.add_tombstones(&[5], 1, 0);
 
         assert_eq!(mgr.segment_count(), 1);
         mgr.clear();
@@ -3001,6 +3835,7 @@ mod tests {
                 creation_lsn: 0,
                 seal_seq: 0,
                 schema_version: 0,
+                visible_at_lsn: 0,
             },
             None,
         );

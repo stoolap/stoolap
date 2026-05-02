@@ -107,6 +107,23 @@ typedef struct StoolapValue {
     } v;
 } StoolapValue;
 
+/**
+ * Named parameter binding (for `:name`-style placeholders).
+ *
+ * `name` does not need NUL termination; `name_len` is the byte length.
+ * The name must be valid UTF-8. Names with invalid UTF-8 or zero length
+ * are silently skipped.
+ */
+typedef struct StoolapNamedParam {
+    /** Parameter name (without the ':' prefix). */
+    const char*  name;
+    /** Length of `name` in bytes. */
+    int32_t      name_len;
+    int32_t      _padding;
+    /** Parameter value. */
+    StoolapValue value;
+} StoolapNamedParam;
+
 /* =========================================================================
  * Library info
  * ========================================================================= */
@@ -242,6 +259,28 @@ int32_t stoolap_query_params(
     StoolapDB* db,
     const char* sql,
     const StoolapValue* params,
+    int32_t params_len,
+    StoolapRows** out_rows
+);
+
+/* =========================================================================
+ * Named parameters (`:name` placeholders)
+ * ========================================================================= */
+
+/** Execute a SQL statement with named parameters. */
+int32_t stoolap_exec_named(
+    StoolapDB* db,
+    const char* sql,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    int64_t* rows_affected
+);
+
+/** Execute a query with named parameters. */
+int32_t stoolap_query_named(
+    StoolapDB* db,
+    const char* sql,
+    const StoolapNamedParam* params,
     int32_t params_len,
     StoolapRows** out_rows
 );
@@ -402,6 +441,42 @@ int32_t stoolap_tx_stmt_query(
     StoolapRows** out_rows
 );
 
+/** Execute within a transaction (named parameters). */
+int32_t stoolap_tx_exec_named(
+    StoolapTx* tx,
+    const char* sql,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    int64_t* rows_affected
+);
+
+/** Query within a transaction (named parameters). */
+int32_t stoolap_tx_query_named(
+    StoolapTx* tx,
+    const char* sql,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    StoolapRows** out_rows
+);
+
+/** Execute a prepared statement within a transaction (named parameters). */
+int32_t stoolap_tx_stmt_exec_named(
+    StoolapTx* tx,
+    const StoolapStmt* stmt,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    int64_t* rows_affected
+);
+
+/** Query using a prepared statement within a transaction (named parameters). */
+int32_t stoolap_tx_stmt_query_named(
+    StoolapTx* tx,
+    const StoolapStmt* stmt,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    StoolapRows** out_rows
+);
+
 /**
  * Commit a transaction.
  * The tx handle is consumed (freed) regardless of success or failure.
@@ -544,6 +619,160 @@ void stoolap_buffer_free(uint8_t* buf, int64_t len);
  * Only use for strings explicitly documented as "must be freed".
  */
 void stoolap_string_free(char* s);
+
+/* =========================================================================
+ * Typed error codes (Bucket A)
+ * =========================================================================
+ *
+ * `stoolap_*_errcode()` returns one of the STOOLAP_ERR_* values below.
+ * `stoolap_*_errdetails()` fills a StoolapErrorDetails struct whose
+ * char* fields are valid until the next FFI call on the originating
+ * handle. NULL indicates "field not applicable for this code". The
+ * `message` field is never NULL (empty string on success).
+ *
+ * Codes are appended-only; existing values never change. Plugins SHOULD
+ * default to STOOLAP_ERR_GENERIC behavior for unknown codes so future
+ * additions don't require a recompile.
+ */
+
+#define STOOLAP_ERR_OK                  0
+#define STOOLAP_ERR_GENERIC             1
+#define STOOLAP_ERR_NOT_NULL            2
+#define STOOLAP_ERR_UNIQUE              3
+#define STOOLAP_ERR_PRIMARY_KEY         4
+#define STOOLAP_ERR_FOREIGN_KEY         5
+#define STOOLAP_ERR_CHECK               6
+#define STOOLAP_ERR_TABLE_NOT_FOUND     7
+#define STOOLAP_ERR_TABLE_EXISTS        8
+#define STOOLAP_ERR_COLUMN_NOT_FOUND    9
+#define STOOLAP_ERR_INDEX_NOT_FOUND    10
+#define STOOLAP_ERR_INDEX_EXISTS       11
+#define STOOLAP_ERR_TYPE_MISMATCH      12
+#define STOOLAP_ERR_INVALID_ARGUMENT   13
+#define STOOLAP_ERR_PARSE              14
+#define STOOLAP_ERR_TX_ABORTED         15
+#define STOOLAP_ERR_TX_CLOSED          16
+#define STOOLAP_ERR_READ_ONLY          17
+#define STOOLAP_ERR_DB_LOCKED          18
+#define STOOLAP_ERR_IO                 19
+#define STOOLAP_ERR_NOT_SUPPORTED      20
+#define STOOLAP_ERR_INTERNAL           21
+#define STOOLAP_ERR_QUERY_CANCELLED    22
+#define STOOLAP_ERR_DIVISION_BY_ZERO   23
+#define STOOLAP_ERR_VALUE_TOO_LONG     24
+#define STOOLAP_ERR_VIEW_NOT_FOUND     25
+#define STOOLAP_ERR_VIEW_EXISTS        26
+#define STOOLAP_ERR_REOPEN_REQUIRED    27 /**< SWMR readers: hard-reopen required */
+
+typedef struct StoolapErrorDetails {
+    int32_t code;
+    int32_t _padding;
+    /** Always non-NULL. Empty C string on success. */
+    const char* message;
+    /** Table name, or NULL if not applicable. */
+    const char* table;
+    /** Column name, or NULL if not applicable. */
+    const char* column;
+    /** Index name (UNIQUE) or referenced table (FK), or NULL. */
+    const char* constraint;
+    /** Free-form: conflicting value (UNIQUE), CHECK expression, FK detail. */
+    const char* detail;
+} StoolapErrorDetails;
+
+int32_t  stoolap_errcode      (const StoolapDB*    db);
+int32_t  stoolap_errdetails   (const StoolapDB*    db, StoolapErrorDetails* out);
+int32_t  stoolap_tx_errcode   (const StoolapTx*    tx);
+int32_t  stoolap_tx_errdetails(const StoolapTx*    tx, StoolapErrorDetails* out);
+int32_t  stoolap_stmt_errcode (const StoolapStmt*  stmt);
+int32_t  stoolap_stmt_errdetails(const StoolapStmt* stmt, StoolapErrorDetails* out);
+int32_t  stoolap_rows_errcode (const StoolapRows*  rows);
+int32_t  stoolap_rows_errdetails(const StoolapRows* rows, StoolapErrorDetails* out);
+
+/* =========================================================================
+ * MVCC-safe table count (Bucket A)
+ * =========================================================================
+ *
+ * Returns the visible row count of `table` without parsing or executing
+ * SQL. Database::table_count is autocommit-correct and uses the
+ * SegmentedTable fast path (O(1) atomic loads) so it is safe to call on
+ * the hot loop. Transaction::table_count is snapshot-correct and
+ * accounts for uncommitted local INSERTs/DELETEs in the same tx.
+ */
+
+int32_t stoolap_table_count   (StoolapDB* db,    const char* table, uint64_t* out_count);
+int32_t stoolap_tx_table_count(StoolapTx* tx,    const char* table, uint64_t* out_count);
+
+/* =========================================================================
+ * Savepoints (Bucket A)
+ * =========================================================================
+ *
+ * `name_len` is the byte length of the savepoint name. Pass `-1` to
+ * treat `name` as a NUL-terminated C string. Use the explicit length
+ * when interoperating with non-NUL-terminated buffers (e.g. MariaDB's
+ * handlerton savepoint chunk).
+ */
+
+int32_t stoolap_tx_savepoint            (StoolapTx* tx, const char* name, int32_t name_len);
+int32_t stoolap_tx_release_savepoint    (StoolapTx* tx, const char* name, int32_t name_len);
+int32_t stoolap_tx_rollback_to_savepoint(StoolapTx* tx, const char* name, int32_t name_len);
+
+/* =========================================================================
+ * Read-only handle (Bucket A)
+ * =========================================================================
+ *
+ * Mirrors the Rust type split. `stoolap_open_read_only` returns a
+ * StoolapRoDB* that has only read entry points: there is no
+ * stoolap_ro_exec / stoolap_ro_begin, so write SQL routed through this
+ * handle is a compile-time link error. Write SQL passed to
+ * stoolap_ro_query (which goes through the read engine) is rejected
+ * with STOOLAP_ERR_READ_ONLY at runtime.
+ *
+ * `Database::open` REJECTS the read-only DSN flags (?read_only=true,
+ * ?readonly=true, ?mode=ro) with STOOLAP_ERR_INVALID_ARGUMENT and a
+ * message pointing the caller to stoolap_open_read_only.
+ * `stoolap_open_read_only` accepts those flags as redundant no-ops so
+ * existing driver DSN strings continue to work unchanged.
+ */
+
+/** Read-only database handle. */
+typedef struct StoolapRoDB StoolapRoDB;
+
+int32_t      stoolap_open_read_only(const char* dsn, StoolapRoDB** out_db);
+void         stoolap_ro_close          (StoolapRoDB* db);
+const char*  stoolap_ro_errmsg         (const StoolapRoDB* db);
+int32_t      stoolap_ro_errcode        (const StoolapRoDB* db);
+int32_t      stoolap_ro_errdetails     (const StoolapRoDB* db, StoolapErrorDetails* out);
+const char*  stoolap_ro_dsn            (const StoolapRoDB* db);
+
+/**
+ * Returns 1 if `name` exists, 0 if not, -1 on error (use stoolap_ro_errmsg).
+ */
+int32_t      stoolap_ro_table_exists   (StoolapRoDB* db, const char* name);
+
+int32_t      stoolap_ro_table_count    (StoolapRoDB* db, const char* table, uint64_t* out_count);
+
+/**
+ * Manually advance the snapshot to the writer's latest visible state.
+ * Returns 1 if advanced, 0 if already current, STOOLAP_ERROR otherwise.
+ * Errors of kind STOOLAP_ERR_REOPEN_REQUIRED indicate the caller MUST
+ * close this handle and reopen — cached state is no longer trustworthy.
+ */
+int32_t      stoolap_ro_refresh        (StoolapRoDB* db);
+
+/**
+ * Toggle automatic refresh on every query. Default enabled.
+ * Disable for stable visibility across multiple queries (e.g. inside an
+ * application-level "snapshot" block).
+ */
+void         stoolap_ro_set_auto_refresh(StoolapRoDB* db, int32_t enabled);
+
+int32_t      stoolap_ro_query          (StoolapRoDB* db, const char* sql, StoolapRows** out_rows);
+int32_t      stoolap_ro_query_params   (StoolapRoDB* db, const char* sql,
+                                         const StoolapValue* params, int32_t params_len,
+                                         StoolapRows** out_rows);
+int32_t      stoolap_ro_query_named    (StoolapRoDB* db, const char* sql,
+                                         const StoolapNamedParam* params, int32_t params_len,
+                                         StoolapRows** out_rows);
 
 #ifdef __cplusplus
 }

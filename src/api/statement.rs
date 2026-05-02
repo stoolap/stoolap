@@ -191,6 +191,15 @@ impl Statement {
     pub fn execute<P: Params>(&self, params: P) -> Result<i64> {
         let db = self.get_db()?;
         if let Some(plan) = &self.plan {
+            // Prepared-statement cached-plan path bypasses the
+            // `Database::execute` entry point, so the SWMR
+            // lease heartbeat / refresh that lives there
+            // doesn't fire — call it explicitly here. The
+            // multi-statement fallback below already routes
+            // through `db.execute`, which heartbeats
+            // internally; doing it here too would double the
+            // epoch / shm polling on every execution.
+            db.heartbeat_and_maybe_refresh()?;
             let executor = db
                 .executor()
                 .lock()
@@ -220,6 +229,11 @@ impl Statement {
     pub fn query<P: Params>(&self, params: P) -> Result<Rows> {
         let db = self.get_db()?;
         if let Some(plan) = &self.plan {
+            // See `Statement::execute` for the rationale —
+            // heartbeat lives on the cached-plan branch only,
+            // since the multi-statement fallback below routes
+            // through `db.query` which heartbeats internally.
+            db.heartbeat_and_maybe_refresh()?;
             let executor = db
                 .executor()
                 .lock()

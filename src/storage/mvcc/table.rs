@@ -1176,12 +1176,12 @@ impl MVCCTable {
                 Error::internal(format!("nil value at index {} (column '{}')", i, col.name))
             })?;
 
-            // Check NULL constraint
+            // Check NULL constraint. Use the typed `NotNullConstraint`
+            // variant so callers (FFI typed-error path, monitoring,
+            // pattern-matching retry logic) can branch on the constraint
+            // family without parsing the message string.
             if !col.nullable && value.is_null() {
-                return Err(Error::internal(format!(
-                    "NULL value in non-nullable column '{}'",
-                    col.name
-                )));
+                return Err(Error::not_null_constraint(&col.name));
             }
 
             // Check type compatibility for non-NULL values

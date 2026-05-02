@@ -2770,14 +2770,47 @@ impl Executor {
             Some(table.txn_id()),
         )?;
 
+        // Hold SH on the engine's `transactional_ddl_fence`
+        // across the destructive `table.truncate()` AND the
+        // `record_truncate_table` WAL write so checkpoint's
+        // `rerecord_ddl_to_wal` (which takes EX) cannot run
+        // in the gap. Without this guard a checkpoint that
+        // landed between `table.truncate()` and the WAL
+        // write would persist the already-empty manifest /
+        // checkpoint_lsn and truncate older WAL — recovery
+        // would then see the checkpointed empty table even
+        // though the TRUNCATE was not durable, surfacing a
+        // truncate that the user may not have completed.
+        // The fence is held HERE in the executor (not also
+        // inside `record_truncate_table`) to avoid reentrant
+        // SH on the same fence — parking_lot's RwLock can
+        // deadlock if a checkpoint EX is waiting for the
+        // outer SH to drop and we then try to acquire SH
+        // again from inside.
+        let _ddl_fence_guard = self.engine.ddl_fence().read();
+
         // Truncate all rows (fast path: drops storage directly)
         // WAL is recorded AFTER success to prevent phantom records on failure.
         // If a crash occurs between truncate and WAL write, recovery restores
         // the pre-truncate state from the snapshot — the user simply retries.
         let rows_affected = table.truncate()?;
 
-        // Record TRUNCATE to WAL for persistence (only after successful truncate)
-        self.engine.record_truncate_table(table_name)?;
+        // Record TRUNCATE to WAL for persistence (only after successful truncate).
+        // Latch the engine on Err: by this point `table.truncate()` has already
+        // physically cleared the hot VersionStore + segment manager. The DDL
+        // fence above kept checkpoint out of the truncate→WAL window, but
+        // releasing the fence on this function's return would let a later
+        // background checkpoint persist the empty manifest /
+        // `checkpoint_lsn` and truncate older WAL even though the
+        // `TruncateTable` record never landed durably — recovery would then
+        // see a checkpointed empty table with no `TruncateTable` record to
+        // explain it. Latching forces every subsequent durability path to
+        // refuse so the operator restarts; recovery converges from the WAL
+        // entries that did land before the failure.
+        if let Err(e) = self.engine.record_truncate_table(table_name) {
+            self.engine.enter_catastrophic_failure();
+            return Err(e);
+        }
 
         // Invalidate semantic cache for this table BEFORE commit
         // CRITICAL: Must invalidate before commit to prevent stale data window

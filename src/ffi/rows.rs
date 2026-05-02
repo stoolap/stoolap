@@ -20,7 +20,7 @@ use std::panic;
 use crate::core::types::DataType;
 use crate::core::Value;
 
-use super::types::StoolapRows;
+use super::types::{StoolapErrorDetails, StoolapRows};
 use super::{
     STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW, STOOLAP_TYPE_BLOB, STOOLAP_TYPE_BOOLEAN,
     STOOLAP_TYPE_FLOAT, STOOLAP_TYPE_INTEGER, STOOLAP_TYPE_JSON, STOOLAP_TYPE_NULL,
@@ -76,7 +76,7 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
             handle.has_row = false;
             // Check for runtime filter errors (e.g., invalid parameterized REGEXP)
             if let Some(err) = rows_inner.error() {
-                handle.set_error(&err.to_string());
+                handle.set_error_from(&err);
                 return STOOLAP_ERROR;
             }
             STOOLAP_DONE
@@ -645,4 +645,47 @@ pub unsafe extern "C" fn stoolap_rows_errmsg(rows: *const StoolapRows) -> *const
         Some(handle) => handle.error_ptr(),
         None => super::error::empty_cstr(),
     }
+}
+
+/// Get the typed error code for a rows handle's last error.
+///
+/// # Safety
+///
+/// `rows` must be a valid `StoolapRows` pointer or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_rows_errcode(rows: *const StoolapRows) -> i32 {
+    match rows.as_ref() {
+        Some(handle) => handle.last_error.code,
+        None => super::error::STOOLAP_ERR_OK,
+    }
+}
+
+/// Fill the caller's `StoolapErrorDetails` from this rows handle's last
+/// error. Pointers stay valid until the next API call on this handle.
+///
+/// # Safety
+///
+/// `rows` must be a valid `StoolapRows` pointer or NULL. `out` must
+/// point to a writable `StoolapErrorDetails`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_rows_errdetails(
+    rows: *const StoolapRows,
+    out: *mut StoolapErrorDetails,
+) -> i32 {
+    if out.is_null() {
+        return STOOLAP_ERROR;
+    }
+    match rows.as_ref() {
+        Some(handle) => handle.last_error.fill_details(&mut *out),
+        None => {
+            (*out).code = super::error::STOOLAP_ERR_OK;
+            (*out)._padding = 0;
+            (*out).message = super::error::empty_cstr();
+            (*out).table = std::ptr::null();
+            (*out).column = std::ptr::null();
+            (*out).constraint = std::ptr::null();
+            (*out).detail = std::ptr::null();
+        }
+    }
+    STOOLAP_OK
 }

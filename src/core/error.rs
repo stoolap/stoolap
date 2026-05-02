@@ -307,6 +307,92 @@ pub enum Error {
     /// Write operation rejected on a read-only database handle
     #[error("read-only database handle does not permit {0}")]
     ReadOnlyViolation(String),
+
+    /// SWMR v2: a cross-process reader detected schema state on disk that
+    /// is newer than the schema this reader was opened against. Reopen the
+    /// `Database` / `ReadOnlyDatabase` to see the new schema. The reader's
+    /// in-memory schema is rebuilt only at engine open time; mid-session
+    /// DDL by the writer (ALTER TABLE, ADD COLUMN, etc.) cannot be picked
+    /// up by `refresh()` alone because the WAL replay that materializes
+    /// schema runs only at startup.
+    ///
+    /// String body describes which signal was observed (e.g. "table 't':
+    /// segment schema_version=7 > reader's schema_epoch=5") so logs and
+    /// support tickets can pinpoint the cause.
+    #[error("schema changed since open: {0}")]
+    SchemaChanged(String),
+
+    /// SWMR v2 Phase H: the reader's pinned WAL LSN has been
+    /// truncated by the writer — the WAL bytes the reader needs to
+    /// tail-replay are gone. The reader must hard-reopen its handle
+    /// to recover. This is distinct from `SchemaChanged` (a cold-side
+    /// drift) and `SwmrWriterReincarnated` (a writer crash); it
+    /// surfaces specifically when the WAL pin protocol failed (e.g.
+    /// a lease that wasn't refreshed in time was reaped while a
+    /// large overlay rebuild was in flight).
+    ///
+    /// `pinned_lsn` is what the reader was trying to tail; it does
+    /// not exist on disk anymore. The writer's `wal_chain_head`
+    /// (lowest live LSN) is in the message body for diagnostics.
+    #[error(
+        "SWMR snapshot expired: reader pinned at LSN {pinned_lsn} but \
+         WAL chain head is {chain_head}; reopen the ReadOnlyDatabase to \
+         pick up a fresh checkpoint baseline"
+    )]
+    SwmrSnapshotExpired { pinned_lsn: u64, chain_head: u64 },
+
+    /// SWMR v2 Phase H: the writer process this reader was attached
+    /// to has been replaced (crash + restart, or a clean
+    /// close+reopen). `db.shm.writer_generation` advanced beyond the
+    /// value the reader observed at attach. Cached state (manifests,
+    /// overlay, plans) is no longer trustworthy — the new writer's
+    /// transaction registry uses fresh IDs. Caller must hard-reopen.
+    #[error(
+        "SWMR writer reincarnated: observed generation {observed_gen} \
+         exceeds reader's expected {expected_gen}; reopen the \
+         ReadOnlyDatabase to attach to the new writer"
+    )]
+    SwmrWriterReincarnated {
+        observed_gen: u64,
+        expected_gen: u64,
+    },
+
+    /// SWMR v2 Phase H: the reader observed a DDL event in the
+    /// WAL-tail since the last refresh that cannot be applied to a
+    /// live read-only handle (CREATE/DROP/ALTER TABLE, CREATE/DROP
+    /// INDEX, CREATE/DROP VIEW, RENAME, TRUNCATE). v2 readers can
+    /// tail DML safely because the in-memory schema is stable; DDL
+    /// would require mutating the read-only engine's metadata, which
+    /// is not currently supported. Caller should reopen.
+    ///
+    /// The string body is a short summary of the observed events
+    /// (e.g. `"create_table:t,alter_table:orders"`) so callers can
+    /// log it without needing to re-tail the WAL.
+    #[error(
+        "SWMR pending DDL not applied to read-only handle: {0}; reopen \
+         the ReadOnlyDatabase to pick up the new schema"
+    )]
+    SwmrPendingDdl(String),
+
+    /// SWMR v2 Phase H: rebuilding the per-table overlay from the
+    /// WAL tail failed mid-stream. Distinct from `SwmrSnapshotExpired`
+    /// because the WAL bytes were available but a parse failed
+    /// (CRC mismatch, truncated entry, unsupported format version).
+    /// Caller can retry once; persistent failures indicate WAL
+    /// corruption requiring writer-side recovery.
+    #[error("SWMR overlay rebuild failed: {0}")]
+    SwmrOverlayApplyFailed(String),
+
+    /// One or more per-table manifest reloads failed during
+    /// `reload_manifests`. Earlier tables in the iteration order may
+    /// have already swapped to their new manifests, leaving the
+    /// reader on a mixed-epoch snapshot. Auto-refresh propagates this
+    /// instead of swallowing it so callers can hard-reopen rather
+    /// than continue to query inconsistent state. The cached epoch
+    /// is intentionally NOT advanced on this error so the next
+    /// refresh retries the failed table(s).
+    #[error("SWMR partial manifest reload: {0}; reopen the database")]
+    SwmrPartialReload(String),
 }
 
 /// Mask the query-string portion of a DSN before embedding it in an error

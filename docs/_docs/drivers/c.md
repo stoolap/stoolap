@@ -82,14 +82,15 @@ int main(void) {
 
 ## Handles and Ownership
 
-The API uses four opaque handle types. Each handle is created by a specific function and must be freed by its corresponding cleanup function.
+The API uses five opaque handle types. Each handle is created by a specific function and must be freed by its corresponding cleanup function.
 
 | Handle | Created by | Freed by | Notes |
 |--------|-----------|----------|-------|
 | `StoolapDB` | `stoolap_open`, `stoolap_open_in_memory`, `stoolap_clone` | `stoolap_close` | NULL-safe close (no-op) |
+| `StoolapRoDB` | `stoolap_open_read_only` | `stoolap_ro_close` | NULL-safe close. Read-only handle: no `_exec` / `_begin` entry points exist, so write SQL through this handle is a link error on the C side. |
 | `StoolapStmt` | `stoolap_prepare` | `stoolap_stmt_finalize` | NULL-safe finalize (no-op). Keeps the database engine alive. |
 | `StoolapTx` | `stoolap_begin`, `stoolap_begin_with_isolation` | `stoolap_tx_commit` or `stoolap_tx_rollback` | Handle consumed on commit/rollback regardless of success or failure. Keeps the database engine alive. |
-| `StoolapRows` | `stoolap_query*`, `stoolap_stmt_query`, `stoolap_tx_query*`, `stoolap_tx_stmt_query*` | `stoolap_rows_close` | Must be closed even after `STOOLAP_DONE`. NULL-safe close (no-op) |
+| `StoolapRows` | `stoolap_query*`, `stoolap_ro_query*`, `stoolap_stmt_query`, `stoolap_tx_query*`, `stoolap_tx_stmt_query*` | `stoolap_rows_close` | Must be closed even after `STOOLAP_DONE`. NULL-safe close (no-op) |
 
 **Important**: `stoolap_tx_commit()` and `stoolap_tx_rollback()` free the transaction handle whether they succeed or fail. After calling either function, the `StoolapTx` pointer is invalid.
 
@@ -191,6 +192,35 @@ StoolapValue p = { .value_type = STOOLAP_TYPE_INTEGER, 0, { .integer = 1 } };
 StoolapRows* rows = NULL;
 stoolap_query_params(db, "SELECT name FROM t WHERE id = $1", &p, 1, &rows);
 ```
+
+## Table Row Count
+
+`stoolap_table_count()` returns the number of rows visible to the current autocommit handle without parsing or executing SQL. It uses the SegmentedTable fast path so hot rows in memory and sealed cold volumes are both counted, with a single atomic load when the snapshot-isolation fallback is not required.
+
+```c
+uint64_t count = 0;
+if (stoolap_table_count(db, "users", &count) == STOOLAP_OK) {
+    printf("users: %llu rows\n", (unsigned long long)count);
+}
+```
+
+Inside an explicit transaction, use `stoolap_tx_table_count()` instead. It returns the count visible to that transaction, including uncommitted local INSERTs and DELETEs done in the same transaction:
+
+```c
+StoolapTx* tx = NULL;
+stoolap_begin(db, &tx);
+stoolap_tx_exec(tx, "INSERT INTO users VALUES (99, 'Tx-only')", NULL);
+
+uint64_t in_tx = 0;
+stoolap_tx_table_count(tx, "users", &in_tx);    /* sees the new row */
+
+uint64_t outside = 0;
+stoolap_table_count(db, "users", &outside);     /* does not see it (autocommit) */
+
+stoolap_tx_rollback(tx);
+```
+
+Both functions return `STOOLAP_ERROR` and record `STOOLAP_ERR_TABLE_NOT_FOUND` on a missing table.
 
 ## Column Access
 
@@ -429,6 +459,36 @@ stoolap_tx_commit(tx);
 stoolap_stmt_finalize(lookup);
 ```
 
+### Savepoints
+
+Savepoints record a point inside an open transaction so you can later discard work done after that point without rolling back the entire transaction. The three operations follow the SQL standard: create, release (forget the savepoint, keep the work), and rollback to (undo work done after the savepoint).
+
+```c
+StoolapTx* tx = NULL;
+stoolap_begin(db, &tx);
+
+stoolap_tx_exec(tx, "INSERT INTO orders VALUES (1, 100)", NULL);
+
+stoolap_tx_savepoint(tx, "before_items", -1);
+stoolap_tx_exec(tx, "INSERT INTO order_items VALUES (1, 'A')", NULL);
+stoolap_tx_exec(tx, "INSERT INTO order_items VALUES (1, 'B')", NULL);
+
+/* Something is wrong: undo the items, keep the order. */
+stoolap_tx_rollback_to_savepoint(tx, "before_items", -1);
+
+stoolap_tx_commit(tx);   /* the order is committed; items are not */
+```
+
+The `name_len` argument is the byte length of the savepoint name. Pass `-1` to treat `name` as a NUL-terminated C string, or pass an explicit positive length when interoperating with non-NUL-terminated buffers (for example, MariaDB handlerton savepoint chunks).
+
+```c
+const char* raw = "sp_aBOGUS";    /* explicit length clips the trailing junk */
+stoolap_tx_savepoint(tx, raw, 4);
+stoolap_tx_release_savepoint(tx, raw, 4);
+```
+
+Re-using an existing savepoint name overwrites it. `stoolap_tx_release_savepoint()` and `stoolap_tx_rollback_to_savepoint()` return `STOOLAP_ERROR` on an unknown name; the typed code is `STOOLAP_ERR_INVALID_ARGUMENT` and the message identifies the missing savepoint.
+
 ### Transaction Functions
 
 | Function | Returns | Description |
@@ -441,9 +501,15 @@ stoolap_stmt_finalize(lookup);
 | `stoolap_tx_query_params(tx, sql, params, len, &rows)` | `int32_t` | Query with params |
 | `stoolap_tx_stmt_exec(tx, stmt, params, len, &affected)` | `int32_t` | Execute prepared statement in transaction |
 | `stoolap_tx_stmt_query(tx, stmt, params, len, &rows)` | `int32_t` | Query with prepared statement in transaction |
+| `stoolap_tx_table_count(tx, table, &count)` | `int32_t` | Snapshot-correct row count visible to this tx |
+| `stoolap_tx_savepoint(tx, name, name_len)` | `int32_t` | Create or overwrite a savepoint |
+| `stoolap_tx_release_savepoint(tx, name, name_len)` | `int32_t` | Forget a savepoint, keep the work |
+| `stoolap_tx_rollback_to_savepoint(tx, name, name_len)` | `int32_t` | Undo work done after the savepoint |
 | `stoolap_tx_commit(tx)` | `int32_t` | Commit and free handle |
 | `stoolap_tx_rollback(tx)` | `int32_t` | Rollback and free handle |
 | `stoolap_tx_errmsg(tx)` | `const char*` | Last error message |
+| `stoolap_tx_errcode(tx)` | `int32_t` | Last error code (`STOOLAP_ERR_*`) |
+| `stoolap_tx_errdetails(tx, &out)` | `int32_t` | Fill structured error details |
 
 **Important**: After `stoolap_tx_commit()` or `stoolap_tx_rollback()`, the `tx` pointer is invalid regardless of the return code. On commit/rollback failure, retrieve the error with `stoolap_errmsg(NULL)` (the global thread-local error).
 
@@ -600,6 +666,89 @@ if (stoolap_open("bad://dsn", &db) != STOOLAP_OK) {
 
 If no error has occurred, all `*_errmsg()` functions return an empty string (`""`), never NULL.
 
+### Typed Error Codes
+
+For programmatic error handling, every handle also exposes a typed error code and a structured detail struct. Use the code to branch (for example, retry on `STOOLAP_ERR_DB_LOCKED`, surface the conflicting column for `STOOLAP_ERR_UNIQUE`) instead of grepping the message text.
+
+```c
+int32_t rc = stoolap_exec(db, "INSERT INTO users VALUES (1, 'a@x.com')", NULL);
+if (rc == STOOLAP_ERROR) {
+    switch (stoolap_errcode(db)) {
+        case STOOLAP_ERR_UNIQUE: {
+            StoolapErrorDetails det = {0};
+            stoolap_errdetails(db, &det);
+            /* det.column = "email", det.constraint = "<index name>",
+               det.detail = the conflicting value, det.message = full text. */
+            fprintf(stderr, "duplicate %s: %s\n", det.column, det.detail);
+            break;
+        }
+        case STOOLAP_ERR_DB_LOCKED:
+            /* retry with backoff */
+            break;
+        default:
+            fprintf(stderr, "%s\n", stoolap_errmsg(db));
+    }
+}
+```
+
+`stoolap_errdetails()` fills the caller's struct; the `const char*` fields are valid until the next API call on the same handle. `message` is never NULL (empty string on success). All other pointer fields are NULL when the field does not apply to this error code.
+
+```c
+typedef struct StoolapErrorDetails {
+    int32_t code;          /* one of STOOLAP_ERR_* */
+    int32_t _padding;
+    const char* message;   /* never NULL: empty string on success */
+    const char* table;     /* table name, or NULL */
+    const char* column;    /* column name, or NULL */
+    const char* constraint;/* index name (UNIQUE) or referenced table (FK), or NULL */
+    const char* detail;    /* free-form: conflicting value, CHECK expr, FK detail */
+} StoolapErrorDetails;
+```
+
+The same surface is available on every handle:
+
+| Function | Use when |
+|----------|----------|
+| `stoolap_errcode(db)` / `stoolap_errdetails(db, &out)` | After `stoolap_exec*`, `stoolap_query*`, `stoolap_prepare`, `stoolap_table_count` fail |
+| `stoolap_tx_errcode(tx)` / `stoolap_tx_errdetails(tx, &out)` | After `stoolap_tx_exec*`, `stoolap_tx_query*`, `stoolap_tx_table_count`, `stoolap_tx_savepoint*` fail |
+| `stoolap_stmt_errcode(stmt)` / `stoolap_stmt_errdetails(stmt, &out)` | After `stoolap_stmt_exec`, `stoolap_stmt_query` fail |
+| `stoolap_rows_errcode(rows)` / `stoolap_rows_errdetails(rows, &out)` | After `stoolap_rows_next` returns `STOOLAP_ERROR` |
+| `stoolap_ro_errcode(ro)` / `stoolap_ro_errdetails(ro, &out)` | After `stoolap_ro_*` calls fail |
+| `stoolap_errcode(NULL)` / `stoolap_errdetails(NULL, &out)` | After `stoolap_open*`, `stoolap_open_read_only`, or `stoolap_tx_commit`/`rollback` fail (thread-local fallback) |
+
+Codes are appended-only and stable across releases. Plugins should default to generic handling for unknown codes so future additions do not require a recompile.
+
+| Constant | Value | Meaning |
+|----------|:-----:|---------|
+| `STOOLAP_ERR_OK` | 0 | No error |
+| `STOOLAP_ERR_GENERIC` | 1 | Unclassified error (use the message) |
+| `STOOLAP_ERR_NOT_NULL` | 2 | NOT NULL constraint violated; `column` set |
+| `STOOLAP_ERR_UNIQUE` | 3 | UNIQUE violated; `column`, `constraint`, `detail` set |
+| `STOOLAP_ERR_PRIMARY_KEY` | 4 | PRIMARY KEY violated |
+| `STOOLAP_ERR_FOREIGN_KEY` | 5 | FK violated; `table`, `column`, `constraint` (= referenced table), `detail` set |
+| `STOOLAP_ERR_CHECK` | 6 | CHECK constraint violated; `column`, `detail` (= expression) set |
+| `STOOLAP_ERR_TABLE_NOT_FOUND` | 7 | `table` set |
+| `STOOLAP_ERR_TABLE_EXISTS` | 8 | `table` set |
+| `STOOLAP_ERR_COLUMN_NOT_FOUND` | 9 | `column` set |
+| `STOOLAP_ERR_INDEX_NOT_FOUND` | 10 | `constraint` (= index name) set |
+| `STOOLAP_ERR_INDEX_EXISTS` | 11 | `constraint` set |
+| `STOOLAP_ERR_TYPE_MISMATCH` | 12 | Type conversion or comparison error |
+| `STOOLAP_ERR_INVALID_ARGUMENT` | 13 | Bad parameter, malformed savepoint name, etc. |
+| `STOOLAP_ERR_PARSE` | 14 | SQL parse error |
+| `STOOLAP_ERR_TX_ABORTED` | 15 | Transaction was aborted by the engine |
+| `STOOLAP_ERR_TX_CLOSED` | 16 | Transaction not started, already ended, or closed |
+| `STOOLAP_ERR_READ_ONLY` | 17 | Write rejected on a read-only handle or read-only mount |
+| `STOOLAP_ERR_DB_LOCKED` | 18 | Another process holds the file lock |
+| `STOOLAP_ERR_IO` | 19 | I/O failure |
+| `STOOLAP_ERR_NOT_SUPPORTED` | 20 | Operation not supported |
+| `STOOLAP_ERR_INTERNAL` | 21 | Internal invariant failure (file a bug) |
+| `STOOLAP_ERR_QUERY_CANCELLED` | 22 | Query cancelled |
+| `STOOLAP_ERR_DIVISION_BY_ZERO` | 23 | Division by zero in expression |
+| `STOOLAP_ERR_VALUE_TOO_LONG` | 24 | Value exceeds column length limit; `column` set |
+| `STOOLAP_ERR_VIEW_NOT_FOUND` | 25 | `table` (= view name) set |
+| `STOOLAP_ERR_VIEW_EXISTS` | 26 | `table` (= view name) set |
+| `STOOLAP_ERR_REOPEN_REQUIRED` | 27 | SWMR reader: cached state stale; close and reopen the handle |
+
 ## Thread Safety
 
 A single `StoolapDB` handle must not be used from multiple threads simultaneously. For multi-threaded use, clone the handle with `stoolap_clone()`. Each clone shares the underlying engine (data, indexes, transactions) but has its own executor and error state.
@@ -628,6 +777,89 @@ stoolap_close(db);
 - **StoolapStmt**: Do not use concurrently from multiple threads.
 - **StoolapTx**: Must remain on the thread that created it.
 - **StoolapRows**: Must remain on the thread that created it.
+
+## Read-Only Handle
+
+`stoolap_open_read_only()` returns a `StoolapRoDB*` whose surface is exclusively read-only. There are no `stoolap_ro_exec` or `stoolap_ro_begin` entry points, so write SQL routed through this handle is a link error on the C side rather than a runtime check. Write SQL passed to `stoolap_ro_query()` (which routes through the read engine) is rejected with `STOOLAP_ERR_READ_ONLY` at runtime.
+
+Multiple processes can hold a read-only handle on the same database concurrently. A writable open is rejected while any reader is active, and vice versa.
+
+```c
+StoolapRoDB* ro = NULL;
+if (stoolap_open_read_only("file:///data/mydb", &ro) != STOOLAP_OK) {
+    fprintf(stderr, "open failed: %s\n", stoolap_errmsg(NULL));
+    return 1;
+}
+
+uint64_t n = 0;
+stoolap_ro_table_count(ro, "users", &n);
+printf("users visible to this snapshot: %llu\n", (unsigned long long)n);
+
+StoolapRows* rows = NULL;
+stoolap_ro_query(ro, "SELECT id, name FROM users WHERE id < 100", &rows);
+while (stoolap_rows_next(rows) == STOOLAP_ROW) {
+    /* ... read columns ... */
+}
+stoolap_rows_close(rows);
+
+stoolap_ro_close(ro);
+```
+
+### DSN Flag Routing
+
+`stoolap_open()` REJECTS the read-only DSN flags (`?read_only=true`, `?readonly=true`, `?mode=ro`) with `STOOLAP_ERR_INVALID_ARGUMENT` and a message pointing the caller to `stoolap_open_read_only`. The intent is to surface the type-system mismatch loudly rather than silently downgrade to a writable handle.
+
+`stoolap_open_read_only()` accepts those flags as redundant no-ops, so existing driver DSN strings continue to work unchanged:
+
+```c
+StoolapRoDB* ro = NULL;
+stoolap_open_read_only("file:///data/mydb",                &ro);  /* preferred */
+stoolap_open_read_only("file:///data/mydb?read_only=1",    &ro);  /* also fine */
+stoolap_open_read_only("file:///data/mydb?mode=ro",        &ro);  /* also fine */
+```
+
+In-memory DSNs (`memory://`) are not supported for `stoolap_open_read_only` (there is no on-disk state to share). Read-only opens against directories on read-only mounts and chmod-read-only directories are supported; the engine acquires a long-lived shared lock to prevent a privileged writer from reclaiming files under the reader.
+
+### Cross-Process Visibility
+
+By default each `stoolap_ro_query*` call polls the on-disk manifest epoch (one 8-byte read) and, if the writer has advanced, refreshes manifests before executing. This costs roughly 1 microsecond when nothing has changed; the manifest reload only fires after a writer checkpoint.
+
+For stable visibility across multiple queries (for example, inside an application-level "report" block) disable auto-refresh, run the queries, then re-enable:
+
+```c
+stoolap_ro_set_auto_refresh(ro, 0);
+/* ... run a series of queries against a stable snapshot ... */
+stoolap_ro_set_auto_refresh(ro, 1);
+```
+
+Call `stoolap_ro_refresh()` to advance manually. It returns `1` if the snapshot moved, `0` if it was already current, or `STOOLAP_ERROR` on a must-reopen condition. The latter surfaces with the typed code `STOOLAP_ERR_REOPEN_REQUIRED` and indicates the caller MUST close this handle and call `stoolap_open_read_only` again. Causes include the writer process being replaced, a checkpoint truncating the WAL window the reader was tailing, or DDL that the read-only engine cannot replay live.
+
+```c
+int32_t r = stoolap_ro_refresh(ro);
+if (r == STOOLAP_ERROR && stoolap_ro_errcode(ro) == STOOLAP_ERR_REOPEN_REQUIRED) {
+    fprintf(stderr, "snapshot expired: %s\n", stoolap_ro_errmsg(ro));
+    stoolap_ro_close(ro);
+    stoolap_open_read_only(dsn, &ro);
+}
+```
+
+### Read-Only Functions
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `stoolap_open_read_only(dsn, &ro)` | `int32_t` | Open a read-only handle |
+| `stoolap_ro_close(ro)` | `void` | Close and free (NULL-safe) |
+| `stoolap_ro_query(ro, sql, &rows)` | `int32_t` | Query without parameters |
+| `stoolap_ro_query_params(ro, sql, params, len, &rows)` | `int32_t` | Query with positional parameters |
+| `stoolap_ro_query_named(ro, sql, params, len, &rows)` | `int32_t` | Query with named parameters |
+| `stoolap_ro_table_exists(ro, name)` | `int32_t` | 1 if exists, 0 if not, -1 on error |
+| `stoolap_ro_table_count(ro, table, &count)` | `int32_t` | Snapshot row count for `table` |
+| `stoolap_ro_refresh(ro)` | `int32_t` | Advance to writer's latest visible state |
+| `stoolap_ro_set_auto_refresh(ro, enabled)` | `void` | Toggle automatic refresh on every query |
+| `stoolap_ro_dsn(ro)` | `const char*` | DSN string (cached, valid for handle lifetime) |
+| `stoolap_ro_errmsg(ro)` | `const char*` | Last error message |
+| `stoolap_ro_errcode(ro)` | `int32_t` | Last error code (`STOOLAP_ERR_*`) |
+| `stoolap_ro_errdetails(ro, &out)` | `int32_t` | Fill structured error details |
 
 ## Type Mapping
 
@@ -716,11 +948,14 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 
 | Function | Returns | Description |
 |----------|---------|-------------|
-| `stoolap_open(dsn, &db)` | `int32_t` | Open by DSN string |
+| `stoolap_open(dsn, &db)` | `int32_t` | Open by DSN string (REJECTS `?read_only=*` flags) |
 | `stoolap_open_in_memory(&db)` | `int32_t` | Open a unique in-memory database |
+| `stoolap_open_read_only(dsn, &ro)` | `int32_t` | Open a read-only handle (`StoolapRoDB*`) |
 | `stoolap_clone(db, &out_db)` | `int32_t` | Clone handle for multi-threaded use |
 | `stoolap_close(db)` | `int32_t` | Close and free (NULL-safe) |
 | `stoolap_errmsg(db)` | `const char*` | Last error (pass NULL for global error) |
+| `stoolap_errcode(db)` | `int32_t` | Last error code (`STOOLAP_ERR_*`; pass NULL for global) |
+| `stoolap_errdetails(db, &out)` | `int32_t` | Fill structured error details (pass NULL for global) |
 
 ### Execute (DDL/DML)
 
@@ -737,6 +972,7 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 | `stoolap_query(db, sql, &rows)` | `int32_t` | Query without parameters |
 | `stoolap_query_params(db, sql, params, len, &rows)` | `int32_t` | Query with positional parameters |
 | `stoolap_query_named(db, sql, params, len, &rows)` | `int32_t` | Query with named parameters |
+| `stoolap_table_count(db, table, &count)` | `int32_t` | O(1) autocommit row count for `table` |
 
 ### Prepared Statements
 
@@ -749,6 +985,8 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 | `stoolap_stmt_sql(stmt)` | `const char*` | Get SQL text (valid until finalize) |
 | `stoolap_stmt_finalize(stmt)` | `void` | Destroy statement (NULL-safe) |
 | `stoolap_stmt_errmsg(stmt)` | `const char*` | Last error message |
+| `stoolap_stmt_errcode(stmt)` | `int32_t` | Last error code (`STOOLAP_ERR_*`) |
+| `stoolap_stmt_errdetails(stmt, &out)` | `int32_t` | Fill structured error details |
 
 ### Transactions
 
@@ -766,9 +1004,33 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 | `stoolap_tx_stmt_exec_named(tx, stmt, params, len, &affected)` | `int32_t` | Execute prepared statement with named params in transaction |
 | `stoolap_tx_stmt_query(tx, stmt, params, len, &rows)` | `int32_t` | Query with prepared statement in transaction |
 | `stoolap_tx_stmt_query_named(tx, stmt, params, len, &rows)` | `int32_t` | Query with prepared statement and named params in transaction |
+| `stoolap_tx_table_count(tx, table, &count)` | `int32_t` | Snapshot row count visible to this tx |
+| `stoolap_tx_savepoint(tx, name, name_len)` | `int32_t` | Create or overwrite a savepoint |
+| `stoolap_tx_release_savepoint(tx, name, name_len)` | `int32_t` | Forget a savepoint, keep the work |
+| `stoolap_tx_rollback_to_savepoint(tx, name, name_len)` | `int32_t` | Undo work done after the savepoint |
 | `stoolap_tx_commit(tx)` | `int32_t` | Commit and free handle |
 | `stoolap_tx_rollback(tx)` | `int32_t` | Rollback and free handle |
 | `stoolap_tx_errmsg(tx)` | `const char*` | Last error message |
+| `stoolap_tx_errcode(tx)` | `int32_t` | Last error code (`STOOLAP_ERR_*`) |
+| `stoolap_tx_errdetails(tx, &out)` | `int32_t` | Fill structured error details |
+
+### Read-Only Handle
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `stoolap_open_read_only(dsn, &ro)` | `int32_t` | Open a read-only handle on `dsn` |
+| `stoolap_ro_close(ro)` | `void` | Close and free (NULL-safe) |
+| `stoolap_ro_query(ro, sql, &rows)` | `int32_t` | Query without parameters |
+| `stoolap_ro_query_params(ro, sql, params, len, &rows)` | `int32_t` | Query with positional parameters |
+| `stoolap_ro_query_named(ro, sql, params, len, &rows)` | `int32_t` | Query with named parameters |
+| `stoolap_ro_table_exists(ro, name)` | `int32_t` | 1 if exists, 0 if not, -1 on error |
+| `stoolap_ro_table_count(ro, table, &count)` | `int32_t` | Snapshot row count for `table` |
+| `stoolap_ro_refresh(ro)` | `int32_t` | Advance to writer's latest visible state |
+| `stoolap_ro_set_auto_refresh(ro, enabled)` | `void` | Toggle automatic refresh on every query |
+| `stoolap_ro_dsn(ro)` | `const char*` | DSN string (cached for handle lifetime) |
+| `stoolap_ro_errmsg(ro)` | `const char*` | Last error message |
+| `stoolap_ro_errcode(ro)` | `int32_t` | Last error code (`STOOLAP_ERR_*`) |
+| `stoolap_ro_errdetails(ro, &out)` | `int32_t` | Fill structured error details |
 
 ### Result Set
 
@@ -788,6 +1050,15 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 | `stoolap_rows_affected(rows)` | `int64_t` | Rows affected (for DML results) |
 | `stoolap_rows_close(rows)` | `void` | Close and free (NULL-safe, must always be called) |
 | `stoolap_rows_errmsg(rows)` | `const char*` | Last error message |
+| `stoolap_rows_errcode(rows)` | `int32_t` | Last error code (`STOOLAP_ERR_*`) |
+| `stoolap_rows_errdetails(rows, &out)` | `int32_t` | Fill structured error details |
+
+### Typed Error Codes
+
+| Function | Returns | Description |
+|----------|---------|-------------|
+| `stoolap_errcode(db)` | `int32_t` | Last error code on `db`. Pass NULL for thread-local (open / commit / rollback failures). |
+| `stoolap_errdetails(db, &out)` | `int32_t` | Fill `StoolapErrorDetails` from `db`. Pass NULL for thread-local. |
 
 ### Bulk Fetch
 

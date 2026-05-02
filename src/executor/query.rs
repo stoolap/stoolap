@@ -7987,6 +7987,66 @@ impl Executor {
                 rows.push((0, Row::from_values(vec![Value::text(&result_msg)])));
                 Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
+            "SWMR_STATUS" => {
+                // PRAGMA SWMR_STATUS: cross-process diagnostic. Returns
+                // a single row describing this engine's view of SWMR
+                // coordination state. Useful for debugging "why isn't
+                // my reader seeing data?" / "why isn't the writer
+                // unlinking old volumes?".
+                if stmt.value.is_some() {
+                    return Err(Error::internal("PRAGMA SWMR_STATUS does not accept values"));
+                }
+                let cfg = self.engine.config();
+                let path = self.engine.get_path();
+                let read_only = self.engine.is_read_only_mode();
+
+                // Manifest epoch (writer's last published checkpoint).
+                let manifest_epoch_value = if path.is_empty() {
+                    0i64
+                } else {
+                    crate::storage::mvcc::manifest_epoch::read_epoch(std::path::Path::new(path))
+                        .unwrap_or(0) as i64
+                };
+
+                // Effective lease max_age that the writer's GC uses.
+                let lease_max_age_secs = if cfg.persistence.lease_max_age_secs > 0 {
+                    cfg.persistence.lease_max_age_secs as i64
+                } else {
+                    ((cfg.persistence.checkpoint_interval as u64 * 2).max(120)) as i64
+                };
+
+                // Live lease count (only meaningful for file engines).
+                let live_lease_count = if path.is_empty() {
+                    0i64
+                } else {
+                    let dir =
+                        std::path::Path::new(path).join(crate::storage::mvcc::lease::READERS_DIR);
+                    let max_age = std::time::Duration::from_secs(lease_max_age_secs as u64);
+                    crate::storage::mvcc::lease::live_leases(&dir, max_age)
+                        .map(|v| v.len() as i64)
+                        .unwrap_or(0)
+                };
+
+                let columns = vec![
+                    "manifest_epoch".to_string(),
+                    "live_lease_count".to_string(),
+                    "lease_max_age_secs".to_string(),
+                    "is_read_only".to_string(),
+                    "checkpoint_interval_secs".to_string(),
+                ];
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![
+                        Value::Integer(manifest_epoch_value),
+                        Value::Integer(live_lease_count),
+                        Value::Integer(lease_max_age_secs),
+                        Value::Boolean(read_only),
+                        Value::Integer(cfg.persistence.checkpoint_interval as i64),
+                    ]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
             "DEDUP_SEGMENTS" => {
                 let columns = vec!["message".to_string()];
                 let mut rows = RowVec::with_capacity(1);

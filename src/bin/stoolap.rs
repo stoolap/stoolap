@@ -25,9 +25,95 @@ use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{Config, DefaultEditor, EditMode, Editor};
 
-use stoolap::api::{Database, Transaction as ApiTransaction};
+use stoolap::api::{Database, ReadOnlyDatabase, Rows, Transaction as ApiTransaction};
 use stoolap::common::version::{MAJOR, MINOR, PATCH};
 use stoolap::Value;
+
+/// CLI handle that owns either a writable `Database` or a
+/// `ReadOnlyDatabase` depending on the `--read-only` flag /
+/// `?read_only=true` DSN parameter at startup.
+///
+/// `Database::open(?read_only=true)` is rejected at the API
+/// surface (the type system distinguishes writable from
+/// read-only handles), so the CLI dispatches at startup and
+/// hides the distinction behind a small union API the rest of
+/// the CLI consumes.
+enum CliDb {
+    Writable(Database),
+    ReadOnly(ReadOnlyDatabase),
+}
+
+impl CliDb {
+    fn execute<P: stoolap::api::Params>(&self, sql: &str, params: P) -> stoolap::Result<i64> {
+        match self {
+            CliDb::Writable(db) => db.execute(sql, params),
+            CliDb::ReadOnly(_) => Err(stoolap::Error::ReadOnlyViolation(
+                "execute() unavailable on a read-only database (opened with --read-only / \
+                 ?read_only=true). Use query() for SELECT/SHOW/EXPLAIN, or restart without \
+                 --read-only to run write SQL."
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn execute_with_timeout<P: stoolap::api::Params>(
+        &self,
+        sql: &str,
+        params: P,
+        timeout_ms: u64,
+    ) -> stoolap::Result<i64> {
+        match self {
+            CliDb::Writable(db) => db.execute_with_timeout(sql, params, timeout_ms),
+            CliDb::ReadOnly(_) => Err(stoolap::Error::ReadOnlyViolation(
+                "execute() unavailable on a read-only database".to_string(),
+            )),
+        }
+    }
+
+    fn query<P: stoolap::api::Params>(&self, sql: &str, params: P) -> stoolap::Result<Rows> {
+        match self {
+            CliDb::Writable(db) => db.query(sql, params),
+            CliDb::ReadOnly(rod) => rod.query(sql, params),
+        }
+    }
+
+    fn query_with_timeout<P: stoolap::api::Params>(
+        &self,
+        sql: &str,
+        params: P,
+        timeout_ms: u64,
+    ) -> stoolap::Result<Rows> {
+        match self {
+            CliDb::Writable(db) => db.query_with_timeout(sql, params, timeout_ms),
+            // ReadOnlyDatabase doesn't expose query_with_timeout
+            // yet; fall back to the untimed path. The CLI's
+            // timeout is best-effort already.
+            CliDb::ReadOnly(rod) => rod.query(sql, params),
+        }
+    }
+
+    fn begin(&self) -> stoolap::Result<ApiTransaction> {
+        match self {
+            CliDb::Writable(db) => db.begin(),
+            CliDb::ReadOnly(_) => Err(stoolap::Error::ReadOnlyViolation(
+                "begin() unavailable on a read-only database. Use SQL `BEGIN ... COMMIT` \
+                 inside a query for read-only transactions."
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn close(&self) -> stoolap::Result<()> {
+        match self {
+            CliDb::Writable(db) => db.close(),
+            // ReadOnlyDatabase has no explicit close — the
+            // engine closes when the last `Arc<EngineEntry>`
+            // drops. The CLI's `db.close()` call here returns
+            // Ok and lets the value drop naturally.
+            CliDb::ReadOnly(_) => Ok(()),
+        }
+    }
+}
 
 /// Version string constant
 const VERSION: &str = concat!(
@@ -67,9 +153,8 @@ PERSISTENCE DSN PARAMETERS:\n\
   sync_interval_ms=MS         Min time between syncs in normal mode (default: 1000)\n\
   compression_threshold=BYTES Min size to compress (default: 64)\n\
   target_volume_rows=ROWS     Target rows per cold volume (default: 1048576)\n\
-  read_only=true|false        Open in read-only mode (default: false)\n\
-                              Shared file lock; writes refused.\n\
-                              Equivalent: --read-only, ?mode=ro\n\n\
+  (read-only is selected via --read-only on the CLI; the\n\
+   programmatic API uses Database::open_read_only(dsn).)\n\n\
 EXAMPLES:\n\
   stoolap -d memory://                                    In-memory database\n\
   stoolap -d file:///tmp/mydb                             Persistent database\n\
@@ -77,8 +162,7 @@ EXAMPLES:\n\
   stoolap -d file:///tmp/mydb?sync_mode=none&compression=off  Max performance\n\
   stoolap -d file:///tmp/mydb --profile durable           Use durable preset\n\
   stoolap -d file:///tmp/mydb --sync full --compression off\n\
-  stoolap -d file:///tmp/mydb --read-only                 Open read-only (LOCK_SH)\n\
-  stoolap -d file:///tmp/mydb?read_only=true              Same via DSN flag\n\n\
+  stoolap -d file:///tmp/mydb --read-only                 Open read-only (LOCK_SH)\n\n\
 BACKUP & RESTORE:\n\
   stoolap -d file:///tmp/mydb --snapshot                  Create backup snapshot\n\
   stoolap -d file:///tmp/mydb --restore                   Restore from latest snapshot\n\
@@ -170,19 +254,18 @@ struct Args {
 
     /// Open the database in read-only mode.
     ///
-    /// Acquires a shared file lock (multiple readers can coexist), skips the
-    /// background cleanup thread, and rejects every write SQL statement
-    /// (INSERT/UPDATE/DELETE/DDL/maintenance PRAGMA) with `ReadOnlyViolation`.
-    /// Equivalent to passing `?read_only=true` in the DSN. For file:// the
-    /// path must already exist and contain a stoolap database; a fresh DB is
-    /// never created on disk in read-only mode.
+    /// Routes through `Database::open_read_only(dsn)` (the
+    /// programmatic equivalent), which returns the
+    /// `ReadOnlyDatabase` type — write SQL is rejected at the
+    /// API surface as well as the parser. For file:// the path
+    /// must already exist and contain a stoolap database; a
+    /// fresh DB is never created on disk in read-only mode.
     ///
-    /// Mutually exclusive with --restore (which writes snapshot data to
-    /// disk before opening), --snapshot (which writes new files), and
-    /// --reset-volumes (which deletes on-disk state). Combining any of
-    /// those with --read-only would either fail later inside the engine
-    /// or leave the user with a confusing read-only handle on
-    /// freshly-restored data.
+    /// Mutually exclusive with --restore (which writes snapshot
+    /// data to disk before opening), --snapshot (which writes
+    /// new files), and --reset-volumes (which deletes on-disk
+    /// state). Combining any of those with --read-only would
+    /// fail later inside the engine.
     #[arg(
         long = "read-only",
         alias = "readonly",
@@ -193,7 +276,7 @@ struct Args {
 
 /// CLI state for interactive mode
 struct Cli {
-    db: Database,
+    db: CliDb,
     tx: Option<ApiTransaction>,
     in_transaction: bool,
     json_output: bool,
@@ -208,7 +291,7 @@ struct Cli {
 
 impl Cli {
     fn new(
-        db: Database,
+        db: CliDb,
         json_output: bool,
         limit: usize,
         quiet: bool,
@@ -678,15 +761,13 @@ impl Cli {
 fn build_dsn(args: &Args) -> String {
     let mut dsn = args.db_path.clone();
 
-    // Persistence params only make sense for file://. memory:// gets the
-    // read-only flag handled below (it's the only flag that's meaningful
-    // for both schemes).
+    // Persistence params only make sense for file://. The
+    // `--read-only` flag is dispatched at startup
+    // (`Database::open_read_only(dsn)` vs `Database::open(dsn)`),
+    // not encoded as a DSN param: `Database::open` rejects
+    // `?read_only=true` to keep the writable / read-only
+    // distinction at the type level.
     if !dsn.starts_with("file://") {
-        if args.read_only {
-            let separator = if dsn.contains('?') { "&" } else { "?" };
-            dsn.push_str(separator);
-            dsn.push_str("read_only=true");
-        }
         return dsn;
     }
 
@@ -769,13 +850,11 @@ fn build_dsn(args: &Args) -> String {
         params.push("checkpoint_on_close=off".to_string());
     }
 
-    // Read-only mode (CLI flag → DSN param). Lets `--read-only` work without
-    // the user editing the DSN. If the DSN already carries `read_only=` /
-    // `readonly=` / `mode=`, the parser uses last-flag-wins, so the CLI
-    // flag (appended last) takes precedence.
-    if args.read_only {
-        params.push("read_only=true".to_string());
-    }
+    // `--read-only` is NOT encoded into the DSN — the caller
+    // dispatches at open time via `Database::open_read_only(dsn)`.
+    // `Database::open` rejects `?read_only=true` so the user
+    // can't accidentally produce a `Database` value backed by a
+    // read-only engine.
 
     // Append params to DSN
     if !params.is_empty() {
@@ -1169,12 +1248,27 @@ fn main() {
 
     // --reset-volumes already handled above (before --restore).
 
-    // Open the database
-    let db = match Database::open(&db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("Error opening database: {}", e);
-            std::process::exit(1);
+    // Open the database. `--read-only` dispatches to
+    // `Database::open_read_only(dsn)` (returns `ReadOnlyDatabase`)
+    // because `Database::open` rejects read-only DSN flags — the
+    // type system enforces the read-only contract instead of
+    // runtime checks. The CLI wraps the result in `CliDb` so
+    // execute / query / begin etc. dispatch uniformly.
+    let db: CliDb = if args.read_only {
+        match Database::open_read_only(&db_path) {
+            Ok(rod) => CliDb::ReadOnly(rod),
+            Err(e) => {
+                eprintln!("Error opening database (read-only): {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        match Database::open(&db_path) {
+            Ok(db) => CliDb::Writable(db),
+            Err(e) => {
+                eprintln!("Error opening database: {}", e);
+                std::process::exit(1);
+            }
         }
     };
 
@@ -1282,7 +1376,7 @@ fn main() {
 }
 
 fn execute_from_file(
-    db: &Database,
+    db: &CliDb,
     filename: &str,
     json_output: bool,
     quiet: bool,
@@ -1363,7 +1457,7 @@ fn execute_from_file(
 }
 
 fn execute_piped_input(
-    db: &Database,
+    db: &CliDb,
     json_output: bool,
     quiet: bool,
     row_limit: usize,
@@ -1448,7 +1542,7 @@ fn execute_piped_input(
 }
 
 fn execute_query_with_options(
-    db: &Database,
+    db: &CliDb,
     query: &str,
     json_output: bool,
     quiet: bool,

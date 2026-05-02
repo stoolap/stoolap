@@ -35,21 +35,27 @@ let db = Database::open("file:///path/to/database")?;
 // File-based with configuration
 let db = Database::open("file:///path/to/db?sync=full&checkpoint_interval=60")?;
 
-// Read-only via DSN flag (writable handle type, but every write SQL returns Error::ReadOnlyViolation)
-let db = Database::open("file:///path/to/database?read_only=true")?;
-// SQLite-style alias
-let db = Database::open("file:///path/to/database?mode=ro")?;
-
-// Read-only via dedicated entry point (returns a ReadOnlyDatabase)
+// Read-only handles come from the dedicated entry point — returns
+// `ReadOnlyDatabase`, which has no `execute` / `begin` methods so write
+// SQL is a compile-time error rather than a runtime ReadOnlyViolation.
 let ro = Database::open_read_only("file:///path/to/database")?;
+// The DSN flag is accepted as redundant (driver DSN strings stay valid):
+let ro = Database::open_read_only("file:///path/to/database?read_only=true")?;
+// SQLite-style alias also accepted on this entry point:
+let ro = Database::open_read_only("file:///path/to/database?mode=ro")?;
 
-// Wrap an existing writable handle as read-only (shares the engine)
+// `Database::open(dsn)` REJECTS read-only DSN flags with a clear
+// migration error pointing to `open_read_only`. The type system
+// enforces the read-only contract instead of runtime checks.
+
+// Wrap an existing writable handle as read-only (shares the engine,
+// in-process — no SWMR coordination concerns).
 let ro = db.as_read_only();
 ```
 
 `open_in_memory()` creates a unique, isolated instance each time. `open("memory://")` returns the same shared engine for the same DSN.
 
-Read-only opens take a *shared* file lock (`LOCK_SH`) so multiple reader processes can coexist; a writable open is refused while any reader is alive (and vice versa). `open_read_only` refuses to materialize a fresh database: the path must already exist as a stoolap directory. Read-only opens succeed on directories mounted read-only at the kernel level even without a pre-shipped `db.lock`.
+Read-only opens take a *shared* file lock (`LOCK_SH`) so multiple reader processes can coexist; a writable open is refused while any reader is alive (and vice versa). `open_read_only` refuses to materialize a fresh database: the path must already exist as a stoolap directory. Read-only opens succeed on directories mounted read-only at the kernel level AND on chmod-read-only directories (where they hold a long-lived `LOCK_SH` so a privileged writer cannot reclaim WAL/volumes under the reader).
 
 ### Connection String Options
 
@@ -70,8 +76,8 @@ Read-only opens take a *shared* file lock (`LOCK_SH`) so multiple reader process
 | `volume_compression` | `on` | LZ4 compression for cold volume files |
 | `checkpoint_on_close` | `on` | Seal all hot rows to volumes on clean shutdown |
 | `target_volume_rows` | `1048576` | Target rows per cold volume. Controls compaction split boundary. |
-| `read_only` / `readonly` | `false` | Open in read-only mode: shared file lock, no background cleanup, all write SQL refused with `ReadOnlyViolation`. |
-| `mode` | `rw` | SQLite-style alias for `read_only`. `mode=ro` matches `read_only=true`. |
+| `read_only` / `readonly` | `false` | Read-only mode. Pass to `Database::open_read_only(dsn)` — `Database::open(dsn)` rejects this flag with a migration error. |
+| `mode` | `rw` | SQLite-style alias for `read_only`. `mode=ro` matches `read_only=true`. Same routing rule. |
 
 ### execute()
 
@@ -659,10 +665,10 @@ fn main() -> Result<()> {
 
 | Method | Returns | Description |
 |--------|---------|-------------|
-| `open(dsn)` | `Result<Database>` | Open or reuse a database by DSN. Honors `?read_only=true` / `?mode=ro`. |
+| `open(dsn)` | `Result<Database>` | Open or reuse a writable database by DSN. **Rejects `?read_only=true` / `?readonly=true` / `?mode=ro`** with a migration error pointing to `open_read_only`. |
 | `open_in_memory()` | `Result<Database>` | Open a unique in-memory database |
-| `open_read_only(dsn)` | `Result<ReadOnlyDatabase>` | Open an existing database read-only (shared file lock; refuses to create a fresh DB) |
-| `as_read_only()` | `ReadOnlyDatabase` | Return a read-only view sharing this Database's engine |
+| `open_read_only(dsn)` | `Result<ReadOnlyDatabase>` | Open an existing database read-only (shared file lock; refuses to create a fresh DB). Accepts `?read_only=true` / `?mode=ro` as redundant; rejects `?read_only=false` / `?mode=rw` (contradicts the function name). |
+| `as_read_only()` | `ReadOnlyDatabase` | Return an in-process read-only view sharing this Database's engine |
 | `execute(sql, params)` | `Result<i64>` | Execute DDL/DML, return rows affected |
 | `query(sql, params)` | `Result<Rows>` | Execute SELECT, return row iterator |
 | `query_one(sql, params)` | `Result<T>` | Query single value |
@@ -685,7 +691,7 @@ fn main() -> Result<()> {
 | `close()` | `Result<()>` | Close database, release file lock |
 | `table_exists(name)` | `Result<bool>` | Check if table exists |
 | `dsn()` | `&str` | Get the DSN |
-| `is_read_only()` | `bool` | Whether this handle was opened read-only |
+| `is_read_only()` | `bool` | Always `false` — `Database` is always writable. Read-only handles are `ReadOnlyDatabase` (whose `is_read_only()` always returns `true`). |
 | `set_default_isolation_level(level)` | `Result<()>` | Set default isolation |
 | `create_snapshot()` | `Result<()>` | Create point-in-time snapshot |
 | `semantic_cache_stats()` | `Result<Stats>` | Get cache statistics |
@@ -693,11 +699,13 @@ fn main() -> Result<()> {
 
 ### ReadOnlyDatabase
 
-Returned by `Database::open_read_only(dsn)` and `Database::as_read_only()`. Every write SQL through this handle is rejected at parse time with `Error::ReadOnlyViolation`. Read SQL (SELECT, SHOW, EXPLAIN, BEGIN/COMMIT/ROLLBACK, SAVEPOINT) is allowed.
+Returned by `Database::open_read_only(dsn)` and `Database::as_read_only()`. The type has NO `execute` / `begin` / `prepare` methods — write SQL is a *compile-time* error rather than a runtime `Error::ReadOnlyViolation`. Read SQL (SELECT, SHOW, EXPLAIN) goes through `query` / `query_named` / `cached_plan` + `query_plan`. Read-only transactions inside an explicit `BEGIN ... COMMIT` work via SQL — the Rust `begin()` API is intentionally absent.
 
 `ReadOnlyDatabase` is a *view*, not a connection sharing a session with the source `Database`. Each handle owns its own executor and transaction state, so an uncommitted `BEGIN` on the source `Database` is **not** visible through `as_read_only()`. To observe uncommitted writes, run the read SQL inside the same `Transaction`.
 
-For prepared-statement ergonomics on a `ReadOnlyDatabase`, use `cached_plan(sql)` plus `query_plan` / `query_named_plan`. The `prepare()` API on `Database` is not mirrored on `ReadOnlyDatabase` (it requires a back-reference the read-only handle does not carry); `cached_plan` covers the same parse-once / execute-many use case.
+For cross-process readers (`Database::open_read_only` against a `file://` DSN), the handle picks up writer checkpoints via the manifest-epoch poll AND tails the WAL for sub-checkpoint commits. Typed must-reopen errors (`Error::SwmrPendingDdl` for post-attach DDL, `Error::SwmrWriterReincarnated` for writer crash + restart) are sticky once raised; reopen the handle to apply.
+
+For prepared-statement ergonomics, use `cached_plan(sql)` plus `query_plan` / `query_named_plan` — same parse-once / execute-many shape `Database::prepare` provides.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
@@ -707,7 +715,14 @@ For prepared-statement ergonomics on a `ReadOnlyDatabase`, use `cached_plan(sql)
 | `query_plan(plan, params)` | `Result<Rows>` | Execute a cached plan with positional params |
 | `query_named_plan(plan, params)` | `Result<Rows>` | Execute a cached plan with named params |
 | `dsn()` | `&str` | Get the DSN |
+| `is_read_only()` | `bool` | Always `true`. |
 | `table_exists(name)` | `Result<bool>` | Check if a table exists |
+| `refresh()` | `Result<bool>` | Force a manifest reload + WAL tail; returns `true` if state advanced |
+| `set_auto_refresh(enabled)` | `()` | Toggle the per-query auto-refresh. Disable for stable cross-query snapshots inside a SQL `BEGIN ... COMMIT`. |
+| `auto_refresh_enabled()` | `bool` | Read the auto-refresh flag |
+| `set_swmr_overlay_enabled(enabled)` | `Result<()>` | Opt into per-row WAL-tail materialization. Off by default; DDL detection is always on. |
+| `swmr_overlay_enabled()` | `bool` | Whether overlay materialization is enabled |
+| `read_engine()` | `Arc<dyn ReadEngine>` | Get the underlying read engine for libraries accepting `&dyn ReadEngine` |
 
 ```rust
 let ro = Database::open_read_only("file:///data/mydb")?;

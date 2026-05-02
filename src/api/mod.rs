@@ -83,6 +83,7 @@
 pub mod database;
 pub mod params;
 pub mod read_only_database;
+pub(crate) mod reader_attachment;
 pub mod rows;
 pub mod statement;
 pub mod transaction;

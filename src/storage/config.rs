@@ -108,6 +108,23 @@ pub struct PersistenceConfig {
     /// reduce per-volume metadata overhead.
     /// Default: 1,048,576 (1M rows = ~16 row groups of 64K each)
     pub target_volume_rows: usize,
+
+    /// SWMR v1: maximum age in seconds for a reader's `<db>/readers/<pid>.lease`
+    /// file before the writer treats it as stale and reaps it during the
+    /// next compaction. Stale-reaping lets the writer GC volumes that
+    /// would otherwise be pinned indefinitely by a crashed reader.
+    ///
+    /// `0` (default): use the engine-derived default of
+    /// `max(120s, 2 * checkpoint_interval)`. The 120s floor is a safety
+    /// margin for very-aggressive checkpoint cadences (e.g. 5s, where
+    /// 2x would be 10s and any GC pause on the reader would orphan it).
+    ///
+    /// Set explicitly via `?lease_max_age=N` for callers running long
+    /// scans that exceed `2 * checkpoint_interval` between queries.
+    /// Example: a desktop tool running 30-minute reports against a DB
+    /// with the default 60s checkpoint cadence should set
+    /// `?lease_max_age=2400` (40 minutes) to leave headroom.
+    pub lease_max_age_secs: u32,
 }
 
 impl Default for PersistenceConfig {
@@ -128,6 +145,7 @@ impl Default for PersistenceConfig {
             keep_snapshots: 3,              // Keep 3 backup snapshots per table
             checkpoint_on_close: true,      // Seal all data on clean shutdown
             target_volume_rows: 1_048_576,  // 1M rows per volume (~16 row groups)
+            lease_max_age_secs: 0,          // 0 = engine-derived default
         }
     }
 }
@@ -156,6 +174,7 @@ impl PersistenceConfig {
             keep_snapshots: 3,
             checkpoint_on_close: true,
             target_volume_rows: 1_048_576,
+            lease_max_age_secs: 0,
         }
     }
 
@@ -177,6 +196,7 @@ impl PersistenceConfig {
             keep_snapshots: 3,
             checkpoint_on_close: true,
             target_volume_rows: 2_097_152, // 2M rows for fast mode
+            lease_max_age_secs: 0,
         }
     }
 

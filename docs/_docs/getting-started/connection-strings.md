@@ -83,8 +83,8 @@ file:///path/to/data?sync_mode=normal&checkpoint_interval=60
 | `commit_batch_size` | Integer | 100 | Commits to batch before sync |
 | `sync_interval_ms` / `sync_interval` | Integer (ms) | 1000 | Minimum time between syncs in normal mode |
 | `target_volume_rows` | Integer | 1048576 | Target rows per cold volume (min: 65536). Controls compaction split boundary. |
-| `read_only` / `readonly` | true/false (or 1/0, yes/no, on/off) | false | Open in read-only mode: shared file lock, background cleanup disabled, every write SQL rejected with `ReadOnlyViolation`. |
-| `mode` | ro / rw | rw | SQLite-style alias for `read_only`. `mode=ro` is equivalent to `read_only=true`. |
+| `read_only` / `readonly` | true/false (or 1/0, yes/no, on/off) | false | Open in read-only mode. Must be passed to `Database::open_read_only(dsn)` (returns `ReadOnlyDatabase`); `Database::open(dsn)` REJECTS this flag with a clear error pointing to the right entry point. |
+| `mode` | ro / rw | rw | SQLite-style alias for `read_only`. `mode=ro` is equivalent to `read_only=true`. Same routing rule applies. |
 
 Legacy parameter names are accepted for backward compatibility:
 - `snapshot_interval` maps to `checkpoint_interval`
@@ -92,19 +92,23 @@ Legacy parameter names are accepted for backward compatibility:
 
 ### Read-only mode
 
-Adding `?read_only=true` (or `?mode=ro`) to a DSN opens the database in read-only mode:
+Read-only access is enforced at the type system. There is one entry point — `Database::open_read_only(dsn)` — and one return type — `ReadOnlyDatabase` — which exposes only read methods (`query`, `query_named`, `cached_plan`, `query_plan`, `query_named_plan`, `table_exists`, `refresh`, `read_engine`, `set_auto_refresh`). `execute` and `begin` are not on `ReadOnlyDatabase` at all, so write SQL is a *compile-time* error rather than a runtime `ReadOnlyViolation`.
+
+`Database::open(dsn)` REJECTS `?read_only=true` / `?readonly=true` / `?mode=ro` with `Error::InvalidArgument` containing the message *"read-only DSN flag passed to Database::open. Read-only handles must be opened via Database::open_read_only(dsn)..."*. The DSN string itself can be passed unchanged to `open_read_only`; the flag is accepted there as a redundant no-op.
+
+Read-only opens:
 
 - The engine acquires a *shared* file lock (`LOCK_SH`), so multiple processes can open the same database for reading at the same time. A writable open is rejected while any reader is active, and vice versa.
 - The background cleanup thread is not started (read-only opens never modify on-disk state).
-- Every write SQL statement (INSERT, UPDATE, DELETE, DDL, maintenance PRAGMA, SET TRANSACTION ISOLATION LEVEL) is rejected at parse time with `Error::ReadOnlyViolation`. `db.begin()` is also refused.
-- `Database::open(dsn)` and `Database::open_read_only(dsn)` agree on mode: opening the same DSN twice with conflicting modes errors with `ReadOnlyViolation` until the first handle drops.
+- Cross-process visibility uses lease files at `<db>/readers/<pid>.lease` plus an mmap-backed shm header at `<db>/db.shm`. The reader picks up writer checkpoints via the manifest-epoch poll and sub-checkpoint commits via WAL tailing. Writer reincarnation and post-attach DDL surface as typed must-reopen errors (`Error::SwmrWriterReincarnated`, `Error::SwmrPendingDdl`).
 - Read-only opens against a non-stoolap directory or a missing path are refused; an empty database is never created on disk.
-- Read-only opens work against directories on read-only mounts (the kernel-level read-only flag, not chmod-only restrictions). Packaged databases shipped to a read-only filesystem do not require a pre-existing `db.lock` file.
+- Read-only opens work against directories on read-only mounts (the kernel-level read-only flag) AND chmod-read-only directories. Chmod-RO opens hold a long-lived `LOCK_SH` on `db.lock` so a privileged writer (different uid) cannot acquire `LOCK_EX` and reclaim WAL/volumes under the reader.
 
 ```
-file:///data/mydb?read_only=true
-file:///data/mydb?mode=ro
+file:///data/mydb?read_only=true       # passed to open_read_only — accepted
+file:///data/mydb?mode=ro              # same
 file:///data/mydb?read_only=true&sync_mode=normal
+file:///data/mydb                      # equally valid for open_read_only — flag is redundant
 ```
 
 ### Cleanup Options
@@ -152,11 +156,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // With configuration options
     let db = Database::open("file:///data/mydb?sync_mode=full&checkpoint_interval=60")?;
 
-    // Read-only via DSN flag (writes through this handle return Error::ReadOnlyViolation)
-    let ro = Database::open("file:///data/mydb?read_only=true")?;
-    // Or via the dedicated entry point (returns ReadOnlyDatabase, write SQL refused at compile time of intent)
+    // Read-only handles MUST come from open_read_only — Database::open
+    // rejects ?read_only=true with a clear error pointing here.
     let ro = Database::open_read_only("file:///data/mydb")?;
-    // Or wrap an existing writable handle
+    // The DSN flag is also accepted (redundant) so existing driver
+    // DSN strings keep working unchanged:
+    let ro = Database::open_read_only("file:///data/mydb?read_only=true")?;
+    // Or wrap an existing writable Database — in-process typed read surface,
+    // shares the engine. No SWMR coordination concerns (same engine).
     let ro = db.as_read_only();
 
     // Execute SQL
@@ -189,10 +196,13 @@ stoolap --db "file:///data/mydb?sync_mode=full"
 # With configuration via CLI flags
 stoolap --db "file:///data/mydb" --sync full --checkpoint-interval 30
 
-# Open read-only (shared lock; INSERT/UPDATE/DELETE/DDL all rejected)
+# Open read-only (CLI dispatches to Database::open_read_only internally).
+# The --read-only flag is required; the DSN flag alone (without
+# --read-only) reaches Database::open and is rejected with a clear
+# migration error.
 stoolap --db "file:///data/mydb" --read-only
-stoolap --db "file:///data/mydb?read_only=true"
-stoolap --db "file:///data/mydb?mode=ro"
+stoolap --db "file:///data/mydb?read_only=true" --read-only
+stoolap --db "file:///data/mydb?mode=ro" --read-only
 
 # Execute a query directly
 stoolap --db "file:///data/mydb" -e "SELECT * FROM users"

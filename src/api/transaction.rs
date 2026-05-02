@@ -97,6 +97,52 @@ impl Transaction {
         self.tx.as_ref().map(|tx| tx.id()).unwrap_or(-1)
     }
 
+    /// Returns the row count in `name` visible to this transaction.
+    ///
+    /// Uses the per-table O(1) committed counter when no local changes are
+    /// pending; otherwise walks the per-tx version map to add inserts and
+    /// subtract deletes done in this transaction. Matches what `SELECT
+    /// COUNT(*) FROM name` would report against the same snapshot, without
+    /// the SQL parsing / executor overhead.
+    pub fn table_count(&self, name: &str) -> Result<u64> {
+        self.check_active()?;
+        let txn_id = self.tx.as_ref().unwrap().id();
+        let table = self.entry.engine.get_table_for_txn(txn_id, name)?;
+        if let Some(c) = table.fast_row_count() {
+            return Ok(c as u64);
+        }
+        Ok(table.row_count() as u64)
+    }
+
+    /// Create a savepoint with the given name.
+    ///
+    /// Records the current write state. A later `rollback_to_savepoint(name)`
+    /// reverts every DML and DDL change made after this point. Re-using an
+    /// existing name overwrites the prior savepoint with the same name.
+    pub fn create_savepoint(&mut self, name: &str) -> Result<()> {
+        self.check_active()?;
+        self.tx.as_mut().unwrap().create_savepoint(name)
+    }
+
+    /// Release a savepoint without rolling back.
+    ///
+    /// Forgets the savepoint; changes after it remain in the transaction.
+    /// Per SQL standard a subsequent `rollback_to_savepoint` with the same
+    /// name is an error.
+    pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        self.check_active()?;
+        self.tx.as_mut().unwrap().release_savepoint(name)
+    }
+
+    /// Roll back to the named savepoint.
+    ///
+    /// Discards every DML and DDL change made after `create_savepoint(name)`.
+    /// The savepoint itself is removed, matching standard SQL semantics.
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
+        self.check_active()?;
+        self.tx.as_mut().unwrap().rollback_to_savepoint(name)
+    }
+
     /// Execute a SQL statement within the transaction
     ///
     /// # Parameters

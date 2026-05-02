@@ -212,6 +212,30 @@ pub trait WriteTransaction: ReadTransaction {
     /// Drops a btree index from a table
     fn drop_table_btree_index(&mut self, table_name: &str, column_name: &str) -> Result<()>;
 
+    /// Stage a CREATE INDEX entry on the txn's deferred-DDL
+    /// log. The transactional CREATE TABLE path uses this
+    /// (instead of the auto-commit
+    /// `MVCCEngine::record_create_index`) so generated
+    /// UNIQUE / FK indexes flush as part of the txn's
+    /// deferred DDL batch — recovery applies the parent
+    /// CreateTable, then this index, then the txn's commit
+    /// marker. Default is a no-op for non-MVCC backends.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_deferred_create_index(
+        &mut self,
+        _table_name: &str,
+        _index_name: &str,
+        _columns: &[String],
+        _is_unique: bool,
+        _index_type: crate::core::IndexType,
+        _hnsw_m: Option<u16>,
+        _hnsw_ef_construction: Option<u16>,
+        _hnsw_ef_search: Option<u16>,
+        _hnsw_distance_metric: Option<u8>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     // ---- Column Operations (ALTER TABLE) ----
 
     /// Adds a column to a table

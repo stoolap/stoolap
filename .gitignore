@@ -9,6 +9,11 @@
 *.swp
 *.swo
 
+# Claude Code local session state (scheduled_tasks.lock,
+# settings.local.json, etc.) — machine-local metadata that
+# should never be committed.
+.claude/
+
 # Profiling
 flamegraph*.svg
 profile.json

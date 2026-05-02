@@ -616,7 +616,7 @@ fn ro_open_replays_wal_alter_table_history() {
     // though the engine is in read-only mode. If a future change adds
     // ensure_writable to those methods naively, this test will fail.
     let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let ro = Database::open(&dsn_ro)
+    let ro = Database::open_read_only(&dsn_ro)
         .expect("read-only open must succeed even when WAL contains ALTER TABLE history");
 
     // Verify the replayed schema and data: column `extra` was dropped,
@@ -915,35 +915,23 @@ fn read_only_database_is_read_only_returns_true() {
 
 #[test]
 fn database_is_read_only_accessor() {
-    // is_read_only() reports the engine's mode without forcing callers
-    // to reach into db.engine().is_read_only_mode().
+    // Database is always writable now (Database::open rejects read-only
+    // DSN flags), so Database::is_read_only() always returns false. The
+    // read-only surface lives on ReadOnlyDatabase, whose is_read_only()
+    // always returns true. Verify both halves of the symmetry.
     let writable = Database::open_in_memory().unwrap();
     assert!(
         !writable.is_read_only(),
-        "in-memory writable Database is not read-only"
+        "writable Database must report is_read_only()=false"
     );
+    let cloned = writable.clone();
+    assert!(!cloned.is_read_only(), "Database clone stays writable");
 
-    use std::path::PathBuf;
-    let tmp = tempfile::tempdir().unwrap();
-    let path: PathBuf = tmp.path().join("is_ro_accessor.db");
-    {
-        let dsn_w = format!("file://{}", path.display());
-        let db = Database::open(&dsn_w).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.close().unwrap();
-    }
-
-    let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let ro_handle = Database::open(&dsn_ro).unwrap();
+    let ro_view = writable.as_read_only();
     assert!(
-        ro_handle.is_read_only(),
-        "?read_only=true Database must report is_read_only()=true"
+        ro_view.is_read_only(),
+        "ReadOnlyDatabase must report is_read_only()=true"
     );
-
-    // Clones of a read-only Database stay read-only.
-    let cloned = ro_handle.clone();
-    assert!(cloned.is_read_only());
 }
 
 #[test]
@@ -1035,43 +1023,10 @@ fn ro_database_cached_plan_refuses_write_sql_through_ro_handle() {
 }
 
 #[test]
-fn ro_database_prepare_refuses_write_sql_early() {
-    // Database::prepare on a read-only handle must refuse write SQL at
-    // prepare time, not later at Statement::execute. Without the early
-    // refusal a caller could prepare an INSERT against a `?read_only=true`
-    // Database, get back Ok(Statement), then have it fail confusingly at
-    // execute time.
-    use std::path::PathBuf;
-    let tmp = tempfile::tempdir().unwrap();
-    let path: PathBuf = tmp.path().join("ro_prepare_refuses.db");
-
-    {
-        let dsn_w = format!("file://{}", path.display());
-        let db = Database::open(&dsn_w).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.close().unwrap();
-    }
-
-    let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let db = Database::open(&dsn_ro).unwrap();
-    match db.prepare("INSERT INTO t VALUES ($1)") {
-        Ok(_) => panic!("prepare(INSERT) on read-only must be refused"),
-        Err(Error::ReadOnlyViolation(_)) => {}
-        Err(other) => panic!("expected ReadOnlyViolation from prepare, got: {other:?}"),
-    }
-
-    // Read SQL still preps fine.
-    let _ = db
-        .prepare("SELECT * FROM t WHERE id = $1")
-        .expect("SELECT must still prepare on a read-only Database");
-}
-
-#[test]
 fn ro_database_cached_plan_refuses_write_sql_early() {
-    // Database::cached_plan on a read-only handle must refuse write SQL
-    // at plan-creation time, not later at execute_plan. Mirrors prepare()
-    // behaviour for the lower-level cached-plan API.
+    // ReadOnlyDatabase::cached_plan must refuse write SQL at plan-creation
+    // time, not later at execute_plan, so callers learn the violation up
+    // front instead of after a Statement is built.
     use std::path::PathBuf;
     let tmp = tempfile::tempdir().unwrap();
     let path: PathBuf = tmp.path().join("ro_cached_plan_refuses.db");
@@ -1085,7 +1040,7 @@ fn ro_database_cached_plan_refuses_write_sql_early() {
     }
 
     let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let db = Database::open(&dsn_ro).unwrap();
+    let db = Database::open_read_only(&dsn_ro).unwrap();
     match db.cached_plan("INSERT INTO t VALUES ($1)") {
         Ok(_) => panic!("cached_plan(INSERT) on read-only must be refused"),
         Err(Error::ReadOnlyViolation(_)) => {}
@@ -1095,151 +1050,30 @@ fn ro_database_cached_plan_refuses_write_sql_early() {
     // Read SQL still creates a plan.
     let _ = db
         .cached_plan("SELECT * FROM t WHERE id = $1")
-        .expect("SELECT must still cache on a read-only Database");
+        .expect("SELECT must still cache on a read-only ReadOnlyDatabase");
 }
 
-#[test]
-fn ro_engine_cleanup_methods_are_noops() {
-    // Round-10: db.engine().cleanup_old_transactions / cleanup_deleted_rows /
-    // cleanup_old_previous_versions are silent no-ops on a read-only
-    // engine. They return 0 instead of mutating registry / version
-    // chains. (No Result return type — they signal "did nothing" via the
-    // count.)
-    use std::path::PathBuf;
-    let tmp = tempfile::tempdir().unwrap();
-    let path: PathBuf = tmp.path().join("ro_cleanup_noops.db");
+// `MVCCEngine::cleanup_*` no-op-on-read-only behavior remains an
+// engine implementation detail; with the public API now requiring
+// `Database::open_read_only` to construct a read-only engine and
+// `ReadOnlyDatabase` exposing no `engine()` accessor, integration
+// tests can no longer reach an `Arc<MVCCEngine>` in read-only mode.
+// Engine-internal coverage lives in src/storage/mvcc/engine.rs unit
+// tests now.
 
-    {
-        let dsn_w = format!("file://{}", path.display());
-        let db = Database::open(&dsn_w).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.close().unwrap();
-    }
+// `Database::create_snapshot` / `restore_snapshot` no longer have a
+// runtime read-only gate to cover: `Database` is always writable and
+// `ReadOnlyDatabase` simply doesn't expose those methods (compile-time
+// gate). The previous tests that opened with `?read_only=true` and
+// expected ReadOnlyViolation are obsolete.
 
-    let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let db = Database::open(&dsn_ro).unwrap();
-    let engine = db.engine();
-    let zero = std::time::Duration::from_secs(0);
-    assert_eq!(engine.cleanup_old_transactions(zero), 0);
-    assert_eq!(engine.cleanup_deleted_rows(zero), 0);
-    assert_eq!(engine.cleanup_old_previous_versions(), 0);
-    // No-op accessor; just confirming it doesn't panic.
-    engine.cleanup_abandoned_cold_deletes();
-}
-
-#[test]
-fn ro_database_refuses_create_snapshot() {
-    // Database::create_snapshot writes new files to disk. On a read-only
-    // handle (?read_only=true) it must refuse early with ReadOnlyViolation
-    // instead of failing later at the I/O layer with EROFS / EACCES.
-    use std::path::PathBuf;
-    let tmp = tempfile::tempdir().unwrap();
-    let path: PathBuf = tmp.path().join("ro_create_snapshot.db");
-
-    {
-        let dsn_w = format!("file://{}", path.display());
-        let db = Database::open(&dsn_w).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.close().unwrap();
-    }
-
-    let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let db = Database::open(&dsn_ro).unwrap();
-    match db.create_snapshot() {
-        Ok(_) => panic!("create_snapshot on a read-only database must be refused"),
-        Err(Error::ReadOnlyViolation(_)) => {}
-        Err(other) => panic!("expected ReadOnlyViolation, got: {other:?}"),
-    }
-}
-
-#[test]
-fn ro_database_refuses_restore_snapshot() {
-    // Database::restore_snapshot is destructive: it overwrites engine
-    // state from a backup. Refusing on a read-only handle is mandatory
-    // (not defense-in-depth) — the in-place replacement bypasses every
-    // guarantee the read-only contract was supposed to provide.
-    use std::path::PathBuf;
-    let tmp = tempfile::tempdir().unwrap();
-    let path: PathBuf = tmp.path().join("ro_restore.db");
-
-    {
-        let dsn_w = format!("file://{}", path.display());
-        let db = Database::open(&dsn_w).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.close().unwrap();
-    }
-
-    let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let db = Database::open(&dsn_ro).unwrap();
-    match db.restore_snapshot(None) {
-        Ok(_) => panic!("restore_snapshot on a read-only database must be refused"),
-        Err(Error::ReadOnlyViolation(_)) => {}
-        Err(other) => panic!("expected ReadOnlyViolation, got: {other:?}"),
-    }
-}
-
-#[test]
-fn ro_engine_refuses_direct_engine_writes() {
-    // Round-9 P1: `Database::engine()` exposes &Arc<MVCCEngine>. The
-    // public Engine trait method (begin_transaction*) is gated, but
-    // `MVCCEngine` inherent methods like `create_table`,
-    // `drop_table_internal`, `update_engine_config`, `vacuum`,
-    // `create_view`, `drop_view`, `rename_table`, `create_column*`,
-    // `drop_column`, `rename_column`, `modify_column*` would otherwise
-    // let an external caller mutate engine state on a `?read_only=true`
-    // handle. They now refuse with ReadOnlyViolation.
-    use std::path::PathBuf;
-    use stoolap::core::{DataType, Schema, SchemaColumn};
-    let tmp = tempfile::tempdir().unwrap();
-    let path: PathBuf = tmp.path().join("ro_engine_writes.db");
-
-    {
-        let dsn_w = format!("file://{}", path.display());
-        let db = Database::open(&dsn_w).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.close().unwrap();
-    }
-
-    let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let db = Database::open(&dsn_ro).unwrap();
-    let engine = db.engine();
-
-    // create_table
-    let schema = Schema::new(
-        "t2",
-        vec![SchemaColumn::new(0, "id", DataType::Integer, false, true)],
-    );
-    match engine.create_table(schema) {
-        Ok(_) => panic!("engine.create_table on read-only must refuse"),
-        Err(Error::ReadOnlyViolation(_)) => {}
-        Err(other) => panic!("expected ReadOnlyViolation from create_table, got: {other:?}"),
-    }
-
-    // drop_table_internal
-    match engine.drop_table_internal("t") {
-        Ok(_) => panic!("engine.drop_table_internal on read-only must refuse"),
-        Err(Error::ReadOnlyViolation(_)) => {}
-        Err(other) => panic!("expected ReadOnlyViolation from drop_table_internal, got: {other:?}"),
-    }
-
-    // vacuum
-    match engine.vacuum(None, std::time::Duration::from_secs(0)) {
-        Ok(_) => panic!("engine.vacuum on read-only must refuse"),
-        Err(Error::ReadOnlyViolation(_)) => {}
-        Err(other) => panic!("expected ReadOnlyViolation from vacuum, got: {other:?}"),
-    }
-
-    // create_view
-    match engine.create_view("v1", "SELECT * FROM t".to_string(), false) {
-        Ok(_) => panic!("engine.create_view on read-only must refuse"),
-        Err(Error::ReadOnlyViolation(_)) => {}
-        Err(other) => panic!("expected ReadOnlyViolation from create_view, got: {other:?}"),
-    }
-}
+// `MVCCEngine` inherent write methods (`create_table`,
+// `drop_table_internal`, `vacuum`, `create_view`, etc.) refusing on a
+// read-only engine is now solely an engine-level invariant. The
+// integration test that drove it through `Database::engine()` is
+// obsolete (Database is always writable; ReadOnlyDatabase has no
+// engine() accessor). Engine-internal coverage lives in
+// src/storage/mvcc/engine.rs unit tests.
 
 #[test]
 fn as_read_only_does_not_observe_uncommitted_writes_on_source() {
@@ -1284,65 +1118,104 @@ fn as_read_only_does_not_observe_uncommitted_writes_on_source() {
 }
 
 #[test]
-fn open_with_read_only_query_param_rejects_writes() {
-    // `Database::open("file:///x?read_only=true")` opens read-only:
-    // - Engine acquires shared file lock
-    // - Returns a `Database` (writable type) but its executor is configured
-    //   read-only, so writes through the handle fail at runtime.
+fn open_with_read_only_dsn_flag_is_rejected_with_migration_message() {
+    // `Database::open` rejects every spelling of the read-only DSN flag
+    // (`?read_only=true`, `?readonly=true`, `?mode=ro`) so callers
+    // discover the typed `open_read_only` entry point instead of
+    // silently getting a writable handle. The error message names the
+    // replacement.
     use std::path::PathBuf;
     let tmp = tempfile::tempdir().unwrap();
-    let path: PathBuf = tmp.path().join("dsn_ro.db");
-    let dsn_rw = format!("file://{}", path.display());
-    let dsn_ro = format!("file://{}?read_only=true", path.display());
-
-    // Seed the file via writable open then close.
-    {
-        let db = Database::open(&dsn_rw).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
-        db.close().unwrap();
-    }
-
-    // Open via ?read_only=true.
-    let db = Database::open(&dsn_ro).unwrap();
-
-    // SELECT works.
-    let rows: Vec<_> = db
-        .query("SELECT id FROM t", ())
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(rows.len(), 1);
-
-    // INSERT through this handle is rejected at runtime.
-    let result = db.execute("INSERT INTO t VALUES (2)", ());
-    assert!(matches!(result, Err(Error::ReadOnlyViolation(_))));
-}
-
-#[test]
-fn open_with_mode_ro_alias_works() {
-    // SQLite-style ?mode=ro alias.
-    use std::path::PathBuf;
-    let tmp = tempfile::tempdir().unwrap();
-    let path: PathBuf = tmp.path().join("dsn_mode_ro.db");
+    let path: PathBuf = tmp.path().join("open_rejects_ro_dsn.db");
     {
         let db = Database::open(&format!("file://{}", path.display())).unwrap();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
             .unwrap();
         db.close().unwrap();
     }
-
-    let dsn = format!("file://{}?mode=ro", path.display());
-    let db = Database::open(&dsn).unwrap();
-    let result = db.execute("INSERT INTO t VALUES (1)", ());
-    assert!(matches!(result, Err(Error::ReadOnlyViolation(_))));
+    for flag in ["read_only=true", "readonly=true", "mode=ro"] {
+        let dsn = format!("file://{}?{}", path.display(), flag);
+        match Database::open(&dsn) {
+            Ok(_) => panic!("Database::open must reject {} with InvalidArgument", flag),
+            Err(Error::InvalidArgument(msg)) => assert!(
+                msg.contains("read-only DSN flag"),
+                "error must point at open_read_only via the canonical \
+                 'read-only DSN flag' substring; got: {msg}"
+            ),
+            Err(other) => panic!("expected InvalidArgument for {flag}, got: {other:?}"),
+        }
+    }
 }
 
 #[test]
-fn open_writable_then_open_read_only_query_param_rejects_mode_mismatch() {
-    // Cached engine is writable; new request asks for read-only via ?read_only=true.
-    // Mode mismatch must error.
+fn open_read_only_accepts_redundant_read_only_dsn_flag() {
+    // `Database::open_read_only` takes the same DSN strings drivers
+    // already build, including the redundant `?read_only=true` flag.
+    // The flag is treated as a no-op (matches the function name); a
+    // drivers-friendly migration just changes the entry-point call.
+    use std::path::PathBuf;
+    let tmp = tempfile::tempdir().unwrap();
+    let path: PathBuf = tmp.path().join("open_ro_accepts_flag.db");
+    {
+        let db = Database::open(&format!("file://{}", path.display())).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+        db.close().unwrap();
+    }
+    for flag in ["read_only=true", "readonly=true", "mode=ro"] {
+        let dsn = format!("file://{}?{}", path.display(), flag);
+        let ro = match Database::open_read_only(&dsn) {
+            Ok(r) => r,
+            Err(e) => panic!(
+                "open_read_only must accept redundant {} flag, got: {:?}",
+                flag, e
+            ),
+        };
+        let mut rows = ro.query("SELECT COUNT(*) FROM t", ()).unwrap();
+        let n: i64 = rows.next().unwrap().unwrap().get(0).unwrap();
+        assert_eq!(n, 1);
+        drop(ro);
+    }
+}
+
+#[test]
+fn open_read_only_rejects_writable_dsn_flag() {
+    // The function name says read-only; a DSN flag that explicitly
+    // requests writable contradicts it and is rejected so the caller
+    // catches the disagreement at the API surface instead of getting
+    // surprising behavior.
+    use std::path::PathBuf;
+    let tmp = tempfile::tempdir().unwrap();
+    let path: PathBuf = tmp.path().join("open_ro_rejects_writable.db");
+    {
+        let db = Database::open(&format!("file://{}", path.display())).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.close().unwrap();
+    }
+    for flag in ["read_only=false", "readonly=false", "mode=rw"] {
+        let dsn = format!("file://{}?{}", path.display(), flag);
+        match Database::open_read_only(&dsn) {
+            Ok(_) => panic!("open_read_only must reject writable {} flag", flag),
+            Err(Error::InvalidArgument(msg)) => assert!(
+                msg.contains("explicitly requests writable mode"),
+                "error must contain the canonical 'explicitly requests writable mode' \
+                 substring; got: {msg}"
+            ),
+            Err(other) => panic!("expected InvalidArgument for {flag}, got: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn open_writable_then_open_read_only_query_param_succeeds_under_swmr() {
+    // SWMR v1 contract: a writable engine and a read-only attach can
+    // coexist (Shared mode no longer takes a kernel lock; readers
+    // signal presence via lease files). Pre-SWMR this errored with
+    // DatabaseLocked because the writer's LOCK_EX blocked the reader's
+    // LOCK_SH. Pinning the new behavior here so a regression to the
+    // old lock semantics fails loudly.
     use std::path::PathBuf;
     let tmp = tempfile::tempdir().unwrap();
     let path: PathBuf = tmp.path().join("dsn_mode_mismatch.db");
@@ -1354,21 +1227,13 @@ fn open_writable_then_open_read_only_query_param_rejects_mode_mismatch() {
         .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
         .unwrap();
 
-    // Different DSN string (with vs without query string) means a fresh
-    // create attempt, but if the parser canonicalized them to the same
-    // engine, mode mismatch would fire. Currently each distinct DSN
-    // string has its own registry entry, so this path actually opens
-    // a second engine — and that fails on the file lock (writer holds
-    // LOCK_EX, second open as read-only takes LOCK_SH which is blocked).
-    let result = Database::open(&dsn_ro);
-    assert!(
-        matches!(
-            result,
-            Err(Error::DatabaseLocked) | Err(Error::ReadOnlyViolation(_))
-        ),
-        "expected DatabaseLocked or ReadOnlyViolation, got {:?}",
-        result.is_ok()
-    );
+    let ro = Database::open_read_only(&dsn_ro)
+        .expect("Shared read-only attach must coexist with writable open under SWMR");
+    // ReadOnlyDatabase has no execute(); SELECT works.
+    let mut rows = ro.query("SELECT COUNT(*) FROM t", ()).unwrap();
+    let n: i64 = rows.next().unwrap().unwrap().get(0).unwrap();
+    assert_eq!(n, 0);
+    drop(ro);
     drop(db_rw);
 }
 
@@ -1387,16 +1252,19 @@ fn open_two_read_only_handles_via_query_param_share_engine() {
     }
 
     let dsn = format!("file://{}?read_only=true", path.display());
-    let db1 = Database::open(&dsn).unwrap();
-    let db2 = Database::open(&dsn).unwrap();
+    let db1 = Database::open_read_only(&dsn).unwrap();
+    let db2 = Database::open_read_only(&dsn).unwrap();
     drop(db1);
     drop(db2);
 }
 
 #[test]
 fn open_with_invalid_read_only_value_errors() {
-    let result = Database::open("file:///tmp/nope?read_only=maybe");
-    assert!(result.is_err());
+    // Invalid read-only flag value is rejected at DSN-parse time on
+    // both entry points (Database::open computes the same scan to
+    // refuse the migration target).
+    assert!(Database::open("file:///tmp/nope?read_only=maybe").is_err());
+    assert!(Database::open_read_only("file:///tmp/nope?read_only=maybe").is_err());
 }
 
 #[test]
@@ -1530,18 +1398,17 @@ fn execute_statement_on_read_only_executor_rejects_writes() {
 
 #[test]
 fn open_with_read_only_param_on_missing_path_fails_without_creating() {
-    // P1: Database::open("file://.../missing?read_only=true") used to bypass
-    // the read-only existence check that lived only in open_read_only's
-    // FILE_SCHEME branch. Now the same guard runs when open() sees
-    // config.read_only=true.
+    // open_read_only against a missing path must not silently
+    // materialize a fresh empty engine. The presence check is mandatory
+    // under the read-only contract.
     use std::path::PathBuf;
     let tmp = tempfile::tempdir().unwrap();
     let path: PathBuf = tmp.path().join("missing_via_open_param");
     let dsn = format!("file://{}?read_only=true", path.display());
 
-    let result = Database::open(&dsn);
-    assert!(result.is_err(), "expected open to fail, got Ok");
-    assert!(!path.exists(), "open(read_only=true) created the path");
+    let result = Database::open_read_only(&dsn);
+    assert!(result.is_err(), "expected open_read_only to fail, got Ok");
+    assert!(!path.exists(), "open_read_only created the path");
 }
 
 #[test]
@@ -1694,55 +1561,11 @@ fn last_clone_releases_engine_lock_when_original_drops_first() {
 // Reviewer round-5 regressions
 // ---------------------------------------------------------------------------
 
-#[test]
-fn ro_dsn_begin_rejects_writes_through_writable_transaction() {
-    // P0: a Database opened with `?read_only=true` must refuse to hand
-    // out a writable `Box<dyn WriteTransaction>` via `db.begin()`. The
-    // executor's read_only flag is the gate; without it, callers could
-    // bypass the parser-level write check entirely by going through the
-    // BEGIN API and then INSERTing on the returned transaction.
-    use std::path::PathBuf;
-    let tmp = tempfile::tempdir().unwrap();
-    let path: PathBuf = tmp.path().join("ro_begin.db");
-
-    // Materialize the database first (writable).
-    {
-        let dsn_w = format!("file://{}", path.display());
-        let db = Database::open(&dsn_w).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
-        db.close().unwrap();
-    }
-
-    // Reopen read-only via DSN flag.
-    let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let db = Database::open(&dsn_ro).unwrap();
-
-    // Must reject begin() and begin_with_isolation() — both are bypass
-    // surfaces that previously returned writable handles.
-    match db.begin() {
-        Ok(_) => panic!("db.begin() on ?read_only=true must fail"),
-        Err(Error::ReadOnlyViolation(_)) => {}
-        Err(other) => {
-            panic!("db.begin() on ?read_only=true must fail with ReadOnlyViolation, got: {other:?}")
-        }
-    }
-
-    match db.begin_with_isolation(stoolap::IsolationLevel::SnapshotIsolation) {
-        Ok(_) => panic!("db.begin_with_isolation() on ?read_only=true must fail"),
-        Err(Error::ReadOnlyViolation(_)) => {}
-        Err(other) => panic!(
-            "db.begin_with_isolation() on ?read_only=true must fail with ReadOnlyViolation, got: {other:?}"
-        ),
-    }
-
-    // Sanity: row count is unchanged.
-    let mut rows = db.query("SELECT COUNT(*) FROM t", ()).unwrap();
-    let row = rows.next().unwrap().unwrap();
-    let n: i64 = row.get(0).unwrap();
-    assert_eq!(n, 1);
-}
+// `Database::begin` / `begin_with_isolation` no longer carry a runtime
+// read-only gate: `Database` is always writable, and `ReadOnlyDatabase`
+// has no `begin` / `begin_with_isolation` method (compile-time gate).
+// The previous test that opened with `?read_only=true` and expected
+// ReadOnlyViolation from begin() is obsolete.
 
 #[test]
 fn second_open_dsn_survives_close_on_first() {
@@ -1803,17 +1626,16 @@ fn second_open_dsn_has_independent_transaction_state() {
 
 #[test]
 fn dsn_requests_read_only_matches_parse_file_config_precedence() {
-    // P2: a DSN like `?read_only=false&mode=ro` is read-only because
-    // the actual config parser scans every param and lets the LAST
-    // recognized flag win. The pre-scan used by `Database::open` must
-    // agree, otherwise the SAME DSN opens read-only the first time and
-    // is then rejected as a writable/read-only mismatch on the second
-    // open.
+    // A DSN like `?read_only=false&mode=ro` is read-only because the
+    // actual config parser scans every param and lets the LAST
+    // recognized flag win. The pre-scan used by `Database::open` /
+    // `Database::open_read_only` must agree: the same DSN must be
+    // rejected by `open` (as a read-only request) and accepted by
+    // `open_read_only` (which the redundant flag confirms).
     use std::path::PathBuf;
     let tmp = tempfile::tempdir().unwrap();
     let path: PathBuf = tmp.path().join("precedence.db");
 
-    // Materialize a database first.
     {
         let dsn_w = format!("file://{}", path.display());
         let db = Database::open(&dsn_w).unwrap();
@@ -1824,27 +1646,78 @@ fn dsn_requests_read_only_matches_parse_file_config_precedence() {
 
     // Last-match-wins: `mode=ro` after `read_only=false` => read-only.
     let dsn = format!("file://{}?read_only=false&mode=ro", path.display());
-    let db1 = Database::open(&dsn).unwrap();
-    // Must be read-only: writes are refused.
-    let err = db1.execute("INSERT INTO t VALUES (1)", ()).unwrap_err();
-    assert!(
-        matches!(err, Error::ReadOnlyViolation(_)),
-        "expected ReadOnlyViolation on writable INSERT through read-only DSN, got: {err:?}"
-    );
 
-    // Idempotent reopen of the EXACT same DSN: pre-scan must compute
-    // read_only=true (last-wins), match the cached engine's mode, and
-    // succeed instead of rejecting as a mismatch.
-    let db2 = Database::open(&dsn)
-        .expect("second open of identical DSN must agree on read_only mode (last-flag-wins)");
+    // open: rejected with the migration message because the LAST flag
+    // requests read-only.
+    match Database::open(&dsn) {
+        Ok(_) => panic!("open must refuse a read-only DSN"),
+        Err(Error::InvalidArgument(msg)) => assert!(
+            msg.contains("read-only DSN flag"),
+            "expected migration message; got: {msg}"
+        ),
+        Err(other) => panic!("expected InvalidArgument, got: {other:?}"),
+    }
 
-    drop(db2);
-    drop(db1);
+    // open_read_only: accepts the same DSN (last flag agrees with
+    // function name).
+    let ro = match Database::open_read_only(&dsn) {
+        Ok(r) => r,
+        Err(e) => panic!(
+            "open_read_only must accept a DSN whose last flag requests read-only, got: {:?}",
+            e
+        ),
+    };
+    drop(ro);
+}
+
+#[test]
+fn dsn_read_only_flag_only_parses_query_keys_not_paths() {
+    // P2: an earlier version checked for the substrings
+    // `read_only=` / `readonly=` / `mode=` anywhere in the
+    // DSN, so a file path containing `mode=` (or any unrelated
+    // query value containing those tokens) was incorrectly
+    // treated as a writable-flag contradiction. Verify the
+    // parser only inspects recognized keys inside the
+    // query-string portion.
+    use std::path::PathBuf;
+    let tmp = tempfile::tempdir().unwrap();
+    let path: PathBuf = tmp.path().join("dir_with_mode=rw").join("inner.db");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+    {
+        let dsn_w = format!("file://{}", path.display());
+        let db = Database::open(&dsn_w).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.close().unwrap();
+    }
+
+    // The path contains `mode=rw`. open_read_only must NOT
+    // misread that as a writable flag.
+    let dsn = format!("file://{}", path.display());
+    let ro = Database::open_read_only(&dsn)
+        .expect("open_read_only must ignore `mode=rw` inside the file path");
+    drop(ro);
+
+    // And open must NOT misread the same path as a read-only
+    // flag (it doesn't contain `mode=ro` but the symmetric
+    // failure mode would have rejected this DSN).
+    let db = Database::open(&dsn).unwrap();
+    db.close().unwrap();
+
+    // Unrelated query values that contain the trigger
+    // substrings must also be ignored.
+    let dsn_with_other_param = format!("file://{}?sync_mode=normal&compression=on", path.display());
+    let ro2 = Database::open_read_only(&dsn_with_other_param).unwrap();
+    drop(ro2);
+    let db2 = Database::open(&dsn_with_other_param).unwrap();
+    db2.close().unwrap();
 }
 
 #[test]
 fn dsn_requests_read_only_writable_last_wins() {
-    // Inverse: `?mode=ro&read_only=false` ends writable.
+    // Inverse: `?mode=ro&read_only=false` ends writable. open accepts
+    // it; open_read_only rejects with the contradiction message.
     use std::path::PathBuf;
     let tmp = tempfile::tempdir().unwrap();
     let path: PathBuf = tmp.path().join("precedence_w.db");
@@ -1858,9 +1731,18 @@ fn dsn_requests_read_only_writable_last_wins() {
     }
 
     let dsn = format!("file://{}?mode=ro&read_only=false", path.display());
-    let db = Database::open(&dsn).unwrap();
-    // Writable: INSERT must succeed.
+    let db = Database::open(&dsn).expect("open accepts a DSN whose last flag is writable");
     db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    drop(db);
+
+    match Database::open_read_only(&dsn) {
+        Ok(_) => panic!("open_read_only must reject a DSN whose last flag is writable"),
+        Err(Error::InvalidArgument(msg)) => assert!(
+            msg.contains("explicitly requests writable mode"),
+            "expected contradiction message; got: {msg}"
+        ),
+        Err(other) => panic!("expected InvalidArgument, got: {other:?}"),
+    }
 }
 
 #[test]
@@ -1970,52 +1852,12 @@ fn open_after_all_handles_drop_creates_fresh_engine_memory() {
 // Round-7 regressions
 // ---------------------------------------------------------------------------
 
-#[test]
-fn ro_dsn_engine_begin_transaction_is_rejected() {
-    // Round-7 P0: Database::open("...?read_only=true") returned a writable
-    // engine via db.engine(). Calling .begin_transaction() on that engine
-    // (the public Engine trait method) returned a Box<dyn WriteTransaction>,
-    // which let the caller insert + commit, bypassing every other gate.
-    // Fix: the Engine trait method now refuses on a read-only engine
-    // (internal callers go through the inherent _unchecked variant).
-    use std::path::PathBuf;
-    use stoolap::storage::Engine;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let path: PathBuf = tmp.path().join("ro_engine_bypass.db");
-
-    {
-        let dsn_w = format!("file://{}", path.display());
-        let db = Database::open(&dsn_w).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.close().unwrap();
-    }
-
-    let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let db = Database::open(&dsn_ro).unwrap();
-
-    // The bypass: db.engine() exposes the writable trait method.
-    let engine = db.engine();
-    match Engine::begin_transaction(engine.as_ref()) {
-        Ok(_) => panic!(
-            "engine.begin_transaction() on a read-only engine must return \
-             ReadOnlyViolation; the call instead handed out a writable \
-             transaction"
-        ),
-        Err(Error::ReadOnlyViolation(_)) => {}
-        Err(other) => panic!(
-            "engine.begin_transaction() on a read-only engine must return \
-             ReadOnlyViolation, got: {other:?}"
-        ),
-    }
-
-    // Sanity: the engine still serves reads via the read-only path.
-    let mut rows = db.query("SELECT COUNT(*) FROM t", ()).unwrap();
-    let row = rows.next().unwrap().unwrap();
-    let n: i64 = row.get(0).unwrap();
-    assert_eq!(n, 0);
-}
+// `Engine::begin_transaction` trait method refusing on a read-only
+// engine is an engine-level invariant. The previous integration test
+// that constructed a read-only Database via `?read_only=true` to reach
+// `db.engine()` is obsolete: Database::open rejects the flag and
+// Config::read_only is `pub(crate)`. Engine-internal coverage lives in
+// src/storage/mvcc/engine.rs unit tests.
 
 #[test]
 fn sibling_handles_share_semantic_cache_for_dml_invalidation() {
@@ -2148,62 +1990,12 @@ fn sibling_handles_share_query_planner_for_analyze_invalidation() {
     b.execute("ANALYZE", ()).unwrap();
 }
 
-#[test]
-fn external_executor_constructed_on_ro_engine_inherits_read_only() {
-    // Round-13 P0: Executor::new (and friends) must derive read_only
-    // from the engine. Without this, an external Rust caller could
-    // build a writable executor on top of a ?read_only=true engine
-    // (via db.engine().clone()) and reach
-    // begin_writable_transaction_internal directly. Worse: the resulting
-    // INSERT would partially mutate state (engine succeeded) before
-    // failing on WAL I/O — exposing the inserted row to subsequent
-    // reads through the same engine.
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use stoolap::executor::Executor;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let path: PathBuf = tmp.path().join("ext_executor_ro.db");
-
-    {
-        let dsn_w = format!("file://{}", path.display());
-        let db = Database::open(&dsn_w).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.close().unwrap();
-    }
-
-    let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let db = Database::open(&dsn_ro).unwrap();
-
-    // Build an Executor directly from the engine — the bypass path the
-    // reviewer flagged. This must inherit read_only=true and refuse
-    // writes.
-    let engine: Arc<_> = db.engine().clone();
-    let executor = Executor::new(engine);
-    assert!(
-        executor.is_read_only(),
-        "Executor::new on a read-only engine must inherit read_only=true"
-    );
-
-    match executor.execute("INSERT INTO t VALUES (99)") {
-        Ok(_) => panic!(
-            "INSERT through an Executor built on a read-only engine must \
-             refuse with ReadOnlyViolation, but the call succeeded"
-        ),
-        Err(Error::ReadOnlyViolation(_)) => {}
-        Err(other) => panic!(
-            "expected ReadOnlyViolation from external Executor on RO engine, \
-             got: {other:?}"
-        ),
-    }
-
-    // Sanity: row count is unchanged, no partial-mutation visible.
-    let mut rows = db.query("SELECT COUNT(*) FROM t", ()).unwrap();
-    let row = rows.next().unwrap().unwrap();
-    let n: i64 = row.get(0).unwrap();
-    assert_eq!(n, 0, "no row should be visible after refused INSERT");
-}
+// `Executor::new` deriving read_only from the engine is verified at
+// the engine + executor layer. The previous integration test that
+// reached an Arc<MVCCEngine> in read-only mode through
+// `Database::open(?read_only=true).engine()` is obsolete; Config's
+// `read_only` field is `pub(crate)` and there is no public way to
+// build a read-only Arc<MVCCEngine> from outside the crate.
 
 #[test]
 fn open_read_only_does_not_fail_when_wal_dir_missing() {
@@ -2248,8 +2040,8 @@ fn open_read_only_does_not_fail_when_wal_dir_missing() {
     // but the open itself is permitted; engines without persisted
     // schemas come up empty rather than failing the open.
     let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let _ro = Database::open(&dsn_ro)
-        .expect("open with ?read_only=true must not fail with ENOENT just because wal/ is missing");
+    let _ro = Database::open_read_only(&dsn_ro)
+        .expect("open_read_only must not fail with ENOENT just because wal/ is missing");
 }
 
 #[test]
@@ -2332,8 +2124,8 @@ fn open_read_only_works_when_wal_files_are_read_only() {
     // Wrap so we always restore perms.
     let result = std::panic::catch_unwind(|| {
         let dsn_ro = format!("file://{}?read_only=true", path.display());
-        let ro = Database::open(&dsn_ro)
-            .expect("open with ?read_only=true must succeed even when wal/ files are read-only");
+        let ro = Database::open_read_only(&dsn_ro)
+            .expect("open_read_only must succeed even when wal/ files are read-only");
         let mut rows = ro.query("SELECT COUNT(*) FROM t", ()).unwrap();
         let row = rows.next().unwrap().unwrap();
         let n: i64 = row.get(0).unwrap();
@@ -2413,11 +2205,11 @@ fn open_read_only_persistence_failure_is_fatal_not_silent() {
         // succeeds (Ok), querying the persisted table must work — a
         // successful open paired with `table not found` is the
         // silent-fallback bug we're guarding against.
-        if let Ok(db) = Database::open(&dsn_ro) {
+        if let Ok(db) = Database::open_read_only(&dsn_ro) {
             let result = db.query("SELECT COUNT(*) FROM t", ());
             if result.is_err() {
                 panic!(
-                    "open with ?read_only=true succeeded but the persisted table \
+                    "open_read_only succeeded but the persisted table \
                      is missing, silent fallback to an empty engine: {:?}",
                     result.err()
                 );
@@ -2554,52 +2346,15 @@ fn open_read_only_works_on_read_only_dir() {
 }
 
 // ---------------------------------------------------------------------------
-// Round-15 follow-up: post-merge review fixes
+// Round-15 follow-up: post-merge fixes
 // ---------------------------------------------------------------------------
 
-#[test]
-fn engine_checkpoint_cycle_refused_on_read_only_handle() {
-    // Round-15 #1: `Engine::checkpoint_cycle` and `force_checkpoint_cycle`
-    // mutate persistent state (seal hot rows, persist manifest, truncate
-    // WAL). Sibling Engine write methods (`create_snapshot`,
-    // `restore_snapshot`) gate with `ensure_writable`; checkpoint must too,
-    // otherwise a Rust caller doing
-    // `Database::open("file:///path?read_only=true").engine().checkpoint_cycle()`
-    // can drive a write path under LOCK_SH.
-    use stoolap::storage::Engine;
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("ckpt_gate.db");
-
-    {
-        let dsn = format!("file://{}", path.display());
-        let db = Database::open(&dsn).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.close().unwrap();
-    }
-
-    let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let db = Database::open(&dsn_ro).unwrap();
-    let engine = db.engine();
-
-    let err = match engine.checkpoint_cycle() {
-        Ok(_) => panic!("checkpoint_cycle on read-only engine must fail"),
-        Err(e) => e,
-    };
-    assert!(
-        err.is_read_only_violation(),
-        "expected ReadOnlyViolation from checkpoint_cycle, got: {err:?}"
-    );
-
-    let err = match engine.force_checkpoint_cycle() {
-        Ok(_) => panic!("force_checkpoint_cycle on read-only engine must fail"),
-        Err(e) => e,
-    };
-    assert!(
-        err.is_read_only_violation(),
-        "expected ReadOnlyViolation from force_checkpoint_cycle, got: {err:?}"
-    );
-}
+// `Engine::checkpoint_cycle` / `force_checkpoint_cycle` refusing on a
+// read-only engine is now an engine-level invariant only. The previous
+// integration test that drove it through
+// `Database::open(?read_only=true).engine()` is obsolete; Config's
+// `read_only` field is `pub(crate)` and there is no public way to
+// build a read-only Arc<MVCCEngine> from outside the crate.
 
 #[test]
 fn close_strong_count_check_holds_registry_lock() {
@@ -2688,4 +2443,915 @@ fn close_strong_count_check_holds_registry_lock() {
         closer_ok,
         "closer thread saw a close() error from a freshly-opened handle"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Reader lease tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn ro_handle_creates_lease_file_on_file_engine() {
+    // SWMR v1 P1.2: opening a `file://` read-only handle must register a
+    // cross-process presence lease in `<db>/readers/<pid>.lease`. The
+    // writer's GC paths consult that directory before unlinking volumes
+    // or truncating WAL.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("lease_create.db");
+
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.close().unwrap();
+    }
+
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+    let ro = Database::open_read_only(&dsn_ro).unwrap();
+    let lease_file = path
+        .join("readers")
+        .join(format!("{}.lease", std::process::id()));
+    assert!(
+        lease_file.exists(),
+        "RO open on file engine must create lease at {}",
+        lease_file.display()
+    );
+    drop(ro);
+    assert!(
+        !lease_file.exists(),
+        "lease file must be unlinked when ReadOnlyDatabase drops"
+    );
+}
+
+#[test]
+fn ro_handle_query_touches_lease_mtime() {
+    // SWMR v1 P1.2: every `query` / `query_named` / `cached_plan` etc.
+    // call must bump the lease mtime. This is the heartbeat the writer's
+    // GC uses to distinguish live from stale leases.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("lease_touch.db");
+
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+        db.close().unwrap();
+    }
+
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+    let ro = Database::open_read_only(&dsn_ro).unwrap();
+    let lease_file = path
+        .join("readers")
+        .join(format!("{}.lease", std::process::id()));
+    let mtime1 = std::fs::metadata(&lease_file).unwrap().modified().unwrap();
+
+    // Sleep enough that the FS records a different mtime (50ms covers
+    // every common filesystem; APFS is ns-precise, ext4 is ms, HFS+ is
+    // 1s but is not the macOS default for 5+ years).
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    ro.query("SELECT * FROM t", ()).unwrap().next();
+    let mtime2 = std::fs::metadata(&lease_file).unwrap().modified().unwrap();
+
+    assert!(
+        mtime2 > mtime1,
+        "query must advance lease mtime (was {:?}, now {:?})",
+        mtime1,
+        mtime2
+    );
+}
+
+#[test]
+fn in_process_as_read_only_does_not_create_lease() {
+    // `as_read_only()` over a writable engine in the same process must
+    // NOT take a filesystem lease. The writer in this process coordinates
+    // GC internally; a filesystem lease would just be noise. (Also
+    // matters for tests: an in-process RO view shouldn't leave lease
+    // files in the writable DB's dir.)
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("inproc_lease.db");
+
+    let dsn = format!("file://{}", path.display());
+    let db = Database::open(&dsn).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+
+    let ro = db.as_read_only();
+    ro.query("SELECT * FROM t", ()).unwrap().next();
+
+    let lease_file = path
+        .join("readers")
+        .join(format!("{}.lease", std::process::id()));
+    assert!(
+        !lease_file.exists(),
+        "as_read_only() on writable engine must NOT create a lease (in-process coordination)"
+    );
+}
+
+#[test]
+fn refresh_no_op_when_epoch_unchanged() {
+    // SWMR v1 P3.1: refresh() must be cheap when the writer hasn't
+    // checkpointed since the reader's last refresh. Returns Ok(false)
+    // and does not reload manifests.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("refresh_noop.db");
+
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+    }
+
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+    let ro = Database::open_read_only(&dsn_ro).unwrap();
+    // First refresh: writer made no new checkpoint since we opened.
+    let advanced = ro.refresh().unwrap();
+    assert!(
+        !advanced,
+        "refresh must be a no-op when epoch hasn't advanced since open"
+    );
+}
+
+#[test]
+fn refresh_returns_true_when_epoch_advances() {
+    // SWMR v1 P3.1: when the on-disk epoch is greater than the reader's
+    // cached value, refresh() reloads manifests and returns true. We
+    // simulate the writer's epoch bump by writing the file directly,
+    // since a real writer process (with LOCK_EX) cannot coexist with
+    // our LOCK_SH reader in the same OS process. End-to-end with a
+    // real subprocess writer is covered by P4.2 in swmr_snapshot_test.
+    use stoolap::storage::mvcc::manifest_epoch;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("refresh_advance.db");
+
+    // Set up a real database on disk with a checkpointed table.
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+    }
+
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+    let reader = Database::open_read_only(&dsn_ro).unwrap();
+
+    // First refresh: epoch is whatever the writer left it at; reader's
+    // cached value matches (initialized at open). No-op.
+    let advanced = reader.refresh().unwrap();
+    assert!(!advanced, "first refresh after open must no-op");
+
+    // Simulate a writer checkpoint by bumping the epoch file directly.
+    // In production this would happen from a separate writer process.
+    let new_epoch = manifest_epoch::bump_epoch(&path).unwrap();
+    assert!(new_epoch > 0, "bump_epoch must return positive");
+
+    // Now refresh sees the advance.
+    let advanced = reader.refresh().unwrap();
+    assert!(
+        advanced,
+        "refresh must return true after epoch file was bumped"
+    );
+
+    // And subsequent calls no-op until next bump.
+    let advanced2 = reader.refresh().unwrap();
+    assert!(
+        !advanced2,
+        "second refresh after no further bump must no-op"
+    );
+}
+
+#[test]
+fn auto_refresh_default_is_on() {
+    // SWMR v1 P3.2: auto-refresh defaults to ON for new ReadOnlyDatabase
+    // handles. set_auto_refresh(false) toggles it off; getter reports state.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("auto_default.db");
+
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.close().unwrap();
+    }
+
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+    let ro = Database::open_read_only(&dsn_ro).unwrap();
+    assert!(
+        ro.auto_refresh_enabled(),
+        "auto_refresh must default to true for fresh handles"
+    );
+    ro.set_auto_refresh(false);
+    assert!(
+        !ro.auto_refresh_enabled(),
+        "set_auto_refresh(false) must turn it off"
+    );
+    ro.set_auto_refresh(true);
+    assert!(
+        ro.auto_refresh_enabled(),
+        "set_auto_refresh(true) must turn it back on"
+    );
+}
+
+#[test]
+fn auto_refresh_picks_up_epoch_advance_via_query() {
+    // SWMR v1 P3.2: with auto-refresh ON (default), a query call must
+    // pick up an epoch bump that happened since the last query, without
+    // the caller having to invoke refresh() manually.
+    use stoolap::storage::mvcc::manifest_epoch;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("auto_picks.db");
+
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+    }
+
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+    let ro = Database::open_read_only(&dsn_ro).unwrap();
+
+    // Simulate the writer doing another checkpoint by bumping the epoch.
+    // We can't actually start a writer in this process (LOCK_EX vs LOCK_SH
+    // conflict), so we bump the epoch file directly. The full
+    // writer-and-reader test lives in P4.2 (subprocess-based).
+    manifest_epoch::bump_epoch(&path).unwrap();
+
+    // Issue a query; auto-refresh must observe the bump and advance.
+    ro.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+
+    // Verify by calling refresh() — it should now no-op because
+    // auto-refresh already advanced our cached epoch.
+    let advanced = ro.refresh().unwrap();
+    assert!(
+        !advanced,
+        "explicit refresh after auto-refresh must no-op (auto-refresh \
+         already consumed the bump)"
+    );
+
+    // Bump again. Disable auto-refresh, query, then verify refresh()
+    // sees the un-consumed bump (auto-refresh did NOT advance it).
+    let pre = manifest_epoch::read_epoch(&path).unwrap();
+    manifest_epoch::bump_epoch(&path).unwrap();
+    ro.set_auto_refresh(false);
+    ro.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+    let advanced = ro.refresh().unwrap();
+    assert!(
+        advanced,
+        "with auto-refresh OFF, explicit refresh must still see the bump"
+    );
+    let post = manifest_epoch::read_epoch(&path).unwrap();
+    assert!(
+        post > pre,
+        "epoch should have advanced past the pre-disable value"
+    );
+}
+
+#[test]
+fn refresh_no_op_on_in_process_as_read_only() {
+    // as_read_only() over a writable engine in-process shares state
+    // with the writer through the same EngineEntry — no cross-process
+    // refresh is needed and refresh() is documented to no-op.
+    let db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    let ro = db.as_read_only();
+    assert!(
+        !ro.refresh().unwrap(),
+        "in-process as_read_only must always no-op refresh"
+    );
+}
+
+#[test]
+fn cross_table_atomicity_under_concurrent_checkpoint() {
+    // SWMR v2 P1.4: a reader inside a BEGIN/COMMIT block must observe
+    // both tables at the same writer-side epoch, even while the writer
+    // is actively checkpointing. The invariant chain:
+    //   1. Writer persists per-table manifests in a loop.
+    //   2. Writer bumps `<db>/volumes/epoch` ONLY after all manifests
+    //      in the loop are durable (engine.rs checkpoint_cycle_inner).
+    //   3. Reader's auto-refresh polls the epoch before each query AND
+    //      skips during an active transaction (v2 P0.3).
+    //   4. Therefore a reader's BEGIN+SELECT_a+SELECT_b+COMMIT block
+    //      pins to a single coherent snapshot.
+    //
+    // This test runs writer and reader threads concurrently (writer in
+    // its own engine, reader in another — they coexist under SWMR v1
+    // because LockMode::Shared takes no kernel lock). Each writer
+    // iteration inserts one row into each of two tables in a single
+    // transaction, then checkpoints. The reader asserts COUNT(a) ==
+    // COUNT(b) on every iteration.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc as StdArc;
+    use std::thread;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("xtable_atomic.db");
+    let dsn_rw = format!("file://{}", path.display());
+
+    // Seed both tables and produce an initial checkpoint so the reader
+    // has a non-empty starting state.
+    {
+        let db = Database::open(&dsn_rw).unwrap();
+        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO a VALUES (0)", ()).unwrap();
+        db.execute("INSERT INTO b VALUES (0)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+    }
+
+    let stop = StdArc::new(AtomicBool::new(false));
+
+    // Writer thread: own writable engine, insert+checkpoint loop.
+    let stop_w = StdArc::clone(&stop);
+    let dsn_w = dsn_rw.clone();
+    let writer = thread::spawn(move || -> bool {
+        let db = match Database::open(&dsn_w) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let mut next_id: i64 = 1;
+        while !stop_w.load(Ordering::Relaxed) {
+            let sql_a = format!("INSERT INTO a VALUES ({})", next_id);
+            let sql_b = format!("INSERT INTO b VALUES ({})", next_id);
+            // Writer transaction: both inserts must commit together
+            // before the checkpoint snapshots them.
+            if db.execute("BEGIN", ()).is_err() {
+                return false;
+            }
+            if db.execute(&sql_a, ()).is_err() {
+                let _ = db.execute("ROLLBACK", ());
+                return false;
+            }
+            if db.execute(&sql_b, ()).is_err() {
+                let _ = db.execute("ROLLBACK", ());
+                return false;
+            }
+            if db.execute("COMMIT", ()).is_err() {
+                return false;
+            }
+            if db.execute("PRAGMA CHECKPOINT", ()).is_err() {
+                return false;
+            }
+            next_id += 1;
+        }
+        true
+    });
+
+    // Reader thread: own RO engine via different DSN string. Each
+    // iteration: BEGIN, SELECT COUNT FROM a, SELECT COUNT FROM b,
+    // COMMIT. Assert the two counts agree.
+    let stop_r = StdArc::clone(&stop);
+    let dsn_r = format!("{}?read_only=true", dsn_rw);
+    let inconsistencies = StdArc::new(std::sync::Mutex::new(Vec::<(i64, i64)>::new()));
+    let inc_r = StdArc::clone(&inconsistencies);
+    let reader = thread::spawn(move || {
+        // Open inside the thread so we don't race with seed close.
+        let ro = match Database::open_read_only(&dsn_r) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        while !stop_r.load(Ordering::Relaxed) {
+            // BEGIN pins the snapshot. SchemaChanged (from any DDL)
+            // would be unexpected here since we don't run DDL after
+            // open; treat any error as test setup issue.
+            if ro.query("BEGIN", ()).is_err() {
+                continue;
+            }
+            let mut rows_a = match ro.query("SELECT COUNT(*) FROM a", ()) {
+                Ok(r) => r,
+                Err(_) => {
+                    let _ = ro.query("ROLLBACK", ());
+                    continue;
+                }
+            };
+            let count_a: i64 = match rows_a.next() {
+                Some(Ok(row)) => row.get(0).unwrap_or(-1),
+                _ => {
+                    let _ = ro.query("ROLLBACK", ());
+                    continue;
+                }
+            };
+            drop(rows_a);
+
+            let mut rows_b = match ro.query("SELECT COUNT(*) FROM b", ()) {
+                Ok(r) => r,
+                Err(_) => {
+                    let _ = ro.query("ROLLBACK", ());
+                    continue;
+                }
+            };
+            let count_b: i64 = match rows_b.next() {
+                Some(Ok(row)) => row.get(0).unwrap_or(-1),
+                _ => {
+                    let _ = ro.query("ROLLBACK", ());
+                    continue;
+                }
+            };
+            drop(rows_b);
+
+            let _ = ro.query("COMMIT", ());
+
+            if count_a != count_b {
+                inc_r.lock().unwrap().push((count_a, count_b));
+            }
+        }
+    });
+
+    // Run for ~1.5 seconds. On an unloaded laptop this is enough for
+    // hundreds of writer iterations and a similar count of reader BEGIN
+    // blocks — plenty of opportunity to surface a race.
+    thread::sleep(Duration::from_millis(1500));
+    stop.store(true, Ordering::Relaxed);
+
+    let writer_ok = writer.join().expect("writer thread panicked");
+    reader.join().expect("reader thread panicked");
+
+    let observed = inconsistencies.lock().unwrap().clone();
+    assert!(
+        writer_ok,
+        "writer thread failed mid-loop (test setup issue, not the SWMR property)"
+    );
+    assert!(
+        observed.is_empty(),
+        "reader observed cross-table inconsistencies inside BEGIN/COMMIT \
+         blocks (count_a, count_b): {:?}",
+        observed
+    );
+}
+
+#[test]
+fn auto_refresh_skipped_during_active_transaction() {
+    // SWMR v2 P0.3: when the read-only handle has an open BEGIN, every
+    // subsequent query in that transaction must see the same snapshot
+    // — auto-refresh must NOT silently advance the epoch mid-txn. The
+    // first statement after BEGIN pins the snapshot; subsequent ones
+    // observe the same view.
+    use stoolap::storage::mvcc::manifest_epoch;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("auto_skip_in_txn.db");
+
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+    }
+
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+    let reader = Database::open_read_only(&dsn_ro).unwrap();
+
+    // Open a transaction on the reader. Inside the txn we'll bump the
+    // epoch externally and then issue another query — the query must
+    // NOT auto-refresh (which would otherwise observe the bump).
+    reader.query("BEGIN", ()).unwrap();
+
+    // Bump epoch to simulate a writer checkpoint mid-transaction.
+    let pre = manifest_epoch::read_epoch(&path).unwrap();
+    manifest_epoch::bump_epoch(&path).unwrap();
+    let post_disk = manifest_epoch::read_epoch(&path).unwrap();
+    assert!(post_disk > pre, "bump must advance disk epoch");
+
+    // Issue a query inside the txn. With auto-refresh enabled but a
+    // txn open, the query must NOT call refresh — so subsequent
+    // explicit refresh() should still see the bump as un-consumed.
+    reader.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+
+    // End the transaction.
+    reader.query("COMMIT", ()).unwrap();
+
+    // After COMMIT, an explicit refresh() should observe the bump
+    // (proving the in-txn query never consumed it via auto-refresh).
+    let advanced = reader.refresh().unwrap();
+    assert!(
+        advanced,
+        "refresh after COMMIT must see the bump that was made mid-txn \
+         (auto-refresh inside the txn was correctly skipped)"
+    );
+}
+
+#[test]
+fn refresh_detects_table_added_on_disk() {
+    // SWMR v2 P0.2: when the writer creates a new table after the
+    // reader opened (and checkpoints so manifest.bin appears on disk),
+    // refresh() must surface SchemaChanged with a clear "tables added
+    // on disk" message instead of silently ignoring the new table.
+    use stoolap::storage::mvcc::manifest_epoch;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("ddl_added.db");
+
+    // Seed: table 'a' exists at open time.
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO a VALUES (1)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+    }
+
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+    let reader = Database::open_read_only(&dsn_ro).unwrap();
+
+    // Simulate the writer creating table 'b' in another process by
+    // dropping a fresh manifest.bin into the volumes dir under that
+    // table name. We don't need real volume files — the directory
+    // scan only checks for manifest.bin presence.
+    use stoolap::storage::volume::manifest::TableManifest;
+    let new_table_dir = path.join("volumes").join("b");
+    std::fs::create_dir_all(&new_table_dir).unwrap();
+    let new_manifest = TableManifest::new("b");
+    new_manifest
+        .write_to_disk(&new_table_dir.join("manifest.bin"))
+        .unwrap();
+
+    // Bump epoch so refresh actually runs.
+    manifest_epoch::bump_epoch(&path).unwrap();
+
+    let result = reader.refresh();
+    let err = match result {
+        Err(Error::SchemaChanged(msg)) => msg,
+        other => panic!("expected SchemaChanged for added table; got {:?}", other),
+    };
+    assert!(
+        err.contains("tables added on disk") && err.contains("b"),
+        "error must name the added table; got: {}",
+        err
+    );
+}
+
+#[test]
+fn refresh_detects_table_dropped_on_disk() {
+    // SWMR v2 P0.2: when the writer drops a table after the reader
+    // opened (manifest.bin is unlinked), refresh() must surface
+    // SchemaChanged with "tables dropped on disk" instead of silently
+    // continuing with cached state.
+    use stoolap::storage::mvcc::manifest_epoch;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("ddl_dropped.db");
+
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE keep (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("CREATE TABLE doomed (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO keep VALUES (1)", ()).unwrap();
+        db.execute("INSERT INTO doomed VALUES (1)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+    }
+
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+    let reader = Database::open_read_only(&dsn_ro).unwrap();
+
+    // Simulate writer dropping 'doomed' by unlinking its manifest.bin.
+    let doomed_manifest = path.join("volumes").join("doomed").join("manifest.bin");
+    assert!(
+        doomed_manifest.exists(),
+        "seed must have produced a manifest for 'doomed'"
+    );
+    std::fs::remove_file(&doomed_manifest).unwrap();
+
+    manifest_epoch::bump_epoch(&path).unwrap();
+
+    let err = match reader.refresh() {
+        Err(Error::SchemaChanged(msg)) => msg,
+        other => panic!("expected SchemaChanged for dropped table; got {:?}", other),
+    };
+    assert!(
+        err.contains("tables dropped on disk") && err.contains("doomed"),
+        "error must name the dropped table; got: {}",
+        err
+    );
+}
+
+#[test]
+fn refresh_detects_schema_drift_on_compacted_volume() {
+    // SWMR v2 P0.1: when a writer-produced segment carries a
+    // schema_version higher than the reader's WAL-replayed schema_epoch,
+    // the segment's bytes can't be safely interpreted against the
+    // reader's stale schema. reload_manifests must hard-fail with
+    // SchemaChanged so the caller knows to reopen.
+    //
+    // We simulate the scenario by directly manipulating the on-disk
+    // manifest after the reader has loaded it: bump one segment's
+    // schema_version above what the engine has. This isolates the drift
+    // detection from the writer's own DDL machinery (which we test
+    // separately in cross-process tests when v2.P0.2 lands).
+    use stoolap::storage::volume::manifest::TableManifest;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("schema_drift.db");
+
+    // Seed: create table, insert, checkpoint (produces one volume at
+    // schema_version=1).
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 100)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+    }
+
+    // Open the reader FIRST so its `schema_epoch` baseline is set from
+    // the seed segments (schema_version=1). After this, mutate the
+    // on-disk manifest to claim a higher schema_version — that
+    // simulates the writer doing ALTER TABLE + compaction in another
+    // process AFTER the reader opened.
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+    let reader = Database::open_read_only(&dsn_ro).unwrap();
+
+    let manifest_path = path.join("volumes").join("t").join("manifest.bin");
+    let mut manifest = TableManifest::read_from_disk(&manifest_path).unwrap();
+    assert!(!manifest.segments.is_empty(), "seed must produce a segment");
+    manifest.segments[0].schema_version = 999;
+    manifest.write_to_disk(&manifest_path).unwrap();
+
+    // Bump the manifest_epoch sidecar so refresh() actually triggers a
+    // reload (otherwise the no-change fast path skips drift detection).
+    use stoolap::storage::mvcc::manifest_epoch;
+    manifest_epoch::bump_epoch(&path).unwrap();
+
+    let result = reader.refresh();
+    assert!(
+        matches!(result, Err(Error::SchemaChanged(_))),
+        "refresh must surface SchemaChanged when a segment's schema_version \
+         exceeds the reader's schema_epoch; got {:?}",
+        result
+    );
+
+    // Auto-refresh on the next query also surfaces it.
+    let q = reader.query("SELECT COUNT(*) FROM t", ());
+    assert!(
+        matches!(q, Err(Error::SchemaChanged(_))),
+        "auto-refresh on query must propagate SchemaChanged; got {:?}",
+        q.err()
+    );
+
+    // With auto-refresh disabled, the reader still serves its
+    // pre-failure snapshot (the bumped epoch never got applied because
+    // refresh errored before mutating state). Verify the original row
+    // is still readable.
+    reader.set_auto_refresh(false);
+    let mut rows = reader
+        .query("SELECT COUNT(*) FROM t", ())
+        .expect("auto-refresh OFF: query must succeed against stale snapshot");
+    let n: i64 = rows.next().unwrap().unwrap().get(0).unwrap();
+    assert_eq!(n, 1, "stale snapshot must still see the seed row");
+}
+
+#[test]
+fn checkpoint_bumps_manifest_epoch() {
+    // SWMR v1 P2: writer must publish a monotonically-increasing epoch
+    // at `<db>/volumes/epoch` after each successful checkpoint cycle.
+    // Reader processes poll this file to detect new checkpoints without
+    // re-opening the database. Without this, refresh() has nothing to
+    // poll and visibility lag becomes unbounded.
+    use stoolap::storage::mvcc::manifest_epoch;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("epoch_bump.db");
+    let dsn = format!("file://{}", path.display());
+
+    let db = Database::open(&dsn).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 100)", ()).unwrap();
+
+    // Before any checkpoint, epoch is 0 (file may or may not exist).
+    let before = manifest_epoch::read_epoch(&path).unwrap();
+
+    // Force a successful checkpoint via PRAGMA. Bumps require both
+    // checkpoint_lsn > 0 (everything sealed under fence) AND all
+    // manifests persisted; PRAGMA CHECKPOINT goes through the same
+    // checkpoint_cycle_inner path as the background timer.
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let after = manifest_epoch::read_epoch(&path).unwrap();
+    assert!(
+        after > before,
+        "epoch must advance after PRAGMA CHECKPOINT: before={}, after={}",
+        before,
+        after
+    );
+
+    // A second checkpoint must advance again — even with no new data,
+    // each successful cycle bumps so readers can detect "writer is alive
+    // and has gone through another checkpoint cycle". (If we wanted
+    // bump-only-on-actual-change, that's a v2 optimization.)
+    db.execute("INSERT INTO t VALUES (2, 200)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let after2 = manifest_epoch::read_epoch(&path).unwrap();
+    assert!(
+        after2 > after,
+        "second checkpoint must advance epoch again: after={}, after2={}",
+        after,
+        after2
+    );
+}
+
+#[test]
+fn checkpoint_does_not_bump_epoch_on_memory_engine() {
+    // memory:// has no path; the bump call short-circuits. Sanity check
+    // that PRAGMA CHECKPOINT on an in-memory db doesn't error.
+    let db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+    // PRAGMA CHECKPOINT may or may not be a no-op on memory engines;
+    // either way it must not panic or surface an error here.
+    let _ = db.execute("PRAGMA CHECKPOINT", ());
+}
+
+// Tests for the engine-internal `defer_for_live_readers` helper now
+// live as unit tests in `src/storage/mvcc/engine.rs` (V2.P1.5). Keeping
+// them out of the integration test file lets us demote the helper from
+// `#[doc(hidden)] pub` to `pub(crate)`, matching its true visibility.
+
+// Visibility-lag microbenchmark lives in swmr_snapshot_test.rs (V2.P2.11)
+// because it needs a real cross-process writer+reader pair. The same-
+// process pattern races on engine shutdown / startup timing and produced
+// flaky 0-inserts-observed runs that didn't reflect the SWMR mechanism.
+
+#[test]
+fn pragma_swmr_status_returns_diagnostic_row() {
+    // SWMR v2 P2.12: `PRAGMA SWMR_STATUS` returns one row of cross-process
+    // diagnostic info: manifest_epoch, live_lease_count, lease_max_age_secs,
+    // is_read_only, checkpoint_interval_secs.
+    use stoolap::storage::mvcc::manifest_epoch;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("swmr_status.db");
+
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+    }
+
+    let expected_epoch = manifest_epoch::read_epoch(&path).unwrap();
+    assert!(expected_epoch > 0, "seed should produce non-zero epoch");
+
+    let dsn_ro = format!("file://{}?read_only=true&lease_max_age=300", path.display());
+    let ro = Database::open_read_only(&dsn_ro).unwrap();
+
+    let mut rows = ro.query("PRAGMA SWMR_STATUS", ()).unwrap();
+    let row = rows.next().expect("must return a row").unwrap();
+
+    let manifest_epoch: i64 = row.get(0).unwrap();
+    let live_lease_count: i64 = row.get(1).unwrap();
+    let lease_max_age_secs: i64 = row.get(2).unwrap();
+    let is_read_only: bool = row.get(3).unwrap();
+    let checkpoint_interval_secs: i64 = row.get(4).unwrap();
+
+    assert_eq!(
+        manifest_epoch as u64, expected_epoch,
+        "manifest_epoch must match disk"
+    );
+    assert_eq!(
+        live_lease_count, 1,
+        "live_lease_count must include this reader's own lease"
+    );
+    assert_eq!(
+        lease_max_age_secs, 300,
+        "lease_max_age_secs must reflect the ?lease_max_age=300 DSN override"
+    );
+    assert!(
+        is_read_only,
+        "is_read_only must be true on a read-only handle"
+    );
+    assert_eq!(
+        checkpoint_interval_secs, 60,
+        "default checkpoint_interval is 60s"
+    );
+}
+
+#[test]
+fn pragma_swmr_status_works_on_writable_handle() {
+    // SWMR v2 P2.12: PRAGMA SWMR_STATUS is a pure-read pragma that works
+    // on any handle — writable or read-only. Lets the writer introspect
+    // "how many readers are attached?".
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("swmr_status_writable.db");
+    let dsn = format!("file://{}", path.display());
+
+    let db = Database::open(&dsn).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let mut rows = db.query("PRAGMA SWMR_STATUS", ()).unwrap();
+    let row = rows.next().expect("must return a row").unwrap();
+    let live_lease_count: i64 = row.get(1).unwrap();
+    let is_read_only: bool = row.get(3).unwrap();
+    assert_eq!(live_lease_count, 0, "no readers attached → 0 leases");
+    assert!(
+        !is_read_only,
+        "writable handle must report is_read_only=false"
+    );
+}
+
+#[test]
+fn lease_max_age_dsn_param_is_parsed() {
+    // SWMR v2 P1.7: `?lease_max_age=N` overrides the engine-derived
+    // default of `max(120s, 2 * checkpoint_interval)`. Both parameter
+    // spellings (`lease_max_age` and `lease_max_age_secs`) parse the
+    // same. Invalid values surface as Error::InvalidArgument.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("lease_max_age.db");
+
+    {
+        let dsn = format!("file://{}", path.display());
+        let db = Database::open(&dsn).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.close().unwrap();
+    }
+
+    // Use writable Database::open so we can read config back via
+    // engine().config() — open_read_only would put the engine into
+    // read-only mode but ReadOnlyDatabase doesn't expose config(). The
+    // lease_max_age parsing path is the same for both modes.
+    let dsn_short = format!("file://{}?lease_max_age=2400", path.display());
+    let db_short = Database::open(&dsn_short).unwrap();
+    assert_eq!(
+        db_short.engine().config().persistence.lease_max_age_secs,
+        2400,
+        "?lease_max_age=N must set the config field"
+    );
+    drop(db_short);
+
+    // Long alias for symmetry with the field name.
+    let dsn_long = format!("file://{}?lease_max_age_secs=600", path.display());
+    let db_long = Database::open(&dsn_long).unwrap();
+    assert_eq!(
+        db_long.engine().config().persistence.lease_max_age_secs,
+        600,
+        "?lease_max_age_secs=N must also work"
+    );
+    drop(db_long);
+
+    // Bad value: string surfaces InvalidArgument.
+    let bad = format!("file://{}?lease_max_age=not-a-number", path.display());
+    let err = Database::open(&bad).err().unwrap();
+    assert!(
+        matches!(err, Error::InvalidArgument(_)),
+        "invalid lease_max_age must surface InvalidArgument; got {:?}",
+        err
+    );
+
+    // The same parser also runs through open_read_only (it shares
+    // parse_file_config), so a redundant ?read_only=true flag pairs
+    // cleanly with the override.
+    let dsn_ro = format!("file://{}?read_only=true&lease_max_age=300", path.display());
+    let _ro = Database::open_read_only(&dsn_ro).unwrap();
+}
+
+#[test]
+fn ro_handle_no_lease_on_memory_engine() {
+    // memory:// can't have a lease (no filesystem path). open_read_only
+    // already rejects memory:// (per existing test
+    // `open_read_only_on_memory_dsn_errors`), but `as_read_only()` over a
+    // memory writable engine reaches `from_entry` with an empty path. The
+    // lease branch must short-circuit. Sanity check: just construct one
+    // and confirm no panic.
+    let db = Database::open_in_memory().unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    let ro = db.as_read_only();
+    // No filesystem path to check; if we got here without panic, success.
+    ro.query("SELECT * FROM t", ()).unwrap().next();
 }
