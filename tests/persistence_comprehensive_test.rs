@@ -554,3 +554,51 @@ fn test_unique_multi_column_index_persistence() {
         db.close().unwrap();
     }
 }
+
+/// TRUNCATE's affected-row return value must match COUNT(*) immediately
+/// before the TRUNCATE — i.e., the live row count after deduping
+/// across hot/cold and applying tombstones.
+///
+/// Regression: TRUNCATE used `SegmentManager::total_row_count()`, which
+/// is now an upper-bound hint that intentionally does not subtract
+/// tombstones (orphan tombstones from compacted-away segments must not
+/// shrink the planner hint). The TRUNCATE return value, by contrast, is
+/// part of the user-visible SQL contract and must be exact. Reviewer
+/// repro: checkpoint rows 1,2,3; DELETE cold row 2; TRUNCATE returned 3
+/// instead of 2. Switching to `deduped_row_count()` fixes it.
+#[test]
+fn test_truncate_affected_count_excludes_tombstoned_cold_rows() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("trunc.db");
+    let dsn = format!("file://{}", db_path.display());
+
+    let db = Database::open(&dsn).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)", ())
+        .unwrap();
+    // Seal so rows live in cold.
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    // Delete cold row 2. Becomes a manifest tombstone after commit.
+    let deleted = db.execute("DELETE FROM t WHERE id = 2", ()).unwrap();
+    assert_eq!(deleted, 1, "DELETE should report 1 affected row");
+
+    let live: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(live, 2, "two live rows after the DELETE");
+
+    // TRUNCATE's affected count must equal the live count (2), not
+    // the segment row count (3).
+    let truncated = db.execute("TRUNCATE TABLE t", ()).unwrap();
+    assert_eq!(
+        truncated, 2,
+        "TRUNCATE must report 2 affected rows (live count), not 3 \
+         (raw segment row count). The tombstoned cold row already \
+         had no live presence."
+    );
+
+    let after: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(after, 0);
+
+    db.close().unwrap();
+}

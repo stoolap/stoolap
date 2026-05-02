@@ -2271,14 +2271,25 @@ impl SegmentManager {
         false
     }
 
-    /// Get the total live row count across all segments (minus tombstones).
-    /// NOTE: This is a fast estimate that does not deduplicate overlapping row_ids.
-    /// Use `deduped_row_count()` for an exact count.
+    /// Upper-bound estimate of the row count across all segments.
+    /// Used by the `ReadTable::row_count_hint` contract for planner /
+    /// cache decisions; it does NOT deduplicate overlapping row_ids
+    /// across segments and does NOT subtract tombstones. Tombstones
+    /// can outlive the segments they originally pointed at (compaction
+    /// merges segments and the merged volume physically excludes
+    /// tombstoned rows, but the manifest may still carry the tombstone
+    /// entries for the old row_ids). Subtracting `tombstones.len()`
+    /// blindly therefore over-subtracts and can drive the hint to
+    /// zero on a large table whose only "tombstones" are those
+    /// orphans, fooling the planner / cache into treating the table
+    /// as small.
+    ///
+    /// Per the upper-bound contract, the only safe cheap thing is
+    /// the sum of segment row counts. Use `deduped_row_count()` for
+    /// an exact count.
     pub fn total_row_count(&self) -> usize {
         let manifest = self.manifest.read();
-        let ts_count = self.tombstones.read().len();
-        let total: usize = manifest.segments.iter().map(|s| s.row_count).sum();
-        total.saturating_sub(ts_count)
+        manifest.segments.iter().map(|s| s.row_count).sum()
     }
 
     /// Get the exact deduplicated row count across all segments.
@@ -2842,11 +2853,7 @@ impl SegmentManager {
         // reload_from_manifest is exactly what writer-side seal /
         // compaction paths already do via remove_segments_inner /
         // replace_segments_atomic.
-        let seg_ids: Vec<u64> = new_manifest
-            .segments
-            .iter()
-            .map(|m| m.segment_id)
-            .collect();
+        let seg_ids: Vec<u64> = new_manifest.segments.iter().map(|m| m.segment_id).collect();
         compute_visibility_bitmaps(
             &seg_ids,
             &mut new_segments_map,
@@ -3757,14 +3764,30 @@ mod tests {
         assert!(!mgr.row_exists(5));
         assert!(mgr.row_exists(4));
         assert!(mgr.row_exists(6));
-        assert_eq!(mgr.total_row_count(), 9);
+        // total_row_count is the upper-bound row hint and does NOT
+        // subtract tombstones (they may be orphans from previously-
+        // compacted segments). The exact count comes from
+        // deduped_row_count.
+        assert_eq!(mgr.total_row_count(), 10);
+        assert_eq!(mgr.deduped_row_count(), 9);
         assert!(mgr.is_tombstoned(5));
         assert!(!mgr.is_tombstoned(4));
+
+        // Add an ORPHAN tombstone (row_id 999 isn't in any segment).
+        // This is the regression case: total_row_count must NOT
+        // shrink to 8; it must stay at 10. Pre-fix, total_row_count
+        // blindly subtracted tombstones.len() and would return 8,
+        // which fooled planner / cache hints into treating large
+        // tables as small after compaction left orphans behind.
+        mgr.add_tombstones(&[999], 2, 0);
+        assert_eq!(mgr.total_row_count(), 10);
+        assert_eq!(mgr.deduped_row_count(), 9);
 
         // Clear tombstones
         mgr.clear_tombstones();
         assert!(mgr.row_exists(5));
         assert_eq!(mgr.total_row_count(), 10);
+        assert_eq!(mgr.deduped_row_count(), 10);
     }
 
     #[test]

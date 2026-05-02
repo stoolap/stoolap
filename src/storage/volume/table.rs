@@ -214,21 +214,30 @@ impl SegmentedTable {
     /// Count visible rows by walking the per-volume scanner skip set
     /// without materializing the rows. Used by SWMR readers to avoid
     /// the hot/cold overlap double-counting that the O(1) formula has
-    /// (see `read_only` field doc). O(rows) time, O(hot_count) memory
-    /// for the skip set, no row materialization.
-    fn count_via_scan(&self) -> usize {
-        // Hot side: pull row_ids only (the WriteTable trait's
-        // `get_active_row_ids` returns just the IDs without
-        // materializing rows).
-        let hot_ids = self.hot.get_active_row_ids();
-        let mut total = hot_ids.len();
-        let hot_skip: rustc_hash::FxHashSet<i64> = hot_ids.into_iter().collect();
+    /// (see `read_only` field doc).
+    ///
+    /// `hot_skip` is the FULL set of hot VersionStore keys (live rows
+    /// AND WAL-replayed delete markers). The caller has already built
+    /// it to decide whether the scan path is needed in the first
+    /// place; reusing it avoids a second B-tree pass.
+    ///
+    /// - Hot live count comes from `WriteTable::row_count`, which
+    ///   already excludes delete markers and applies visibility
+    ///   correctly. We do NOT count `hot_skip.len()` because that
+    ///   would include the delete markers we are using to MASK cold.
+    /// - For cold we count rows where `is_visible(i) &&
+    ///   !tombstones.contains(rid) && !hot_skip.contains(rid)`. A
+    ///   delete-marker row_id in `hot_skip` correctly hides cold's
+    ///   older copy of that row. The per-volume visibility bitmap
+    ///   already dedupes inter-volume (a row_id present in N
+    ///   segments has its bit set in only the newest segment), so no
+    ///   `seen` HashSet is needed.
+    ///
+    /// Memory cost: O(hot keys) for the skip set the caller passes.
+    /// No per-cold-row allocation.
+    fn count_via_scan_with_skip(&self, hot_skip: &rustc_hash::FxHashSet<i64>) -> usize {
+        let mut total = self.hot.row_count();
         let (volumes, tombstones) = self.segment_mgr.volumes_and_tombstones_newest_first_lazy();
-        let mut seen_cold: rustc_hash::FxHashSet<i64> =
-            rustc_hash::FxHashSet::with_capacity_and_hasher(
-                volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum(),
-                Default::default(),
-            );
         for (_seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
             for i in 0..vol.meta.row_count {
@@ -242,9 +251,7 @@ impl SegmentedTable {
                 if !tombstones.is_empty() && tombstones.contains_key(&rid) {
                     continue;
                 }
-                if seen_cold.insert(rid) {
-                    total += 1;
-                }
+                total += 1;
             }
         }
         total
@@ -1786,14 +1793,21 @@ impl ReadTable for SegmentedTable {
             return self.collect_all_rows(None).map_or(0, |r| r.len());
         }
         // SWMR cross-process read-only handle: see the `read_only`
-        // field doc on the struct for why the fast `seg + hot -
-        // overlap` formula double-counts here. Use a count-only scan
-        // that walks the same merged stream the slow query path uses
-        // (per-volume scanner with hot row_ids in the skip set) but
-        // discards the materialized rows so memory cost stays O(1)
-        // instead of O(rows).
-        if self.read_only && self.hot.row_count() > 0 && self.segment_mgr.has_segments() {
-            return self.count_via_scan();
+        // field doc on the struct for why the fast formula
+        // double-counts here. Trigger the scan path whenever hot has
+        // ANY VersionStore keys (live rows OR WAL-replayed delete
+        // markers): a delete marker has hot.row_count() == 0 but
+        // still has to mask its row_id from cold's count. Pure-cold
+        // readers (no replay state in hot) still get the O(1)
+        // formula. Building the skip set up front is also exactly
+        // what `count_via_scan_with_skip` needs, so this isn't an
+        // extra B-tree pass.
+        if self.read_only && self.segment_mgr.has_segments() {
+            let mut hot_skip = rustc_hash::FxHashSet::default();
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            if !hot_skip.is_empty() {
+                return self.count_via_scan_with_skip(&hot_skip);
+            }
         }
         let seg = self.segment_mgr.deduped_row_count();
         let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
@@ -1814,11 +1828,16 @@ impl ReadTable for SegmentedTable {
             return None;
         }
         let hot_count = self.hot.fast_row_count()?;
-        // SWMR read-only handle: bail so caller falls back to
-        // `row_count` which uses `count_via_scan`. See the `read_only`
-        // field doc on the struct.
-        if self.read_only && hot_count > 0 && self.segment_mgr.has_segments() {
-            return None;
+        // SWMR read-only handle: same condition as `row_count` above.
+        // Bail when hot has any keys (live rows OR delete markers)
+        // alongside cold so the caller falls through to row_count's
+        // scan path. See the `read_only` field doc on the struct.
+        if self.read_only && self.segment_mgr.has_segments() {
+            let mut hot_skip = rustc_hash::FxHashSet::default();
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            if !hot_skip.is_empty() {
+                return None;
+            }
         }
         let seg = self.segment_mgr.deduped_row_count();
         let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
@@ -5586,7 +5605,15 @@ impl WriteTable for SegmentedTable {
     }
     fn truncate(&mut self) -> Result<i32> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
-        let seg_rows = self.segment_mgr.total_row_count() as i32;
+        // Use the EXACT live cold count, not `total_row_count` which
+        // is an upper-bound hint that deliberately does not subtract
+        // tombstones. TRUNCATE's affected-row return value is part of
+        // the user-visible SQL contract: COUNT(*) before TRUNCATE
+        // must equal the affected count it reports. With orphan or
+        // live tombstones in the manifest, the hint over-reports —
+        // e.g., a 3-row segment with one tombstoned row had COUNT=2
+        // but TRUNCATE was returning 3.
+        let seg_rows = self.segment_mgr.deduped_row_count() as i32;
         // Clear pending tombstones for this txn (segments are being dropped)
         self.segment_mgr.rollback_pending_tombstones(self.txn_id());
         self.segment_mgr.clear();
@@ -6236,12 +6263,17 @@ mod tests {
 
         // Tombstones are deferred until commit. Before commit, the shared
         // segment manager still sees the row as live.
-        assert_eq!(mgr.total_row_count(), 3);
+        assert_eq!(mgr.deduped_row_count(), 3);
         assert!(!mgr.is_tombstoned(2));
 
         // After commit, tombstones are applied to the shared segment manager.
+        // total_row_count is the upper-bound hint and does NOT subtract
+        // tombstones (orphan tombstones must not collapse the hint —
+        // see SegmentManager::total_row_count). The exact post-delete
+        // count comes from deduped_row_count.
         table.commit().unwrap();
-        assert_eq!(mgr.total_row_count(), 2);
+        assert_eq!(mgr.total_row_count(), 3);
+        assert_eq!(mgr.deduped_row_count(), 2);
         assert!(mgr.is_tombstoned(2));
         assert!(mgr.row_exists(1));
         assert!(mgr.row_exists(3));
