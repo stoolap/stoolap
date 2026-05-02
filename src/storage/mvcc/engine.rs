@@ -10473,6 +10473,12 @@ struct EngineOperations {
     /// `MVCCEngine::failed`). Set by `mark_engine_failed` to block
     /// every durability path on the engine.
     failed: Arc<AtomicBool>,
+    /// Snapshot of `MVCCEngine::is_read_only_mode()` taken at construction.
+    /// Read-only engines need the SWMR-aware `count_via_scan` path in
+    /// `SegmentedTable::row_count`; writers stay on the O(1) formula.
+    /// Read-only mode is fixed for the engine's lifetime, so a
+    /// snapshot at construction is sufficient.
+    read_only: bool,
 }
 
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
@@ -10480,6 +10486,7 @@ struct EngineOperations {
 impl EngineOperations {
     fn new(engine: &MVCCEngine) -> Self {
         let shm = engine.shm.lock().unwrap().as_ref().map(Arc::clone);
+        let read_only = engine.is_read_only_mode();
         Self {
             schemas: Arc::clone(&engine.schemas),
             version_stores: Arc::clone(&engine.version_stores),
@@ -10501,6 +10508,7 @@ impl EngineOperations {
             shm_publish_lock: Arc::clone(&engine.shm_publish_lock),
             lease_present: Arc::clone(&engine.lease_present),
             failed: Arc::clone(&engine.failed),
+            read_only,
         }
     }
 
@@ -10848,9 +10856,17 @@ impl TransactionEngineOperations for EngineOperations {
                         ),
                     ));
                 }
-                return Ok(Box::new(
-                    crate::storage::volume::table::SegmentedTable::new(Box::new(table), mgr),
-                ));
+                // Read-only engines need the SWMR-aware row_count
+                // path; writers stay on the O(1) formula. See the
+                // `read_only` field doc on SegmentedTable.
+                return Ok(Box::new(if self.read_only {
+                    crate::storage::volume::table::SegmentedTable::new_read_only(
+                        Box::new(table),
+                        mgr,
+                    )
+                } else {
+                    crate::storage::volume::table::SegmentedTable::new(Box::new(table), mgr)
+                }));
             }
         }
 

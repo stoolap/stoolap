@@ -144,6 +144,19 @@ pub struct SegmentedTable {
     /// preserving the snapshot's point-in-time view of cold data.
     /// None for auto-commit transactions (all tombstones visible).
     snapshot_seq: Option<u64>,
+    /// True when this table view belongs to a read-only engine (cross-
+    /// process SWMR reader). On readers `hot` is populated by initial
+    /// WAL replay and never drains because no seal runs, so when the
+    /// writer subsequently checkpoints those same row_ids into a new
+    /// sealed segment they appear in BOTH `hot` and cold. The fast
+    /// `seg + hot - overlap` row_count formula assumes hot/cold are
+    /// disjoint (true for writers because seal moves rows OUT of hot
+    /// before they appear in cold, with `seal_overlap` covering the
+    /// brief overlap window). Read-only handles fall back to a count-
+    /// only scan that uses the per-volume scanner skip set so the
+    /// hot/cold overlap is deduped correctly. Writers stay on the
+    /// O(1) formula.
+    read_only: bool,
 }
 
 impl SegmentedTable {
@@ -153,6 +166,18 @@ impl SegmentedTable {
             hot,
             segment_mgr,
             snapshot_seq: None,
+            read_only: false,
+        }
+    }
+
+    /// Same as [`Self::new`] but for tables backed by a read-only engine.
+    /// See the `read_only` field doc on the struct for the rationale.
+    pub fn new_read_only(hot: Box<dyn WriteTable>, segment_mgr: Arc<SegmentManager>) -> Self {
+        Self {
+            hot,
+            segment_mgr,
+            snapshot_seq: None,
+            read_only: true,
         }
     }
 
@@ -167,6 +192,7 @@ impl SegmentedTable {
             hot,
             segment_mgr,
             snapshot_seq: Some(snapshot_seq),
+            read_only: false,
         }
     }
 
@@ -176,12 +202,52 @@ impl SegmentedTable {
             segment_mgr: Arc::new(SegmentManager::new("", None)),
             hot,
             snapshot_seq: None,
+            read_only: false,
         }
     }
 
     /// Get the transaction ID for per-txn tombstone tracking.
     fn txn_id(&self) -> i64 {
         self.hot.txn_id()
+    }
+
+    /// Count visible rows by walking the per-volume scanner skip set
+    /// without materializing the rows. Used by SWMR readers to avoid
+    /// the hot/cold overlap double-counting that the O(1) formula has
+    /// (see `read_only` field doc). O(rows) time, O(hot_count) memory
+    /// for the skip set, no row materialization.
+    fn count_via_scan(&self) -> usize {
+        // Hot side: pull row_ids only (the WriteTable trait's
+        // `get_active_row_ids` returns just the IDs without
+        // materializing rows).
+        let hot_ids = self.hot.get_active_row_ids();
+        let mut total = hot_ids.len();
+        let hot_skip: rustc_hash::FxHashSet<i64> = hot_ids.into_iter().collect();
+        let (volumes, tombstones) = self.segment_mgr.volumes_and_tombstones_newest_first_lazy();
+        let mut seen_cold: rustc_hash::FxHashSet<i64> =
+            rustc_hash::FxHashSet::with_capacity_and_hasher(
+                volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum(),
+                Default::default(),
+            );
+        for (_seg_id, cs) in volumes.iter() {
+            let vol = &cs.volume;
+            for i in 0..vol.meta.row_count {
+                if !cs.is_visible(i) {
+                    continue;
+                }
+                let rid = vol.meta.row_ids[i];
+                if hot_skip.contains(&rid) {
+                    continue;
+                }
+                if !tombstones.is_empty() && tombstones.contains_key(&rid) {
+                    continue;
+                }
+                if seen_cold.insert(rid) {
+                    total += 1;
+                }
+            }
+        }
+        total
     }
 
     /// Check if a tombstone is visible to this table's snapshot.
@@ -1719,34 +1785,20 @@ impl ReadTable for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return self.collect_all_rows(None).map_or(0, |r| r.len());
         }
-        // The `seg + hot - overlap` fast path assumes hot/cold are
-        // disjoint (true for writers because seal moves rows OUT of
-        // hot before they land in cold). SWMR cross-process readers
-        // violate that invariant: their hot buffer is populated by
-        // initial WAL replay at attach and never drains (read-only
-        // opens cannot seal), so when the writer subsequently
-        // checkpoints those same logical rows into a new sealed
-        // segment, the reader sees the row_id in BOTH hot and cold.
-        // `seal_overlap` is only set during the writer's brief seal
-        // critical section, so it stays 0 on the reader and every
-        // replay-then-checkpointed row is double-counted by COUNT(*).
-        //
-        // Whenever both sides are non-empty we cannot tell from the
-        // fast-path formula alone whether hot and cold overlap (the
-        // writer's `set_seal_overlap` is the only signal and it
-        // doesn't fire on readers). The full scan correctly dedupes
-        // via the per-volume scanner skip set, so we use it whenever
-        // hot is non-empty alongside cold. Pure-cold tables (hot
-        // empty) and pure-hot tables (cold empty) keep the O(1)
-        // formula since there can be no overlap to mishandle.
-        let hot_count = self.hot.row_count();
-        if hot_count > 0 && self.segment_mgr.has_segments() {
-            return self.collect_all_rows(None).map_or(0, |r| r.len());
+        // SWMR cross-process read-only handle: see the `read_only`
+        // field doc on the struct for why the fast `seg + hot -
+        // overlap` formula double-counts here. Use a count-only scan
+        // that walks the same merged stream the slow query path uses
+        // (per-volume scanner with hot row_ids in the skip set) but
+        // discards the materialized rows so memory cost stays O(1)
+        // instead of O(rows).
+        if self.read_only && self.hot.row_count() > 0 && self.segment_mgr.has_segments() {
+            return self.count_via_scan();
         }
         let seg = self.segment_mgr.deduped_row_count();
         let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
         let overlap = self.segment_mgr.seal_overlap();
-        seg.saturating_sub(pending) + hot_count.saturating_sub(overlap)
+        seg.saturating_sub(pending) + self.hot.row_count().saturating_sub(overlap)
     }
     fn row_count_hint(&self) -> usize {
         let seg = self.segment_row_count_hint();
@@ -1762,11 +1814,10 @@ impl ReadTable for SegmentedTable {
             return None;
         }
         let hot_count = self.hot.fast_row_count()?;
-        // Same disjoint-set assumption as `row_count` above. Bail to
-        // the slow path when hot AND cold are both non-empty so the
-        // SWMR-reader hot/cold overlap doesn't double-count via the
-        // O(1) formula. Caller (Table::row_count) will then scan.
-        if hot_count > 0 && self.segment_mgr.has_segments() {
+        // SWMR read-only handle: bail so caller falls back to
+        // `row_count` which uses `count_via_scan`. See the `read_only`
+        // field doc on the struct.
+        if self.read_only && hot_count > 0 && self.segment_mgr.has_segments() {
             return None;
         }
         let seg = self.segment_mgr.deduped_row_count();
