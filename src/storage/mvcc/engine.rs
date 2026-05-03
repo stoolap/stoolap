@@ -1383,13 +1383,16 @@ impl MVCCEngine {
         if !config.cleanup.enabled {
             return;
         }
-        // Read-only engines have no DML and no checkpoint work; skip the
-        // background cleanup thread entirely. Saves a thread per
-        // ReadOnlyDatabase open and avoids any cleanup-related write
-        // attempts on a read-only file lock.
-        if config.read_only {
-            return;
-        }
+        // Read-only engines previously skipped this thread entirely.
+        // That left warm-tier eviction unrun: every loaded volume sat
+        // in warm forever (no `idle_cycles` advance, no demotion to
+        // cold), so a long-lived ReadOnlyDatabase grew to hold every
+        // touched volume's decompressed columns in RAM. The cleanup
+        // loop now runs for read-only too; the read-only branch in
+        // `start_periodic_cleanup_internal` does eviction only and
+        // skips every writer-mutation step (cleanup_old_*,
+        // checkpoint_cycle_inner, spawn_compaction,
+        // flush_wal_for_visibility, refresh_lease_present_cache).
 
         let interval = std::time::Duration::from_secs(config.cleanup.interval_secs);
         let deleted_row_retention =
@@ -1419,13 +1422,23 @@ impl MVCCEngine {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = Arc::clone(&stop_flag);
         let engine = Arc::clone(self);
+        // Snapshot read-only mode for the loop. Read-only is fixed
+        // for the engine's lifetime, so we never need to re-check it
+        // per tick. Writer-only operations (lease scans, WAL
+        // visibility flush, checkpoint, compaction, retention
+        // sweeps) are skipped on read-only; eviction still runs.
+        let read_only = engine.is_read_only_mode();
 
         let handle = thread::spawn(move || {
             let mut time_since_cleanup = std::time::Duration::ZERO;
 
             while !stop_flag_clone.load(Ordering::Acquire) {
-                // Read config once per outer iteration (not per 100ms tick)
-                let current_checkpoint_interval = {
+                // Read config once per outer iteration (not per 100ms tick).
+                // Checkpoint cadence drives the writer's loop interval;
+                // read-only handles use the configured cleanup interval as-is.
+                let current_checkpoint_interval = if read_only {
+                    std::time::Duration::ZERO
+                } else {
                     let cfg = engine.config.read().unwrap();
                     if cfg.persistence.checkpoint_interval > 0 {
                         std::time::Duration::from_secs(cfg.persistence.checkpoint_interval as u64)
@@ -1444,29 +1457,19 @@ impl MVCCEngine {
                 while elapsed < loop_interval && !stop_flag_clone.load(Ordering::Acquire) {
                     thread::sleep(check_interval);
                     elapsed += check_interval;
-                    // Refresh the cached `lease_present` flag on
-                    // EVERY 100ms inner tick so a freshly-attached
-                    // reader sees the writer's barrier publish
-                    // within a bounded window (~100ms worst case).
-                    // The lease scan is a single read_dir + N stats
-                    // — cheap to amortize per-tick. On
-                    // `false → true` transition the refresh helper
-                    // runs `barrier_publish_full_state` which
-                    // re-syncs shm under the full seqlock. The
-                    // reader's pre_acquire short-wait
-                    // (await_writer_barrier_after_lease_write) pairs
-                    // with this so the attach window is closed
-                    // synchronously rather than racing the cleanup
-                    // tick.
-                    // SyncMode::None no longer flushes every commit
-                    // marker. Periodically write the WAL buffer and
-                    // republish the flushed frontier so read-only
-                    // processes catch up without putting the cost on
-                    // each commit.
-                    if engine.flush_wal_for_visibility_if_due() {
-                        engine.barrier_publish_full_state();
+                    if !read_only {
+                        // Writer side: refresh lease-presence cache on
+                        // every 100ms inner tick so a freshly-attached
+                        // reader sees the writer's barrier publish
+                        // within a bounded window. SyncMode::None no
+                        // longer flushes every commit marker, so we
+                        // periodically write the WAL buffer and
+                        // republish the flushed frontier here too.
+                        if engine.flush_wal_for_visibility_if_due() {
+                            engine.barrier_publish_full_state();
+                        }
+                        engine.refresh_lease_present_cache();
                     }
-                    engine.refresh_lease_present_cache();
                 }
 
                 if stop_flag_clone.load(Ordering::Acquire) {
@@ -1477,12 +1480,16 @@ impl MVCCEngine {
                 time_since_cleanup += loop_interval;
                 if time_since_cleanup >= interval {
                     time_since_cleanup = std::time::Duration::ZERO;
-                    let _txn_count = engine.cleanup_old_transactions(txn_retention);
-                    let _row_count = engine.cleanup_deleted_rows(deleted_row_retention);
-                    let _prev_version_count = engine.cleanup_old_previous_versions();
+                    if !read_only {
+                        let _txn_count = engine.cleanup_old_transactions(txn_retention);
+                        let _row_count = engine.cleanup_deleted_rows(deleted_row_retention);
+                        let _prev_version_count = engine.cleanup_old_previous_versions();
+                    }
                 }
 
-                // Auto-checkpoint using the cached interval
+                // Auto-checkpoint using the cached interval. Writer
+                // only: read-only zeroed `current_checkpoint_interval`
+                // above, so this whole block is skipped.
                 if !current_checkpoint_interval.is_zero() {
                     if let Some(ref pm) = *engine.persistence {
                         let last = pm.last_checkpoint_time();
@@ -1511,6 +1518,17 @@ impl MVCCEngine {
                             }
                         }
                     }
+                } else if read_only {
+                    // Read-only handles never run compaction, so the
+                    // writer's "eviction runs inside spawn_compaction"
+                    // hook never fires. Drive eviction directly here on
+                    // the cleanup cadence so warm volumes age out to
+                    // cold instead of pinning every loaded volume's
+                    // decompressed columns in RAM forever. Eviction is
+                    // pure RAM management (drops decompressed/
+                    // compressed columns; metadata stays via Arc) and
+                    // does not touch disk, so it is safe for read-only.
+                    engine.evict_idle_volumes();
                 }
             }
         });
