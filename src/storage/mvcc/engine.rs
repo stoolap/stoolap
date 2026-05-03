@@ -817,10 +817,7 @@ fn clear_published_completed_txns(
     let mut txn_ids = Vec::new();
     {
         let mut completed = completed_marker_txns.lock();
-        loop {
-            let Some((&marker_lsn, &txn_id)) = completed.iter().next() else {
-                break;
-            };
+        while let Some((&marker_lsn, &txn_id)) = completed.iter().next() {
             if marker_lsn > published_lsn {
                 break;
             }
@@ -3261,7 +3258,14 @@ impl MVCCEngine {
     }
 
     pub(crate) fn defer_for_live_readers(&self) -> bool {
-        if self.path.is_empty() {
+        // Memory engines have no on-disk readers/ directory and no
+        // SWMR readers attached. The path is set to "memory://" by
+        // `MVCCEngine::new` (not empty), so checking `is_empty` was
+        // not enough: on Windows `Path::new("memory://").join("readers")`
+        // is a malformed path and `live_leases` returned Err, which
+        // the fail-closed branch interpreted as "live readers may
+        // exist" -> deferred. Short-circuit on the actual sentinel.
+        if self.path.is_empty() || self.path == "memory://" {
             return false;
         }
         let max_age = self.effective_lease_max_age();
