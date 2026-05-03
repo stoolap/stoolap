@@ -823,17 +823,42 @@ In-memory DSNs (`memory://`) are not supported for `stoolap_open_read_only` (the
 
 ### Cross-Process Visibility
 
-By default each `stoolap_ro_query*` call polls the on-disk manifest epoch (one 8-byte read) and, if the writer has advanced, refreshes manifests before executing. This costs roughly 1 microsecond when nothing has changed; the manifest reload only fires after a writer checkpoint.
+Two knobs control how this handle picks up writer-side changes:
 
-For stable visibility across multiple queries (for example, inside an application-level "report" block) disable auto-refresh, run the queries, then re-enable:
+| Knob | DSN flag | Programmatic | Default |
+|------|----------|--------------|---------|
+| Auto-refresh on every query | `?auto_refresh=on/off` | `stoolap_ro_set_auto_refresh(ro, enabled)` | on |
+| Background refresh interval | `?refresh_interval=30s` | `stoolap_ro_set_refresh_interval(ro, millis)` | off |
+
+**Auto-refresh** runs inside every `stoolap_ro_query*` call: one 8-byte read of the on-disk epoch (~1µs when nothing has changed) and, if the writer has advanced, a manifest reload before executing. This is the default because it is cheap and gives every query the freshest visible state.
+
+**Refresh interval** spawns a background thread that calls `stoolap_ro_refresh()` every N milliseconds (minimum 100ms). Set this when the handle may sit idle: each query path advances the per-handle WAL pin via auto-refresh, but a handle that issues no queries pins the writer's WAL forever and blocks truncation. The ticker keeps the pin moving so the writer can recycle WAL.
+
+`auto_refresh` is the master switch for implicit refresh on this handle. When `auto_refresh=off`, both the per-query path AND the background ticker pause until you re-enable it (the ticker is not stopped, just skipped on every wake). This means `set_auto_refresh(0)` is a single-call way to freeze the snapshot for an ad-hoc multi-query stable block:
+
+| Combination | Behavior | Best for |
+|-------------|----------|----------|
+| `auto_refresh=on`, `refresh_interval=0` (defaults) | Freshest per query, no background thread. | "Always querying" workloads. |
+| `auto_refresh=on`, `refresh_interval=30s` | Freshest per query AND pin advances during idle. | Long-lived handles that may go idle (web app pools, workers). |
+| `auto_refresh=off` (any `refresh_interval`) | Snapshot frozen until `refresh()` or `set_auto_refresh(1)`. Ticker pauses; WAL pin does not advance. | Ad-hoc stable multi-query block. Keep short. |
+| Inside `BEGIN ... COMMIT` (any flags) | Ticker and per-query auto-refresh both pause until COMMIT/ROLLBACK. | Multi-statement transactions on the read-only handle. |
+
+```c
+StoolapRoDB* ro = NULL;
+stoolap_open_read_only("file:///data/mydb?refresh_interval=30s", &ro);
+/* ... or set programmatically ... */
+stoolap_ro_set_refresh_interval(ro, 30000);  /* 30s; 0 stops */
+```
+
+For a stable snapshot across multiple queries (an application-level "report" block), disable auto-refresh; both the per-query path and the ticker pause for the duration:
 
 ```c
 stoolap_ro_set_auto_refresh(ro, 0);
 /* ... run a series of queries against a stable snapshot ... */
-stoolap_ro_set_auto_refresh(ro, 1);
+stoolap_ro_set_auto_refresh(ro, 1);  /* per-query AND ticker resume */
 ```
 
-Call `stoolap_ro_refresh()` to advance manually. It returns `1` if the snapshot moved, `0` if it was already current, or `STOOLAP_ERROR` on a must-reopen condition. The latter surfaces with the typed code `STOOLAP_ERR_REOPEN_REQUIRED` and indicates the caller MUST close this handle and call `stoolap_open_read_only` again. Causes include the writer process being replaced, a checkpoint truncating the WAL window the reader was tailing, or DDL that the read-only engine cannot replay live.
+Call `stoolap_ro_refresh()` to advance manually. It returns `1` if the snapshot moved, `0` if it was already current, or `STOOLAP_ERROR` on a must-reopen condition. The latter surfaces with the typed code `STOOLAP_ERR_REOPEN_REQUIRED` and indicates the caller MUST close this handle and call `stoolap_open_read_only` again. Causes include the writer process being replaced, a checkpoint truncating the WAL window the reader was tailing, or DDL that the read-only engine cannot replay live. The same condition raised on the background ticker exits the ticker; the next user query/refresh surfaces the error.
 
 ```c
 int32_t r = stoolap_ro_refresh(ro);
@@ -877,6 +902,7 @@ Toggling `stoolap_ro_set_auto_refresh()` on one clone does not affect any other 
 | `stoolap_ro_table_count(ro, table, &count)` | `int32_t` | Snapshot row count for `table` |
 | `stoolap_ro_refresh(ro)` | `int32_t` | Advance to writer's latest visible state |
 | `stoolap_ro_set_auto_refresh(ro, enabled)` | `void` | Toggle automatic refresh on every query |
+| `stoolap_ro_set_refresh_interval(ro, millis)` | `int32_t` | Configure background refresh ticker (0 stops, min 100ms) |
 | `stoolap_ro_dsn(ro)` | `const char*` | DSN string (cached, valid for handle lifetime) |
 | `stoolap_ro_errmsg(ro)` | `const char*` | Last error message |
 | `stoolap_ro_errcode(ro)` | `int32_t` | Last error code (`STOOLAP_ERR_*`) |
@@ -1049,6 +1075,7 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 | `stoolap_ro_table_count(ro, table, &count)` | `int32_t` | Snapshot row count for `table` |
 | `stoolap_ro_refresh(ro)` | `int32_t` | Advance to writer's latest visible state |
 | `stoolap_ro_set_auto_refresh(ro, enabled)` | `void` | Toggle automatic refresh on every query |
+| `stoolap_ro_set_refresh_interval(ro, millis)` | `int32_t` | Configure background refresh ticker (0 stops, min 100ms) |
 | `stoolap_ro_dsn(ro)` | `const char*` | DSN string (cached for handle lifetime) |
 | `stoolap_ro_errmsg(ro)` | `const char*` | Last error message |
 | `stoolap_ro_errcode(ro)` | `int32_t` | Last error code (`STOOLAP_ERR_*`) |

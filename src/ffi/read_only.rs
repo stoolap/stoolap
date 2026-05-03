@@ -377,6 +377,56 @@ pub unsafe extern "C" fn stoolap_ro_set_auto_refresh(db: *mut StoolapRoDB, enabl
     }
 }
 
+/// Configure (or stop) the background refresh ticker.
+///
+/// `interval_millis == 0` stops any active ticker. `interval_millis > 0`
+/// (re)starts the ticker at that cadence. Minimum 100ms; smaller values
+/// are rejected with `STOOLAP_ERR_INVALID_ARGUMENT`.
+///
+/// Use this when the handle may sit idle for long stretches: each
+/// query path normally advances the per-handle WAL pin via
+/// auto-refresh, but a handle with no queries pins the writer's WAL
+/// forever and blocks truncation. The ticker keeps the pin moving.
+///
+/// On a must-reopen condition raised by the ticker, the ticker exits;
+/// the next user query/refresh surfaces the same error so the caller
+/// knows to reopen the handle.
+///
+/// # Safety
+///
+/// `db` must be a valid `StoolapRoDB` pointer.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_ro_set_refresh_interval(
+    db: *mut StoolapRoDB,
+    interval_millis: u64,
+) -> i32 {
+    let handle = match db.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error.clear();
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let interval = if interval_millis == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_millis(interval_millis))
+        };
+        match handle.ro.set_refresh_interval(interval) {
+            Ok(()) => STOOLAP_OK,
+            Err(e) => {
+                handle.set_error_from(&e);
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_ro_set_refresh_interval");
+        STOOLAP_ERROR
+    })
+}
+
 /// Query without parameters.
 ///
 /// # Safety

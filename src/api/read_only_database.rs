@@ -93,7 +93,9 @@
 //! `ReadOnlyDatabase` directly.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::thread::{JoinHandle, ThreadId};
+use std::time::Duration;
 
 use crate::core::{Error, Result};
 use crate::executor::Executor;
@@ -104,6 +106,212 @@ use crate::storage::traits::Engine;
 use super::database::EngineEntry;
 use super::params::Params;
 use super::rows::Rows;
+
+/// Minimum allowed `refresh_interval`. Tighter intervals waste CPU on
+/// kernel sleep+wake cycles for no real benefit (the refresh check
+/// itself is ~1µs); callers wanting sub-100ms cadence should drive
+/// `refresh()` from their own loop.
+const MIN_REFRESH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// State shared between a `ReadOnlyDatabaseInner` and its background
+/// refresh ticker. Owned by the inner via the `Mutex<Option<...>>`
+/// in `refresh_ticker`; the ticker holds an `Arc` clone of `stop`.
+struct RefreshTickerHandle {
+    /// `(want_stop, condvar)`. `set_refresh_interval(None)` and
+    /// `Drop` set `want_stop = true` and `notify_all` so the ticker
+    /// exits within microseconds instead of sleeping out the
+    /// remaining interval. The ticker checks `want_stop` on every
+    /// wake.
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    /// Joined by `set_refresh_interval`/`Drop`. Always `Some` after
+    /// construction; `Option` only so we can `take()` to satisfy
+    /// `JoinHandle::join`'s by-value receiver.
+    join: Option<JoinHandle<()>>,
+    /// Identity of the ticker thread, captured at spawn time. Used
+    /// by `shutdown` to detect the self-shutdown race: when the
+    /// last user `Arc<ReadOnlyDatabase>` drops while the ticker
+    /// has briefly upgraded its `Weak<Inner>` into a strong Arc
+    /// (the temporary `ReadOnlyDatabase` wrapper inside
+    /// `run_refresh_ticker`), `Inner::drop` runs on the ticker
+    /// thread itself. Calling `JoinHandle::join` on our own thread
+    /// would block forever (the OS reports `Resource deadlock
+    /// avoided`); detect this and detach instead.
+    thread_id: ThreadId,
+}
+
+impl RefreshTickerHandle {
+    /// Signal the ticker to exit and reap it.
+    ///
+    /// Idempotent: a second call is a no-op (`join` is already
+    /// `None`).
+    ///
+    /// Safe from ANY thread, including the ticker thread itself —
+    /// the ticker-thread case detaches (drops the `JoinHandle`)
+    /// instead of joining, since joining one's own thread
+    /// deadlocks. The detached thread runs at most one more
+    /// trip through its loop top: the next `weak.upgrade()`
+    /// returns `None` (we're already inside `Inner::drop`, so the
+    /// strong count just hit zero) and the closure returns. Net
+    /// result is the same as a join, minus the deadlock.
+    fn shutdown(&mut self) {
+        {
+            let mut want_stop = self.stop.0.lock().expect("ticker stop mutex poisoned");
+            *want_stop = true;
+            self.stop.1.notify_all();
+        }
+        if let Some(join) = self.join.take() {
+            if std::thread::current().id() == self.thread_id {
+                // Self-shutdown: detach. See field doc on
+                // `thread_id` for the race that lands us here.
+                drop(join);
+            } else {
+                // Ticker thread never panics — it catches refresh()
+                // errors and either retries or exits cleanly. A
+                // panic here would indicate a bug in the ticker
+                // body.
+                let _ = join.join();
+            }
+        }
+    }
+}
+
+impl Drop for RefreshTickerHandle {
+    fn drop(&mut self) {
+        // Defense in depth: if a code path forgets to call shutdown()
+        // explicitly, dropping the handle still joins the ticker.
+        self.shutdown();
+    }
+}
+
+/// Body of the background refresh ticker thread.
+///
+/// Wakes every `interval` (or earlier on shutdown signal), upgrades
+/// the `Weak<ReadOnlyDatabaseInner>`, checks for an active executor
+/// transaction (mirrors the `BEGIN`-pin guard in
+/// `maybe_auto_refresh`), and calls `refresh()` to advance the
+/// per-handle WAL pin. Exits when:
+///   - `*stop.0 == true` (caller asked us to stop), OR
+///   - `weak.upgrade()` returns `None` (the handle was dropped
+///     before our `RefreshTickerHandle::shutdown` ran), OR
+///   - `refresh()` returns a must-reopen error — re-running would
+///     return the same error every tick, and the next user query
+///     will surface it on its own.
+///
+/// Transient refresh errors (I/O blips, etc.) are swallowed: the
+/// next user query will retry through `maybe_auto_refresh` anyway.
+///
+/// **Skip conditions** — the ticker checks these on every wake
+/// and skips the refresh (without stopping) when any holds:
+/// - `auto_refresh == false`: the user has explicitly asked for
+///   no implicit refresh on this handle. The promise covers BOTH
+///   per-query and background paths; ignoring it here would
+///   silently violate `set_auto_refresh(false)`'s contract.
+///   Re-enabling resumes the ticker without a fresh
+///   `set_refresh_interval` call.
+/// - Active executor `BEGIN`: refreshing mid-transaction would
+///   break the stable-reads-across-statements contract that
+///   `maybe_auto_refresh` already enforces on the per-query
+///   path.
+///
+/// Both conditions stall WAL-pin advancement for their duration —
+/// long `BEGIN` blocks or extended `auto_refresh=false` windows
+/// trade pin freshness for stable visibility, by design.
+fn run_refresh_ticker(
+    weak: Weak<ReadOnlyDatabaseInner>,
+    interval: Duration,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+) {
+    loop {
+        // Sleep until either the interval elapses or shutdown is
+        // signalled. `wait_timeout_while` returns when the closure
+        // returns false OR the timeout fires, so we wake exactly
+        // once per interval and immediately on shutdown.
+        let mut want_stop = match stop.0.lock() {
+            Ok(g) => g,
+            // Poisoned mutex means the writer thread that set
+            // want_stop panicked. Treat as "stop now" — safer to
+            // exit than to keep refreshing against possibly-
+            // corrupted shared state.
+            Err(_) => return,
+        };
+        let result = stop.1.wait_timeout_while(want_stop, interval, |s| !*s);
+        want_stop = match result {
+            Ok((g, _)) => g,
+            Err(_) => return,
+        };
+        if *want_stop {
+            return;
+        }
+        drop(want_stop);
+
+        let inner = match weak.upgrade() {
+            Some(i) => i,
+            None => return,
+        };
+        // Wrap the upgraded Arc into a temporary `ReadOnlyDatabase`
+        // so the existing `refresh()` impl on `ReadOnlyDatabase`
+        // (which owns the per-handle state through `Deref`) is
+        // reachable. The temporary drops at end-of-iteration; the
+        // user's handle still owns the inner via its own Arc.
+        let temp = ReadOnlyDatabase { inner };
+        // Hold the refresh fence across the entire iteration body
+        // (auto_refresh check + executor probe + refresh()). This
+        // turns `set_auto_refresh(false)` into a synchronous
+        // fence: that call acquires the same mutex briefly, so
+        // when it returns no in-flight ticker iteration is mid-
+        // refresh and the next iteration will observe the new
+        // flag. Without the fence the ticker could pass its
+        // auto_refresh check, block on the executor lock behind a
+        // long query, and then complete the refresh AFTER
+        // `set_auto_refresh(false)` had returned — silently
+        // violating the documented contract.
+        let _refresh_fence = match temp.refresh_fence.lock() {
+            Ok(g) => g,
+            // Poisoned fence means a previous iteration panicked
+            // (shouldn't happen — refresh swallows errors). Bail
+            // rather than spin.
+            Err(_) => return,
+        };
+        // `auto_refresh` guard: when the user disables auto-refresh
+        // they're asking for "no implicit refresh on this handle"
+        // — that promise covers BOTH the per-query path and the
+        // background ticker. Skip this tick; we do NOT stop the
+        // ticker, so a later `set_auto_refresh(true)` resumes it
+        // without needing a fresh `set_refresh_interval` call.
+        if !temp.auto_refresh.load(Ordering::Acquire) {
+            continue;
+        }
+        // BEGIN-pin guard: if the executor is mid-transaction,
+        // skip this tick. `maybe_auto_refresh` enforces the same
+        // guard on the per-query path; not enforcing it here would
+        // let the ticker silently advance the snapshot inside a
+        // user's BEGIN/COMMIT block. The lock is brief — single
+        // mutex check on the executor.
+        if let Ok(executor) = temp.executor.lock() {
+            if executor.has_active_transaction() {
+                continue;
+            }
+        }
+        match temp.refresh() {
+            Ok(_) => {}
+            // Must-reopen errors are sticky on the inner
+            // (`swmr_must_reopen_summary`) or re-checked from disk
+            // every refresh. Either way, calling refresh again
+            // returns the same error. Exit so we don't burn CPU
+            // raising the same condition every interval.
+            Err(Error::SwmrPendingDdl(_))
+            | Err(Error::SwmrWriterReincarnated { .. })
+            | Err(Error::SwmrSnapshotExpired { .. })
+            | Err(Error::SwmrPartialReload(_))
+            | Err(Error::SchemaChanged(_)) => return,
+            // Transient I/O / overlay-apply / lock-acquire errors:
+            // the user-driven `maybe_auto_refresh` swallows the
+            // same class of errors and advances on next query, so
+            // we mirror that behaviour and try again next tick.
+            Err(_) => {}
+        }
+    }
+}
 
 /// Read-only handle over a database.
 ///
@@ -173,11 +381,12 @@ use super::rows::Rows;
 /// the owning handle observes — both surfaces advance the same
 /// pin / overlay / epoch.
 ///
-/// Lifecycle: this inner struct does NOT have a `Drop` impl.
-/// Pin release runs via `ReaderAttachment::Drop` (when the last
-/// `Arc<ReaderAttachment>` drops) OR via an explicit
+/// Lifecycle: this inner struct has a minimal `Drop` impl that only
+/// joins the background refresh ticker (if `refresh_interval` is
+/// set). Pin release still runs via `ReaderAttachment::Drop` (when
+/// the last `Arc<ReaderAttachment>` drops) OR via an explicit
 /// `attachment.detach()` from `ReadOnlyDatabase::close` /
-/// `Database::close` (idempotent). Engine close runs via
+/// `Database::close` (idempotent). Engine close still runs via
 /// `EngineEntry::Drop` (when the last `Arc<EngineEntry>` drops).
 ///
 /// `pub` (not `pub(crate)`) only because it appears in the
@@ -271,6 +480,57 @@ pub struct ReadOnlyDatabaseInner {
     /// One mutex serializes refresh on a single handle, but the
     /// common case is one user per handle so contention is minimal.
     swmr_overlay_state_lock: Mutex<()>,
+    /// Background refresh ticker handle, if a non-zero
+    /// `refresh_interval` was requested at open or via
+    /// `set_refresh_interval`. The ticker calls `refresh()` every
+    /// interval to keep the WAL pin advancing for handles that
+    /// don't query frequently — without it, an idle reader pins
+    /// the writer's WAL forever and blocks truncation.
+    ///
+    /// `None` = no background refresh (caller drives `refresh()`
+    /// or relies on per-query `auto_refresh`).
+    ///
+    /// Mutex (not lock-free) because flipping it spawns/joins a
+    /// thread. Held briefly by `set_refresh_interval` and `Drop`.
+    refresh_ticker: Mutex<Option<RefreshTickerHandle>>,
+    /// Mirror of the interval the ticker is currently running at,
+    /// readable without joining the ticker. `None` when no ticker
+    /// is active. Updated under `refresh_ticker`'s lock.
+    refresh_interval: Mutex<Option<Duration>>,
+    /// Synchronous fence between `set_auto_refresh(false)` and
+    /// in-flight ticker iterations. The ticker holds this for the
+    /// duration of each iteration's auto_refresh check + executor
+    /// check + `refresh()` call. `set_auto_refresh(false)` acquires
+    /// it briefly before storing the flag, which guarantees the
+    /// post-return contract "no further implicit refresh on this
+    /// handle" — any iteration that was past its initial
+    /// auto_refresh check before the call is allowed to complete,
+    /// and the flag store is observed by every iteration that
+    /// starts afterwards.
+    ///
+    /// Per-query auto-refresh is NOT gated by this fence: the
+    /// per-query path runs synchronously on the caller's thread,
+    /// so the handle's documented "do not share across threads"
+    /// rule already provides happens-before ordering between
+    /// `set_auto_refresh` and the next query's auto-refresh check.
+    /// The fence exists specifically because the ticker runs on
+    /// its own thread by design.
+    refresh_fence: Mutex<()>,
+}
+
+impl Drop for ReadOnlyDatabaseInner {
+    fn drop(&mut self) {
+        // Stop the background ticker (if any) so it doesn't outlive
+        // the inner. The ticker holds a `Weak<Self>` so it can't
+        // keep us alive, but a still-sleeping ticker would leak the
+        // OS thread until its next tick. shutdown() wakes it
+        // immediately via the condvar.
+        if let Ok(mut guard) = self.refresh_ticker.lock() {
+            if let Some(mut handle) = guard.take() {
+                handle.shutdown();
+            }
+        }
+    }
 }
 
 /// Read-only handle to a database opened via
@@ -393,6 +653,9 @@ impl ReadOnlyDatabase {
                 // See `swmr_overlay_enabled` field doc.
                 swmr_overlay_enabled: AtomicBool::new(false),
                 swmr_overlay_state_lock: Mutex::new(()),
+                refresh_ticker: Mutex::new(None),
+                refresh_interval: Mutex::new(None),
+                refresh_fence: Mutex::new(()),
             }),
         }
     }
@@ -417,7 +680,26 @@ impl ReadOnlyDatabase {
     /// Mirrors [`crate::api::Database::clone`] for writable
     /// handles.
     pub fn try_clone(&self) -> Self {
-        Self::from_entry(Arc::clone(&self.inner.entry))
+        let cloned = Self::from_entry(Arc::clone(&self.inner.entry));
+        // Mirror the parent's per-handle config onto the clone so
+        // workers spawned via `try_clone` inherit "open with these
+        // flags" semantics from the parent's DSN. Each clone gets
+        // its OWN ticker (per-attachment WAL pin needs its own
+        // driver) at the same interval; auto_refresh is a per-handle
+        // flag and must be copied explicitly.
+        cloned.set_auto_refresh(self.auto_refresh_enabled());
+        if let Some(d) = self.refresh_interval() {
+            // Spawn ignores errors from a re-spawn at the same
+            // interval (it joins the absent ticker first); the
+            // only real failure mode here is OS thread-spawn
+            // refusal, which is fatal enough to surface as a
+            // panic below — drivers expect `clone` to be
+            // infallible.
+            cloned
+                .set_refresh_interval(Some(d))
+                .expect("clone failed to spawn refresh ticker");
+        }
+        cloned
     }
 }
 
@@ -650,7 +932,7 @@ impl ReadOnlyDatabase {
         self.attachment.advance_pin(pin);
     }
 
-    /// Toggle automatic refresh on every query.
+    /// Toggle implicit refresh on this handle.
     ///
     /// Default is `true`: each `query` / `query_named` / `query_plan` /
     /// `query_named_plan` call polls the on-disk manifest epoch (one
@@ -659,14 +941,42 @@ impl ReadOnlyDatabase {
     /// changed; the reload only happens after the writer checkpoints.
     ///
     /// Set to `false` when you need stable visibility across multiple
-    /// queries — for example, inside a `BEGIN ... COMMIT` block on this
-    /// read-only handle, or while iterating multiple `Rows` cursors that
-    /// must agree on the same snapshot. Call `refresh()` manually when
-    /// you want to advance.
+    /// queries — for example, while iterating multiple `Rows` cursors
+    /// that must agree on the same snapshot. Call `refresh()` manually
+    /// when you want to advance.
+    ///
+    /// **Disables both implicit-refresh paths.** When `false`:
+    /// - the per-query auto-refresh path skips, AND
+    /// - the background `refresh_interval` ticker (if any) pauses.
+    ///
+    /// Together these guarantee the snapshot moves only when the
+    /// caller explicitly calls `refresh()`. Re-enabling resumes both
+    /// paths without a fresh `set_refresh_interval` call. WAL pin
+    /// advancement also stalls for the duration; keep stable
+    /// windows short or fall back to a `BEGIN ... COMMIT` block.
     ///
     /// This is a per-handle setting; sibling `ReadOnlyDatabase` handles
     /// over the same DSN have independent flags.
     pub fn set_auto_refresh(&self, enabled: bool) {
+        // Disable case: synchronously fence in-flight ticker
+        // iterations. Acquiring `refresh_fence` blocks until any
+        // ticker iteration that is past its initial auto_refresh
+        // check (and possibly mid-`refresh()`) completes. With the
+        // store happening while we hold the fence, every
+        // subsequent ticker iteration acquires the same mutex and
+        // observes the new flag value via the load INSIDE the
+        // fence. Net effect: no implicit refresh starts after
+        // this call returns.
+        //
+        // Enable case: no fence needed — re-enabling can race
+        // freely with the ticker. The next iteration will see
+        // `true` and proceed normally; an iteration that already
+        // saw `false` and skipped is harmless.
+        let _fence = if !enabled {
+            self.refresh_fence.lock().ok()
+        } else {
+            None
+        };
         self.auto_refresh.store(enabled, Ordering::Release);
     }
 
@@ -674,6 +984,107 @@ impl ReadOnlyDatabase {
     /// [`set_auto_refresh`].
     pub fn auto_refresh_enabled(&self) -> bool {
         self.auto_refresh.load(Ordering::Acquire)
+    }
+
+    /// Test-only accessor for the per-handle `last_seen_epoch`,
+    /// used to verify that the background refresh ticker actually
+    /// advances the snapshot for an idle handle (no queries).
+    #[doc(hidden)]
+    pub fn last_seen_epoch_for_test(&self) -> u64 {
+        self.last_seen_epoch.load(Ordering::Acquire)
+    }
+
+    /// Configure (or stop) the background refresh ticker.
+    ///
+    /// `Some(d)` spawns (or replaces) a background thread that calls
+    /// [`Self::refresh`] every `d`. Use this when the handle may sit
+    /// idle for long stretches: each query path normally advances the
+    /// per-handle WAL pin via auto-refresh, but a handle with no
+    /// queries pins the writer's WAL forever and blocks truncation.
+    /// The ticker keeps the pin moving so the writer can recycle WAL.
+    ///
+    /// `None` stops any currently-running ticker. Idempotent.
+    ///
+    /// `d` must be at least 100ms (`MIN_REFRESH_INTERVAL`); tighter
+    /// cadences waste CPU on kernel sleep+wake cycles for no real
+    /// gain. Callers wanting sub-100ms cadence should drive
+    /// [`Self::refresh`] from their own loop.
+    ///
+    /// Replacing an existing interval joins the old ticker before
+    /// spawning the new one; the new ticker uses the new interval
+    /// from its very first sleep.
+    ///
+    /// **Paused while `auto_refresh` is `false` or a `BEGIN` is
+    /// active**: the ticker's purpose is to advance the snapshot for
+    /// idle handles, but those two states are explicit signals that
+    /// the caller wants stable visibility. The ticker checks both
+    /// on every wake and skips (does not exit) until the condition
+    /// clears. See [`Self::set_auto_refresh`] for the full
+    /// implicit-refresh contract.
+    ///
+    /// On a must-reopen error (`SwmrPendingDdl`,
+    /// `SwmrWriterReincarnated`, `SwmrSnapshotExpired`,
+    /// `SwmrPartialReload`) the ticker exits and does not respawn —
+    /// the next user-driven `query` / `refresh` surfaces the same
+    /// error so the caller knows to reopen the handle.
+    pub fn set_refresh_interval(&self, interval: Option<Duration>) -> Result<()> {
+        if let Some(d) = interval {
+            if d < MIN_REFRESH_INTERVAL {
+                return Err(Error::invalid_argument(format!(
+                    "refresh_interval must be at least {}ms (got {}ms); for tighter \
+                     cadence, drive refresh() from your own loop",
+                    MIN_REFRESH_INTERVAL.as_millis(),
+                    d.as_millis()
+                )));
+            }
+        }
+
+        let mut ticker_guard = self
+            .refresh_ticker
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("refresh_ticker".to_string()))?;
+        let mut interval_guard = self
+            .refresh_interval
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("refresh_interval".to_string()))?;
+
+        // Always join the existing ticker first. Even if we're about
+        // to spawn a new one at the same interval, joining ensures
+        // the old thread is gone before we start the new one (no
+        // double-tick window, no leak if shutdown panics).
+        if let Some(mut handle) = ticker_guard.take() {
+            handle.shutdown();
+        }
+        *interval_guard = None;
+
+        let Some(d) = interval else {
+            return Ok(());
+        };
+
+        let stop = Arc::new((Mutex::new(false), Condvar::new()));
+        let stop_for_thread = Arc::clone(&stop);
+        let weak_inner = Arc::downgrade(&self.inner);
+        let join = std::thread::Builder::new()
+            .name("stoolap-ro-refresh".to_string())
+            .spawn(move || run_refresh_ticker(weak_inner, d, stop_for_thread))
+            .map_err(|e| {
+                Error::internal(format!("failed to spawn refresh ticker thread: {}", e))
+            })?;
+        let thread_id = join.thread().id();
+
+        *ticker_guard = Some(RefreshTickerHandle {
+            stop,
+            join: Some(join),
+            thread_id,
+        });
+        *interval_guard = Some(d);
+        Ok(())
+    }
+
+    /// Returns the current refresh interval, or `None` if no
+    /// background ticker is running.
+    pub fn refresh_interval(&self) -> Option<Duration> {
+        self.refresh_interval.lock().ok().and_then(|g| *g)
     }
 
     /// Cheap auto-refresh hook called from every query path. Skips when

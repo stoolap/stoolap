@@ -45,6 +45,7 @@
 
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use crate::core::{DataType, Error, IsolationLevel, Result, Value};
 use crate::executor::context::ExecutionContextBuilder;
@@ -60,6 +61,45 @@ use super::transaction::Transaction;
 /// Storage scheme constants
 pub const MEMORY_SCHEME: &str = "memory";
 pub const FILE_SCHEME: &str = "file";
+
+/// Parse a `refresh_interval` value like `"30s"`, `"500ms"`, `"1m"`,
+/// or `"0"` (special: no unit allowed for zero, means "disabled").
+///
+/// Used by `Database::dsn_refresh_interval_flag`. Free function (not
+/// a method) so the parser stays close to its sole caller and is
+/// directly unit-testable. Rejects unitless non-zero numbers,
+/// unknown units, negatives (caught by `u64::parse`), and overflow.
+pub(crate) fn parse_refresh_interval_value(value: &str) -> Result<Duration> {
+    let trimmed = value.trim();
+    if trimmed == "0" {
+        return Ok(Duration::ZERO);
+    }
+    let (num_str, multiplier_ms): (&str, u64) = if let Some(rest) = trimmed.strip_suffix("ms") {
+        (rest, 1)
+    } else if let Some(rest) = trimmed.strip_suffix('s') {
+        (rest, 1_000)
+    } else if let Some(rest) = trimmed.strip_suffix('m') {
+        (rest, 60_000)
+    } else {
+        return Err(Error::invalid_argument(format!(
+            "invalid refresh_interval: '{}' (expected 'Nms', 'Ns', 'Nm', or '0')",
+            value
+        )));
+    };
+    let n: u64 = num_str.parse().map_err(|_| {
+        Error::invalid_argument(format!(
+            "invalid refresh_interval: '{}' (numeric portion not a non-negative integer)",
+            value
+        ))
+    })?;
+    let total_ms = n.checked_mul(multiplier_ms).ok_or_else(|| {
+        Error::invalid_argument(format!(
+            "invalid refresh_interval: '{}' overflows u64 milliseconds",
+            value
+        ))
+    })?;
+    Ok(Duration::from_millis(total_ms))
+}
 
 /// Global database registry to ensure single instance per DSN.
 ///
@@ -1182,6 +1222,27 @@ impl Database {
             ));
         }
 
+        // Parse `auto_refresh` and `refresh_interval` once, up front,
+        // so the parse error surfaces before any registry / engine
+        // work and the flags are uniformly applied to both the
+        // cache-hit and fresh-create paths below. `Duration::ZERO`
+        // means "explicitly disabled" (no background ticker); `None`
+        // means "absent from DSN, leave the per-handle default".
+        let dsn_auto_refresh = Self::dsn_auto_refresh_flag(dsn)?;
+        let dsn_refresh_interval = Self::dsn_refresh_interval_flag(dsn)?;
+        let apply_dsn_flags =
+            |ro: crate::api::ReadOnlyDatabase| -> Result<crate::api::ReadOnlyDatabase> {
+                if let Some(enabled) = dsn_auto_refresh {
+                    ro.set_auto_refresh(enabled);
+                }
+                if let Some(d) = dsn_refresh_interval {
+                    if !d.is_zero() {
+                        ro.set_refresh_interval(Some(d))?;
+                    }
+                }
+                Ok(ro)
+            };
+
         // If the DSN is already open in this process (writable or
         // read-only), share the existing engine entry — but ONLY
         // when ALL of:
@@ -1260,7 +1321,7 @@ impl Database {
             if let Some(weak) = registry.get(dsn) {
                 if let Some(entry) = weak.upgrade() {
                     if cached_is_writable(&entry) || frontier_static(&entry) {
-                        return Ok(crate::api::ReadOnlyDatabase::from_entry(entry));
+                        return apply_dsn_flags(crate::api::ReadOnlyDatabase::from_entry(entry));
                     }
                     // Frontier moved — fall through to fresh-create.
                     // Existing handles keep their Arc<EngineEntry>;
@@ -1280,7 +1341,7 @@ impl Database {
         if let Some(weak) = registry.get(dsn) {
             if let Some(entry) = weak.upgrade() {
                 if cached_is_writable(&entry) || frontier_static(&entry) {
-                    return Ok(crate::api::ReadOnlyDatabase::from_entry(entry));
+                    return apply_dsn_flags(crate::api::ReadOnlyDatabase::from_entry(entry));
                 }
                 // Frontier moved — fall through.
             }
@@ -1499,7 +1560,7 @@ impl Database {
         if let Some(ref l) = entry.lease {
             l.remove_handle_pin(pre_acquire_pin_handle_id);
         }
-        Ok(ro_db)
+        apply_dsn_flags(ro_db)
     }
 
     /// Return a read-only view over this database.
@@ -1614,6 +1675,59 @@ impl Database {
     /// substring checks against the whole DSN would catch
     /// `mode=` / `read_only=` inside file paths or unrelated
     /// query values.
+    /// Parse `auto_refresh=on/off/true/false/1/0/yes/no` from the DSN
+    /// query string. Returns `Ok(None)` when the key is absent so
+    /// callers can apply their own default. Same last-flag-wins
+    /// semantics as `dsn_read_only_flag`.
+    pub(crate) fn dsn_auto_refresh_flag(dsn: &str) -> Result<Option<bool>> {
+        let query = match dsn.find('?') {
+            Some(idx) => &dsn[idx + 1..],
+            None => return Ok(None),
+        };
+        let mut last: Option<bool> = None;
+        for param in query.split('&') {
+            let mut parts = param.splitn(2, '=');
+            let key = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("");
+            if key == "auto_refresh" {
+                last = Some(match value.to_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => true,
+                    "false" | "0" | "no" | "off" => false,
+                    _ => {
+                        return Err(Error::invalid_argument(format!(
+                            "invalid auto_refresh: '{}' (expected true/false/on/off)",
+                            value
+                        )))
+                    }
+                });
+            }
+        }
+        Ok(last)
+    }
+
+    /// Parse `refresh_interval=Nms|Ns|Nm|0` from the DSN query
+    /// string. Returns `Ok(None)` when the key is absent. `0` (with
+    /// or without unit) means "no background ticker" and is
+    /// returned as `Ok(Some(Duration::ZERO))` so callers can
+    /// distinguish "explicitly disabled" from "unset". Last-flag-
+    /// wins semantics; rejects unitless numbers and unknown units.
+    pub(crate) fn dsn_refresh_interval_flag(dsn: &str) -> Result<Option<Duration>> {
+        let query = match dsn.find('?') {
+            Some(idx) => &dsn[idx + 1..],
+            None => return Ok(None),
+        };
+        let mut last: Option<Duration> = None;
+        for param in query.split('&') {
+            let mut parts = param.splitn(2, '=');
+            let key = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("");
+            if key == "refresh_interval" {
+                last = Some(parse_refresh_interval_value(value)?);
+            }
+        }
+        Ok(last)
+    }
+
     fn dsn_read_only_flag(dsn: &str) -> Result<Option<bool>> {
         let query = match dsn.find('?') {
             Some(idx) => &dsn[idx + 1..],

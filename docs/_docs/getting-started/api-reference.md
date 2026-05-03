@@ -718,8 +718,11 @@ For prepared-statement ergonomics, use `cached_plan(sql)` plus `query_plan` / `q
 | `is_read_only()` | `bool` | Always `true`. |
 | `table_exists(name)` | `Result<bool>` | Check if a table exists |
 | `refresh()` | `Result<bool>` | Force a manifest reload + WAL tail; returns `true` if state advanced |
-| `set_auto_refresh(enabled)` | `()` | Toggle the per-query auto-refresh. Disable for stable cross-query snapshots inside a SQL `BEGIN ... COMMIT`. |
+| `set_auto_refresh(enabled)` | `()` | Master switch for implicit refresh. `false` pauses BOTH the per-query auto-refresh path AND the background ticker (if any) — the snapshot only moves on explicit `refresh()`. WAL pin advancement also stalls; keep stable windows short. |
 | `auto_refresh_enabled()` | `bool` | Read the auto-refresh flag |
+| `set_refresh_interval(Option<Duration>)` | `Result<()>` | Configure the background refresh ticker. `Some(d)` spawns a thread calling `refresh()` every `d` (min 100ms); `None` stops it. Use for idle handles so the WAL pin advances. Pauses while `auto_refresh=false` or a `BEGIN` is active. Equivalent DSN flag: `?refresh_interval=30s`. |
+| `refresh_interval()` | `Option<Duration>` | Currently configured ticker interval, or `None` if no ticker is running. |
+| `try_clone()` | `Self` | Clone for multi-threaded use. Each clone has its own executor, WAL pin, auto_refresh flag, and ticker (inherits parent's interval). |
 | `set_swmr_overlay_enabled(enabled)` | `Result<()>` | Opt into per-row WAL-tail materialization. Off by default; DDL detection is always on. |
 | `swmr_overlay_enabled()` | `bool` | Whether overlay materialization is enabled |
 | `read_engine()` | `Arc<dyn ReadEngine>` | Get the underlying read engine for libraries accepting `&dyn ReadEngine` |

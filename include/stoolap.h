@@ -776,6 +776,27 @@ int32_t      stoolap_ro_refresh        (StoolapRoDB* db);
  */
 void         stoolap_ro_set_auto_refresh(StoolapRoDB* db, int32_t enabled);
 
+/**
+ * Configure (or stop) the background refresh ticker.
+ *
+ * `interval_millis == 0` stops any active ticker. `interval_millis > 0`
+ * (re)starts the ticker at that cadence. Minimum 100ms; smaller values
+ * are rejected with STOOLAP_ERR_INVALID_ARGUMENT.
+ *
+ * The ticker advances the per-handle WAL pin even when no queries are
+ * being issued, so an idle reader does not block the writer's WAL
+ * truncation. Most apps doing constant queries leave this unset; long-
+ * lived report handles or worker pools that go idle should set it
+ * (typical 30s / 60s).
+ *
+ * On a must-reopen condition raised by the ticker, the ticker exits;
+ * the next user query/refresh surfaces the same error so the caller
+ * can close and reopen the handle.
+ *
+ * Equivalent DSN flag: `?refresh_interval=30s` at open time.
+ */
+int32_t      stoolap_ro_set_refresh_interval(StoolapRoDB* db, uint64_t interval_millis);
+
 int32_t      stoolap_ro_query          (StoolapRoDB* db, const char* sql, StoolapRows** out_rows);
 int32_t      stoolap_ro_query_params   (StoolapRoDB* db, const char* sql,
                                          const StoolapValue* params, int32_t params_len,
