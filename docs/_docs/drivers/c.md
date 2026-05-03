@@ -823,14 +823,16 @@ In-memory DSNs (`memory://`) are not supported for `stoolap_open_read_only` (the
 
 ### Cross-Process Visibility
 
-Two knobs control how this handle picks up writer-side changes:
+**Visibility is checkpoint-bounded.** A read-only handle sees writer state as of the writer's most recent checkpoint. Commits the writer has accepted but not yet checkpointed (rows still in the writer's hot buffer + WAL tail) are NOT visible to this handle. To make a commit visible across processes, the writer must run `PRAGMA CHECKPOINT` (or wait for the periodic background checkpoint at `checkpoint_interval`, default 60s). The WAL-tail overlay infrastructure exists on the read-only side but is not yet wired into query execution; sub-checkpoint visibility ships in a follow-up phase.
+
+Two knobs control how this handle picks up writer-side **checkpoint** advances:
 
 | Knob | DSN flag | Programmatic | Default |
 |------|----------|--------------|---------|
 | Auto-refresh on every query | `?auto_refresh=on/off` | `stoolap_ro_set_auto_refresh(ro, enabled)` | on |
 | Background refresh interval | `?refresh_interval=30s` | `stoolap_ro_set_refresh_interval(ro, millis)` | off |
 
-**Auto-refresh** runs inside every `stoolap_ro_query*` call: one 8-byte read of the on-disk epoch (~1µs when nothing has changed) and, if the writer has advanced, a manifest reload before executing. This is the default because it is cheap and gives every query the freshest visible state.
+**Auto-refresh** runs inside every `stoolap_ro_query*` call: one 8-byte read of the on-disk epoch (~1µs when nothing has changed) and, if the writer has checkpointed since the last query, a manifest reload before executing. This is the default because it is cheap and gives every query the freshest checkpointed state.
 
 **Refresh interval** spawns a background thread that calls `stoolap_ro_refresh()` every N milliseconds (minimum 100ms). Set this when the handle may sit idle: each query path advances the per-handle WAL pin via auto-refresh, but a handle that issues no queries pins the writer's WAL forever and blocks truncation. The ticker keeps the pin moving so the writer can recycle WAL.
 
@@ -838,10 +840,12 @@ Two knobs control how this handle picks up writer-side changes:
 
 | Combination | Behavior | Best for |
 |-------------|----------|----------|
-| `auto_refresh=on`, `refresh_interval=0` (defaults) | Freshest per query, no background thread. | "Always querying" workloads. |
-| `auto_refresh=on`, `refresh_interval=30s` | Freshest per query AND pin advances during idle. | Long-lived handles that may go idle (web app pools, workers). |
+| `auto_refresh=on`, `refresh_interval=0` (defaults) | Per query: pick up the writer's latest checkpoint. No background thread. | "Always querying" workloads. |
+| `auto_refresh=on`, `refresh_interval=30s` | Per query: pick up latest checkpoint AND pin advances during idle. | Long-lived handles that may go idle (web app pools, workers). |
 | `auto_refresh=off` (any `refresh_interval`) | Snapshot frozen until `refresh()` or `set_auto_refresh(1)`. Ticker pauses; WAL pin does not advance. | Ad-hoc stable multi-query block. Keep short. |
 | Inside `BEGIN ... COMMIT` (any flags) | Ticker and per-query auto-refresh both pause until COMMIT/ROLLBACK. | Multi-statement transactions on the read-only handle. |
+
+All three "per query: pick up..." rows still mean **checkpointed** state only. To make a writer commit visible across processes, the writer must checkpoint.
 
 ```c
 StoolapRoDB* ro = NULL;

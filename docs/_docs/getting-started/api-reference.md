@@ -703,7 +703,9 @@ Returned by `Database::open_read_only(dsn)` and `Database::as_read_only()`. The 
 
 `ReadOnlyDatabase` is a *view*, not a connection sharing a session with the source `Database`. Each handle owns its own executor and transaction state, so an uncommitted `BEGIN` on the source `Database` is **not** visible through `as_read_only()`. To observe uncommitted writes, run the read SQL inside the same `Transaction`.
 
-For cross-process readers (`Database::open_read_only` against a `file://` DSN), the handle picks up writer checkpoints via the manifest-epoch poll AND tails the WAL for sub-checkpoint commits. Typed must-reopen errors (`Error::SwmrPendingDdl` for post-attach DDL, `Error::SwmrWriterReincarnated` for writer crash + restart) are sticky once raised; reopen the handle to apply.
+For cross-process readers (`Database::open_read_only` against a `file://` DSN), the handle picks up writer **checkpoints** via the manifest-epoch poll. Typed must-reopen errors (`Error::SwmrPendingDdl` for post-attach DDL, `Error::SwmrWriterReincarnated` for writer crash + restart) are sticky once raised; reopen the handle to apply.
+
+**Visibility is checkpoint-bounded.** A read-only handle sees writer state as of the writer's most recent checkpoint. Commits the writer has accepted but not yet checkpointed (rows in the writer's hot buffer + WAL tail) are NOT visible to query execution on the read-only handle. To make a writer commit visible across processes, the writer must run `PRAGMA CHECKPOINT` (or wait for the periodic background checkpoint at `checkpoint_interval`, default 60s). The WAL-tail overlay infrastructure exists on the read-only side but is not yet wired into query execution; sub-checkpoint visibility ships in a follow-up phase.
 
 For prepared-statement ergonomics, use `cached_plan(sql)` plus `query_plan` / `query_named_plan` — same parse-once / execute-many shape `Database::prepare` provides.
 
@@ -717,7 +719,7 @@ For prepared-statement ergonomics, use `cached_plan(sql)` plus `query_plan` / `q
 | `dsn()` | `&str` | Get the DSN |
 | `is_read_only()` | `bool` | Always `true`. |
 | `table_exists(name)` | `Result<bool>` | Check if a table exists |
-| `refresh()` | `Result<bool>` | Force a manifest reload + WAL tail; returns `true` if state advanced |
+| `refresh()` | `Result<bool>` | Force a manifest reload to pick up any new writer checkpoint; returns `true` if state advanced. Visibility is checkpoint-bounded — uncheckpointed writer commits are not yet exposed to query execution. |
 | `set_auto_refresh(enabled)` | `()` | Master switch for implicit refresh. `false` pauses BOTH the per-query auto-refresh path AND the background ticker (if any) — the snapshot only moves on explicit `refresh()`. WAL pin advancement also stalls; keep stable windows short. |
 | `auto_refresh_enabled()` | `bool` | Read the auto-refresh flag |
 | `set_refresh_interval(Option<Duration>)` | `Result<()>` | Configure the background refresh ticker. `Some(d)` spawns a thread calling `refresh()` every `d` (min 100ms); `None` stops it. Use for idle handles so the WAL pin advances. Pauses while `auto_refresh=false` or a `BEGIN` is active. Equivalent DSN flag: `?refresh_interval=30s`. |
