@@ -98,7 +98,9 @@ fn default_function_registry() -> Arc<FunctionRegistry> {
 use crate::parser::ast::{Program, Statement};
 use crate::parser::Parser;
 use crate::storage::mvcc::engine::MVCCEngine;
-use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
+use crate::storage::traits::{
+    QueryResult, ReadEngine, ReadTransaction, WriteTable, WriteTransaction,
+};
 
 pub use context::{clear_all_thread_local_caches, ExecutionContext, TimeoutGuard};
 pub use expression::{
@@ -154,9 +156,9 @@ pub use utils::{compute_join_projection, extract_join_keys_and_residual, JoinPro
 /// Active transaction state for explicit transaction control (BEGIN/COMMIT/ROLLBACK)
 struct ActiveTransaction {
     /// The transaction object
-    transaction: Box<dyn Transaction>,
+    transaction: Box<dyn WriteTransaction>,
     /// Tables accessed within this transaction (cached for proper commit/rollback)
-    tables: FxHashMap<String, Box<dyn Table>>,
+    tables: FxHashMap<String, Box<dyn WriteTable>>,
 }
 
 /// SQL Query Executor
@@ -172,55 +174,167 @@ pub struct Executor {
     default_isolation_level: crate::core::IsolationLevel,
     /// Query cache for parsed statements
     query_cache: QueryCache,
-    /// Semantic cache for query results with subsumption detection
-    semantic_cache: SemanticCache,
+    /// Semantic cache for query results with subsumption detection.
+    ///
+    /// Held as `Arc<SemanticCache>` so every per-handle `Executor` for
+    /// the same `EngineEntry` shares one cache. DML invalidation on any
+    /// handle reaches every sibling reader. A per-handle cache would
+    /// silently serve stale rows after a peer's commit (DML invalidates
+    /// only the writer's local map; the reader sees the pre-update
+    /// cached result).
+    semantic_cache: Arc<SemanticCache>,
     /// Active transaction for explicit transaction control (BEGIN/COMMIT/ROLLBACK)
     active_transaction: Mutex<Option<ActiveTransaction>>,
-    /// Query planner for cost-based optimization (lazily initialized)
-    query_planner: std::sync::OnceLock<QueryPlanner>,
+    /// Query planner for cost-based optimization.
+    ///
+    /// Held as `Arc<QueryPlanner>` so every per-handle `Executor` for the
+    /// same `EngineEntry` shares one planner. ANALYZE invalidates the
+    /// planner's stats cache, and a per-handle planner would leave
+    /// sibling handles on pre-ANALYZE estimates until the 5-minute TTL
+    /// expires. Public Executor constructors (called by external Rust
+    /// callers) build a fresh planner since they aren't tied to an
+    /// engine entry.
+    query_planner: Arc<QueryPlanner>,
+    /// True for executors backing a `ReadOnlyDatabase`. DML helper paths
+    /// (`get_table_for_dml`, `start_transaction_for_dml`) refuse to begin
+    /// auto-commit transactions when this is set, providing defense-in-depth
+    /// against any path that bypasses the parser-level write gate.
+    read_only: bool,
 }
 
 impl Executor {
-    /// Create a new executor with the given storage engine
+    /// Create a new executor with the given storage engine.
+    ///
+    /// `read_only` is inferred from the engine: if the engine was opened
+    /// read-only (`?read_only=true` / `?mode=ro`), the executor refuses
+    /// to begin writable auto-commit transactions in DML helper paths.
+    /// Without this inference, an external caller could obtain an
+    /// `Arc<MVCCEngine>` from a read-only `Database::engine()` and use
+    /// `Executor::new` to construct a writable executor on top, reaching
+    /// `MVCCEngine::begin_writable_transaction_internal` and writing
+    /// through (with partial-mutation hazards on top of the contract
+    /// violation, since the engine's WAL is opened read-only).
     pub fn new(engine: Arc<MVCCEngine>) -> Self {
+        let read_only = engine.is_read_only_mode();
+        let query_planner = Arc::new(QueryPlanner::new(Arc::clone(&engine)));
         Self {
             engine,
             function_registry: default_function_registry(),
             default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
             query_cache: QueryCache::default(),
-            semantic_cache: SemanticCache::default(),
+            semantic_cache: Arc::new(SemanticCache::default()),
             active_transaction: Mutex::new(None),
-            query_planner: std::sync::OnceLock::new(),
+            query_planner,
+            read_only,
         }
     }
 
-    /// Create a new executor with a custom function registry
+    /// Create a new executor configured for a read-only database.
+    ///
+    /// In addition to the parser-level write gate that
+    /// [`crate::api::ReadOnlyDatabase`] applies before dispatching any
+    /// SQL, this executor refuses to begin auto-commit transactions in
+    /// DML helper paths (`get_table_for_dml`, `start_transaction_for_dml`).
+    /// Together they prevent any write code path from running on a
+    /// read-only handle, even if the parser gate is bypassed.
+    pub fn new_read_only(engine: Arc<MVCCEngine>) -> Self {
+        let query_planner = Arc::new(QueryPlanner::new(Arc::clone(&engine)));
+        Self {
+            engine,
+            function_registry: default_function_registry(),
+            default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
+            query_cache: QueryCache::default(),
+            semantic_cache: Arc::new(SemanticCache::default()),
+            active_transaction: Mutex::new(None),
+            query_planner,
+            read_only: true,
+        }
+    }
+
+    /// Create a per-handle executor that shares its semantic cache and
+    /// query planner with every sibling executor for the same `EngineEntry`.
+    ///
+    /// Used by `Database::share_entry` / `ReadOnlyDatabase::from_entry`
+    /// so DML invalidation on one handle's cache and ANALYZE on one
+    /// handle's planner reach every sibling reader. Without sharing, a
+    /// sibling would keep serving pre-update cached rows (semantic cache)
+    /// or pre-ANALYZE plan estimates (planner) after a peer's commit.
+    pub(crate) fn with_shared_semantic_cache(
+        engine: Arc<MVCCEngine>,
+        semantic_cache: Arc<SemanticCache>,
+        query_planner: Arc<QueryPlanner>,
+    ) -> Self {
+        let read_only = engine.is_read_only_mode();
+        Self {
+            engine,
+            function_registry: default_function_registry(),
+            default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
+            query_cache: QueryCache::default(),
+            semantic_cache,
+            active_transaction: Mutex::new(None),
+            query_planner,
+            read_only,
+        }
+    }
+
+    /// Read-only variant of [`Self::with_shared_semantic_cache`].
+    pub(crate) fn with_shared_semantic_cache_read_only(
+        engine: Arc<MVCCEngine>,
+        semantic_cache: Arc<SemanticCache>,
+        query_planner: Arc<QueryPlanner>,
+    ) -> Self {
+        Self {
+            engine,
+            function_registry: default_function_registry(),
+            default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
+            query_cache: QueryCache::default(),
+            semantic_cache,
+            active_transaction: Mutex::new(None),
+            query_planner,
+            read_only: true,
+        }
+    }
+
+    /// Create a new executor with a custom function registry.
+    /// `read_only` is inferred from the engine; see [`Self::new`] for details.
     pub fn with_function_registry(
         engine: Arc<MVCCEngine>,
         function_registry: Arc<FunctionRegistry>,
     ) -> Self {
+        let read_only = engine.is_read_only_mode();
+        let query_planner = Arc::new(QueryPlanner::new(Arc::clone(&engine)));
         Self {
             engine,
             function_registry,
             default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
             query_cache: QueryCache::default(),
-            semantic_cache: SemanticCache::default(),
+            semantic_cache: Arc::new(SemanticCache::default()),
             active_transaction: Mutex::new(None),
-            query_planner: std::sync::OnceLock::new(),
+            query_planner,
+            read_only,
         }
     }
 
-    /// Create a new executor with a custom cache size
+    /// Create a new executor with a custom cache size.
+    /// `read_only` is inferred from the engine; see [`Self::new`] for details.
     pub fn with_cache_size(engine: Arc<MVCCEngine>, cache_size: usize) -> Self {
+        let read_only = engine.is_read_only_mode();
+        let query_planner = Arc::new(QueryPlanner::new(Arc::clone(&engine)));
         Self {
             engine,
             function_registry: default_function_registry(),
             default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
             query_cache: QueryCache::new(cache_size),
-            semantic_cache: SemanticCache::default(),
+            semantic_cache: Arc::new(SemanticCache::default()),
             active_transaction: Mutex::new(None),
-            query_planner: std::sync::OnceLock::new(),
+            query_planner,
+            read_only,
         }
+    }
+
+    /// Returns true if this executor is configured for read-only access.
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
     }
 
     /// Check if there is an active explicit transaction
@@ -228,16 +342,19 @@ impl Executor {
         self.active_transaction.lock().unwrap().is_some()
     }
 
-    /// Get the query planner (lazily initialized)
+    /// Get the query planner.
+    ///
+    /// Eagerly constructed at executor creation; shared across sibling
+    /// executors via `Arc` so ANALYZE on one handle invalidates the
+    /// stats cache observed by every reader.
     fn get_query_planner(&self) -> &QueryPlanner {
-        self.query_planner
-            .get_or_init(|| QueryPlanner::new(Arc::clone(&self.engine)))
+        &self.query_planner
     }
 
     /// Get or create a table within the active transaction
     /// Returns (table, should_auto_commit) where should_auto_commit is false if there's an active transaction
     #[allow(dead_code)]
-    fn get_table_for_dml(&self, table_name: &str) -> Result<(Box<dyn Table>, bool)> {
+    fn get_table_for_dml(&self, table_name: &str) -> Result<(Box<dyn WriteTable>, bool)> {
         let mut active_tx = self.active_transaction.lock().unwrap();
 
         if let Some(ref mut tx_state) = *active_tx {
@@ -246,7 +363,7 @@ impl Executor {
 
             // Check if we already have this table cached
             if tx_state.tables.contains_key(&table_name_lower) {
-                // We need to get the table from the transaction again since we can't clone Box<dyn Table>
+                // We need to get the table from the transaction again since we can't clone Box<dyn WriteTable>
                 let table = tx_state.transaction.get_table(table_name)?;
                 return Ok((table, false));
             }
@@ -255,7 +372,7 @@ impl Executor {
             let table = tx_state.transaction.get_table(table_name)?;
 
             // Store a reference indicator that this table is active in the transaction
-            // Note: We can't cache the actual table as Box<dyn Table> isn't Clone
+            // Note: We can't cache the actual table as Box<dyn WriteTable> isn't Clone
             // But we can get a fresh handle each time - the key is using the same transaction
             tx_state.tables.insert(
                 table_name_lower.clone(),
@@ -264,8 +381,18 @@ impl Executor {
 
             Ok((table, false))
         } else {
-            // No active transaction - create a new one with auto-commit
-            let tx = self.engine.begin_transaction()?;
+            // No active transaction - create a new one with auto-commit.
+            // Defense-in-depth: refuse to begin a writable auto-commit txn
+            // on a read-only executor. The parser-level write gate on
+            // ReadOnlyDatabase should prevent ever reaching here, but this
+            // is the second line of defence at the executor surface.
+            if self.read_only {
+                return Err(crate::core::Error::read_only_violation_at(
+                    "executor",
+                    "DML auto-commit",
+                ));
+            }
+            let tx = self.engine.begin_writable_transaction_internal()?;
             let table = tx.get_table(table_name)?;
             Ok((table, true))
         }
@@ -277,7 +404,7 @@ impl Executor {
     fn start_transaction_for_dml(
         &self,
         table_name: &str,
-    ) -> Result<(Option<Box<dyn Transaction>>, Box<dyn Table>, bool)> {
+    ) -> Result<(Option<Box<dyn WriteTransaction>>, Box<dyn WriteTable>, bool)> {
         let active_tx = self.active_transaction.lock().unwrap();
 
         if active_tx.is_some() {
@@ -286,9 +413,16 @@ impl Executor {
             let (table, auto_commit) = self.get_table_for_dml(table_name)?;
             Ok((None, table, auto_commit))
         } else {
-            // No active transaction - create a new one with auto-commit
+            // No active transaction - create a new one with auto-commit.
+            // Defense-in-depth (see get_table_for_dml).
             drop(active_tx);
-            let tx = self.engine.begin_transaction()?;
+            if self.read_only {
+                return Err(crate::core::Error::read_only_violation_at(
+                    "executor",
+                    "DML auto-commit",
+                ));
+            }
+            let tx = self.engine.begin_writable_transaction_internal()?;
             let table = tx.get_table(table_name)?;
             Ok((Some(tx), table, true))
         }
@@ -350,6 +484,19 @@ impl Executor {
         // Try to get from cache
         let cached = self.query_cache.get(sql)?;
 
+        // On a read-only executor, the PK Update / PK Delete fast paths
+        // would otherwise mutate storage without going through
+        // `execute_cached` (which has its own read-only check). Reject
+        // them here so the parser-level write gate is honoured even on
+        // the fast path. The cached AST has already been parsed once.
+        if self.read_only {
+            if let Some(reason) = cached.statement.write_reason() {
+                return Some(Err(crate::core::Error::read_only_violation_at(
+                    "parser", reason,
+                )));
+            }
+        }
+
         // Validate parameter count
         if cached.has_params && params.len() < cached.param_count {
             return None; // Let normal path handle error
@@ -401,6 +548,15 @@ impl Executor {
     fn execute_cached(&self, sql: &str, ctx: &ExecutionContext) -> Result<Box<dyn QueryResult>> {
         // Try to get from cache
         if let Some(cached) = self.query_cache.get(sql) {
+            // On a read-only executor, refuse any cached statement that
+            // mutates persistent state. The check uses the parsed-once
+            // cached AST — no extra parse on the hot path.
+            if self.read_only {
+                if let Some(reason) = cached.statement.write_reason() {
+                    return Err(crate::core::Error::read_only_violation_at("parser", reason));
+                }
+            }
+
             // Validate parameter count if query has parameters
             if cached.has_params {
                 let provided = ctx.params().len();
@@ -463,6 +619,17 @@ impl Executor {
         let mut program = parser
             .parse_program()
             .map_err(|e| Error::parse(e.to_string()))?;
+
+        // On a read-only executor, refuse any statement in the program that
+        // mutates persistent state. Single fresh parse — checks happen on
+        // the parsed AST without re-parsing.
+        if self.read_only {
+            for stmt in &program.statements {
+                if let Some(reason) = stmt.write_reason() {
+                    return Err(crate::core::Error::read_only_violation_at("parser", reason));
+                }
+            }
+        }
 
         // Cache single-statement queries and execute directly from cache
         if program.statements.len() == 1 {
@@ -543,6 +710,16 @@ impl Executor {
         self.query_cache.clear();
     }
 
+    /// SWMR v2 Phase G: invalidate cached query plans for one table
+    /// only. Used by `ReadOnlyDatabase::refresh` so a writer commit
+    /// against table A doesn't blow away cached plans for unrelated
+    /// tables B, C, … on the reader side. Same fallback semantics as
+    /// `QueryCache::invalidate_table` (per-plan scan of its compiled
+    /// lookup table name + query text heuristic).
+    pub fn invalidate_query_cache_for_table(&self, table_name: &str) {
+        self.query_cache.invalidate_table(table_name);
+    }
+
     /// Get the semantic cache
     pub fn semantic_cache(&self) -> &SemanticCache {
         &self.semantic_cache
@@ -596,6 +773,17 @@ impl Executor {
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        // Read-only check at the AST entrypoint. SQL-string callers
+        // (`execute`, `execute_with_params`) check earlier in the
+        // parse/cache path; AST callers (`execute_program`,
+        // `execute_statement`, FFI callers, etc.) bypass that, so the
+        // gate must live here too.
+        if self.read_only {
+            if let Some(reason) = statement.write_reason() {
+                return Err(crate::core::Error::read_only_violation_at("parser", reason));
+            }
+        }
+
         // If there's an active transaction, inject the transaction ID into the context
         // This enables CURRENT_TRANSACTION_ID() function to return the correct value
         let ctx = {
@@ -663,7 +851,7 @@ impl Executor {
     /// Used by the programmatic Transaction API to delegate SELECT queries
     /// to the full executor pipeline (aggregates, JOINs, window functions, etc.)
     /// while keeping the transaction's uncommitted changes visible.
-    pub fn install_transaction(&self, tx: Box<dyn Transaction>) {
+    pub fn install_transaction(&self, tx: Box<dyn WriteTransaction>) {
         let mut active_tx = self.active_transaction.lock().unwrap();
         *active_tx = Some(ActiveTransaction {
             transaction: tx,
@@ -675,24 +863,74 @@ impl Executor {
     ///
     /// Returns the transaction so the caller can continue using it for
     /// further DML operations after the SELECT delegation completes.
-    pub fn take_transaction(&self) -> Option<Box<dyn Transaction>> {
+    pub fn take_transaction(&self) -> Option<Box<dyn WriteTransaction>> {
         let mut active_tx = self.active_transaction.lock().unwrap();
         active_tx.take().map(|at| at.transaction)
     }
 
     /// Begin a new transaction
-    pub fn begin_transaction(&self) -> Result<Box<dyn Transaction>> {
-        self.engine.begin_transaction()
+    ///
+    /// Refuses on a read-only executor. Without this guard, a `Database`
+    /// opened with `?read_only=true` could call `db.begin()?` and receive
+    /// a writable `Box<dyn WriteTransaction>` that bypasses every other
+    /// gate (parser, DML auto-commit). Read-intent internal paths
+    /// (subquery, SHOW, planner stats, INL join, etc.) use
+    /// `ReadEngine::begin_read_transaction` and never reach this method.
+    /// Write-intent internal paths (DML, DDL, COPY, ANALYZE) use
+    /// `MVCCEngine::begin_writable_transaction_internal` directly. The
+    /// public Engine trait method (`<MVCCEngine as Engine>::begin_transaction`)
+    /// gates on `is_read_only_mode`, so external callers going through
+    /// `Database::engine().begin_transaction()` get the same refusal.
+    pub fn begin_transaction(&self) -> Result<Box<dyn WriteTransaction>> {
+        if self.read_only {
+            return Err(crate::core::Error::read_only_violation_at(
+                "executor", "BEGIN",
+            ));
+        }
+        self.engine.begin_writable_transaction_internal()
     }
 
     /// Begin a new transaction with a specific isolation level
+    ///
+    /// Same read-only guard as [`Self::begin_transaction`]: a writable
+    /// transaction is never handed out from a read-only executor.
     pub fn begin_transaction_with_isolation(
         &self,
         isolation: crate::core::IsolationLevel,
-    ) -> Result<Box<dyn Transaction>> {
-        let mut tx = self.engine.begin_transaction()?;
+    ) -> Result<Box<dyn WriteTransaction>> {
+        if self.read_only {
+            return Err(crate::core::Error::read_only_violation_at(
+                "executor", "BEGIN",
+            ));
+        }
+        let mut tx = self.engine.begin_writable_transaction_internal()?;
         let _ = tx.set_isolation_level(isolation);
         Ok(tx)
+    }
+
+    /// Begin a new read-only transaction.
+    ///
+    /// Returns `Box<dyn ReadTransaction>`, which has no path to writable
+    /// table handles, DDL, or any mutating engine operation. Callers
+    /// holding the returned trait object cannot escalate to write
+    /// access by construction.
+    ///
+    /// Used by future read-only execution paths
+    /// (e.g. `ReadOnlyDatabase::begin`) and by external Rust callers who
+    /// want compile-time read-only enforcement on a transaction obtained
+    /// from a writable engine.
+    pub fn begin_read_transaction(&self) -> Result<Box<dyn ReadTransaction>> {
+        ReadEngine::begin_read_transaction(self.engine.as_ref())
+    }
+
+    /// Begin a new read-only transaction with a specific isolation level.
+    ///
+    /// See [`Self::begin_read_transaction`] for the contract.
+    pub fn begin_read_transaction_with_isolation(
+        &self,
+        isolation: crate::core::IsolationLevel,
+    ) -> Result<Box<dyn ReadTransaction>> {
+        ReadEngine::begin_read_transaction_with_level(self.engine.as_ref(), isolation)
     }
 
     /// Get or create a cached plan for a SQL statement.
@@ -702,6 +940,17 @@ impl Executor {
     /// for repeated execution without re-parsing or cache lookup overhead.
     pub fn get_or_create_plan(&self, sql: &str) -> Result<CachedPlanRef> {
         if let Some(plan) = self.query_cache.get(sql) {
+            // Even on a cache hit, refuse to hand out a write-intent plan
+            // from a read-only executor. The plan was cached by an earlier
+            // (writable) caller; the executor wrapping that plan now is
+            // read-only and would refuse at execute time anyway. Failing
+            // here gives the caller the same diagnostic earlier and
+            // matches the behaviour of `prepare()`.
+            if self.read_only {
+                if let Some(reason) = plan.statement.write_reason() {
+                    return Err(crate::core::Error::read_only_violation_at("parser", reason));
+                }
+            }
             return Ok(plan);
         }
         let mut parser = Parser::new(sql);
@@ -714,6 +963,15 @@ impl Executor {
             ));
         }
         let stmt = program.statements.pop().unwrap();
+        // Read-only refusal at parse time. Without this, write SQL would
+        // parse and cache successfully against a read-only executor,
+        // and the refusal would only fire later at `execute_plan` /
+        // `query_plan` — confusing to debug.
+        if self.read_only {
+            if let Some(reason) = stmt.write_reason() {
+                return Err(crate::core::Error::read_only_violation_at("parser", reason));
+            }
+        }
         let (has_params, param_count) = count_parameters(&stmt);
         Ok(self
             .query_cache
@@ -731,6 +989,15 @@ impl Executor {
         plan: &CachedPlanRef,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        // Read-only check on the prepared-statement path. Like
+        // `try_fast_path_with_params`, this entrypoint bypasses
+        // `execute_cached`, so the read-only enforcement must live here too.
+        if self.read_only {
+            if let Some(reason) = plan.statement.write_reason() {
+                return Err(crate::core::Error::read_only_violation_at("parser", reason));
+            }
+        }
+
         // Validate parameter count
         if plan.has_params {
             let provided = ctx.params().len();

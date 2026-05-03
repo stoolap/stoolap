@@ -42,10 +42,9 @@ use crate::executor::Executor;
 use crate::parser::ast::{Expression, Statement};
 use crate::parser::Parser;
 use crate::storage::expression::Expression as StorageExprTrait;
-use crate::storage::mvcc::engine::MVCCEngine;
-use crate::storage::traits::{QueryResult, Transaction as StorageTransaction};
+use crate::storage::traits::{QueryResult, WriteTransaction as StorageTransaction};
 
-use super::database::FromValue;
+use super::database::{EngineEntry, FromValue};
 use super::params::Params;
 use super::rows::Rows;
 
@@ -53,19 +52,27 @@ use super::rows::Rows;
 ///
 /// Provides ACID guarantees for a series of database operations.
 /// Must be explicitly committed or rolled back.
+///
+/// Holds an `Arc<EngineEntry>` (not just `Arc<MVCCEngine>`) so the
+/// engine entry's strong count reflects this transaction. Without
+/// that, `Database::close()` — which decides whether to close the
+/// engine using `Arc::strong_count(&entry)` — could fire
+/// `engine.close_engine()` while a transaction is alive, and the next
+/// statement on the transaction would error with `EngineNotOpen`. The
+/// engine itself is reachable via `entry.engine`.
 pub struct Transaction {
     tx: Option<Box<dyn StorageTransaction>>,
-    engine: Arc<MVCCEngine>,
+    entry: Arc<EngineEntry>,
     committed: bool,
     rolled_back: bool,
 }
 
 impl Transaction {
     /// Create a new transaction wrapper
-    pub(crate) fn new(tx: Box<dyn StorageTransaction>, engine: Arc<MVCCEngine>) -> Self {
+    pub(crate) fn new(tx: Box<dyn StorageTransaction>, entry: Arc<EngineEntry>) -> Self {
         Self {
             tx: Some(tx),
-            engine,
+            entry,
             committed: false,
             rolled_back: false,
         }
@@ -88,6 +95,52 @@ impl Transaction {
     /// Get the transaction ID
     pub fn id(&self) -> i64 {
         self.tx.as_ref().map(|tx| tx.id()).unwrap_or(-1)
+    }
+
+    /// Returns the row count in `name` visible to this transaction.
+    ///
+    /// Uses the per-table O(1) committed counter when no local changes are
+    /// pending; otherwise walks the per-tx version map to add inserts and
+    /// subtract deletes done in this transaction. Matches what `SELECT
+    /// COUNT(*) FROM name` would report against the same snapshot, without
+    /// the SQL parsing / executor overhead.
+    pub fn table_count(&self, name: &str) -> Result<u64> {
+        self.check_active()?;
+        let txn_id = self.tx.as_ref().unwrap().id();
+        let table = self.entry.engine.get_table_for_txn(txn_id, name)?;
+        if let Some(c) = table.fast_row_count() {
+            return Ok(c as u64);
+        }
+        Ok(table.row_count() as u64)
+    }
+
+    /// Create a savepoint with the given name.
+    ///
+    /// Records the current write state. A later `rollback_to_savepoint(name)`
+    /// reverts every DML and DDL change made after this point. Re-using an
+    /// existing name overwrites the prior savepoint with the same name.
+    pub fn create_savepoint(&mut self, name: &str) -> Result<()> {
+        self.check_active()?;
+        self.tx.as_mut().unwrap().create_savepoint(name)
+    }
+
+    /// Release a savepoint without rolling back.
+    ///
+    /// Forgets the savepoint; changes after it remain in the transaction.
+    /// Per SQL standard a subsequent `rollback_to_savepoint` with the same
+    /// name is an error.
+    pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        self.check_active()?;
+        self.tx.as_mut().unwrap().release_savepoint(name)
+    }
+
+    /// Roll back to the named savepoint.
+    ///
+    /// Discards every DML and DDL change made after `create_savepoint(name)`.
+    /// The savepoint itself is removed, matching standard SQL semantics.
+    pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
+        self.check_active()?;
+        self.tx.as_mut().unwrap().rollback_to_savepoint(name)
     }
 
     /// Execute a SQL statement within the transaction
@@ -313,7 +366,15 @@ impl Transaction {
                 | Statement::Delete(_)
         ) {
             let tx = self.tx.take().ok_or(Error::TransactionNotStarted)?;
-            let executor = Executor::new(self.engine.clone());
+            // Use the engine entry's shared semantic cache and query
+            // planner so DML / ANALYZE inside this transaction
+            // invalidate the cache and stats that sibling handles see,
+            // not just per-call local state that drops at end-of-method.
+            let executor = Executor::with_shared_semantic_cache(
+                self.entry.engine.clone(),
+                Arc::clone(&self.entry.semantic_cache),
+                Arc::clone(&self.entry.query_planner),
+            );
             executor.install_transaction(tx);
             let result = executor.execute_statement(statement, ctx);
             // Reclaim the transaction regardless of success/failure

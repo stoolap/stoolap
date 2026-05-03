@@ -435,16 +435,222 @@ pub fn delete_volume(path: &Path) -> Result<()> {
     })
 }
 
-/// Delete all volumes for a table.
+/// Delete every artifact for a table — `vol_*.vol` files,
+/// `manifest.bin`, and the table directory itself. Used by
+/// the immediate-DROP / immediate-TRUNCATE path
+/// (`delete_table_volumes_when_safe(..., defer=false)`); the
+/// caller has already verified there are no live readers
+/// that could lazy-load this state.
+///
+/// Removing `manifest.bin` is critical: leaving it behind
+/// would let a checkpoint cycle running between this delete
+/// and the next orphan sweep re-record only the live tables,
+/// bump the manifest epoch, and truncate WAL past the
+/// `DropTable` record. A reader attaching or refreshing in
+/// that window would still see this directory via
+/// `scan_table_dirs` (which keys on the presence of
+/// `manifest.bin`) and treat the dropped table as live
+/// against an out-of-date schema. `remove_dir_all` is
+/// best-effort: a non-empty unrecognised file in the dir
+/// would propagate the IO error to the caller.
 pub fn delete_all_volumes(dir: &Path, table_name: &str) -> Result<()> {
-    let paths = list_volumes(dir, table_name);
-    for path in paths {
-        delete_volume(&path)?;
-    }
-    // Remove the table directory if empty
     let table_dir = dir.join(table_name);
-    let _ = std::fs::remove_dir(&table_dir); // OK if not empty
-    Ok(())
+    if !table_dir.exists() {
+        return Ok(());
+    }
+    std::fs::remove_dir_all(&table_dir).map_err(|e| {
+        crate::core::Error::internal(format!(
+            "failed to remove table directory {:?}: {}",
+            table_dir, e
+        ))
+    })
+}
+
+/// Defer-aware DROP/TRUNCATE volume cleanup.
+///
+/// When `defer` is `false`, immediately deletes every volume
+/// for the table and the (empty) table directory — same
+/// behaviour as `delete_all_volumes`.
+///
+/// When `defer` is `true`, leaves the directory and every
+/// volume file UNTOUCHED at its original path so a live
+/// cross-process reader holding a stale manifest pointer to
+/// `<dir>/<table>/vol_NNNN.vol` continues to resolve and
+/// `read_volume_from_disk` returns valid bytes (rather than
+/// `None`, which the SegmentManager scan / point-lookup paths
+/// would silently treat as "row not in cold" and skip).
+/// Reaping is the responsibility of `sweep_orphan_table_dirs`,
+/// invoked by the engine's checkpoint and `open_engine` paths
+/// once `defer_for_live_readers()` returns false.
+///
+/// Trade-off: a same-name `CREATE TABLE` issued during the
+/// deferred window will reuse the on-disk path and may
+/// overwrite leftover `vol_NNNN.vol` files with new content.
+/// That is the documented hazard of racing DROP and CREATE
+/// while readers are live; the alternative (renaming the
+/// directory immediately) made the live reader's lazy
+/// `ensure_volume` return `None` for every cold segment, a
+/// worse failure mode than the rare same-name race.
+pub fn delete_table_volumes_when_safe(dir: &Path, table_name: &str, defer: bool) -> Result<()> {
+    if defer {
+        return Ok(());
+    }
+    let table_dir = dir.join(table_name);
+    if !table_dir.exists() {
+        return Ok(());
+    }
+    // Propagate the failure. Correctness now depends on
+    // removing `manifest.bin` along with the .vol files —
+    // leaving the manifest behind would let a checkpoint
+    // re-record only the live tables, bump the manifest
+    // epoch, and truncate WAL past the `DropTable` record
+    // before the next orphan sweep can reap the leftover
+    // directory. Caller decides whether to fail the
+    // surrounding DDL or refuse the next checkpoint
+    // truncation.
+    delete_all_volumes(dir, table_name)
+}
+
+/// Remove every `<dir>/<table_name>/vol_*.vol` file whose
+/// 64-bit segment id is NOT in `keep_segment_ids`. Caller is
+/// responsible for confirming `defer_for_live_readers() ==
+/// false` BEFORE invoking — same safety contract as
+/// `sweep_orphan_table_dirs`. Used to reap obsolete .vol
+/// files for an ACTIVE table whose manifest was emptied (e.g.
+/// TRUNCATE while readers were live, leaving the old files
+/// in place at the original path); without this the table's
+/// directory accumulates dead files until the next process
+/// restart's startup-orphan pass.
+pub fn sweep_orphan_volumes_in_table(
+    dir: &Path,
+    table_name: &str,
+    keep_segment_ids: &rustc_hash::FxHashSet<u64>,
+) -> usize {
+    let table_dir = dir.join(table_name);
+    let entries = match std::fs::read_dir(&table_dir) {
+        Ok(e) => e,
+        Err(_) => return 0,
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e != VOLUME_EXT)
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        // Filename layout (matches `write_volume_to_disk`):
+        // `vol_{:016x}.vol` — strip the `vol_` prefix and
+        // `.vol` suffix, parse the hex id.
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let hex = match stem.strip_prefix("vol_") {
+            Some(h) => h,
+            None => continue,
+        };
+        let id = match u64::from_str_radix(hex, 16) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if keep_segment_ids.contains(&id) {
+            continue;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+/// Reap every `<dir>/<subdir>` whose lowercased name is NOT
+/// in `active_tables`. Caller is responsible for confirming
+/// `defer_for_live_readers() == false` BEFORE invoking this
+/// — the sweep's safety contract is "no live reader can hold
+/// a stale manifest pointer into the directory being unlinked."
+///
+/// `active_tables` is the set of lowercased table names the
+/// engine currently knows about (union of `schemas` and
+/// `segment_managers`); any on-disk subdirectory not in that
+/// set is an orphan from a prior DROP / TRUNCATE / crash. The
+/// directory's contents are removed via `remove_dir_all`.
+///
+/// Returns a `SweepReport` so the caller can correlate the four
+/// independent failure modes with the writer-side gate flags
+/// (`pending_drop_cleanups`, `orphan_discovery_failed`):
+///   - `read_dir_failed` is true when the top-level enumeration
+///     errored (NotFound is reported as an empty success, not a
+///     failure).
+///   - `entry_errors` counts per-entry iteration / file_type
+///     failures.
+///   - `remove_failures` counts directories we identified as
+///     orphan but could not unlink.
+///   - `removed` counts orphans we did successfully unlink.
+///
+/// Per-failure callers can decide whether to raise a
+/// discovery-failed gate; the function itself does not panic and
+/// does not abort the sweep on partial errors.
+pub struct SweepReport {
+    pub removed: usize,
+    pub entry_errors: usize,
+    pub remove_failures: usize,
+    pub read_dir_failed: bool,
+}
+
+pub fn sweep_orphan_table_dirs(
+    dir: &Path,
+    active_tables: &rustc_hash::FxHashSet<String>,
+) -> SweepReport {
+    let mut report = SweepReport {
+        removed: 0,
+        entry_errors: 0,
+        remove_failures: 0,
+        read_dir_failed: false,
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return report,
+        Err(_) => {
+            report.read_dir_failed = true;
+            return report;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                report.entry_errors += 1;
+                continue;
+            }
+        };
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => {
+                report.entry_errors += 1;
+                continue;
+            }
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n.to_lowercase(),
+            None => continue,
+        };
+        if active_tables.contains(&name) {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => report.removed += 1,
+            Err(_) => report.remove_failures += 1,
+        }
+    }
+    report
 }
 
 /// Generate a new volume ID. Monotonically increasing, unique across calls.

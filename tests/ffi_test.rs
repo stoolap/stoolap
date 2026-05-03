@@ -3262,3 +3262,613 @@ fn test_tx_stmt_exec_named_rollback() {
         stoolap_close(db);
     }
 }
+
+// ===========================================================================
+// Round-6 regression: FFI keepalives must keep the registry pointing at the
+// live engine.
+// ===========================================================================
+
+#[test]
+fn test_close_db_with_live_stmt_keeps_registry_pointing_at_live_engine() {
+    // Round-6 P1: stoolap_prepare keeps the engine alive via
+    // _db_keepalive: Arc<DatabaseInner>, but those clones do NOT bump
+    // entry.strong_count (they all share the same DatabaseInner.entry
+    // field). If try_unregister_arc only checks entry.strong_count, it
+    // unregisters the still-live engine on stoolap_close, and the next
+    // stoolap_open(dsn) creates a fresh empty engine — orphaning the
+    // original from the registry. The reviewer's repro: prepare a
+    // statement, close the DB, reopen the same DSN; SELECT COUNT(*) FROM t
+    // failed with "table not found" against the fresh engine.
+    unsafe {
+        let dsn = cstr("memory://round6-stmt-keepalive");
+
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(stoolap_open(dsn.as_ptr(), &mut db), STOOLAP_OK);
+
+        let create = cstr("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        assert_eq!(
+            stoolap_exec(db, create.as_ptr(), std::ptr::null_mut()),
+            STOOLAP_OK
+        );
+        let insert = cstr("INSERT INTO t VALUES (1)");
+        assert_eq!(
+            stoolap_exec(db, insert.as_ptr(), std::ptr::null_mut()),
+            STOOLAP_OK
+        );
+
+        // Prepare a statement — its _db_keepalive holds an Arc<DatabaseInner>.
+        let select = cstr("SELECT COUNT(*) FROM t");
+        let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
+        assert_eq!(stoolap_prepare(db, select.as_ptr(), &mut stmt), STOOLAP_OK);
+
+        // Close the DB handle while the stmt is still alive. The engine
+        // must remain alive (stmt holds keepalive) AND must remain
+        // discoverable in the registry under the same DSN.
+        assert_eq!(stoolap_close(db), STOOLAP_OK);
+
+        // Reopen the same DSN. Must reuse the engine that's still alive
+        // through the stmt — for memory:// that means seeing the row
+        // inserted above. A fresh engine would be empty, and the
+        // table_exists check would fail.
+        let mut db2: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(stoolap_open(dsn.as_ptr(), &mut db2), STOOLAP_OK);
+
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        let rc = stoolap_query(db2, select.as_ptr(), &mut rows);
+        assert_eq!(
+            rc,
+            STOOLAP_OK,
+            "SELECT COUNT(*) FROM t must succeed against the same live engine, \
+             not a fresh empty engine. Errmsg: {}",
+            read_cstr(stoolap_errmsg(db2))
+        );
+        // STOOLAP_ROW (100) means "row available". If the engine were a
+        // fresh empty one, the table wouldn't exist and stoolap_query
+        // would already have failed above with errmsg "table 't' not found".
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_ROW);
+        assert_eq!(stoolap_rows_column_int64(rows, 0), 1);
+        stoolap_rows_close(rows);
+
+        // Cleanup.
+        stoolap_stmt_finalize(stmt);
+        stoolap_close(db2);
+    }
+}
+
+#[test]
+fn test_close_db_with_live_tx_keeps_registry_pointing_at_live_engine() {
+    // Round-6 P1, transaction variant: stoolap_tx_begin's keepalive
+    // (Arc<DatabaseInner> via tx._db_keepalive) must protect the registry
+    // entry the same way as the prepared-statement variant. Without the
+    // strong_count(inner) check in try_unregister_arc, stoolap_close
+    // unregisters the engine while the transaction is still live, and a
+    // sibling open sees a fresh engine.
+    unsafe {
+        let dsn = cstr("memory://round6-tx-keepalive");
+
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(stoolap_open(dsn.as_ptr(), &mut db), STOOLAP_OK);
+        let create = cstr("CREATE TABLE t (id INTEGER PRIMARY KEY)");
+        assert_eq!(
+            stoolap_exec(db, create.as_ptr(), std::ptr::null_mut()),
+            STOOLAP_OK
+        );
+        let insert = cstr("INSERT INTO t VALUES (7)");
+        assert_eq!(
+            stoolap_exec(db, insert.as_ptr(), std::ptr::null_mut()),
+            STOOLAP_OK
+        );
+
+        // Begin a transaction — tx keepalive holds Arc<DatabaseInner>.
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
+
+        // Close the original DB handle.
+        assert_eq!(stoolap_close(db), STOOLAP_OK);
+
+        // Reopen — must reuse the still-live engine.
+        let mut db2: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(stoolap_open(dsn.as_ptr(), &mut db2), STOOLAP_OK);
+
+        let select = cstr("SELECT id FROM t");
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        let rc = stoolap_query(db2, select.as_ptr(), &mut rows);
+        assert_eq!(
+            rc,
+            STOOLAP_OK,
+            "reopen must hit the same engine the tx is still using; got: {}",
+            read_cstr(stoolap_errmsg(db2))
+        );
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_ROW);
+        assert_eq!(stoolap_rows_column_int64(rows, 0), 7);
+        stoolap_rows_close(rows);
+
+        assert_eq!(stoolap_tx_rollback(tx), STOOLAP_OK);
+        stoolap_close(db2);
+    }
+}
+
+// =========================================================================
+// Bucket A: typed errors, table_count, savepoints, read-only handle
+// =========================================================================
+
+/// Build a fresh `StoolapErrorDetails` zeroed out — code OK, all pointers
+/// NULL — to make assertions on what `errdetails` actually populates.
+fn empty_details() -> StoolapErrorDetails {
+    StoolapErrorDetails {
+        code: -1,
+        _padding: 0,
+        message: std::ptr::null(),
+        table: std::ptr::null(),
+        column: std::ptr::null(),
+        constraint: std::ptr::null(),
+        detail: std::ptr::null(),
+    }
+}
+
+#[test]
+fn test_errcode_no_error_initial() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        assert_eq!(stoolap_errcode(db), STOOLAP_ERR_OK);
+        let mut det = empty_details();
+        assert_eq!(stoolap_errdetails(db, &mut det), STOOLAP_OK);
+        assert_eq!(det.code, STOOLAP_ERR_OK);
+        // message is empty string but non-NULL.
+        assert!(!det.message.is_null());
+        assert_eq!(read_cstr(det.message), "");
+        assert!(det.table.is_null());
+        assert!(det.column.is_null());
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_errdetails_table_not_found() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        let sql = cstr("SELECT * FROM no_such_table");
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, sql.as_ptr(), &mut rows), STOOLAP_ERROR);
+        assert_eq!(stoolap_errcode(db), STOOLAP_ERR_TABLE_NOT_FOUND);
+        let mut det = empty_details();
+        stoolap_errdetails(db, &mut det);
+        assert_eq!(det.code, STOOLAP_ERR_TABLE_NOT_FOUND);
+        assert!(!det.table.is_null());
+        assert_eq!(read_cstr(det.table), "no_such_table");
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_errdetails_unique_constraint() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        stoolap_exec(
+            db,
+            cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, e TEXT UNIQUE)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        stoolap_exec(
+            db,
+            cstr("INSERT INTO t VALUES (1, 'a@x')").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        // Conflict on the UNIQUE column 'e'.
+        let rc = stoolap_exec(
+            db,
+            cstr("INSERT INTO t VALUES (2, 'a@x')").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc, STOOLAP_ERROR);
+        assert_eq!(stoolap_errcode(db), STOOLAP_ERR_UNIQUE);
+        let mut det = empty_details();
+        stoolap_errdetails(db, &mut det);
+        assert!(!det.column.is_null());
+        assert_eq!(read_cstr(det.column), "e");
+        // constraint = index name (auto-generated, contains the column).
+        assert!(!det.constraint.is_null());
+        // detail = the conflicting value (formatted by the unique-index path;
+        // exact formatting may vary across versions, only assert presence).
+        assert!(!det.detail.is_null());
+        let det_str = read_cstr(det.detail);
+        assert!(
+            det_str.contains("a@x"),
+            "detail did not include value: {}",
+            det_str
+        );
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_errdetails_primary_key_constraint() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        stoolap_exec(
+            db,
+            cstr("CREATE TABLE t (id INTEGER PRIMARY KEY)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        stoolap_exec(
+            db,
+            cstr("INSERT INTO t VALUES (7)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        let rc = stoolap_exec(
+            db,
+            cstr("INSERT INTO t VALUES (7)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc, STOOLAP_ERROR);
+        assert_eq!(stoolap_errcode(db), STOOLAP_ERR_PRIMARY_KEY);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_errdetails_not_null_constraint() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        stoolap_exec(
+            db,
+            cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        // Explicit NULL on a NOT NULL column reaches the constraint check
+        // (a missing column is a different error path that the engine
+        // classifies as Internal — that one is not NOT_NULL).
+        let rc = stoolap_exec(
+            db,
+            cstr("INSERT INTO t (id, name) VALUES (1, NULL)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc, STOOLAP_ERROR);
+        assert_eq!(stoolap_errcode(db), STOOLAP_ERR_NOT_NULL);
+        let mut det = empty_details();
+        stoolap_errdetails(db, &mut det);
+        assert_eq!(read_cstr(det.column), "name");
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_errdetails_read_only_open_rejection() {
+    // Database::open rejects ?read_only=true with InvalidArgument that
+    // points the caller to open_read_only. The migration message lands
+    // in the thread-local error slot since `db` is NULL.
+    let dir = tempfile::tempdir().unwrap();
+    let dsn_str = format!(
+        "file://{}?read_only=1",
+        dir.path().join("ro_open").display()
+    );
+    unsafe {
+        let dsn = cstr(&dsn_str);
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        let rc = stoolap_open(dsn.as_ptr(), &mut db);
+        assert_eq!(rc, STOOLAP_ERROR);
+        assert_eq!(
+            stoolap_errcode(std::ptr::null()),
+            STOOLAP_ERR_INVALID_ARGUMENT
+        );
+        let msg = read_cstr(stoolap_errmsg(std::ptr::null()));
+        assert!(
+            msg.contains("Database::open_read_only"),
+            "expected migration message, got: {}",
+            msg
+        );
+    }
+}
+
+#[test]
+fn test_errcode_clears_on_success() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        // First produce an error so the handle has a code set.
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        stoolap_query(db, cstr("SELECT * FROM nope").as_ptr(), &mut rows);
+        assert_ne!(stoolap_errcode(db), STOOLAP_ERR_OK);
+        // Then succeed; the error should clear.
+        stoolap_exec(
+            db,
+            cstr("CREATE TABLE t (id INTEGER PRIMARY KEY)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(stoolap_errcode(db), STOOLAP_ERR_OK);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_table_count_db_inmemory() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        stoolap_exec(
+            db,
+            cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        let mut count: u64 = 999;
+        assert_eq!(
+            stoolap_table_count(db, cstr("t").as_ptr(), &mut count),
+            STOOLAP_OK
+        );
+        assert_eq!(count, 0);
+        stoolap_exec(
+            db,
+            cstr("INSERT INTO t VALUES (1,10),(2,20),(3,30)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        stoolap_table_count(db, cstr("t").as_ptr(), &mut count);
+        assert_eq!(count, 3);
+        // missing table -> error + STOOLAP_ERR_TABLE_NOT_FOUND
+        assert_eq!(
+            stoolap_table_count(db, cstr("nope").as_ptr(), &mut count),
+            STOOLAP_ERROR
+        );
+        assert_eq!(stoolap_errcode(db), STOOLAP_ERR_TABLE_NOT_FOUND);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_tx_table_count_sees_local_inserts() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        stoolap_exec(
+            db,
+            cstr("CREATE TABLE t (id INTEGER PRIMARY KEY)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        stoolap_exec(
+            db,
+            cstr("INSERT INTO t VALUES (1),(2)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        stoolap_begin(db, &mut tx);
+        stoolap_tx_exec(
+            tx,
+            cstr("INSERT INTO t VALUES (3)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+
+        // Inside the tx: should see 3 (committed 2 + local 1).
+        let mut count: u64 = 0;
+        assert_eq!(
+            stoolap_tx_table_count(tx, cstr("t").as_ptr(), &mut count),
+            STOOLAP_OK
+        );
+        assert_eq!(count, 3);
+
+        // Autocommit Database::table_count outside the tx: still 2 (commit
+        // hasn't happened yet, so committed_row_count is unchanged).
+        let mut db_count: u64 = 0;
+        stoolap_table_count(db, cstr("t").as_ptr(), &mut db_count);
+        assert_eq!(db_count, 2);
+
+        stoolap_tx_commit(tx);
+        stoolap_table_count(db, cstr("t").as_ptr(), &mut db_count);
+        assert_eq!(db_count, 3);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_savepoint_create_rollback_release() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        stoolap_exec(
+            db,
+            cstr("CREATE TABLE t (id INTEGER PRIMARY KEY)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        stoolap_begin(db, &mut tx);
+
+        stoolap_tx_exec(
+            tx,
+            cstr("INSERT INTO t VALUES (1)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+
+        // Savepoint, then add another row.
+        let sp = cstr("sp1");
+        assert_eq!(stoolap_tx_savepoint(tx, sp.as_ptr(), -1), STOOLAP_OK);
+        stoolap_tx_exec(
+            tx,
+            cstr("INSERT INTO t VALUES (2)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        let mut c: u64 = 0;
+        stoolap_tx_table_count(tx, cstr("t").as_ptr(), &mut c);
+        assert_eq!(c, 2);
+
+        // Rollback to savepoint discards the second insert.
+        assert_eq!(
+            stoolap_tx_rollback_to_savepoint(tx, sp.as_ptr(), -1),
+            STOOLAP_OK
+        );
+        stoolap_tx_table_count(tx, cstr("t").as_ptr(), &mut c);
+        assert_eq!(c, 1);
+
+        // Subsequent rollback after rollback-to: SQL standard keeps the
+        // savepoint usable for re-pinning, but a fresh release on a new
+        // name should still work end-to-end.
+        let sp2 = cstr("sp2");
+        assert_eq!(stoolap_tx_savepoint(tx, sp2.as_ptr(), -1), STOOLAP_OK);
+        assert_eq!(
+            stoolap_tx_release_savepoint(tx, sp2.as_ptr(), -1),
+            STOOLAP_OK
+        );
+
+        // Release of unknown savepoint -> error with a specific message.
+        let bogus = cstr("does_not_exist");
+        assert_eq!(
+            stoolap_tx_release_savepoint(tx, bogus.as_ptr(), -1),
+            STOOLAP_ERROR
+        );
+        let msg = read_cstr(stoolap_tx_errmsg(tx));
+        assert!(msg.contains("savepoint"), "got: {}", msg);
+
+        stoolap_tx_commit(tx);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_savepoint_explicit_name_len() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        stoolap_exec(
+            db,
+            cstr("CREATE TABLE t (id INTEGER PRIMARY KEY)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        let mut tx: *mut StoolapTx = std::ptr::null_mut();
+        stoolap_begin(db, &mut tx);
+        // Embed extra trailing bytes; the explicit length should clip.
+        let raw: &[u8] = b"sp_aBOGUS";
+        assert_eq!(
+            stoolap_tx_savepoint(tx, raw.as_ptr() as *const c_char, 4),
+            STOOLAP_OK
+        );
+        // Same name used with the explicit length: release succeeds.
+        assert_eq!(
+            stoolap_tx_release_savepoint(tx, raw.as_ptr() as *const c_char, 4),
+            STOOLAP_OK
+        );
+        stoolap_tx_rollback(tx);
+        stoolap_close(db);
+    }
+}
+
+#[test]
+fn test_open_read_only_basic_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn_str = format!("file://{}", dir.path().join("ro_query").display());
+    unsafe {
+        // First, write some data via a writable handle.
+        let dsn = cstr(&dsn_str);
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(stoolap_open(dsn.as_ptr(), &mut db), STOOLAP_OK);
+        stoolap_exec(
+            db,
+            cstr("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        stoolap_exec(
+            db,
+            cstr("INSERT INTO t VALUES (1,100),(2,200)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        stoolap_close(db);
+
+        // Now open read-only and query.
+        let mut ro: *mut StoolapRoDB = std::ptr::null_mut();
+        assert_eq!(stoolap_open_read_only(dsn.as_ptr(), &mut ro), STOOLAP_OK);
+        assert!(!ro.is_null());
+
+        // table_exists / table_count smoke
+        assert_eq!(stoolap_ro_table_exists(ro, cstr("t").as_ptr()), 1);
+        assert_eq!(stoolap_ro_table_exists(ro, cstr("nope").as_ptr()), 0);
+        let mut count: u64 = 0;
+        assert_eq!(
+            stoolap_ro_table_count(ro, cstr("t").as_ptr(), &mut count),
+            STOOLAP_OK
+        );
+        assert_eq!(count, 2);
+
+        // Query.
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(
+            stoolap_ro_query(ro, cstr("SELECT v FROM t ORDER BY id").as_ptr(), &mut rows),
+            STOOLAP_OK
+        );
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_ROW);
+        assert_eq!(stoolap_rows_column_int64(rows, 0), 100);
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_ROW);
+        assert_eq!(stoolap_rows_column_int64(rows, 0), 200);
+        assert_eq!(stoolap_rows_next(rows), STOOLAP_DONE);
+        stoolap_rows_close(rows);
+
+        // dsn() pointer is stable across calls.
+        let p1 = stoolap_ro_dsn(ro);
+        let p2 = stoolap_ro_dsn(ro);
+        assert_eq!(p1, p2);
+
+        stoolap_ro_close(ro);
+    }
+}
+
+#[test]
+fn test_open_read_only_accepts_dsn_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ro_flag");
+    let create_dsn = format!("file://{}", path.display());
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        assert_eq!(
+            stoolap_open(cstr(&create_dsn).as_ptr(), &mut db),
+            STOOLAP_OK
+        );
+        stoolap_exec(
+            db,
+            cstr("CREATE TABLE t (id INTEGER PRIMARY KEY)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        stoolap_close(db);
+
+        // The DSN flag is redundant on this path but accepted, so
+        // existing driver DSN strings continue to work unchanged.
+        for suffix in &["?read_only=1", "?readonly=true", "?mode=ro"] {
+            let dsn = format!("file://{}{}", path.display(), suffix);
+            let mut ro: *mut StoolapRoDB = std::ptr::null_mut();
+            assert_eq!(
+                stoolap_open_read_only(cstr(&dsn).as_ptr(), &mut ro),
+                STOOLAP_OK,
+                "open_read_only failed for suffix {}",
+                suffix
+            );
+            stoolap_ro_close(ro);
+        }
+    }
+}
+
+#[test]
+fn test_ro_query_rejects_write_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn_str = format!("file://{}", dir.path().join("ro_write_reject").display());
+    unsafe {
+        let dsn = cstr(&dsn_str);
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open(dsn.as_ptr(), &mut db);
+        stoolap_exec(
+            db,
+            cstr("CREATE TABLE t (id INTEGER PRIMARY KEY)").as_ptr(),
+            std::ptr::null_mut(),
+        );
+        stoolap_close(db);
+
+        let mut ro: *mut StoolapRoDB = std::ptr::null_mut();
+        stoolap_open_read_only(dsn.as_ptr(), &mut ro);
+        let mut rows: *mut StoolapRows = std::ptr::null_mut();
+        // Write SQL routed through the read surface is rejected.
+        let rc = stoolap_ro_query(ro, cstr("INSERT INTO t VALUES (1)").as_ptr(), &mut rows);
+        assert_eq!(rc, STOOLAP_ERROR);
+        assert_eq!(stoolap_ro_errcode(ro), STOOLAP_ERR_READ_ONLY);
+        stoolap_ro_close(ro);
+    }
+}

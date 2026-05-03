@@ -1342,6 +1342,100 @@ impl fmt::Display for Statement {
     }
 }
 
+impl Statement {
+    /// Returns `Some(reason)` if this statement mutates persistent state
+    /// or session-wide configuration, `None` if it is a read-only statement.
+    /// The reason string is used for error messages from read-only databases.
+    pub fn write_reason(&self) -> Option<&'static str> {
+        match self {
+            // --- Pure reads ---
+            Statement::Select(_) => None,
+            Statement::ShowTables(_)
+            | Statement::ShowViews(_)
+            | Statement::ShowCreateTable(_)
+            | Statement::ShowCreateView(_)
+            | Statement::ShowIndexes(_)
+            | Statement::Describe(_) => None,
+            Statement::Begin(_)
+            | Statement::Commit(_)
+            | Statement::Rollback(_)
+            | Statement::Savepoint(_)
+            | Statement::ReleaseSavepoint(_) => None,
+            Statement::Expression(_) => None,
+
+            // --- Writes (DML/DDL/maintenance) ---
+            Statement::Insert(_) => Some("INSERT"),
+            Statement::Update(_) => Some("UPDATE"),
+            Statement::Delete(_) => Some("DELETE"),
+            Statement::Truncate(_) => Some("TRUNCATE"),
+            Statement::CreateTable(_) => Some("CREATE TABLE"),
+            Statement::DropTable(_) => Some("DROP TABLE"),
+            Statement::AlterTable(_) => Some("ALTER TABLE"),
+            Statement::CreateIndex(_) => Some("CREATE INDEX"),
+            Statement::DropIndex(_) => Some("DROP INDEX"),
+            Statement::CreateView(_) => Some("CREATE VIEW"),
+            Statement::DropView(_) => Some("DROP VIEW"),
+            Statement::Analyze(_) => Some("ANALYZE"),
+            Statement::Vacuum(_) => Some("VACUUM"),
+            Statement::Copy(_) => Some("COPY"),
+
+            // --- Conditional ---
+            Statement::Set(set) => {
+                // SET TRANSACTION ISOLATION LEVEL is a session mutation (rejected on read-only).
+                // Other SET statements (e.g. unknown vars from drivers) are benign no-ops.
+                let name_lower = &set.name.value_lower;
+                if name_lower == "isolation_level"
+                    || name_lower == "transaction_isolation"
+                    || name_lower.starts_with("transaction")
+                {
+                    Some("SET TRANSACTION")
+                } else {
+                    None
+                }
+            }
+            Statement::Pragma(p) => {
+                // Any PRAGMA with a value is a setter (write).
+                if p.value.is_some() {
+                    return Some("PRAGMA <write>");
+                }
+                // Without a value the pragma is either a getter (read) or a
+                // maintenance command (write). Fail closed: only an explicit
+                // allow-list of known-read pragmas returns None; anything
+                // else (including future maintenance commands) is treated
+                // as a write. This prevents bypasses like `PRAGMA RESTORE`
+                // which has no value but rewrites the entire database.
+                let n = &p.name.value_lower;
+                match n.as_str() {
+                    // Pure-read getters / informational pragmas
+                    "volume_stats"
+                    | "snapshot_interval"
+                    | "checkpoint_interval"
+                    | "compact_threshold"
+                    | "target_volume_rows"
+                    | "sync_mode"
+                    | "wal_flush_trigger"
+                    | "keep_snapshots"
+                    // SWMR v2 P2.12: cross-process diagnostic. Pure read.
+                    | "swmr_status" => None,
+                    // Everything else (snapshot, checkpoint, restore, vacuum,
+                    // compact, dedup_segments, analyze, future maintenance
+                    // pragmas, unknown pragmas) is treated as a write.
+                    _ => Some("PRAGMA <maintenance>"),
+                }
+            }
+            Statement::Explain(e) => {
+                // EXPLAIN of a write statement is read (it analyzes, doesn't execute).
+                // EXPLAIN ANALYZE actually executes — treat it as a write if inner is a write.
+                if e.analyze {
+                    e.statement.write_reason()
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
 /// Program (collection of statements)
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {

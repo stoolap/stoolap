@@ -82,12 +82,15 @@
 
 pub mod database;
 pub mod params;
+pub mod read_only_database;
+pub(crate) mod reader_attachment;
 pub mod rows;
 pub mod statement;
 pub mod transaction;
 
 pub use database::{Database, FromValue};
 pub use params::{NamedParams, ParamVec, Params, ToParam};
+pub use read_only_database::ReadOnlyDatabase;
 pub use rows::{FromRow, ResultRow, Rows};
 pub use statement::Statement;
 pub use transaction::Transaction;

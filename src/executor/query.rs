@@ -1825,7 +1825,7 @@ impl Executor {
     /// - The column must have an index
     fn try_distinct_pushdown(
         &self,
-        table: &dyn crate::storage::traits::Table,
+        table: &dyn crate::storage::traits::ReadTable,
         stmt: &SelectStatement,
         all_columns: &[String],
         classification: &std::sync::Arc<QueryClassification>,
@@ -1929,22 +1929,33 @@ impl Executor {
         let active_tx = self.active_transaction.lock().unwrap();
         let in_explicit_transaction = active_tx.is_some();
 
-        // Get table from active transaction or create a new one
-        let (table, _standalone_tx) = if let Some(ref tx_state) = *active_tx {
+        // Get table from active transaction or create a new one. The simple
+        // table-scan path is read-only (all `table.` calls below are read
+        // methods like `schema`, `scan`, `collect_rows_with_limit_unordered`),
+        // so we use the read-only table surface throughout. The standalone
+        // tx is a `ReadTransaction` for the same reason.
+        let (table, _standalone_tx): (
+            Box<dyn crate::storage::traits::ReadTable>,
+            Option<Box<dyn crate::storage::traits::ReadTransaction>>,
+        ) = if let Some(ref tx_state) = *active_tx {
             // Use the active transaction - this allows seeing uncommitted changes
-            let table = tx_state.transaction.get_table(table_name).map_err(|e| {
-                if matches!(e, Error::TableNotFound(_)) {
-                    Error::TableOrViewNotFound(table_name.to_string())
-                } else {
-                    e
-                }
-            })?;
+            let table = tx_state
+                .transaction
+                .get_read_table(table_name)
+                .map_err(|e| {
+                    if matches!(e, Error::TableNotFound(_)) {
+                        Error::TableOrViewNotFound(table_name.to_string())
+                    } else {
+                        e
+                    }
+                })?;
             drop(active_tx); // Release lock before doing work
             (table, None)
         } else {
             drop(active_tx); // Release lock before creating new transaction
-                             // No active transaction - create a standalone transaction
-            let tx = self.engine.begin_transaction()?;
+                             // No active transaction - create a standalone read-only transaction
+            use crate::storage::traits::ReadEngine;
+            let tx = ReadEngine::begin_read_transaction(self.engine.as_ref())?;
 
             // Check for AS OF (temporal query)
             if let Some(ref as_of) = table_source.as_of {
@@ -1958,7 +1969,7 @@ impl Executor {
                 );
             }
 
-            let table = tx.get_table(table_name).map_err(|e| {
+            let table = tx.get_read_table(table_name).map_err(|e| {
                 if matches!(e, Error::TableNotFound(_)) {
                     Error::TableOrViewNotFound(table_name.to_string())
                 } else {
@@ -4014,9 +4025,11 @@ impl Executor {
                     });
 
                 if let Some(outer_idx) = outer_key_idx {
-                    // Get inner table for schema and row fetching
-                    let txn = self.engine.begin_transaction()?;
-                    let inner_table = txn.get_table(&table_name)?;
+                    // Get inner table for schema and row fetching. Read-only
+                    // path: the join only ever reads from inner_table.
+                    use crate::storage::traits::ReadEngine;
+                    let txn = ReadEngine::begin_read_transaction(self.engine.as_ref())?;
+                    let inner_table = txn.get_read_table(&table_name)?;
                     let inner_schema = inner_table.schema();
 
                     // Build inner columns list (qualified)
@@ -7731,9 +7744,10 @@ impl Executor {
         // Start a new transaction, with isolation level if specified
         let transaction = if let Some(ref level) = stmt.isolation_level {
             let isolation = Self::parse_isolation_level(level)?;
-            self.engine.begin_transaction_with_level(isolation)?
+            self.engine
+                .begin_writable_transaction_with_level_internal(isolation)?
         } else {
-            self.engine.begin_transaction()?
+            self.engine.begin_writable_transaction_internal()?
         };
 
         *active_tx = Some(ActiveTransaction {
@@ -7971,6 +7985,66 @@ impl Executor {
                 let columns = vec!["result".to_string()];
                 let mut rows = RowVec::with_capacity(1);
                 rows.push((0, Row::from_values(vec![Value::text(&result_msg)])));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
+            "SWMR_STATUS" => {
+                // PRAGMA SWMR_STATUS: cross-process diagnostic. Returns
+                // a single row describing this engine's view of SWMR
+                // coordination state. Useful for debugging "why isn't
+                // my reader seeing data?" / "why isn't the writer
+                // unlinking old volumes?".
+                if stmt.value.is_some() {
+                    return Err(Error::internal("PRAGMA SWMR_STATUS does not accept values"));
+                }
+                let cfg = self.engine.config();
+                let path = self.engine.get_path();
+                let read_only = self.engine.is_read_only_mode();
+
+                // Manifest epoch (writer's last published checkpoint).
+                let manifest_epoch_value = if path.is_empty() {
+                    0i64
+                } else {
+                    crate::storage::mvcc::manifest_epoch::read_epoch(std::path::Path::new(path))
+                        .unwrap_or(0) as i64
+                };
+
+                // Effective lease max_age that the writer's GC uses.
+                let lease_max_age_secs = if cfg.persistence.lease_max_age_secs > 0 {
+                    cfg.persistence.lease_max_age_secs as i64
+                } else {
+                    ((cfg.persistence.checkpoint_interval as u64 * 2).max(120)) as i64
+                };
+
+                // Live lease count (only meaningful for file engines).
+                let live_lease_count = if path.is_empty() {
+                    0i64
+                } else {
+                    let dir =
+                        std::path::Path::new(path).join(crate::storage::mvcc::lease::READERS_DIR);
+                    let max_age = std::time::Duration::from_secs(lease_max_age_secs as u64);
+                    crate::storage::mvcc::lease::live_leases(&dir, max_age)
+                        .map(|v| v.len() as i64)
+                        .unwrap_or(0)
+                };
+
+                let columns = vec![
+                    "manifest_epoch".to_string(),
+                    "live_lease_count".to_string(),
+                    "lease_max_age_secs".to_string(),
+                    "is_read_only".to_string(),
+                    "checkpoint_interval_secs".to_string(),
+                ];
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![
+                        Value::Integer(manifest_epoch_value),
+                        Value::Integer(live_lease_count),
+                        Value::Integer(lease_max_age_secs),
+                        Value::Boolean(read_only),
+                        Value::Integer(cfg.persistence.checkpoint_interval as i64),
+                    ]),
+                ));
                 Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
             "DEDUP_SEGMENTS" => {
@@ -8311,13 +8385,13 @@ impl Executor {
         as_of: &AsOfClause,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
-        tx: &dyn crate::storage::traits::Transaction,
+        tx: &dyn crate::storage::traits::ReadTransaction,
         classification: &std::sync::Arc<QueryClassification>,
     ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
 
-        // Get table schema
-        let table = tx.get_table(table_name)?;
+        // Get table schema (read-only handle is sufficient)
+        let table = tx.get_read_table(table_name)?;
         let schema = table.schema().clone();
         let all_columns: Vec<String> = schema.column_names_owned().to_vec();
 
@@ -8994,9 +9068,10 @@ impl Executor {
             inner_col.clone()
         };
 
-        // Try to get the table and check for index or PK
-        let txn = self.engine.begin_transaction().ok()?;
-        let table = txn.get_table(table_name_ref).ok()?;
+        // Try to get the table and check for index or PK. Read-only path.
+        use crate::storage::traits::ReadEngine;
+        let txn = ReadEngine::begin_read_transaction(self.engine.as_ref()).ok()?;
+        let table = txn.get_read_table(table_name_ref).ok()?;
         let schema = table.schema();
 
         // First check if inner column is the PRIMARY KEY (direct row_id lookup)
@@ -9273,7 +9348,7 @@ impl Executor {
     fn try_streaming_group_by(
         &self,
         stmt: &SelectStatement,
-        table: &dyn crate::storage::traits::Table,
+        table: &dyn crate::storage::traits::ReadTable,
         all_columns: &[String],
         ctx: &ExecutionContext,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {

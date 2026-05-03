@@ -23,7 +23,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::common::I64Set;
 use crate::core::{Error, Result};
@@ -65,8 +65,22 @@ const CHECKPOINT_MAGIC: u32 = 0x43504F49;
 // │ Reserved       (4 bytes)  Reserved for future use               │
 // └─────────────────────────────────────────────────────────────────┘
 
-/// Current WAL entry format version
-const WAL_FORMAT_VERSION: u8 = 2;
+/// Current WAL entry format version.
+///
+/// - **v1** (historical): no header magic byte, retired before v0.4.
+/// - **v2** (released): 32-byte header with magic + version + flags +
+///   LSN + entry size; data portion has txn_id, table_name, row_id,
+///   operation, timestamp, data_len + data. CRC32 covers data only.
+/// - **v3** (SWMR v2): adds an `i64 commit_seq` to the data portion
+///   immediately after the operation byte AND extends CRC32 to cover
+///   header + data so the LSN / flags / entry_size are authenticated.
+///   For DML entries `commit_seq` is 0 (placeholder; reader joins to
+///   the commit marker by txn_id). For commit markers it is the
+///   writer's actual commit_seq — what reader's WAL-tail uses to tag
+///   tombstones consistently with `snapshot_seq` filtering. v2
+///   entries decode with `commit_seq=0` and the data-only CRC scope
+///   (selected by the version byte), so v0.4.0 WALs replay in place.
+const WAL_FORMAT_VERSION: u8 = 3;
 
 /// WAL entry header size in bytes
 const WAL_HEADER_SIZE: u16 = 32;
@@ -239,6 +253,17 @@ pub struct WALEntry {
     pub data: Vec<u8>,
     /// Operation timestamp (nanoseconds since epoch)
     pub timestamp: i64,
+    /// Commit sequence number (SWMR v2, format v3).
+    ///
+    /// - On a commit marker: the actual `commit_seq` allocated by
+    ///   `TransactionRegistry::start_commit`. Reader's WAL-tail uses
+    ///   this to tag tombstones from the corresponding txn's DML so
+    ///   `snapshot_seq` filtering matches what the writer's manifest
+    ///   stores.
+    /// - On DML entries: 0 (placeholder; reader joins to the txn's
+    ///   commit marker by `txn_id`).
+    /// - On v2 entries decoded under v3 code: 0 (back-compat).
+    pub commit_seq: i64,
 }
 
 impl WALEntry {
@@ -265,7 +290,16 @@ impl WALEntry {
             operation,
             data,
             timestamp,
+            commit_seq: 0, // 0 for DML; commit markers override via with_commit_seq.
         }
+    }
+
+    /// Set `commit_seq` on this entry. Builder-style; used by the commit
+    /// marker constructor to record the writer's allocated commit_seq
+    /// so reader's WAL-tail can tag tombstones consistently.
+    pub fn with_commit_seq(mut self, commit_seq: i64) -> Self {
+        self.commit_seq = commit_seq;
+        self
     }
 
     /// Create a new WAL entry with flags
@@ -282,9 +316,12 @@ impl WALEntry {
         entry
     }
 
-    /// Create a commit entry (with COMMIT_MARKER flag for two-phase recovery)
-    pub fn commit(txn_id: i64) -> Self {
-        // Always set COMMIT_MARKER flag so two-phase recovery can identify commits
+    /// Create a commit entry (with COMMIT_MARKER flag for two-phase
+    /// recovery). `commit_seq` is the value `start_commit` allocated
+    /// for this transaction; reader's WAL-tail consumes it (SWMR v2).
+    /// Pass 0 for DDL-style synthetic commits that don't participate
+    /// in snapshot_seq.
+    pub fn commit(txn_id: i64, commit_seq: i64) -> Self {
         Self::with_flags(
             txn_id,
             String::new(),
@@ -293,12 +330,12 @@ impl WALEntry {
             Vec::new(),
             WalFlags::COMMIT_MARKER,
         )
+        .with_commit_seq(commit_seq)
     }
 
-    /// Create a commit marker entry (explicit commit record for two-phase recovery)
-    /// Note: This is now equivalent to commit() - kept for API compatibility
-    pub fn commit_marker(txn_id: i64) -> Self {
-        Self::commit(txn_id)
+    /// Create a commit marker entry. Equivalent to [`Self::commit`].
+    pub fn commit_marker(txn_id: i64, commit_seq: i64) -> Self {
+        Self::commit(txn_id, commit_seq)
     }
 
     /// Create a rollback entry (with ABORT_MARKER flag for two-phase recovery)
@@ -320,14 +357,26 @@ impl WALEntry {
         Self::rollback(txn_id)
     }
 
-    /// Check if this entry is a commit marker
+    /// Check if this entry is a commit marker.
+    ///
+    /// Classify on the `operation` byte ONLY. The
+    /// header `flags` byte is NOT covered by the WAL CRC (CRC32
+    /// hashes only the data portion starting after the 32-byte
+    /// header), so a header-bit corruption could flip
+    /// `COMMIT_MARKER` on for a DML entry (silently adding the
+    /// txn to `committed_txns`) or off for a real commit marker
+    /// (silently losing the commit). The `operation` byte lives
+    /// in the CRC-protected data section, so it's the only safe
+    /// source of truth for marker classification.
     pub fn is_commit_marker(&self) -> bool {
-        self.flags.contains(WalFlags::COMMIT_MARKER) || self.operation == WALOperationType::Commit
+        self.operation == WALOperationType::Commit
     }
 
-    /// Check if this entry is an abort marker
+    /// Check if this entry is an abort marker. Same CRC-coverage
+    /// reasoning as `is_commit_marker` — classify on the
+    /// CRC-protected `operation` byte.
     pub fn is_abort_marker(&self) -> bool {
-        self.flags.contains(WalFlags::ABORT_MARKER) || self.operation == WALOperationType::Rollback
+        self.operation == WALOperationType::Rollback
     }
 
     /// Encode entry to binary format with integrity protection
@@ -376,8 +425,8 @@ impl WALEntry {
         }
         let payload: &[u8] = compressed_data.as_deref().unwrap_or(&self.data);
 
-        // Calculate data portion size: txnID(8) + tableNameLen(2) + tableName + rowID(8) + op(1) + ts(8) + dataLen(4) + data
-        let data_size = 8 + 2 + self.table_name.len() + 8 + 1 + 8 + 4 + payload.len();
+        // Calculate data portion size: txnID(8) + tableNameLen(2) + tableName + rowID(8) + op(1) + commitSeq(8, v3+) + ts(8) + dataLen(4) + data
+        let data_size = 8 + 2 + self.table_name.len() + 8 + 1 + 8 + 8 + 4 + payload.len();
 
         // Total buffer: header(32) + data + CRC(4)
         let mut buf = Vec::with_capacity(WAL_HEADER_SIZE as usize + data_size + 4);
@@ -425,6 +474,12 @@ impl WALEntry {
         // Operation (1 byte)
         buf.push(self.operation as u8);
 
+        // CommitSeq (8 bytes, format v3). Always written by v3 encoders;
+        // v2 decoders that see a v3 entry would fail at the size check
+        // anyway because of the extra 8 bytes — version byte tells the
+        // decoder which layout to expect.
+        buf.extend_from_slice(&self.commit_seq.to_le_bytes());
+
         // Timestamp (8 bytes)
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
 
@@ -434,37 +489,163 @@ impl WALEntry {
         buf.extend_from_slice(payload);
 
         // ========== CRC32 (4 bytes) ==========
-        // Calculate CRC over data portion only (starting after 32-byte header)
-        // This allows decode() to verify integrity without needing the header bytes
-        let crc = crc32fast::hash(&buf[WAL_HEADER_SIZE as usize..]);
+        // v3 CRC covers the FULL buffer (header + data). v2's
+        // data-only scope left LSN / flags / entry_size /
+        // version unauthenticated; a header-bit corruption
+        // could move an in-window scanner entry out of window
+        // or change a DML's apparent commit-marker
+        // classification. v3 decoders verify the full CRC; v2
+        // entries (legacy on-disk WALs from v0.4.0) fall back
+        // to data-only CRC for back-compat.
+        let crc = crc32fast::hash(&buf[..]);
         buf.extend_from_slice(&crc.to_le_bytes());
 
         buf
     }
 
+    /// Verify the CRC32 of an encoded entry without
+    /// parsing the fields. Cheaper than `decode` (skips
+    /// decompression + field decoding) — used by SWMR tail
+    /// scanners to authenticate the header (v3) or the data
+    /// portion (v2) BEFORE trusting the header LSN for
+    /// windowing decisions. Without this, a corrupted header LSN
+    /// could move an in-window record out of window, the scanner
+    /// would `seek` past it, and the corruption would never
+    /// surface as `SwmrOverlayApplyFailed`.
+    ///
+    /// `header_bytes` is the 32-byte on-disk header; required for
+    /// v3 (covered by CRC) and ignored for v2.
+    pub fn verify_crc(version: u8, header_bytes: &[u8], data: &[u8]) -> Result<()> {
+        if data.len() < 4 {
+            return Err(Error::internal(format!(
+                "data too short for CRC tail: {} bytes",
+                data.len()
+            )));
+        }
+        if version != 2 && version != 3 {
+            return Err(Error::internal(format!(
+                "unsupported WAL entry format version: {}",
+                version
+            )));
+        }
+        let crc_offset = data.len() - 4;
+        let stored_crc = u32::from_le_bytes(data[crc_offset..].try_into().unwrap());
+        let computed_crc = if version >= 3 {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(header_bytes);
+            hasher.update(&data[..crc_offset]);
+            hasher.finalize()
+        } else {
+            crc32fast::hash(&data[..crc_offset])
+        };
+        if stored_crc != computed_crc {
+            return Err(Error::internal(format!(
+                "WAL CRC mismatch (version {}): stored={:#x}, computed={:#x}",
+                version, stored_crc, computed_crc
+            )));
+        }
+        Ok(())
+    }
+
+    /// Cheap classification probe: extract `(txn_id, operation)`
+    /// from the data portion WITHOUT building a full `WALEntry`
+    /// (no payload allocation, no decompression, no schema/value
+    /// parsing). Used by Phase 1 (which only needs to find commit
+    /// markers and their txn_id) and Phase 2 in DDL-only mode
+    /// (which only needs to filter on `operation.is_ddl()`).
+    ///
+    /// Caller MUST have CRC-validated `data` against `header_bytes`
+    /// already — this function trusts the bytes. Layout matches
+    /// `decode`: txn_id(8) + name_len(2) + name(name_len) +
+    /// row_id(8) + op(1). For DML the operation byte is enough to
+    /// classify; for commit/abort markers the txn_id is the
+    /// payload of interest.
+    ///
+    /// Returns `None` on layout corruption (data too short for
+    /// the fixed-offset reads). Caller should fall back to full
+    /// `decode` to surface a richer error.
+    pub fn peek_classification(data: &[u8]) -> Option<(i64, WALOperationType)> {
+        // CRC tail; payload size = data.len() - 4.
+        if data.len() < 4 + 8 + 2 + 8 + 1 {
+            return None;
+        }
+        let payload_len = data.len() - 4;
+        let mut pos = 0;
+        let txn_id = i64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+        pos += 8;
+        let name_len = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+        pos += 2;
+        if pos + name_len + 8 + 1 > payload_len {
+            return None;
+        }
+        pos += name_len; // skip table_name
+        pos += 8; // skip row_id
+        let op_byte = data[pos];
+        let op = WALOperationType::from_u8(op_byte)?;
+        Some((txn_id, op))
+    }
+
     /// Decode entry from data portion (after header has been parsed)
     ///
     /// Parameters:
-    /// - lsn, previous_lsn, flags: extracted from header by caller
+    /// - lsn, previous_lsn, flags, version: extracted from header by caller.
+    ///   `version` selects the data-portion layout AND CRC scope:
+    ///   - v2 (legacy v0.4.0): no commit_seq, CRC covers data only.
+    ///   - v3 (current): adds an 8-byte commit_seq after the operation
+    ///     byte AND extends CRC to cover header + data so the header
+    ///     bytes (LSN, flags, entry_size) are authenticated.
+    ///
+    ///   Versions outside the supported range error.
     /// - data: data portion + CRC (4 bytes)
-    pub fn decode(lsn: u64, previous_lsn: u64, flags: WalFlags, data: &[u8]) -> Result<Self> {
+    /// - header_bytes: the 32-byte on-disk header. Required for v3
+    ///   CRC validation; v2 ignores it. Pre-existing tests can pass
+    ///   an all-zero buffer for v2 entries.
+    pub fn decode(
+        lsn: u64,
+        previous_lsn: u64,
+        flags: WalFlags,
+        version: u8,
+        data: &[u8],
+        header_bytes: &[u8],
+    ) -> Result<Self> {
         // Minimum size: txnID(8) + tableNameLen(2) + rowID(8) + op(1) + ts(8) + dataLen(4) + CRC(4) = 35
+        // (v3 also has commit_seq(8); the per-version size guard fires
+        // after we read enough header to know the version.)
         if data.len() < 35 {
             return Err(Error::internal(format!(
                 "data too short for WAL entry: {} bytes",
                 data.len()
             )));
         }
+        if version != 2 && version != 3 {
+            return Err(Error::internal(format!(
+                "unsupported WAL entry format version: {}",
+                version
+            )));
+        }
 
-        // Verify CRC32 (last 4 bytes)
+        // Verify CRC32 (last 4 bytes). Scope depends on version:
+        //   - v2: CRC covers data portion only (offset 32..pre-CRC).
+        //   - v3: CRC covers header (32 bytes) + data portion.
         let crc_offset = data.len() - 4;
         let stored_crc = u32::from_le_bytes(data[crc_offset..].try_into().unwrap());
-        let computed_crc = crc32fast::hash(&data[..crc_offset]);
+        let computed_crc = if version >= 3 {
+            // Hash header + data so header bytes are
+            // integrity-protected. Caller provides the original
+            // 32-byte header buffer; we hash that followed by the
+            // pre-CRC data slice.
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(header_bytes);
+            hasher.update(&data[..crc_offset]);
+            hasher.finalize()
+        } else {
+            crc32fast::hash(&data[..crc_offset])
+        };
 
         if stored_crc != computed_crc {
             return Err(Error::internal(format!(
-                "WAL entry checksum mismatch at LSN {}: stored={:#x}, computed={:#x}",
-                lsn, stored_crc, computed_crc
+                "WAL entry checksum mismatch at LSN {} (version {}): stored={:#x}, computed={:#x}",
+                lsn, version, stored_crc, computed_crc
             )));
         }
 
@@ -511,6 +692,22 @@ impl WALEntry {
             .ok_or_else(|| Error::internal(format!("invalid operation type: {}", data[pos])))?;
         pos += 1;
 
+        // CommitSeq (8 bytes, v3 only). v2 entries default to 0 — the
+        // synthesize-from-marker-LSN fallback for v2 commit markers is
+        // applied by the WAL-tail caller, not here.
+        let commit_seq: i64 = if version >= 3 {
+            if pos + 8 > data.len() {
+                return Err(Error::internal(
+                    "unexpected end of data reading commit_seq (v3)",
+                ));
+            }
+            let v = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            v
+        } else {
+            0
+        };
+
         // Timestamp (8 bytes)
         if pos + 8 > data.len() {
             return Err(Error::internal("unexpected end of data reading timestamp"));
@@ -552,6 +749,7 @@ impl WALEntry {
             operation,
             data: entry_data,
             timestamp,
+            commit_seq,
         })
     }
 
@@ -602,6 +800,48 @@ pub struct TwoPhaseRecoveryInfo {
     pub applied_entries: u64,
     /// Number of WAL entries skipped (from aborted/in-doubt transactions)
     pub skipped_entries: u64,
+}
+
+/// Per-reader cursor recording the byte offset just past the
+/// last record this reader has CRC-validated AND whose LSN
+/// fell within the prior scan's `to_lsn` window. Used by
+/// `tail_committed_entries` to skip re-reading + re-CRC-
+/// validating bytes the same reader already proved authentic.
+///
+/// CRC-safe by construction: a record's bytes can only land
+/// before `offset` if a prior scan read past it, which means
+/// `verify_crc` accepted it then. WAL files are append-only
+/// between rotations (the writer never rewrites already-
+/// written bytes), so the validated prefix stays stable. On
+/// rotation the cursor's `path` no longer matches the current
+/// scan target and the cache is bypassed for that file.
+///
+/// `lsn_at_offset` records the LSN of the last record
+/// covered by the cursor. The next scan reuses the cursor
+/// ONLY when its window's lower bound is `>= lsn_at_offset` —
+/// otherwise it would skip records the new window still
+/// needs (e.g. an in-flight transaction's DML below
+/// `lsn_at_offset` whose commit marker now lands in the
+/// new window, which Phase 2 must rescan from `entry_floor`
+/// upward).
+///
+/// Trade-off note: a hostile process editing already-validated
+/// WAL bytes out-of-band could escape detection. Stoolap
+/// trusts the WAL directory to be writable only by the
+/// running writer, same as the rest of the persistence layer.
+#[derive(Clone, Debug)]
+pub struct WalScanCursor {
+    /// Absolute path of the WAL file the offset belongs to.
+    pub path: PathBuf,
+    /// Byte position just past the last in-window record this
+    /// reader has CRC-validated in `path`.
+    pub offset: u64,
+    /// LSN of the last record covered by the cursor (i.e. the
+    /// largest LSN whose record fully fits in `[0, offset)`).
+    /// `0` means "no records yet" — the cursor only holds the
+    /// file path, not a real position. Reuse requires the
+    /// next scan's lower bound to be `>= lsn_at_offset`.
+    pub lsn_at_offset: u64,
 }
 
 impl CheckpointMetadata {
@@ -945,10 +1185,21 @@ pub struct WALManager {
     current_wal_file: Mutex<String>,
     /// Current Log Sequence Number
     current_lsn: AtomicU64,
+    /// Highest WAL LSN whose encoded bytes have been written from the
+    /// in-memory WAL buffer to the WAL file. This is intentionally a
+    /// file-write watermark, not an fsync durability watermark:
+    /// SWMR readers need bytes to be readable from the OS page cache,
+    /// while `SyncMode` still controls power-failure durability.
+    flushed_lsn: AtomicU64,
     /// Previous LSN for entry chaining (enables backward traversal)
     previous_lsn: AtomicU64,
     /// Write buffer
     buffer: Mutex<Vec<u8>>,
+    /// Highest LSN currently present in `buffer`. Guarded by
+    /// `buffer`'s mutex; atomic only so the WAL manager can keep the
+    /// field adjacent to the other LSN watermarks without introducing
+    /// another lock type.
+    buffer_highest_lsn: AtomicU64,
     /// Flush trigger size
     flush_trigger: u64,
     /// Maximum WAL file size
@@ -980,12 +1231,55 @@ pub struct WALManager {
     /// Count of in-flight writes (entries taken from buffer but not yet written to disk)
     /// Used to prevent race condition during checkpoint where LSN is read but data isn't on disk yet
     in_flight_writes: AtomicU64,
+    /// SWMR v2 P2 perf fix: per-active-txn first DML LSN. Inserted
+    /// on the first DML entry the writer appends for a given
+    /// `txn_id > 0`; removed on commit/abort marker. The MIN over
+    /// values is the "oldest active txn LSN" published to db.shm so
+    /// readers can floor their WAL-tail Phase 2 entry scan instead
+    /// of starting from LSN 0 every refresh. Synthetic txn_ids
+    /// (DDL = -2, RECOVERY, INVALID) are NOT tracked: they're
+    /// auto-committed (no in-flight period) or used during recovery.
+    active_txn_first_lsn: parking_lot::Mutex<rustc_hash::FxHashMap<i64, u64>>,
+    /// Cached MIN of `active_txn_first_lsn` values, refreshed on
+    /// every insert/remove. `u64::MAX` when the map is empty (no
+    /// active user txns). Engine reads this and publishes to
+    /// `db.shm.oldest_active_txn_lsn` after commit/abort.
+    oldest_active_lsn_cache: AtomicU64,
+    /// Optional `Arc<ShmHandle>` set by the engine after `db.shm`
+    /// creation. When set, every active-set change in
+    /// `refresh_oldest_active_cache_locked` ALSO does
+    /// `shm.oldest_active_txn_lsn.fetch_min(new_oldest, ...)` so
+    /// shm tracks a monotonically-decreasing lower bound of the
+    /// WAL's actual oldest. This is the deterministic guarantee
+    /// the reader's `pre_acquire_swmr_for_read_only_path` relies
+    /// on: any txn that has appended its first DML before the
+    /// reader samples shm has its first-DML LSN reflected (≤)
+    /// in `shm.oldest_active_txn_lsn`, regardless of whether
+    /// the writer's commit fast path skipped the seqlock
+    /// publish or whether the cleanup loop has had a chance to
+    /// run a barrier publish.
+    ///
+    /// `fetch_min` only — the value never RAISES via this
+    /// path. Slow-path commits and `barrier_publish_full_state`
+    /// raise via `.store()` under the seqlock when the actual
+    /// oldest moves up (e.g., a long txn cleared).
+    ///
+    /// `OnceLock` (not `Mutex<Option<...>>`) because the engine
+    /// wires this once during `MVCCEngine::new` after the shm
+    /// handle is created and never changes it for the lifetime
+    /// of the WAL manager. `.get()` is a single relaxed atomic
+    /// load — eliminates the per-WAL-append + per-commit Mutex
+    /// lock that the previous `Mutex<Option<...>>` paid even on
+    /// engines with no SWMR readers. Cost on the no-mirror path
+    /// (write-only engine, in-memory variants that never wire
+    /// the mirror) drops from ~15-25 ns to ~1 ns.
+    shm_oldest_mirror: std::sync::OnceLock<Arc<crate::storage::mvcc::shm::ShmHandle>>,
 }
 
 impl WALManager {
-    /// Create a new WAL manager with default config
+    /// Create a new WAL manager with default config (writable).
     pub fn new(path: impl AsRef<Path>, sync_mode: SyncMode) -> Result<Self> {
-        Self::with_config(path, sync_mode, None)
+        Self::with_config(path, sync_mode, None, false)
     }
 
     /// Recover from any interrupted WAL truncation operations
@@ -1085,16 +1379,59 @@ impl WALManager {
         path: impl AsRef<Path>,
         sync_mode: SyncMode,
         config: Option<&PersistenceConfig>,
+        read_only: bool,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
-        // Create WAL directory if it doesn't exist
-        fs::create_dir_all(&path)
-            .map_err(|e| Error::internal(format!("failed to create WAL directory: {}", e)))?;
+        // Create WAL directory only on writable opens. On a read-only
+        // mount the dir must already exist (caller verifies); calling
+        // create_dir_all would fail with EROFS / EACCES.
+        if !read_only {
+            fs::create_dir_all(&path)
+                .map_err(|e| Error::internal(format!("failed to create WAL directory: {}", e)))?;
+        }
 
         // CRITICAL: Recover from any interrupted truncation before proceeding
-        // This ensures data integrity if a crash happened during WAL truncation
-        Self::recover_interrupted_truncation(&path)?;
+        // This ensures data integrity if a crash happened during WAL truncation.
+        // Skipped on read-only opens (recovery would write to disk).
+        if !read_only {
+            Self::recover_interrupted_truncation(&path)?;
+        }
+
+        // Pick how to open existing WAL files. Writable opens want
+        // `read + append` (and create if missing). Read-only opens want
+        // `read` only — no append (would require write perm), no create
+        // (would create state on a read-only mount).
+        let open_existing_wal = |wal_path: &Path| -> std::io::Result<File> {
+            if read_only {
+                OpenOptions::new().read(true).open(wal_path)
+            } else {
+                OpenOptions::new().read(true).append(true).open(wal_path)
+            }
+        };
+
+        // Read-only opens distinguish "wal/ missing" (acceptable —
+        // volumes-only deployments are valid; checkpointed databases
+        // shipped without a WAL fall in this bucket) from "wal/ exists
+        // but unreadable" (fatal — silently coming up with no WAL would
+        // let the engine appear "successfully open" while missing every
+        // uncheckpointed change).
+        if read_only {
+            match fs::read_dir(&path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // No wal/ at all. Caller relies on volumes / fresh
+                    // engine. Continue with no WAL.
+                }
+                Err(e) => {
+                    return Err(Error::internal(format!(
+                        "read-only open: cannot read WAL directory '{}': {}",
+                        path.display(),
+                        e
+                    )));
+                }
+            }
+        }
 
         let mut wal_file: Option<File> = None;
         let mut initial_lsn: u64 = 0;
@@ -1108,7 +1445,7 @@ impl WALManager {
                 initial_lsn = checkpoint.lsn;
 
                 let wal_path = path.join(&checkpoint.wal_file);
-                if let Ok(file) = OpenOptions::new().read(true).append(true).open(&wal_path) {
+                if let Ok(file) = open_existing_wal(&wal_path) {
                     wal_file = Some(file);
                 }
             }
@@ -1125,6 +1462,28 @@ impl WALManager {
                         && name.ends_with(".log")
                     {
                         wal_files.push(name);
+                    }
+                }
+            }
+
+            // Read-only opens with WAL files present that we cannot open:
+            // surface the failure rather than silently coming up with no
+            // WAL. (For writable opens, the create-new-WAL path below
+            // takes over.)
+            if read_only && !wal_files.is_empty() && wal_file.is_none() {
+                // Re-attempt the open of the newest file to capture the
+                // OS error. Sorting first so we pick the same file the
+                // happy path would have used.
+                let mut sorted = wal_files.clone();
+                sorted.sort_by_key(|name| Self::extract_lsn_from_filename(name).unwrap_or(0));
+                if let Some(newest) = sorted.last() {
+                    let wal_path = path.join(newest);
+                    if let Err(e) = open_existing_wal(&wal_path) {
+                        return Err(Error::internal(format!(
+                            "read-only open: cannot read WAL file '{}': {}",
+                            wal_path.display(),
+                            e
+                        )));
                     }
                 }
             }
@@ -1147,7 +1506,7 @@ impl WALManager {
                     }
                 }
 
-                if let Ok(file) = OpenOptions::new().read(true).append(true).open(&wal_path) {
+                if let Ok(file) = open_existing_wal(&wal_path) {
                     // Find last LSN in file
                     if let Ok(last_lsn) = find_last_lsn(&path.join(newest)) {
                         if last_lsn > initial_lsn {
@@ -1159,8 +1518,12 @@ impl WALManager {
             }
         }
 
-        // Create new WAL file if none exists
-        if wal_file.is_none() {
+        // Create new WAL file if none exists. Writable opens only —
+        // a read-only mount can't create a file, and a read-only handle
+        // has no business appending to the WAL anyway. If no WAL files
+        // were found in read-only mode, wal_file stays None and replay
+        // is a no-op (volumes alone supply the engine state).
+        if wal_file.is_none() && !read_only {
             let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
             wal_filename = format!("wal-{}-lsn-0.log", timestamp);
             let wal_path = path.join(&wal_filename);
@@ -1215,8 +1578,10 @@ impl WALManager {
             wal_file: Mutex::new(wal_file),
             current_wal_file: Mutex::new(wal_filename),
             current_lsn: AtomicU64::new(initial_lsn),
+            flushed_lsn: AtomicU64::new(initial_lsn),
             previous_lsn: AtomicU64::new(initial_lsn),
             buffer: Mutex::new(Vec::with_capacity(buffer_size)),
+            buffer_highest_lsn: AtomicU64::new(0),
             flush_trigger,
             max_wal_size,
             last_checkpoint: AtomicU64::new(initial_lsn),
@@ -1229,6 +1594,10 @@ impl WALManager {
             current_file_position: AtomicU64::new(initial_file_position),
             wal_sequence: AtomicU64::new(initial_sequence),
             in_flight_writes: AtomicU64::new(0),
+            active_txn_first_lsn: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
+            // u64::MAX = "no active user txns" sentinel.
+            oldest_active_lsn_cache: AtomicU64::new(u64::MAX),
+            shm_oldest_mirror: std::sync::OnceLock::new(),
         })
     }
 
@@ -1262,6 +1631,12 @@ impl WALManager {
         self.current_lsn.load(Ordering::Acquire)
     }
 
+    /// Highest WAL LSN whose bytes have been written to the WAL file
+    /// and are therefore safe to advertise to cross-process readers.
+    pub fn flushed_lsn(&self) -> u64 {
+        self.flushed_lsn.load(Ordering::Acquire)
+    }
+
     /// Append a WAL entry
     pub fn append_entry(&self, mut entry: WALEntry) -> Result<u64> {
         if !self.running.load(Ordering::Acquire) {
@@ -1285,6 +1660,23 @@ impl WALManager {
         // Update previous_lsn for next entry's chain link
         self.previous_lsn.store(entry.lsn, Ordering::Release);
 
+        // SWMR v2 P2 perf fix: track first DML LSN per active user
+        // transaction so the engine can publish the MIN as
+        // db.shm.oldest_active_txn_lsn. Skip synthetic txn ids:
+        //   - DDL (-2): auto-committed, no in-flight period
+        //   - INVALID (0) / RECOVERY (negative): not user txns
+        // Skip marker entries (commit/abort/rotation) — those don't
+        // open a new in-flight DML window.
+        if entry.txn_id > 0 && !entry.is_marker_entry() {
+            let mut map = self.active_txn_first_lsn.lock();
+            // entry_or_insert preserves the FIRST DML LSN we saw for
+            // this txn — subsequent DML entries don't overwrite.
+            if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(entry.txn_id) {
+                slot.insert(entry.lsn);
+                self.refresh_oldest_active_cache_locked(&map);
+            }
+        }
+
         // Encode entry with new V2 format
         let encoded = entry.encode();
         let encoded_len = encoded.len() as u64;
@@ -1293,27 +1685,32 @@ impl WALManager {
         {
             let mut buffer = self.buffer.lock().unwrap();
             buffer.extend_from_slice(&encoded);
+            self.buffer_highest_lsn
+                .fetch_max(entry.lsn, Ordering::AcqRel);
 
             let needs_flush = buffer.len() >= self.flush_trigger as usize;
+            // Full still writes every WAL entry immediately. Normal
+            // keeps the historical commit/DDL flush behavior. None
+            // intentionally does NOT force-flush transaction-end/DDL
+            // markers; SWMR publication is capped by `flushed_lsn`
+            // instead, so readers never observe a marker that is
+            // still only in this in-memory buffer.
             let force_flush = self.sync_mode == SyncMode::Full
                 || (self.sync_mode == SyncMode::Normal
                     && (entry.operation.is_transaction_end() || entry.operation.is_ddl()));
 
             if needs_flush || force_flush {
                 let buffer_data = std::mem::take(&mut *buffer);
+                let max_lsn = self.buffer_highest_lsn.swap(0, Ordering::AcqRel);
                 // CRITICAL: Increment in-flight counter BEFORE releasing lock
                 // This prevents checkpoint from reading LSN before data is on disk
                 self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
                 drop(buffer); // Release buffer lock before file operations
 
                 // Use a guard pattern to ensure we decrement even on error
-                let write_result = self.write_to_file(&buffer_data);
+                let write_result = self.write_to_file(&buffer_data, max_lsn);
                 self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
                 write_result?;
-
-                // Update file position tracking
-                self.current_file_position
-                    .fetch_add(buffer_data.len() as u64, Ordering::Relaxed);
 
                 if self.should_sync(entry.operation) {
                     self.sync_locked()?;
@@ -1333,20 +1730,121 @@ impl WALManager {
         self.previous_lsn.load(Ordering::Acquire)
     }
 
-    /// Write a commit marker for two-phase recovery
-    pub fn write_commit_marker(&self, txn_id: i64) -> Result<u64> {
-        let entry = WALEntry::commit_marker(txn_id);
-        self.append_entry(entry)
+    /// Write a commit marker for two-phase recovery. `commit_seq` is
+    /// the value `TransactionRegistry::start_commit` allocated for the
+    /// txn; reader's WAL-tail uses it to tag tombstones with a
+    /// `snapshot_seq`-compatible commit_seq. Pass 0 for synthetic
+    /// commits (DDL paths) that don't participate in snapshot ordering.
+    pub fn write_commit_marker(&self, txn_id: i64, commit_seq: i64) -> Result<u64> {
+        let entry = WALEntry::commit_marker(txn_id, commit_seq);
+        let lsn = self.append_entry(entry)?;
+        // Do NOT clear active_txn_first_lsn here.
+        // The prior version removed the txn from the map
+        // immediately after writing the marker — but the txn isn't
+        // safely visible until `complete_commit` AND publish run.
+        // If a concurrent commit/DDL publish observed the cleared
+        // map in that window, it would store
+        // `oldest_active_txn_lsn` without this txn → readers would
+        // advance `next_entry_floor` above this txn's earlier DML
+        // LSNs and lose those rows when the marker eventually
+        // becomes visible.
+        //
+        // Cleanup is deferred to `clear_active_txn`, which the
+        // engine's `publish_visible_commit_lsn` calls AFTER the
+        // safe-visible publish has fired (so the snapshot it
+        // publishes still includes this txn's first DML).
+        Ok(lsn)
     }
 
     /// Write an abort marker for two-phase recovery
     pub fn write_abort_marker(&self, txn_id: i64) -> Result<u64> {
         let entry = WALEntry::abort_marker(txn_id);
-        self.append_entry(entry)
+        let lsn = self.append_entry(entry)?;
+        // Same deferred-cleanup contract as
+        // write_commit_marker. The aborted txn's DML stays in the
+        // WAL (and won't be applied since txn_id won't be in
+        // committed_txns), but its first-DML LSN must remain in
+        // `active_txn_first_lsn` until `clear_active_txn` is
+        // called by the engine's commit-finalize path.
+        Ok(lsn)
+    }
+
+    /// Clear a txn's active-DML record. Called by
+    /// the engine's `publish_visible_commit_lsn` AFTER the
+    /// safe-visible store has been published — so any reader that
+    /// observes the new visible_commit_lsn also observed an
+    /// `oldest_active_txn_lsn` that still included this txn (and
+    /// therefore its earlier DML LSNs). Subsequent publishes won't
+    /// include this txn anymore. No-op for synthetic txn_ids
+    /// (DDL/INVALID/RECOVERY) that were never tracked on the
+    /// entry side.
+    pub fn clear_active_txn(&self, txn_id: i64) {
+        if txn_id > 0 {
+            let mut map = self.active_txn_first_lsn.lock();
+            if map.remove(&txn_id).is_some() {
+                self.refresh_oldest_active_cache_locked(&map);
+            }
+        }
+    }
+
+    /// Recompute the cached `oldest_active_lsn` from the
+    /// `active_txn_first_lsn` map. Caller must hold the map's lock.
+    /// `u64::MAX` is the "no active user txns" sentinel.
+    ///
+    /// Also `fetch_min`-mirrors the new value into
+    /// `db.shm.oldest_active_txn_lsn` when the engine has wired
+    /// in an `Arc<ShmHandle>`. This is the deterministic
+    /// guarantee a fresh reader's pre_acquire relies on:
+    /// any txn that has appended its first DML before the
+    /// reader samples shm has its first-DML LSN reflected (≤)
+    /// in shm.oldest_active_txn_lsn, even when the writer's
+    /// commit fast path skipped the seqlock publish during a
+    /// `lease_present == false` window. `fetch_min` only
+    /// LOWERS — slow-path commits and `barrier_publish_full_state`
+    /// raise via `.store()` under the seqlock when the actual
+    /// oldest moves up (e.g., a long txn cleared).
+    fn refresh_oldest_active_cache_locked(&self, map: &rustc_hash::FxHashMap<i64, u64>) {
+        let new = map.values().copied().min().unwrap_or(u64::MAX);
+        self.oldest_active_lsn_cache.store(new, Ordering::Release);
+        // Mirror to shm if attached. The fetch_min keeps the
+        // shm value bounded above by `new`, so a reader sees
+        // a valid lower-bound at any time — even mid-update.
+        // No seqlock needed: this only DECREASES the value;
+        // readers using the (visible, oldest) pair still get a
+        // safe (over-pinning) result via Release-Acquire on
+        // visible_commit_lsn.
+        if let Some(handle) = self.shm_oldest_mirror.get() {
+            handle
+                .header()
+                .oldest_active_txn_lsn
+                .fetch_min(new, Ordering::AcqRel);
+        }
+    }
+
+    /// Wire an `Arc<ShmHandle>` for the
+    /// `db.shm.oldest_active_txn_lsn` mirror. Called by the
+    /// engine after creating shm so subsequent active-set
+    /// changes propagate immediately. Idempotent — only the
+    /// first wire-in takes effect (subsequent calls are a no-op
+    /// that intentionally drops the new Arc). The engine wires
+    /// once during init, so the Err arm is unreachable in
+    /// practice; we silently ignore it rather than panic.
+    pub fn set_shm_oldest_mirror(&self, shm: Arc<crate::storage::mvcc::shm::ShmHandle>) {
+        let _ = self.shm_oldest_mirror.set(shm);
+    }
+
+    /// SWMR v2 P2 perf fix: lowest first-DML LSN across active user
+    /// transactions. `u64::MAX` when no user txn has open DML in
+    /// the WAL — readers may safely skip entries below their
+    /// `from_lsn`. Other negative/synthetic txn ids (DDL,
+    /// RECOVERY) are NOT counted: DDL is auto-committed; RECOVERY
+    /// applies during startup before any reader can attach.
+    pub fn oldest_active_txn_lsn(&self) -> u64 {
+        self.oldest_active_lsn_cache.load(Ordering::Acquire)
     }
 
     /// Write data to WAL file
-    fn write_to_file(&self, data: &[u8]) -> Result<()> {
+    fn write_to_file(&self, data: &[u8], max_lsn: u64) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -1362,6 +1860,11 @@ impl WALManager {
                 .map_err(|e| Error::internal(format!("failed to write to WAL: {}", e)))?;
         } else {
             return Err(Error::WalFileClosed);
+        }
+        self.current_file_position
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        if max_lsn > 0 {
+            self.flushed_lsn.fetch_max(max_lsn, Ordering::AcqRel);
         }
 
         Ok(())
@@ -1532,16 +2035,40 @@ impl WALManager {
                 return Ok(());
             }
             let data = std::mem::take(&mut *buffer);
+            let max_lsn = self.buffer_highest_lsn.swap(0, Ordering::AcqRel);
             // CRITICAL: Increment in-flight counter BEFORE releasing lock
             // This prevents checkpoint from reading LSN before data is on disk
             self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
-            data
+            (data, max_lsn)
         };
 
         // Use a guard pattern to ensure we decrement even on error
-        let write_result = self.write_to_file(&buffer_data);
+        let write_result = self.write_to_file(&buffer_data.0, buffer_data.1);
         self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
         write_result
+    }
+
+    /// Periodically flush `SyncMode::None` buffers so SWMR readers can
+    /// observe commits without forcing a write on every commit marker.
+    /// Returns true when the reader-visible file-write frontier advanced.
+    pub fn flush_for_visibility_if_due(&self) -> Result<bool> {
+        if self.sync_mode != SyncMode::None {
+            return Ok(false);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let last = self.last_sync_time.load(Ordering::Acquire);
+        if self.sync_interval > 0 && now.saturating_sub(last) < self.sync_interval {
+            return Ok(false);
+        }
+
+        let before = self.flushed_lsn();
+        self.flush()?;
+        let after = self.flushed_lsn();
+        self.last_sync_time.store(now, Ordering::Release);
+        Ok(after > before)
     }
 
     /// Check if we should sync based on operation type
@@ -1580,9 +2107,24 @@ impl WALManager {
     ///
     /// Memory optimization: Uses streaming approach with two passes over WAL files
     /// instead of loading all entries into memory. Only txn_id HashSets are kept.
-    pub fn replay_two_phase<F>(
+    pub fn replay_two_phase<F>(&self, from_lsn: u64, callback: F) -> Result<TwoPhaseRecoveryInfo>
+    where
+        F: FnMut(WALEntry) -> Result<()>,
+    {
+        self.replay_two_phase_capped(from_lsn, u64::MAX, callback)
+    }
+
+    /// Same as `replay_two_phase` but caps the
+    /// max LSN considered. Read-only opens pass the writer's
+    /// published `db.shm.visible_commit_lsn` so unpublished
+    /// commit markers (writer wrote marker but hasn't yet
+    /// `complete_commit`/published) are skipped during attach.
+    /// Writable opens (the writer's own recovery) pass
+    /// `u64::MAX` (no cap).
+    pub fn replay_two_phase_capped<F>(
         &self,
         from_lsn: u64,
+        max_lsn: u64,
         mut callback: F,
     ) -> Result<TwoPhaseRecoveryInfo>
     where
@@ -1597,10 +2139,22 @@ impl WALManager {
         // (from_lsn == 0). When snapshots exist, from_lsn already reflects the safe
         // replay point. Using checkpoint.lsn to override would skip WAL entries needed
         // by tables whose snapshots are older (e.g., after a crash during snapshot rename).
+        //
+        // Capped read-only attach (max_lsn != u64::MAX): never let
+        // `checkpoint.lsn` push the floor PAST the reader's cap.
+        // The writer's checkpoint.meta reflects post-attach state
+        // (the writer raced past us between our shm sample and this
+        // load). Filtering segments above the cap already trimmed
+        // our cold view; advancing the floor to `checkpoint.lsn > cap`
+        // would then leave the WAL replay range empty and silently
+        // drop rows committed in (max_kept_visible, cap]. The
+        // pre-acquire WAL pin keeps that range intact, so we'd
+        // rather start replay from 0 (or wherever the cold view
+        // ends) than skip it entirely.
         if from_lsn == 0 {
             let checkpoint_path = self.path.join("checkpoint.meta");
             if let Ok(checkpoint) = CheckpointMetadata::read_from_file(&checkpoint_path) {
-                if checkpoint.lsn > from_lsn {
+                if checkpoint.lsn > from_lsn && checkpoint.lsn <= max_lsn {
                     from_lsn = checkpoint.lsn;
                 }
             }
@@ -1641,6 +2195,7 @@ impl WALManager {
             Self::scan_wal_for_txn_status(
                 wal_path,
                 from_lsn,
+                max_lsn,
                 &mut committed_txns,
                 &mut aborted_txns,
                 &mut last_lsn,
@@ -1680,6 +2235,7 @@ impl WALManager {
                 }
 
                 // Parse header
+                let version = header_buf[4];
                 let flags = WalFlags::from_byte(header_buf[5]);
                 let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
@@ -1695,35 +2251,101 @@ impl WALManager {
                     }
                 }
 
-                // Sanity check on size
+                // Capped read-only attach: stop once the parsed
+                // header LSN passes the published frontier.
+                // Records beyond `max_lsn` are the live writer's
+                // in-flight tail — body/CRC may still be mid-
+                // write, and they're explicitly outside this
+                // snapshot. The fatal-on-truncated and
+                // fatal-on-CRC checks below would otherwise
+                // refuse the open just because the writer was
+                // mid-write on an unpublished record. WAL files
+                // (and entries within a file) are LSN-monotonic,
+                // so a single out-of-cap header is the boundary;
+                // the outer file loop iterates the next file
+                // which short-circuits at its first read too.
+                let capped = max_lsn != u64::MAX;
+                if capped && lsn > max_lsn {
+                    break;
+                }
+
+                // Sanity check on size. In capped read-only attach
+                // (`max_lsn != u64::MAX`), the writer has already
+                // published a frontier covering this byte range — an
+                // oversized record below the cap means the writer
+                // wrote bytes a downstream reader cannot trust, and
+                // skipping silently leaves the snapshot incomplete.
+                // Fail the open instead. The header LSN is unverified
+                // pre-CRC, so we can't filter by window beyond the
+                // above-cap short-circuit; treat any oversized in
+                // capped mode as fatal.
                 let total_data_size = entry_size + 4;
                 if entry_size > 64 * 1024 * 1024 {
+                    if capped {
+                        return Err(Error::internal(format!(
+                            "WAL recovery (capped at LSN {}): oversized record \
+                             entry_size={} at header-LSN {}; refusing to skip in \
+                             capped read-only attach",
+                            max_lsn, entry_size, lsn
+                        )));
+                    }
                     if !Self::scan_for_magic(&mut file) {
                         break;
                     }
                     continue;
                 }
 
-                // Skip entries before from_lsn
-                if lsn < from_lsn {
-                    if file
-                        .seek(SeekFrom::Current(total_data_size as i64))
-                        .is_err()
-                    {
-                        break;
+                // ALWAYS read data + verify CRC
+                // BEFORE applying the [from_lsn, max_lsn] window.
+                // v3 CRC covers header + data, so a successful
+                // verify authenticates the LSN we then use for
+                // the window check. Without this, a corrupted v3
+                // header LSN could move a committed marker
+                // outside the cap and Phase 2 would skip it.
+                let mut data = vec![0u8; total_data_size];
+                if file.read_exact(&mut data).is_err() {
+                    if capped {
+                        return Err(Error::internal(format!(
+                            "WAL recovery (capped at LSN {}): truncated record \
+                             at header-LSN {}; refusing to skip in capped \
+                             read-only attach",
+                            max_lsn, lsn
+                        )));
                     }
+                    break;
+                }
+                if WALEntry::verify_crc(version, &header_buf, &data).is_err() {
+                    if capped {
+                        // Inside a published frontier, the writer's
+                        // contract is "every byte below visible_commit_lsn
+                        // is authentic." A CRC failure means either the
+                        // header LSN is wrong (so we can't trust the
+                        // window check to filter this out) or the data
+                        // is corrupted within the published range.
+                        // Either way, silently skipping would leave the
+                        // reader's snapshot missing committed records.
+                        return Err(Error::internal(format!(
+                            "WAL recovery (capped at LSN {}): CRC failed at \
+                             header-LSN {}; refusing to skip in capped \
+                             read-only attach",
+                            max_lsn, lsn
+                        )));
+                    }
+                    eprintln!(
+                        "Warning: WAL recovery Phase 2 CRC failed at header-LSN {}; \
+                         skipping",
+                        lsn
+                    );
+                    skipped_count += 1;
+                    continue;
+                }
+                // CRC validated — apply window AFTER validation.
+                if lsn < from_lsn || lsn > max_lsn {
                     continue;
                 }
 
-                // Read entry data + CRC
-                let mut data = vec![0u8; total_data_size];
-                match file.read_exact(&mut data) {
-                    Ok(()) => {}
-                    Err(_) => break,
-                }
-
                 // Decode entry
-                match WALEntry::decode(lsn, previous_lsn, flags, &data) {
+                match WALEntry::decode(lsn, previous_lsn, flags, version, &data, &header_buf) {
                     Ok(entry) => {
                         // Skip rotation/snapshot markers (internal WAL management)
                         if entry.is_marker_entry() {
@@ -1755,6 +2377,20 @@ impl WALManager {
                         }
                     }
                     Err(e) => {
+                        if capped {
+                            // CRC just passed, so the bytes are
+                            // authentic — a decode failure means the
+                            // WAL format itself is incompatible with
+                            // this build. Skipping would leave
+                            // committed data unapplied inside the
+                            // published frontier.
+                            return Err(Error::internal(format!(
+                                "WAL recovery (capped at LSN {}): decode failed \
+                                 at LSN {}: {}; refusing to skip in capped \
+                                 read-only attach",
+                                max_lsn, lsn, e
+                            )));
+                        }
                         // Log decode errors (including CRC failures) during recovery
                         // These could indicate WAL corruption or incomplete writes
                         eprintln!(
@@ -1790,6 +2426,7 @@ impl WALManager {
     fn scan_wal_for_txn_status(
         wal_path: &Path,
         from_lsn: u64,
+        max_lsn: u64,
         committed_txns: &mut I64Set,
         aborted_txns: &mut I64Set,
         last_lsn: &mut u64,
@@ -1818,10 +2455,12 @@ impl WALManager {
                 continue;
             }
 
-            // Parse header - only need flags, header_size, lsn, entry_size
+            // Parse header
+            let version = header_buf[4];
             let flags = WalFlags::from_byte(header_buf[5]);
             let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
             let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+            let previous_lsn = u64::from_le_bytes(header_buf[16..24].try_into().unwrap());
             let entry_size = u32::from_le_bytes(header_buf[24..28].try_into().unwrap()) as usize;
 
             // Skip any additional header bytes
@@ -1832,54 +2471,135 @@ impl WALManager {
                 }
             }
 
-            // Sanity check on size
+            // Capped read-only attach: stop once the parsed
+            // header LSN passes the published frontier — see
+            // the matching block in `replay_two_phase_capped`
+            // for the full rationale. In short: records beyond
+            // `max_lsn` are the live writer's in-flight tail,
+            // their body/CRC may not yet be complete, and the
+            // fatal-on-truncated / fatal-on-CRC checks below
+            // would otherwise refuse the open just because the
+            // writer was mid-write.
+            let capped = max_lsn != u64::MAX;
+            if capped && lsn > max_lsn {
+                break;
+            }
+
+            // Sanity check on size. In capped read-only attach
+            // (`max_lsn != u64::MAX`), an oversized record below the
+            // published frontier means the writer wrote bytes a
+            // downstream reader cannot trust — silently skipping
+            // would let Phase 2's commit/abort decision miss a
+            // committed transaction inside the cap. Treat any
+            // oversized in capped mode as fatal: the header LSN is
+            // unverified pre-CRC, so we can't filter by window
+            // beyond the above-cap short-circuit.
             let total_data_size = entry_size + 4;
             if entry_size > 64 * 1024 * 1024 {
+                if capped {
+                    return Err(Error::internal(format!(
+                        "WAL recovery Phase 1 (capped at LSN {}): oversized \
+                         record entry_size={} at header-LSN {}; refusing to \
+                         skip in capped read-only attach",
+                        max_lsn, entry_size, lsn
+                    )));
+                }
                 if !Self::scan_for_magic(&mut file) {
                     break;
                 }
                 continue;
             }
 
-            // Skip entries before from_lsn
-            if lsn < from_lsn {
-                if file
-                    .seek(SeekFrom::Current(total_data_size as i64))
-                    .is_err()
-                {
-                    break;
+            // ALWAYS read data + verify CRC BEFORE
+            // applying the [from_lsn, max_lsn] window. v3 CRC
+            // covers header + data, so a successful verify
+            // authenticates the LSN we then use for the window
+            // check. Otherwise a corrupted v3 header LSN could
+            // move a committed marker outside the cap and recovery
+            // would skip it without ever validating the CRC.
+            let mut data = vec![0u8; total_data_size];
+            if file.read_exact(&mut data).is_err() {
+                if capped {
+                    return Err(Error::internal(format!(
+                        "WAL recovery Phase 1 (capped at LSN {}): truncated \
+                         record at header-LSN {}; refusing to skip in capped \
+                         read-only attach",
+                        max_lsn, lsn
+                    )));
                 }
+                break;
+            }
+            if WALEntry::verify_crc(version, &header_buf, &data).is_err() {
+                if capped {
+                    // Inside the writer's published frontier the
+                    // bytes must be authentic. A CRC failure means
+                    // either the header LSN is corrupted (so we
+                    // can't trust the window check to filter this
+                    // out) or a real DML/marker is unreadable.
+                    // Either way Phase 2 would build a wrong
+                    // committed_txns set, dropping a transaction
+                    // that's actually visible.
+                    return Err(Error::internal(format!(
+                        "WAL recovery Phase 1 (capped at LSN {}): CRC failed \
+                         at header-LSN {} (flags={:?}); refusing to skip in \
+                         capped read-only attach",
+                        max_lsn, lsn, flags
+                    )));
+                }
+                // CRC failure during recovery: log and skip.
+                // Recovery semantics tolerate corruption (the
+                // affected entry is effectively aborted /
+                // unrecoverable); the writer's checkpoint_lsn
+                // is the durable boundary.
+                eprintln!(
+                    "Warning: WAL recovery CRC failed at header-LSN {} (flags={:?}); \
+                     skipping",
+                    lsn, flags
+                );
+                continue;
+            }
+            // CRC validated — header LSN is authenticated for v3.
+            // Apply window AFTER validation.
+            if lsn < from_lsn || lsn > max_lsn {
                 continue;
             }
 
-            // For commit/abort markers, we can identify them from flags without full decode
-            // This is the fast path - only read txn_id (first 8 bytes of data)
-            if flags.contains(WalFlags::COMMIT_MARKER) || flags.contains(WalFlags::ABORT_MARKER) {
-                // Read just the txn_id (first 8 bytes of data portion)
-                let mut txn_id_buf = [0u8; 8];
-                match file.read_exact(&mut txn_id_buf) {
-                    Ok(()) => {
-                        let txn_id = i64::from_le_bytes(txn_id_buf);
-                        if flags.contains(WalFlags::COMMIT_MARKER) {
-                            committed_txns.insert(txn_id);
-                        } else {
-                            aborted_txns.insert(txn_id);
-                        }
-                        // Skip rest of entry (entry_size - 8 + CRC 4)
-                        let remaining = total_data_size.saturating_sub(8);
-                        if file.seek(SeekFrom::Current(remaining as i64)).is_err() {
-                            break;
-                        }
+            // classify commit/abort markers via the
+            // CRC-protected `operation` byte, NOT the unauthenticated
+            // header flags. Marker classification is now identical
+            // to the SWMR Phase 1 helper.
+            match WALEntry::decode(lsn, previous_lsn, flags, version, &data, &header_buf) {
+                Ok(entry) => {
+                    if entry.is_commit_marker() {
+                        committed_txns.insert(entry.txn_id);
+                    } else if entry.is_abort_marker() {
+                        aborted_txns.insert(entry.txn_id);
                     }
-                    Err(_) => break,
+                    // Non-marker entries (DML/DDL): nothing to do
+                    // in Phase 1 — Phase 2 reads them based on
+                    // the committed_txns set we built here.
                 }
-            } else {
-                // Not a commit/abort marker, skip the entire entry
-                if file
-                    .seek(SeekFrom::Current(total_data_size as i64))
-                    .is_err()
-                {
-                    break;
+                Err(e) => {
+                    if capped {
+                        // CRC just passed, so the bytes are
+                        // authentic — a decode failure means the
+                        // WAL format is incompatible with this
+                        // build. Skipping would mis-classify a
+                        // committed marker as not committed.
+                        return Err(Error::internal(format!(
+                            "WAL recovery Phase 1 (capped at LSN {}): decode \
+                             failed at LSN {}: {}; refusing to skip in capped \
+                             read-only attach",
+                            max_lsn, lsn, e
+                        )));
+                    }
+                    // Decode failure (despite CRC pass) — layout
+                    // bug, log and skip.
+                    eprintln!(
+                        "Warning: WAL recovery decode failed at LSN {} (flags={:?}): {}; \
+                         skipping",
+                        lsn, flags, e
+                    );
                 }
             }
 
@@ -1890,6 +2610,788 @@ impl WALManager {
         }
 
         Ok(())
+    }
+
+    /// SWMR v2 Phase E + H: tail committed entries from the WAL
+    /// between LSN bounds, without going through full recovery.
+    /// Returns DML entries (Insert/Update/Delete) AND DDL entries
+    /// (CreateTable/AlterTable/DropTable/etc., as of Phase H) whose
+    /// owning transaction has a commit marker with
+    /// `marker_lsn <= to_lsn`. Entries from txns with no commit
+    /// marker (in-flight or aborted) are excluded.
+    ///
+    /// The caller decides what to do with DDL — the overlay stores
+    /// DDL events separately so the reader can surface a typed
+    /// `Error::SwmrPendingDdl` rather than silently mutate the
+    /// read-only handle's schema metadata.
+    ///
+    /// Two-pass like `replay_two_phase` but pure (no callback, no
+    /// state mutation, no side effects). Safe to call concurrently
+    /// with writes — the writer only appends, so a tail run sees a
+    /// consistent prefix.
+    ///
+    /// `from_lsn` is exclusive and applies to the commit-marker
+    /// scan (which transactions are "newly committed in this
+    /// window") and to the DDL entry filter (DDL is auto-committed,
+    /// so its entry LSN must be > from_lsn to belong to the new
+    /// window). `to_lsn` is inclusive — entries with LSN > to_lsn
+    /// are skipped.
+    ///
+    /// The DML entry floor is a SEPARATE parameter `entry_floor` to
+    /// support long-running explicit transactions whose DML was
+    /// written before `from_lsn` but whose commit marker lands
+    /// inside the window. Pass:
+    ///   - `entry_floor = 0`: full DML scan (safe but O(WAL)).
+    ///   - `entry_floor = writer.oldest_active_txn_lsn at the time
+    ///     of the previous tail` (clamped to `<= from_lsn`): O(delta)
+    ///     in steady state. Any DML below the snapshotted watermark
+    ///     belongs to a transaction that already committed (and was
+    ///     applied) before the previous refresh.
+    ///
+    /// `to_lsn = u64::MAX` tails every committed entry.
+    ///
+    /// Returns `Err(Error::SwmrSnapshotExpired { .. })` when the
+    /// caller's `from_lsn` (or `entry_floor`) falls below the first
+    /// live WAL entry on disk. Without this check, a reader whose
+    /// lease was reaped (writer truncated the WAL we needed) would
+    /// see an empty delta and silently advance `last_applied_lsn`,
+    /// hiding committed rows it should have observed. The error tells
+    /// the caller to reopen the handle and re-snapshot.
+    /// `include_dml`: when `false`, Phase 2 collects ONLY DDL
+    /// entries (skipping all per-row Insert/Update/Delete payload
+    /// loading + decode). `last_applied_lsn` and
+    /// `next_entry_floor` still advance via the normal scan, so
+    /// DDL detection and the WAL pin stay current — but readers
+    /// that haven't enabled overlay row materialization don't
+    /// pay the per-DML decode + allocation cost on every refresh.
+    pub fn tail_committed_entries(
+        &self,
+        from_lsn: u64,
+        entry_floor: u64,
+        to_lsn: u64,
+        include_dml: bool,
+        cursor_hint: Option<&WalScanCursor>,
+        out_cursor: Option<&mut Option<WalScanCursor>>,
+    ) -> Result<Vec<WALEntry>> {
+        // Flush buffer first so the on-disk WAL reflects everything
+        // committed so far. Otherwise a reader could miss entries the
+        // writer just wrote but hasn't fsynced.
+        self.flush()?;
+
+        // Collect WAL files (same logic as replay_two_phase).
+        let mut wal_files: Vec<PathBuf> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&self.path) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if (name.starts_with("wal-") || name.starts_with("wal_")) && name.ends_with(".log")
+                {
+                    wal_files.push(entry.path());
+                }
+            }
+        }
+        wal_files.sort_by_key(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(Self::extract_lsn_from_filename)
+                .unwrap_or(0)
+        });
+
+        // Chain-head check: if the writer truncated past our needed
+        // range, fail with SwmrSnapshotExpired BEFORE scanning. The
+        // earliest LSN still on disk is the first LSN of the oldest
+        // WAL file. The lower of `from_lsn + 1` (commit-marker
+        // window starts AFTER from_lsn) and the Phase 2 DML floor
+        // is what we need to be present — missing either would
+        // silently lose data.
+        //
+        // When `entry_floor == 0` Phase 2 explicitly scans from
+        // the BEGINNING (the writer's oldest-active watermark was
+        // unknown, so `with_baseline` defers to "scan from 0").
+        // Treating that case as needing only `from_lsn + 1` lets a
+        // reader whose lease was reaped have WAL truncated to a
+        // chain head between 1 and `from_lsn + 1`, still find a
+        // later commit marker, and silently miss that
+        // transaction's earlier DML. Use `1` instead so a chain
+        // head above 1 correctly trips SwmrSnapshotExpired.
+        if let Some(chain_head) = Self::first_live_wal_lsn(&wal_files) {
+            let phase2_floor = if entry_floor > 0 { entry_floor } else { 1 };
+            let needed = phase2_floor.min(from_lsn.saturating_add(1));
+            if needed < chain_head {
+                return Err(Error::SwmrSnapshotExpired {
+                    pinned_lsn: needed,
+                    chain_head,
+                });
+            }
+        }
+
+        // Phase 1: which txns have a commit marker with marker_lsn in
+        // (from_lsn, to_lsn]? Incremental — only NEWLY committed
+        // transactions since the caller's prior tail.
+        //
+        // P2 perf fix: skip rotated WAL files whose entire LSN range
+        // is at or below `from_lsn`. Filenames embed each file's
+        // first LSN (`wal-{ts}-lsn-{N}.log`); a file is entirely at
+        // or below `from_lsn` iff the NEXT file's start LSN is at
+        // or below `from_lsn + 1`. The last (current) file always
+        // gets scanned — its tail may have just-written entries
+        // with no successor file yet to bound it.
+        // Per-reader cursor cache: skip CRC-validating bytes
+        // we already validated on a prior call. The cursor's
+        // path/offset only matches the LAST file in the
+        // wal_files chain (the one still being appended); for
+        // older static files the existing
+        // `wal_files_needed_for_marker_scan` filename-LSN
+        // filter handles cold-start skipping. Older files of
+        // the chain that need rescanning still go through the
+        // full CRC path because they don't match the cursor.
+        let phase1_files = Self::wal_files_needed_for_marker_scan(&wal_files, from_lsn);
+        let mut committed_txns: I64Set = I64Set::new();
+        let mut last_path_p1: Option<PathBuf> = None;
+        let mut last_offset_p1: u64 = 0;
+        let mut last_lsn_p1: u64 = 0;
+        for wal_path in phase1_files {
+            // Reuse the cursor only when its LSN is at or below
+            // our window's lower bound (`from_lsn`). Phase 1's
+            // window is `(from_lsn, to_lsn]`, so records up to
+            // and including LSN `from_lsn` are already
+            // consumed and safe to skip. A higher
+            // `lsn_at_offset` would mean we'd skip past
+            // records still in our window.
+            let (start, start_lsn) = match cursor_hint {
+                Some(c) if c.path == *wal_path && c.lsn_at_offset <= from_lsn => {
+                    (c.offset, c.lsn_at_offset)
+                }
+                _ => (0, 0),
+            };
+            let (end, end_lsn) = Self::scan_wal_for_committed_in_range(
+                wal_path,
+                from_lsn,
+                to_lsn,
+                &mut committed_txns,
+                start,
+                start_lsn,
+            )?;
+            last_path_p1 = Some(wal_path.clone());
+            last_offset_p1 = end;
+            last_lsn_p1 = end_lsn;
+        }
+        if committed_txns.is_empty() {
+            // No new commits — still publish the cursor
+            // advance so the next refresh skips the bytes we
+            // just CRC-validated.
+            if let (Some(out_c), Some(p)) = (out_cursor, last_path_p1) {
+                *out_c = Some(WalScanCursor {
+                    path: p,
+                    offset: last_offset_p1,
+                    lsn_at_offset: last_lsn_p1,
+                });
+            }
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: scan DML entries with `entry_lsn <= to_lsn` whose
+        // txn_id is in `committed_txns`. The DML floor is
+        // `entry_floor`, which the caller computes from the writer's
+        // published `oldest_active_txn_lsn` at the time of the prior
+        // refresh. Anything below that watermark belongs to a
+        // transaction that committed before the prior refresh and
+        // was already applied (so we can skip the file walk for
+        // those entirely).
+        //
+        // For DDL entries (which all share the synthetic
+        // `DDL_TXN_ID = -2`), the per-entry filter `entry.lsn >
+        // from_lsn` is enforced inside the helper — DDL is
+        // auto-committed at its own LSN so this distinguishes new
+        // DDL from stale re-records.
+        //
+        // P2 perf fix: pre-compute the smallest LSN we may need to
+        // scan, then skip whole WAL files whose range is entirely
+        // below it. The helper's `from_lsn` semantics are EXCLUSIVE
+        // (skip files whose max LSN <= from_lsn), but `entry_floor`
+        // is INCLUSIVE (we want entries with LSN >= entry_floor).
+        // Pass `entry_floor.saturating_sub(1)` to translate. For
+        // entry_floor == 0, saturating_sub gives 0 and the helper
+        // short-circuits "scan all".
+        let phase2_files =
+            Self::wal_files_needed_for_marker_scan(&wal_files, entry_floor.saturating_sub(1));
+        let mut out: Vec<WALEntry> = Vec::new();
+        let mut last_path_p2: Option<PathBuf> = None;
+        let mut last_offset_p2: u64 = 0;
+        let mut last_lsn_p2: u64 = 0;
+        for wal_path in phase2_files {
+            // Phase 2 needs records with `lsn >= entry_floor`,
+            // so cursor reuse requires the cached LSN to be
+            // STRICTLY less than `entry_floor` — equality means
+            // a record at exactly `entry_floor` is already past
+            // the cursor and would be missed. The cold-start
+            // case (cursor LSN == 0, entry_floor == 0) falls
+            // out naturally since the cursor offset is also 0.
+            let (start, start_lsn) = match cursor_hint {
+                Some(c) if c.path == *wal_path && c.lsn_at_offset < entry_floor => {
+                    (c.offset, c.lsn_at_offset)
+                }
+                _ => (0, 0),
+            };
+            let (end, end_lsn) = Self::collect_committed_dml_in_range(
+                wal_path,
+                from_lsn,
+                entry_floor,
+                to_lsn,
+                &committed_txns,
+                &mut out,
+                include_dml,
+                start,
+                start_lsn,
+            )?;
+            last_path_p2 = Some(wal_path.clone());
+            last_offset_p2 = end;
+            last_lsn_p2 = end_lsn;
+        }
+        // Publish the new cursor: pick whichever phase covered
+        // more of the last file. Both phases produce in-window
+        // cursors, so taking the MAX preserves the most cache
+        // for the next refresh.
+        if let Some(out_c) = out_cursor {
+            *out_c = match (last_path_p2.clone(), last_path_p1) {
+                (Some(p2), Some(p1)) if p2 == p1 => {
+                    let (offset, lsn) = if last_offset_p2 >= last_offset_p1 {
+                        (last_offset_p2, last_lsn_p2)
+                    } else {
+                        (last_offset_p1, last_lsn_p1)
+                    };
+                    Some(WalScanCursor {
+                        path: p2,
+                        offset,
+                        lsn_at_offset: lsn,
+                    })
+                }
+                (Some(p), _) => Some(WalScanCursor {
+                    path: p,
+                    offset: last_offset_p2,
+                    lsn_at_offset: last_lsn_p2,
+                }),
+                (None, Some(p)) => Some(WalScanCursor {
+                    path: p,
+                    offset: last_offset_p1,
+                    lsn_at_offset: last_lsn_p1,
+                }),
+                (None, None) => None,
+            };
+        }
+        // Stable sort by LSN — writer emits in LSN order per file but
+        // multiple files may interleave only at file boundaries, so
+        // sorting is cheap (already mostly-sorted).
+        out.sort_by_key(|e| e.lsn);
+        Ok(out)
+    }
+
+    /// SWMR v2 P2 perf fix: pick the subset of WAL files whose LSN
+    /// range can possibly contain a record with `lsn > from_lsn`.
+    /// The last file is always included — its tail may contain
+    /// just-written entries with no successor file yet to bound it.
+    ///
+    /// The rotation naming convention is
+    /// `wal_NNN-ts-lsn-{N}.log` where `N == current_lsn at
+    /// rotation time` (see `rotate_wal`). `current_lsn` is the LSN
+    /// of the LAST entry written to the OLD file, NOT the first
+    /// LSN of the NEW file. So
+    /// `extract_lsn_from_filename(files[i+1])` gives the LAST LSN
+    /// of `files[i]`. We skip `files[i]` only when ALL its entries
+    /// are `<= from_lsn`, i.e. when its last LSN `<= from_lsn`.
+    /// The prior `<= from_lsn + 1` threshold was off-by-one and
+    /// dropped a file whose last entry was exactly `from_lsn + 1`
+    /// — that LSN is in the `(from_lsn, to_lsn]` window and must
+    /// be scanned.
+    ///
+    /// Files must already be sorted by extracted LSN (the
+    /// caller's invariant). For the typical SWMR case of a single
+    /// live WAL file, this returns the whole slice; for multi-file
+    /// WAL chains the marker scan only walks the relevant tail.
+    fn wal_files_needed_for_marker_scan(files: &[PathBuf], from_lsn: u64) -> &[PathBuf] {
+        if files.len() <= 1 || from_lsn == 0 {
+            return files;
+        }
+        let mut skip_count = 0usize;
+        for i in 0..files.len() - 1 {
+            let next_file_lsn = files[i + 1]
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(Self::extract_lsn_from_filename)
+                .unwrap_or(0);
+            // `next_file_lsn` is the last LSN of `files[i]`.
+            // Skip `files[i]` only if that last LSN `<= from_lsn`
+            // (every entry in `files[i]` is at or below `from_lsn`).
+            if next_file_lsn <= from_lsn {
+                skip_count = i + 1;
+            } else {
+                break;
+            }
+        }
+        &files[skip_count..]
+    }
+
+    /// SWMR v2 Phase E helper: Phase-1 scan that adds to `out` any
+    /// txn_id whose commit marker has `from_lsn < marker_lsn <= to_lsn`.
+    ///
+    /// `start_offset`: byte offset at which to begin scanning.
+    /// Bytes in `[0, start_offset)` are assumed to have been CRC-
+    /// validated by a prior scan with the SAME reader cursor. The
+    /// caller passes `0` when no cursor is available (cold start
+    /// or rotation).
+    ///
+    /// Returns the byte offset just past the last record this scan
+    /// successfully processed (or the start_offset on error / EOF
+    /// at start). The caller stores this back into the per-reader
+    /// cursor so the next refresh can resume from here.
+    fn scan_wal_for_committed_in_range(
+        wal_path: &Path,
+        from_lsn: u64,
+        to_lsn: u64,
+        out: &mut I64Set,
+        start_offset: u64,
+        start_offset_lsn: u64,
+    ) -> Result<(u64, u64)> {
+        let mut file = match File::open(wal_path) {
+            Ok(f) => f,
+            Err(_) => return Ok((start_offset, start_offset_lsn)),
+        };
+        if start_offset > 0 && file.seek(SeekFrom::Start(start_offset)).is_err() {
+            // Seek failure (file shorter than cursor) — give up on
+            // the cache and rescan from the beginning.
+            if file.seek(SeekFrom::Start(0)).is_err() {
+                return Ok((0, 0));
+            }
+        }
+        // Cursor advances only for records WITHIN the
+        // `(from_lsn, to_lsn]` window. Records read beyond
+        // `to_lsn` are CRC-validated this scan (cost paid) but
+        // not "owned" by this scan's window — the next refresh
+        // may have a higher to_lsn that needs to re-process
+        // them, so leaving them outside the cursor preserves
+        // correctness. `last_in_window_lsn` tracks the LSN of
+        // the last in-window record so the caller can refuse
+        // cursor reuse on a window whose lower bound moved
+        // backwards (e.g. entry_floor regression for Phase 2).
+        let mut last_good_offset = start_offset;
+        let mut last_in_window_lsn = start_offset_lsn;
+        loop {
+            let mut header_buf = [0u8; 32];
+            match file.read_exact(&mut header_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(_) => break,
+            }
+            let magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+            if magic != WAL_ENTRY_MAGIC {
+                let _ = file.seek(SeekFrom::Current(-32));
+                if !Self::scan_for_magic(&mut file) {
+                    break;
+                }
+                continue;
+            }
+            let version = header_buf[4];
+            let flags = WalFlags::from_byte(header_buf[5]);
+            let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
+            let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+            let previous_lsn = u64::from_le_bytes(header_buf[16..24].try_into().unwrap());
+            let entry_size = u32::from_le_bytes(header_buf[24..28].try_into().unwrap()) as usize;
+            if header_size > 32 {
+                let extra = header_size - 32;
+                if file.seek(SeekFrom::Current(extra as i64)).is_err() {
+                    break;
+                }
+            }
+            let total_data_size = entry_size + 4;
+            // an in-window oversized record is
+            // corruption, not "scan forward and resync". Treat
+            // out-of-window oversized records as the prior code
+            // did (resync), but in-window must error.
+            let lsn_in_window = lsn > from_lsn && lsn <= to_lsn;
+            if entry_size > 64 * 1024 * 1024 {
+                if lsn_in_window {
+                    return Err(Error::internal(format!(
+                        "WAL Phase-1 oversized record at LSN {} \
+                         (entry_size={} > 64 MiB, in window ({}, {}])",
+                        lsn, entry_size, from_lsn, to_lsn
+                    )));
+                }
+                if !Self::scan_for_magic(&mut file) {
+                    break;
+                }
+                continue;
+            }
+            // ALWAYS read data + verify CRC BEFORE
+            // trusting the header LSN for windowing. Without
+            // this, a corrupted header LSN could move an in-window
+            // record out of window, the scanner would `seek` past
+            // it (cheap-skip), and the corruption would never
+            // surface — the overlay would advance past a missing
+            // commit/DML.
+            //
+            // For v3 entries the CRC covers header + data, so a
+            // successful verify_crc authenticates the header LSN
+            // (and flags, version, etc.) we're about to use. For
+            // v2 entries the header remains unauthenticated
+            // (a known limitation of those formats); we still
+            // verify the data-only CRC.
+            //
+            // After CRC validates: in-window entries get full
+            // decode + commit-marker classification via the
+            // CRC-protected `operation` byte; out-of-window
+            // entries are skipped.
+            let mut data = vec![0u8; total_data_size];
+            if let Err(e) = file.read_exact(&mut data) {
+                if lsn_in_window {
+                    return Err(Error::internal(format!(
+                        "WAL Phase-1 short read at LSN {} (in window ({}, {}], \
+                         expected {} bytes): {}",
+                        lsn, from_lsn, to_lsn, total_data_size, e
+                    )));
+                }
+                break;
+            }
+            if let Err(e) = WALEntry::verify_crc(version, &header_buf, &data) {
+                return Err(Error::internal(format!(
+                    "WAL Phase-1 CRC verify failed at header-LSN {} (in window \
+                     ({}, {}]={}): {}",
+                    lsn, from_lsn, to_lsn, lsn_in_window, e
+                )));
+            }
+            // CRC passed — record bytes are authenticated up to
+            // and including this entry. Advance the cursor only
+            // when this record is INSIDE our window, so the
+            // next scan with a higher `to_lsn` correctly
+            // re-processes records that were beyond our cap.
+            if lsn_in_window {
+                if let Ok(pos) = file.stream_position() {
+                    last_good_offset = pos;
+                    last_in_window_lsn = lsn;
+                }
+            }
+            // CRC passed — for v3 the header LSN is authenticated.
+            // For v2 we trust it under the prior-format risk
+            // model.
+            //
+            // WAL entries are LSN-monotonic within and across
+            // files (writer only appends), so once we observe
+            // an LSN above `to_lsn` no later record in this
+            // file can land back in the window. Break instead
+            // of `continue` to avoid re-CRC-validating the
+            // entire unpublished tail on every refresh — that
+            // also stops surfacing CRC / layout errors from
+            // records beyond this snapshot's published cap.
+            // Records BELOW `from_lsn` (left half of the
+            // window) still need the `continue` path because
+            // we may not have started reading at the exact
+            // window lower bound.
+            if lsn > to_lsn {
+                break;
+            }
+            if !lsn_in_window {
+                continue;
+            }
+            // Phase 1 only needs `(txn_id, operation)` to find
+            // commit markers — skip the full `decode` (payload
+            // allocation, decompression, schema/value parsing) for
+            // every other entry. `peek_classification` reads the
+            // CRC-validated bytes at fixed offsets only.
+            if let Some((txn_id, op)) = WALEntry::peek_classification(&data) {
+                if matches!(op, WALOperationType::Commit) {
+                    out.insert(txn_id);
+                }
+            } else {
+                // Layout corruption — fall back to full decode so
+                // the error message is precise.
+                let _ = WALEntry::decode(lsn, previous_lsn, flags, version, &data, &header_buf)
+                    .map_err(|e| {
+                        Error::internal(format!(
+                            "WAL Phase-1 decode failed at LSN {} (in window \
+                             ({}, {}]): {}",
+                            lsn, from_lsn, to_lsn, e
+                        ))
+                    })?;
+            }
+        }
+        Ok((last_good_offset, last_in_window_lsn))
+    }
+
+    /// SWMR v2 Phase E helper: Phase-2 scan that decodes each DML
+    /// entry whose `txn_id` is in `committed` AND whose `lsn` falls
+    /// in `(entry_floor, to_lsn]`. The DDL-specific filter
+    /// `entry.lsn > from_lsn` is also applied so stale DDL re-records
+    /// don't replay.
+    ///
+    /// `start_offset` works the same way as in
+    /// `scan_wal_for_committed_in_range`: bytes in
+    /// `[0, start_offset)` are assumed CRC-validated by a prior
+    /// call from the same reader cursor and are skipped without
+    /// re-reading. Returns the byte offset just past the last
+    /// CRC-validated record so the caller can advance the cursor.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_committed_dml_in_range(
+        wal_path: &Path,
+        from_lsn: u64,
+        entry_floor: u64,
+        to_lsn: u64,
+        committed: &I64Set,
+        out: &mut Vec<WALEntry>,
+        include_dml: bool,
+        start_offset: u64,
+        start_offset_lsn: u64,
+    ) -> Result<(u64, u64)> {
+        let mut file = match File::open(wal_path) {
+            Ok(f) => f,
+            Err(_) => return Ok((start_offset, start_offset_lsn)),
+        };
+        if start_offset > 0
+            && file.seek(SeekFrom::Start(start_offset)).is_err()
+            && file.seek(SeekFrom::Start(0)).is_err()
+        {
+            return Ok((0, 0));
+        }
+        // See `scan_wal_for_committed_in_range` for the cursor-
+        // tracking rationale: only update on records inside
+        // `[entry_floor, to_lsn]`, so a future scan with a
+        // higher `to_lsn` (or a lower `entry_floor`) can still
+        // re-process records the current scan walked past
+        // without owning.
+        let mut last_good_offset = start_offset;
+        let mut last_in_window_lsn = start_offset_lsn;
+        loop {
+            let mut header_buf = [0u8; 32];
+            match file.read_exact(&mut header_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(_) => break,
+            }
+            let magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+            if magic != WAL_ENTRY_MAGIC {
+                let _ = file.seek(SeekFrom::Current(-32));
+                if !Self::scan_for_magic(&mut file) {
+                    break;
+                }
+                continue;
+            }
+            let version = header_buf[4];
+            let flags = WalFlags::from_byte(header_buf[5]);
+            let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
+            let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+            let previous_lsn = u64::from_le_bytes(header_buf[16..24].try_into().unwrap());
+            let entry_size = u32::from_le_bytes(header_buf[24..28].try_into().unwrap()) as usize;
+            if header_size > 32 {
+                let extra = header_size - 32;
+                if file.seek(SeekFrom::Current(extra as i64)).is_err() {
+                    break;
+                }
+            }
+            let total_data_size = entry_size + 4;
+            // an in-window oversized record is
+            // corruption, not "scan forward and resync". Treat
+            // out-of-window oversized records as the prior code
+            // did (resync), but in-window must error.
+            let lsn_in_window = lsn >= entry_floor && lsn <= to_lsn;
+            if entry_size > 64 * 1024 * 1024 {
+                if lsn_in_window {
+                    return Err(Error::internal(format!(
+                        "WAL Phase-2 oversized record at LSN {} \
+                         (entry_size={} > 64 MiB, in window [{}, {}])",
+                        lsn, entry_size, entry_floor, to_lsn
+                    )));
+                }
+                if !Self::scan_for_magic(&mut file) {
+                    break;
+                }
+                continue;
+            }
+            // ALWAYS read data + verify CRC BEFORE
+            // trusting the header LSN for windowing. v3 CRC covers
+            // header + data, so a successful verify authenticates
+            // the LSN we're about to use for the in-window check.
+            // For v2 the header is unauthenticated (prior-format
+            // limitation); we still do the data-only CRC.
+            //
+            // After CRC validates: in-window entries get full
+            // decode + commit/abort/DML classification via the
+            // CRC-protected `operation` byte; out-of-window
+            // entries are skipped.
+            let mut data = vec![0u8; total_data_size];
+            if let Err(e) = file.read_exact(&mut data) {
+                if lsn_in_window {
+                    return Err(Error::internal(format!(
+                        "WAL Phase-2 short read at LSN {} (in window [{}, {}], \
+                         expected {} bytes): {}",
+                        lsn, entry_floor, to_lsn, total_data_size, e
+                    )));
+                }
+                break;
+            }
+            if let Err(e) = WALEntry::verify_crc(version, &header_buf, &data) {
+                return Err(Error::internal(format!(
+                    "WAL Phase-2 CRC verify failed at header-LSN {} (in window \
+                     [{}, {}]={}): {}",
+                    lsn, entry_floor, to_lsn, lsn_in_window, e
+                )));
+            }
+            // CRC passed — advance cursor only for in-window
+            // records so a future scan with a wider window can
+            // re-process records this scan walked past.
+            if lsn_in_window {
+                if let Ok(pos) = file.stream_position() {
+                    last_good_offset = pos;
+                    last_in_window_lsn = lsn;
+                }
+            }
+            // CRC passed — for v3 the header LSN is now
+            // authenticated. Apply windowing.
+            //
+            // WAL is append-only and LSN-monotonic, so an
+            // LSN above `to_lsn` means every remaining
+            // record in this file is also above the window.
+            // Break to stop re-CRC-validating the
+            // unpublished tail on every refresh — that also
+            // prevents surfacing CRC / layout errors from
+            // records beyond this snapshot's published cap.
+            // Records BELOW `from_lsn` still need `continue`
+            // because we may not have started reading at the
+            // exact window lower bound.
+            if lsn > to_lsn {
+                break;
+            }
+            if !lsn_in_window {
+                continue;
+            }
+            // DDL-only mode: peek txn_id + operation BEFORE the
+            // full decode. Skip non-DDL entries (the common case
+            // under write-heavy workloads) without paying the
+            // payload-allocation + decompression + schema-decode
+            // cost. The peek is cheap: it reads CRC-validated
+            // bytes at fixed offsets.
+            if !include_dml {
+                if let Some((txn_id, op)) = WALEntry::peek_classification(&data) {
+                    // Skip non-DDL fast: DDL-only mode discards
+                    // every Insert/Update/Delete + marker.
+                    if !op.is_ddl() {
+                        continue;
+                    }
+                    // In-doubt / aborted txns: skip without full
+                    // decode.
+                    if !committed.contains(txn_id) {
+                        continue;
+                    }
+                    // DDL stale re-record (lsn <= from_lsn): same
+                    // filter as the full-decode branch — applies
+                    // ONLY to auto-committed DDL_TXN_ID entries.
+                    // User-txn DDL is uniquely tagged by txn_id;
+                    // its commit marker may sit in this window
+                    // even when the entry itself is below
+                    // `from_lsn`, so applying the LSN filter
+                    // unconditionally would silently drop a
+                    // committed user-txn DDL.
+                    if txn_id == crate::storage::mvcc::persistence::DDL_TXN_ID && lsn <= from_lsn {
+                        continue;
+                    }
+                    // Surviving DDL falls through to full decode
+                    // so the entry has its payload populated for
+                    // `pending_ddl` (CreateIndex needs the
+                    // IndexMetadata payload to extract the index
+                    // name).
+                }
+                // peek_classification == None → fall through to
+                // full decode for a precise error.
+            }
+            // ALWAYS read the full payload + decode
+            // (CRC validate) for every in-window entry. CRC was
+            // already verified above; this decode parses fields.
+            //
+            // The pre-decode `total_data_size < 8` layout check
+            // remains: a valid entry's data section is at least 8
+            // bytes (txn_id alone), so anything smaller is layout
+            // corruption inside the window.
+            if total_data_size < 8 {
+                return Err(Error::internal(format!(
+                    "WAL Phase-2 layout corruption at LSN {}: total_data_size={} \
+                     (less than minimum 8 bytes for txn_id), in window \
+                     [{}, {}]",
+                    lsn, total_data_size, entry_floor, to_lsn
+                )));
+            }
+            match WALEntry::decode(lsn, previous_lsn, flags, version, &data, &header_buf) {
+                Ok(entry) => {
+                    if entry.is_marker_entry() {
+                        continue;
+                    }
+                    // also skip commit/abort
+                    // markers. With the header-flag pre-skip
+                    // removed (so flag-bit corruption can't
+                    // silently drop in-window DML), markers now
+                    // reach the decode branch. Classify via the
+                    // CRC-protected `operation` byte.
+                    if entry.is_commit_marker() || entry.is_abort_marker() {
+                        continue;
+                    }
+                    // Skip this committed-set check AFTER decode so
+                    // CRC has been validated for every in-window
+                    // entry — even ones we end up not applying.
+                    if !committed.contains(entry.txn_id) {
+                        continue;
+                    }
+                    // Auto-committed DDL entries reuse
+                    // `DDL_TXN_ID`, so the txn_id-set check alone
+                    // can't tell "new DDL" from "old DDL" when a
+                    // fresh DDL marker arrives. Reject DDL whose
+                    // entry LSN is at or below `from_lsn` ONLY for
+                    // DDL_TXN_ID entries — every auto-committed
+                    // DDL is immediately followed by its own
+                    // commit marker, so its entry LSN must be >
+                    // from_lsn to belong to this refresh's window.
+                    //
+                    // Transactional DDL written under a USER txn
+                    // id (deferred-DDL Phase 2.5) is uniquely
+                    // tagged: the txn_id-set check alone is
+                    // sufficient to filter stale entries. Apply
+                    // the LSN filter would WRONGLY skip user-txn
+                    // DDL whose entry LSN sits below from_lsn but
+                    // whose commit marker is in the current
+                    // refresh window (legitimate when the user
+                    // txn opened many entries before this
+                    // refresh's tail boundary).
+                    if entry.operation.is_ddl()
+                        && entry.txn_id == crate::storage::mvcc::persistence::DDL_TXN_ID
+                        && entry.lsn <= from_lsn
+                    {
+                        continue;
+                    }
+                    // DDL-only mode: skip non-DDL entries to avoid
+                    // the per-row decode + payload allocation cost
+                    // for readers that haven't enabled overlay row
+                    // materialization. The cursor still advances
+                    // (handled in `rebuild_from_wal` via to_lsn) and
+                    // DDL surfaces SwmrPendingDdl as before.
+                    if !include_dml && !entry.operation.is_ddl() {
+                        continue;
+                    }
+                    // Phase H: non-stale DDL passes through. The
+                    // overlay segregates DDL into a separate list so
+                    // the reader's refresh can surface SwmrPendingDdl
+                    // while keeping DML rows applied to the per-table
+                    // overlay.
+                    out.push(entry);
+                }
+                Err(e) => {
+                    // every in-window entry must
+                    // decode successfully. A CRC failure here is
+                    // corruption inside the published window —
+                    // silently skipping would drop a possibly
+                    // committed row from the overlay.
+                    return Err(Error::internal(format!(
+                        "WAL Phase-2 decode failed at LSN {} (in window \
+                         [{}, {}], entry must validate): {}",
+                        lsn, entry_floor, to_lsn, e
+                    )));
+                }
+            }
+        }
+        Ok((last_good_offset, last_in_window_lsn))
     }
 
     /// Scan forward in the file looking for the next valid magic marker
@@ -2142,6 +3644,32 @@ impl WALManager {
         }
     }
 
+    /// First live WAL LSN: the LSN of the first entry in the oldest
+    /// WAL file on disk. Returns `None` when there are no WAL files
+    /// (fresh DB, never written) or when the oldest file is empty /
+    /// unreadable. Used by `tail_committed_entries` to detect WAL
+    /// truncation past a reader's needed range.
+    ///
+    /// `wal_files` MUST be sorted by file-name LSN (caller's
+    /// responsibility — same sort the rest of the tail / replay
+    /// paths use).
+    ///
+    /// Reads only the first 16 bytes of the oldest file (magic +
+    /// version + flags + header_size + LSN), so this is cheap.
+    fn first_live_wal_lsn(wal_files: &[PathBuf]) -> Option<u64> {
+        let oldest = wal_files.first()?;
+        let mut file = File::open(oldest).ok()?;
+        let mut header = [0u8; 16];
+        file.read_exact(&mut header).ok()?;
+        let magic = u32::from_le_bytes(header[0..4].try_into().ok()?);
+        if magic != WAL_ENTRY_MAGIC {
+            return None;
+        }
+        // Header layout (see WALEntry::encode): magic[4] + version[1]
+        // + flags[1] + header_size[2] + lsn[8] = 16 bytes.
+        Some(u64::from_le_bytes(header[8..16].try_into().ok()?))
+    }
+
     /// Extract the LSN from a WAL filename containing the pattern `lsn-{N}`.
     fn extract_lsn_from_filename(name: &str) -> Option<u64> {
         let lsn_start = name.find("lsn-")?;
@@ -2225,10 +3753,16 @@ impl WALManager {
             let mut buffer = self.buffer.lock().unwrap();
             if !buffer.is_empty() {
                 let buffer_data = std::mem::take(&mut *buffer);
+                let max_lsn = self.buffer_highest_lsn.swap(0, Ordering::AcqRel);
                 if let Some(file) = wal_file_guard.as_mut() {
                     file.write_all(&buffer_data).map_err(|e| {
                         Error::internal(format!("failed to flush buffer during truncation: {}", e))
                     })?;
+                    self.current_file_position
+                        .fetch_add(buffer_data.len() as u64, Ordering::Relaxed);
+                    if max_lsn > 0 {
+                        self.flushed_lsn.fetch_max(max_lsn, Ordering::AcqRel);
+                    }
                 }
             }
         }
@@ -2353,6 +3887,7 @@ impl WALManager {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0),
+                commit_seq: 0, // chain-break marker, not a real commit
             };
             let encoded = marker_entry.encode();
             temp_wal_file
@@ -2495,6 +4030,8 @@ impl WALManager {
         // Update file position to reflect the new WAL file size
         self.current_file_position
             .store(new_file_size, Ordering::Release);
+        self.flushed_lsn
+            .fetch_max(last_copied_lsn, Ordering::AcqRel);
 
         Ok(())
     }
@@ -2623,9 +4160,18 @@ mod tests {
         let previous_lsn = u64::from_le_bytes(encoded[16..24].try_into().unwrap());
         assert_eq!(previous_lsn, 41);
 
-        // Data starts at offset 32, includes CRC at end
-        let decoded =
-            WALEntry::decode(entry.lsn, entry.previous_lsn, flags, &encoded[32..]).unwrap();
+        // Data starts at offset 32, includes CRC at end. v3 CRC
+        // covers header + data, so we pass the encoded[..32]
+        // header bytes through to decode.
+        let decoded = WALEntry::decode(
+            entry.lsn,
+            entry.previous_lsn,
+            flags,
+            WAL_FORMAT_VERSION,
+            &encoded[32..],
+            &encoded[..32],
+        )
+        .unwrap();
 
         assert_eq!(decoded.lsn, entry.lsn);
         assert_eq!(decoded.previous_lsn, entry.previous_lsn);
@@ -2657,8 +4203,17 @@ mod tests {
             encoded[40] ^= 0xFF; // Flip some bits in data portion
         }
 
-        // Decode should fail due to CRC mismatch
-        let result = WALEntry::decode(entry.lsn, entry.previous_lsn, entry.flags, &encoded[32..]);
+        // Decode should fail due to CRC mismatch. v3 CRC covers
+        // header + data; corruption at offset 40 still falls
+        // inside the protected region.
+        let result = WALEntry::decode(
+            entry.lsn,
+            entry.previous_lsn,
+            entry.flags,
+            WAL_FORMAT_VERSION,
+            &encoded[32..],
+            &encoded[..32],
+        );
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2690,6 +4245,7 @@ mod tests {
             operation: WALOperationType::Commit,
             data: Vec::new(),
             timestamp: 0,
+            commit_seq: 0,
         };
         assert!(marker.is_marker_entry());
 
@@ -2699,7 +4255,7 @@ mod tests {
 
     #[test]
     fn test_wal_entry_commit_rollback() {
-        let commit = WALEntry::commit(100);
+        let commit = WALEntry::commit(100, 0);
         assert_eq!(commit.txn_id, 100);
         assert_eq!(commit.operation, WALOperationType::Commit);
         assert!(commit.table_name.is_empty());
@@ -2742,7 +4298,7 @@ mod tests {
     #[test]
     fn test_commit_abort_markers() {
         // Test commit marker
-        let commit_marker = WALEntry::commit_marker(42);
+        let commit_marker = WALEntry::commit_marker(42, 0);
         assert_eq!(commit_marker.txn_id, 42);
         assert!(commit_marker.is_commit_marker());
         assert!(!commit_marker.is_abort_marker());
@@ -2756,7 +4312,7 @@ mod tests {
         assert!(abort_marker.flags.contains(WalFlags::ABORT_MARKER));
 
         // Test regular commit (without marker flag)
-        let regular_commit = WALEntry::commit(44);
+        let regular_commit = WALEntry::commit(44, 0);
         assert!(regular_commit.is_commit_marker()); // Still recognized via operation type
 
         // Test regular rollback (without marker flag)
@@ -2786,7 +4342,7 @@ mod tests {
         assert_eq!(wal.previous_lsn(), 2);
 
         // Commit both transactions so they show up in two-phase replay
-        wal.write_commit_marker(1).unwrap();
+        wal.write_commit_marker(1, 0).unwrap();
 
         // Verify entries have correct previous_lsn when replayed
         let mut entries = Vec::new();
@@ -2910,7 +4466,7 @@ mod tests {
         let lsn = wal.append_entry(entry).unwrap();
         assert_eq!(lsn, 1);
 
-        let entry2 = WALEntry::commit(1);
+        let entry2 = WALEntry::commit(1, 0);
         let lsn2 = wal.append_entry(entry2).unwrap();
         assert_eq!(lsn2, 2);
 
@@ -2936,7 +4492,7 @@ mod tests {
                 );
                 wal.append_entry(entry).unwrap();
                 // Commit each transaction so it shows up in two-phase replay
-                wal.write_commit_marker(i).unwrap();
+                wal.write_commit_marker(i, 0).unwrap();
             }
 
             wal.close().unwrap();
@@ -3018,6 +4574,36 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_none_commit_marker_waits_for_buffer_flush() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal_none_flush_cap");
+        let wal = WALManager::new(&wal_path, SyncMode::None).unwrap();
+
+        let marker_lsn = wal.write_commit_marker(1, 7).unwrap();
+        assert_eq!(wal.current_lsn(), marker_lsn);
+        assert_eq!(
+            wal.flushed_lsn(),
+            0,
+            "SyncMode::None must not force-flush commit markers"
+        );
+
+        wal.flush().unwrap();
+        assert_eq!(wal.flushed_lsn(), marker_lsn);
+        wal.close().unwrap();
+    }
+
+    #[test]
+    fn test_sync_normal_commit_marker_still_flushes() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal_normal_flush_cap");
+        let wal = WALManager::new(&wal_path, SyncMode::Normal).unwrap();
+
+        let marker_lsn = wal.write_commit_marker(1, 7).unwrap();
+        assert_eq!(wal.flushed_lsn(), marker_lsn);
+        wal.close().unwrap();
+    }
+
+    #[test]
     fn test_wal_manager_multiple_operations() {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal");
@@ -3043,7 +4629,7 @@ mod tests {
         );
         let lsn2 = wal.append_entry(update).unwrap();
 
-        let commit = WALEntry::commit(1);
+        let commit = WALEntry::commit(1, 0);
         let lsn3 = wal.append_entry(commit).unwrap();
 
         assert_eq!(lsn1, 1);
@@ -3151,7 +4737,7 @@ mod tests {
                 );
                 wal.append_entry(entry).unwrap();
                 // Commit each transaction
-                wal.write_commit_marker(i).unwrap();
+                wal.write_commit_marker(i, 0).unwrap();
             }
 
             // Get initial WAL file size
@@ -3244,7 +4830,7 @@ mod tests {
                     vec![],
                 );
                 wal.append_entry(entry).unwrap();
-                wal.write_commit_marker(i).unwrap();
+                wal.write_commit_marker(i, 0).unwrap();
             }
 
             // Truncate all entries (up to LSN 10, which covers all 5 inserts + 5 commits)
@@ -3301,7 +4887,7 @@ mod tests {
             wal.append_entry(entry2).unwrap();
 
             // Write commit marker for transaction 1
-            wal.write_commit_marker(1).unwrap();
+            wal.write_commit_marker(1, 0).unwrap();
 
             wal.close().unwrap();
         }
@@ -3459,7 +5045,7 @@ mod tests {
                 vec![1],
             );
             wal.append_entry(entry1).unwrap();
-            wal.write_commit_marker(1).unwrap();
+            wal.write_commit_marker(1, 0).unwrap();
 
             // Transaction 2: Aborted
             let entry2 = WALEntry::new(
@@ -3491,7 +5077,7 @@ mod tests {
                 vec![4],
             );
             wal.append_entry(entry4).unwrap();
-            wal.write_commit_marker(4).unwrap();
+            wal.write_commit_marker(4, 0).unwrap();
 
             wal.close().unwrap();
         }
@@ -3541,7 +5127,7 @@ mod tests {
             ..Default::default()
         };
 
-        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config)).unwrap();
+        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config), false).unwrap();
 
         // Initial state
         assert_eq!(wal.current_sequence(), 0);
@@ -3600,7 +5186,7 @@ mod tests {
             ..Default::default()
         };
 
-        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config)).unwrap();
+        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config), false).unwrap();
 
         // Write entries before rotation
         for i in 1..=3 {
@@ -3612,7 +5198,7 @@ mod tests {
                 vec![0u8; 50],
             );
             wal.append_entry(entry).unwrap();
-            wal.write_commit_marker(i).unwrap();
+            wal.write_commit_marker(i, 0).unwrap();
         }
 
         // Count files before rotation
@@ -3647,7 +5233,7 @@ mod tests {
                 vec![0u8; 50],
             );
             wal.append_entry(entry).unwrap();
-            wal.write_commit_marker(i).unwrap();
+            wal.write_commit_marker(i, 0).unwrap();
         }
 
         // Count files after rotation (should be 2)
@@ -3665,7 +5251,7 @@ mod tests {
         wal.close().unwrap();
 
         // Reopen and replay - should get all committed entries from BOTH files
-        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config)).unwrap();
+        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config), false).unwrap();
 
         let mut row_ids = Vec::new();
         let mut commit_count = 0;

@@ -20,7 +20,10 @@ use std::sync::Arc;
 
 use crate::api::database::DatabaseInner;
 use crate::api::transaction::Transaction;
-use crate::api::{Database, Rows, Statement};
+use crate::api::{Database, ReadOnlyDatabase, Rows, Statement};
+use crate::core::Error;
+
+use super::error::LastErrorState;
 
 /// FFI-safe tagged union for passing parameter values across the C boundary.
 #[repr(C)]
@@ -70,20 +73,58 @@ pub struct StoolapNamedParam {
     pub value: StoolapValue,
 }
 
+/// FFI-safe structured error detail. Pointers are valid until the next
+/// FFI call on the originating handle. NULL fields indicate "not
+/// applicable for this error code". `message` is never NULL — empty
+/// string when no error.
+#[repr(C)]
+pub struct StoolapErrorDetails {
+    /// One of `STOOLAP_ERR_*` constants.
+    pub code: i32,
+    pub _padding: i32,
+    /// Always non-NULL. Empty string on success.
+    pub message: *const c_char,
+    /// Table name for table-scoped errors. NULL otherwise.
+    pub table: *const c_char,
+    /// Column name for column-scoped errors. NULL otherwise.
+    pub column: *const c_char,
+    /// Index name (UNIQUE) or referenced table (FK). NULL otherwise.
+    pub constraint: *const c_char,
+    /// Free-form detail: conflicting value (UNIQUE), CHECK expression,
+    /// FK detail message. NULL otherwise.
+    pub detail: *const c_char,
+}
+
 /// Opaque handle wrapping a [`Database`] connection.
 pub struct StoolapDB {
     pub(crate) db: Database,
-    pub(crate) last_error: Option<CString>,
+    pub(crate) last_error: LastErrorState,
     /// Holds a reference to the original (engine-owning) DatabaseInner.
     /// Prevents premature engine shutdown when the original handle is closed
     /// before its clones. `None` for the original handle, `Some` for clones.
     pub(crate) _engine_keepalive: Option<Arc<DatabaseInner>>,
 }
 
+/// Opaque handle wrapping a [`ReadOnlyDatabase`] view.
+///
+/// Mirrors the Rust type split: this handle exposes only read functions
+/// (`stoolap_ro_query*`, `stoolap_ro_table_*`, `stoolap_ro_refresh`).
+/// There are no `_exec` / `_begin` / savepoint entry points, so attempting
+/// to write through a read-only handle is a compile-time error on the C
+/// side too — not a runtime `STOOLAP_ERR_READ_ONLY`.
+pub struct StoolapRoDB {
+    pub(crate) ro: ReadOnlyDatabase,
+    pub(crate) last_error: LastErrorState,
+    /// One-time cache of the DSN as a CString, populated lazily on
+    /// first `stoolap_ro_dsn()` call so the returned pointer is stable
+    /// for the lifetime of the handle without leaking on every call.
+    pub(crate) dsn_cstr: std::sync::OnceLock<CString>,
+}
+
 /// Opaque handle wrapping a [`Statement`].
 pub struct StoolapStmt {
     pub(crate) stmt: Statement,
-    pub(crate) last_error: Option<CString>,
+    pub(crate) last_error: LastErrorState,
     /// Pre-computed CString for `stoolap_stmt_sql()`.
     pub(crate) sql_cstr: CString,
     /// Cached column name CStrings (computed on first query, reused thereafter).
@@ -101,7 +142,7 @@ pub struct StoolapStmt {
 /// Opaque handle wrapping a [`Transaction`].
 pub struct StoolapTx {
     pub(crate) tx: Option<Transaction>,
-    pub(crate) last_error: Option<CString>,
+    pub(crate) last_error: LastErrorState,
     /// Keeps the originating `DatabaseInner` alive so the transaction's
     /// storage references remain valid.
     pub(crate) _db_keepalive: Arc<DatabaseInner>,
@@ -114,7 +155,7 @@ pub struct StoolapTx {
 pub struct StoolapRows {
     pub(crate) rows: Option<Rows>,
     pub(crate) has_row: bool,
-    pub(crate) last_error: Option<CString>,
+    pub(crate) last_error: LastErrorState,
     /// Column names as CStrings (shared via Arc for prepared statement reuse).
     pub(crate) column_names: Arc<Vec<CString>>,
     /// Lazy text cache for the current row. Starts empty; grown on demand by
@@ -132,56 +173,70 @@ pub struct StoolapRows {
 
 impl StoolapDB {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        let sanitized = msg.replace('\0', "\\0");
-        self.last_error = CString::new(sanitized).ok();
+        self.last_error.set_message(msg);
+    }
+
+    pub(crate) fn set_error_from(&mut self, err: &Error) {
+        self.last_error.set_from_error(err);
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
-        match &self.last_error {
-            Some(cs) => cs.as_ptr(),
-            None => super::error::empty_cstr(),
-        }
+        self.last_error.message_ptr()
+    }
+}
+
+impl StoolapRoDB {
+    pub(crate) fn set_error(&mut self, msg: &str) {
+        self.last_error.set_message(msg);
+    }
+
+    pub(crate) fn set_error_from(&mut self, err: &Error) {
+        self.last_error.set_from_error(err);
+    }
+
+    pub(crate) fn error_ptr(&self) -> *const c_char {
+        self.last_error.message_ptr()
     }
 }
 
 impl StoolapStmt {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        let sanitized = msg.replace('\0', "\\0");
-        self.last_error = CString::new(sanitized).ok();
+        self.last_error.set_message(msg);
+    }
+
+    pub(crate) fn set_error_from(&mut self, err: &Error) {
+        self.last_error.set_from_error(err);
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
-        match &self.last_error {
-            Some(cs) => cs.as_ptr(),
-            None => super::error::empty_cstr(),
-        }
+        self.last_error.message_ptr()
     }
 }
 
 impl StoolapTx {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        let sanitized = msg.replace('\0', "\\0");
-        self.last_error = CString::new(sanitized).ok();
+        self.last_error.set_message(msg);
+    }
+
+    pub(crate) fn set_error_from(&mut self, err: &Error) {
+        self.last_error.set_from_error(err);
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
-        match &self.last_error {
-            Some(cs) => cs.as_ptr(),
-            None => super::error::empty_cstr(),
-        }
+        self.last_error.message_ptr()
     }
 }
 
 impl StoolapRows {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        let sanitized = msg.replace('\0', "\\0");
-        self.last_error = CString::new(sanitized).ok();
+        self.last_error.set_message(msg);
+    }
+
+    pub(crate) fn set_error_from(&mut self, err: &Error) {
+        self.last_error.set_from_error(err);
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
-        match &self.last_error {
-            Some(cs) => cs.as_ptr(),
-            None => super::error::empty_cstr(),
-        }
+        self.last_error.message_ptr()
     }
 }

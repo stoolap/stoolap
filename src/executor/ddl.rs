@@ -332,93 +332,31 @@ impl Executor {
             // Use the active transaction for DDL (allows rollback)
             let table = tx_state.transaction.create_table(table_name, schema)?;
 
-            // Create unique indexes for columns with UNIQUE constraint
-            for col_name in &unique_columns {
-                let index_name = format!("unique_{}_{}", table_name, col_name);
-                table.create_index(&index_name, &[col_name.as_str()], true)?;
-                // Get index type for WAL persistence
-                let idx_type = table
-                    .get_index(&index_name)
-                    .map(|idx| idx.index_type())
-                    .unwrap_or(crate::core::IndexType::BTree);
-                // Record index creation to WAL for persistence
-                self.engine.record_create_index(
-                    table_name,
-                    &index_name,
-                    std::slice::from_ref(col_name),
-                    true,
-                    idx_type,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
-            }
-
-            // Create multi-column unique indexes from table-level constraints
-            for (i, col_names) in table_unique_constraints.iter().enumerate() {
-                let index_name = format!("unique_{}_{}", table_name, i);
-                let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-                table.create_index(&index_name, &col_refs, true)?;
-                // Get index type for WAL persistence
-                let idx_type = table
-                    .get_index(&index_name)
-                    .map(|idx| idx.index_type())
-                    .unwrap_or(crate::core::IndexType::BTree);
-                // Record index creation to WAL for persistence
-                self.engine.record_create_index(
-                    table_name,
-                    &index_name,
-                    col_names,
-                    true,
-                    idx_type,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
-            }
-
-            // Auto-create indexes on FK columns for efficient referential integrity checks
-            for col_name in &fk_index_columns {
-                let index_name = format!("fk_{}_{}", table_name, col_name);
-                table.create_index(&index_name, &[col_name.as_str()], false)?;
-                let idx_type = table
-                    .get_index(&index_name)
-                    .map(|idx| idx.index_type())
-                    .unwrap_or(crate::core::IndexType::BTree);
-                self.engine.record_create_index(
-                    table_name,
-                    &index_name,
-                    std::slice::from_ref(col_name),
-                    false,
-                    idx_type,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
-            }
-        } else {
-            // No active transaction - use direct engine call (auto-committed)
-            self.engine.create_table(schema)?;
-
-            // Create unique indexes and FK indexes
-            let needs_indexes = !unique_columns.is_empty()
-                || !table_unique_constraints.is_empty()
-                || !fk_index_columns.is_empty();
-            if needs_indexes {
-                let tx = self.engine.begin_transaction()?;
-                let table = tx.get_table(table_name)?;
-
+            // Create unique indexes and FK indexes. The active-tx
+            // CREATE TABLE statement must be atomic from the SQL
+            // caller's view: a partial-success outcome (table
+            // logged in `ddl_log`, some auto-indexes missing) would
+            // leave the open transaction holding a half-formed
+            // table that a later COMMIT could promote to durable
+            // state. Wrap the auto-index work in a labeled block,
+            // capture the first failure, and on any failure undo
+            // the just-created table inside the same txn so
+            // `ddl_log` records `Create + Drop` (which COMMIT
+            // collapses to "no table" and ROLLBACK undoes via the
+            // existing reverse-walk).
+            let mut autoindex_err: Option<Error> = None;
+            'autoindex: {
                 for col_name in &unique_columns {
                     let index_name = format!("unique_{}_{}", table_name, col_name);
-                    table.create_index(&index_name, &[col_name.as_str()], true)?;
+                    if let Err(e) = table.create_index(&index_name, &[col_name.as_str()], true) {
+                        autoindex_err = Some(e);
+                        break 'autoindex;
+                    }
                     let idx_type = table
                         .get_index(&index_name)
                         .map(|idx| idx.index_type())
                         .unwrap_or(crate::core::IndexType::BTree);
-                    self.engine.record_create_index(
+                    if let Err(e) = tx_state.transaction.stage_deferred_create_index(
                         table_name,
                         &index_name,
                         std::slice::from_ref(col_name),
@@ -428,19 +366,26 @@ impl Executor {
                         None,
                         None,
                         None,
-                    )?;
+                    ) {
+                        let _ = table.drop_index(&index_name);
+                        autoindex_err = Some(e);
+                        break 'autoindex;
+                    }
                 }
 
                 // Create multi-column unique indexes from table-level constraints
                 for (i, col_names) in table_unique_constraints.iter().enumerate() {
                     let index_name = format!("unique_{}_{}", table_name, i);
                     let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-                    table.create_index(&index_name, &col_refs, true)?;
+                    if let Err(e) = table.create_index(&index_name, &col_refs, true) {
+                        autoindex_err = Some(e);
+                        break 'autoindex;
+                    }
                     let idx_type = table
                         .get_index(&index_name)
                         .map(|idx| idx.index_type())
                         .unwrap_or(crate::core::IndexType::BTree);
-                    self.engine.record_create_index(
+                    if let Err(e) = tx_state.transaction.stage_deferred_create_index(
                         table_name,
                         &index_name,
                         col_names,
@@ -450,18 +395,25 @@ impl Executor {
                         None,
                         None,
                         None,
-                    )?;
+                    ) {
+                        let _ = table.drop_index(&index_name);
+                        autoindex_err = Some(e);
+                        break 'autoindex;
+                    }
                 }
 
                 // Auto-create indexes on FK columns for efficient referential integrity checks
                 for col_name in &fk_index_columns {
                     let index_name = format!("fk_{}_{}", table_name, col_name);
-                    table.create_index(&index_name, &[col_name.as_str()], false)?;
+                    if let Err(e) = table.create_index(&index_name, &[col_name.as_str()], false) {
+                        autoindex_err = Some(e);
+                        break 'autoindex;
+                    }
                     let idx_type = table
                         .get_index(&index_name)
                         .map(|idx| idx.index_type())
                         .unwrap_or(crate::core::IndexType::BTree);
-                    self.engine.record_create_index(
+                    if let Err(e) = tx_state.transaction.stage_deferred_create_index(
                         table_name,
                         &index_name,
                         std::slice::from_ref(col_name),
@@ -471,7 +423,232 @@ impl Executor {
                         None,
                         None,
                         None,
-                    )?;
+                    ) {
+                        let _ = table.drop_index(&index_name);
+                        autoindex_err = Some(e);
+                        break 'autoindex;
+                    }
+                }
+            }
+            if let Some(e) = autoindex_err {
+                // Drop the index handle FIRST so the in-process
+                // `Arc<dyn WriteTable>` doesn't keep the
+                // version-store reachable during the undo
+                // drop_table (which closes the store after WAL
+                // succeeds).
+                drop(table);
+                // Undo the just-created table inside the same
+                // txn. `ddl_log` becomes [Create, Drop]; reverse-
+                // walk on rollback or natural reorder on commit
+                // both end with "no table". A failure here
+                // (latch flipped between, WAL I/O failure in the
+                // DROP) latches the engine and forces the
+                // entire transaction to be unusable so the
+                // failed CREATE TABLE statement can't be
+                // promoted to durable state by a subsequent
+                // COMMIT.
+                if let Err(undo_e) = tx_state.transaction.drop_table(table_name) {
+                    eprintln!(
+                        "Error: Failed to undo CREATE TABLE '{}' after auto-index \
+                         failure: {} — rolling back the entire transaction so the \
+                         failed CREATE cannot be committed.",
+                        table_name, undo_e
+                    );
+                    let _ = tx_state.transaction.rollback();
+                    *active_tx = None;
+                }
+                return Err(e);
+            }
+        } else {
+            // No active transaction - use direct engine call (auto-committed)
+            self.engine.create_table(schema)?;
+
+            // Create unique indexes and FK indexes. CREATE TABLE
+            // is documented as atomic from the SQL caller's view —
+            // any failure between the table CREATE and the last
+            // generated index must roll the table BACK so an Err
+            // doesn't leave the table half-indexed (some
+            // generated indexes durable, the failing UNIQUE/FK
+            // index missing). Wrap the index work in a labeled
+            // block so the table-undo runs once on any failure
+            // path.
+            let needs_indexes = !unique_columns.is_empty()
+                || !table_unique_constraints.is_empty()
+                || !fk_index_columns.is_empty();
+            if needs_indexes {
+                // Hold SH on the engine's
+                // `transactional_ddl_fence` across every
+                // generated-index `table.create_index` →
+                // `record_create_index` window. The fence
+                // is scoped to JUST the loops; the
+                // table-undo path below calls
+                // `drop_table_internal` which itself
+                // acquires SH on the same fence, so we MUST
+                // release here before the undo (parking_lot
+                // RwLock can deadlock on reentrant SH if a
+                // checkpoint writer is waiting for EX). The
+                // undo is then fenced by `drop_table_internal`'s
+                // own SH guard.
+                //
+                // Without this guard, `engine.create_table`
+                // released its own fence above before
+                // returning, so a checkpoint could grab EX
+                // between any `table.create_index(...)`
+                // (in-memory) and its companion
+                // `record_create_index(...)` (WAL). A
+                // re-record landing in that gap becomes
+                // durable; if `record_create_index` then
+                // fails and the rollback drops the index,
+                // recovery would still rebuild that index
+                // (and its parent table) from the
+                // checkpoint's re-records — surfacing schema
+                // state belonging to a CREATE TABLE
+                // statement that ultimately failed.
+                let mut autoindex_err: Option<Error> = None;
+                {
+                    let _ddl_fence_guard = self.engine.ddl_fence().read();
+                    let tx = self.engine.begin_writable_transaction_internal()?;
+                    let table = tx.get_table(table_name)?;
+
+                    'autoindex: {
+                        for col_name in &unique_columns {
+                            let index_name = format!("unique_{}_{}", table_name, col_name);
+                            if let Err(e) =
+                                table.create_index(&index_name, &[col_name.as_str()], true)
+                            {
+                                autoindex_err = Some(e);
+                                break 'autoindex;
+                            }
+                            let idx_type = table
+                                .get_index(&index_name)
+                                .map(|idx| idx.index_type())
+                                .unwrap_or(crate::core::IndexType::BTree);
+                            if let Err(e) = self.engine.record_create_index(
+                                table_name,
+                                &index_name,
+                                std::slice::from_ref(col_name),
+                                true,
+                                idx_type,
+                                None,
+                                None,
+                                None,
+                                None,
+                            ) {
+                                let _ = table.drop_index(&index_name);
+                                autoindex_err = Some(e);
+                                break 'autoindex;
+                            }
+                        }
+
+                        // Create multi-column unique indexes from table-level constraints
+                        for (i, col_names) in table_unique_constraints.iter().enumerate() {
+                            let index_name = format!("unique_{}_{}", table_name, i);
+                            let col_refs: Vec<&str> =
+                                col_names.iter().map(|s| s.as_str()).collect();
+                            if let Err(e) = table.create_index(&index_name, &col_refs, true) {
+                                autoindex_err = Some(e);
+                                break 'autoindex;
+                            }
+                            let idx_type = table
+                                .get_index(&index_name)
+                                .map(|idx| idx.index_type())
+                                .unwrap_or(crate::core::IndexType::BTree);
+                            if let Err(e) = self.engine.record_create_index(
+                                table_name,
+                                &index_name,
+                                col_names,
+                                true,
+                                idx_type,
+                                None,
+                                None,
+                                None,
+                                None,
+                            ) {
+                                let _ = table.drop_index(&index_name);
+                                autoindex_err = Some(e);
+                                break 'autoindex;
+                            }
+                        }
+
+                        // Auto-create indexes on FK columns for efficient referential integrity checks
+                        for col_name in &fk_index_columns {
+                            let index_name = format!("fk_{}_{}", table_name, col_name);
+                            if let Err(e) =
+                                table.create_index(&index_name, &[col_name.as_str()], false)
+                            {
+                                autoindex_err = Some(e);
+                                break 'autoindex;
+                            }
+                            let idx_type = table
+                                .get_index(&index_name)
+                                .map(|idx| idx.index_type())
+                                .unwrap_or(crate::core::IndexType::BTree);
+                            if let Err(e) = self.engine.record_create_index(
+                                table_name,
+                                &index_name,
+                                std::slice::from_ref(col_name),
+                                false,
+                                idx_type,
+                                None,
+                                None,
+                                None,
+                                None,
+                            ) {
+                                let _ = table.drop_index(&index_name);
+                                autoindex_err = Some(e);
+                                break 'autoindex;
+                            }
+                        }
+                    }
+                    // Drop the SH guard + tx + table here
+                    // so the rollback path below (which
+                    // calls `drop_table_internal`, which
+                    // takes its OWN SH guard) doesn't
+                    // attempt reentrant SH on the same
+                    // fence — parking_lot can deadlock if a
+                    // checkpoint EX is waiting.
+                }
+                if let Some(e) = autoindex_err {
+                    // Undo the durable CREATE TABLE so the
+                    // failed statement leaves no half-formed
+                    // table behind. `drop_table_internal`
+                    // also writes a durable DropTable WAL +
+                    // tears down the version store, so any
+                    // earlier successful CreateIndex WAL
+                    // entries become orphans cleanable on the
+                    // next checkpoint. Recovery sees CREATE
+                    // TABLE + index entries + DROP TABLE
+                    // and converges to "no table".
+                    //
+                    // The undo can fail under the same
+                    // conditions that produced `autoindex_err`
+                    // (latch tripped via
+                    // `ensure_writable`, fresh WAL I/O
+                    // failure). Discarding that failure would
+                    // leave the table durable + partially
+                    // indexed and let this process keep
+                    // accepting writes against an
+                    // inconsistent durable state. Latch the
+                    // engine instead so subsequent durability
+                    // paths refuse and the user is forced to
+                    // restart; WAL recovery converges to
+                    // either CREATE+DROP (table gone) or just
+                    // CREATE (table present but
+                    // partially indexed — visible at the
+                    // schema/index level) depending on how
+                    // far the original failure got. Surface
+                    // both errors to the caller.
+                    if let Err(undo_e) = self.engine.drop_table_internal(table_name) {
+                        self.engine.enter_catastrophic_failure();
+                        return Err(Error::internal(format!(
+                            "CREATE TABLE auto-index failed ({}); the compensating \
+                             DROP TABLE for '{}' also failed ({}). The engine has \
+                             been latched; restart the process so WAL recovery can \
+                             converge.",
+                            e, table_name, undo_e
+                        )));
+                    }
+                    return Err(e);
                 }
             }
         }
@@ -536,7 +713,7 @@ impl Executor {
         // Insert the rows into the new table
         let rows_count = rows.len();
         if !rows.is_empty() {
-            let mut tx = self.engine.begin_transaction()?;
+            let mut tx = self.engine.begin_writable_transaction_internal()?;
             let mut table = tx.get_table(table_name)?;
 
             for row in rows {
@@ -620,6 +797,20 @@ impl Executor {
         stmt: &CreateIndexStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        // Hold SH on the engine's `transactional_ddl_fence`
+        // across the index mutation-to-WAL window.
+        // Checkpoint's `rerecord_ddl_to_wal` takes EX, so
+        // this fence blocks any concurrent checkpoint from
+        // snapshotting the in-memory index BEFORE
+        // `record_create_index` writes the durable
+        // CreateIndex record. Without the guard, a
+        // checkpoint that landed mid-window would re-record
+        // the transient index; if `record_create_index`
+        // later fails and the rollback drops the index from
+        // the table, recovery would still rebuild it from
+        // the checkpoint's CreateIndex re-record.
+        let _ddl_fence_guard = self.engine.ddl_fence().read();
+
         let table_name = &stmt.table_name.value;
         let index_name = &stmt.index_name.value;
 
@@ -643,7 +834,7 @@ impl Executor {
         let is_unique = stmt.is_unique;
 
         // Get table to validate columns exist
-        let tx = self.engine.begin_transaction()?;
+        let tx = self.engine.begin_writable_transaction_internal()?;
         let table = tx.get_table(table_name)?;
         let schema = table.schema();
 
@@ -846,6 +1037,15 @@ impl Executor {
         stmt: &DropIndexStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        // Hold SH on the engine's `transactional_ddl_fence`
+        // across the WAL-to-mutation window — same rationale
+        // as `execute_create_index`. Without the guard a
+        // checkpoint that landed between `record_drop_index`
+        // and `table.drop_index` could re-record the
+        // not-yet-removed index, leaving a later CreateIndex
+        // entry past the durable DropIndex.
+        let _ddl_fence_guard = self.engine.ddl_fence().read();
+
         let index_name = &stmt.index_name.value;
 
         // Get table name if specified
@@ -880,7 +1080,7 @@ impl Executor {
         self.engine.record_drop_index(&table_name, index_name)?;
 
         // Now apply the in-memory change
-        let tx = self.engine.begin_transaction()?;
+        let tx = self.engine.begin_writable_transaction_internal()?;
         let table = tx.get_table(&table_name)?;
         table.drop_index(index_name)?;
 
@@ -893,6 +1093,23 @@ impl Executor {
         stmt: &AlterTableStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        // Hold SH on the engine's `transactional_ddl_fence`
+        // across every ALTER variant in this function.
+        // ALTER mutates the table schema (and refreshes the
+        // engine schema cache) BEFORE the corresponding
+        // `record_alter_table_*` WAL write. Without the
+        // fence a checkpoint that landed mid-window could
+        // snapshot the post-ALTER schema into a CreateTable
+        // re-record; if the WAL write later fails and this
+        // branch restores the pre-ALTER schema in memory,
+        // crash recovery still sees the checkpoint's
+        // re-recorded post-ALTER schema and the two views
+        // diverge. Same hazard applies to add / drop /
+        // rename / modify column and rename table — all
+        // inside this same function — so a single
+        // function-scoped guard covers every variant.
+        let _ddl_fence_guard = self.engine.ddl_fence().read();
+
         let table_name = &stmt.table_name.value;
 
         // Check if table exists
@@ -901,8 +1118,28 @@ impl Executor {
         }
 
         // Get the table for modifications
-        let mut tx = self.engine.begin_transaction()?;
+        let mut tx = self.engine.begin_writable_transaction_internal()?;
         let mut table = tx.get_table(table_name)?;
+
+        // Recheck the catastrophic-failure latch before mutating the
+        // table schema. begin_writable_transaction_internal checked
+        // it once, but a concurrent marker-failure commit can latch
+        // the engine in the gap before we touch
+        // create_column_with_default_value / drop_column / etc.
+        // Without this check the schema mutation lands in memory,
+        // then `record_alter_table_*` (which routes through
+        // record_ddl) hits the failed-latch guard and returns Err —
+        // leaving the in-memory ALTER live but never recorded to
+        // WAL. `MvccTransaction::Drop` only rolls back created /
+        // dropped tables, not column-level edits, so the divergence
+        // would persist for the lifetime of the process.
+        if self.engine.is_failed() {
+            return Err(Error::internal(
+                "ALTER TABLE refused: engine is in the catastrophic-failure \
+                 state from a prior commit's marker write failure. Restart \
+                 the process; recovery will discard the markerless transaction.",
+            ));
+        }
 
         // Process the single ALTER TABLE operation
         match stmt.operation {
@@ -936,6 +1173,13 @@ impl Executor {
                         None
                     };
 
+                    // Snapshot pre-mutation schema so the WAL-failure
+                    // revert can restore EVERY field verbatim
+                    // (column ids, positions, PK / auto-increment /
+                    // check / default metadata) instead of
+                    // approximating with an inverse op.
+                    let pre_schema = table.schema().clone();
+
                     table.create_column_with_default_value(
                         &col_def.name.value,
                         data_type,
@@ -948,20 +1192,32 @@ impl Executor {
                     // The table modified the version_store schema, but engine has a separate cache
                     self.engine.refresh_schema_cache(table_name)?;
 
-                    // Record ALTER TABLE ADD COLUMN to WAL for persistence
+                    // Record ALTER TABLE ADD COLUMN to WAL for persistence.
+                    // record_ddl has the failed-latch guard. If the
+                    // latch was set after our up-front check (between
+                    // create_column_with_default_value above and this
+                    // call), the WAL record fails and we MUST revert
+                    // the in-memory mutation — otherwise the column
+                    // stays live in memory but recovery has no record
+                    // of it, and `MvccTransaction::Drop` only rolls
+                    // back created/dropped tables, not column edits.
                     let vector_dimensions = if data_type == DataType::Vector {
                         crate::executor::utils::parse_vector_dimension(&col_def.data_type)
                     } else {
                         0
                     };
-                    self.engine.record_alter_table_add_column(
+                    if let Err(e) = self.engine.record_alter_table_add_column(
                         table_name,
                         &col_def.name.value,
                         data_type,
                         nullable,
                         default_expr.as_deref(),
                         vector_dimensions,
-                    )?;
+                    ) {
+                        // Restore the entire pre-mutation schema.
+                        let _ = self.engine.restore_table_schema(table_name, pre_schema);
+                        return Err(e);
+                    }
                 } else {
                     return Err(Error::InvalidArgument(
                         "ADD COLUMN requires column definition".to_string(),
@@ -970,18 +1226,41 @@ impl Executor {
             }
             AlterTableOperation::DropColumn => {
                 if let Some(ref col_name) = stmt.column_name {
+                    // Snapshot the entire pre-drop schema so revert
+                    // restores every column field verbatim — id,
+                    // position, PK / auto-increment / check / default
+                    // metadata. Reconstructing via
+                    // create_column_with_default_value would silently
+                    // change those.
+                    let pre_schema = table.schema().clone();
+
                     table.drop_column(&col_name.value)?;
 
                     // Refresh schema cache FIRST so invalidate_mappings sees the post-drop schema
                     self.engine.refresh_schema_cache(table_name)?;
 
+                    // Record ALTER TABLE DROP COLUMN to WAL BEFORE
+                    // propagating to the manifest. propagate_column_drop
+                    // mutates segment-manager state that's harder to
+                    // revert; doing the WAL call first lets us bail
+                    // cleanly with just the table-schema revert if the
+                    // latch flipped between the up-front check and now.
+                    if let Err(e) = self
+                        .engine
+                        .record_alter_table_drop_column(table_name, &col_name.value)
+                    {
+                        // Restore the entire pre-mutation schema.
+                        // Indexes the original column had are NOT
+                        // re-attached here — restart's WAL replay
+                        // will rebuild them from DDL since no DROP
+                        // COLUMN landed in WAL.
+                        let _ = self.engine.restore_table_schema(table_name, pre_schema);
+                        return Err(e);
+                    }
+
                     // Record column drop in manifest and recompute cold volume mappings
                     self.engine
                         .propagate_column_drop(table_name, &col_name.value);
-
-                    // Record ALTER TABLE DROP COLUMN to WAL for persistence
-                    self.engine
-                        .record_alter_table_drop_column(table_name, &col_name.value)?;
                 } else {
                     return Err(Error::InvalidArgument(
                         "DROP COLUMN requires column name".to_string(),
@@ -990,7 +1269,24 @@ impl Executor {
             }
             AlterTableOperation::RenameColumn => match (&stmt.column_name, &stmt.new_column_name) {
                 (Some(old_name), Some(new_name)) => {
+                    let pre_schema = table.schema().clone();
+
                     table.rename_column(&old_name.value, &new_name.value)?;
+
+                    // Refresh engine's schema cache from version store
+                    self.engine.refresh_schema_cache(table_name)?;
+
+                    // Record WAL BEFORE propagating the alias, so a
+                    // latch-set failure has only the table-schema
+                    // rename to revert via wholesale schema restore.
+                    if let Err(e) = self.engine.record_alter_table_rename_column(
+                        table_name,
+                        &old_name.value,
+                        &new_name.value,
+                    ) {
+                        let _ = self.engine.restore_table_schema(table_name, pre_schema);
+                        return Err(e);
+                    }
 
                     // Propagate rename alias to cold volumes
                     self.engine.propagate_column_alias(
@@ -998,16 +1294,6 @@ impl Executor {
                         &new_name.value,
                         &old_name.value,
                     );
-
-                    // Refresh engine's schema cache from version store
-                    self.engine.refresh_schema_cache(table_name)?;
-
-                    // Record ALTER TABLE RENAME COLUMN to WAL for persistence
-                    self.engine.record_alter_table_rename_column(
-                        table_name,
-                        &old_name.value,
-                        &new_name.value,
-                    )?;
                 }
                 _ => {
                     return Err(Error::InvalidArgument(
@@ -1044,24 +1330,33 @@ impl Executor {
                         }
                     }
 
+                    // Snapshot the entire pre-modify schema for the
+                    // WAL-failure revert path.
+                    let pre_schema = table.schema().clone();
+
                     table.modify_column(&col_def.name.value, data_type, nullable)?;
 
                     // Refresh engine's schema cache from version store
                     self.engine.refresh_schema_cache(table_name)?;
 
-                    // Record ALTER TABLE MODIFY COLUMN to WAL for persistence
+                    // Record ALTER TABLE MODIFY COLUMN to WAL.
+                    // Revert via wholesale schema restore on
+                    // latch-set failure.
                     let vector_dimensions = if data_type == DataType::Vector {
                         crate::executor::utils::parse_vector_dimension(&col_def.data_type)
                     } else {
                         0
                     };
-                    self.engine.record_alter_table_modify_column(
+                    if let Err(e) = self.engine.record_alter_table_modify_column(
                         table_name,
                         &col_def.name.value,
                         data_type,
                         nullable,
                         vector_dimensions,
-                    )?;
+                    ) {
+                        let _ = self.engine.restore_table_schema(table_name, pre_schema);
+                        return Err(e);
+                    }
                 } else {
                     return Err(Error::InvalidArgument(
                         "MODIFY COLUMN requires column definition".to_string(),
@@ -1072,9 +1367,25 @@ impl Executor {
                 if let Some(ref new_name) = stmt.new_table_name {
                     tx.rename_table(table_name, &new_name.value)?;
 
-                    // Record ALTER TABLE RENAME TO WAL for persistence
-                    self.engine
-                        .record_alter_table_rename(table_name, &new_name.value)?;
+                    // Record ALTER TABLE RENAME TO WAL. On WAL
+                    // failure (typically the failed-latch flipping
+                    // between tx.rename_table's begin-time check and
+                    // now) we MUST undo the in-memory + on-disk
+                    // rename. Routing the revert back through
+                    // tx.rename_table would be refused by the same
+                    // latch — use the engine's
+                    // `rename_table_revert` path which bypasses the
+                    // latch check (the latch was set BY the failure
+                    // we're reverting from, so refusing the revert
+                    // would leave durable state diverged with no
+                    // path to fix it short of restart-and-replay).
+                    if let Err(e) = self
+                        .engine
+                        .record_alter_table_rename(table_name, &new_name.value)
+                    {
+                        let _ = self.engine.rename_table_revert(&new_name.value, table_name);
+                        return Err(e);
+                    }
                 } else {
                     return Err(Error::InvalidArgument(
                         "RENAME TABLE requires new table name".to_string(),

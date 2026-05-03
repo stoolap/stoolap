@@ -12,44 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Transaction trait for database transactions
+//! Transaction traits for database transactions.
 //!
+//! Split into [`ReadTransaction`] (non-mutating surface, plus
+//! transaction-local mutations like savepoints / commit / rollback that
+//! do not write to disk on read-only transactions) and
+//! [`WriteTransaction`] (extends `ReadTransaction` with table DDL and
+//! the writable `get_table`).
+//!
+//! Read-only callers receive `Box<dyn ReadTransaction>` and cannot reach
+//! `create_table`, `drop_table`, schema DDL, or any path that returns a
+//! [`WriteTable`]. The compiler enforces this by construction.
 
 use rustc_hash::FxHashMap;
 
 use crate::core::{IsolationLevel, Result, Schema, SchemaColumn};
 use crate::storage::expression::Expression;
-use crate::storage::traits::{QueryResult, Table};
+use crate::storage::traits::{QueryResult, ReadTable, WriteTable};
 
-/// Transaction represents a database transaction
+/// Read-only surface of a database transaction.
 ///
-/// This trait defines the interface for transaction operations including
-/// DDL (table/index management), DML (select/insert/update/delete),
-/// and transaction control (begin/commit/rollback).
+/// Includes transaction lifecycle (`begin`, `commit`, `rollback`),
+/// savepoint management, isolation-level updates, table listing, and
+/// queries — none of which write persistent state on a read-only
+/// transaction.
 ///
-/// # Example
-///
-/// ```ignore
-/// let tx = engine.begin_transaction()?;
-///
-/// // Create a table
-/// let schema = Schema::new("users").with_column("id", DataType::Integer, false);
-/// tx.create_table("users", schema)?;
-///
-/// // Insert data
-/// let table = tx.get_table("users")?;
-/// table.insert(Row::from_values(vec![Value::Integer(1)]))?;
-///
-/// // Query data
-/// let result = tx.select("users", &["id"], None, None)?;
-///
-/// tx.commit()?;
-/// ```
-pub trait Transaction: Send {
+/// `commit` is on this trait because it must finalize registry/state
+/// cleanup even on read-only transactions; `Drop` aborts otherwise. On
+/// read-only transactions, `commit` performs no WAL or data flush.
+pub trait ReadTransaction: Send {
     /// Begins the transaction
     fn begin(&mut self) -> Result<()>;
 
-    /// Commits the transaction
+    /// Commits the transaction.
+    ///
+    /// On read-only transactions: no WAL/data flush, but still finalizes
+    /// registry/state cleanup (transitions state to `Committed`).
+    /// Cannot be a literal no-op — `Drop` checks `state == Active` and
+    /// aborts; if `commit` left the state Active, the transaction would
+    /// silently abort on drop.
     fn commit(&mut self) -> Result<()>;
 
     /// Rolls back the transaction
@@ -79,82 +80,22 @@ pub trait Transaction: Send {
     /// Returns the transaction ID
     fn id(&self) -> i64;
 
-    /// Sets the isolation level for this transaction
+    /// Sets the isolation level for this transaction.
+    ///
+    /// Mutates transaction-local state only. SQL-level
+    /// `SET TRANSACTION ISOLATION LEVEL` is rejected at the parser gate
+    /// for read-only databases (`Statement::write_reason()` classifies
+    /// it as a writer); the Rust method is safe to leave reachable.
     fn set_isolation_level(&mut self, level: IsolationLevel) -> Result<()>;
-
-    // ---- Table Operations ----
-
-    /// Creates a new table with the given schema
-    fn create_table(&mut self, name: &str, schema: Schema) -> Result<Box<dyn Table>>;
-
-    /// Drops a table
-    fn drop_table(&mut self, name: &str) -> Result<()>;
-
-    /// Gets a reference to a table by name
-    fn get_table(&self, name: &str) -> Result<Box<dyn Table>>;
 
     /// Lists all table names
     fn list_tables(&self) -> Result<Vec<String>>;
 
-    /// Renames a table
-    fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<()>;
-
-    // ---- Index Operations ----
-
-    /// Creates an index on a table
+    /// Gets a read-only handle to a table by name.
     ///
-    /// # Arguments
-    /// * `table_name` - Name of the table
-    /// * `index_name` - Name for the new index
-    /// * `columns` - Column names to include in the index
-    /// * `is_unique` - Whether this is a unique index
-    fn create_table_index(
-        &mut self,
-        table_name: &str,
-        index_name: &str,
-        columns: &[String],
-        is_unique: bool,
-    ) -> Result<()>;
-
-    /// Drops an index from a table
-    fn drop_table_index(&mut self, table_name: &str, index_name: &str) -> Result<()>;
-
-    /// Creates a btree index on a table column
-    ///
-    /// # Arguments
-    /// * `table_name` - Name of the table
-    /// * `column_name` - Name of the column to index
-    /// * `is_unique` - Whether this is a unique index
-    /// * `custom_name` - Optional custom name for the index
-    fn create_table_btree_index(
-        &mut self,
-        table_name: &str,
-        column_name: &str,
-        is_unique: bool,
-        custom_name: Option<&str>,
-    ) -> Result<()>;
-
-    /// Drops a btree index from a table
-    fn drop_table_btree_index(&mut self, table_name: &str, column_name: &str) -> Result<()>;
-
-    // ---- Column Operations (ALTER TABLE) ----
-
-    /// Adds a column to a table
-    fn add_table_column(&mut self, table_name: &str, column: SchemaColumn) -> Result<()>;
-
-    /// Drops a column from a table
-    fn drop_table_column(&mut self, table_name: &str, column_name: &str) -> Result<()>;
-
-    /// Renames a column in a table
-    fn rename_table_column(
-        &mut self,
-        table_name: &str,
-        old_name: &str,
-        new_name: &str,
-    ) -> Result<()>;
-
-    /// Modifies a column in a table
-    fn modify_table_column(&mut self, table_name: &str, column: SchemaColumn) -> Result<()>;
+    /// Returns `Box<dyn ReadTable>`. Never returns a writable handle —
+    /// read-only callers cannot reach `WriteTable` through this method.
+    fn get_read_table(&self, name: &str) -> Result<Box<dyn ReadTable>>;
 
     // ---- Query Operations ----
 
@@ -210,6 +151,111 @@ pub trait Transaction: Send {
     ) -> Result<Box<dyn QueryResult>>;
 }
 
+/// Writable surface of a database transaction.
+///
+/// Extends [`ReadTransaction`] with table DDL (`create_table`,
+/// `drop_table`, `rename_table`), index DDL, column DDL, and the
+/// writable `get_table` returning `Box<dyn WriteTable>`.
+///
+/// Read-only callers cannot reach this trait — they hold
+/// `Box<dyn ReadTransaction>` instead.
+pub trait WriteTransaction: ReadTransaction {
+    // ---- Table Operations (write-side) ----
+
+    /// Creates a new table with the given schema
+    fn create_table(&mut self, name: &str, schema: Schema) -> Result<Box<dyn WriteTable>>;
+
+    /// Drops a table
+    fn drop_table(&mut self, name: &str) -> Result<()>;
+
+    /// Gets a writable handle to a table by name
+    fn get_table(&self, name: &str) -> Result<Box<dyn WriteTable>>;
+
+    /// Renames a table
+    fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<()>;
+
+    // ---- Index Operations ----
+
+    /// Creates an index on a table
+    ///
+    /// # Arguments
+    /// * `table_name` - Name of the table
+    /// * `index_name` - Name for the new index
+    /// * `columns` - Column names to include in the index
+    /// * `is_unique` - Whether this is a unique index
+    fn create_table_index(
+        &mut self,
+        table_name: &str,
+        index_name: &str,
+        columns: &[String],
+        is_unique: bool,
+    ) -> Result<()>;
+
+    /// Drops an index from a table
+    fn drop_table_index(&mut self, table_name: &str, index_name: &str) -> Result<()>;
+
+    /// Creates a btree index on a table column
+    ///
+    /// # Arguments
+    /// * `table_name` - Name of the table
+    /// * `column_name` - Name of the column to index
+    /// * `is_unique` - Whether this is a unique index
+    /// * `custom_name` - Optional custom name for the index
+    fn create_table_btree_index(
+        &mut self,
+        table_name: &str,
+        column_name: &str,
+        is_unique: bool,
+        custom_name: Option<&str>,
+    ) -> Result<()>;
+
+    /// Drops a btree index from a table
+    fn drop_table_btree_index(&mut self, table_name: &str, column_name: &str) -> Result<()>;
+
+    /// Stage a CREATE INDEX entry on the txn's deferred-DDL
+    /// log. The transactional CREATE TABLE path uses this
+    /// (instead of the auto-commit
+    /// `MVCCEngine::record_create_index`) so generated
+    /// UNIQUE / FK indexes flush as part of the txn's
+    /// deferred DDL batch — recovery applies the parent
+    /// CreateTable, then this index, then the txn's commit
+    /// marker. Default is a no-op for non-MVCC backends.
+    #[allow(clippy::too_many_arguments)]
+    fn stage_deferred_create_index(
+        &mut self,
+        _table_name: &str,
+        _index_name: &str,
+        _columns: &[String],
+        _is_unique: bool,
+        _index_type: crate::core::IndexType,
+        _hnsw_m: Option<u16>,
+        _hnsw_ef_construction: Option<u16>,
+        _hnsw_ef_search: Option<u16>,
+        _hnsw_distance_metric: Option<u8>,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    // ---- Column Operations (ALTER TABLE) ----
+
+    /// Adds a column to a table
+    fn add_table_column(&mut self, table_name: &str, column: SchemaColumn) -> Result<()>;
+
+    /// Drops a column from a table
+    fn drop_table_column(&mut self, table_name: &str, column_name: &str) -> Result<()>;
+
+    /// Renames a column in a table
+    fn rename_table_column(
+        &mut self,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<()>;
+
+    /// Modifies a column in a table
+    fn modify_table_column(&mut self, table_name: &str, column: SchemaColumn) -> Result<()>;
+}
+
 /// Temporal query type for time-travel queries
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemporalType {
@@ -263,6 +309,7 @@ mod tests {
         assert_eq!(TemporalType::parse("INVALID"), None);
     }
 
-    // Verify trait is object-safe
-    fn _assert_object_safe(_: &dyn Transaction) {}
+    // Verify both traits are object-safe
+    fn _assert_read_object_safe(_: &dyn ReadTransaction) {}
+    fn _assert_write_object_safe(_: &dyn WriteTransaction) {}
 }

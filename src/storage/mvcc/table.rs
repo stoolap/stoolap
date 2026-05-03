@@ -29,7 +29,7 @@ use crate::storage::expression::Expression;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
 use crate::storage::mvcc::scanner::MVCCScanner;
 use crate::storage::mvcc::{TransactionVersionStore, VersionStore};
-use crate::storage::traits::{Index, QueryResult, ScanPlan, Scanner, Table};
+use crate::storage::traits::{Index, QueryResult, ReadTable, ScanPlan, Scanner, WriteTable};
 use crate::storage::MemoryResult;
 
 /// MVCC Table wrapper that provides MVCC isolation for tables
@@ -1176,12 +1176,12 @@ impl MVCCTable {
                 Error::internal(format!("nil value at index {} (column '{}')", i, col.name))
             })?;
 
-            // Check NULL constraint
+            // Check NULL constraint. Use the typed `NotNullConstraint`
+            // variant so callers (FFI typed-error path, monitoring,
+            // pattern-matching retry logic) can branch on the constraint
+            // family without parsing the message string.
             if !col.nullable && value.is_null() {
-                return Err(Error::internal(format!(
-                    "NULL value in non-nullable column '{}'",
-                    col.name
-                )));
+                return Err(Error::not_null_constraint(&col.name));
             }
 
             // Check type compatibility for non-NULL values
@@ -1812,7 +1812,7 @@ impl MVCCTable {
     }
 }
 
-impl Table for MVCCTable {
+impl ReadTable for MVCCTable {
     fn name(&self) -> &str {
         self.version_store.table_name()
     }
@@ -1874,6 +1874,1085 @@ impl Table for MVCCTable {
         }
     }
 
+    fn get_active_row_ids(&self) -> Vec<i64> {
+        self.version_store.get_all_row_ids()
+    }
+
+    fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
+        self.version_store.collect_row_ids_into(dest);
+    }
+
+    fn has_row_id(&self, row_id: i64) -> bool {
+        self.version_store.has_committed_row(row_id)
+    }
+
+    fn scan(
+        &self,
+        column_indices: &[usize],
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<Box<dyn Scanner>> {
+        // CompactArc clone - O(1) reference count increment instead of full Schema clone
+        let schema = self.cached_schema.clone();
+
+        // Fast path: Check if this is a primary key equality lookup (WHERE id = X)
+        if let Some(expr) = where_expr {
+            if let Some(pk_lookup) = self.try_pk_lookup(expr, &schema) {
+                // Direct O(1) lookup by primary key
+                // Use get_local_version to preserve delete signal. txn_versions.get()
+                // swallows deletes as None, causing fallback to committed store and
+                // missing uncommitted deletes in the current transaction.
+                let row = {
+                    let txn_versions = self.txn_versions.read().unwrap();
+                    if let Some(local) = txn_versions.get_local_version(pk_lookup) {
+                        if local.is_deleted() {
+                            None // Locally deleted in this transaction
+                        } else {
+                            Some(local.data.clone())
+                        }
+                    } else if let Some(version) = self
+                        .version_store
+                        .get_visible_version(pk_lookup, self.txn_id)
+                    {
+                        if !version.is_deleted() {
+                            Some(version.data.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(row) = row {
+                    // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
+                    let row = self.normalize_row_to_schema(row, &schema);
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((pk_lookup, row));
+                    let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
+                    return Ok(Box::new(scanner));
+                } else {
+                    // Row not found - return empty scanner
+                    let scanner = MVCCScanner::empty(schema, column_indices.to_vec());
+                    return Ok(Box::new(scanner));
+                }
+            }
+
+            // Try index lookup for non-PK columns
+            if let Some(filtered_row_ids) = self.try_index_lookup(expr, &schema) {
+                // Use index-based scan - much more efficient
+                let rows = self.fetch_rows_by_ids(&filtered_row_ids, expr);
+                let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
+                return Ok(Box::new(scanner));
+            }
+        }
+
+        // Fall back to full scan - use MVCCScanner with RowVec for cache reuse
+        let rows = self.collect_visible_rows(where_expr);
+        let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
+        Ok(Box::new(scanner))
+    }
+
+    fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
+        // Return cached row vector directly - caller iterates (i64, Row) tuples
+        Ok(self.collect_visible_rows(where_expr))
+    }
+
+    fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
+        Ok(self.collect_visible_rows_unsorted())
+    }
+
+    fn collect_rows_by_ids(&self, row_ids: &[i64]) -> Result<RowVec> {
+        let mut rows = RowVec::with_capacity(row_ids.len());
+        for &row_id in row_ids {
+            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                if !version.is_deleted() {
+                    rows.push((row_id, version.data.clone()));
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    fn collect_rows_with_limit(
+        &self,
+        where_expr: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
+        // Use the optimized version with limit/offset
+        Ok(self.collect_visible_rows_with_limit(where_expr, limit, offset))
+    }
+
+    fn collect_rows_with_limit_unordered(
+        &self,
+        where_expr: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
+        // Use the optimized unordered version with true early termination
+        Ok(self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset))
+    }
+
+    fn collect_rows_sorted_with_limit(
+        &self,
+        sort_col_idx: usize,
+        ascending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<Row>> {
+        // DEFERRED MATERIALIZATION OPTIMIZATION
+        // Instead of cloning all rows, sorting, and taking limit:
+        // 1. Get row indices (no cloning)
+        // 2. Load only sort column values
+        // 3. Sort indices by values
+        // 4. Take top N indices
+        // 5. Materialize only N rows
+        //
+        // Performance: For 100K rows with 20 columns, LIMIT 10:
+        // - Old: Clone 2M values, sort, take 10
+        // - New: Load 100K sort values, sort indices, clone 200 values
+
+        // Check for local versions - if present, fall back to default implementation
+        let has_local = self.txn_versions.read().unwrap().has_local_changes();
+        if has_local {
+            // Local changes exist - use slower but correct path
+            let mut rows = self.collect_visible_rows(None);
+            rows.sort_by(|(_, a), (_, b)| {
+                let va = a.get(sort_col_idx);
+                let vb = b.get(sort_col_idx);
+                let cmp = match (va, vb) {
+                    (None, None) => std::cmp::Ordering::Equal,
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (Some(va), Some(vb)) => va.compare(vb).unwrap_or(std::cmp::Ordering::Equal),
+                };
+                if ascending {
+                    cmp
+                } else {
+                    cmp.reverse()
+                }
+            });
+            return Ok(rows
+                .into_iter()
+                .skip(offset)
+                .take(limit)
+                .map(|(_, row)| row)
+                .collect());
+        }
+
+        // FAST PATH: Use deferred materialization from version_store
+        let rows = self.version_store.get_visible_rows_sorted_limit(
+            self.txn_id,
+            sort_col_idx,
+            ascending,
+            limit,
+            offset,
+        );
+
+        // Normalize rows to schema and return
+        let schema = &self.cached_schema;
+        Ok(rows
+            .into_iter()
+            .map(|(_, row)| self.normalize_row_to_schema(row, schema))
+            .collect())
+    }
+
+    fn close(&mut self) -> Result<()> {
+        // Rollback any uncommitted changes
+        self.txn_versions.write().unwrap().rollback();
+        Ok(())
+    }
+
+    fn rollback(&mut self) {
+        self.txn_versions.write().unwrap().rollback();
+    }
+
+    fn rollback_to_timestamp(&self, timestamp: i64) {
+        self.txn_versions
+            .write()
+            .unwrap()
+            .rollback_to_timestamp(timestamp);
+    }
+
+    fn has_local_changes(&self) -> bool {
+        self.txn_versions.read().unwrap().has_local_changes()
+    }
+
+    fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
+        let txn_versions = self.txn_versions.read().unwrap();
+        txn_versions
+            .iter_local()
+            .map(|(row_id, version)| {
+                (
+                    row_id,
+                    version.data.clone(),
+                    version.is_deleted(),
+                    version.txn_id,
+                )
+            })
+            .collect()
+    }
+
+    fn has_index_on_column(&self, column_name: &str) -> bool {
+        self.version_store
+            .get_index_by_column(column_name)
+            .is_some()
+    }
+
+    fn get_index_on_column(&self, column_name: &str) -> Option<std::sync::Arc<dyn Index>> {
+        self.version_store.get_index_by_column(column_name)
+    }
+
+    fn get_index(&self, name: &str) -> Option<std::sync::Arc<dyn Index>> {
+        self.version_store.get_index(name)
+    }
+
+    fn get_unique_indexes(&self) -> Vec<(String, Vec<String>)> {
+        self.version_store
+            .get_all_indexes()
+            .into_iter()
+            .filter(|idx| idx.is_unique())
+            .map(|idx| (idx.name().to_string(), idx.column_names().to_vec()))
+            .collect()
+    }
+
+    fn for_each_unique_non_pk_index(
+        &self,
+        f: &mut dyn FnMut(&str, &[String]) -> Result<()>,
+    ) -> Result<()> {
+        let pk_col = self
+            .cached_schema
+            .pk_column_index()
+            .map(|i| &self.cached_schema.columns[i].name_lower);
+        let indexes = self.version_store.indexes_read();
+        for idx in indexes.values() {
+            if !idx.is_unique() {
+                continue;
+            }
+            let names = idx.column_names();
+            // Skip single-column indexes that match the PK column
+            if names.len() == 1 {
+                if let Some(pk) = pk_col {
+                    if names[0].eq_ignore_ascii_case(pk) {
+                        continue;
+                    }
+                }
+            }
+            f(idx.name(), names)?;
+        }
+        Ok(())
+    }
+
+    fn has_unique_non_pk_indexes(&self) -> bool {
+        let pk_col = self
+            .cached_schema
+            .pk_column_index()
+            .map(|i| &self.cached_schema.columns[i].name_lower);
+        let indexes = self.version_store.indexes_read();
+        indexes.values().any(|idx| {
+            if !idx.is_unique() {
+                return false;
+            }
+            let names = idx.column_names();
+            if names.len() == 1 {
+                if let Some(pk) = pk_col {
+                    return !names[0].eq_ignore_ascii_case(pk);
+                }
+            }
+            true
+        })
+    }
+
+    fn get_multi_column_index(
+        &self,
+        predicate_columns: &[&str],
+    ) -> Option<(std::sync::Arc<dyn Index>, usize)> {
+        self.version_store.get_multi_column_index(predicate_columns)
+    }
+
+    fn get_index_min_value(&self, column_name: &str) -> Option<Value> {
+        // Try to find an index on this column and get its minimum value
+        if let Some(index) = self.version_store.get_index_by_column(column_name) {
+            return index.get_min_value();
+        }
+        None
+    }
+
+    fn get_index_max_value(&self, column_name: &str) -> Option<Value> {
+        // Try to find an index on this column and get its maximum value
+        if let Some(index) = self.version_store.get_index_by_column(column_name) {
+            return index.get_max_value();
+        }
+        None
+    }
+
+    fn row_count(&self) -> usize {
+        // Try O(1) fast path first
+        if let Some(count) = MVCCTable::fast_row_count(self) {
+            return count;
+        }
+        // Fall back to optimized single-pass counting
+        MVCCTable::row_count(self)
+    }
+
+    fn row_count_hint(&self) -> usize {
+        // O(1) - just return the committed row count without any lock checks
+        self.version_store.committed_row_count()
+    }
+
+    fn fast_row_count(&self) -> Option<usize> {
+        MVCCTable::fast_row_count(self)
+    }
+
+    fn collect_rows_ordered_by_index(
+        &self,
+        column_name: &str,
+        ascending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Option<RowVec> {
+        // If transaction has local changes (inserts/updates/deletes), fall back to
+        // the regular path which correctly merges local changes via collect_visible_rows.
+        // This optimization only reads from the global version store and indexes.
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            if txn_versions.has_local_changes() {
+                return None;
+            }
+        }
+
+        // OPTIMIZATION: Handle PRIMARY KEY column specially
+        // For INTEGER PRIMARY KEY, the row_id IS the value, so we can iterate
+        // directly in order without any sorting using skip/take semantics.
+        if let Some(pk_idx) = self.cached_schema.pk_column_index() {
+            let pk_col = &self.cached_schema.columns[pk_idx];
+            if pk_col.name_lower == column_name.to_lowercase() {
+                return self.version_store.collect_rows_pk_ordered(
+                    self.txn_id,
+                    ascending,
+                    limit,
+                    offset,
+                );
+            }
+        }
+
+        // Check if column has an index
+        let index = self.version_store.get_index_by_column(column_name)?;
+
+        // Try using the efficient ordered iteration method (available in B-tree indexes)
+        // We request more row IDs than needed to account for invisible rows
+        let batch_size = (limit + offset) * 2 + 100; // Request extra to handle filtered rows
+
+        if let Some(ordered_row_ids) = index.get_row_ids_ordered(ascending, batch_size, 0) {
+            // Fast path: B-tree index supports ordered iteration
+            let mut rows = RowVec::with_capacity(limit.min(100));
+            let mut skipped = 0;
+
+            for row_id in ordered_row_ids {
+                // Check visibility and get row
+                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                    if version.is_deleted() {
+                        continue;
+                    }
+
+                    // Handle offset
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    rows.push((row_id, version.data.clone()));
+
+                    // Check if we've reached the limit
+                    if rows.len() >= limit {
+                        return Some(rows);
+                    }
+                }
+            }
+
+            // If we got all needed rows, return them
+            // If not, we may need to fetch more (rare case with many invisible rows)
+            if !rows.is_empty() {
+                return Some(rows);
+            }
+        }
+
+        // Fallback path: Get all values and sort (for non-B-tree indexes)
+        let all_values = index.get_all_values();
+
+        // If the index doesn't support get_all_values (returns empty), return None
+        // to let the regular query execution path handle ORDER BY + LIMIT
+        if all_values.is_empty() {
+            return None;
+        }
+
+        // Sort values using partial_cmp (Value implements PartialOrd)
+        let mut sorted_values = all_values;
+        sorted_values.sort_by(|a, b| {
+            if ascending {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
+            }
+        });
+
+        // Collect rows by iterating through sorted values
+        let mut rows = RowVec::with_capacity(limit.min(100));
+        let mut skipped = 0;
+        let mut row_ids = Vec::new();
+
+        for value in sorted_values {
+            // Get all row IDs for this value - reuse buffer to avoid allocation per iteration
+            row_ids.clear();
+            index.get_row_ids_equal_into(&[value], &mut row_ids);
+
+            for row_id in &row_ids {
+                let row_id = *row_id;
+                // Check visibility and get row
+                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                    if version.is_deleted() {
+                        continue;
+                    }
+
+                    // Handle offset
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    rows.push((row_id, version.data.clone()));
+
+                    // Check if we've reached the limit
+                    if rows.len() >= limit {
+                        return Some(rows);
+                    }
+                }
+            }
+        }
+
+        Some(rows)
+    }
+
+    fn collect_rows_pk_keyset(
+        &self,
+        start_after: Option<i64>,
+        start_from: Option<i64>,
+        ascending: bool,
+        limit: usize,
+    ) -> Option<RowVec> {
+        // Only works if table has a single-column INTEGER PRIMARY KEY
+        self.cached_schema.pk_column_index()?;
+
+        // If transaction has local changes, fall back to regular path
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            if txn_versions.has_local_changes() {
+                return None;
+            }
+        }
+
+        // Use the efficient keyset iteration from version store
+        // Returns RowVec with (row_id, Row) tuples
+        Some(self.version_store.collect_rows_keyset(
+            self.txn_id,
+            start_after,
+            start_from,
+            ascending,
+            limit,
+        ))
+    }
+
+    fn collect_rows_grouped_by_partition(&self, column_name: &str) -> Option<Vec<(Value, RowVec)>> {
+        // If transaction has local changes, fall back to regular path
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            if txn_versions.has_local_changes() {
+                return None;
+            }
+        }
+
+        // Check if column has an index
+        let index = self.version_store.get_index_by_column(column_name)?;
+
+        // Get all unique values from the index (partition keys)
+        let all_values = index.get_all_values();
+        if all_values.is_empty() {
+            return Some(Vec::new());
+        }
+
+        // Collect rows grouped by partition value
+        let mut result: Vec<(Value, RowVec)> = Vec::with_capacity(all_values.len());
+        let mut row_ids = Vec::new();
+
+        for partition_value in all_values {
+            // Get all row IDs for this partition value - reuse buffer to avoid allocation per iteration
+            row_ids.clear();
+            index.get_row_ids_equal_into(std::slice::from_ref(&partition_value), &mut row_ids);
+
+            // Collect visible rows for this partition
+            let mut partition_rows = RowVec::with_capacity(row_ids.len());
+            for &row_id in &row_ids {
+                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                    if !version.is_deleted() {
+                        partition_rows.push((row_id, version.data.clone()));
+                    }
+                }
+            }
+
+            if !partition_rows.is_empty() {
+                result.push((partition_value, partition_rows));
+            }
+        }
+
+        Some(result)
+    }
+
+    fn get_partition_values(&self, column_name: &str) -> Option<Vec<Value>> {
+        // Only use index-based distinct values if no uncommitted local changes
+        // (local changes are in txn_versions, not reflected in the index)
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
+        // Get index for the column
+        let index = self.version_store.get_index_by_column(column_name)?;
+        // Return all distinct values from the index
+        Some(index.get_all_values())
+    }
+
+    fn get_partition_count(&self, column_name: &str) -> Option<usize> {
+        // Only use index-based count if no uncommitted local changes
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
+        // Get index for the column
+        let index = self.version_store.get_index_by_column(column_name)?;
+        // Return count of distinct non-null values without cloning
+        index.get_distinct_count_excluding_null()
+    }
+
+    fn get_rows_for_partition_value(
+        &self,
+        column_name: &str,
+        partition_value: &Value,
+    ) -> Option<RowVec> {
+        // If transaction has local changes, fall back to regular path
+        {
+            let txn_versions = self.txn_versions.read().unwrap();
+            if txn_versions.has_local_changes() {
+                return None;
+            }
+        }
+
+        // Get index for the column
+        let index = self.version_store.get_index_by_column(column_name)?;
+
+        // Get row IDs for this partition value
+        let row_ids = index.get_row_ids_equal(std::slice::from_ref(partition_value));
+
+        // Collect visible rows for this partition
+        let mut rows = RowVec::with_capacity(row_ids.len());
+        for &row_id in row_ids.iter() {
+            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                if !version.is_deleted() {
+                    rows.push((row_id, version.data.clone()));
+                }
+            }
+        }
+
+        Some(rows)
+    }
+
+    fn select(
+        &self,
+        columns: &[&str],
+        expr: Option<&dyn Expression>,
+    ) -> Result<Box<dyn QueryResult>> {
+        // Convert column names to indices
+        let column_indices: Vec<usize> = columns
+            .iter()
+            .filter_map(|name| self.cached_schema.find_column(name).map(|(idx, _)| idx))
+            .collect();
+
+        // Scan and collect results
+        let mut scanner = self.scan(&column_indices, expr)?;
+        let mut rows = Vec::new();
+
+        while scanner.next() {
+            rows.push(scanner.take_row());
+        }
+
+        scanner.close()?;
+
+        // Create result
+        let result_columns: Vec<String> = columns.iter().map(|s| s.to_string()).collect();
+        let result = MemoryResult::with_rows(result_columns, rows);
+
+        Ok(Box::new(result))
+    }
+
+    fn select_with_aliases(
+        &self,
+        columns: &[&str],
+        expr: Option<&dyn Expression>,
+        aliases: &FxHashMap<String, String>,
+    ) -> Result<Box<dyn QueryResult>> {
+        // Get base result
+        let result = self.select(columns, expr)?;
+
+        // Apply aliases
+        Ok(result.with_aliases(aliases.clone()))
+    }
+
+    fn select_as_of(
+        &self,
+        columns: &[&str],
+        expr: Option<&dyn Expression>,
+        temporal_type: &str,
+        temporal_value: i64,
+    ) -> Result<Box<dyn QueryResult>> {
+        // Convert column names to indices
+        let column_indices: Vec<usize> = columns
+            .iter()
+            .filter_map(|name| self.cached_schema.find_column(name).map(|(idx, _)| idx))
+            .collect();
+
+        // Get all row IDs
+        let row_ids = self.version_store.get_all_row_ids();
+
+        // Collect temporal rows
+        let mut rows = Vec::new();
+        for row_id in row_ids {
+            let version = match temporal_type.to_uppercase().as_str() {
+                "TRANSACTION" => self
+                    .version_store
+                    .get_visible_version_as_of_transaction(row_id, temporal_value),
+                "TIMESTAMP" => self
+                    .version_store
+                    .get_visible_version_as_of_timestamp(row_id, temporal_value),
+                _ => {
+                    return Err(Error::internal(format!(
+                        "unsupported temporal type: {}",
+                        temporal_type
+                    )))
+                }
+            };
+
+            if let Some(v) = version {
+                if !v.is_deleted() {
+                    // Apply filter
+                    if let Some(e) = expr {
+                        match e.evaluate(&v.data) {
+                            Ok(true) => {}
+                            Ok(false) => continue,
+                            Err(_) => continue,
+                        }
+                    }
+
+                    // Project columns
+                    let projected: Vec<Value> = column_indices
+                        .iter()
+                        .map(|&idx| v.data.get(idx).cloned().unwrap_or(Value::null_unknown()))
+                        .collect();
+                    rows.push(Row::from_values(projected));
+                }
+            }
+        }
+
+        // Create result
+        let result_columns: Vec<String> = columns.iter().map(|s| s.to_string()).collect();
+        let result = MemoryResult::with_rows(result_columns, rows);
+
+        Ok(Box::new(result))
+    }
+
+    fn explain_scan(&self, where_expr: Option<&dyn Expression>) -> ScanPlan {
+        use crate::core::Operator;
+
+        let table_name = self.cached_schema.table_name.clone();
+        let schema = &self.cached_schema;
+
+        // No WHERE clause - always Seq Scan
+        let Some(expr) = where_expr else {
+            return ScanPlan::SeqScan {
+                table: table_name,
+                filter: None,
+            };
+        };
+
+        // Check for PK lookup
+        let pk_indices = schema.primary_key_indices();
+        if pk_indices.len() == 1 {
+            let pk_col_idx = pk_indices[0];
+            let pk_col = &schema.columns[pk_col_idx];
+
+            if let Some((col_name, operator, value)) = expr.get_comparison_info() {
+                if col_name.eq_ignore_ascii_case(&pk_col.name) && operator == Operator::Eq {
+                    return ScanPlan::PkLookup {
+                        table: table_name,
+                        pk_column: pk_col.name.clone(),
+                        pk_value: format!("{}", value),
+                    };
+                }
+            }
+        }
+
+        // Check for single column index lookup
+        if let Some((col_name, operator, value)) = expr.get_comparison_info() {
+            // Skip boolean index (low cardinality)
+            if !matches!(value, Value::Boolean(_))
+                || !matches!(operator, Operator::Eq | Operator::Ne)
+            {
+                if let Some(index) = self.version_store.get_index_by_column(col_name) {
+                    let condition = format!("{} {}", operator_to_string(operator), value);
+                    return ScanPlan::IndexScan {
+                        table: table_name,
+                        index_name: index.name().to_string(),
+                        column: col_name.to_string(),
+                        condition,
+                        filter: None,
+                    };
+                }
+            }
+        }
+
+        // Check for LIKE prefix pattern
+        if let Some((col_name, prefix, negated)) = expr.get_like_prefix_info() {
+            if !negated {
+                if let Some(index) = self.version_store.get_index_by_column(col_name) {
+                    return ScanPlan::IndexScan {
+                        table: table_name,
+                        index_name: index.name().to_string(),
+                        column: col_name.to_string(),
+                        condition: format!("LIKE '{}%'", prefix),
+                        filter: None,
+                    };
+                }
+            }
+        }
+
+        // Check for OR expressions (union of indexes)
+        if let Some(or_operands) = expr.get_or_operands() {
+            let mut indexed_info: Vec<(String, String, String)> = Vec::new();
+            let mut all_indexed = true;
+
+            for operand in or_operands {
+                if let Some((col_name, operator, value)) = operand.get_comparison_info() {
+                    if let Some(index) = self.version_store.get_index_by_column(col_name) {
+                        let condition = format!("{} {}", operator_to_string(operator), value);
+                        indexed_info.push((
+                            index.name().to_string(),
+                            col_name.to_string(),
+                            condition,
+                        ));
+                    } else {
+                        all_indexed = false;
+                    }
+                } else {
+                    all_indexed = false;
+                }
+            }
+
+            if !indexed_info.is_empty() {
+                if all_indexed {
+                    if indexed_info.len() == 1 {
+                        let (idx_name, col, cond) = indexed_info.into_iter().next().unwrap();
+                        return ScanPlan::IndexScan {
+                            table: table_name,
+                            index_name: idx_name,
+                            column: col,
+                            condition: cond,
+                            filter: None,
+                        };
+                    }
+                    return ScanPlan::MultiIndexScan {
+                        table: table_name,
+                        indexes: indexed_info,
+                        operation: "OR".to_string(),
+                        filter: None,
+                    };
+                }
+                // Mixed OR: some operands indexed, some not — hybrid scan
+                // Show as Multi-Index Scan with a Filter for the non-indexed operands
+                let non_indexed_parts: Vec<String> = or_operands
+                    .iter()
+                    .filter(|op| {
+                        if let Some((col_name, _, _)) = op.get_comparison_info() {
+                            self.version_store.get_index_by_column(col_name).is_none()
+                        } else {
+                            true
+                        }
+                    })
+                    .map(|op| {
+                        if let Some((col, operator, val)) = op.get_comparison_info() {
+                            format!("{} {} {}", col, operator_to_string(operator), val)
+                        } else {
+                            format!("{:?}", op)
+                        }
+                    })
+                    .collect();
+                let filter_str = if non_indexed_parts.len() == 1 {
+                    non_indexed_parts.into_iter().next().unwrap()
+                } else {
+                    non_indexed_parts.join(" OR ")
+                };
+                return ScanPlan::MultiIndexScan {
+                    table: table_name,
+                    indexes: indexed_info,
+                    operation: "OR".to_string(),
+                    filter: Some(filter_str),
+                };
+            }
+        }
+
+        // Check for multi-column (composite) index before single-column index intersection
+        let comparisons = expr.collect_comparisons();
+        if !comparisons.is_empty() {
+            // Group by column - needed for both multi-column and single-column index checks
+            let mut column_conditions: FxHashMap<&str, Vec<(Operator, &Value)>> =
+                FxHashMap::default();
+            for (col_name, op, val) in &comparisons {
+                column_conditions
+                    .entry(*col_name)
+                    .or_default()
+                    .push((*op, *val));
+            }
+
+            // Collect columns with equality predicates (best for multi-column index)
+            let eq_columns: Vec<&str> = column_conditions
+                .iter()
+                .filter_map(|(col, ops)| {
+                    if ops.iter().any(|(op, _)| *op == Operator::Eq) {
+                        Some(*col)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            // Try multi-column index if we have equality predicates matching a prefix
+            if !eq_columns.is_empty() {
+                if let Some((multi_idx, matched_count)) =
+                    self.version_store.get_multi_column_index(&eq_columns)
+                {
+                    let index_columns = multi_idx.column_names();
+                    let mut columns = Vec::new();
+                    let mut conditions = Vec::new();
+
+                    // Build columns and conditions in index column order
+                    for col in index_columns.iter().take(matched_count) {
+                        if let Some(ops) = column_conditions.get(col.as_str()) {
+                            columns.push(col.clone());
+                            // Find the equality condition
+                            for (op, val) in ops {
+                                if *op == Operator::Eq {
+                                    conditions.push(format!("= {}", val));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Check if the next index column (after the equality prefix) has
+                    // range predicates — the composite index BTree can serve these too
+                    if matched_count < index_columns.len() {
+                        let next_col = &index_columns[matched_count];
+                        if let Some(ops) = column_conditions.get(next_col.as_str()) {
+                            let range_ops: Vec<String> = ops
+                                .iter()
+                                .filter(|(op, _)| !matches!(op, Operator::Eq))
+                                .map(|(op, val)| format!("{} {}", operator_to_string(*op), val))
+                                .collect();
+                            if !range_ops.is_empty() {
+                                columns.push(next_col.clone());
+                                conditions.push(range_ops.join(" AND "));
+                            }
+                        }
+                    }
+
+                    if !columns.is_empty() {
+                        // Collect residual predicates: columns not covered by the index
+                        let covered: rustc_hash::FxHashSet<&str> =
+                            columns.iter().map(|c| c.as_str()).collect();
+                        let residual: Vec<String> = column_conditions
+                            .iter()
+                            .filter(|(col, _)| !covered.contains(*col))
+                            .map(|(col, ops)| {
+                                ops.iter()
+                                    .map(|(op, val)| {
+                                        format!("{} {} {}", col, operator_to_string(*op), val)
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" AND ")
+                            })
+                            .collect();
+                        let filter = if residual.is_empty() {
+                            None
+                        } else {
+                            Some(residual.join(" AND "))
+                        };
+
+                        return ScanPlan::CompositeIndexScan {
+                            table: table_name,
+                            index_name: multi_idx.name().to_string(),
+                            columns,
+                            conditions,
+                            filter,
+                        };
+                    }
+                }
+            }
+        }
+
+        // Check for AND expressions (intersection of indexes)
+        if !comparisons.is_empty() {
+            let mut indexed_info: Vec<(String, String, String)> = Vec::new();
+
+            // Re-group by column for single-column index checks
+            let mut column_conditions: FxHashMap<&str, Vec<(Operator, &Value)>> =
+                FxHashMap::default();
+            for (col_name, op, val) in &comparisons {
+                column_conditions
+                    .entry(*col_name)
+                    .or_default()
+                    .push((*op, *val));
+            }
+
+            let mut indexed_columns: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
+            for (col_name, ops) in &column_conditions {
+                if let Some(index) = self.version_store.get_index_by_column(col_name) {
+                    // Simplify to a single condition string
+                    let condition = if ops.len() == 1 {
+                        let (op, val) = ops[0];
+                        format!("{} {}", operator_to_string(op), val)
+                    } else {
+                        // Multiple conditions on same column (e.g., col >= 5 AND col <= 10)
+                        let parts: Vec<String> = ops
+                            .iter()
+                            .map(|(op, val)| format!("{} {}", operator_to_string(*op), val))
+                            .collect();
+                        parts.join(" AND ")
+                    };
+                    indexed_info.push((index.name().to_string(), col_name.to_string(), condition));
+                    indexed_columns.insert(col_name);
+                }
+            }
+
+            if !indexed_info.is_empty() {
+                // Collect residual predicates for non-indexed columns
+                let residual: Vec<String> = column_conditions
+                    .iter()
+                    .filter(|(col, _)| !indexed_columns.contains(*col))
+                    .map(|(col, ops)| {
+                        ops.iter()
+                            .map(|(op, val)| format!("{} {} {}", col, operator_to_string(*op), val))
+                            .collect::<Vec<_>>()
+                            .join(" AND ")
+                    })
+                    .collect();
+                let filter = if residual.is_empty() {
+                    None
+                } else {
+                    Some(residual.join(" AND "))
+                };
+
+                if indexed_info.len() == 1 {
+                    let (idx_name, col, cond) = indexed_info.into_iter().next().unwrap();
+                    return ScanPlan::IndexScan {
+                        table: table_name,
+                        index_name: idx_name,
+                        column: col,
+                        condition: cond,
+                        filter,
+                    };
+                }
+                return ScanPlan::MultiIndexScan {
+                    table: table_name,
+                    indexes: indexed_info,
+                    operation: "AND".to_string(),
+                    filter,
+                };
+            }
+        }
+
+        // Default: Seq Scan with filter
+        ScanPlan::SeqScan {
+            table: table_name,
+            filter: Some(format!("{:?}", expr)),
+        }
+    }
+
+    fn get_zone_maps(&self) -> Option<std::sync::Arc<crate::storage::mvcc::zonemap::TableZoneMap>> {
+        self.version_store.get_zone_maps()
+    }
+
+    fn get_segments_to_scan(
+        &self,
+        column: &str,
+        operator: crate::core::Operator,
+        value: &Value,
+    ) -> Option<Vec<u32>> {
+        self.version_store
+            .get_segments_to_scan(column, operator, value)
+    }
+
+    fn sum_column(&self, col_idx: usize) -> Option<(f64, usize)> {
+        // Only use deferred aggregation if no uncommitted local changes
+        // (local changes are in txn_versions, not the main version_store)
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
+        Some(self.version_store.sum_column(self.txn_id, col_idx))
+    }
+
+    fn min_column(&self, col_idx: usize) -> Option<Option<Value>> {
+        // Only use deferred aggregation if no uncommitted local changes
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
+        Some(self.version_store.min_column(self.txn_id, col_idx))
+    }
+
+    fn max_column(&self, col_idx: usize) -> Option<Option<Value>> {
+        // Only use deferred aggregation if no uncommitted local changes
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
+        Some(self.version_store.max_column(self.txn_id, col_idx))
+    }
+
+    fn compute_grouped_aggregates(
+        &self,
+        group_by_indices: &[usize],
+        aggregates: &[(crate::storage::mvcc::version_store::AggregateOp, usize)],
+    ) -> Option<Vec<crate::storage::mvcc::version_store::GroupedAggregateResult>> {
+        // Only use storage-level aggregation if no uncommitted local changes
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            return None;
+        }
+        drop(txn_versions);
+
+        self.version_store
+            .compute_grouped_aggregates(self.txn_id, group_by_indices, aggregates)
+    }
+}
+
+impl WriteTable for MVCCTable {
     fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
         self.create_column_with_default(name, column_type, nullable, None)
     }
@@ -2436,18 +3515,6 @@ impl Table for MVCCTable {
         Ok(delete_count)
     }
 
-    fn get_active_row_ids(&self) -> Vec<i64> {
-        self.version_store.get_all_row_ids()
-    }
-
-    fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
-        self.version_store.collect_row_ids_into(dest);
-    }
-
-    fn has_row_id(&self, row_id: i64) -> bool {
-        self.version_store.has_committed_row(row_id)
-    }
-
     fn try_claim_row(&self, row_id: i64) -> Result<()> {
         self.version_store
             .try_claim_row(row_id, self.txn_id)
@@ -2713,216 +3780,9 @@ impl Table for MVCCTable {
         self.version_store.truncate_all()
     }
 
-    fn scan(
-        &self,
-        column_indices: &[usize],
-        where_expr: Option<&dyn Expression>,
-    ) -> Result<Box<dyn Scanner>> {
-        // CompactArc clone - O(1) reference count increment instead of full Schema clone
-        let schema = self.cached_schema.clone();
-
-        // Fast path: Check if this is a primary key equality lookup (WHERE id = X)
-        if let Some(expr) = where_expr {
-            if let Some(pk_lookup) = self.try_pk_lookup(expr, &schema) {
-                // Direct O(1) lookup by primary key
-                // Use get_local_version to preserve delete signal. txn_versions.get()
-                // swallows deletes as None, causing fallback to committed store and
-                // missing uncommitted deletes in the current transaction.
-                let row = {
-                    let txn_versions = self.txn_versions.read().unwrap();
-                    if let Some(local) = txn_versions.get_local_version(pk_lookup) {
-                        if local.is_deleted() {
-                            None // Locally deleted in this transaction
-                        } else {
-                            Some(local.data.clone())
-                        }
-                    } else if let Some(version) = self
-                        .version_store
-                        .get_visible_version(pk_lookup, self.txn_id)
-                    {
-                        if !version.is_deleted() {
-                            Some(version.data.clone())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                if let Some(row) = row {
-                    // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                    let row = self.normalize_row_to_schema(row, &schema);
-                    let mut rows = RowVec::with_capacity(1);
-                    rows.push((pk_lookup, row));
-                    let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
-                    return Ok(Box::new(scanner));
-                } else {
-                    // Row not found - return empty scanner
-                    let scanner = MVCCScanner::empty(schema, column_indices.to_vec());
-                    return Ok(Box::new(scanner));
-                }
-            }
-
-            // Try index lookup for non-PK columns
-            if let Some(filtered_row_ids) = self.try_index_lookup(expr, &schema) {
-                // Use index-based scan - much more efficient
-                let rows = self.fetch_rows_by_ids(&filtered_row_ids, expr);
-                let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
-                return Ok(Box::new(scanner));
-            }
-        }
-
-        // Fall back to full scan - use MVCCScanner with RowVec for cache reuse
-        let rows = self.collect_visible_rows(where_expr);
-        let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
-        Ok(Box::new(scanner))
-    }
-
-    fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
-        // Return cached row vector directly - caller iterates (i64, Row) tuples
-        Ok(self.collect_visible_rows(where_expr))
-    }
-
-    fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
-        Ok(self.collect_visible_rows_unsorted())
-    }
-
-    fn collect_rows_by_ids(&self, row_ids: &[i64]) -> Result<RowVec> {
-        let mut rows = RowVec::with_capacity(row_ids.len());
-        for &row_id in row_ids {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
-                if !version.is_deleted() {
-                    rows.push((row_id, version.data.clone()));
-                }
-            }
-        }
-        Ok(rows)
-    }
-
-    fn collect_rows_with_limit(
-        &self,
-        where_expr: Option<&dyn Expression>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<RowVec> {
-        // Use the optimized version with limit/offset
-        Ok(self.collect_visible_rows_with_limit(where_expr, limit, offset))
-    }
-
-    fn collect_rows_with_limit_unordered(
-        &self,
-        where_expr: Option<&dyn Expression>,
-        limit: usize,
-        offset: usize,
-    ) -> Result<RowVec> {
-        // Use the optimized unordered version with true early termination
-        Ok(self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset))
-    }
-
-    fn collect_rows_sorted_with_limit(
-        &self,
-        sort_col_idx: usize,
-        ascending: bool,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<Row>> {
-        // DEFERRED MATERIALIZATION OPTIMIZATION
-        // Instead of cloning all rows, sorting, and taking limit:
-        // 1. Get row indices (no cloning)
-        // 2. Load only sort column values
-        // 3. Sort indices by values
-        // 4. Take top N indices
-        // 5. Materialize only N rows
-        //
-        // Performance: For 100K rows with 20 columns, LIMIT 10:
-        // - Old: Clone 2M values, sort, take 10
-        // - New: Load 100K sort values, sort indices, clone 200 values
-
-        // Check for local versions - if present, fall back to default implementation
-        let has_local = self.txn_versions.read().unwrap().has_local_changes();
-        if has_local {
-            // Local changes exist - use slower but correct path
-            let mut rows = self.collect_visible_rows(None);
-            rows.sort_by(|(_, a), (_, b)| {
-                let va = a.get(sort_col_idx);
-                let vb = b.get(sort_col_idx);
-                let cmp = match (va, vb) {
-                    (None, None) => std::cmp::Ordering::Equal,
-                    (None, Some(_)) => std::cmp::Ordering::Less,
-                    (Some(_), None) => std::cmp::Ordering::Greater,
-                    (Some(va), Some(vb)) => va.compare(vb).unwrap_or(std::cmp::Ordering::Equal),
-                };
-                if ascending {
-                    cmp
-                } else {
-                    cmp.reverse()
-                }
-            });
-            return Ok(rows
-                .into_iter()
-                .skip(offset)
-                .take(limit)
-                .map(|(_, row)| row)
-                .collect());
-        }
-
-        // FAST PATH: Use deferred materialization from version_store
-        let rows = self.version_store.get_visible_rows_sorted_limit(
-            self.txn_id,
-            sort_col_idx,
-            ascending,
-            limit,
-            offset,
-        );
-
-        // Normalize rows to schema and return
-        let schema = &self.cached_schema;
-        Ok(rows
-            .into_iter()
-            .map(|(_, row)| self.normalize_row_to_schema(row, schema))
-            .collect())
-    }
-
-    fn close(&mut self) -> Result<()> {
-        // Rollback any uncommitted changes
-        self.txn_versions.write().unwrap().rollback();
-        Ok(())
-    }
-
     fn commit(&mut self) -> Result<()> {
         // Call inherent method which handles index updates
         MVCCTable::commit(self)
-    }
-
-    fn rollback(&mut self) {
-        self.txn_versions.write().unwrap().rollback();
-    }
-
-    fn rollback_to_timestamp(&self, timestamp: i64) {
-        self.txn_versions
-            .write()
-            .unwrap()
-            .rollback_to_timestamp(timestamp);
-    }
-
-    fn has_local_changes(&self) -> bool {
-        self.txn_versions.read().unwrap().has_local_changes()
-    }
-
-    fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
-        let txn_versions = self.txn_versions.read().unwrap();
-        txn_versions
-            .iter_local()
-            .map(|(row_id, version)| {
-                (
-                    row_id,
-                    version.data.clone(),
-                    version.is_deleted(),
-                    version.txn_id,
-                )
-            })
-            .collect()
     }
 
     fn create_index(&self, name: &str, columns: &[&str], is_unique: bool) -> Result<()> {
@@ -3298,85 +4158,8 @@ impl Table for MVCCTable {
         Ok(())
     }
 
-    fn has_index_on_column(&self, column_name: &str) -> bool {
-        self.version_store
-            .get_index_by_column(column_name)
-            .is_some()
-    }
-
-    fn get_index_on_column(&self, column_name: &str) -> Option<std::sync::Arc<dyn Index>> {
-        self.version_store.get_index_by_column(column_name)
-    }
-
-    fn get_index(&self, name: &str) -> Option<std::sync::Arc<dyn Index>> {
-        self.version_store.get_index(name)
-    }
-
-    fn get_unique_indexes(&self) -> Vec<(String, Vec<String>)> {
-        self.version_store
-            .get_all_indexes()
-            .into_iter()
-            .filter(|idx| idx.is_unique())
-            .map(|idx| (idx.name().to_string(), idx.column_names().to_vec()))
-            .collect()
-    }
-
-    fn for_each_unique_non_pk_index(
-        &self,
-        f: &mut dyn FnMut(&str, &[String]) -> Result<()>,
-    ) -> Result<()> {
-        let pk_col = self
-            .cached_schema
-            .pk_column_index()
-            .map(|i| &self.cached_schema.columns[i].name_lower);
-        let indexes = self.version_store.indexes_read();
-        for idx in indexes.values() {
-            if !idx.is_unique() {
-                continue;
-            }
-            let names = idx.column_names();
-            // Skip single-column indexes that match the PK column
-            if names.len() == 1 {
-                if let Some(pk) = pk_col {
-                    if names[0].eq_ignore_ascii_case(pk) {
-                        continue;
-                    }
-                }
-            }
-            f(idx.name(), names)?;
-        }
-        Ok(())
-    }
-
-    fn has_unique_non_pk_indexes(&self) -> bool {
-        let pk_col = self
-            .cached_schema
-            .pk_column_index()
-            .map(|i| &self.cached_schema.columns[i].name_lower);
-        let indexes = self.version_store.indexes_read();
-        indexes.values().any(|idx| {
-            if !idx.is_unique() {
-                return false;
-            }
-            let names = idx.column_names();
-            if names.len() == 1 {
-                if let Some(pk) = pk_col {
-                    return !names[0].eq_ignore_ascii_case(pk);
-                }
-            }
-            true
-        })
-    }
-
     fn acquire_upsert_lock(&self) -> Option<Box<dyn std::any::Any>> {
         Some(Box::new(self.version_store.acquire_upsert_lock()))
-    }
-
-    fn get_multi_column_index(
-        &self,
-        predicate_columns: &[&str],
-    ) -> Option<(std::sync::Arc<dyn Index>, usize)> {
-        self.version_store.get_multi_column_index(predicate_columns)
     }
 
     fn create_btree_index(
@@ -3601,304 +4384,6 @@ impl Table for MVCCTable {
         Ok(())
     }
 
-    fn get_index_min_value(&self, column_name: &str) -> Option<Value> {
-        // Try to find an index on this column and get its minimum value
-        if let Some(index) = self.version_store.get_index_by_column(column_name) {
-            return index.get_min_value();
-        }
-        None
-    }
-
-    fn get_index_max_value(&self, column_name: &str) -> Option<Value> {
-        // Try to find an index on this column and get its maximum value
-        if let Some(index) = self.version_store.get_index_by_column(column_name) {
-            return index.get_max_value();
-        }
-        None
-    }
-
-    fn row_count(&self) -> usize {
-        // Try O(1) fast path first
-        if let Some(count) = MVCCTable::fast_row_count(self) {
-            return count;
-        }
-        // Fall back to optimized single-pass counting
-        MVCCTable::row_count(self)
-    }
-
-    fn row_count_hint(&self) -> usize {
-        // O(1) - just return the committed row count without any lock checks
-        self.version_store.committed_row_count()
-    }
-
-    fn fast_row_count(&self) -> Option<usize> {
-        MVCCTable::fast_row_count(self)
-    }
-
-    fn collect_rows_ordered_by_index(
-        &self,
-        column_name: &str,
-        ascending: bool,
-        limit: usize,
-        offset: usize,
-    ) -> Option<RowVec> {
-        // If transaction has local changes (inserts/updates/deletes), fall back to
-        // the regular path which correctly merges local changes via collect_visible_rows.
-        // This optimization only reads from the global version store and indexes.
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            if txn_versions.has_local_changes() {
-                return None;
-            }
-        }
-
-        // OPTIMIZATION: Handle PRIMARY KEY column specially
-        // For INTEGER PRIMARY KEY, the row_id IS the value, so we can iterate
-        // directly in order without any sorting using skip/take semantics.
-        if let Some(pk_idx) = self.cached_schema.pk_column_index() {
-            let pk_col = &self.cached_schema.columns[pk_idx];
-            if pk_col.name_lower == column_name.to_lowercase() {
-                return self.version_store.collect_rows_pk_ordered(
-                    self.txn_id,
-                    ascending,
-                    limit,
-                    offset,
-                );
-            }
-        }
-
-        // Check if column has an index
-        let index = self.version_store.get_index_by_column(column_name)?;
-
-        // Try using the efficient ordered iteration method (available in B-tree indexes)
-        // We request more row IDs than needed to account for invisible rows
-        let batch_size = (limit + offset) * 2 + 100; // Request extra to handle filtered rows
-
-        if let Some(ordered_row_ids) = index.get_row_ids_ordered(ascending, batch_size, 0) {
-            // Fast path: B-tree index supports ordered iteration
-            let mut rows = RowVec::with_capacity(limit.min(100));
-            let mut skipped = 0;
-
-            for row_id in ordered_row_ids {
-                // Check visibility and get row
-                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
-                    if version.is_deleted() {
-                        continue;
-                    }
-
-                    // Handle offset
-                    if skipped < offset {
-                        skipped += 1;
-                        continue;
-                    }
-
-                    rows.push((row_id, version.data.clone()));
-
-                    // Check if we've reached the limit
-                    if rows.len() >= limit {
-                        return Some(rows);
-                    }
-                }
-            }
-
-            // If we got all needed rows, return them
-            // If not, we may need to fetch more (rare case with many invisible rows)
-            if !rows.is_empty() {
-                return Some(rows);
-            }
-        }
-
-        // Fallback path: Get all values and sort (for non-B-tree indexes)
-        let all_values = index.get_all_values();
-
-        // If the index doesn't support get_all_values (returns empty), return None
-        // to let the regular query execution path handle ORDER BY + LIMIT
-        if all_values.is_empty() {
-            return None;
-        }
-
-        // Sort values using partial_cmp (Value implements PartialOrd)
-        let mut sorted_values = all_values;
-        sorted_values.sort_by(|a, b| {
-            if ascending {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            } else {
-                b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
-            }
-        });
-
-        // Collect rows by iterating through sorted values
-        let mut rows = RowVec::with_capacity(limit.min(100));
-        let mut skipped = 0;
-        let mut row_ids = Vec::new();
-
-        for value in sorted_values {
-            // Get all row IDs for this value - reuse buffer to avoid allocation per iteration
-            row_ids.clear();
-            index.get_row_ids_equal_into(&[value], &mut row_ids);
-
-            for row_id in &row_ids {
-                let row_id = *row_id;
-                // Check visibility and get row
-                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
-                    if version.is_deleted() {
-                        continue;
-                    }
-
-                    // Handle offset
-                    if skipped < offset {
-                        skipped += 1;
-                        continue;
-                    }
-
-                    rows.push((row_id, version.data.clone()));
-
-                    // Check if we've reached the limit
-                    if rows.len() >= limit {
-                        return Some(rows);
-                    }
-                }
-            }
-        }
-
-        Some(rows)
-    }
-
-    fn collect_rows_pk_keyset(
-        &self,
-        start_after: Option<i64>,
-        start_from: Option<i64>,
-        ascending: bool,
-        limit: usize,
-    ) -> Option<RowVec> {
-        // Only works if table has a single-column INTEGER PRIMARY KEY
-        self.cached_schema.pk_column_index()?;
-
-        // If transaction has local changes, fall back to regular path
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            if txn_versions.has_local_changes() {
-                return None;
-            }
-        }
-
-        // Use the efficient keyset iteration from version store
-        // Returns RowVec with (row_id, Row) tuples
-        Some(self.version_store.collect_rows_keyset(
-            self.txn_id,
-            start_after,
-            start_from,
-            ascending,
-            limit,
-        ))
-    }
-
-    fn collect_rows_grouped_by_partition(&self, column_name: &str) -> Option<Vec<(Value, RowVec)>> {
-        // If transaction has local changes, fall back to regular path
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            if txn_versions.has_local_changes() {
-                return None;
-            }
-        }
-
-        // Check if column has an index
-        let index = self.version_store.get_index_by_column(column_name)?;
-
-        // Get all unique values from the index (partition keys)
-        let all_values = index.get_all_values();
-        if all_values.is_empty() {
-            return Some(Vec::new());
-        }
-
-        // Collect rows grouped by partition value
-        let mut result: Vec<(Value, RowVec)> = Vec::with_capacity(all_values.len());
-        let mut row_ids = Vec::new();
-
-        for partition_value in all_values {
-            // Get all row IDs for this partition value - reuse buffer to avoid allocation per iteration
-            row_ids.clear();
-            index.get_row_ids_equal_into(std::slice::from_ref(&partition_value), &mut row_ids);
-
-            // Collect visible rows for this partition
-            let mut partition_rows = RowVec::with_capacity(row_ids.len());
-            for &row_id in &row_ids {
-                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
-                    if !version.is_deleted() {
-                        partition_rows.push((row_id, version.data.clone()));
-                    }
-                }
-            }
-
-            if !partition_rows.is_empty() {
-                result.push((partition_value, partition_rows));
-            }
-        }
-
-        Some(result)
-    }
-
-    fn get_partition_values(&self, column_name: &str) -> Option<Vec<Value>> {
-        // Only use index-based distinct values if no uncommitted local changes
-        // (local changes are in txn_versions, not reflected in the index)
-        let txn_versions = self.txn_versions.read().unwrap();
-        if txn_versions.has_local_changes() {
-            return None;
-        }
-        drop(txn_versions);
-
-        // Get index for the column
-        let index = self.version_store.get_index_by_column(column_name)?;
-        // Return all distinct values from the index
-        Some(index.get_all_values())
-    }
-
-    fn get_partition_count(&self, column_name: &str) -> Option<usize> {
-        // Only use index-based count if no uncommitted local changes
-        let txn_versions = self.txn_versions.read().unwrap();
-        if txn_versions.has_local_changes() {
-            return None;
-        }
-        drop(txn_versions);
-
-        // Get index for the column
-        let index = self.version_store.get_index_by_column(column_name)?;
-        // Return count of distinct non-null values without cloning
-        index.get_distinct_count_excluding_null()
-    }
-
-    fn get_rows_for_partition_value(
-        &self,
-        column_name: &str,
-        partition_value: &Value,
-    ) -> Option<RowVec> {
-        // If transaction has local changes, fall back to regular path
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            if txn_versions.has_local_changes() {
-                return None;
-            }
-        }
-
-        // Get index for the column
-        let index = self.version_store.get_index_by_column(column_name)?;
-
-        // Get row IDs for this partition value
-        let row_ids = index.get_row_ids_equal(std::slice::from_ref(partition_value));
-
-        // Collect visible rows for this partition
-        let mut rows = RowVec::with_capacity(row_ids.len());
-        for &row_id in row_ids.iter() {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
-                if !version.is_deleted() {
-                    rows.push((row_id, version.data.clone()));
-                }
-            }
-        }
-
-        Some(rows)
-    }
-
     fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()> {
         // Rename column in both version store and cached schema
         {
@@ -3927,491 +4412,8 @@ impl Table for MVCCTable {
         Ok(())
     }
 
-    fn select(
-        &self,
-        columns: &[&str],
-        expr: Option<&dyn Expression>,
-    ) -> Result<Box<dyn QueryResult>> {
-        // Convert column names to indices
-        let column_indices: Vec<usize> = columns
-            .iter()
-            .filter_map(|name| self.cached_schema.find_column(name).map(|(idx, _)| idx))
-            .collect();
-
-        // Scan and collect results
-        let mut scanner = self.scan(&column_indices, expr)?;
-        let mut rows = Vec::new();
-
-        while scanner.next() {
-            rows.push(scanner.take_row());
-        }
-
-        scanner.close()?;
-
-        // Create result
-        let result_columns: Vec<String> = columns.iter().map(|s| s.to_string()).collect();
-        let result = MemoryResult::with_rows(result_columns, rows);
-
-        Ok(Box::new(result))
-    }
-
-    fn select_with_aliases(
-        &self,
-        columns: &[&str],
-        expr: Option<&dyn Expression>,
-        aliases: &FxHashMap<String, String>,
-    ) -> Result<Box<dyn QueryResult>> {
-        // Get base result
-        let result = self.select(columns, expr)?;
-
-        // Apply aliases
-        Ok(result.with_aliases(aliases.clone()))
-    }
-
-    fn select_as_of(
-        &self,
-        columns: &[&str],
-        expr: Option<&dyn Expression>,
-        temporal_type: &str,
-        temporal_value: i64,
-    ) -> Result<Box<dyn QueryResult>> {
-        // Convert column names to indices
-        let column_indices: Vec<usize> = columns
-            .iter()
-            .filter_map(|name| self.cached_schema.find_column(name).map(|(idx, _)| idx))
-            .collect();
-
-        // Get all row IDs
-        let row_ids = self.version_store.get_all_row_ids();
-
-        // Collect temporal rows
-        let mut rows = Vec::new();
-        for row_id in row_ids {
-            let version = match temporal_type.to_uppercase().as_str() {
-                "TRANSACTION" => self
-                    .version_store
-                    .get_visible_version_as_of_transaction(row_id, temporal_value),
-                "TIMESTAMP" => self
-                    .version_store
-                    .get_visible_version_as_of_timestamp(row_id, temporal_value),
-                _ => {
-                    return Err(Error::internal(format!(
-                        "unsupported temporal type: {}",
-                        temporal_type
-                    )))
-                }
-            };
-
-            if let Some(v) = version {
-                if !v.is_deleted() {
-                    // Apply filter
-                    if let Some(e) = expr {
-                        match e.evaluate(&v.data) {
-                            Ok(true) => {}
-                            Ok(false) => continue,
-                            Err(_) => continue,
-                        }
-                    }
-
-                    // Project columns
-                    let projected: Vec<Value> = column_indices
-                        .iter()
-                        .map(|&idx| v.data.get(idx).cloned().unwrap_or(Value::null_unknown()))
-                        .collect();
-                    rows.push(Row::from_values(projected));
-                }
-            }
-        }
-
-        // Create result
-        let result_columns: Vec<String> = columns.iter().map(|s| s.to_string()).collect();
-        let result = MemoryResult::with_rows(result_columns, rows);
-
-        Ok(Box::new(result))
-    }
-
-    fn explain_scan(&self, where_expr: Option<&dyn Expression>) -> ScanPlan {
-        use crate::core::Operator;
-
-        let table_name = self.cached_schema.table_name.clone();
-        let schema = &self.cached_schema;
-
-        // No WHERE clause - always Seq Scan
-        let Some(expr) = where_expr else {
-            return ScanPlan::SeqScan {
-                table: table_name,
-                filter: None,
-            };
-        };
-
-        // Check for PK lookup
-        let pk_indices = schema.primary_key_indices();
-        if pk_indices.len() == 1 {
-            let pk_col_idx = pk_indices[0];
-            let pk_col = &schema.columns[pk_col_idx];
-
-            if let Some((col_name, operator, value)) = expr.get_comparison_info() {
-                if col_name.eq_ignore_ascii_case(&pk_col.name) && operator == Operator::Eq {
-                    return ScanPlan::PkLookup {
-                        table: table_name,
-                        pk_column: pk_col.name.clone(),
-                        pk_value: format!("{}", value),
-                    };
-                }
-            }
-        }
-
-        // Check for single column index lookup
-        if let Some((col_name, operator, value)) = expr.get_comparison_info() {
-            // Skip boolean index (low cardinality)
-            if !matches!(value, Value::Boolean(_))
-                || !matches!(operator, Operator::Eq | Operator::Ne)
-            {
-                if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                    let condition = format!("{} {}", operator_to_string(operator), value);
-                    return ScanPlan::IndexScan {
-                        table: table_name,
-                        index_name: index.name().to_string(),
-                        column: col_name.to_string(),
-                        condition,
-                        filter: None,
-                    };
-                }
-            }
-        }
-
-        // Check for LIKE prefix pattern
-        if let Some((col_name, prefix, negated)) = expr.get_like_prefix_info() {
-            if !negated {
-                if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                    return ScanPlan::IndexScan {
-                        table: table_name,
-                        index_name: index.name().to_string(),
-                        column: col_name.to_string(),
-                        condition: format!("LIKE '{}%'", prefix),
-                        filter: None,
-                    };
-                }
-            }
-        }
-
-        // Check for OR expressions (union of indexes)
-        if let Some(or_operands) = expr.get_or_operands() {
-            let mut indexed_info: Vec<(String, String, String)> = Vec::new();
-            let mut all_indexed = true;
-
-            for operand in or_operands {
-                if let Some((col_name, operator, value)) = operand.get_comparison_info() {
-                    if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                        let condition = format!("{} {}", operator_to_string(operator), value);
-                        indexed_info.push((
-                            index.name().to_string(),
-                            col_name.to_string(),
-                            condition,
-                        ));
-                    } else {
-                        all_indexed = false;
-                    }
-                } else {
-                    all_indexed = false;
-                }
-            }
-
-            if !indexed_info.is_empty() {
-                if all_indexed {
-                    if indexed_info.len() == 1 {
-                        let (idx_name, col, cond) = indexed_info.into_iter().next().unwrap();
-                        return ScanPlan::IndexScan {
-                            table: table_name,
-                            index_name: idx_name,
-                            column: col,
-                            condition: cond,
-                            filter: None,
-                        };
-                    }
-                    return ScanPlan::MultiIndexScan {
-                        table: table_name,
-                        indexes: indexed_info,
-                        operation: "OR".to_string(),
-                        filter: None,
-                    };
-                }
-                // Mixed OR: some operands indexed, some not — hybrid scan
-                // Show as Multi-Index Scan with a Filter for the non-indexed operands
-                let non_indexed_parts: Vec<String> = or_operands
-                    .iter()
-                    .filter(|op| {
-                        if let Some((col_name, _, _)) = op.get_comparison_info() {
-                            self.version_store.get_index_by_column(col_name).is_none()
-                        } else {
-                            true
-                        }
-                    })
-                    .map(|op| {
-                        if let Some((col, operator, val)) = op.get_comparison_info() {
-                            format!("{} {} {}", col, operator_to_string(operator), val)
-                        } else {
-                            format!("{:?}", op)
-                        }
-                    })
-                    .collect();
-                let filter_str = if non_indexed_parts.len() == 1 {
-                    non_indexed_parts.into_iter().next().unwrap()
-                } else {
-                    non_indexed_parts.join(" OR ")
-                };
-                return ScanPlan::MultiIndexScan {
-                    table: table_name,
-                    indexes: indexed_info,
-                    operation: "OR".to_string(),
-                    filter: Some(filter_str),
-                };
-            }
-        }
-
-        // Check for multi-column (composite) index before single-column index intersection
-        let comparisons = expr.collect_comparisons();
-        if !comparisons.is_empty() {
-            // Group by column - needed for both multi-column and single-column index checks
-            let mut column_conditions: FxHashMap<&str, Vec<(Operator, &Value)>> =
-                FxHashMap::default();
-            for (col_name, op, val) in &comparisons {
-                column_conditions
-                    .entry(*col_name)
-                    .or_default()
-                    .push((*op, *val));
-            }
-
-            // Collect columns with equality predicates (best for multi-column index)
-            let eq_columns: Vec<&str> = column_conditions
-                .iter()
-                .filter_map(|(col, ops)| {
-                    if ops.iter().any(|(op, _)| *op == Operator::Eq) {
-                        Some(*col)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Try multi-column index if we have equality predicates matching a prefix
-            if !eq_columns.is_empty() {
-                if let Some((multi_idx, matched_count)) =
-                    self.version_store.get_multi_column_index(&eq_columns)
-                {
-                    let index_columns = multi_idx.column_names();
-                    let mut columns = Vec::new();
-                    let mut conditions = Vec::new();
-
-                    // Build columns and conditions in index column order
-                    for col in index_columns.iter().take(matched_count) {
-                        if let Some(ops) = column_conditions.get(col.as_str()) {
-                            columns.push(col.clone());
-                            // Find the equality condition
-                            for (op, val) in ops {
-                                if *op == Operator::Eq {
-                                    conditions.push(format!("= {}", val));
-                                    break;
-                                }
-                            }
-                        }
-                    }
-
-                    // Check if the next index column (after the equality prefix) has
-                    // range predicates — the composite index BTree can serve these too
-                    if matched_count < index_columns.len() {
-                        let next_col = &index_columns[matched_count];
-                        if let Some(ops) = column_conditions.get(next_col.as_str()) {
-                            let range_ops: Vec<String> = ops
-                                .iter()
-                                .filter(|(op, _)| !matches!(op, Operator::Eq))
-                                .map(|(op, val)| format!("{} {}", operator_to_string(*op), val))
-                                .collect();
-                            if !range_ops.is_empty() {
-                                columns.push(next_col.clone());
-                                conditions.push(range_ops.join(" AND "));
-                            }
-                        }
-                    }
-
-                    if !columns.is_empty() {
-                        // Collect residual predicates: columns not covered by the index
-                        let covered: rustc_hash::FxHashSet<&str> =
-                            columns.iter().map(|c| c.as_str()).collect();
-                        let residual: Vec<String> = column_conditions
-                            .iter()
-                            .filter(|(col, _)| !covered.contains(*col))
-                            .map(|(col, ops)| {
-                                ops.iter()
-                                    .map(|(op, val)| {
-                                        format!("{} {} {}", col, operator_to_string(*op), val)
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join(" AND ")
-                            })
-                            .collect();
-                        let filter = if residual.is_empty() {
-                            None
-                        } else {
-                            Some(residual.join(" AND "))
-                        };
-
-                        return ScanPlan::CompositeIndexScan {
-                            table: table_name,
-                            index_name: multi_idx.name().to_string(),
-                            columns,
-                            conditions,
-                            filter,
-                        };
-                    }
-                }
-            }
-        }
-
-        // Check for AND expressions (intersection of indexes)
-        if !comparisons.is_empty() {
-            let mut indexed_info: Vec<(String, String, String)> = Vec::new();
-
-            // Re-group by column for single-column index checks
-            let mut column_conditions: FxHashMap<&str, Vec<(Operator, &Value)>> =
-                FxHashMap::default();
-            for (col_name, op, val) in &comparisons {
-                column_conditions
-                    .entry(*col_name)
-                    .or_default()
-                    .push((*op, *val));
-            }
-
-            let mut indexed_columns: rustc_hash::FxHashSet<&str> = rustc_hash::FxHashSet::default();
-            for (col_name, ops) in &column_conditions {
-                if let Some(index) = self.version_store.get_index_by_column(col_name) {
-                    // Simplify to a single condition string
-                    let condition = if ops.len() == 1 {
-                        let (op, val) = ops[0];
-                        format!("{} {}", operator_to_string(op), val)
-                    } else {
-                        // Multiple conditions on same column (e.g., col >= 5 AND col <= 10)
-                        let parts: Vec<String> = ops
-                            .iter()
-                            .map(|(op, val)| format!("{} {}", operator_to_string(*op), val))
-                            .collect();
-                        parts.join(" AND ")
-                    };
-                    indexed_info.push((index.name().to_string(), col_name.to_string(), condition));
-                    indexed_columns.insert(col_name);
-                }
-            }
-
-            if !indexed_info.is_empty() {
-                // Collect residual predicates for non-indexed columns
-                let residual: Vec<String> = column_conditions
-                    .iter()
-                    .filter(|(col, _)| !indexed_columns.contains(*col))
-                    .map(|(col, ops)| {
-                        ops.iter()
-                            .map(|(op, val)| format!("{} {} {}", col, operator_to_string(*op), val))
-                            .collect::<Vec<_>>()
-                            .join(" AND ")
-                    })
-                    .collect();
-                let filter = if residual.is_empty() {
-                    None
-                } else {
-                    Some(residual.join(" AND "))
-                };
-
-                if indexed_info.len() == 1 {
-                    let (idx_name, col, cond) = indexed_info.into_iter().next().unwrap();
-                    return ScanPlan::IndexScan {
-                        table: table_name,
-                        index_name: idx_name,
-                        column: col,
-                        condition: cond,
-                        filter,
-                    };
-                }
-                return ScanPlan::MultiIndexScan {
-                    table: table_name,
-                    indexes: indexed_info,
-                    operation: "AND".to_string(),
-                    filter,
-                };
-            }
-        }
-
-        // Default: Seq Scan with filter
-        ScanPlan::SeqScan {
-            table: table_name,
-            filter: Some(format!("{:?}", expr)),
-        }
-    }
-
     fn set_zone_maps(&self, zone_maps: crate::storage::mvcc::zonemap::TableZoneMap) {
         self.version_store.set_zone_maps(zone_maps);
-    }
-
-    fn get_zone_maps(&self) -> Option<std::sync::Arc<crate::storage::mvcc::zonemap::TableZoneMap>> {
-        self.version_store.get_zone_maps()
-    }
-
-    fn get_segments_to_scan(
-        &self,
-        column: &str,
-        operator: crate::core::Operator,
-        value: &Value,
-    ) -> Option<Vec<u32>> {
-        self.version_store
-            .get_segments_to_scan(column, operator, value)
-    }
-
-    fn sum_column(&self, col_idx: usize) -> Option<(f64, usize)> {
-        // Only use deferred aggregation if no uncommitted local changes
-        // (local changes are in txn_versions, not the main version_store)
-        let txn_versions = self.txn_versions.read().unwrap();
-        if txn_versions.has_local_changes() {
-            return None;
-        }
-        drop(txn_versions);
-
-        Some(self.version_store.sum_column(self.txn_id, col_idx))
-    }
-
-    fn min_column(&self, col_idx: usize) -> Option<Option<Value>> {
-        // Only use deferred aggregation if no uncommitted local changes
-        let txn_versions = self.txn_versions.read().unwrap();
-        if txn_versions.has_local_changes() {
-            return None;
-        }
-        drop(txn_versions);
-
-        Some(self.version_store.min_column(self.txn_id, col_idx))
-    }
-
-    fn max_column(&self, col_idx: usize) -> Option<Option<Value>> {
-        // Only use deferred aggregation if no uncommitted local changes
-        let txn_versions = self.txn_versions.read().unwrap();
-        if txn_versions.has_local_changes() {
-            return None;
-        }
-        drop(txn_versions);
-
-        Some(self.version_store.max_column(self.txn_id, col_idx))
-    }
-
-    fn compute_grouped_aggregates(
-        &self,
-        group_by_indices: &[usize],
-        aggregates: &[(crate::storage::mvcc::version_store::AggregateOp, usize)],
-    ) -> Option<Vec<crate::storage::mvcc::version_store::GroupedAggregateResult>> {
-        // Only use storage-level aggregation if no uncommitted local changes
-        let txn_versions = self.txn_versions.read().unwrap();
-        if txn_versions.has_local_changes() {
-            return None;
-        }
-        drop(txn_versions);
-
-        self.version_store
-            .compute_grouped_aggregates(self.txn_id, group_by_indices, aggregates)
     }
 }
 

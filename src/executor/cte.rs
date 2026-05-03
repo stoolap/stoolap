@@ -36,7 +36,7 @@ use crate::common::{CompactArc, CompactVec, StringMap};
 use crate::core::{Error, Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
 use crate::parser::token::{Position, Token, TokenType};
-use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
+use crate::storage::traits::{QueryResult, ReadTable, ReadTransaction};
 
 use super::context::ExecutionContext;
 use super::expression::ExpressionEval;
@@ -2155,9 +2155,12 @@ impl Executor {
             table_col.clone()
         };
 
-        // Try to get the table and check for index or PK
-        let txn: Box<dyn Transaction> = self.engine.begin_transaction()?;
-        let table: Box<dyn Table> = match txn.get_table(&table_name) {
+        // Try to get the table and check for index or PK. Read-only path
+        // (we just inspect schema + index metadata).
+        use crate::storage::traits::ReadEngine;
+        let txn: Box<dyn ReadTransaction> =
+            ReadEngine::begin_read_transaction(self.engine.as_ref())?;
+        let table: Box<dyn ReadTable> = match txn.get_read_table(&table_name) {
             Ok(t) => t,
             Err(_) => return Ok(None),
         };

@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Table trait for database tables
+//! Table traits for database tables.
 //!
+//! Split into [`ReadTable`] (non-mutating surface) and
+//! [`WriteTable`] (extends `ReadTable` with mutators).
+//! Read-only callers receive `Box<dyn ReadTable>` and cannot reach any
+//! method that mutates persistent state. The compiler enforces this by
+//! construction.
 
 use rustc_hash::FxHashMap;
 use std::fmt;
@@ -213,29 +218,16 @@ impl fmt::Display for ScanPlan {
     }
 }
 
-/// Table represents a database table
+/// Read-only surface of a database table.
 ///
-/// This trait defines the interface for interacting with a table,
-/// including schema management, data manipulation (CRUD), and scanning.
+/// Every method on this trait is non-mutating to shared engine state.
+/// `&mut self` methods (`close`, `rollback`, `rollback_to_timestamp`)
+/// only touch transaction-local state and are safe on read-only handles.
 ///
-/// # Example
-///
-/// ```ignore
-/// let table = transaction.get_table("users")?;
-/// println!("Table: {}", table.name());
-/// println!("Schema: {:?}", table.schema());
-///
-/// // Insert a row
-/// let row = Row::from_values(vec![Value::Integer(1), Value::text("Alice")]);
-/// table.insert(row)?;
-///
-/// // Scan all rows
-/// let scanner = table.scan(&[0, 1], None)?;
-/// while scanner.next() {
-///     println!("{:?}", scanner.row());
-/// }
-/// ```
-pub trait Table: Send + Sync {
+/// Read-only callers receive `Box<dyn ReadTable>`; the trait object has
+/// no `insert`, `commit`, DDL, or any other mutator. The compiler refuses
+/// every write call. This is the read-only contract.
+pub trait ReadTable: Send + Sync {
     /// Returns the name of the table
     fn name(&self) -> &str;
 
@@ -245,132 +237,6 @@ pub trait Table: Send + Sync {
     /// Returns the transaction ID this table handle belongs to.
     /// Used by FK enforcement to participate in the caller's transaction.
     fn txn_id(&self) -> i64;
-
-    /// Creates a new column in the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the column
-    /// * `column_type` - The data type of the column
-    /// * `nullable` - Whether the column can contain NULL values
-    fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()>;
-
-    /// Creates a new column in the table with default expression
-    ///
-    /// # Arguments
-    /// * `name` - The name of the column
-    /// * `column_type` - The data type of the column
-    /// * `nullable` - Whether the column can contain NULL values
-    /// * `default_expr` - Default value expression as string (to be evaluated during INSERT)
-    fn create_column_with_default(
-        &mut self,
-        name: &str,
-        column_type: DataType,
-        nullable: bool,
-        _default_expr: Option<String>,
-    ) -> Result<()> {
-        // Default implementation ignores default_expr for backwards compatibility
-        self.create_column(name, column_type, nullable)
-    }
-
-    /// Creates a new column with both expression and pre-computed default value
-    ///
-    /// The pre-computed default value is used for schema evolution (backfilling existing rows)
-    /// while the expression string is used for new inserts.
-    ///
-    /// # Arguments
-    /// * `name` - The name of the column
-    /// * `column_type` - The data type of the column
-    /// * `nullable` - Whether the column can contain NULL values
-    /// * `default_expr` - Default value expression as string (for INSERT)
-    /// * `default_value` - Pre-computed default value (for schema evolution)
-    fn create_column_with_default_value(
-        &mut self,
-        name: &str,
-        column_type: DataType,
-        nullable: bool,
-        default_expr: Option<String>,
-        _default_value: Option<crate::core::Value>,
-    ) -> Result<()> {
-        // Default implementation ignores default_value for backwards compatibility
-        self.create_column_with_default(name, column_type, nullable, default_expr)
-    }
-
-    /// Drops a column from the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the column to drop
-    fn drop_column(&mut self, name: &str) -> Result<()>;
-
-    /// Inserts a single row into the table
-    ///
-    /// # Arguments
-    /// * `row` - The row to insert
-    ///
-    /// # Returns
-    /// The inserted row (with AUTO_INCREMENT values applied)
-    fn insert(&mut self, row: Row) -> Result<Row>;
-
-    /// Inserts a single row without returning it (avoids clone overhead)
-    ///
-    /// Use this when the RETURNING clause is not needed.
-    /// This is ~7ms faster per 1000 rows by avoiding Row::clone().
-    ///
-    /// # Arguments
-    /// * `row` - The row to insert
-    fn insert_discard(&mut self, row: Row) -> Result<()> {
-        self.insert(row)?;
-        Ok(())
-    }
-
-    /// Inserts multiple rows into the table in a single batch operation
-    ///
-    /// This is more efficient than calling `insert` multiple times.
-    ///
-    /// # Arguments
-    /// * `rows` - The rows to insert
-    fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()>;
-
-    /// Updates rows matching the given expression
-    ///
-    /// # Arguments
-    /// * `where_expr` - Expression to filter rows to update (None means all rows)
-    /// * `setter` - Function that transforms a row in place, returns true if changed
-    ///
-    /// # Returns
-    /// The number of rows updated
-    fn update(
-        &mut self,
-        where_expr: Option<&dyn Expression>,
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
-    ) -> Result<i32>;
-
-    /// Updates rows by their row IDs directly (O(k) lookup instead of O(n) scan).
-    ///
-    /// This is an optimization for UPDATE with IN subquery on INTEGER PRIMARY KEY.
-    /// Instead of scanning all rows and filtering, we directly look up the specific row IDs.
-    ///
-    /// # Arguments
-    /// * `row_ids` - The row IDs to update (should be sorted for cache locality)
-    /// * `setter` - Function that transforms a row in place, returns true if changed
-    ///
-    /// # Returns
-    /// The number of rows updated
-    fn update_by_row_ids(
-        &mut self,
-        row_ids: &[i64],
-        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
-    ) -> Result<i32>;
-
-    /// Deletes rows by their row IDs directly (O(k) lookup instead of O(n) scan).
-    ///
-    /// This is an optimization for DELETE with IN subquery on INTEGER PRIMARY KEY.
-    ///
-    /// # Arguments
-    /// * `row_ids` - The row IDs to delete (should be sorted for cache locality)
-    ///
-    /// # Returns
-    /// The number of rows deleted
-    fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32>;
 
     /// Returns all active row IDs visible to the current transaction.
     /// Used for NOT IN (anti-join) optimization.
@@ -388,31 +254,6 @@ pub trait Table: Send + Sync {
     /// O(log n) lookup instead of collecting all row_ids.
     fn has_row_id(&self, _row_id: i64) -> bool {
         false
-    }
-
-    /// Claim a row for update to prevent concurrent cold-row modifications.
-    /// When two transactions update the same cold row, both mirror it into hot
-    /// via insert_discard. Without claiming, neither detects the other because
-    /// the row starts absent from hot. This method uses the VersionStore's
-    /// uncommitted_writes map to serialize access.
-    fn try_claim_row(&self, _row_id: i64) -> Result<()> {
-        Ok(())
-    }
-
-    /// Deletes rows matching the given expression
-    ///
-    /// # Arguments
-    /// * `where_expr` - Expression to filter rows to delete (None means all rows)
-    ///
-    /// # Returns
-    /// The number of rows deleted
-    fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32>;
-
-    /// Truncates the table, removing all rows efficiently.
-    /// Unlike DELETE, this drops storage directly instead of creating delete versions.
-    /// Default implementation falls back to delete(None).
-    fn truncate(&mut self) -> Result<i32> {
-        self.delete(None)
     }
 
     /// Scans the table and returns a scanner over matching rows
@@ -558,18 +399,17 @@ pub trait Table: Send + Sync {
             .collect())
     }
 
-    /// Closes the table and releases any resources
+    /// Closes the table and releases any resources.
+    ///
+    /// On `ReadTable` because the executor's `ActiveTransaction` cleanup
+    /// drains cached read-side handles and calls `close()` on each.
     fn close(&mut self) -> Result<()>;
 
-    /// Commits any pending changes in this table's transaction
+    /// Rolls back any pending changes in this table's transaction.
     ///
-    /// This applies the table's local transaction changes to the global store,
-    /// making them visible to other transactions.
-    fn commit(&mut self) -> Result<()>;
-
-    /// Rolls back any pending changes in this table's transaction
-    ///
-    /// This discards any local changes that have not been committed.
+    /// Discards transaction-local state only; on `ReadTable` because the
+    /// executor's `ActiveTransaction` rollback path calls `rollback()`
+    /// on every cached handle.
     fn rollback(&mut self);
 
     /// Rolls back changes to a specific timestamp (for savepoint support)
@@ -599,117 +439,7 @@ pub trait Table: Send + Sync {
         Vec::new() // Default implementation returns empty - override in concrete tables
     }
 
-    // ---- Index Operations ----
-
-    /// Creates an index on the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the index
-    /// * `columns` - The column names to include in the index
-    /// * `is_unique` - Whether this is a unique index
-    fn create_index(&self, name: &str, columns: &[&str], is_unique: bool) -> Result<()>;
-
-    /// Creates an index on the table with a specific index type
-    ///
-    /// # Arguments
-    /// * `name` - The name of the index
-    /// * `columns` - The column names to include in the index
-    /// * `is_unique` - Whether this is a unique index
-    /// * `index_type` - Optional index type (Hash, BTree, Bitmap). If None, auto-selects based on column types.
-    ///
-    /// # Type-Based Index Selection (when index_type is None):
-    /// - TEXT/JSON columns → Hash index (avoids O(strlen) comparisons)
-    /// - BOOLEAN columns → Bitmap index (only 2 values, fast AND/OR)
-    /// - INTEGER/FLOAT/TIMESTAMP columns → BTree index (supports range queries)
-    fn create_index_with_type(
-        &self,
-        name: &str,
-        columns: &[&str],
-        is_unique: bool,
-        index_type: Option<IndexType>,
-    ) -> Result<()> {
-        // Default implementation calls create_index (ignores index_type)
-        let _ = index_type;
-        self.create_index(name, columns, is_unique)
-    }
-
-    /// Creates an HNSW index with custom parameters
-    ///
-    /// # Arguments
-    /// * `name` - The name of the index
-    /// * `column` - The vector column to index
-    /// * `is_unique` - Whether this is a unique index
-    /// * `m` - Max connections per node per layer
-    /// * `ef_construction` - Build-time beam width
-    /// * `ef_search` - Search-time beam width
-    /// * `metric` - Distance metric (L2, Cosine, InnerProduct)
-    #[allow(clippy::too_many_arguments)]
-    fn create_hnsw_index(
-        &self,
-        name: &str,
-        column: &str,
-        is_unique: bool,
-        m: usize,
-        ef_construction: usize,
-        ef_search: usize,
-        metric: crate::storage::index::HnswDistanceMetric,
-    ) -> Result<()> {
-        let _ = (
-            name,
-            column,
-            is_unique,
-            m,
-            ef_construction,
-            ef_search,
-            metric,
-        );
-        Err(crate::core::Error::internal(
-            "HNSW index not supported by this storage engine".to_string(),
-        ))
-    }
-
-    /// Drops an index from the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the index to drop
-    fn drop_index(&self, name: &str) -> Result<()>;
-
-    /// Creates a btree index on a column
-    ///
-    /// # Arguments
-    /// * `column_name` - The column to index
-    /// * `is_unique` - Whether this is a unique index
-    /// * `custom_name` - Optional custom name for the index
-    fn create_btree_index(
-        &self,
-        column_name: &str,
-        is_unique: bool,
-        custom_name: Option<&str>,
-    ) -> Result<()>;
-
-    /// Drops a btree index from the table
-    ///
-    /// # Arguments
-    /// * `column_name` - The column whose index to drop
-    fn drop_btree_index(&self, column_name: &str) -> Result<()>;
-
-    /// Creates a multi-column index on the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the index
-    /// * `columns` - The column names to include in the index
-    /// * `is_unique` - Whether this is a unique index
-    fn create_multi_column_index(
-        &self,
-        name: &str,
-        columns: &[&str],
-        is_unique: bool,
-    ) -> Result<()> {
-        let _ = (name, columns, is_unique);
-        Err(Error::NotSupported(
-            "Multi-column indexes not supported by this table type".to_string(),
-        ))
-    }
+    // ---- Index Lookups (read-only) ----
 
     /// Checks if an index exists on a specific column
     ///
@@ -743,19 +473,6 @@ pub trait Table: Send + Sync {
         Vec::new() // Default: no unique indexes
     }
 
-    /// Finds a conflicting row ID for a unique-key lookup.
-    ///
-    /// Volume-backed tables can override this to probe cold storage directly
-    /// after the hot index path misses, avoiding a full table scan on upserts.
-    fn find_unique_conflict_row_id(
-        &self,
-        _index_name: &str,
-        _column_name: &str,
-        _row_values: &[Value],
-    ) -> Result<Option<i64>> {
-        Ok(None)
-    }
-
     /// Iterate unique non-PK indexes by reference, avoiding per-call String allocations.
     ///
     /// The callback receives `(&str, &[String])` — the index name and its column names —
@@ -777,11 +494,6 @@ pub trait Table: Send + Sync {
     /// Used as a fast bail-out to avoid allocating get_unique_indexes().
     fn has_unique_non_pk_indexes(&self) -> bool {
         false // Default: no
-    }
-
-    /// Acquire per-table upsert mutex for ON CONFLICT serialization.
-    fn acquire_upsert_lock(&self) -> Option<Box<dyn std::any::Any>> {
-        None
     }
 
     /// Gets an index by name
@@ -836,6 +548,8 @@ pub trait Table: Send + Sync {
         let _ = column_name;
         None // Default implementation - override in concrete tables
     }
+
+    // ---- Counts / Partitions ----
 
     /// Gets the count of rows in the table (COUNT(*) pushdown optimization)
     ///
@@ -1017,23 +731,6 @@ pub trait Table: Send + Sync {
         // Default implementation does nothing
     }
 
-    // ---- Additional Column Operations ----
-
-    /// Renames a column in the table
-    ///
-    /// # Arguments
-    /// * `old_name` - Current column name
-    /// * `new_name` - New column name
-    fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()>;
-
-    /// Modifies a column's definition
-    ///
-    /// # Arguments
-    /// * `name` - The column name
-    /// * `column_type` - The new data type
-    /// * `nullable` - Whether the column can contain NULL values
-    fn modify_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()>;
-
     // ---- Query Operations ----
 
     /// Executes a SELECT query on the table
@@ -1101,20 +798,6 @@ pub trait Table: Send + Sync {
             table: self.name().to_string(),
             filter: where_expr.map(|e| format!("{:?}", e)),
         }
-    }
-
-    // ---- Zone Map Operations (Statistics for Segment Pruning) ----
-
-    /// Sets the zone maps for this table
-    ///
-    /// Zone maps contain min/max statistics per segment, enabling the query
-    /// executor to skip entire segments when predicates fall outside the range.
-    /// This is typically called by ANALYZE.
-    ///
-    /// # Arguments
-    /// * `zone_maps` - The zone map statistics for the table
-    fn set_zone_maps(&self, _zone_maps: crate::storage::mvcc::zonemap::TableZoneMap) {
-        // Default implementation does nothing - override in concrete tables
     }
 
     /// Gets the zone maps for this table
@@ -1236,12 +919,356 @@ pub trait Table: Send + Sync {
     }
 }
 
+/// Writable surface of a database table.
+///
+/// Extends [`ReadTable`] with mutators (DML, DDL, index management,
+/// commit, etc.). `Box<dyn WriteTable>` exposes both the inherited
+/// read methods and the additional write methods.
+///
+/// Read-only callers cannot reach this trait — they hold
+/// `Box<dyn ReadTable>` instead. Splitting the trait surface is what
+/// makes read-only mode bypass-proof at compile time.
+pub trait WriteTable: ReadTable {
+    // ---- Column DDL ----
+
+    /// Creates a new column in the table
+    ///
+    /// # Arguments
+    /// * `name` - The name of the column
+    /// * `column_type` - The data type of the column
+    /// * `nullable` - Whether the column can contain NULL values
+    fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()>;
+
+    /// Creates a new column in the table with default expression
+    ///
+    /// # Arguments
+    /// * `name` - The name of the column
+    /// * `column_type` - The data type of the column
+    /// * `nullable` - Whether the column can contain NULL values
+    /// * `default_expr` - Default value expression as string (to be evaluated during INSERT)
+    fn create_column_with_default(
+        &mut self,
+        name: &str,
+        column_type: DataType,
+        nullable: bool,
+        _default_expr: Option<String>,
+    ) -> Result<()> {
+        // Default implementation ignores default_expr for backwards compatibility
+        self.create_column(name, column_type, nullable)
+    }
+
+    /// Creates a new column with both expression and pre-computed default value
+    ///
+    /// The pre-computed default value is used for schema evolution (backfilling existing rows)
+    /// while the expression string is used for new inserts.
+    ///
+    /// # Arguments
+    /// * `name` - The name of the column
+    /// * `column_type` - The data type of the column
+    /// * `nullable` - Whether the column can contain NULL values
+    /// * `default_expr` - Default value expression as string (for INSERT)
+    /// * `default_value` - Pre-computed default value (for schema evolution)
+    fn create_column_with_default_value(
+        &mut self,
+        name: &str,
+        column_type: DataType,
+        nullable: bool,
+        default_expr: Option<String>,
+        _default_value: Option<crate::core::Value>,
+    ) -> Result<()> {
+        // Default implementation ignores default_value for backwards compatibility
+        self.create_column_with_default(name, column_type, nullable, default_expr)
+    }
+
+    /// Drops a column from the table
+    ///
+    /// # Arguments
+    /// * `name` - The name of the column to drop
+    fn drop_column(&mut self, name: &str) -> Result<()>;
+
+    /// Renames a column in the table
+    ///
+    /// # Arguments
+    /// * `old_name` - Current column name
+    /// * `new_name` - New column name
+    fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()>;
+
+    /// Modifies a column's definition
+    ///
+    /// # Arguments
+    /// * `name` - The column name
+    /// * `column_type` - The new data type
+    /// * `nullable` - Whether the column can contain NULL values
+    fn modify_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()>;
+
+    // ---- DML ----
+
+    /// Inserts a single row into the table
+    ///
+    /// # Arguments
+    /// * `row` - The row to insert
+    ///
+    /// # Returns
+    /// The inserted row (with AUTO_INCREMENT values applied)
+    fn insert(&mut self, row: Row) -> Result<Row>;
+
+    /// Inserts a single row without returning it (avoids clone overhead)
+    ///
+    /// Use this when the RETURNING clause is not needed.
+    /// This is ~7ms faster per 1000 rows by avoiding Row::clone().
+    ///
+    /// # Arguments
+    /// * `row` - The row to insert
+    fn insert_discard(&mut self, row: Row) -> Result<()> {
+        self.insert(row)?;
+        Ok(())
+    }
+
+    /// Inserts multiple rows into the table in a single batch operation
+    ///
+    /// This is more efficient than calling `insert` multiple times.
+    ///
+    /// # Arguments
+    /// * `rows` - The rows to insert
+    fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()>;
+
+    /// Updates rows matching the given expression
+    ///
+    /// # Arguments
+    /// * `where_expr` - Expression to filter rows to update (None means all rows)
+    /// * `setter` - Function that transforms a row in place, returns true if changed
+    ///
+    /// # Returns
+    /// The number of rows updated
+    fn update(
+        &mut self,
+        where_expr: Option<&dyn Expression>,
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+    ) -> Result<i32>;
+
+    /// Updates rows by their row IDs directly (O(k) lookup instead of O(n) scan).
+    ///
+    /// This is an optimization for UPDATE with IN subquery on INTEGER PRIMARY KEY.
+    /// Instead of scanning all rows and filtering, we directly look up the specific row IDs.
+    ///
+    /// # Arguments
+    /// * `row_ids` - The row IDs to update (should be sorted for cache locality)
+    /// * `setter` - Function that transforms a row in place, returns true if changed
+    ///
+    /// # Returns
+    /// The number of rows updated
+    fn update_by_row_ids(
+        &mut self,
+        row_ids: &[i64],
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+    ) -> Result<i32>;
+
+    /// Deletes rows matching the given expression
+    ///
+    /// # Arguments
+    /// * `where_expr` - Expression to filter rows to delete (None means all rows)
+    ///
+    /// # Returns
+    /// The number of rows deleted
+    fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32>;
+
+    /// Deletes rows by their row IDs directly (O(k) lookup instead of O(n) scan).
+    ///
+    /// This is an optimization for DELETE with IN subquery on INTEGER PRIMARY KEY.
+    ///
+    /// # Arguments
+    /// * `row_ids` - The row IDs to delete (should be sorted for cache locality)
+    ///
+    /// # Returns
+    /// The number of rows deleted
+    fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32>;
+
+    /// Truncates the table, removing all rows efficiently.
+    /// Unlike DELETE, this drops storage directly instead of creating delete versions.
+    /// Default implementation falls back to delete(None).
+    fn truncate(&mut self) -> Result<i32> {
+        self.delete(None)
+    }
+
+    /// Claim a row for update to prevent concurrent cold-row modifications.
+    /// When two transactions update the same cold row, both mirror it into hot
+    /// via insert_discard. Without claiming, neither detects the other because
+    /// the row starts absent from hot. This method uses the VersionStore's
+    /// uncommitted_writes map to serialize access.
+    ///
+    /// Takes `&self` but mutates internal claim state. Lives on `WriteTable`
+    /// because claiming a row is a write precondition; read-only callers
+    /// must not be able to call it.
+    fn try_claim_row(&self, _row_id: i64) -> Result<()> {
+        Ok(())
+    }
+
+    // ---- Index DDL ----
+
+    /// Creates an index on the table
+    ///
+    /// # Arguments
+    /// * `name` - The name of the index
+    /// * `columns` - The column names to include in the index
+    /// * `is_unique` - Whether this is a unique index
+    fn create_index(&self, name: &str, columns: &[&str], is_unique: bool) -> Result<()>;
+
+    /// Creates an index on the table with a specific index type
+    ///
+    /// # Arguments
+    /// * `name` - The name of the index
+    /// * `columns` - The column names to include in the index
+    /// * `is_unique` - Whether this is a unique index
+    /// * `index_type` - Optional index type (Hash, BTree, Bitmap). If None, auto-selects based on column types.
+    ///
+    /// # Type-Based Index Selection (when index_type is None):
+    /// - TEXT/JSON columns → Hash index (avoids O(strlen) comparisons)
+    /// - BOOLEAN columns → Bitmap index (only 2 values, fast AND/OR)
+    /// - INTEGER/FLOAT/TIMESTAMP columns → BTree index (supports range queries)
+    fn create_index_with_type(
+        &self,
+        name: &str,
+        columns: &[&str],
+        is_unique: bool,
+        index_type: Option<IndexType>,
+    ) -> Result<()> {
+        // Default implementation calls create_index (ignores index_type)
+        let _ = index_type;
+        self.create_index(name, columns, is_unique)
+    }
+
+    /// Creates an HNSW index with custom parameters
+    ///
+    /// # Arguments
+    /// * `name` - The name of the index
+    /// * `column` - The vector column to index
+    /// * `is_unique` - Whether this is a unique index
+    /// * `m` - Max connections per node per layer
+    /// * `ef_construction` - Build-time beam width
+    /// * `ef_search` - Search-time beam width
+    /// * `metric` - Distance metric (L2, Cosine, InnerProduct)
+    #[allow(clippy::too_many_arguments)]
+    fn create_hnsw_index(
+        &self,
+        name: &str,
+        column: &str,
+        is_unique: bool,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+        metric: crate::storage::index::HnswDistanceMetric,
+    ) -> Result<()> {
+        let _ = (
+            name,
+            column,
+            is_unique,
+            m,
+            ef_construction,
+            ef_search,
+            metric,
+        );
+        Err(crate::core::Error::internal(
+            "HNSW index not supported by this storage engine".to_string(),
+        ))
+    }
+
+    /// Drops an index from the table
+    ///
+    /// # Arguments
+    /// * `name` - The name of the index to drop
+    fn drop_index(&self, name: &str) -> Result<()>;
+
+    /// Creates a btree index on a column
+    ///
+    /// # Arguments
+    /// * `column_name` - The column to index
+    /// * `is_unique` - Whether this is a unique index
+    /// * `custom_name` - Optional custom name for the index
+    fn create_btree_index(
+        &self,
+        column_name: &str,
+        is_unique: bool,
+        custom_name: Option<&str>,
+    ) -> Result<()>;
+
+    /// Drops a btree index from the table
+    ///
+    /// # Arguments
+    /// * `column_name` - The column whose index to drop
+    fn drop_btree_index(&self, column_name: &str) -> Result<()>;
+
+    /// Creates a multi-column index on the table
+    ///
+    /// # Arguments
+    /// * `name` - The name of the index
+    /// * `columns` - The column names to include in the index
+    /// * `is_unique` - Whether this is a unique index
+    fn create_multi_column_index(
+        &self,
+        name: &str,
+        columns: &[&str],
+        is_unique: bool,
+    ) -> Result<()> {
+        let _ = (name, columns, is_unique);
+        Err(Error::NotSupported(
+            "Multi-column indexes not supported by this table type".to_string(),
+        ))
+    }
+
+    // ---- Unique constraint enforcement (write-side coordination) ----
+
+    /// Finds a conflicting row ID for a unique-key lookup.
+    ///
+    /// Volume-backed tables can override this to probe cold storage directly
+    /// after the hot index path misses, avoiding a full table scan on upserts.
+    fn find_unique_conflict_row_id(
+        &self,
+        _index_name: &str,
+        _column_name: &str,
+        _row_values: &[Value],
+    ) -> Result<Option<i64>> {
+        Ok(None)
+    }
+
+    /// Acquire per-table upsert mutex for ON CONFLICT serialization.
+    ///
+    /// Returns a mutex guard erased as `Box<dyn Any>`. The `Any` here is
+    /// type erasure for the mutex guard, not a downcast vector to engine
+    /// internals. Lives on `WriteTable` because only DML reaches it.
+    fn acquire_upsert_lock(&self) -> Option<Box<dyn std::any::Any>> {
+        None
+    }
+
+    // ---- Zone maps (write side) ----
+
+    /// Sets the zone maps for this table
+    ///
+    /// Zone maps contain min/max statistics per segment, enabling the query
+    /// executor to skip entire segments when predicates fall outside the range.
+    /// This is typically called by ANALYZE.
+    ///
+    /// # Arguments
+    /// * `zone_maps` - The zone map statistics for the table
+    fn set_zone_maps(&self, _zone_maps: crate::storage::mvcc::zonemap::TableZoneMap) {
+        // Default implementation does nothing - override in concrete tables
+    }
+
+    // ---- Lifecycle ----
+
+    /// Commits any pending changes in this table's transaction
+    ///
+    /// This applies the table's local transaction changes to the global store,
+    /// making them visible to other transactions.
+    fn commit(&mut self) -> Result<()>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Verify trait is object-safe
-    fn _assert_object_safe(_: &dyn Table) {}
+    // Verify both traits are object-safe
+    fn _assert_read_object_safe(_: &dyn ReadTable) {}
+    fn _assert_write_object_safe(_: &dyn WriteTable) {}
 
     // ScanPlan Display tests
 
@@ -1251,42 +1278,39 @@ mod tests {
             table: "users".to_string(),
             filter: None,
         };
-        let display = format!("{}", plan);
-        assert_eq!(display, "Seq Scan on users");
+        assert_eq!(plan.to_string(), "Seq Scan on users");
     }
 
     #[test]
     fn test_seq_scan_display_with_filter() {
         let plan = ScanPlan::SeqScan {
-            table: "orders".to_string(),
-            filter: Some("amount > 100".to_string()),
+            table: "users".to_string(),
+            filter: Some("age > 18".to_string()),
         };
-        let display = format!("{}", plan);
-        assert!(display.contains("Seq Scan on orders"));
-        assert!(display.contains("Filter: amount > 100"));
+        assert_eq!(plan.to_string(), "Seq Scan on users\n  Filter: age > 18");
     }
 
     #[test]
     fn test_parallel_seq_scan_display_without_filter() {
         let plan = ScanPlan::ParallelSeqScan {
-            table: "products".to_string(),
+            table: "users".to_string(),
             filter: None,
             workers: 4,
         };
-        let display = format!("{}", plan);
-        assert_eq!(display, "Parallel Seq Scan on products (workers=4)");
+        assert_eq!(plan.to_string(), "Parallel Seq Scan on users (workers=4)");
     }
 
     #[test]
     fn test_parallel_seq_scan_display_with_filter() {
         let plan = ScanPlan::ParallelSeqScan {
-            table: "items".to_string(),
-            filter: Some("price < 50".to_string()),
-            workers: 8,
+            table: "users".to_string(),
+            filter: Some("age > 18".to_string()),
+            workers: 4,
         };
-        let display = format!("{}", plan);
-        assert!(display.contains("Parallel Seq Scan on items (workers=8)"));
-        assert!(display.contains("Filter: price < 50"));
+        assert_eq!(
+            plan.to_string(),
+            "Parallel Seq Scan on users (workers=4)\n  Filter: age > 18"
+        );
     }
 
     #[test]
@@ -1296,149 +1320,144 @@ mod tests {
             pk_column: "id".to_string(),
             pk_value: "42".to_string(),
         };
-        let display = format!("{}", plan);
-        assert!(display.contains("PK Lookup on users"));
-        assert!(display.contains("id = 42"));
+        assert_eq!(plan.to_string(), "PK Lookup on users\n  id = 42");
     }
 
     #[test]
     fn test_index_scan_display() {
         let plan = ScanPlan::IndexScan {
-            table: "orders".to_string(),
-            index_name: "idx_customer_id".to_string(),
-            column: "customer_id".to_string(),
-            condition: "= 123".to_string(),
+            table: "users".to_string(),
+            index_name: "idx_email".to_string(),
+            column: "email".to_string(),
+            condition: "= 'alice@example.com'".to_string(),
             filter: None,
         };
-        let display = format!("{}", plan);
-        assert!(display.contains("Index Scan using idx_customer_id on orders"));
-        assert!(display.contains("Index Cond: customer_id = 123"));
+        assert_eq!(
+            plan.to_string(),
+            "Index Scan using idx_email on users\n  Index Cond: email = 'alice@example.com'"
+        );
     }
 
     #[test]
     fn test_multi_index_scan_display_and() {
         let plan = ScanPlan::MultiIndexScan {
-            table: "products".to_string(),
+            table: "users".to_string(),
             indexes: vec![
+                ("idx_age".to_string(), "age".to_string(), "> 18".to_string()),
                 (
-                    "idx_category".to_string(),
-                    "category".to_string(),
-                    "= 'electronics'".to_string(),
-                ),
-                (
-                    "idx_price".to_string(),
-                    "price".to_string(),
-                    "> 100".to_string(),
+                    "idx_status".to_string(),
+                    "status".to_string(),
+                    "= 'active'".to_string(),
                 ),
             ],
             operation: "AND".to_string(),
             filter: None,
         };
-        let display = format!("{}", plan);
-        assert!(display.contains("Multi-Index Scan on products (AND)"));
-        assert!(display.contains("idx_category on category: = 'electronics'"));
-        assert!(display.contains("idx_price on price: > 100"));
+        assert_eq!(
+            plan.to_string(),
+            "Multi-Index Scan on users (AND)\n  -> idx_age on age: > 18\n  -> idx_status on status: = 'active'"
+        );
     }
 
     #[test]
     fn test_multi_index_scan_display_or() {
         let plan = ScanPlan::MultiIndexScan {
-            table: "items".to_string(),
+            table: "products".to_string(),
             indexes: vec![
-                ("idx_a".to_string(), "col_a".to_string(), "= 1".to_string()),
-                ("idx_b".to_string(), "col_b".to_string(), "= 2".to_string()),
+                (
+                    "idx_name".to_string(),
+                    "name".to_string(),
+                    "LIKE 'A%'".to_string(),
+                ),
+                (
+                    "idx_sku".to_string(),
+                    "sku".to_string(),
+                    "= 'XYZ'".to_string(),
+                ),
             ],
             operation: "OR".to_string(),
             filter: None,
         };
-        let display = format!("{}", plan);
-        assert!(display.contains("Multi-Index Scan on items (OR)"));
+        assert_eq!(
+            plan.to_string(),
+            "Multi-Index Scan on products (OR)\n  -> idx_name on name: LIKE 'A%'\n  -> idx_sku on sku: = 'XYZ'"
+        );
     }
 
     #[test]
     fn test_composite_index_scan_display() {
         let plan = ScanPlan::CompositeIndexScan {
             table: "orders".to_string(),
-            index_name: "idx_cust_date".to_string(),
-            columns: vec!["customer_id".to_string(), "order_date".to_string()],
-            conditions: vec!["= 100".to_string(), "> '2024-01-01'".to_string()],
+            index_name: "idx_user_date".to_string(),
+            columns: vec!["user_id".to_string(), "order_date".to_string()],
+            conditions: vec!["= 42".to_string(), "> '2024-01-01'".to_string()],
             filter: None,
         };
-        let display = format!("{}", plan);
-        assert!(display.contains("Composite Index Scan using idx_cust_date on orders"));
-        assert!(display.contains("Columns: (customer_id, order_date)"));
-        assert!(display.contains("customer_id = 100"));
-        assert!(display.contains("order_date > '2024-01-01'"));
+        assert_eq!(
+            plan.to_string(),
+            "Composite Index Scan using idx_user_date on orders\n  Columns: (user_id, order_date)\n  user_id = 42\n  order_date > '2024-01-01'"
+        );
     }
 
     #[test]
     fn test_scan_plan_debug() {
+        // Verify Debug is derived
         let plan = ScanPlan::SeqScan {
-            table: "test".to_string(),
-            filter: Some("x > 1".to_string()),
+            table: "users".to_string(),
+            filter: None,
         };
-        let debug = format!("{:?}", plan);
-        assert!(debug.contains("SeqScan"));
-        assert!(debug.contains("test"));
+        let debug_str = format!("{:?}", plan);
+        assert!(debug_str.contains("SeqScan"));
+        assert!(debug_str.contains("users"));
     }
 
     #[test]
     fn test_scan_plan_clone() {
-        let plan = ScanPlan::PkLookup {
+        // Verify Clone is derived
+        let plan = ScanPlan::IndexScan {
             table: "users".to_string(),
-            pk_column: "id".to_string(),
-            pk_value: "1".to_string(),
+            index_name: "idx_id".to_string(),
+            column: "id".to_string(),
+            condition: "= 1".to_string(),
+            filter: None,
         };
         let cloned = plan.clone();
-        match cloned {
-            ScanPlan::PkLookup {
-                table,
-                pk_column,
-                pk_value,
-            } => {
-                assert_eq!(table, "users");
-                assert_eq!(pk_column, "id");
-                assert_eq!(pk_value, "1");
-            }
-            _ => panic!("Expected PkLookup"),
-        }
+        assert_eq!(plan.to_string(), cloned.to_string());
     }
 
     #[test]
     fn test_multi_index_scan_empty_indexes() {
         let plan = ScanPlan::MultiIndexScan {
-            table: "empty".to_string(),
+            table: "users".to_string(),
             indexes: vec![],
             operation: "AND".to_string(),
             filter: None,
         };
-        let display = format!("{}", plan);
-        assert!(display.contains("Multi-Index Scan on empty (AND)"));
+        assert_eq!(plan.to_string(), "Multi-Index Scan on users (AND)");
     }
 
     #[test]
     fn test_composite_index_scan_single_column() {
         let plan = ScanPlan::CompositeIndexScan {
-            table: "single".to_string(),
-            index_name: "idx_single".to_string(),
-            columns: vec!["id".to_string()],
-            conditions: vec!["= 1".to_string()],
+            table: "orders".to_string(),
+            index_name: "idx_user".to_string(),
+            columns: vec!["user_id".to_string()],
+            conditions: vec!["= 42".to_string()],
             filter: None,
         };
-        let display = format!("{}", plan);
-        assert!(display.contains("Composite Index Scan using idx_single on single"));
-        assert!(display.contains("Columns: (id)"));
-        assert!(display.contains("id = 1"));
+        assert_eq!(
+            plan.to_string(),
+            "Composite Index Scan using idx_user on orders\n  Columns: (user_id)\n  user_id = 42"
+        );
     }
 
     #[test]
     fn test_parallel_seq_scan_single_worker() {
         let plan = ScanPlan::ParallelSeqScan {
-            table: "small".to_string(),
+            table: "users".to_string(),
             filter: None,
             workers: 1,
         };
-        let display = format!("{}", plan);
-        assert_eq!(display, "Parallel Seq Scan on small (workers=1)");
+        assert_eq!(plan.to_string(), "Parallel Seq Scan on users (workers=1)");
     }
 }

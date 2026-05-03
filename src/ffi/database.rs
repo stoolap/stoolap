@@ -22,8 +22,8 @@ use std::sync::Arc;
 use crate::api::Database;
 use crate::common::version::VERSION;
 
-use super::error;
-use super::types::{StoolapDB, StoolapNamedParam, StoolapRows, StoolapValue};
+use super::error::{self, LastErrorState};
+use super::types::{StoolapDB, StoolapErrorDetails, StoolapNamedParam, StoolapRows, StoolapValue};
 use super::value;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
 
@@ -71,14 +71,14 @@ pub unsafe extern "C" fn stoolap_open(dsn: *const c_char, out_db: *mut *mut Stoo
             Ok(db) => {
                 let handle = Box::new(StoolapDB {
                     db,
-                    last_error: None,
+                    last_error: LastErrorState::default(),
                     _engine_keepalive: None,
                 });
                 *out_db = Box::into_raw(handle);
                 STOOLAP_OK
             }
             Err(e) => {
-                error::set_global_error(&e.to_string());
+                error::set_global_error_from(&e);
                 STOOLAP_ERROR
             }
         }
@@ -107,14 +107,14 @@ pub unsafe extern "C" fn stoolap_open_in_memory(out_db: *mut *mut StoolapDB) -> 
             Ok(db) => {
                 let handle = Box::new(StoolapDB {
                     db,
-                    last_error: None,
+                    last_error: LastErrorState::default(),
                     _engine_keepalive: None,
                 });
                 *out_db = Box::into_raw(handle);
                 STOOLAP_OK
             }
             Err(e) => {
-                error::set_global_error(&e.to_string());
+                error::set_global_error_from(&e);
                 STOOLAP_ERROR
             }
         }
@@ -209,7 +209,7 @@ pub unsafe extern "C" fn stoolap_clone(db: *const StoolapDB, out_db: *mut *mut S
         let cloned = handle.db.clone();
         let new_handle = Box::new(StoolapDB {
             db: cloned,
-            last_error: None,
+            last_error: LastErrorState::default(),
             _engine_keepalive: Some(keepalive),
         });
         *out_db = Box::into_raw(new_handle);
@@ -240,6 +240,105 @@ pub unsafe extern "C" fn stoolap_errmsg(db: *const StoolapDB) -> *const c_char {
     }
 }
 
+/// Get the typed error code for a database handle's last error. Returns
+/// `STOOLAP_ERR_OK` when no error is pending. If `db` is NULL, returns the
+/// thread-local code (from `stoolap_open` failures).
+///
+/// # Safety
+///
+/// `db` must be a valid `StoolapDB` pointer or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_errcode(db: *const StoolapDB) -> i32 {
+    match db.as_ref() {
+        Some(handle) => handle.last_error.code,
+        None => error::global_error_code(),
+    }
+}
+
+/// Fill the caller's `StoolapErrorDetails` struct from this handle's last
+/// error. All pointer fields stay valid until the next API call on this
+/// handle. `out` MUST NOT be NULL. If `db` is NULL the thread-local error
+/// is reported (matching `stoolap_errmsg(NULL)`).
+///
+/// # Safety
+///
+/// `db` must be a valid `StoolapDB` pointer or NULL. `out` must point to a
+/// writable `StoolapErrorDetails`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_errdetails(
+    db: *const StoolapDB,
+    out: *mut StoolapErrorDetails,
+) -> i32 {
+    if out.is_null() {
+        return STOOLAP_ERROR;
+    }
+    match db.as_ref() {
+        Some(handle) => handle.last_error.fill_details(&mut *out),
+        None => error::fill_global_error_details(&mut *out),
+    }
+    STOOLAP_OK
+}
+
+/// Returns the committed row count of `table` (autocommit semantics).
+/// O(1) atomic read, no transaction is started, no rows scanned.
+///
+/// On success returns `STOOLAP_OK` and stores the count in `*out_count`.
+/// On error (NULL db, NULL table, missing table) returns `STOOLAP_ERROR`
+/// and the error is recorded on `db`.
+///
+/// # Safety
+///
+/// - `db` must be a valid `StoolapDB` pointer.
+/// - `table` must be a valid null-terminated UTF-8 string.
+/// - `out_count` must be a valid pointer to a `u64`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_table_count(
+    db: *mut StoolapDB,
+    table: *const c_char,
+    out_count: *mut u64,
+) -> i32 {
+    if out_count.is_null() {
+        return STOOLAP_ERROR;
+    }
+    *out_count = 0;
+
+    let handle = match db.as_mut() {
+        Some(h) => h,
+        None => return STOOLAP_ERROR,
+    };
+    handle.last_error.clear();
+
+    if table.is_null() {
+        handle.set_error("table name is NULL");
+        return STOOLAP_ERROR;
+    }
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let name = match CStr::from_ptr(table).to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                handle.set_error(&format!("invalid UTF-8 in table name: {}", e));
+                return STOOLAP_ERROR;
+            }
+        };
+        match handle.db.table_count(name) {
+            Ok(c) => {
+                *out_count = c;
+                STOOLAP_OK
+            }
+            Err(e) => {
+                handle.set_error_from(&e);
+                STOOLAP_ERROR
+            }
+        }
+    }));
+
+    result.unwrap_or_else(|_| {
+        handle.set_error("panic during stoolap_table_count");
+        STOOLAP_ERROR
+    })
+}
+
 /// Execute a SQL statement without parameters.
 ///
 /// # Safety
@@ -257,7 +356,7 @@ pub unsafe extern "C" fn stoolap_exec(
         Some(h) => h,
         None => return STOOLAP_ERROR,
     };
-    handle.last_error = None;
+    handle.last_error.clear();
 
     if sql.is_null() {
         handle.set_error("SQL string is NULL");
@@ -281,7 +380,7 @@ pub unsafe extern "C" fn stoolap_exec(
                 STOOLAP_OK
             }
             Err(e) => {
-                handle.set_error(&e.to_string());
+                handle.set_error_from(&e);
                 STOOLAP_ERROR
             }
         }
@@ -313,7 +412,7 @@ pub unsafe extern "C" fn stoolap_exec_params(
         Some(h) => h,
         None => return STOOLAP_ERROR,
     };
-    handle.last_error = None;
+    handle.last_error.clear();
 
     if sql.is_null() {
         handle.set_error("SQL string is NULL");
@@ -339,7 +438,7 @@ pub unsafe extern "C" fn stoolap_exec_params(
                 STOOLAP_OK
             }
             Err(e) => {
-                handle.set_error(&e.to_string());
+                handle.set_error_from(&e);
                 STOOLAP_ERROR
             }
         }
@@ -392,7 +491,7 @@ pub unsafe extern "C" fn stoolap_query_params(
         Some(h) => h,
         None => return STOOLAP_ERROR,
     };
-    handle.last_error = None;
+    handle.last_error.clear();
 
     if sql.is_null() {
         handle.set_error("SQL string is NULL");
@@ -422,7 +521,7 @@ pub unsafe extern "C" fn stoolap_query_params(
                 let rows_handle = Box::new(StoolapRows {
                     rows: Some(rows),
                     has_row: false,
-                    last_error: None,
+                    last_error: LastErrorState::default(),
                     column_names: Arc::new(column_names),
                     text_cache: Vec::new(),
                     text_cache_dirty: false,
@@ -432,7 +531,7 @@ pub unsafe extern "C" fn stoolap_query_params(
                 STOOLAP_OK
             }
             Err(e) => {
-                handle.set_error(&e.to_string());
+                handle.set_error_from(&e);
                 STOOLAP_ERROR
             }
         }
@@ -464,7 +563,7 @@ pub unsafe extern "C" fn stoolap_exec_named(
         Some(h) => h,
         None => return STOOLAP_ERROR,
     };
-    handle.last_error = None;
+    handle.last_error.clear();
 
     if sql.is_null() {
         handle.set_error("SQL string is NULL");
@@ -490,7 +589,7 @@ pub unsafe extern "C" fn stoolap_exec_named(
                 STOOLAP_OK
             }
             Err(e) => {
-                handle.set_error(&e.to_string());
+                handle.set_error_from(&e);
                 STOOLAP_ERROR
             }
         }
@@ -527,7 +626,7 @@ pub unsafe extern "C" fn stoolap_query_named(
         Some(h) => h,
         None => return STOOLAP_ERROR,
     };
-    handle.last_error = None;
+    handle.last_error.clear();
 
     if sql.is_null() {
         handle.set_error("SQL string is NULL");
@@ -557,7 +656,7 @@ pub unsafe extern "C" fn stoolap_query_named(
                 let rows_handle = Box::new(StoolapRows {
                     rows: Some(rows),
                     has_row: false,
-                    last_error: None,
+                    last_error: LastErrorState::default(),
                     column_names: Arc::new(column_names),
                     text_cache: Vec::new(),
                     text_cache_dirty: false,
@@ -567,7 +666,7 @@ pub unsafe extern "C" fn stoolap_query_named(
                 STOOLAP_OK
             }
             Err(e) => {
-                handle.set_error(&e.to_string());
+                handle.set_error_from(&e);
                 STOOLAP_ERROR
             }
         }

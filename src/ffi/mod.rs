@@ -21,6 +21,7 @@
 
 mod database;
 mod error;
+mod read_only;
 mod rows;
 mod statement;
 mod transaction;
@@ -29,12 +30,13 @@ mod value;
 
 // Re-export all extern "C" functions
 pub use database::*;
+pub use read_only::*;
 pub use rows::*;
 pub use statement::*;
 pub use transaction::*;
 pub use types::{
-    StoolapBlobData, StoolapDB, StoolapNamedParam, StoolapRows, StoolapStmt, StoolapTextData,
-    StoolapTx, StoolapValue, StoolapValueData,
+    StoolapBlobData, StoolapDB, StoolapErrorDetails, StoolapNamedParam, StoolapRoDB, StoolapRows,
+    StoolapStmt, StoolapTextData, StoolapTx, StoolapValue, StoolapValueData,
 };
 
 // Status codes
@@ -56,3 +58,16 @@ pub const STOOLAP_TYPE_BLOB: i32 = 7;
 // Isolation levels (match IsolationLevel repr)
 pub const STOOLAP_ISOLATION_READ_COMMITTED: i32 = 0;
 pub const STOOLAP_ISOLATION_SNAPSHOT: i32 = 1;
+
+// Typed error codes (see error::codes documentation for stability rules).
+pub use error::codes::{
+    STOOLAP_ERR_CHECK, STOOLAP_ERR_COLUMN_NOT_FOUND, STOOLAP_ERR_DB_LOCKED,
+    STOOLAP_ERR_DIVISION_BY_ZERO, STOOLAP_ERR_FOREIGN_KEY, STOOLAP_ERR_GENERIC,
+    STOOLAP_ERR_INDEX_EXISTS, STOOLAP_ERR_INDEX_NOT_FOUND, STOOLAP_ERR_INTERNAL,
+    STOOLAP_ERR_INVALID_ARGUMENT, STOOLAP_ERR_IO, STOOLAP_ERR_NOT_NULL, STOOLAP_ERR_NOT_SUPPORTED,
+    STOOLAP_ERR_OK, STOOLAP_ERR_PARSE, STOOLAP_ERR_PRIMARY_KEY, STOOLAP_ERR_QUERY_CANCELLED,
+    STOOLAP_ERR_READ_ONLY, STOOLAP_ERR_REOPEN_REQUIRED, STOOLAP_ERR_TABLE_EXISTS,
+    STOOLAP_ERR_TABLE_NOT_FOUND, STOOLAP_ERR_TX_ABORTED, STOOLAP_ERR_TX_CLOSED,
+    STOOLAP_ERR_TYPE_MISMATCH, STOOLAP_ERR_UNIQUE, STOOLAP_ERR_VALUE_TOO_LONG,
+    STOOLAP_ERR_VIEW_EXISTS, STOOLAP_ERR_VIEW_NOT_FOUND,
+};

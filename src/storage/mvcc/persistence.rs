@@ -313,8 +313,18 @@ pub struct PersistenceManager {
 }
 
 impl PersistenceManager {
-    /// Create a new persistence manager
-    pub fn new(path: Option<&Path>, config: &PersistenceConfig) -> Result<Self> {
+    /// Create a new persistence manager.
+    ///
+    /// `read_only` controls whether on-disk state is mutated during init:
+    /// - `false` (writable): the persistence dir and `wal/` subdir are
+    ///   created if missing, the WAL file is opened with append access,
+    ///   and a fresh WAL file is created when none exists.
+    /// - `true` (read-only): existing on-disk state is opened read-only.
+    ///   No directories are created. WAL files are opened without
+    ///   `append`/`create` so chmod-restricted or read-only-mounted
+    ///   databases work. If no WAL files exist, the manager comes up
+    ///   with no WAL and skips replay (volumes-only path).
+    pub fn new(path: Option<&Path>, config: &PersistenceConfig, read_only: bool) -> Result<Self> {
         // Memory-only mode if no path provided
         if path.is_none() || !config.enabled {
             return Ok(Self {
@@ -331,14 +341,20 @@ impl PersistenceManager {
 
         let path = path.unwrap();
 
-        // Create base directory
-        fs::create_dir_all(path).map_err(|e| {
-            Error::internal(format!("failed to create persistence directory: {}", e))
-        })?;
+        // Create base directory only when writable. Read-only opens
+        // require the directory to already exist (Database::open_read_only
+        // checks this above us); calling create_dir_all on a read-only
+        // mount would fail with EROFS / EACCES even when the dir is
+        // already there.
+        if !read_only {
+            fs::create_dir_all(path).map_err(|e| {
+                Error::internal(format!("failed to create persistence directory: {}", e))
+            })?;
+        }
 
         // Initialize WAL with config (including fast sync settings)
         let wal_path = path.join("wal");
-        let wal = WALManager::with_config(&wal_path, config.sync_mode, Some(config))?;
+        let wal = WALManager::with_config(&wal_path, config.sync_mode, Some(config), read_only)?;
 
         // Get initial LSN from WAL
         let initial_lsn = wal.current_lsn();
@@ -403,15 +419,18 @@ impl PersistenceManager {
         Ok(())
     }
 
-    /// Record a DDL operation (CREATE TABLE, DROP TABLE, etc.)
+    /// Record a DDL operation (CREATE TABLE, DROP TABLE, etc.).
+    /// Returns the WAL LSN of the auto-commit marker so the engine can
+    /// publish it to `db.shm` (SWMR v2 Phase C). Returns `0` when
+    /// persistence is disabled.
     pub fn record_ddl_operation(
         &self,
         table_name: &str,
         op: WALOperationType,
         schema_data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<u64> {
         if !self.is_enabled() {
-            return Ok(());
+            return Ok(0);
         }
 
         let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
@@ -426,26 +445,67 @@ impl PersistenceManager {
 
         wal.append_entry(entry)?;
 
-        // DDL operations are auto-committed (they don't participate in user transactions)
-        // Write a commit marker so two-phase recovery will apply them
-        wal.write_commit_marker(DDL_TXN_ID)?;
+        // DDL operations are auto-committed (they don't participate in user transactions).
+        // Write a commit marker with commit_seq=0; DDL doesn't allocate from
+        // start_commit and doesn't participate in snapshot_seq filtering.
+        // Returns the marker LSN so the engine can publish to db.shm
+        // (SWMR v2 Phase C). Cross-process readers need DDL events too:
+        // a CREATE TABLE bumps visible_commit_lsn so subsequent reader
+        // tail-WAL replay observes the new schema.
+        let lsn = wal.write_commit_marker(DDL_TXN_ID, 0)?;
 
         // Attempt WAL rotation if file exceeds max size.
         // Failure is non-critical: the commit is already persisted.
         let _ = wal.maybe_rotate();
 
-        Ok(())
+        Ok(lsn)
     }
 
-    /// Record an index operation (CREATE INDEX, DROP INDEX)
+    /// Record a DDL entry under a USER transaction id (no
+    /// auto-commit marker). Returns the WAL LSN of the entry,
+    /// or `0` when persistence is disabled.
+    ///
+    /// Unlike `record_ddl_operation`, no `write_commit_marker`
+    /// follows: the entry's recovery / SWMR-tail visibility is
+    /// gated by the surrounding transaction's commit marker
+    /// (which `record_commit` writes from the txn commit path).
+    /// A crash between this write and the txn commit therefore
+    /// leaves the DDL entry orphaned in WAL — recovery will not
+    /// find a commit marker for `txn_id` and will skip the
+    /// entry. This is the property `MvccTransaction::commit`
+    /// relies on for transactional DDL semantics.
+    pub fn record_transactional_ddl(
+        &self,
+        txn_id: i64,
+        table_name: &str,
+        op: WALOperationType,
+        schema_data: &[u8],
+    ) -> Result<u64> {
+        if !self.is_enabled() {
+            return Ok(0);
+        }
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
+        let entry = WALEntry::new(txn_id, table_name.to_string(), 0, op, schema_data.to_vec());
+        let lsn = wal.append_entry(entry)?;
+        // Don't rotate here — rotation is fine to happen at the
+        // next auto-commit DDL or at the txn's commit marker
+        // write. Avoiding rotation here keeps this batch tightly
+        // packed in one file segment, easing recovery's locality.
+        Ok(lsn)
+    }
+
+    /// Record an index operation (CREATE INDEX, DROP INDEX). Returns
+    /// the WAL LSN of the auto-commit marker so the engine can publish
+    /// it to `db.shm` (SWMR v2 Phase C). Returns `0` when persistence
+    /// is disabled.
     pub fn record_index_operation(
         &self,
         table_name: &str,
         op: WALOperationType,
         index_data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<u64> {
         if !self.is_enabled() {
-            return Ok(());
+            return Ok(0);
         }
 
         let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
@@ -460,15 +520,15 @@ impl PersistenceManager {
 
         wal.append_entry(entry)?;
 
-        // Index operations are auto-committed (like other DDL)
-        // Write a commit marker so two-phase recovery will apply them
-        wal.write_commit_marker(DDL_TXN_ID)?;
+        // Index operations are auto-committed (like other DDL). commit_seq=0
+        // because DDL doesn't go through start_commit / snapshot_seq.
+        let lsn = wal.write_commit_marker(DDL_TXN_ID, 0)?;
 
         // Attempt WAL rotation if file exceeds max size.
         // Failure is non-critical: the commit is already persisted.
         let _ = wal.maybe_rotate();
 
-        Ok(())
+        Ok(lsn)
     }
 
     /// Record a DML operation (INSERT, UPDATE, DELETE)
@@ -495,24 +555,37 @@ impl PersistenceManager {
         Ok(())
     }
 
-    /// Record a transaction commit
-    ///
-    /// Uses commit_marker() which sets the COMMIT_MARKER flag for two-phase recovery
-    pub fn record_commit(&self, txn_id: i64) -> Result<()> {
+    /// SWMR v2 Phase E: borrow the live `WALManager`, if persistence
+    /// is initialized. Reader-side overlay rebuild calls
+    /// `WALManager::tail_committed_entries` through this. Returns
+    /// `None` for in-memory engines or when persistence init failed.
+    pub fn wal(&self) -> Option<&WALManager> {
+        self.wal.as_ref()
+    }
+
+    /// Record a transaction commit. `commit_seq` is the value
+    /// `TransactionRegistry::start_commit` allocated for the txn, so
+    /// reader's WAL-tail can tag tombstones consistently with the
+    /// writer's snapshot_seq scheme. Returns the LSN of the commit
+    /// marker entry; the caller (engine) publishes it to db.shm so
+    /// reader processes can advance their `visible_commit_lsn`
+    /// (SWMR v2 Phase C). Returns `0` when persistence is disabled.
+    pub fn record_commit(&self, txn_id: i64, commit_seq: i64) -> Result<u64> {
         if !self.is_enabled() {
-            return Ok(());
+            return Ok(0);
         }
 
         let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
 
-        // Use commit_marker to set COMMIT_MARKER flag for two-phase recovery
-        wal.write_commit_marker(txn_id)?;
+        // Use commit_marker (carries COMMIT_MARKER flag for two-phase
+        // recovery and the SWMR-v2 commit_seq field).
+        let lsn = wal.write_commit_marker(txn_id, commit_seq)?;
 
         // Attempt WAL rotation if file exceeds max size.
         // Failure is non-critical: the commit is already persisted.
         let _ = wal.maybe_rotate();
 
-        Ok(())
+        Ok(lsn)
     }
 
     /// Record a transaction rollback
@@ -551,6 +624,30 @@ impl PersistenceManager {
         let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
 
         wal.replay_two_phase(from_lsn, callback)
+    }
+
+    /// Same as `replay_two_phase` but caps the
+    /// maximum LSN considered. Read-only opens pass the writer's
+    /// published `db.shm.visible_commit_lsn` so commit markers
+    /// the writer wrote but hasn't yet
+    /// `complete_commit`/published are NOT applied during attach
+    /// (they would otherwise leave the read-only handle ahead of
+    /// the writer's in-process visibility state, with no SWMR
+    /// refresh path to bring it back). Writable opens pass
+    /// `u64::MAX` (no cap; the writer's recovery is
+    /// authoritative).
+    pub fn replay_two_phase_capped<F>(
+        &self,
+        from_lsn: u64,
+        max_lsn: u64,
+        callback: F,
+    ) -> Result<super::wal_manager::TwoPhaseRecoveryInfo>
+    where
+        F: FnMut(super::wal_manager::WALEntry) -> Result<()>,
+    {
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
+
+        wal.replay_two_phase_capped(from_lsn, max_lsn, callback)
     }
 
     /// Create a checkpoint and return the LSN at the checkpoint point
@@ -1103,7 +1200,7 @@ mod tests {
     #[test]
     fn test_persistence_manager_disabled() {
         let config = PersistenceConfig::default();
-        let pm = PersistenceManager::new(None, &config).unwrap();
+        let pm = PersistenceManager::new(None, &config, false).unwrap();
         assert!(!pm.is_enabled());
     }
 
@@ -1114,7 +1211,7 @@ mod tests {
             enabled: true,
             ..Default::default()
         };
-        let pm = PersistenceManager::new(Some(dir.path()), &config).unwrap();
+        let pm = PersistenceManager::new(Some(dir.path()), &config, false).unwrap();
         assert!(pm.is_enabled());
         assert_eq!(pm.current_lsn(), 0);
     }
@@ -1127,7 +1224,7 @@ mod tests {
             sync_mode: SyncMode::Full,
             ..Default::default()
         };
-        let pm = PersistenceManager::new(Some(dir.path()), &config).unwrap();
+        let pm = PersistenceManager::new(Some(dir.path()), &config, false).unwrap();
 
         // Record DDL (auto-committed, so 2 entries: DDL + commit marker)
         pm.record_ddl_operation("test", WALOperationType::CreateTable, b"schema_data")
@@ -1141,7 +1238,7 @@ mod tests {
         assert_eq!(pm.current_lsn(), 3);
 
         // Record commit
-        pm.record_commit(1).unwrap();
+        pm.record_commit(1, 0).unwrap();
         assert_eq!(pm.current_lsn(), 4);
     }
 
@@ -1210,7 +1307,7 @@ mod tests {
 
         // Write some entries with commits
         {
-            let pm = PersistenceManager::new(Some(dir.path()), &config).unwrap();
+            let pm = PersistenceManager::new(Some(dir.path()), &config, false).unwrap();
             pm.start().unwrap();
 
             for i in 1..=5 {
@@ -1218,7 +1315,7 @@ mod tests {
                 pm.record_dml_operation(i, "test", i * 100, WALOperationType::Insert, &version)
                     .unwrap();
                 // Commit each transaction
-                pm.record_commit(i).unwrap();
+                pm.record_commit(i, 0).unwrap();
             }
 
             pm.stop().unwrap();
@@ -1226,7 +1323,7 @@ mod tests {
 
         // Replay entries using two-phase recovery
         {
-            let pm = PersistenceManager::new(Some(dir.path()), &config).unwrap();
+            let pm = PersistenceManager::new(Some(dir.path()), &config, false).unwrap();
             let mut data_count = 0;
             let mut commit_count = 0;
 
@@ -1255,7 +1352,7 @@ mod tests {
             ..Default::default()
         };
 
-        let pm = PersistenceManager::new(Some(dir.path()), &config).unwrap();
+        let pm = PersistenceManager::new(Some(dir.path()), &config, false).unwrap();
         pm.start().unwrap();
 
         // Add some entries

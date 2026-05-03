@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use crate::api::Database;
 
-use super::types::{StoolapDB, StoolapRows, StoolapStmt, StoolapValue};
+use super::error::LastErrorState;
+use super::types::{StoolapDB, StoolapErrorDetails, StoolapRows, StoolapStmt, StoolapValue};
 use super::value;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
 
@@ -47,7 +48,7 @@ pub unsafe extern "C" fn stoolap_prepare(
         Some(h) => h,
         None => return STOOLAP_ERROR,
     };
-    handle.last_error = None;
+    handle.last_error.clear();
 
     if sql.is_null() {
         handle.set_error("SQL string is NULL");
@@ -70,7 +71,7 @@ pub unsafe extern "C" fn stoolap_prepare(
                 let engine_keepalive = handle._engine_keepalive.clone();
                 let stmt_handle = Box::new(StoolapStmt {
                     stmt,
-                    last_error: None,
+                    last_error: LastErrorState::default(),
                     sql_cstr,
                     cached_columns: None,
                     _db_keepalive: db_keepalive,
@@ -80,7 +81,7 @@ pub unsafe extern "C" fn stoolap_prepare(
                 STOOLAP_OK
             }
             Err(e) => {
-                handle.set_error(&e.to_string());
+                handle.set_error_from(&e);
                 STOOLAP_ERROR
             }
         }
@@ -110,7 +111,7 @@ pub unsafe extern "C" fn stoolap_stmt_exec(
         Some(h) => h,
         None => return STOOLAP_ERROR,
     };
-    handle.last_error = None;
+    handle.last_error.clear();
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let param_vec = value::params_to_vec(params, params_len);
@@ -123,7 +124,7 @@ pub unsafe extern "C" fn stoolap_stmt_exec(
                 STOOLAP_OK
             }
             Err(e) => {
-                handle.set_error(&e.to_string());
+                handle.set_error_from(&e);
                 STOOLAP_ERROR
             }
         }
@@ -167,7 +168,7 @@ pub unsafe extern "C" fn stoolap_stmt_exec_batch(
             return STOOLAP_ERROR;
         }
     };
-    db_handle.last_error = None;
+    db_handle.last_error.clear();
 
     let stmt_handle = match stmt.as_ref() {
         Some(h) => h,
@@ -188,7 +189,7 @@ pub unsafe extern "C" fn stoolap_stmt_exec_batch(
         let mut tx = match db_handle.db.begin() {
             Ok(t) => t,
             Err(e) => {
-                db_handle.set_error(&e.to_string());
+                db_handle.set_error_from(&e);
                 return STOOLAP_ERROR;
             }
         };
@@ -212,7 +213,7 @@ pub unsafe extern "C" fn stoolap_stmt_exec_batch(
                 Ok(affected) => total += affected,
                 Err(e) => {
                     let _ = tx.rollback();
-                    db_handle.set_error(&e.to_string());
+                    db_handle.set_error_from(&e);
                     return STOOLAP_ERROR;
                 }
             }
@@ -226,7 +227,7 @@ pub unsafe extern "C" fn stoolap_stmt_exec_batch(
                 STOOLAP_OK
             }
             Err(e) => {
-                db_handle.set_error(&e.to_string());
+                db_handle.set_error_from(&e);
                 STOOLAP_ERROR
             }
         }
@@ -261,7 +262,7 @@ pub unsafe extern "C" fn stoolap_stmt_query(
         Some(h) => h,
         None => return STOOLAP_ERROR,
     };
-    handle.last_error = None;
+    handle.last_error.clear();
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         let param_vec = value::params_to_vec(params, params_len);
@@ -295,7 +296,7 @@ pub unsafe extern "C" fn stoolap_stmt_query(
                 let rows_handle = Box::new(StoolapRows {
                     rows: Some(rows),
                     has_row: false,
-                    last_error: None,
+                    last_error: LastErrorState::default(),
                     column_names,
                     text_cache: Vec::new(),
                     text_cache_dirty: false,
@@ -305,7 +306,7 @@ pub unsafe extern "C" fn stoolap_stmt_query(
                 STOOLAP_OK
             }
             Err(e) => {
-                handle.set_error(&e.to_string());
+                handle.set_error_from(&e);
                 STOOLAP_ERROR
             }
         }
@@ -369,4 +370,48 @@ pub unsafe extern "C" fn stoolap_stmt_errmsg(stmt: *const StoolapStmt) -> *const
         Some(handle) => handle.error_ptr(),
         None => super::error::empty_cstr(),
     }
+}
+
+/// Get the typed error code for a statement handle's last error.
+///
+/// # Safety
+///
+/// `stmt` must be a valid `StoolapStmt` pointer or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_stmt_errcode(stmt: *const StoolapStmt) -> i32 {
+    match stmt.as_ref() {
+        Some(handle) => handle.last_error.code,
+        None => super::error::STOOLAP_ERR_OK,
+    }
+}
+
+/// Fill the caller's `StoolapErrorDetails` from this statement's last
+/// error. Pointers stay valid until the next API call on this statement.
+///
+/// # Safety
+///
+/// `stmt` must be a valid `StoolapStmt` pointer or NULL. `out` must
+/// point to a writable `StoolapErrorDetails`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_stmt_errdetails(
+    stmt: *const StoolapStmt,
+    out: *mut StoolapErrorDetails,
+) -> i32 {
+    if out.is_null() {
+        return STOOLAP_ERROR;
+    }
+    match stmt.as_ref() {
+        Some(handle) => handle.last_error.fill_details(&mut *out),
+        None => {
+            // Zero-initialize so callers see a coherent "no error" view.
+            (*out).code = super::error::STOOLAP_ERR_OK;
+            (*out)._padding = 0;
+            (*out).message = super::error::empty_cstr();
+            (*out).table = std::ptr::null();
+            (*out).column = std::ptr::null();
+            (*out).constraint = std::ptr::null();
+            (*out).detail = std::ptr::null();
+        }
+    }
+    STOOLAP_OK
 }
