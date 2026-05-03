@@ -1208,6 +1208,15 @@ fn open_read_only_rejects_writable_dsn_flag() {
     }
 }
 
+// SWMR cross-process coexistence requires `db.shm`, which is
+// Unix-only in this build (the Windows shim returns an error from
+// `ShmHandle::create_writer`). The engine refuses the read-only
+// attach with a documented message: "this platform has no db.shm
+// support, so live reader/writer coexistence is unavailable. Close
+// the writer or retry the open." Skip on Windows; the rest of the
+// read-only test suite (which doesn't need writer/reader coexistence)
+// continues to run there.
+#[cfg(unix)]
 #[test]
 fn open_writable_then_open_read_only_query_param_succeeds_under_swmr() {
     // SWMR v1 contract: a writable engine and a read-only attach can
@@ -2736,6 +2745,13 @@ fn refresh_no_op_on_in_process_as_read_only() {
     );
 }
 
+// Same reason as above: a writer + a read-only handle running
+// concurrently against the same DSN need `db.shm` for the visibility
+// handshake, and shm is Unix-only. The Windows engine refuses the
+// read-only attach while the writer holds LOCK_EX so the test
+// harness's writer thread cannot make the reader observe a
+// cross-checkpoint snapshot in the first place.
+#[cfg(unix)]
 #[test]
 fn cross_table_atomicity_under_concurrent_checkpoint() {
     // SWMR v2 P1.4: a reader inside a BEGIN/COMMIT block must observe
