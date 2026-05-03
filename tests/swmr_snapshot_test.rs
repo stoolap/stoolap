@@ -12,6 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// SWMR v2's mmap-backed `db.shm` is Unix-only. The Windows build of
+// `ShmHandle` is a stub that errors on construction (see
+// `src/storage/mvcc/shm.rs::stub`); the subprocess helpers in this file
+// reach for real shm methods (`mark_ready`, etc.) that the stub
+// intentionally does not expose. Gate the entire suite at the file
+// level so Windows CI does not try to compile against the stub.
+#![cfg(unix)]
+
 //! Cross-process SWMR (single-writer-multi-reader) v1 tests.
 //!
 //! These tests spawn a SECOND OS process (the writer "child") via

@@ -8412,9 +8412,9 @@ impl MVCCEngine {
         // local catches up — silently delaying warm→cold demotion
         // and pinning RAM. Sourcing from the global counter keeps
         // the comparison monotonic across all engines in the process.
-        let epoch =
-            crate::storage::volume::writer::GLOBAL_EVICTION_EPOCH.fetch_add(1, Ordering::Relaxed)
-                + 1;
+        let epoch = crate::storage::volume::writer::GLOBAL_EVICTION_EPOCH
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         let mgrs = self.segment_managers.read().unwrap();
         for mgr in mgrs.values() {
             mgr.evict_idle_volumes(epoch);
