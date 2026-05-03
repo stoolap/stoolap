@@ -673,10 +673,6 @@ pub struct MVCCEngine {
     /// up with an empty in-memory engine. Always `None` for writable
     /// opens (those preserve the historical warn-and-degrade behaviour).
     persistence_init_error: Mutex<Option<Error>>,
-    /// Global epoch counter for volume eviction. Incremented each checkpoint
-    /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
-    #[cfg(not(target_arch = "wasm32"))]
-    eviction_epoch: AtomicU64,
     /// Cross-process shared header (`<db>/db.shm`). Initialized in
     /// `open_engine()` for writable, disk-backed opens on Unix; `None`
     /// otherwise. Writer publishes `visible_commit_lsn` here after
@@ -917,8 +913,6 @@ impl MVCCEngine {
             orphan_discovery_failed: Arc::new(AtomicBool::new(false)),
             compaction_running: Arc::new(AtomicBool::new(false)),
             persistence_init_error: Mutex::new(persistence_init_error),
-            #[cfg(not(target_arch = "wasm32"))]
-            eviction_epoch: AtomicU64::new(0),
             shm: Mutex::new(None),
             pending_marker_lsns: Arc::new(parking_lot::Mutex::new(
                 std::collections::BTreeSet::new(),
@@ -1381,6 +1375,18 @@ impl MVCCEngine {
     pub fn start_cleanup(self: &Arc<Self>) {
         let config = self.config.read().unwrap();
         if !config.cleanup.enabled {
+            return;
+        }
+        // `cleanup_interval = 0` is meaningless for an "interval
+        // between runs" value, but DSN parsing accepts it. Treat it
+        // as cleanup-disabled (same semantics as
+        // `cleanup.enabled = false`) instead of letting the loop spin
+        // with `loop_interval = 0`, which would skip the inner sleep
+        // and hammer eviction (read-only) or the cleanup sweeps
+        // (writer) in a tight loop. The read-only path is especially
+        // bad because the tight loop also fetch_add's
+        // `GLOBAL_EVICTION_EPOCH` on every iteration.
+        if config.cleanup.interval_secs == 0 {
             return;
         }
         // Read-only engines previously skipped this thread entirely.
@@ -8394,10 +8400,21 @@ impl MVCCEngine {
     /// last epoch transition: hot → warm (drop decompressed) → cold (drop compressed).
     #[cfg(not(target_arch = "wasm32"))]
     fn evict_idle_volumes(&self) {
-        let epoch = self.eviction_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-        // Publish to global so scanners stamp volumes with the correct epoch.
-        // Use fetch_max so multiple engines only move the global forward.
-        crate::storage::volume::writer::GLOBAL_EVICTION_EPOCH.fetch_max(epoch, Ordering::Relaxed);
+        // Drive eviction directly from `GLOBAL_EVICTION_EPOCH` rather
+        // than a per-engine counter. Volumes are stamped with
+        // `last_access_epoch = GLOBAL_EVICTION_EPOCH.load(...)` on
+        // load and on tier transitions (writer.rs:1570, 1961, 1977).
+        // If we ticked a per-engine counter that started at 0, a
+        // volume freshly loaded into warm could carry a global stamp
+        // way ahead of our local epoch (any other live engine in the
+        // process advances global), and `current - last_access`
+        // saturating_sub would stay 0 for thousands of ticks until
+        // local catches up — silently delaying warm→cold demotion
+        // and pinning RAM. Sourcing from the global counter keeps
+        // the comparison monotonic across all engines in the process.
+        let epoch =
+            crate::storage::volume::writer::GLOBAL_EVICTION_EPOCH.fetch_add(1, Ordering::Relaxed)
+                + 1;
         let mgrs = self.segment_managers.read().unwrap();
         for mgr in mgrs.values() {
             mgr.evict_idle_volumes(epoch);
