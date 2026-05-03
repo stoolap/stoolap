@@ -738,6 +738,16 @@ int32_t stoolap_tx_rollback_to_savepoint(StoolapTx* tx, const char* name, int32_
 typedef struct StoolapRoDB StoolapRoDB;
 
 int32_t      stoolap_open_read_only(const char* dsn, StoolapRoDB** out_db);
+/**
+ * Clone a read-only handle for multi-threaded use.
+ *
+ * Each clone shares the underlying engine but has its own per-handle
+ * state: independent executor, fresh ReaderAttachment (own WAL pin),
+ * own auto_refresh flag, own overlay cursor. Recommended pattern:
+ * open once, then `stoolap_ro_clone` per worker thread. Each clone
+ * must be closed independently with `stoolap_ro_close`.
+ */
+int32_t      stoolap_ro_clone          (const StoolapRoDB* db, StoolapRoDB** out_db);
 void         stoolap_ro_close          (StoolapRoDB* db);
 const char*  stoolap_ro_errmsg         (const StoolapRoDB* db);
 int32_t      stoolap_ro_errcode        (const StoolapRoDB* db);

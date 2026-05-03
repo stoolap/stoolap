@@ -87,7 +87,7 @@ The API uses five opaque handle types. Each handle is created by a specific func
 | Handle | Created by | Freed by | Notes |
 |--------|-----------|----------|-------|
 | `StoolapDB` | `stoolap_open`, `stoolap_open_in_memory`, `stoolap_clone` | `stoolap_close` | NULL-safe close (no-op) |
-| `StoolapRoDB` | `stoolap_open_read_only` | `stoolap_ro_close` | NULL-safe close. Read-only handle: no `_exec` / `_begin` entry points exist, so write SQL through this handle is a link error on the C side. |
+| `StoolapRoDB` | `stoolap_open_read_only`, `stoolap_ro_clone` | `stoolap_ro_close` | NULL-safe close. Read-only handle: no `_exec` / `_begin` entry points exist, so write SQL through this handle is a link error on the C side. |
 | `StoolapStmt` | `stoolap_prepare` | `stoolap_stmt_finalize` | NULL-safe finalize (no-op). Keeps the database engine alive. |
 | `StoolapTx` | `stoolap_begin`, `stoolap_begin_with_isolation` | `stoolap_tx_commit` or `stoolap_tx_rollback` | Handle consumed on commit/rollback regardless of success or failure. Keeps the database engine alive. |
 | `StoolapRows` | `stoolap_query*`, `stoolap_ro_query*`, `stoolap_stmt_query`, `stoolap_tx_query*`, `stoolap_tx_stmt_query*` | `stoolap_rows_close` | Must be closed even after `STOOLAP_DONE`. NULL-safe close (no-op) |
@@ -774,6 +774,7 @@ stoolap_close(db);
 ### Thread Safety Rules
 
 - **StoolapDB**: Do not share across threads. Use `stoolap_clone()` for per-thread handles.
+- **StoolapRoDB**: Do not share across threads. Use `stoolap_ro_clone()` for per-thread handles. See "Multi-Threaded Read-Only Use" in the Read-Only Handle section.
 - **StoolapStmt**: Do not use concurrently from multiple threads.
 - **StoolapTx**: Must remain on the thread that created it.
 - **StoolapRows**: Must remain on the thread that created it.
@@ -843,11 +844,31 @@ if (r == STOOLAP_ERROR && stoolap_ro_errcode(ro) == STOOLAP_ERR_REOPEN_REQUIRED)
 }
 ```
 
+### Multi-Threaded Read-Only Use
+
+A single `StoolapRoDB` handle must not be used from multiple threads simultaneously, just like the writable `StoolapDB`. Use `stoolap_ro_clone()` to mint per-thread handles. Each clone shares the underlying read engine (manifests, volumes, mmap state) but has its own executor, its own `ReaderAttachment` (independent WAL pin), its own `auto_refresh` flag, and its own overlay cursor. The recommended pattern is "open once, then clone per worker thread":
+
+```c
+StoolapRoDB* ro = NULL;
+stoolap_open_read_only("file:///data/mydb", &ro);
+
+StoolapRoDB* worker_ro = NULL;
+stoolap_ro_clone(ro, &worker_ro);
+/* Pass worker_ro to a worker thread; it must stay on that thread. */
+
+/* Each clone must be closed independently. */
+stoolap_ro_close(worker_ro);
+stoolap_ro_close(ro);
+```
+
+Toggling `stoolap_ro_set_auto_refresh()` on one clone does not affect any other clone, so a "report" thread can pin a stable snapshot while sibling threads keep tailing the writer.
+
 ### Read-Only Functions
 
 | Function | Returns | Description |
 |----------|---------|-------------|
 | `stoolap_open_read_only(dsn, &ro)` | `int32_t` | Open a read-only handle |
+| `stoolap_ro_clone(ro, &out_ro)` | `int32_t` | Clone handle for multi-threaded use |
 | `stoolap_ro_close(ro)` | `void` | Close and free (NULL-safe) |
 | `stoolap_ro_query(ro, sql, &rows)` | `int32_t` | Query without parameters |
 | `stoolap_ro_query_params(ro, sql, params, len, &rows)` | `int32_t` | Query with positional parameters |
@@ -1019,6 +1040,7 @@ The caller must free the buffer with `stoolap_buffer_free(buf, buf_len)`. The ro
 | Function | Returns | Description |
 |----------|---------|-------------|
 | `stoolap_open_read_only(dsn, &ro)` | `int32_t` | Open a read-only handle on `dsn` |
+| `stoolap_ro_clone(ro, &out_ro)` | `int32_t` | Clone handle for multi-threaded use; each clone has its own executor, attachment, and refresh state |
 | `stoolap_ro_close(ro)` | `void` | Close and free (NULL-safe) |
 | `stoolap_ro_query(ro, sql, &rows)` | `int32_t` | Query without parameters |
 | `stoolap_ro_query_params(ro, sql, params, len, &rows)` | `int32_t` | Query with positional parameters |

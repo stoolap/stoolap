@@ -397,6 +397,41 @@ impl ReadOnlyDatabase {
         }
     }
 
+    /// Clone this read-only handle for multi-threaded use.
+    ///
+    /// Each clone shares the underlying engine (cold volumes,
+    /// segment manager, semantic + plan caches, the writer's WAL
+    /// being tailed) but has its own per-handle state:
+    ///
+    /// - independent `Executor` (a `BEGIN` on one clone does not
+    ///   affect transactions on another),
+    /// - its own `ReaderAttachment` (fresh handle id, fresh WAL
+    ///   pin contribution to the writer's truncate floor),
+    /// - its own per-handle `auto_refresh` flag,
+    /// - its own per-handle `OverlayStore` so the WAL-tail
+    ///   cursor advances independently per clone.
+    ///
+    /// Each clone must be closed independently. Engine resources
+    /// are released only when the last clone (and any prepared
+    /// statements / transactions still referencing it) drops.
+    /// Mirrors [`crate::api::Database::clone`] for writable
+    /// handles.
+    pub fn try_clone(&self) -> Self {
+        Self::from_entry(Arc::clone(&self.inner.entry))
+    }
+}
+
+impl Clone for ReadOnlyDatabase {
+    /// See [`Self::try_clone`] for the per-handle semantics. The
+    /// clone is infallible at this layer; the `try_` prefix on
+    /// the inherent method is preserved for symmetry with future
+    /// fallible accessors.
+    fn clone(&self) -> Self {
+        self.try_clone()
+    }
+}
+
+impl ReadOnlyDatabase {
     /// Enable WAL-tail overlay rebuild on every refresh. Off by
     /// default — the overlay isn't yet consumed by query execution,
     /// so building it on every query would be pure CPU + memory

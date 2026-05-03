@@ -94,6 +94,63 @@ pub unsafe extern "C" fn stoolap_open_read_only(
     })
 }
 
+/// Clone a read-only handle for multi-threaded use.
+///
+/// Each clone shares the underlying engine (cold volumes, segment
+/// manager, semantic + plan caches, the writer's WAL being tailed)
+/// but has its own per-handle state: independent executor, fresh
+/// `ReaderAttachment` (its own WAL pin contribution), its own
+/// `auto_refresh` flag, its own overlay cursor. A `BEGIN` /
+/// `set_auto_refresh` / `refresh` on one clone does not affect
+/// the others.
+///
+/// Recommended pattern for multi-threaded readers: open once,
+/// then `stoolap_ro_clone` per worker thread. Each thread owns
+/// its clone exclusively. Each clone must be closed independently
+/// with `stoolap_ro_close`. Engine resources are released only
+/// when the last clone (and any open `StoolapRows` referencing
+/// it) drops. Mirrors `stoolap_clone` for writable handles.
+///
+/// # Safety
+///
+/// - `db` must be a valid `StoolapRoDB` pointer.
+/// - `out_db` must be a valid pointer to a `*mut StoolapRoDB`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_ro_clone(
+    db: *const StoolapRoDB,
+    out_db: *mut *mut StoolapRoDB,
+) -> i32 {
+    if out_db.is_null() {
+        error::set_global_error("out_db pointer is NULL");
+        return STOOLAP_ERROR;
+    }
+    *out_db = std::ptr::null_mut();
+
+    let handle = match db.as_ref() {
+        Some(h) => h,
+        None => {
+            error::set_global_error("db handle is NULL");
+            return STOOLAP_ERROR;
+        }
+    };
+
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let cloned = handle.ro.clone();
+        let new_handle = Box::new(StoolapRoDB {
+            ro: cloned,
+            last_error: LastErrorState::default(),
+            dsn_cstr: std::sync::OnceLock::new(),
+        });
+        *out_db = Box::into_raw(new_handle);
+        STOOLAP_OK
+    }));
+
+    result.unwrap_or_else(|_| {
+        error::set_global_error("panic during stoolap_ro_clone");
+        STOOLAP_ERROR
+    })
+}
+
 /// Close a read-only handle.
 ///
 /// Safe to call with NULL (no-op).
