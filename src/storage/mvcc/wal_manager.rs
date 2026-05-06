@@ -1375,6 +1375,18 @@ impl WALManager {
         }
         entry.lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
         self.previous_lsn.store(entry.lsn, Ordering::Release);
+        // Cover the gap between LSN allocation and disk durability so
+        // create_checkpoint's wait_for_in_flight_writes can't sample a
+        // current_lsn ahead of the buffered entry. RAII guard
+        // decrements on every exit path.
+        self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
+        struct InFlightGuard<'a>(&'a AtomicU64);
+        impl<'a> Drop for InFlightGuard<'a> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _in_flight = InFlightGuard(&self.in_flight_writes);
 
         // Track first DML LSN per active user txn (skip synthetic ids and markers).
         if entry.txn_id > 0 && !entry.is_marker_entry() {
@@ -1428,14 +1440,9 @@ impl WALManager {
             if needs_flush || force_flush {
                 let buffer_data = std::mem::take(&mut *buffer);
                 let max_lsn = self.buffer_highest_lsn.swap(0, Ordering::AcqRel);
-                // Bump in_flight_writes BEFORE releasing buffer lock so checkpoint
-                // can't read current_lsn ahead of the disk write.
-                self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
                 drop(buffer);
 
-                let write_result = self.write_to_file(&buffer_data, max_lsn);
-                self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
-                write_result?;
+                self.write_to_file(&buffer_data, max_lsn)?;
 
                 if self.should_sync(entry.operation) {
                     self.sync_locked()?;
@@ -2368,6 +2375,12 @@ impl WALManager {
                 }
             }
             let total_data_size = entry_size + 4;
+            // Past the cap: stop before reading/CRC-checking unpublished
+            // tail records (in-progress writes may be torn or have bad
+            // CRC and would falsely abort an otherwise-valid scan).
+            if lsn > to_lsn {
+                break;
+            }
             // In-window oversized = corruption (fatal); out-of-window = resync.
             let lsn_in_window = lsn > from_lsn && lsn <= to_lsn;
             if entry_size > 64 * 1024 * 1024 {
@@ -2493,6 +2506,11 @@ impl WALManager {
                 }
             }
             let total_data_size = entry_size + 4;
+            // Past the cap: stop before reading/CRC-checking unpublished
+            // tail records (in-progress writes may be torn).
+            if lsn > to_lsn {
+                break;
+            }
             // In-window oversized = corruption (fatal); out-of-window = resync.
             let lsn_in_window = lsn >= entry_floor && lsn <= to_lsn;
             if entry_size > 64 * 1024 * 1024 {

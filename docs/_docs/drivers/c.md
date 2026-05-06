@@ -842,8 +842,9 @@ Two knobs control how this handle picks up writer-side **checkpoint** advances:
 |-------------|----------|----------|
 | `auto_refresh=on`, `refresh_interval=0` (defaults) | Per query: pick up the writer's latest checkpoint. No background thread. | "Always querying" workloads. |
 | `auto_refresh=on`, `refresh_interval=30s` | Per query: pick up latest checkpoint AND pin advances during idle. | Long-lived handles that may go idle (web app pools, workers). |
-| `auto_refresh=off` (any `refresh_interval`) | Snapshot frozen until `refresh()` or `set_auto_refresh(1)`. Ticker pauses; WAL pin does not advance. | Ad-hoc stable multi-query block. Keep short. |
-| Inside `BEGIN ... COMMIT` (any flags) | Ticker and per-query auto-refresh both pause until COMMIT/ROLLBACK. | Multi-statement transactions on the read-only handle. |
+| `auto_refresh=off` (any `refresh_interval`) | Snapshot frozen until `refresh()` or `set_auto_refresh(1)`. Ticker pauses; WAL pin does not advance. | Stable multi-query block on a read-only handle. |
+
+SQL `BEGIN`/`COMMIT`/`ROLLBACK` are rejected on `StoolapRoDB` with `STOOLAP_ERR_READ_ONLY` (constructing a writable transaction object on a read-only handle is unsafe). Use `stoolap_ro_set_auto_refresh(ro, 0)` for stable visibility across multiple reads.
 
 All three "per query: pick up..." rows still mean **checkpointed** state only. To make a writer commit visible across processes, the writer must checkpoint.
 
@@ -862,7 +863,7 @@ stoolap_ro_set_auto_refresh(ro, 0);
 stoolap_ro_set_auto_refresh(ro, 1);  /* per-query AND ticker resume */
 ```
 
-Call `stoolap_ro_refresh()` to advance manually. It returns `1` if the snapshot moved, `0` if it was already current, or `STOOLAP_ERROR` on a must-reopen condition. The latter surfaces with the typed code `STOOLAP_ERR_REOPEN_REQUIRED` and indicates the caller MUST close this handle and call `stoolap_open_read_only` again. Causes include the writer process being replaced, a checkpoint truncating the WAL window the reader was tailing, or DDL that the read-only engine cannot replay live. The same condition raised on the background ticker exits the ticker; the next user query/refresh surfaces the error.
+Call `stoolap_ro_refresh()` to advance manually. It returns `STOOLAP_REFRESH_ADVANCED` (102) if the snapshot moved, `STOOLAP_OK` (0) if it was already current, or `STOOLAP_ERROR` (1) on a must-reopen condition. The error surfaces with the typed code `STOOLAP_ERR_REOPEN_REQUIRED` and indicates the caller MUST close this handle and call `stoolap_open_read_only` again. Causes include the writer process being replaced, a checkpoint truncating the WAL window the reader was tailing, or DDL that the read-only engine cannot replay live. The same condition raised on the background ticker exits the ticker; the next user query/refresh surfaces the error.
 
 ```c
 int32_t r = stoolap_ro_refresh(ro);

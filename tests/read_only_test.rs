@@ -442,10 +442,13 @@ fn ro_full_table_scan_works_no_pk_filter() {
 }
 
 #[test]
-fn ro_begin_commit_works_on_fresh_read_only_engine() {
+fn ro_begin_is_refused_on_read_only_handle() {
+    // BEGIN on RO would otherwise construct a writable transaction
+    // (Box<dyn WriteTransaction>) reachable internally; we refuse it
+    // at the executor and route stable-snapshot use to set_auto_refresh(false).
     use std::path::PathBuf;
     let tmp = tempfile::tempdir().unwrap();
-    let path: PathBuf = tmp.path().join("ro_begin_commit.db");
+    let path: PathBuf = tmp.path().join("ro_begin_refused.db");
     let dsn = format!("file://{}", path.display());
 
     {
@@ -457,9 +460,13 @@ fn ro_begin_commit_works_on_fresh_read_only_engine() {
     }
 
     let ro = Database::open_read_only(&dsn).unwrap();
-    ro.query("BEGIN", ()).unwrap();
-    let _ = ro.query("SELECT * FROM t", ()).unwrap();
-    ro.query("COMMIT", ()).unwrap();
+    match ro.query("BEGIN", ()) {
+        Err(stoolap::Error::ReadOnlyViolation(_)) => {}
+        other => panic!(
+            "expected ReadOnlyViolation on RO BEGIN, got {:?}",
+            other.is_ok()
+        ),
+    }
 }
 
 #[test]
@@ -2327,46 +2334,6 @@ fn cross_table_atomicity_under_concurrent_checkpoint() {
 }
 
 #[test]
-fn auto_refresh_skipped_during_active_transaction() {
-    // Auto-refresh must skip while a BEGIN is open (stable reads).
-    use stoolap::storage::mvcc::manifest_epoch;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("auto_skip_in_txn.db");
-
-    {
-        let dsn = format!("file://{}", path.display());
-        let db = Database::open(&dsn).unwrap();
-        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-            .unwrap();
-        db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
-        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-        db.close().unwrap();
-    }
-
-    let dsn_ro = format!("file://{}?read_only=true", path.display());
-    let reader = Database::open_read_only(&dsn_ro).unwrap();
-
-    reader.query("BEGIN", ()).unwrap();
-
-    let pre = manifest_epoch::read_epoch(&path).unwrap();
-    manifest_epoch::bump_epoch(&path).unwrap();
-    let post_disk = manifest_epoch::read_epoch(&path).unwrap();
-    assert!(post_disk > pre, "bump must advance disk epoch");
-
-    reader.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
-
-    reader.query("COMMIT", ()).unwrap();
-
-    let advanced = reader.refresh().unwrap();
-    assert!(
-        advanced,
-        "refresh after COMMIT must see the bump that was made mid-txn \
-         (auto-refresh inside the txn was correctly skipped)"
-    );
-}
-
-#[test]
 fn refresh_detects_table_added_on_disk() {
     use stoolap::storage::mvcc::manifest_epoch;
 
@@ -2954,75 +2921,6 @@ fn try_clone_inherits_refresh_interval() {
         Some(std::time::Duration::from_millis(500)),
         "stopping parent's ticker must not stop child's"
     );
-}
-
-#[cfg(unix)]
-#[test]
-fn ticker_does_not_advance_during_active_begin() {
-    // Ticker must mirror maybe_auto_refresh's active-tx guard so
-    // stable-reads-across-statements is not silently violated.
-    use stoolap::storage::mvcc::manifest_epoch;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("ticker_begin_guard.db");
-    let dsn_rw = format!("file://{}", path.display());
-
-    let writer = Database::open(&dsn_rw).unwrap();
-    writer
-        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
-        .unwrap();
-    writer.execute("INSERT INTO t VALUES (1)", ()).unwrap();
-    writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
-
-    // auto_refresh=on isolates the BEGIN guard from the auto_refresh skip.
-    let dsn_ro = format!(
-        "file://{}?read_only=true&auto_refresh=on&refresh_interval=100ms",
-        path.display()
-    );
-    let ro = Database::open_read_only(&dsn_ro).unwrap();
-
-    ro.query("BEGIN", ()).unwrap();
-    let pinned_epoch = ro.last_seen_epoch_for_test();
-
-    writer.execute("INSERT INTO t VALUES (2)", ()).unwrap();
-    writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    let post_writer_epoch = manifest_epoch::read_epoch(&path).unwrap_or(0);
-    assert!(
-        post_writer_epoch > pinned_epoch,
-        "writer checkpoint should bump on-disk epoch ({} -> {})",
-        pinned_epoch,
-        post_writer_epoch
-    );
-
-    // ~5 ticker intervals.
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    assert_eq!(
-        ro.last_seen_epoch_for_test(),
-        pinned_epoch,
-        "ticker must not advance last_seen_epoch during active BEGIN \
-         (would break stable-reads contract)"
-    );
-
-    // After ROLLBACK the ticker resumes within ~3 intervals.
-    let _ = ro.query("ROLLBACK", ());
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1000);
-    let mut advanced = false;
-    while std::time::Instant::now() < deadline {
-        if ro.last_seen_epoch_for_test() >= post_writer_epoch {
-            advanced = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    assert!(
-        advanced,
-        "after ROLLBACK the ticker must resume; expected last_seen_epoch >= {}, saw {}",
-        post_writer_epoch,
-        ro.last_seen_epoch_for_test()
-    );
-
-    drop(ro);
-    drop(writer);
 }
 
 #[cfg(unix)]

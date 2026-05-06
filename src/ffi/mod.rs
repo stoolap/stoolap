@@ -44,6 +44,10 @@ pub const STOOLAP_OK: i32 = 0;
 pub const STOOLAP_ERROR: i32 = 1;
 pub const STOOLAP_ROW: i32 = 100;
 pub const STOOLAP_DONE: i32 = 101;
+/// stoolap_ro_refresh: snapshot advanced (distinct from STOOLAP_OK
+/// so callers can distinguish "current" from "advanced", and distinct
+/// from STOOLAP_ERROR which is also 1).
+pub const STOOLAP_REFRESH_ADVANCED: i32 = 102;
 
 // Value type codes (match DataType repr(u8))
 pub const STOOLAP_TYPE_NULL: i32 = 0;

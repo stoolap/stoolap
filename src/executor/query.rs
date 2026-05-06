@@ -7734,6 +7734,15 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         use super::ActiveTransaction;
 
+        // Read-only handles must not construct a writable transaction
+        // (its trait object is reachable via take_transaction). Stable
+        // snapshots on RO use set_auto_refresh(false).
+        if self.read_only {
+            return Err(crate::core::Error::read_only_violation_at(
+                "executor", "BEGIN",
+            ));
+        }
+
         let mut active_tx = self.active_transaction.lock().unwrap();
 
         // If there's already an active transaction, treat as no-op

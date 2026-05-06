@@ -55,7 +55,7 @@ let ro = db.as_read_only();
 
 `open_in_memory()` creates a unique, isolated instance each time. `open("memory://")` returns the same shared engine for the same DSN.
 
-Read-only opens take a *shared* file lock (`LOCK_SH`) so multiple reader processes can coexist; a writable open is refused while any reader is alive (and vice versa). `open_read_only` refuses to materialize a fresh database: the path must already exist as a stoolap directory. Read-only opens succeed on directories mounted read-only at the kernel level AND on chmod-read-only directories (where they hold a long-lived `LOCK_SH` so a privileged writer cannot reclaim WAL/volumes under the reader).
+On Unix SWMR opens, the read-only path takes NO kernel `flock`; cross-process coexistence is handled by `db.shm` + lease files, and writers and readers can be live at the same time. The chmod-read-only fallback holds a long-lived `LOCK_SH` so a privileged writer cannot reclaim WAL/volumes under the reader. Non-Unix builds take a real `LOCK_SH`. `open_read_only` refuses to materialize a fresh database: the path must already exist as a stoolap directory.
 
 ### Connection String Options
 
@@ -699,7 +699,7 @@ fn main() -> Result<()> {
 
 ### ReadOnlyDatabase
 
-Returned by `Database::open_read_only(dsn)` and `Database::as_read_only()`. The type has NO `execute` / `begin` / `prepare` methods — write SQL is a *compile-time* error rather than a runtime `Error::ReadOnlyViolation`. Read SQL (SELECT, SHOW, EXPLAIN) goes through `query` / `query_named` / `cached_plan` + `query_plan`. Read-only transactions inside an explicit `BEGIN ... COMMIT` work via SQL — the Rust `begin()` API is intentionally absent.
+Returned by `Database::open_read_only(dsn)` and `Database::as_read_only()`. The type has NO `execute` / `begin` / `prepare` methods — write SQL is a *compile-time* error rather than a runtime `Error::ReadOnlyViolation`. Read SQL (SELECT, SHOW, EXPLAIN) goes through `query` / `query_named` / `cached_plan` + `query_plan`. SQL `BEGIN` / `COMMIT` / `ROLLBACK` are also rejected on `ReadOnlyDatabase` (they would otherwise construct a writable transaction object reachable from internal paths). For stable visibility across multiple reads, use `set_auto_refresh(false)` and call `refresh()` manually when you want to advance.
 
 `ReadOnlyDatabase` is a *view*, not a connection sharing a session with the source `Database`. Each handle owns its own executor and transaction state, so an uncommitted `BEGIN` on the source `Database` is **not** visible through `as_read_only()`. To observe uncommitted writes, run the read SQL inside the same `Transaction`.
 
@@ -722,7 +722,7 @@ For prepared-statement ergonomics, use `cached_plan(sql)` plus `query_plan` / `q
 | `refresh()` | `Result<bool>` | Force a manifest reload to pick up any new writer checkpoint; returns `true` if state advanced. Visibility is checkpoint-bounded — uncheckpointed writer commits are not yet exposed to query execution. |
 | `set_auto_refresh(enabled)` | `()` | Master switch for implicit refresh. `false` pauses BOTH the per-query auto-refresh path AND the background ticker (if any) — the snapshot only moves on explicit `refresh()`. WAL pin advancement also stalls; keep stable windows short. |
 | `auto_refresh_enabled()` | `bool` | Read the auto-refresh flag |
-| `set_refresh_interval(Option<Duration>)` | `Result<()>` | Configure the background refresh ticker. `Some(d)` spawns a thread calling `refresh()` every `d` (min 100ms); `None` stops it. Use for idle handles so the WAL pin advances. Pauses while `auto_refresh=false` or a `BEGIN` is active. Equivalent DSN flag: `?refresh_interval=30s`. |
+| `set_refresh_interval(Option<Duration>)` | `Result<()>` | Configure the background refresh ticker. `Some(d)` spawns a thread calling `refresh()` every `d` (min 100ms); `None` stops it. Use for idle handles so the WAL pin advances. Pauses while `auto_refresh=false`. Equivalent DSN flag: `?refresh_interval=30s`. |
 | `refresh_interval()` | `Option<Duration>` | Currently configured ticker interval, or `None` if no ticker is running. |
 | `try_clone()` | `Self` | Clone for multi-threaded use. Each clone has its own executor, WAL pin, auto_refresh flag, and ticker (inherits parent's interval). |
 | `read_engine()` | `Arc<dyn ReadEngine>` | Get the underlying read engine for libraries accepting `&dyn ReadEngine` |

@@ -67,6 +67,9 @@ typedef struct StoolapRows   StoolapRows;
 /** stoolap_rows_next(): no more rows. */
 #define STOOLAP_DONE    101
 
+/** stoolap_ro_refresh(): snapshot advanced. STOOLAP_OK = unchanged. */
+#define STOOLAP_REFRESH_ADVANCED    102
+
 /* =========================================================================
  * Value type codes
  * ========================================================================= */
@@ -574,8 +577,9 @@ int32_t      stoolap_ro_table_count    (StoolapRoDB* db, const char* table, uint
 
 /**
  * Advance the snapshot to the writer's latest visible state.
- * Returns 1 if advanced, 0 if already current, STOOLAP_ERROR otherwise.
- * STOOLAP_ERR_REOPEN_REQUIRED means the caller MUST close and reopen this handle.
+ * Returns STOOLAP_REFRESH_ADVANCED on advance, STOOLAP_OK if already
+ * current, STOOLAP_ERROR on failure (STOOLAP_ERR_REOPEN_REQUIRED
+ * means the caller MUST close and reopen this handle).
  */
 int32_t      stoolap_ro_refresh        (StoolapRoDB* db);
 

@@ -1220,6 +1220,7 @@ impl MVCCEngine {
         if !snapshot_dir.exists() {
             return Ok(0); // No snapshots directory
         }
+        let read_only = self.is_read_only_mode();
 
         // Read the snapshot LSN from metadata (supports both binary and JSON formats)
         let metadata_lsn = read_snapshot_lsn(&snapshot_dir);
@@ -1257,7 +1258,12 @@ impl MVCCEngine {
                 let file_size = std::fs::metadata(snapshot_path)
                     .map(|m| m.len())
                     .unwrap_or(0);
-                let use_volume = has_vol || file_size > 16 * 1024 * 1024;
+                // Read-only opens take the in-memory load path: the
+                // volume-promotion path writes tmp+rename and markers
+                // under volumes/. For very large snapshots this means
+                // higher RAM, but RO callers chose to attach a legacy
+                // snapshot DB without first migrating it.
+                let use_volume = !read_only && (has_vol || file_size > 16 * 1024 * 1024);
 
                 let load_result = if use_volume {
                     self.load_table_snapshot_as_volume(&table_name, snapshot_path)
@@ -4109,6 +4115,15 @@ impl MVCCEngine {
                      falling back to WAL replay from 0",
                     observed_checkpoint_min, observed_checkpoint_max
                 );
+                // Install staged managers BEFORE returning so the
+                // load_standalone_volumes pass that follows finds
+                // per-table manifests and doesn't silently skip every
+                // .vol as orphan-not-in-manifest.
+                let mut mgrs = self.segment_managers.write().unwrap();
+                for (table_name, mgr) in staged {
+                    mgrs.insert(table_name, mgr);
+                }
+                drop(mgrs);
                 let checkpoint_path = pm.path().join("wal").join("checkpoint.meta");
                 let _ = std::fs::remove_file(checkpoint_path);
                 return 0;

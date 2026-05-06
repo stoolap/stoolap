@@ -96,8 +96,10 @@ impl CliDb {
         match self {
             CliDb::Writable(db) => db.begin(),
             CliDb::ReadOnly(_) => Err(stoolap::Error::ReadOnlyViolation(
-                "begin() unavailable on a read-only database. Use SQL `BEGIN ... COMMIT` \
-                 inside a query for read-only transactions."
+                "begin() unavailable on a read-only database. SQL BEGIN/COMMIT/ROLLBACK \
+                 are also rejected on read-only handles; use \
+                 `set_auto_refresh(false)` (Rust) or restart without \
+                 `?read_only=true` for transactions."
                     .to_string(),
             )),
         }

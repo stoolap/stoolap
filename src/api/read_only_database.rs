@@ -236,9 +236,7 @@ impl ReadOnlyDatabase {
         let cloned = Self::from_entry(Arc::clone(&self.inner.entry))?;
         cloned.set_auto_refresh(self.auto_refresh_enabled());
         if let Some(d) = self.refresh_interval() {
-            cloned
-                .set_refresh_interval(Some(d))
-                .expect("clone failed to spawn refresh ticker");
+            cloned.set_refresh_interval(Some(d))?;
         }
         Ok(cloned)
     }
@@ -345,9 +343,8 @@ impl ReadOnlyDatabase {
     /// Configure (or stop) the background refresh ticker. `Some(d)`
     /// spawns (or replaces) a thread calling [`Self::refresh`] every
     /// `d` (>= 100ms) so an idle handle keeps advancing its WAL pin.
-    /// `None` stops the ticker. Paused while `auto_refresh == false`
-    /// or a BEGIN is active. Exits without respawn on a must-reopen
-    /// error.
+    /// `None` stops the ticker. Paused while `auto_refresh == false`.
+    /// Exits without respawn on a must-reopen error.
     pub fn set_refresh_interval(&self, interval: Option<Duration>) -> Result<()> {
         if let Some(d) = interval {
             if d < MIN_REFRESH_INTERVAL {

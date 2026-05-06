@@ -86,7 +86,7 @@ file:///path/to/data?sync_mode=normal&checkpoint_interval=60
 | `read_only` / `readonly` | true/false (or 1/0, yes/no, on/off) | false | Open in read-only mode. Must be passed to `Database::open_read_only(dsn)` (returns `ReadOnlyDatabase`); `Database::open(dsn)` REJECTS this flag with a clear error pointing to the right entry point. |
 | `mode` | ro / rw | rw | SQLite-style alias for `read_only`. `mode=ro` is equivalent to `read_only=true`. Same routing rule applies. |
 | `auto_refresh` | on/off (or true/false, 1/0, yes/no) | on | Read-only handles only. `on` (default): every query polls the manifest epoch (~1µs) and reloads if the writer advanced past a checkpoint. `off` is the master switch for "no implicit refresh on this handle" — both the per-query path AND the background ticker (if any) pause until you re-enable it (or call `refresh()` explicitly). Visibility is checkpoint-bounded either way. |
-| `refresh_interval` | Duration (`Nms` / `Ns` / `Nm`, or `0`) | `0` | Read-only handles only. Spawns a background thread that calls `refresh()` every interval to advance the per-handle WAL pin while the handle is idle (otherwise the writer can't truncate WAL past it). Minimum 100ms. `0` disables. Pauses while `auto_refresh=off` or a `BEGIN` is active. |
+| `refresh_interval` | Duration (`Nms` / `Ns` / `Nm`, or `0`) | `0` | Read-only handles only. Spawns a background thread that calls `refresh()` every interval to advance the per-handle WAL pin while the handle is idle (otherwise the writer can't truncate WAL past it). Minimum 100ms. `0` disables. Pauses while `auto_refresh=off`. |
 
 Legacy parameter names are accepted for backward compatibility:
 - `snapshot_interval` maps to `checkpoint_interval`
@@ -100,7 +100,7 @@ Read-only access is enforced at the type system. There is one entry point — `D
 
 Read-only opens:
 
-- The engine acquires a *shared* file lock (`LOCK_SH`), so multiple processes can open the same database for reading at the same time. A writable open is rejected while any reader is active, and vice versa.
+- On Unix SWMR opens, the read-only path takes NO kernel `flock` (cross-process coexistence via `db.shm` + lease files instead). Writers and readers can be live concurrently. The exception is the chmod-read-only fallback, which holds a long-lived `LOCK_SH` so a privileged writer (different uid) cannot acquire `LOCK_EX` and reclaim WAL/volumes under the reader. On non-Unix builds the read-only open takes a real `LOCK_SH`.
 - The background cleanup thread is not started (read-only opens never modify on-disk state).
 - Cross-process visibility uses lease files at `<db>/readers/<pid>.lease` plus an mmap-backed shm header at `<db>/db.shm`. The reader picks up writer **checkpoints** via the manifest-epoch poll. Writer reincarnation and post-attach DDL surface as typed must-reopen errors (`Error::SwmrWriterReincarnated`, `Error::SwmrPendingDdl`).
 - **Visibility is checkpoint-bounded.** A reader sees writer state as of the writer's most recent checkpoint. Commits that the writer has accepted but NOT YET checkpointed (rows still in the writer's hot buffer + WAL tail) are NOT visible to the read-only handle. To make a commit visible across processes, the writer must run `PRAGMA CHECKPOINT` (or wait for the periodic background checkpoint at `checkpoint_interval`). The WAL-tail overlay infrastructure exists on the read-only side but is not yet wired into query execution; sub-checkpoint visibility is a follow-up phase.

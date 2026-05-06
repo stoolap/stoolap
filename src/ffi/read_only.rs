@@ -333,9 +333,10 @@ pub unsafe extern "C" fn stoolap_ro_table_count(
 }
 
 /// Manually advance the read-only handle to the writer's latest visible
-/// state. Returns 1 if the snapshot moved, 0 if it was already current,
-/// or `STOOLAP_ERROR` on must-reopen errors (which surface via the
-/// handle's `errcode`/`errdetails`).
+/// state. Returns `STOOLAP_REFRESH_ADVANCED` (102) if the snapshot moved,
+/// `STOOLAP_OK` (0) if it was already current, or `STOOLAP_ERROR` (1)
+/// on must-reopen errors (which surface via the handle's
+/// `errcode`/`errdetails`).
 ///
 /// # Safety
 ///
@@ -349,8 +350,8 @@ pub unsafe extern "C" fn stoolap_ro_refresh(db: *mut StoolapRoDB) -> i32 {
     handle.last_error.clear();
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| match handle.ro.refresh() {
-        Ok(true) => 1,
-        Ok(false) => 0,
+        Ok(true) => crate::ffi::STOOLAP_REFRESH_ADVANCED,
+        Ok(false) => STOOLAP_OK,
         Err(e) => {
             handle.set_error_from(&e);
             STOOLAP_ERROR
