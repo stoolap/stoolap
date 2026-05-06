@@ -3264,13 +3264,13 @@ fn test_tx_stmt_exec_named_rollback() {
 }
 
 // ===========================================================================
-// Round-6 regression: FFI keepalives must keep the registry pointing at the
+// FFI keepalives must keep the registry pointing at the
 // live engine.
 // ===========================================================================
 
 #[test]
 fn test_close_db_with_live_stmt_keeps_registry_pointing_at_live_engine() {
-    // Round-6 P1: stoolap_prepare keeps the engine alive via
+    // stoolap_prepare keeps the engine alive via
     // _db_keepalive: Arc<DatabaseInner>, but those clones do NOT bump
     // entry.strong_count (they all share the same DatabaseInner.entry
     // field). If try_unregister_arc only checks entry.strong_count, it
@@ -3337,7 +3337,7 @@ fn test_close_db_with_live_stmt_keeps_registry_pointing_at_live_engine() {
 
 #[test]
 fn test_close_db_with_live_tx_keeps_registry_pointing_at_live_engine() {
-    // Round-6 P1, transaction variant: stoolap_tx_begin's keepalive
+    // stoolap_tx_begin's keepalive
     // (Arc<DatabaseInner> via tx._db_keepalive) must protect the registry
     // entry the same way as the prepared-statement variant. Without the
     // strong_count(inner) check in try_unregister_arc, stoolap_close
@@ -3389,7 +3389,7 @@ fn test_close_db_with_live_tx_keeps_registry_pointing_at_live_engine() {
 }
 
 // =========================================================================
-// Bucket A: typed errors, table_count, savepoints, read-only handle
+// typed errors, table_count, savepoints, read-only handle
 // =========================================================================
 
 /// Build a fresh `StoolapErrorDetails` zeroed out — code OK, all pointers

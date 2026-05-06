@@ -12,36 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Database struct and operations
-//!
-//! Provides a modern, ergonomic Rust API for database operations.
-//!
-//! # Examples
-//!
-//! ```ignore
-//! use stoolap::{Database, params};
-//!
-//! let db = Database::open("memory://")?;
-//!
-//! // DDL - no params needed
-//! db.execute("CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)", ())?;
-//!
-//! // Insert with params - using tuple syntax
-//! db.execute("INSERT INTO users VALUES ($1, $2, $3)", (1, "Alice", 30))?;
-//!
-//! // Insert with params! macro
-//! db.execute("INSERT INTO users VALUES ($1, $2, $3)", params![2, "Bob", 25])?;
-//!
-//! // Query with iteration
-//! for row in db.query("SELECT * FROM users WHERE age > $1", (20,))? {
-//!     let row = row?;
-//!     let name: String = row.get("name")?;
-//!     println!("{}", name);
-//! }
-//!
-//! // Query single value
-//! let count: i64 = db.query_one("SELECT COUNT(*) FROM users", ())?;
-//! ```
+//! Database struct and operations.
 
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, RwLock};
@@ -62,13 +33,7 @@ use super::transaction::Transaction;
 pub const MEMORY_SCHEME: &str = "memory";
 pub const FILE_SCHEME: &str = "file";
 
-/// Parse a `refresh_interval` value like `"30s"`, `"500ms"`, `"1m"`,
-/// or `"0"` (special: no unit allowed for zero, means "disabled").
-///
-/// Used by `Database::dsn_refresh_interval_flag`. Free function (not
-/// a method) so the parser stays close to its sole caller and is
-/// directly unit-testable. Rejects unitless non-zero numbers,
-/// unknown units, negatives (caught by `u64::parse`), and overflow.
+/// Parse `"Nms"`, `"Ns"`, `"Nm"`, or `"0"` into a Duration.
 pub(crate) fn parse_refresh_interval_value(value: &str) -> Result<Duration> {
     let trimmed = value.trim();
     if trimmed == "0" {
@@ -101,113 +66,36 @@ pub(crate) fn parse_refresh_interval_value(value: &str) -> Result<Duration> {
     Ok(Duration::from_millis(total_ms))
 }
 
-/// Global database registry to ensure single instance per DSN.
-///
-/// Stores `Weak<EngineEntry>` so the registry never keeps an engine alive
-/// past its last user-visible handle. When the last `Database` /
-/// `ReadOnlyDatabase` for a DSN drops, `Arc<EngineEntry>` count hits zero,
-/// `EngineEntry::drop` closes the engine, and the registry's `Weak`
-/// silently expires. The next `open(dsn)` finds the dead `Weak`, fails to
-/// upgrade, and creates a fresh `EngineEntry`.
+/// Per-DSN registry. Weak refs so entries self-expire when the last user handle drops.
 static DATABASE_REGISTRY: std::sync::LazyLock<
     RwLock<FxHashMap<String, std::sync::Weak<EngineEntry>>>,
 > = std::sync::LazyLock::new(|| RwLock::new(FxHashMap::default()));
 
-/// Engine-level shared state, keyed by DSN in the registry.
-///
-/// Multiple user-visible handles (`Database` clones, sibling `Database::open`
-/// calls, `ReadOnlyDatabase` views) all hold `Arc<EngineEntry>`. The Arc
-/// count *is* the count of live user handles for this DSN — there is no
-/// other path to an `Arc<EngineEntry>`, no internal clone leaks into other
-/// subsystems (the executor and query planner hold `Arc<MVCCEngine>`, not
-/// `Arc<EngineEntry>`).
-///
-/// `EngineEntry::drop` is the single point that closes the engine, so the
-/// engine is closed iff every user handle has been dropped — independent of
-/// which order they drop in.
+/// Engine-level shared state, keyed by DSN. Arc count = live user handles.
 pub(crate) struct EngineEntry {
     pub(crate) engine: Arc<MVCCEngine>,
     pub(crate) dsn: String,
-    /// Semantic-cache shared across every per-handle `Executor` for this
-    /// engine. Each `Database` clone / sibling `Database::open(dsn)` call
-    /// gets its own `Executor` (for transaction-state isolation), but
-    /// every executor holds an `Arc::clone` of this cache. That way a
-    /// DML invalidation on one handle's executor reaches the cached
-    /// SELECT results held by every sibling reader. Per-handle caches
-    /// would silently serve stale rows after a peer's commit.
+    /// Shared across per-handle executors so DML invalidation reaches all readers.
     pub(crate) semantic_cache: Arc<crate::executor::SemanticCache>,
-    /// Query planner shared across every per-handle `Executor` for this
-    /// engine. Same shape as `semantic_cache` and same reason: ANALYZE
-    /// invalidates the planner's stats cache, and a per-handle planner
-    /// would leave sibling handles on pre-ANALYZE estimates until the
-    /// 5-minute TTL expires. Sharing keeps every reader's plan choices
-    /// in sync with the writer's `ANALYZE`.
+    /// Shared so ANALYZE updates reach all readers' plans.
     pub(crate) query_planner: Arc<crate::executor::QueryPlanner>,
-    /// Cross-process SWMR lease + shm live on the
-    /// EngineEntry, not on `ReadOnlyDatabase`. They get registered
-    /// for ANY engine opened in read-only mode against a file:// DSN —
-    /// including the `Database::open("file://...?read_only=true")`
-    /// path that returns a plain `Database` wrapper (not
-    /// `ReadOnlyDatabase`). Without this, that documented entry
-    /// point would skip the lease, leaving the writer's cleanup
-    /// unable to defer for the reader's WAL/volume needs.
-    ///
-    /// `None` for in-memory or non-read-only engines.
+    /// SWMR lease for read-only file:// engines. `None` for in-memory or writable.
     pub(crate) lease: Option<crate::storage::mvcc::lease::LeaseManager>,
-    /// Read-only mmap of the writer's `db.shm`. Populated alongside
-    /// `lease` (same conditions). Falls back to `None` when the
-    /// writer hasn't created a shm yet — degrades to v1 mtime-only
-    /// presence.
+    /// Read-only mmap of writer's `db.shm`. `None` falls back to v1 mtime-only presence.
     pub(crate) shm: Option<Arc<crate::storage::mvcc::shm::ShmHandle>>,
-    /// Snapshot of `writer_generation` at attach. ReadOnlyDatabase's
-    /// refresh path compares this against the live shm value to
-    /// detect writer reincarnation.
+    /// `writer_generation` snapshot at attach; refresh detects reincarnation against it.
     pub(crate) attach_writer_gen: u64,
-    /// Snapshot of `visible_commit_lsn` at attach. ReadOnlyDatabase's
-    /// SwmrPendingDdl filter uses this to suppress DDL events that
-    /// pre-date this attach.
+    /// `visible_commit_lsn` snapshot at attach; SwmrPendingDdl filter suppresses pre-attach DDL.
     pub(crate) attach_visible_commit_lsn: u64,
-    /// Snapshot of `oldest_active_txn_lsn` taken in
-    /// `pre_acquire_swmr_for_read_only_path` BEFORE the
-    /// visible_commit_lsn snapshot — so a writer txn that committed
-    /// between attach and ReadOnlyDatabase construction can't move
-    /// the on-disk floor above this value. ReadOnlyDatabase's
-    /// overlay baseline uses `min(this, attach_visible_commit_lsn + 1)`
-    /// as the entry-scan floor; sampling at attach (rather than at
-    /// from_entry) ensures the floor covers any pre-attach DML for
-    /// transactions whose commit markers will land post-attach.
-    /// `u64::MAX` = no shm or no active user txns at attach time.
+    /// `oldest_active_txn_lsn` sampled before visible_commit_lsn, so post-attach commits
+    /// can't move the floor above us. `u64::MAX` = no shm or no active txns at attach.
     pub(crate) attach_oldest_active_txn_lsn: u64,
-    /// Manifest epoch read from `<db>/volumes/epoch` BEFORE this
-    /// entry's `open_engine` ran. Used as the baseline that every
-    /// `ReadOnlyDatabase::from_entry` seeds into `last_seen_epoch`,
-    /// instead of re-reading the live on-disk epoch. Without this,
-    /// a sibling ReadOnlyDatabase opened after a writer checkpoint
-    /// (or after an entry-reuse via the DSN registry) would seed its
-    /// cache from the NEW epoch, then `refresh()` would see
-    /// `on_disk == cached` and skip `reload_manifests`, leaving cold
-    /// rows the underlying engine never reloaded.
+    /// Manifest epoch read before `open_engine`; baseline for ReadOnlyDatabase refresh.
     pub(crate) loaded_epoch: u64,
-    /// Epoch-millis of the last shared lease mtime
-    /// touch. Both `Database` (when read-only) and
-    /// `ReadOnlyDatabase` query paths call into the rate-limited
-    /// `EngineEntry::heartbeat_swmr_lease`, which skips the
-    /// underlying syscall when the prior touch is < 1 second ago.
-    /// Keeps the writer's reaper from declaring the reader stale
-    /// without paying a syscall on every query.
+    /// Epoch-millis of last lease touch; rate-limits the touch syscall to ~1Hz.
     last_lease_touch_ms: std::sync::atomic::AtomicU64,
-    /// Long-lived shared file lock held by chmod-read-only
-    /// fallback opens (lease registration failed because the
-    /// readers/ dir isn't writable for THIS process, but the
-    /// path isn't on a read-only mount). Without this, a
-    /// concurrent writer running with elevated privileges
-    /// could acquire `LOCK_EX` and reclaim WAL/volumes under
-    /// the reader — the writer's GC/cleanup is lease-based
-    /// and a chmod-RO reader has no lease. Holding `LOCK_SH`
-    /// for the entry's lifetime blocks `LOCK_EX` acquisition,
-    /// providing kernel-level reader presence as a fallback.
-    /// `None` for the standard lease-backed path and for true
-    /// read-only-mount opens (where no writer can ever exist).
+    /// Long-lived SH lock for chmod-read-only fallback (lease registration failed on
+    /// writable mount). Blocks LOCK_EX so a privileged writer can't reclaim under us.
     #[allow(dead_code)]
     pub(crate) chmod_ro_lock: Option<crate::storage::mvcc::file_lock::SharedLockGuard>,
     /// Temp directory for test-filedb feature. Deleted with the entry.
@@ -215,15 +103,7 @@ pub(crate) struct EngineEntry {
     _temp_dir: Option<tempfile::TempDir>,
 }
 
-/// Probe whether `db_path` is writable for THIS process by
-/// attempting to create a tiny throwaway file inside it. Used to
-/// classify lease-registration failures: a writable directory ⇒
-/// real failure (transient I/O, ENOSPC, etc.), an unwritable
-/// directory ⇒ effectively-read-only (chmod-style RO DB on a
-/// writable mount), so we accept lease=None.
-///
-/// The probe file is always cleaned up. Any I/O error is treated
-/// as "not writable" — conservative for the SWMR attach decision.
+/// Probe `db_path` writability via a throwaway file. Used to classify lease failures.
 fn is_directory_writable(db_path: &std::path::Path) -> bool {
     let pid = std::process::id();
     let probe = db_path.join(format!(".swmr-write-probe-{}", pid));
@@ -242,20 +122,7 @@ fn is_directory_writable(db_path: &std::path::Path) -> bool {
 }
 
 impl EngineEntry {
-    /// Rate-limited mtime touch on the SWMR lease
-    /// file. No-op when no lease is registered (non-read-only or
-    /// memory engine). Skips the underlying syscall when the
-    /// prior touch was < 1 second ago — far below the default
-    /// `2 * checkpoint_interval = 120s` reaper floor, so net
-    /// correctness is preserved and the common case is
-    /// syscall-free.
-    ///
-    /// Called from every `Database` and `ReadOnlyDatabase` query /
-    /// execute entry point. Without it, a documented
-    /// `Database::open("file://...?read_only=true")` handle would
-    /// leave its lease at the initial mtime and be reaped after
-    /// `lease_max_age`, letting the writer proceed with cleanup
-    /// while the handle was still active.
+    /// Rate-limited (~1Hz) mtime touch on the SWMR lease. No-op without a lease.
     pub(crate) fn heartbeat_swmr_lease(&self) {
         let Some(ref l) = self.lease else { return };
         use std::sync::atomic::Ordering;
@@ -272,22 +139,9 @@ impl EngineEntry {
         }
     }
 
-    /// Register the SWMR lease + shm if the engine is
-    /// opened in read-only mode against a file:// path. Returns
-    /// `(Option<LeaseManager>, Option<Arc<ShmHandle>>, attach_gen,
-    /// attach_lsn)`. `None`/0 for any non-read-only or memory engine.
-    /// Pre-acquire SWMR lease + shm + attach snapshots BEFORE
-    /// engine construction. The lease is registered first so the
-    /// writer's GC sees us during the engine's WAL replay; the
-    /// shm snapshot is taken next so the SAME `visible_commit_lsn`
-    /// value drives both the engine's `replay_cap_lsn` and the
-    /// EngineEntry's `attach_visible_commit_lsn`. This keeps
-    /// SwmrPendingDdl pre-attach filtering aligned with what was
-    /// actually replayed at attach time.
-    ///
-    /// Returns all-`None`/0 for non-file paths or non-read-only
-    /// configs; the caller decides based on its own state whether
-    /// to skip this call.
+    /// Pre-acquire SWMR lease + shm + attach snapshots before engine construction.
+    /// Lease registers first (writer's GC sees us during WAL replay); shm sample
+    /// drives both engine `replay_cap_lsn` and EngineEntry's attach snapshot.
     #[allow(clippy::type_complexity)]
     pub(crate) fn pre_acquire_swmr_for_read_only_path(
         path: &std::path::Path,
@@ -300,27 +154,7 @@ impl EngineEntry {
         Option<crate::storage::mvcc::file_lock::SharedLockGuard>, // no-shm v1 fallback handshake guard
         u64, // pre_acquire_pin_handle_id (caller removes via remove_handle_pin)
     )> {
-        // Lease registration failure is acceptable in TWO
-        // "effectively read-only" cases — both proven no-writer
-        // paths — and a hard failure otherwise:
-        //
-        //   1. Whole filesystem mounted read-only (`is_path_on_readonly_mount`).
-        //   2. The DB directory itself is not writable for THIS
-        //      process (chmod-style read-only DB on a writable
-        //      mount). The reader has no lease to advertise
-        //      presence; the caller must hold the no-shm
-        //      handshake guard (`SharedLockGuard` returned at
-        //      tuple position 5 below) for the entire entry
-        //      lifetime so a concurrent writer with elevated
-        //      privileges cannot acquire `LOCK_EX` and start
-        //      cleanup. Without that, the writer's lease-based
-        //      GC sees no live reader and can reclaim WAL /
-        //      volumes under us.
-        //
-        // Otherwise (writable directory, transient I/O failure,
-        // etc.), fail the SWMR attach loudly: silently dropping
-        // lease presence on a writable mount would let the writer's
-        // GC reclaim volumes/WAL while we're still attached.
+        // Lease registration failure: accept on RO mount or chmod-RO dir, fail otherwise.
         let lease = match crate::storage::mvcc::lease::LeaseManager::register(path) {
             Ok(l) => Some(l),
             Err(e) => {
@@ -340,52 +174,9 @@ impl EngineEntry {
                 }
             }
         };
-        // Pin WAL BEFORE sampling shm. `register` leaves the lease
-        // at 0 bytes; the writer's `min_pinned_lsn` ignores
-        // non-8-byte files and treats us as a v1 (no-WAL-pin)
-        // reader. Pin `1` (= "keep all WAL") so a writer checkpoint
-        // between this point and the engine's manifest load + capped
-        // WAL replay can't truncate entries we're about to read.
-        //
-        // Shared opens do not take a kernel lock, so the writer can
-        // start or checkpoint at any time — pinning conservatively
-        // is the only safe option for the open window. This holds
-        // regardless of shm availability:
-        //   - shm present: ReadOnlyDatabase's first refresh advances
-        //     this to `overlay.next_entry_floor` via `set_handle_pin`.
-        //   - shm absent (no writer running yet, or writer not yet
-        //     ready): the open path still needs WAL protection
-        //     while it replays. Database::open's plain-Database
-        //     release path releases the pin to `0` after
-        //     `open_engine` completes (plain Database has no
-        //     overlay/tail and doesn't need the pin afterward).
-        //     ReadOnlyDatabase::from_entry's first refresh takes
-        //     over via `set_handle_pin`.
-        // Pin write must SUCCEED before we accept shm. The capped
-        // WAL replay path uses `attach_visible_commit_lsn` (from
-        // shm) as `replay_cap_lsn` BEFORE `open_engine` — so capped
-        // replay would run while no reader pin protects the WAL
-        // from concurrent writer checkpoint truncation.
-        //
-        // Use `set_handle_pin` with a fresh handle_id (NOT the
-        // direct `set_pinned_lsn`) so the contribution lives in
-        // the process-wide `lease_pin_contributions` registry.
-        // The caller releases ONLY this contribution via
-        // `remove_handle_pin(pre_acquire_pin_handle_id)`, leaving
-        // any sibling ReadOnlyDatabase's contribution intact. A
-        // direct `set_pinned_lsn(0)` to release would have
-        // overwritten the on-disk MIN, dropping the sibling's
-        // pin protection.
-        //
-        // RAII guard: every `?`/early-Err path between the
-        // contribution install and the success return must
-        // remove the contribution. `LeaseManager::Drop` only
-        // unlinks the file — it does NOT clean the
-        // `lease_pin_contributions` registry — so a leaked
-        // contribution would let a later same-process open of
-        // the same DB inherit a stale pin of `1` and block WAL
-        // truncation. Defuse the guard right before the success
-        // return so the contribution survives for the caller.
+        // Pin WAL=1 BEFORE shm sample so a concurrent checkpoint can't truncate our
+        // replay range. Use `set_handle_pin` with a fresh id to coexist with sibling
+        // contributions; RAII guard releases on early-Err so we never leak a pin of 1.
         struct PreAcquirePinGuard<'a> {
             lease: Option<&'a crate::storage::mvcc::lease::LeaseManager>,
             handle_id: u64,
@@ -410,44 +201,11 @@ impl EngineEntry {
             handle_id: pre_acquire_pin_handle_id,
             armed: pin_ok,
         };
-        // Probe whether the writer's `db.shm` file is present on
-        // disk. If it IS present, a writer is (or was recently)
-        // running and we MUST be able to coordinate with it via
-        // shm + pin. Falling back to an uncapped WAL replay in
-        // that case would let the reader apply commit markers the
-        // writer has flushed but not yet published, observing data
-        // the writer considers in-flight. When the file is absent,
-        // no writer is running and uncapped recovery from the
-        // on-disk WAL is safe (= v1 semantics) — but ONLY while
-        // we keep `handshake_guard` alive across the engine open.
         let shm_path = path.join(crate::storage::mvcc::shm::SHM_FILENAME);
 
-        // ALWAYS run the handshake, even when the shm file is on
-        // disk. `close_engine` intentionally leaves db.shm behind
-        // (and a crash can leave it half-initialized or stuck at
-        // init_done = MAGIC_READY), so file presence alone does
-        // not prove a live writer. Without this probe we'd cap
-        // recovery at a stale visible_commit_lsn and miss durable
-        // WAL commits, or fail forever on init_done = 0 until a
-        // writer restarts.
-        //
-        // The handshake returns a [`HandshakeOutcome`] that
-        // classifies the writer state:
-        //   - NoWriter(SH guard): no LOCK_EX holder. Shm is
-        //     stale; do uncapped recovery while the guard
-        //     blocks new writers.
-        //   - LiveWriter(startup-gate SH guard): a writer holds
-        //     LOCK_EX and is past mark_ready right now. The
-        //     gate guard MUST stay alive across opening + sampling
-        //     db.shm, then a final liveness recheck via
-        //     `recheck_writer_still_holds_lock`. If the recheck
-        //     reveals the writer disappeared mid-sample, the
-        //     sample is discarded and we fall back to uncapped
-        //     recovery under the recheck's db.lock SH guard.
-        //   - ReadOnlyMount: no writer can ever exist here.
-        //     Trust whatever shm is on disk without further proof.
-        //   - Err(...): transient flock failure; propagate to
-        //     refuse silent downgrade to uncapped replay.
+        // Always handshake: shm file presence doesn't prove a live writer (close_engine
+        // leaves db.shm behind). Outcome classifies writer state and gates capped vs
+        // uncapped WAL replay.
         let outcome =
             crate::storage::mvcc::file_lock::FileLock::await_writer_startup_quiescent(path)?;
         use crate::storage::mvcc::file_lock::HandshakeOutcome;
@@ -472,25 +230,8 @@ impl EngineEntry {
         } else {
             None
         };
-        // Best-effort coherence wait: poll briefly for the
-        // writer's cleanup loop to barrier-publish a coherent
-        // (visible, oldest) seqlock pair after observing our
-        // freshly-written lease. NOT correctness-required —
-        // the WAL → shm `fetch_min` mirror (wired in
-        // `MVCCEngine::open_engine` via
-        // `WALManager::set_shm_oldest_mirror`) already
-        // guarantees `shm.oldest_active_txn_lsn` is a valid
-        // lower bound at any sample point because every
-        // active-set change `fetch_min`s into shm directly.
-        // The wait just gives the writer's barrier a chance
-        // to publish a fully-fresh pair (matching the writer's
-        // ACTUAL oldest, not the running lower bound),
-        // avoiding mild over-pinning on the first refresh.
-        //
-        // Poll up to 250ms (~2-3 cleanup ticks). Timing out
-        // is fine: the reader proceeds with whatever shm
-        // shows; the WAL→shm mirror's lower-bound guarantee
-        // covers correctness.
+        // Best-effort 250ms poll for the writer to publish a fresh seqlock pair.
+        // Not correctness-required (WAL→shm fetch_min mirror covers the lower bound).
         if let Some(h) = shm.as_ref() {
             let baseline_seq = h
                 .header()
@@ -502,37 +243,18 @@ impl EngineEntry {
                     .header()
                     .publish_seq
                     .load(std::sync::atomic::Ordering::Acquire);
-                // Wait for an EVEN seq strictly greater than
-                // baseline (any seqlock pair completion bumps
-                // by 2; an in-flight publish leaves it odd —
-                // keep polling).
+                // Wait for an EVEN seq > baseline (in-flight publish leaves it odd).
                 if seq > baseline_seq && seq.is_multiple_of(2) {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        // Sample the shm header WHILE holding `startup_guard`
-        // (when present). Sampling failures (mid-reincarnation)
-        // are surfaced now; a successful sample is then liveness-
-        // rechecked below to confirm the writer didn't exit
-        // during the sample window.
         let mut attach_gen: u64 = 0;
         let mut attach_oldest_active: u64 = u64::MAX;
         let mut attach_lsn: u64 = 0;
-        // Even on the no-shm path (no live writer at attach),
-        // probe `db.shm` if it's on disk so we capture the
-        // writer_generation as a baseline. A future writer that
-        // starts AFTER this reader attached, commits, then
-        // exits will leave `db.shm` with a HIGHER
-        // writer_generation than this baseline; the reader's
-        // refresh detects the increment and surfaces
-        // `SwmrWriterReincarnated`. Without this baseline,
-        // `attach_gen=0` and the refresh check `observed > 0`
-        // would also fire on the test pattern of "writable
-        // open, close, then read-only open" (where the prior
-        // writable session left writer_generation > 0 with no
-        // post-attach writer activity).
+        // No-shm path: still probe db.shm to capture writer_generation as baseline so
+        // a future writer reincarnation is detected on refresh.
         if shm.is_none() {
             if let Ok(h) = crate::storage::mvcc::shm::ShmHandle::open_reader(path) {
                 let gen = h
@@ -561,55 +283,21 @@ impl EngineEntry {
                 }
             }
         }
-        // LiveWriter post-sample liveness recheck: if the writer
-        // exited between handshake return and our shm sample, the
-        // sampled visible_commit_lsn could be from an exited
-        // writer's leftover READY shm. Re-acquire db.lock SH:
-        //   - Success → writer exited mid-sample → discard the
-        //     sample (treat as no-writer) and use the recheck's
-        //     SH guard to block any new writer from racing the
-        //     uncapped recovery that follows.
-        //   - EWOULDBLOCK → writer still holds LOCK_EX, so it
-        //     was alive throughout our sample window. The sample
-        //     stands; drop the startup gate.
+        // LiveWriter post-sample liveness recheck: writer may have exited mid-sample.
         if let Some(sg) = startup_guard.take() {
             match crate::storage::mvcc::file_lock::FileLock::recheck_writer_still_holds_lock(path)?
             {
                 Some(db_lock_g) => {
-                    // Writer disappeared mid-sample. Discard the
-                    // shm Arc so we don't tail an exited
-                    // writer's WAL frontier — uncapped recovery
-                    // under the SH guard below replays the
-                    // durable WAL the exited writer left behind.
-                    //
-                    // PRESERVE `attach_gen`: the leftover ready
-                    // db.shm carries the just-exited writer's
-                    // generation as the latest value any writer
-                    // has set. The reader's no-shm refresh check
-                    // (`observed > expected`) compares current
-                    // db.shm gen against this baseline; without
-                    // preserving it, expected=0 would cause every
-                    // refresh to surface a spurious
-                    // `SwmrWriterReincarnated` against the
-                    // existing leftover gen value (typically >= 1)
-                    // even though no writer ran post-attach.
+                    // Writer exited mid-sample. Discard shm; preserve attach_gen
+                    // (refresh check needs the leftover gen as baseline).
                     handshake_guard = Some(db_lock_g);
                     shm_is_stale_leftover = true;
                     shm = None;
-                    // attach_gen intentionally retained.
                     attach_oldest_active = u64::MAX;
                     attach_lsn = 0;
                 }
                 None => {
-                    // Writer still alive. The sample stands ONLY
-                    // when we actually attached to shm. If shm
-                    // open failed (file unlinked between writer
-                    // create and our open, EACCES on the inode,
-                    // a torn read of the magic header, ...) we
-                    // have a live writer with no coordination
-                    // surface. Falling through to v1 uncapped
-                    // recovery would race the writer's WAL
-                    // appends. Hard fail; caller can retry.
+                    // Writer still alive. Require shm — uncapped replay would race appends.
                     if shm.is_none() {
                         if let Some(ref l) = lease {
                             l.remove_handle_pin(pre_acquire_pin_handle_id);
@@ -625,29 +313,14 @@ impl EngineEntry {
                             shm_path.exists()
                         )));
                     }
-                    // Writer alive AND shm attached — release the gate.
                     drop(sg);
                 }
             }
         }
 
-        // Track whether shm is effectively available for the
-        // post-attach error classification below. Stale shm is
-        // treated as absent.
         let shm_file_exists = shm_path.exists() && !shm_is_stale_leftover;
         if shm_file_exists && shm.is_none() {
-            // shm file exists but we couldn't open it / pin. If
-            // the filesystem or directory is effectively read-only
-            // (verified RO mount or unwritable dir on a writable
-            // mount), no live writer can be running here — the
-            // shm is just a leftover from a prior writer session.
-            // Fall through to the no-shm v1 fallback in that case;
-            // capped replay isn't required because no writer is
-            // appending WAL.
-            //
-            // On a writable mount with normal perms, shm-exists +
-            // can't-coordinate means a live writer is around and
-            // we'd race its commits with uncapped replay — fail.
+            // shm exists but unattachable: accept on RO/chmod-RO (leftover), fail otherwise.
             let ro_mount = crate::storage::mvcc::file_lock::is_path_on_readonly_mount_pub(path);
             let dir_unwritable = !ro_mount && !is_directory_writable(path);
             if !ro_mount && !dir_unwritable {
@@ -663,25 +336,14 @@ impl EngineEntry {
                     shm.is_some()
                 )));
             }
-            // Effectively-RO path: drop any failed-pin contribution
-            // (shm remains None for the rest of pre_acquire).
+            // Effectively-RO path: drop the failed-pin contribution.
             if let Some(ref l) = lease {
                 l.remove_handle_pin(pre_acquire_pin_handle_id);
             }
         }
-        // Return the handshake guard ONLY for the no-shm v1
-        // fallback. With shm attached, the engine's own
-        // `open_engine` shared lock takes over (and our lease pin
-        // already protects the WAL), so dropping the guard here is
-        // safe. With shm absent, the caller MUST hold the guard
-        // across `engine.open_engine()` to prevent a writer from
-        // sneaking in, creating shm, and writing WAL during our
-        // uncapped recovery.
+        // No-shm path: caller holds the guard across open_engine to fence new writers.
         let returned_guard = if shm.is_none() { handshake_guard } else { None };
-        // Defuse the RAII guard: success path returns the
-        // contribution to the caller, who removes it later. Drop
-        // the guard explicitly so its `&LeaseManager` borrow
-        // releases before the success Ok moves `lease`.
+        // Defuse the RAII guard so the contribution survives for the caller.
         pin_guard.armed = false;
         drop(pin_guard);
         Ok((
@@ -698,26 +360,11 @@ impl EngineEntry {
 
 impl Drop for EngineEntry {
     fn drop(&mut self) {
-        // Clear all thread-local caches to release references to engine internals
-        // (cached Arc<dyn Index>, closures). Done once per engine close.
+        // Release thread-local caches that hold engine-internal Arcs/closures.
         crate::executor::clear_all_thread_local_caches();
         let _ = self.engine.close_engine();
 
-        // Reap our dead `Weak` from the registry. Without this, every
-        // dropped DSN leaves a permanent (DSN string -> dead Weak) entry
-        // behind, so a long-lived process opening many ephemeral DSNs
-        // grows the registry monotonically and pays for the dead entries
-        // on every `open()` lookup.
-        //
-        // We're inside `Drop` for the entry whose Arc count just hit 0,
-        // so any `Weak` pointing at us is now dead. We only remove the
-        // entry if the registry still has a *dead* weak for our DSN — if
-        // a fresh entry was inserted concurrently between our drop and
-        // this lock acquire, its weak is live and we leave it alone.
-        //
-        // `try_write` to avoid blocking on a held registry lock; the
-        // entry will be reaped on the next `open()` of the same DSN
-        // either way.
+        // Reap our dead Weak from the registry; skip if a sibling re-inserted live.
         if let Ok(mut registry) = DATABASE_REGISTRY.try_write() {
             if let Some(weak) = registry.get(&self.dsn) {
                 if weak.strong_count() == 0 {
@@ -728,43 +375,18 @@ impl Drop for EngineEntry {
     }
 }
 
-/// Per-handle database state.
-///
-/// Each user-visible handle (a `Database`, every `Database::clone`, every
-/// sibling from `Database::open(dsn)`, every `ReadOnlyDatabase`) owns its
-/// own `DatabaseInner` — primarily for executor isolation, so a `BEGIN` on
-/// one handle doesn't leak into another. Engine-level shared state lives on
-/// the `Arc<EngineEntry>` field, which is what the registry counts.
+/// Per-handle state. Each handle gets its own executor so BEGIN doesn't leak across.
 pub(crate) struct DatabaseInner {
     entry: Arc<EngineEntry>,
-    /// Wrapped in `Arc<Mutex<...>>` so `Database::read_engine`'s
-    /// guard can clone a reference and check for an active
-    /// `BEGIN` on this handle. Without that share, a caller
-    /// could open a transaction on `Database`, call
-    /// `db.read_engine().begin_read_transaction()`, and have
-    /// the guard refresh the shared read-only state
-    /// mid-transaction (only matters when the trait object's
-    /// `RefreshOwner::ReadOnly` variant is in play, e.g.
-    /// `Database::as_read_only` paths).
+    /// Shared so `read_engine`'s guard can check for an active BEGIN on this handle.
     executor: Arc<Mutex<Executor>>,
 }
 
-/// Type alias for Statement to use (avoids exposing DatabaseInner directly)
 pub(crate) type DatabaseInnerHandle = DatabaseInner;
 
 impl DatabaseInner {
-    /// Build a fresh per-handle inner around an existing engine entry.
-    /// Picks a writable or read-only executor to match the engine mode,
-    /// and shares the engine entry's semantic cache and query planner so
-    /// DML invalidation and ANALYZE reach every sibling reader.
+    /// Build a fresh writable per-handle inner sharing the entry's caches.
     fn new_with_entry(entry: Arc<EngineEntry>) -> Self {
-        // `Database` is always writable — read-only DSNs are
-        // rejected by `Database::open` and routed to
-        // `Database::open_read_only`, which returns
-        // `ReadOnlyDatabase` (a different type with its own
-        // `ReaderAttachment` + refresh state). So this
-        // constructor builds a writable executor unconditionally
-        // and stores no SWMR claim on the inner.
         let engine = Arc::clone(&entry.engine);
         let semantic_cache = Arc::clone(&entry.semantic_cache);
         let query_planner = Arc::clone(&entry.query_planner);
@@ -776,66 +398,25 @@ impl DatabaseInner {
     }
 }
 
-/// `ReadEngine` trait object returned by
-/// [`Database::read_engine`] and [`crate::api::ReadOnlyDatabase::read_engine`].
-///
-/// Every `begin_read_transaction*` call goes through this
-/// wrapper, which:
-///   - Heartbeats the cross-process reader lease (rate-limited
-///     internally by `EngineEntry::heartbeat_swmr_lease`), so a
-///     long-lived caller polling only via the trait object
-///     stays live and isn't reaped by the writer's lease GC.
-///   - Dispatches refresh based on `RefreshOwner`: `ReadOnly`
-///     runs overlay rebuild + DDL detection + pin advance via
-///     the shared `Arc<ReadOnlyDatabaseInner>`; `None`
-///     (writable / in-memory) is a no-op. Errors from refresh
-///     propagate as `begin_read_transaction*` errors, surfacing
-///     typed must-reopen sub-kinds (`SwmrPendingDdl`,
-///     `SwmrWriterReincarnated`, ...) the same way the public
-///     `query` paths do.
-///
-/// The wrapper is the SOLE ReadEngine surface for read-only
-/// callers. The bare `Arc<MVCCEngine>` is no longer cast to
-/// `Arc<dyn ReadEngine>` directly — that would bypass all of
-/// the above and leave the documented "safe read surface"
-/// silently stale.
+/// `ReadEngine` wrapper returned by `read_engine()`. Heartbeats lease and runs the
+/// per-handle refresh on every `begin_read_transaction*` call.
 pub(crate) struct SwmrReadEngineGuard {
     pub(crate) engine: Arc<MVCCEngine>,
     pub(crate) entry: Arc<EngineEntry>,
-    /// Refresh dispatch. Two states: writable engines get
-    /// `None`; `ReadOnlyDatabase` gets `ReadOnly` (which carries
-    /// the shared `Arc<ReadOnlyDatabaseInner>` so the trait
-    /// surface drives the same overlay/DDL/pin-advance state as
-    /// the owning handle).
     pub(crate) refresh_owner: RefreshOwner,
 }
 
-/// Refresh dispatch for `SwmrReadEngineGuard`. Two discrete
-/// states; the guard's `maintain` matches and dispatches.
 pub(crate) enum RefreshOwner {
-    /// `ReadOnlyDatabase`. The shared `Arc<ReadOnlyDatabaseInner>`
-    /// drives overlay rebuild + DDL detection + pin advance.
-    /// The guard delegates to the inner's `maybe_auto_refresh`.
     ReadOnly(Arc<crate::api::read_only_database::ReadOnlyDatabaseInner>),
-    /// Writable engine or in-memory engine. No refresh needed.
     None,
 }
 
 impl SwmrReadEngineGuard {
-    /// Run the per-call SWMR maintenance shared by every trait
-    /// method: lease heartbeat, then refresh dispatch. Returns
-    /// the typed error from refresh so the caller's
-    /// `begin_read_transaction*` surfaces it instead of a stale
-    /// Ok.
     #[inline]
     fn maintain(&self) -> Result<()> {
         self.entry.heartbeat_swmr_lease();
         match &self.refresh_owner {
             RefreshOwner::ReadOnly(inner) => {
-                // ROD's `maybe_auto_refresh` does its own
-                // active-txn check via `inner.executor`, which
-                // is identical to the executor a SQL `BEGIN` on
-                // the ROD touches.
                 let rod = crate::api::ReadOnlyDatabase {
                     inner: Arc::clone(inner),
                 };
@@ -862,92 +443,32 @@ impl crate::storage::traits::ReadEngine for SwmrReadEngineGuard {
     }
 }
 
-/// Database represents a Stoolap database connection
-///
-/// This is the main entry point for using Stoolap. It wraps the storage engine
-/// and executor, providing a simple API for executing SQL queries.
-///
-/// # Thread Safety
-///
-/// Database is thread-safe and can be shared across threads via cloning.
-/// Each clone shares the same underlying storage engine.
-///
-/// # Examples
-///
-/// ```ignore
-/// use stoolap::{Database, params};
-///
-/// // Open in-memory database
-/// let db = Database::open("memory://")?;
-///
-/// // Create table
-/// db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ())?;
-///
-/// // Insert with parameters
-/// db.execute("INSERT INTO users VALUES ($1, $2)", (1, "Alice"))?;
-///
-/// // Query
-/// for row in db.query("SELECT * FROM users", ())? {
-///     let row = row?;
-///     println!("{}: {}", row.get::<i64>("id")?, row.get::<String>("name")?);
-/// }
-/// ```
+/// Stoolap database connection. Thread-safe; clone to share across threads
+/// (each clone gets independent transaction state but shares the engine).
 pub struct Database {
     inner: Arc<DatabaseInner>,
 }
 
 #[cfg(feature = "ffi")]
 impl Database {
-    /// Returns an Arc reference to the inner state, preventing the engine
-    /// from being closed while any keepalive handle exists.
-    ///
-    /// Used by the FFI layer to ensure cloned handles keep the original
-    /// engine-owning DatabaseInner alive.
+    /// FFI keepalive: holds inner Arc to keep the engine alive across handles.
     pub(crate) fn keepalive(&self) -> Arc<DatabaseInner> {
         Arc::clone(&self.inner)
     }
 
-    /// Returns a borrow of the inner Arc (no clone, no count change).
     pub(crate) fn inner_arc(&self) -> &Arc<DatabaseInner> {
         &self.inner
     }
 }
 
 impl Database {
-    /// Best-effort cleanup of a registry entry pointing to the same engine
-    /// the caller holds.
-    ///
-    /// With the `Weak<EngineEntry>` registry the entry self-expires once the
-    /// last user handle drops, so this method is no longer load-bearing for
-    /// correctness. It is retained for the FFI's explicit `stoolap_close`
-    /// flow to keep the registry tidy.
-    ///
-    /// Removal is only safe when the engine is about to die after the
-    /// caller's `Arc<DatabaseInner>` is dropped, i.e. when:
-    /// - `Arc::strong_count(inner) == 1`: nobody else holds *this*
-    ///   `DatabaseInner` (FFI prepared-statement / transaction keepalives
-    ///   clone the same `Arc<DatabaseInner>`, so they bump this count
-    ///   without bumping `entry.strong_count` — checking only the entry
-    ///   would orphan a still-live engine from the registry); AND
-    /// - `Arc::strong_count(&inner.entry) == 1`: no sibling `DatabaseInner`
-    ///   from a different `Database::open(dsn)` / clone holds the entry.
-    ///
-    /// If either count is greater than 1, the engine will outlive this
-    /// caller — leave the registry alone so a subsequent `open(dsn)` can
-    /// still find it. Otherwise the next `open(dsn)` would create a fresh
-    /// engine (empty for `memory://`, file-lock conflict for `file://`)
-    /// while the prior engine is still in use through a stale handle.
+    /// FFI-only registry tidying for `stoolap_close`. No-op when other handles exist.
     #[cfg(feature = "ffi")]
     pub(crate) fn try_unregister_arc(inner: &Arc<DatabaseInner>) {
         if Arc::strong_count(inner) > 1 {
-            // Other Arc<DatabaseInner> clones (FFI stmt/tx keepalive) keep
-            // this exact DatabaseInner — and therefore its entry — alive.
             return;
         }
-        // `Database` is always writable now, so the baseline is
-        // simply 1 (this DatabaseInner's `Arc<EngineEntry>`).
         if Arc::strong_count(&inner.entry) > 1 {
-            // Sibling DatabaseInners share the same engine entry.
             return;
         }
         if let Ok(mut registry) = DATABASE_REGISTRY.write() {
@@ -957,7 +478,6 @@ impl Database {
                         registry.remove(&inner.entry.dsn);
                     }
                     None => {
-                        // Dead entry — clean it up.
                         registry.remove(&inner.entry.dsn);
                     }
                     _ => {}
@@ -968,17 +488,7 @@ impl Database {
 }
 
 impl Database {
-    /// Build a new `Database` handle that shares the engine entry of
-    /// `existing` but has its own `DatabaseInner` and its own executor
-    /// (independent transaction state).
-    ///
-    /// Used by both `Clone for Database` and the registry-hit fast path in
-    /// `Database::open`. Each handle gets its own executor so a `BEGIN` on
-    /// one handle does not leak into another, and each handle bumps the
-    /// engine entry's strong count by one — so `Arc::strong_count(&entry)`
-    /// is exactly the count of live user handles for the DSN, which is
-    /// what `close()` and `try_unregister_arc` use to decide when to
-    /// release engine resources.
+    /// New handle sharing `entry` but with its own executor (independent BEGIN state).
     fn share_entry(entry: Arc<EngineEntry>) -> Database {
         Database {
             inner: Arc::new(DatabaseInner::new_with_entry(entry)),
@@ -987,53 +497,26 @@ impl Database {
 }
 
 impl Clone for Database {
-    /// Clone the database handle.
-    ///
-    /// Each cloned handle has its own executor with independent transaction state,
-    /// but shares the same underlying storage engine. This ensures proper transaction
-    /// isolation - a BEGIN on one handle won't affect reads on another handle.
+    /// Clone gets its own executor (independent transaction state); shares the engine.
     fn clone(&self) -> Self {
         Database::share_entry(Arc::clone(&self.inner.entry))
     }
 }
 
-// `Database` has no `Drop` impl: dropping it drops `inner` which drops the
-// per-handle `Arc<EngineEntry>`. When the *last* user handle for a DSN
-// drops, the entry's strong count hits zero and `EngineEntry::drop` closes
-// the engine. The registry's `Weak` then silently expires; the next
-// `Database::open(dsn)` will see a dead Weak, fail the upgrade, and create
-// a fresh entry. No registry-removal logic is needed in `Drop for
-// Database` — relying on it was the source of the round-5 bug where a
-// sibling's drop unregistered the engine while peers were still using it.
+// No Drop impl: dropping `inner` drops the per-handle `Arc<EngineEntry>`; when the
+// last handle drops, `EngineEntry::drop` closes the engine and reaps the Weak.
 
 impl Database {
-    /// Open a database connection
+    /// Open a database connection.
     ///
-    /// The DSN (Data Source Name) specifies the database location:
-    /// - `memory://` - In-memory database (data lost when closed)
-    /// - `file:///path/to/db` - Persistent database at the specified path
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // In-memory database
-    /// let db = Database::open("memory://")?;
-    ///
-    /// // Persistent database
-    /// let db = Database::open("file:///tmp/mydb")?;
-    /// ```
-    ///
-    /// # Engine Reuse
+    /// DSN forms:
+    /// - `memory://` — in-memory (data lost on close).
+    /// - `file:///path/to/db` — persistent.
     ///
     /// Opening the same DSN multiple times returns the same engine instance.
-    /// This ensures consistency and prevents data corruption.
+    /// Read-only DSNs (`?read_only=true` / `?mode=ro`) must use `open_read_only`.
     pub fn open(dsn: &str) -> Result<Self> {
-        // Read-only DSNs go through `Database::open_read_only(dsn)`. The
-        // type system distinguishes the writable surface (`Database`) from
-        // the read-only one (`ReadOnlyDatabase`); routing read-only DSNs
-        // through `open` would force a runtime check on every write
-        // method instead of a compile-time gate. Refuse with a clear
-        // pointer to the right entry point.
+        // Read-only DSNs go through `open_read_only` for compile-time type-level enforcement.
         if Self::dsn_read_only_flag(dsn)? == Some(true) {
             return Err(Error::invalid_argument(
                 "read-only DSN flag (?read_only=true / ?readonly=true / \
@@ -1046,12 +529,7 @@ impl Database {
             ));
         }
 
-        // Check if we already have an engine for this DSN.
-        // Read-only-cached entries (from a prior
-        // `Database::open_read_only(dsn)` call) cannot serve a
-        // writable request; reject with the mode-mismatch error
-        // so the caller drops the read-only handle first or
-        // opens a fresh DSN.
+        // Reuse a writable cached entry; reject read-only-cached entries with mode mismatch.
         {
             let registry = DATABASE_REGISTRY
                 .read()
@@ -1063,16 +541,14 @@ impl Database {
                     }
                     return Ok(Self::share_entry(entry));
                 }
-                // Dead Weak — fall through to create a fresh engine entry.
             }
         }
 
-        // Need to create a new engine - acquire write lock
         let mut registry = DATABASE_REGISTRY
             .write()
             .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
 
-        // Double-check after acquiring write lock
+        // Re-check under write lock.
         if let Some(weak) = registry.get(dsn) {
             if let Some(entry) = weak.upgrade() {
                 if entry.engine.is_read_only_mode() {
@@ -1080,19 +556,14 @@ impl Database {
                 }
                 return Ok(Self::share_entry(entry));
             }
-            // Dead Weak — will be overwritten by the insert below.
         }
 
-        // Parse the DSN
         let (scheme, path) = Self::parse_dsn(dsn)?;
 
-        // test-filedb: track temp dir so it lives as long as the engine
         #[cfg(feature = "test-filedb")]
         let mut _temp_dir_holder: Option<tempfile::TempDir> = None;
 
-        // Create the engine. `Database::open` is writable-only (the
-        // `?read_only` DSN flag was rejected above), so no SWMR
-        // pre-acquire / lease / shm setup runs here.
+        // Writable-only path: no SWMR lease/shm setup.
         let engine = match scheme.as_str() {
             MEMORY_SCHEME => {
                 #[cfg(feature = "test-filedb")]
@@ -1134,9 +605,6 @@ impl Database {
             }
         };
 
-        // Build the engine entry. Writable-only: no lease, no shm,
-        // no attach snapshot — those exist solely for cross-process
-        // SWMR readers (`Database::open_read_only`).
         let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
         let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
         let entry = Arc::new(EngineEntry {
@@ -1156,46 +624,20 @@ impl Database {
             _temp_dir: _temp_dir_holder,
         });
 
-        // Store a Weak in the registry so it self-expires when the last
-        // user handle drops.
         registry.insert(dsn.to_string(), Arc::downgrade(&entry));
 
         Ok(Self::share_entry(entry))
     }
 
-    /// Open an in-memory database
-    ///
-    /// This is a convenience method that creates a new in-memory database.
-    /// Each call creates a unique instance (unlike `open("memory://")` which
-    /// would share the same instance).
+    /// Open a fresh in-memory database. Unlike `open("memory://")`, each call is unique.
     pub fn open_in_memory() -> Result<Self> {
         Self::create_in_memory_engine()
     }
 
-    /// Open a read-only handle over an existing database.
-    ///
-    /// Opens the database normally (or reuses an existing registry entry) and
-    /// wraps the engine in a `ReadOnlyDatabase` that rejects all write SQL at
-    /// query time.
-    ///
-    /// On a `file://` DSN this also registers a cross-process presence
-    /// lease so a sibling writer process defers volume cleanup while this
-    /// reader is attached. See [`crate::api::ReadOnlyDatabase`] doc for
-    /// the lease-touch cadence requirement (issue at least one query
-    /// per `2 * checkpoint_interval` to keep the lease fresh).
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let rodb = Database::open_read_only("file:///tmp/mydb")?;
-    /// for row in rodb.query("SELECT * FROM users", ())? {
-    ///     let row = row?;
-    ///     println!("{:?}", row);
-    /// }
-    /// ```
+    /// Open a read-only handle over an existing `file://` database. The returned
+    /// `ReadOnlyDatabase` rejects write SQL and registers a cross-process presence
+    /// lease (issue at least one query per `2 * checkpoint_interval` to keep it fresh).
     pub fn open_read_only(dsn: &str) -> Result<crate::api::ReadOnlyDatabase> {
-        // Read-only is meaningless on `memory://`: a fresh in-memory engine
-        // has nothing to read. Reject early.
         if dsn.starts_with(MEMORY_SCHEME) {
             return Err(Error::invalid_argument(
                 "open_read_only is not supported on memory:// (a fresh \
@@ -1204,14 +646,7 @@ impl Database {
             ));
         }
 
-        // The function name already says read-only. DSN flags
-        // requesting read-only (`?read_only=true` /
-        // `?readonly=true` / `?mode=ro`) are accepted as
-        // redundant — drivers that build DSN strings can keep
-        // emitting them. A flag explicitly requesting writable
-        // (`?read_only=false` / `?readonly=false` / `?mode=rw`)
-        // contradicts the function name and is rejected so the
-        // caller catches the mistake at the API surface.
+        // Reject DSN flag that explicitly requests writable; redundant RO flags accepted.
         if Self::dsn_read_only_flag(dsn)? == Some(false) {
             return Err(Error::invalid_argument(
                 "Database::open_read_only called with a DSN flag that \
@@ -1222,12 +657,7 @@ impl Database {
             ));
         }
 
-        // Parse `auto_refresh` and `refresh_interval` once, up front,
-        // so the parse error surfaces before any registry / engine
-        // work and the flags are uniformly applied to both the
-        // cache-hit and fresh-create paths below. `Duration::ZERO`
-        // means "explicitly disabled" (no background ticker); `None`
-        // means "absent from DSN, leave the per-handle default".
+        // Parse refresh flags up front so errors surface before any engine work.
         let dsn_auto_refresh = Self::dsn_auto_refresh_flag(dsn)?;
         let dsn_refresh_interval = Self::dsn_refresh_interval_flag(dsn)?;
         let apply_dsn_flags =
@@ -1243,47 +673,8 @@ impl Database {
                 Ok(ro)
             };
 
-        // If the DSN is already open in this process (writable or
-        // read-only), share the existing engine entry — but ONLY
-        // when ALL of:
-        //   - `entry.shm` is `Some` (no-shm v1 fallback entries
-        //     are non-reusable: see the matching predicate in
-        //     `Database::open` for why),
-        //   - the writer's published frontier hasn't moved past
-        //     the entry's attach, AND
-        //   - the writer's `writer_generation` matches the
-        //     entry's attach snapshot.
-        //
-        // The visible-LSN check protects against silently
-        // skipping WAL: the shared engine was opened ONCE with
-        // `attach_visible_commit_lsn` as its replay cap; any
-        // commits the writer published after that point are not
-        // in the engine's parent VersionStores. Older handles on
-        // the same entry pick them up via their per-handle overlay
-        // tail, but a new handle's overlay seeded at any
-        // post-attach baseline would mark those WAL entries as
-        // already applied and silently skip them.
-        //
-        // The generation check protects against writer
-        // close/reopen or crash/restart that recovered to the
-        // same `visible_commit_lsn`. In that case any old
-        // handle correctly raises `SwmrWriterReincarnated` on
-        // its next refresh, but reuse here would hand the
-        // caller back the same stale `EngineEntry` (same
-        // `attach_writer_gen`), and the next refresh would
-        // immediately fail again. Refusing reuse on a generation
-        // bump forces a fresh open path that re-samples the new
-        // writer's identity into a new attach snapshot.
-        //
-        // The no-shm rejection protects against a cross-process
-        // writer that started AFTER this process's no-writer
-        // open. The original handshake (NoWriter outcome)
-        // dropped the kernel SH right after `open_engine`, and
-        // `acquire_shared` on Unix takes no kernel lock, so a
-        // writer can have created `db.shm` and published commits
-        // since attach. A reused entry would skip
-        // `pre_acquire_swmr_for_read_only_path` and never see
-        // the new writer's frontier or DDL.
+        // Entry reuse requires shm present, frontier static, and writer_gen unchanged
+        // since attach; otherwise fall through to a fresh open with new attach snapshot.
         let frontier_static = |entry: &Arc<EngineEntry>| -> bool {
             match entry.shm.as_ref() {
                 Some(h) => {
@@ -1301,17 +692,7 @@ impl Database {
                 None => false,
             }
         };
-        // Cached writable entries are ALWAYS reusable: the writer
-        // owns the engine, so wrapping it as a `ReadOnlyDatabase`
-        // is the same operation as `Database::as_read_only()`.
-        // The `frontier_static` check is gated on `entry.shm`,
-        // which is always `None` for writable entries (shm/lease
-        // snapshots are only stored on read-only pre-acquire), so
-        // running the check would unconditionally fall through to
-        // fresh-create, evicting the live writable weak from the
-        // registry. A subsequent `Database::open(dsn)` would then
-        // see the new read-only weak and return a mode-mismatch
-        // error against the still-live writable handle.
+        // Writable cached entries are always reusable (equivalent to `as_read_only`).
         let cached_is_writable =
             |entry: &Arc<EngineEntry>| -> bool { !entry.engine.is_read_only_mode() };
         {
@@ -1321,29 +702,21 @@ impl Database {
             if let Some(weak) = registry.get(dsn) {
                 if let Some(entry) = weak.upgrade() {
                     if cached_is_writable(&entry) || frontier_static(&entry) {
-                        return apply_dsn_flags(crate::api::ReadOnlyDatabase::from_entry(entry));
+                        return apply_dsn_flags(crate::api::ReadOnlyDatabase::from_entry(entry)?);
                     }
-                    // Frontier moved — fall through to fresh-create.
-                    // Existing handles keep their Arc<EngineEntry>;
-                    // the stale Weak<> in the registry will be
-                    // overwritten by the new entry's insert below.
                 }
             }
         }
 
-        // Need to create a new engine in read-only mode (acquires LOCK_SH,
-        // skips background cleanup). Acquire registry write lock.
         let mut registry = DATABASE_REGISTRY
             .write()
             .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
 
-        // Double-check after acquiring write lock.
         if let Some(weak) = registry.get(dsn) {
             if let Some(entry) = weak.upgrade() {
                 if cached_is_writable(&entry) || frontier_static(&entry) {
-                    return apply_dsn_flags(crate::api::ReadOnlyDatabase::from_entry(entry));
+                    return apply_dsn_flags(crate::api::ReadOnlyDatabase::from_entry(entry)?);
                 }
-                // Frontier moved — fall through.
             }
         }
 
@@ -1352,10 +725,6 @@ impl Database {
         #[cfg(feature = "test-filedb")]
         let _temp_dir_holder: Option<tempfile::TempDir> = None;
 
-        // memory:// was rejected at the top of this function. Only file://
-        // reaches the engine-construction match. Each arm returns the engine
-        // and the SWMR lease/shm/attach snapshots so the EngineEntry can
-        // observe the writer's state from the moment recovery begins.
         let (
             engine,
             lease,
@@ -1371,12 +740,7 @@ impl Database {
                 let (clean_path, mut config) = Self::parse_file_config(&path)?;
                 config.read_only = true;
 
-                // Read-only opens must not create a new database. Refuse if
-                // the directory doesn't already exist (or exists but lacks a
-                // recognizable stoolap layout). Without this check,
-                // PersistenceManager::new would `create_dir_all` and lay
-                // down a fresh WAL, silently turning `open_read_only` into
-                // a write that creates an empty DB.
+                // Refuse to materialize a fresh DB on a read-only open.
                 let path_obj = std::path::Path::new(&clean_path);
                 if !path_obj.exists() {
                     return Err(Error::internal(format!(
@@ -1390,10 +754,7 @@ impl Database {
                         clean_path
                     )));
                 }
-                // A stoolap database always has a `wal` subdirectory once
-                // it has been written to. If neither `wal/` nor `volumes/`
-                // exists, the directory is not a stoolap database and we
-                // refuse to materialize one in read-only mode.
+                // Require wal/ or volumes/ to confirm this is an existing stoolap DB.
                 let has_wal = path_obj.join("wal").exists();
                 let has_volumes = path_obj.join("volumes").exists();
                 if !has_wal && !has_volumes {
@@ -1404,11 +765,7 @@ impl Database {
                     )));
                 }
 
-                // Pre-acquire the SWMR lease + shm snapshot BEFORE engine
-                // open. The lease must be live during WAL replay so the
-                // writer's GC sees us; the attach snapshot drives the
-                // engine's replay cap so unpublished commit markers are
-                // not applied.
+                // Pre-acquire SWMR lease + shm + attach snapshots before engine open.
                 let (
                     lease,
                     shm,
@@ -1420,27 +777,7 @@ impl Database {
                 ) = EngineEntry::pre_acquire_swmr_for_read_only_path(std::path::Path::new(
                     &clean_path,
                 ))?;
-                // The pre-acquire pin contribution stays in the
-                // registry until ReadOnlyDatabase::from_entry
-                // installs its own per-handle pin (also in the
-                // registry) and then we remove the pre-acquire
-                // contribution below — registry MIN guarantees
-                // the on-disk lease never drops below the
-                // sibling-handles' floor at any point.
-                // `handshake_guard` is `Some` only on no-shm
-                // paths. Held across `engine.open_engine()` to
-                // block writer-startup races; for the chmod-RO
-                // case (lease=None on a writable mount) we
-                // ALSO move it into `EngineEntry.chmod_ro_lock`
-                // below so it persists for the entry's
-                // lifetime, providing kernel-level reader
-                // presence the writer's `LOCK_EX` acquisition
-                // would otherwise bypass.
-                // Snapshot the manifest epoch BEFORE open_engine
-                // for the same reason as Database::open: a sibling
-                // ReadOnlyDatabase from `from_entry` seeds its
-                // `last_seen_epoch` from this baseline rather than
-                // reading the live on-disk file.
+                // Snapshot manifest epoch before open_engine; from_entry seeds it as baseline.
                 let loaded_epoch = crate::storage::mvcc::manifest_epoch::read_epoch(
                     std::path::Path::new(&clean_path),
                 )
@@ -1449,10 +786,7 @@ impl Database {
                 if shm.is_some() {
                     engine.set_replay_cap_lsn(attach_visible_commit_lsn);
                 }
-                // open_engine failure must NOT leak the temp
-                // pre-acquire pin contribution. See the
-                // matching `Database::open` cleanup for the
-                // full rationale.
+                // Don't leak the pre-acquire pin contribution on open failure.
                 if let Err(e) = engine.open_engine() {
                     if let Some(ref l) = lease {
                         l.remove_handle_pin(pre_acquire_pin_handle_id);
@@ -1460,30 +794,10 @@ impl Database {
                     return Err(e);
                 }
                 let engine = Arc::new(engine);
-                // start_cleanup is a no-op when config.read_only is set,
-                // but call it for symmetry with the writable path.
+                // No-op for read_only configs but call for symmetry.
                 engine.start_cleanup();
-                // Do NOT release the pre-acquire pin here. There
-                // is a gap between this point and
-                // `ReadOnlyDatabase::from_entry` (which installs
-                // the per-handle pin); a writer checkpoint in
-                // that gap could truncate post-attach WAL the
-                // first refresh needs. The pre-acquire pin of
-                // `1` keeps WAL protected through the gap, and
-                // `from_entry`'s `set_handle_pin(handle_id, 1)`
-                // overwrites the on-disk value with the same `1`
-                // (no behaviour change there). Drop's
-                // `remove_handle_pin` then releases to `0` when
-                // the last per-handle contribution drops.
-                // Persist the handshake guard for the chmod-RO
-                // / RO-mount fallback (lease=None paths). For
-                // ro_mount no writer can ever exist so the
-                // guard is harmless extra protection; for
-                // chmod-RO it's the only thing keeping a
-                // privileged writer from `LOCK_EX`-ing under
-                // us. For the standard lease-backed path the
-                // guard is dropped here — the writer
-                // coordinates via the lease, not flock.
+                // Pre-acquire pin stays until `from_entry` installs the per-handle pin.
+                // Persist handshake guard for chmod-RO / RO-mount lease=None paths.
                 let chmod_ro_lock = if lease.is_none() {
                     handshake_guard
                 } else {
@@ -1511,27 +825,7 @@ impl Database {
 
         let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
         let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
-        // `open_read_only` does NOT install an entry-scoped pin.
-        // The ReadOnlyDatabase built below via `from_entry`
-        // installs its own per-handle pin at
-        // `attach_visible_commit_lsn.max(1)`, which advances
-        // forward via `advance_pin_after_refresh` as the reader
-        // observes new commits. Holding an additional entry pin
-        // at the original attach LSN would clamp the writer's
-        // `min_pinned_lsn` to that fixed value for the entry's
-        // full lifetime, blocking WAL truncation forever even
-        // after the per-handle pin moved on.
-        //
-        // The plain `Database::open(...?read_only=true)` path
-        // DOES install an entry pin because it has no per-handle
-        // pin between open and a future `as_read_only()` call,
-        // and the entry-pin floor is what makes that wrap safe.
-        // Registry-share between the two paths is safe because
-        // the `frontier_static` check in `Database::open` refuses
-        // to reuse an entry whose `visible_commit_lsn` has moved
-        // past attach: no new commits since attach implies the
-        // writer's `compute_wal_truncate_floor` cannot move past
-        // attach either.
+        // No entry-scoped pin: `from_entry` installs an advancing per-handle pin instead.
         let entry = Arc::new(EngineEntry {
             engine,
             dsn: dsn.to_string(),
@@ -1551,47 +845,34 @@ impl Database {
 
         registry.insert(dsn.to_string(), Arc::downgrade(&entry));
 
-        let ro_db = crate::api::ReadOnlyDatabase::from_entry(entry.clone());
-        // ReadOnlyDatabase::from_entry installed its own
-        // per-handle pin at `attach_visible_commit_lsn.max(1)`.
-        // That pin is now the protective floor; release the
-        // pre-acquire contribution so the writer's truncate
-        // cycle isn't held at `1` indefinitely.
+        // Release pre-acquire pin on either path: success means
+        // from_entry installed its own per-handle pin (the new floor);
+        // failure means the in-process lease_pin_contributions entry
+        // would otherwise leak past EngineEntry::drop and constrain
+        // future readers' MIN computation.
+        let ro_db = match crate::api::ReadOnlyDatabase::from_entry(entry.clone()) {
+            Ok(db) => db,
+            Err(e) => {
+                if let Some(ref l) = entry.lease {
+                    l.remove_handle_pin(pre_acquire_pin_handle_id);
+                }
+                return Err(e);
+            }
+        };
         if let Some(ref l) = entry.lease {
             l.remove_handle_pin(pre_acquire_pin_handle_id);
         }
         apply_dsn_flags(ro_db)
     }
 
-    /// Return a read-only view over this database.
-    ///
-    /// The returned handle shares the same underlying engine and sees the same
-    /// committed data. Write SQL submitted through the `ReadOnlyDatabase`
-    /// handle is rejected at query time.
-    ///
-    /// The returned handle holds an Arc to this Database's engine entry, so
-    /// the engine stays open as long as either handle is alive.
-    ///
-    /// # Transaction visibility
-    ///
-    /// The returned `ReadOnlyDatabase` has its own executor with independent
-    /// transaction state — it is a *view*, not a connection sharing this
-    /// `Database`'s session. In particular:
-    ///
-    /// - An uncommitted `BEGIN` on this `Database` (e.g. via [`Self::begin`])
-    ///   is **not** visible through the read-only view. Writes inside the
-    ///   open transaction are not observed until they commit.
-    /// - A `BEGIN` issued via SQL on the read-only view starts a separate
-    ///   read-only transaction snapshot; it does not interact with any
-    ///   transaction on this `Database`.
-    /// - Default isolation level is independent: changing it on one handle
-    ///   has no effect on the other.
-    ///
-    /// If you need a read-only handle that observes uncommitted writes from a
-    /// specific transaction, do the read inside that same `Transaction`
-    /// (which is gated by the parser at SQL time but allowed for read SQL).
+    /// Return a read-only view sharing this database's engine. Writes through
+    /// the view are rejected at query time. The view has its own executor:
+    /// uncommitted writes from this `Database`'s transactions are not visible.
     pub fn as_read_only(&self) -> crate::api::ReadOnlyDatabase {
+        // Writable entries have no lease, so attach() can't fail on the
+        // epoch-file path. Any failure here is a hard internal error.
         crate::api::ReadOnlyDatabase::from_entry(Arc::clone(&self.inner.entry))
+            .expect("as_read_only on a writable Database cannot fail")
     }
 
     #[cfg(feature = "test-filedb")]
@@ -1637,8 +918,6 @@ impl Database {
             dsn: "memory://".to_string(),
             semantic_cache,
             query_planner,
-            // memory:// engines are never read-only and have no
-            // disk path, so no SWMR coordination applies.
             lease: None,
             shm: None,
             attach_writer_gen: 0,
@@ -1651,34 +930,7 @@ impl Database {
         Ok(Self::share_entry(entry))
     }
 
-    /// Parse a DSN into scheme and path
-    /// Parse the DSN's query string for an explicit read-only
-    /// flag.  Returns `Ok(None)` when no recognized flag is
-    /// present, `Ok(Some(true))` for `?read_only=true` /
-    /// `?readonly=true` / `?mode=ro`, and `Ok(Some(false))` for
-    /// the writable spellings (`?read_only=false`, `?mode=rw`,
-    /// ...).  `Err` when a recognized key has an invalid value
-    /// (`?read_only=banana`).
-    ///
-    /// Used by `Database::open` (rejects `Some(true)` with the
-    /// migration message) and `Database::open_read_only`
-    /// (rejects `Some(false)` as a contradiction with the
-    /// function name; treats `Some(true)` as a redundant no-op).
-    ///
-    /// Last-flag-wins semantics: the parser scans every param
-    /// and records the LAST recognized value, regardless of
-    /// which spelling it used. Without this, the same DSN
-    /// could pass the API-surface check while
-    /// `parse_file_config` interpreted it differently.
-    ///
-    /// Only the query-string portion (after `?`) is scanned —
-    /// substring checks against the whole DSN would catch
-    /// `mode=` / `read_only=` inside file paths or unrelated
-    /// query values.
-    /// Parse `auto_refresh=on/off/true/false/1/0/yes/no` from the DSN
-    /// query string. Returns `Ok(None)` when the key is absent so
-    /// callers can apply their own default. Same last-flag-wins
-    /// semantics as `dsn_read_only_flag`.
+    /// Parse `auto_refresh=on/off/...` from the DSN. `Ok(None)` if absent.
     pub(crate) fn dsn_auto_refresh_flag(dsn: &str) -> Result<Option<bool>> {
         let query = match dsn.find('?') {
             Some(idx) => &dsn[idx + 1..],
@@ -1705,12 +957,7 @@ impl Database {
         Ok(last)
     }
 
-    /// Parse `refresh_interval=Nms|Ns|Nm|0` from the DSN query
-    /// string. Returns `Ok(None)` when the key is absent. `0` (with
-    /// or without unit) means "no background ticker" and is
-    /// returned as `Ok(Some(Duration::ZERO))` so callers can
-    /// distinguish "explicitly disabled" from "unset". Last-flag-
-    /// wins semantics; rejects unitless numbers and unknown units.
+    /// Parse `refresh_interval=Nms|Ns|Nm|0` from the DSN. `0` = explicitly disabled.
     pub(crate) fn dsn_refresh_interval_flag(dsn: &str) -> Result<Option<Duration>> {
         let query = match dsn.find('?') {
             Some(idx) => &dsn[idx + 1..],
@@ -1906,19 +1153,8 @@ impl Database {
                                 ))
                             })?;
                     }
-                    // Open in read-only mode: read_only=true
-                    //
-                    // When set, the engine acquires the file lock in shared
-                    // mode (multiple readers coexist), skips the background
-                    // checkpoint thread, and the executor refuses any write
-                    // SQL via the parser-level gate plus the DML auto-commit
-                    // guard. Equivalent to calling `Database::open_read_only`
-                    // except the returned handle has the writable `Database`
-                    // type — write attempts fail at runtime with
-                    // `Error::ReadOnlyViolation`.
+                    // Read-only mode: read_only=true / readonly=true / mode=ro
                     "read_only" | "readonly" | "mode" => {
-                        // For "mode" the value is "ro" / "rw" (sqlite-style);
-                        // for "read_only"/"readonly" it's "true"/"false"/"1"/"0".
                         config.read_only = match value.to_lowercase().as_str() {
                             "true" | "1" | "yes" | "on" | "ro" => true,
                             "false" | "0" | "no" | "off" | "rw" => false,
@@ -2026,54 +1262,15 @@ impl Database {
         Ok((clean_path, config))
     }
 
-    /// Execute a SQL statement
-    ///
-    /// Use this for DDL (CREATE, DROP, ALTER) and DML (INSERT, UPDATE, DELETE) statements.
-    ///
-    /// # Parameters
-    ///
-    /// Parameters can be passed using:
-    /// - Empty tuple `()` for no parameters
-    /// - Tuple syntax `(1, "Alice", 30)` for multiple parameters
-    /// - `params!` macro `params![1, "Alice", 30]`
-    ///
-    /// # Returns
-    ///
-    /// Returns the number of rows affected for DML statements, or 0 for DDL.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // DDL - no parameters
-    /// db.execute("CREATE TABLE users (id INTEGER, name TEXT)", ())?;
-    ///
-    /// // DML with tuple parameters
-    /// db.execute("INSERT INTO users VALUES ($1, $2)", (1, "Alice"))?;
-    ///
-    /// // DML with params! macro
-    /// db.execute("INSERT INTO users VALUES ($1, $2)", params![2, "Bob"])?;
-    ///
-    /// // Update with mixed types
-    /// let affected = db.execute(
-    ///     "UPDATE users SET name = $1 WHERE id = $2",
-    ///     ("Charlie", 1)
-    /// )?;
-    /// ```
-    /// Per-call SWMR maintenance for any query/execute entry
-    /// point on this `Database`. Bumps the lease mtime so the
-    /// writer's reaper doesn't declare us stale.
-    ///
-    /// `Database` is always writable. For writable engines the
-    /// heartbeat is a no-op (no lease to bump). Cross-process
-    /// read-only handles go through `ReadOnlyDatabase` (opened
-    /// via `Database::open_read_only`), which has its own
-    /// refresh + heartbeat path on `maybe_auto_refresh`.
+    /// Per-call SWMR maintenance: heartbeat the lease. No-op for writable engines.
     #[inline]
     pub(crate) fn heartbeat_and_maybe_refresh(&self) -> Result<()> {
         self.inner.entry.heartbeat_swmr_lease();
         Ok(())
     }
 
+    /// Execute a DDL or DML statement. Returns rows affected (0 for DDL).
+    /// Parameters: `()`, tuple `(1, "Alice")`, or `params![...]`.
     pub fn execute<P: Params>(&self, sql: &str, params: P) -> Result<i64> {
         self.heartbeat_and_maybe_refresh()?;
         let executor = self
@@ -2093,35 +1290,7 @@ impl Database {
         Ok(result.rows_affected())
     }
 
-    /// Execute a query that returns rows
-    ///
-    /// # Parameters
-    ///
-    /// Parameters can be passed using:
-    /// - Empty tuple `()` for no parameters
-    /// - Tuple syntax `(value,)` for single parameter (note trailing comma)
-    /// - Tuple syntax `(1, "Alice")` for multiple parameters
-    /// - `params!` macro `params![1, "Alice"]`
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // Query all rows
-    /// for row in db.query("SELECT * FROM users", ())? {
-    ///     let row = row?;
-    ///     let id: i64 = row.get(0)?;
-    ///     let name: String = row.get("name")?;
-    /// }
-    ///
-    /// // Query with parameters
-    /// for row in db.query("SELECT * FROM users WHERE age > $1", (18,))? {
-    ///     // ...
-    /// }
-    ///
-    /// // Collect into Vec
-    /// let users: Vec<_> = db.query("SELECT * FROM users", ())?
-    ///     .collect::<Result<Vec<_>, _>>()?;
-    /// ```
+    /// Execute a query and return rows. Single-param tuples need a trailing comma: `(v,)`.
     pub fn query<P: Params>(&self, sql: &str, params: P) -> Result<Rows> {
         self.heartbeat_and_maybe_refresh()?;
         let executor = self
@@ -2141,17 +1310,8 @@ impl Database {
         Ok(Rows::new(result))
     }
 
-    /// Execute a query and return a single value
-    ///
-    /// This is a convenience method for queries that return a single row with a single column.
-    /// Returns an error if the query returns no rows.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let count: i64 = db.query_one("SELECT COUNT(*) FROM users", ())?;
-    /// let name: String = db.query_one("SELECT name FROM users WHERE id = $1", (1,))?;
-    /// ```
+    /// Query a single value from a single-row, single-column result.
+    /// Errors if no rows returned.
     pub fn query_one<T: FromValue, P: Params>(&self, sql: &str, params: P) -> Result<T> {
         let row = self
             .query(sql, params)?
@@ -2160,16 +1320,7 @@ impl Database {
         row.get(0)
     }
 
-    /// Execute a query and return an optional single value
-    ///
-    /// Like `query_one`, but returns `None` if no rows are returned.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let name: Option<String> = db.query_opt("SELECT name FROM users WHERE id = $1", (999,))?;
-    /// assert!(name.is_none());
-    /// ```
+    /// Like `query_one` but returns `None` instead of erroring on no rows.
     pub fn query_opt<T: FromValue, P: Params>(&self, sql: &str, params: P) -> Result<Option<T>> {
         match self.query(sql, params)?.next() {
             Some(row) => Ok(Some(row?.get(0)?)),
@@ -2177,17 +1328,7 @@ impl Database {
         }
     }
 
-    /// Execute a write statement with a timeout
-    ///
-    /// Like `execute`, but cancels the query if it exceeds the timeout.
-    /// Timeout is specified in milliseconds. Use 0 for no timeout.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // Execute with 5 second timeout
-    /// db.execute_with_timeout("DELETE FROM large_table WHERE old = true", (), 5000)?;
-    /// ```
+    /// Like `execute` with a timeout in ms. `0` = no timeout.
     pub fn execute_with_timeout<P: Params>(
         &self,
         sql: &str,
@@ -2211,19 +1352,7 @@ impl Database {
         Ok(result.rows_affected())
     }
 
-    /// Execute a query with a timeout
-    ///
-    /// Like `query`, but cancels the query if it exceeds the timeout.
-    /// Timeout is specified in milliseconds. Use 0 for no timeout.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // Query with 10 second timeout
-    /// for row in db.query_with_timeout("SELECT * FROM large_table", (), 10000)? {
-    ///     // process row
-    /// }
-    /// ```
+    /// Like `query` with a timeout in ms. `0` = no timeout.
     pub fn query_with_timeout<P: Params>(
         &self,
         sql: &str,
@@ -2247,57 +1376,17 @@ impl Database {
         Ok(Rows::new(result))
     }
 
-    /// Prepare a SQL statement for repeated execution
-    ///
-    /// Prepared statements are more efficient when executing the same query
-    /// multiple times with different parameters.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let stmt = db.prepare("SELECT * FROM users WHERE id = $1")?;
-    ///
-    /// // Execute multiple times with different parameters
-    /// for id in 1..=10 {
-    ///     for row in stmt.query((id,))? {
-    ///         // ...
-    ///     }
-    /// }
-    /// ```
+    /// Prepare a SQL statement for repeated execution with different params.
     pub fn prepare(&self, sql: &str) -> Result<Statement> {
         Statement::new(Arc::downgrade(&self.inner), sql.to_string(), self)
     }
 
-    /// Create a Database from an existing Arc<DatabaseInner>.
-    /// Used by Statement to upgrade weak references.
+    /// Used by Statement to upgrade weak references back to a Database handle.
     pub(crate) fn from_inner(inner: Arc<DatabaseInner>) -> Self {
         Database { inner }
     }
 
-    /// Execute a statement with named parameters
-    ///
-    /// Named parameters use the `:name` syntax in SQL queries.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use stoolap::{Database, named_params};
-    ///
-    /// let db = Database::open("memory://")?;
-    /// db.execute("CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)", ())?;
-    ///
-    /// // Insert with named params
-    /// db.execute_named(
-    ///     "INSERT INTO users VALUES (:id, :name, :age)",
-    ///     named_params!{ id: 1, name: "Alice", age: 30 }
-    /// )?;
-    ///
-    /// // Update with named params
-    /// db.execute_named(
-    ///     "UPDATE users SET name = :name WHERE id = :id",
-    ///     named_params!{ id: 1, name: "Alicia" }
-    /// )?;
-    /// ```
+    /// Execute a statement with `:name`-style named parameters.
     pub fn execute_named(&self, sql: &str, params: NamedParams) -> Result<i64> {
         self.heartbeat_and_maybe_refresh()?;
         let executor = self
@@ -2310,28 +1399,7 @@ impl Database {
         Ok(result.rows_affected())
     }
 
-    /// Execute a query with named parameters
-    ///
-    /// Named parameters use the `:name` syntax in SQL queries.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use stoolap::{Database, named_params};
-    ///
-    /// let db = Database::open("memory://")?;
-    /// db.execute("CREATE TABLE users (id INTEGER, name TEXT)", ())?;
-    /// db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')", ())?;
-    ///
-    /// // Query with named params
-    /// for row in db.query_named(
-    ///     "SELECT * FROM users WHERE name = :name",
-    ///     named_params!{ name: "Alice" }
-    /// )? {
-    ///     let row = row?;
-    ///     println!("Found user: id={}", row.get::<i64>(0)?);
-    /// }
-    /// ```
+    /// Query with `:name`-style named parameters.
     pub fn query_named(&self, sql: &str, params: NamedParams) -> Result<Rows> {
         self.heartbeat_and_maybe_refresh()?;
         let executor = self
@@ -2344,18 +1412,7 @@ impl Database {
         Ok(Rows::new(result))
     }
 
-    /// Execute a query with named parameters and return a single value
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use stoolap::{Database, named_params};
-    ///
-    /// let count: i64 = db.query_one_named(
-    ///     "SELECT COUNT(*) FROM users WHERE age > :min_age",
-    ///     named_params!{ min_age: 18 }
-    /// )?;
-    /// ```
+    /// Query a single value with named parameters.
     pub fn query_one_named<T: FromValue>(&self, sql: &str, params: NamedParams) -> Result<T> {
         let mut rows = self.query_named(sql, params)?;
         match rows.next() {
@@ -2365,102 +1422,24 @@ impl Database {
         }
     }
 
-    /// Execute a query and map results to structs
-    ///
-    /// This method executes a query and converts each row to a struct
-    /// that implements the `FromRow` trait.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use stoolap::{Database, FromRow, ResultRow, Result};
-    ///
-    /// struct User {
-    ///     id: i64,
-    ///     name: String,
-    /// }
-    ///
-    /// impl FromRow for User {
-    ///     fn from_row(row: &ResultRow) -> Result<Self> {
-    ///         Ok(User {
-    ///             id: row.get(0)?,
-    ///             name: row.get(1)?,
-    ///         })
-    ///     }
-    /// }
-    ///
-    /// let db = Database::open("memory://")?;
-    /// db.execute("CREATE TABLE users (id INTEGER, name TEXT)", ())?;
-    /// db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')", ())?;
-    ///
-    /// // Query and map to structs
-    /// let users: Vec<User> = db.query_as("SELECT id, name FROM users", ())?;
-    /// assert_eq!(users.len(), 2);
-    /// assert_eq!(users[0].name, "Alice");
-    /// ```
+    /// Query and map each row to `T` via the `FromRow` trait.
     pub fn query_as<T: FromRow, P: Params>(&self, sql: &str, params: P) -> Result<Vec<T>> {
         let rows = self.query(sql, params)?;
         rows.map(|r| r.and_then(|row| T::from_row(&row))).collect()
     }
 
-    /// Execute a query with named parameters and map results to structs
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use stoolap::{Database, FromRow, ResultRow, Result, named_params};
-    ///
-    /// struct Product {
-    ///     id: i64,
-    ///     name: String,
-    ///     price: f64,
-    /// }
-    ///
-    /// impl FromRow for Product {
-    ///     fn from_row(row: &ResultRow) -> Result<Self> {
-    ///         Ok(Product {
-    ///             id: row.get(0)?,
-    ///             name: row.get(1)?,
-    ///             price: row.get(2)?,
-    ///         })
-    ///     }
-    /// }
-    ///
-    /// let products: Vec<Product> = db.query_as_named(
-    ///     "SELECT id, name, price FROM products WHERE price > :min_price",
-    ///     named_params!{ min_price: 10.0 }
-    /// )?;
-    /// ```
+    /// Query with named parameters and map each row to `T` via `FromRow`.
     pub fn query_as_named<T: FromRow>(&self, sql: &str, params: NamedParams) -> Result<Vec<T>> {
         let rows = self.query_named(sql, params)?;
         rows.map(|r| r.and_then(|row| T::from_row(&row))).collect()
     }
 
-    /// Begin a new transaction with default isolation level
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let tx = db.begin()?;
-    /// tx.execute("INSERT INTO users VALUES ($1, $2)", (1, "Alice"))?;
-    /// tx.commit()?;
-    /// ```
+    /// Begin a transaction with the default isolation level (ReadCommitted).
     pub fn begin(&self) -> Result<Transaction> {
         self.begin_with_isolation(IsolationLevel::ReadCommitted)
     }
 
-    /// Begin a new transaction with a specific isolation level
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use stoolap::IsolationLevel;
-    ///
-    /// let tx = db.begin_with_isolation(IsolationLevel::Snapshot)?;
-    /// // All reads in this transaction see a consistent snapshot
-    /// tx.execute("UPDATE users SET balance = balance - 100 WHERE id = $1", (1,))?;
-    /// tx.commit()?;
-    /// ```
+    /// Begin a transaction with a specific isolation level.
     pub fn begin_with_isolation(&self, isolation: IsolationLevel) -> Result<Transaction> {
         let executor = self
             .inner
@@ -2469,100 +1448,26 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let tx = executor.begin_transaction_with_isolation(isolation)?;
-        // Pass the engine entry (not just the engine Arc) so live
-        // transactions count toward `Arc::strong_count(&entry)`. Without
-        // this, `db.close()` could fire `engine.close_engine()` while a
-        // transaction is alive — close() would see the entry's count as 1
-        // (only db.inner.entry) and conclude no other peer needs the
-        // engine. The transaction's `Arc<MVCCEngine>` clone wouldn't
-        // affect that count, leaving the txn with a closed engine.
+        // Pass the entry so live txns count in `Arc::strong_count(&entry)` and `close()` defers.
         let entry = Arc::clone(&self.inner.entry);
         Ok(Transaction::new(tx, entry))
     }
 
-    /// Get the underlying storage engine
-    ///
-    /// This is primarily for advanced use cases and testing.
-    ///
-    /// # Read-only handles
-    ///
-    /// On a `Database` opened with `?read_only=true` / `?mode=ro`, every
-    /// write-intent method on the returned `MVCCEngine` is gated and
-    /// returns `Error::ReadOnlyViolation`:
-    ///
-    /// - `Engine::begin_transaction` / `begin_transaction_with_level`
-    ///   (the trait methods reachable through `engine.begin_transaction()`).
-    /// - `Engine::create_snapshot` / `restore_snapshot`.
-    /// - `MVCCEngine::create_table`, `drop_table_internal`, `create_view`,
-    ///   `drop_view`, `rename_table`, `create_column`,
-    ///   `create_column_with_default`, `drop_column`, `rename_column`,
-    ///   `modify_column`, `update_engine_config`, `vacuum`.
-    /// - `MVCCEngine::cleanup_old_transactions`,
-    ///   `cleanup_deleted_rows`, `cleanup_old_previous_versions` are
-    ///   silent no-ops returning `0` on read-only engines.
-    /// - `MVCCEngine::start_periodic_cleanup` returns a no-op
-    ///   `CleanupHandle` (no thread is spawned).
-    ///
-    /// Other engine methods (`is_open`, `is_read_only_mode`, `path`,
-    /// `volume_stats`, `config`, view lookup, `oldest_loaded_snapshot_timestamp`,
-    /// the `ReadEngine::begin_read_transaction*` family) work normally on
-    /// both writable and read-only handles.
-    ///
-    /// Internal-only methods like `propagate_column_*`,
-    /// `refresh_schema_cache`, `modify_column_with_dimensions`,
-    /// `get_table_for_txn`, `find_referencing_fks`, `get_version_store`
-    /// are not part of the public surface — they are `pub(crate)` and
-    /// not reachable through this accessor.
+    /// Get the underlying storage engine. Advanced use only.
+    /// On read-only handles, write-intent methods on the engine return `Error::ReadOnlyViolation`.
     pub fn engine(&self) -> &Arc<MVCCEngine> {
         &self.inner.entry.engine
     }
 
-    /// Returns `true` if this `Database` was opened in read-only mode
-    /// (`?read_only=true` / `?mode=ro`).
-    ///
-    /// Equivalent to `db.engine().is_read_only_mode()` — provided as a
-    /// direct accessor so callers don't have to reach into the engine.
-    /// Useful for branching in user code that wants to skip work it
-    /// knows would be refused (e.g. issuing PRAGMA SNAPSHOT only when
-    /// writable).
+    /// True if opened with `?read_only=true` / `?mode=ro`.
     pub fn is_read_only(&self) -> bool {
         self.inner.entry.engine.is_read_only_mode()
     }
 
-    /// Get the engine as a read-only trait object.
-    ///
-    /// Returns `Arc<dyn ReadEngine>` instead of the concrete `Arc<MVCCEngine>`
-    /// returned by [`Self::engine`]. The trait object exposes only
-    /// `begin_read_transaction` / `begin_read_transaction_with_level`
-    /// (plus `Engine::table_exists` via the supertrait). Callers holding
-    /// the trait object cannot reach `Engine::begin_transaction` or any
-    /// inherent write method on `MVCCEngine` — the read-only contract is
-    /// enforced at the type level rather than at runtime.
-    ///
-    /// Works on writable Databases too: returning the read surface is
-    /// always safe regardless of mode. Cheap (one Arc clone). Use this
-    /// in libraries that want to accept "any database that can serve
-    /// reads" without coupling to the writable surface.
+    /// Get the engine as a read-only trait object — type-level enforcement of the
+    /// read-only contract. Works on writable Databases too.
     pub fn read_engine(&self) -> Arc<dyn crate::storage::traits::ReadEngine> {
-        // Wrap the engine in a `SwmrReadEngineGuard` so every
-        // `begin_read_transaction*` call through the trait
-        // object first runs the same SWMR maintenance the
-        // public `query` / `execute` paths do: lease heartbeat
-        // (so a long-lived caller isn't reaped as stale) and —
-        // for read-only handles — drive the per-handle refresh
-        // (manifest reload + cache invalidation + writer-gen
-        // reincarnation) so writer-side CREATE/DROP/checkpoint
-        // is observed. Without the wrapper the trait object
-        // went straight to `MVCCEngine::begin_read_transaction*`,
-        // leaving a documented "safe read surface" that
-        // silently kept returning stale state and let the
-        // writer reap the lease.
-        // `Database` is always writable, so the guard's refresh
-        // owner is `None` (no overlay, no manifest poll, no
-        // sticky DDL — those belong to `ReadOnlyDatabase`). The
-        // guard still wraps the engine so a future `Database`
-        // type with refresh needs has a stable extension point,
-        // and so the heartbeat call still routes through here.
+        // Wrap so trait-object callers also get lease heartbeat + refresh maintenance.
         Arc::new(SwmrReadEngineGuard {
             engine: Arc::clone(&self.inner.entry.engine),
             entry: Arc::clone(&self.inner.entry),
@@ -2570,47 +1475,17 @@ impl Database {
         }) as Arc<dyn crate::storage::traits::ReadEngine>
     }
 
-    /// Close the database connection
-    ///
-    /// When this handle is the last one for its DSN, closes the engine
-    /// immediately so the file lock is released for other processes. If
-    /// another `Database` clone, sibling `Database::open(dsn)` handle, or
-    /// `ReadOnlyDatabase` view still references the same engine, the close
-    /// is *deferred* until that last handle drops. This preserves the
-    /// lifetime contract for `as_read_only()` / `open_read_only()` and
-    /// makes `close()` safe to call on one of several handles without
-    /// pulling the rug out from under in-flight queries on the others.
-    ///
-    /// Note: The engine is also closed automatically when the last handle
-    /// is dropped.
+    /// Close the database. If sibling handles exist, defer until the last drops.
+    /// Engine also closes automatically when the last handle drops.
     pub fn close(&self) -> Result<()> {
-        // `Database` is always writable now: no `ReaderAttachment`,
-        // no per-handle pin, no baseline math. The strong_count
-        // check is the simple form — if any sibling
-        // `Database::open(dsn)` clone, `Database::clone()`, or
-        // shared `ReadOnlyDatabase` view still references the
-        // entry, defer; otherwise close.
-        //
-        // The check runs under the registry write lock so a
-        // concurrent `Database::open(dsn)` can't upgrade the
-        // still-live Weak between our decision and our
-        // `close_engine()` call.
+        // Decision under the registry write lock so a concurrent open can't upgrade.
         let mut registry = match DATABASE_REGISTRY.write() {
             Ok(g) => g,
             Err(_) => return Err(Error::LockAcquisitionFailed("registry write".to_string())),
         };
         if Arc::strong_count(&self.inner.entry) > 1 {
-            // Sibling handle alive — defer. Registry stays intact.
             return Ok(());
         }
-        // Commit path: clear the registry's dead-soon Weak so
-        // the next `open(dsn)` doesn't have to upgrade-and-fail,
-        // drop the lock, then close the engine. The
-        // `is_open()` checks inside the transaction-begin paths
-        // cover the residual race where `read_engine()` clones
-        // the entry between this check and `close_engine` —
-        // they surface `EngineNotOpen` as the soft contract
-        // for that vanishing window.
         if let Some(weak) = registry.get(&self.inner.entry.dsn) {
             let same = weak
                 .upgrade()
@@ -2621,16 +1496,12 @@ impl Database {
             }
         }
         drop(registry);
-        // Idempotent — safe to call multiple times.
         self.inner.entry.engine.close_engine()?;
 
         Ok(())
     }
 
-    /// Get a cached plan for a SQL statement (parse once, execute many times).
-    ///
-    /// Returns a `CachedPlanRef` that can be stored and passed to
-    /// `execute_plan()` / `query_plan()` for zero-lookup execution.
+    /// Cache a plan for a SQL statement; pass the returned ref to `execute_plan` / `query_plan`.
     pub fn cached_plan(&self, sql: &str) -> Result<CachedPlanRef> {
         self.heartbeat_and_maybe_refresh()?;
         let executor = self
@@ -2703,36 +1574,17 @@ impl Database {
         Ok(Rows::new(result))
     }
 
-    /// Check if a table exists
+    /// Check if a table exists.
     pub fn table_exists(&self, name: &str) -> Result<bool> {
         use crate::storage::traits::ReadEngine;
-        // Run the same SWMR maintenance the query/execute paths
-        // do: heartbeat the lease (so a `table_exists`-only
-        // poller doesn't get reaped) and — for SWMR-eligible
-        // read-only handles — refresh manifests/WAL so a
-        // writer-side CREATE/DROP/checkpoint is observed instead
-        // of returning the handle's stale schema cache. Surfaces
-        // typed must-reopen errors (`SchemaChanged`,
-        // `SwmrPendingDdl`, ...) too.
         self.heartbeat_and_maybe_refresh()?;
-        // Read-only path: a `ReadTransaction` is enough for `get_read_table`,
-        // and it works on both writable and read-only engines without any
-        // gate bypass.
         let engine = &self.inner.entry.engine;
         let tx = ReadEngine::begin_read_transaction(engine.as_ref())?;
         Ok(tx.get_read_table(name).is_ok())
     }
 
-    /// Returns the number of rows in `name` visible to this autocommit handle.
-    ///
-    /// Goes through the same read-transaction path as `SELECT COUNT(*)` so
-    /// hot rows, sealed cold volumes, and pending tombstones are all
-    /// accounted for. The fast path is O(1) (atomic load of the per-segment
-    /// deduped counter plus the hot committed counter); the slow fallback
-    /// fires only under snapshot-isolation autocommit, which is rare.
-    ///
-    /// For row counts visible to a specific in-flight transaction (including
-    /// its own uncommitted INSERTs/DELETEs) use [`Transaction::table_count`].
+    /// Rows in `name` visible to this autocommit handle. For txn-visible counts
+    /// (including uncommitted writes) use [`Transaction::table_count`].
     pub fn table_count(&self, name: &str) -> Result<u64> {
         use crate::storage::traits::ReadEngine;
         let engine = &self.inner.entry.engine;
@@ -2760,19 +1612,8 @@ impl Database {
         Ok(())
     }
 
-    /// Create a backup snapshot of the database
-    ///
-    /// This creates snapshot files (.bin) for each table along with
-    /// index/view definitions (ddl-{timestamp}.bin) for disaster recovery.
-    /// Normal persistence uses the checkpoint cycle (seal to volumes + WAL).
-    ///
-    /// Note: This is a no-op for in-memory databases.
-    ///
-    /// Returns `Error::ReadOnlyViolation` when called on a read-only handle
-    /// (`?read_only=true` / `?mode=ro`). The engine layer also refuses, but
-    /// catching it here keeps the error message tied to the user-facing
-    /// `Database::create_snapshot` rather than the lower-level
-    /// `MVCCEngine::create_snapshot`.
+    /// Create backup .bin snapshot files for each table plus ddl-*.bin.
+    /// No-op for in-memory. `Error::ReadOnlyViolation` on read-only handles.
     pub fn create_snapshot(&self) -> Result<()> {
         use crate::storage::Engine;
         if self.inner.entry.engine.is_read_only_mode() {
@@ -2781,20 +1622,8 @@ impl Database {
         self.inner.entry.engine.create_snapshot()
     }
 
-    /// Restore the database from a backup snapshot.
-    ///
-    /// If no timestamp is provided, restores from the latest snapshot.
-    /// If a timestamp is provided (format: "YYYYMMDD-HHMMSS.fff"),
-    /// restores from that specific snapshot.
-    ///
-    /// This is a destructive operation that replaces all current data
-    /// with the snapshot data. Indexes and views are restored from
-    /// ddl-{timestamp}.bin or preserved from current in-memory state.
-    ///
-    /// Returns `Error::ReadOnlyViolation` when called on a read-only handle
-    /// (`?read_only=true` / `?mode=ro`). Restore overwrites engine state
-    /// in place, which is fundamentally incompatible with the read-only
-    /// contract regardless of the on-disk write permissions.
+    /// Restore from a backup snapshot. `timestamp` format: `"YYYYMMDD-HHMMSS.fff"`,
+    /// or `None` for the latest. Destructive. `Error::ReadOnlyViolation` on read-only handles.
     pub fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
         use crate::storage::Engine;
         if self.inner.entry.engine.is_read_only_mode() {
@@ -2804,7 +1633,7 @@ impl Database {
             ));
         }
         let result = self.inner.entry.engine.restore_snapshot(timestamp)?;
-        // Clear all query caches since all data has changed.
+        // Data wholly changed; flush all query caches.
         let executor = self
             .inner
             .executor
@@ -2822,20 +1651,7 @@ impl Database {
         &self.inner.executor
     }
 
-    /// Get semantic cache statistics
-    ///
-    /// Returns statistics about the semantic query cache including hit rates,
-    /// exact matches, and subsumption matches.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let db = Database::open("memory://")?;
-    /// // ... execute some queries ...
-    /// let stats = db.semantic_cache_stats()?;
-    /// println!("Cache hits: {}", stats.hits);
-    /// println!("Subsumption hits: {}", stats.subsumption_hits);
-    /// ```
+    /// Semantic query cache statistics (hits, exact and subsumption matches).
     pub fn semantic_cache_stats(&self) -> Result<crate::executor::SemanticCacheStatsSnapshot> {
         let executor = self
             .inner
@@ -2845,10 +1661,7 @@ impl Database {
         Ok(executor.semantic_cache_stats())
     }
 
-    /// Clear the semantic cache
-    ///
-    /// This clears all cached query results. Useful for testing or when
-    /// you want to force queries to re-execute.
+    /// Clear all cached query results.
     pub fn clear_semantic_cache(&self) -> Result<()> {
         let executor = self
             .inner

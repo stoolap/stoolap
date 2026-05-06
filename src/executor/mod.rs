@@ -710,10 +710,10 @@ impl Executor {
         self.query_cache.clear();
     }
 
-    /// SWMR v2 Phase G: invalidate cached query plans for one table
-    /// only. Used by `ReadOnlyDatabase::refresh` so a writer commit
-    /// against table A doesn't blow away cached plans for unrelated
-    /// tables B, C, … on the reader side. Same fallback semantics as
+    /// Invalidate cached query plans for one table only. Used by
+    /// `ReadOnlyDatabase::refresh` so a writer commit against table
+    /// A doesn't blow away cached plans for unrelated tables B, C,
+    /// … on the reader side. Same fallback semantics as
     /// `QueryCache::invalidate_table` (per-plan scan of its compiled
     /// lookup table name + query text heuristic).
     pub fn invalidate_query_cache_for_table(&self, table_name: &str) {

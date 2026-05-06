@@ -567,6 +567,99 @@ pub fn sweep_orphan_volumes_in_table(
     removed
 }
 
+/// Suffix appended to an orphan `.vol` file to make a retire sidecar.
+/// The sidecar's 8-byte LE payload is the manifest_epoch at the time
+/// the file became orphaned. Reaper uses it to gate the unlink.
+pub const RETIRE_SIDECAR_SUFFIX: &str = "retired";
+
+/// Per-file orphan reap. New orphans get a `vol_<id>.vol.retired`
+/// sidecar stamped at `stamp_epoch`. Reap when min_reader >= stamp
+/// (or no live readers). Original `.vol` stays in place until reap
+/// so stale readers' lazy `ensure_volume(old_id)` still succeeds.
+pub fn reap_orphan_volumes_with_sidecars(
+    dir: &Path,
+    table_name: &str,
+    keep_segment_ids: &rustc_hash::FxHashSet<u64>,
+    stamp_epoch: u64,
+    min_reader_epoch: Option<u64>,
+) {
+    let table_dir = dir.join(table_name);
+    let entries = match std::fs::read_dir(&table_dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str());
+        // Reap leftover sidecar tmps from interrupted writes.
+        if ext == Some("tmp") {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        if ext != Some(VOLUME_EXT) {
+            continue;
+        }
+        let stem = match path.file_stem().and_then(|s| s.to_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let hex = match stem.strip_prefix("vol_") {
+            Some(h) => h,
+            None => continue,
+        };
+        let id = match u64::from_str_radix(hex, 16) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if keep_segment_ids.contains(&id) {
+            continue;
+        }
+        let sidecar_path = path.with_extension(format!("{}.{}", VOLUME_EXT, RETIRE_SIDECAR_SUFFIX));
+        let retire_epoch = match read_sidecar_epoch(&sidecar_path) {
+            Some(e) => e,
+            None => {
+                if write_sidecar_atomic(&sidecar_path, stamp_epoch).is_err() {
+                    continue;
+                }
+                stamp_epoch
+            }
+        };
+        let safe = match min_reader_epoch {
+            None => true,
+            Some(min) => min >= retire_epoch,
+        };
+        if safe {
+            // Unlink .vol first; if that fails, keep the sidecar so
+            // the next sweep re-tries instead of orphaning forever.
+            if std::fs::remove_file(&path).is_ok() {
+                let _ = std::fs::remove_file(&sidecar_path);
+            }
+        }
+    }
+}
+
+fn read_sidecar_epoch(path: &Path) -> Option<u64> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() != 8 {
+        return None;
+    }
+    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+}
+
+fn write_sidecar_atomic(path: &Path, epoch: u64) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!("{}.tmp", RETIRE_SIDECAR_SUFFIX));
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp)?;
+        f.write_all(&epoch.to_le_bytes())?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
 /// Reap every `<dir>/<subdir>` whose lowercased name is NOT
 /// in `active_tables`. Caller is responsible for confirming
 /// `defer_for_live_readers() == false` BEFORE invoking this

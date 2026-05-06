@@ -1415,7 +1415,7 @@ impl Statement {
                     | "sync_mode"
                     | "wal_flush_trigger"
                     | "keep_snapshots"
-                    // SWMR v2 P2.12: cross-process diagnostic. Pure read.
+                    // Cross-process SWMR diagnostic. Pure read.
                     | "swmr_status" => None,
                     // Everything else (snapshot, checkpoint, restore, vacuum,
                     // compact, dedup_segments, analyze, future maintenance

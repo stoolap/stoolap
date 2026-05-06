@@ -12,13 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Table traits for database tables.
-//!
-//! Split into [`ReadTable`] (non-mutating surface) and
-//! [`WriteTable`] (extends `ReadTable` with mutators).
-//! Read-only callers receive `Box<dyn ReadTable>` and cannot reach any
-//! method that mutates persistent state. The compiler enforces this by
-//! construction.
+//! Table traits. [`ReadTable`] is the non-mutating surface;
+//! [`WriteTable`] extends it with mutators. Read-only callers receive
+//! `Box<dyn ReadTable>` and cannot reach any mutator at compile time.
 
 use rustc_hash::FxHashMap;
 use std::fmt;
@@ -28,9 +24,7 @@ use crate::storage::expression::Expression;
 use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
 use crate::storage::traits::{Index, QueryResult, Scanner};
 
-/// Describes the access method that will be used for a table scan
-///
-/// This is used by EXPLAIN to show users how their queries will be executed.
+/// Access method used for a table scan (consumed by EXPLAIN).
 #[derive(Debug, Clone)]
 pub enum ScanPlan {
     /// Sequential scan - reads all rows and applies filter in memory
@@ -220,152 +214,81 @@ impl fmt::Display for ScanPlan {
 
 /// Read-only surface of a database table.
 ///
-/// Every method on this trait is non-mutating to shared engine state.
-/// `&mut self` methods (`close`, `rollback`, `rollback_to_timestamp`)
-/// only touch transaction-local state and are safe on read-only handles.
-///
-/// Read-only callers receive `Box<dyn ReadTable>`; the trait object has
-/// no `insert`, `commit`, DDL, or any other mutator. The compiler refuses
-/// every write call. This is the read-only contract.
+/// Every method is non-mutating to shared engine state. `&mut self`
+/// methods (`close`, `rollback`, `rollback_to_timestamp`) touch only
+/// transaction-local state and are safe on read-only handles.
 pub trait ReadTable: Send + Sync {
-    /// Returns the name of the table
+    /// Returns the name of the table.
     fn name(&self) -> &str;
 
-    /// Returns the schema of the table
+    /// Returns the schema of the table.
     fn schema(&self) -> &Schema;
 
     /// Returns the transaction ID this table handle belongs to.
-    /// Used by FK enforcement to participate in the caller's transaction.
     fn txn_id(&self) -> i64;
 
-    /// Returns all active row IDs visible to the current transaction.
-    /// Used for NOT IN (anti-join) optimization.
+    /// Returns all active row IDs visible to the current transaction
+    /// (used for NOT IN anti-join optimization).
     fn get_active_row_ids(&self) -> Vec<i64>;
 
-    /// Populate a FxHashSet with all hot row_ids. Avoids the intermediate Vec
-    /// allocation of get_active_row_ids() when building skip sets.
+    /// Populates `dest` with hot row_ids without an intermediate `Vec`.
     fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
         for id in self.get_active_row_ids() {
             dest.insert(id);
         }
     }
 
-    /// Check if a specific row_id exists in the hot buffer.
-    /// O(log n) lookup instead of collecting all row_ids.
+    /// Returns true if `row_id` exists in the hot buffer.
     fn has_row_id(&self, _row_id: i64) -> bool {
         false
     }
 
-    /// Scans the table and returns a scanner over matching rows
-    ///
-    /// # Arguments
-    /// * `column_indices` - Indices of columns to include in the scan
-    /// * `where_expr` - Expression to filter rows (None means all rows)
-    ///
-    /// # Returns
-    /// A scanner that iterates over the matching rows
+    /// Returns a scanner over rows matching `where_expr`, projecting `column_indices`.
     fn scan(
         &self,
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>>;
 
-    /// Collects all rows matching the expression without intermediate cloning
-    ///
-    /// This is more efficient than using scan() when you need all rows at once,
-    /// as it avoids the double-clone overhead of the scanner interface.
-    ///
-    /// # Arguments
-    /// * `where_expr` - Expression to filter rows (None means all rows)
-    ///
-    /// # Returns
-    /// Cached row vector - returns to cache on drop for reuse
+    /// Collects all rows matching `where_expr` (None = all rows).
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec>;
 
-    /// Collects rows with an optional limit (LIMIT pushdown optimization)
-    ///
-    /// This enables early termination when only a limited number of rows are needed,
-    /// avoiding the cost of scanning the entire table.
-    ///
-    /// # Arguments
-    /// * `where_expr` - Optional filter expression
-    /// * `limit` - Maximum number of rows to return
-    /// * `offset` - Number of rows to skip before returning
-    ///
-    /// # Returns
-    /// A RowVec containing rows up to the limit (after offset) with row IDs
+    /// Collects rows matching `where_expr` with LIMIT/OFFSET pushdown.
     fn collect_rows_with_limit(
         &self,
         where_expr: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        // Default implementation: collect all and apply limit/offset
         let all_rows = self.collect_all_rows(where_expr)?;
         Ok(all_rows.into_iter().skip(offset).take(limit).collect())
     }
 
-    /// Collects rows with LIMIT/OFFSET without guaranteeing deterministic order.
-    ///
-    /// This is an optimization for queries with LIMIT but without ORDER BY.
-    /// Since SQL doesn't guarantee order for LIMIT without ORDER BY, we can
-    /// skip sorting and return rows in arbitrary order. This provides significant
-    /// speedup by enabling true early termination.
-    ///
-    /// # Arguments
-    /// * `where_expr` - Optional filter expression
-    /// * `limit` - Maximum number of rows to return
-    /// * `offset` - Number of rows to skip before returning
-    ///
-    /// # Returns
-    /// A RowVec containing rows up to the limit (after offset), in arbitrary order
+    /// Like [`collect_rows_with_limit`] but order is unspecified
+    /// (LIMIT without ORDER BY enables true early termination).
     fn collect_rows_with_limit_unordered(
         &self,
         where_expr: Option<&dyn Expression>,
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        // Default implementation: delegate to ordered version
         self.collect_rows_with_limit(where_expr, limit, offset)
     }
 
-    /// Collects all rows WITHOUT guaranteeing deterministic order.
-    ///
-    /// This is an optimization for GROUP BY queries where row order doesn't matter.
-    /// By skipping the O(n log n) sort, this provides significant speedup for large tables.
-    ///
-    /// # Returns
-    /// Cached row vector in arbitrary (storage iteration) order
+    /// Collects all rows in arbitrary order (skips sort for GROUP BY).
     fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
-        // Default implementation: delegate to ordered version
         self.collect_all_rows(None)
     }
 
-    /// Collects rows for specific row IDs.
-    ///
-    /// Used by HNSW index search to fetch rows after approximate nearest neighbor lookup.
-    /// The returned rows preserve the order of the input row_ids.
+    /// Fetches rows for the given `row_ids`, preserving input order
+    /// (used by HNSW after ANN lookup).
     fn collect_rows_by_ids(&self, _row_ids: &[i64]) -> Result<RowVec> {
         Err(Error::NotSupported(
             "collect_rows_by_ids not implemented".to_string(),
         ))
     }
 
-    /// Collect rows with ORDER BY + LIMIT using deferred materialization
-    ///
-    /// This is an optimization for `SELECT * FROM t ORDER BY col LIMIT n`:
-    /// - Loads only the sort column values (not full rows)
-    /// - Sorts indices by those values
-    /// - Materializes only the top N rows
-    ///
-    /// # Arguments
-    /// * `sort_col_idx` - Column index to sort by
-    /// * `ascending` - Sort direction (true = ASC, false = DESC)
-    /// * `limit` - Maximum rows to return
-    /// * `offset` - Rows to skip before collecting
-    ///
-    /// # Returns
-    /// A vector of rows sorted by the specified column
+    /// Collects top-N rows ordered by `sort_col_idx` (deferred materialization).
     fn collect_rows_sorted_with_limit(
         &self,
         sort_col_idx: usize,
@@ -373,8 +296,6 @@ pub trait ReadTable: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Row>> {
-        // Default implementation: collect all, sort, take limit
-        // Concrete implementations can override with deferred materialization
         let mut rows = self.collect_all_rows(None)?;
         rows.sort_by(|(_, a), (_, b)| {
             let va = a.get(sort_col_idx);
@@ -399,87 +320,50 @@ pub trait ReadTable: Send + Sync {
             .collect())
     }
 
-    /// Closes the table and releases any resources.
-    ///
-    /// On `ReadTable` because the executor's `ActiveTransaction` cleanup
-    /// drains cached read-side handles and calls `close()` on each.
+    /// Closes the table and releases any resources. Lives on `ReadTable`
+    /// because the executor's transaction cleanup calls `close()` on every
+    /// cached read-side handle.
     fn close(&mut self) -> Result<()>;
 
-    /// Rolls back any pending changes in this table's transaction.
-    ///
-    /// Discards transaction-local state only; on `ReadTable` because the
-    /// executor's `ActiveTransaction` rollback path calls `rollback()`
-    /// on every cached handle.
+    /// Discards transaction-local state. Lives on `ReadTable` for the same
+    /// reason as [`close`](Self::close).
     fn rollback(&mut self);
 
-    /// Rolls back changes to a specific timestamp (for savepoint support)
-    ///
-    /// Discards all local changes with timestamps greater than the specified timestamp.
-    /// This is used by ROLLBACK TO SAVEPOINT to partially undo transaction changes.
-    ///
-    /// # Arguments
-    /// * `timestamp` - The timestamp to roll back to (in nanoseconds since epoch)
+    /// Discards local changes with timestamps greater than `timestamp`
+    /// (nanoseconds since epoch). Used by ROLLBACK TO SAVEPOINT.
     fn rollback_to_timestamp(&self, timestamp: i64);
 
-    /// Returns true if this table has uncommitted local changes
-    ///
-    /// This is used by the transaction to determine if the two-phase commit
-    /// protocol needs to be executed.
+    /// Returns true if the table has uncommitted local changes
+    /// (drives the two-phase commit path).
     fn has_local_changes(&self) -> bool;
 
-    /// Returns the pending versions to be committed for WAL logging
-    ///
-    /// Returns a list of (row_id, row_data, is_deleted, txn_id) tuples representing
-    /// all uncommitted changes in this table. This is called before commit()
-    /// to capture changes for WAL persistence.
-    ///
-    /// # Returns
-    /// Vec of (row_id, row_data, is_deleted, txn_id) tuples
+    /// Returns `(row_id, row_data, is_deleted, txn_id)` for each pending
+    /// version, captured before commit for WAL persistence.
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
-        Vec::new() // Default implementation returns empty - override in concrete tables
+        Vec::new()
     }
 
     // ---- Index Lookups (read-only) ----
 
-    /// Checks if an index exists on a specific column
-    ///
-    /// # Arguments
-    /// * `column_name` - The column to check for an index
-    ///
-    /// # Returns
-    /// true if an index exists on the column, false otherwise
+    /// Returns true if `column_name` has an index.
     fn has_index_on_column(&self, column_name: &str) -> bool {
         let _ = column_name;
-        false // Default implementation - override in concrete tables
+        false
     }
 
-    /// Gets the index on a specific column (if any exists)
-    ///
-    /// # Arguments
-    /// * `column_name` - The column to get the index for
-    ///
-    /// # Returns
-    /// Some(index) if an index exists on the column, None otherwise
+    /// Returns the index covering `column_name`, if any.
     fn get_index_on_column(&self, column_name: &str) -> Option<std::sync::Arc<dyn Index>> {
         let _ = column_name;
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Gets all unique indexes on the table (for constraint checking).
-    ///
-    /// Returns a list of (index_name, column_names) for each unique index.
-    /// Used by SegmentedTable to check volume data during inserts.
+    /// Returns `(index_name, column_names)` for every unique index on the table.
     fn get_unique_indexes(&self) -> Vec<(String, Vec<String>)> {
-        Vec::new() // Default: no unique indexes
+        Vec::new()
     }
 
-    /// Iterate unique non-PK indexes by reference, avoiding per-call String allocations.
-    ///
-    /// The callback receives `(&str, &[String])` — the index name and its column names —
-    /// without cloning.  Implementations that hold an `RwLock<FxHashMap<String, Arc<dyn Index>>>`
-    /// can iterate the lock guard directly.
-    ///
-    /// The default implementation falls back to `get_unique_indexes()`.
+    /// Iterates unique non-PK indexes by reference to avoid String allocations.
+    /// Default delegates to [`get_unique_indexes`](Self::get_unique_indexes).
     fn for_each_unique_non_pk_index(
         &self,
         f: &mut dyn FnMut(&str, &[String]) -> Result<()>,
@@ -490,111 +374,59 @@ pub trait ReadTable: Send + Sync {
         Ok(())
     }
 
-    /// Check if the table has any unique indexes that are NOT the PK column.
-    /// Used as a fast bail-out to avoid allocating get_unique_indexes().
+    /// Fast bail-out: returns true if any unique non-PK index exists.
     fn has_unique_non_pk_indexes(&self) -> bool {
-        false // Default: no
+        false
     }
 
-    /// Gets an index by name
-    ///
-    /// # Arguments
-    /// * `name` - The name of the index
-    ///
-    /// # Returns
-    /// Some(index) if found, None otherwise
+    /// Returns the index named `name`, if any.
     fn get_index(&self, name: &str) -> Option<std::sync::Arc<dyn Index>> {
         let _ = name;
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Find the best multi-column index that matches a set of predicate columns.
-    /// Returns the index if it covers a prefix of the given columns.
-    /// For example, an index on (a, b, c) can be used for queries on (a), (a, b), or (a, b, c).
-    ///
-    /// # Arguments
-    /// * `predicate_columns` - The columns used in WHERE clause predicates
-    ///
-    /// # Returns
-    /// Some((index, matched_columns)) if found, None otherwise
+    /// Returns the best multi-column index covering a prefix of
+    /// `predicate_columns`, plus the matched-prefix length.
     fn get_multi_column_index(
         &self,
         predicate_columns: &[&str],
     ) -> Option<(std::sync::Arc<dyn Index>, usize)> {
         let _ = predicate_columns;
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Gets the minimum value from an indexed column (O(1) or O(log n) instead of O(n) scan)
-    ///
-    /// # Arguments
-    /// * `column_name` - The column to get the minimum value from
-    ///
-    /// # Returns
-    /// Some(Value) if the column has an index with min/max support, None otherwise
+    /// Returns the minimum value of an indexed column (avoids O(n) scan).
     fn get_index_min_value(&self, column_name: &str) -> Option<Value> {
         let _ = column_name;
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Gets the maximum value from an indexed column (O(1) or O(log n) instead of O(n) scan)
-    ///
-    /// # Arguments
-    /// * `column_name` - The column to get the maximum value from
-    ///
-    /// # Returns
-    /// Some(Value) if the column has an index with min/max support, None otherwise
+    /// Returns the maximum value of an indexed column (avoids O(n) scan).
     fn get_index_max_value(&self, column_name: &str) -> Option<Value> {
         let _ = column_name;
-        None // Default implementation - override in concrete tables
+        None
     }
 
     // ---- Counts / Partitions ----
 
-    /// Gets the count of rows in the table (COUNT(*) pushdown optimization)
-    ///
-    /// This enables O(1) row counting instead of O(n) scan for `SELECT COUNT(*) FROM table`
-    /// without WHERE clause.
-    ///
-    /// # Returns
-    /// The number of visible rows in the table
+    /// Returns the visible row count (COUNT(*) without WHERE).
     fn row_count(&self) -> usize {
-        0 // Default implementation - override in concrete tables
+        0
     }
 
-    /// Fast O(1) row count hint for optimizer decisions
-    ///
-    /// Returns an upper bound estimate without expensive visibility checks.
-    /// Use for cache eligibility and similar decisions where exact count isn't needed.
+    /// Cheap upper-bound row-count estimate for optimizer decisions.
     fn row_count_hint(&self) -> usize {
-        self.row_count() // Default falls back to row_count
+        self.row_count()
     }
 
-    /// Fast O(1) exact row count for COUNT(*) queries
-    ///
-    /// Returns Some(count) if the fast path can be used (no local changes, sees all committed data),
-    /// Returns None if the caller should fall back to the full row_count() method.
-    ///
-    /// This is different from row_count_hint() because it returns the EXACT count,
-    /// not an estimate. It's designed for COUNT(*) without WHERE clause.
+    /// Returns the exact row count via the COUNT(*) fast path, or None
+    /// if the caller must fall back to [`row_count`](Self::row_count).
     fn fast_row_count(&self) -> Option<usize> {
-        None // Default: no fast path available
+        None
     }
 
-    /// Collects rows sorted by an indexed column with limit (ORDER BY + LIMIT pushdown)
-    ///
-    /// For queries like `SELECT * FROM table ORDER BY col LIMIT 10`, this uses the
-    /// index to get rows in sorted order, stopping after the limit is reached.
-    /// This is O(limit) instead of O(n log n) for full sort.
-    ///
-    /// # Arguments
-    /// * `column_name` - The indexed column to order by
-    /// * `ascending` - True for ASC, false for DESC
-    /// * `limit` - Maximum number of rows to return
-    /// * `offset` - Number of rows to skip
-    ///
-    /// # Returns
-    /// Some(RowVec) if the column has an index, None otherwise
+    /// ORDER BY + LIMIT pushdown using an index on `column_name`. Returns
+    /// None when the column is unindexed.
     fn collect_rows_ordered_by_index(
         &self,
         column_name: &str,
@@ -603,23 +435,11 @@ pub trait ReadTable: Send + Sync {
         offset: usize,
     ) -> Option<RowVec> {
         let _ = (column_name, ascending, limit, offset);
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Keyset pagination optimization for PRIMARY KEY columns
-    ///
-    /// For queries like `WHERE id > X ORDER BY id LIMIT Y`, this uses the PK's
-    /// natural ordering to start iteration from X and return only Y rows.
-    /// This provides O(limit) complexity instead of O(n) for full table scans.
-    ///
-    /// # Arguments
-    /// * `start_after` - For `id > X` (exclusive bound)
-    /// * `start_from` - For `id >= X` (inclusive bound)
-    /// * `ascending` - True for ASC, false for DESC
-    /// * `limit` - Maximum number of rows to return
-    ///
-    /// # Returns
-    /// Some(RowVec) if the table has an INTEGER PRIMARY KEY, None otherwise
+    /// Keyset pagination on an INTEGER PRIMARY KEY. `start_after` is
+    /// exclusive (`>`), `start_from` is inclusive (`>=`).
     fn collect_rows_pk_keyset(
         &self,
         start_after: Option<i64>,
@@ -628,99 +448,52 @@ pub trait ReadTable: Send + Sync {
         limit: usize,
     ) -> Option<RowVec> {
         let _ = (start_after, start_from, ascending, limit);
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Collects rows grouped by an indexed partition column (PARTITION BY optimization)
-    ///
-    /// For window functions with `PARTITION BY col` where col is indexed, this uses the
-    /// index to iterate through unique values and collect rows already grouped by partition.
-    /// This avoids O(n) hash-based grouping in window function execution.
-    ///
-    /// # Arguments
-    /// * `column_name` - The indexed column to partition by
-    ///
-    /// # Returns
-    /// Some(Vec<(Value, RowVec)>) where each tuple is (partition_value, rows_in_partition)
-    /// Returns None if the column has no index
+    /// Collects rows grouped by an indexed partition column. Returns None
+    /// if the column has no index.
     fn collect_rows_grouped_by_partition(&self, column_name: &str) -> Option<Vec<(Value, RowVec)>> {
         let _ = column_name;
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Get distinct partition values from an indexed column.
-    /// Used for LIMIT pushdown in window functions - allows fetching partitions one at a time.
-    ///
-    /// # Arguments
-    /// * `column_name` - The indexed column to get partition values from
-    ///
-    /// # Returns
-    /// Some(Vec<Value>) with distinct values, or None if column has no index
+    /// Returns distinct values of an indexed column (LIMIT-pushdown for window funcs).
     fn get_partition_values(&self, column_name: &str) -> Option<Vec<Value>> {
         let _ = column_name;
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Compute distinct non-null values for a column by exploiting cold volume
-    /// metadata. For dictionary-encoded TEXT columns with no tombstones, this
-    /// extracts dictionary entries directly (O(unique values) per volume, no
-    /// row scan). Falls back to None when the fast path is not applicable.
-    ///
-    /// # Arguments
-    /// * `col_idx` - Schema column index
-    ///
-    /// # Returns
-    /// Some(Vec<Value>) with distinct non-null values, or None if fast path unavailable
+    /// Returns distinct non-null values of `col_idx` from cold-volume
+    /// dictionary metadata when available.
     fn compute_distinct_values(&self, _col_idx: usize) -> Option<Vec<Value>> {
         None
     }
 
-    /// Get the count of distinct non-null values from an indexed column.
-    /// Used for COUNT(DISTINCT col) optimization without cloning all values.
-    ///
-    /// # Arguments
-    /// * `column_name` - The indexed column to count distinct values from
-    ///
-    /// # Returns
-    /// Some(count) excluding NULL values, or None if column has no index
+    /// Returns the count of distinct non-null values for an indexed column.
     fn get_partition_count(&self, column_name: &str) -> Option<usize> {
         let _ = column_name;
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Get rows for a specific partition value.
-    /// Used for LIMIT pushdown in window functions - fetches only one partition at a time.
-    ///
-    /// # Arguments
-    /// * `column_name` - The indexed column
-    /// * `partition_value` - The specific partition value to fetch rows for
-    ///
-    /// # Returns
-    /// Some(RowVec) with rows matching the partition value, or None if column has no index
+    /// Returns rows matching `partition_value` on an indexed column.
     fn get_rows_for_partition_value(
         &self,
         column_name: &str,
         partition_value: &Value,
     ) -> Option<RowVec> {
         let _ = (column_name, partition_value);
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Fetch rows by their row IDs with an optional filter.
-    ///
-    /// # Arguments
-    /// * `row_ids` - The row IDs to fetch
-    /// * `filter` - Filter expression to apply to fetched rows
-    ///
-    /// # Returns
-    /// RowVec of (row_id, Row) pairs for visible, non-deleted rows that pass the filter
+    /// Fetches rows by id and applies `filter`, returning visible non-deleted rows.
     fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> RowVec {
         let mut results = RowVec::with_capacity(row_ids.len());
         self.fetch_rows_by_ids_into(row_ids, filter, &mut results);
         results
     }
 
-    /// Fetch rows into a reusable RowVec buffer
+    /// Like [`fetch_rows_by_ids`](Self::fetch_rows_by_ids) but writes into a reusable buffer.
     fn fetch_rows_by_ids_into(
         &self,
         row_ids: &[i64],
@@ -728,34 +501,18 @@ pub trait ReadTable: Send + Sync {
         buffer: &mut RowVec,
     ) {
         let _ = (row_ids, filter, buffer);
-        // Default implementation does nothing
     }
 
     // ---- Query Operations ----
 
-    /// Executes a SELECT query on the table
-    ///
-    /// # Arguments
-    /// * `columns` - Column names to include in the result
-    /// * `expr` - Optional filter expression
-    ///
-    /// # Returns
-    /// A QueryResult with the matching rows
+    /// Executes a SELECT projecting `columns` and filtering by `expr`.
     fn select(
         &self,
         columns: &[&str],
         expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn QueryResult>>;
 
-    /// Executes a SELECT query with column aliases
-    ///
-    /// # Arguments
-    /// * `columns` - Column names to include in the result
-    /// * `expr` - Optional filter expression
-    /// * `aliases` - Map from alias names to original column names
-    ///
-    /// # Returns
-    /// A QueryResult with the matching rows and aliased column names
+    /// Like [`select`](Self::select) but with output `aliases` (alias -> original).
     fn select_with_aliases(
         &self,
         columns: &[&str],
@@ -763,16 +520,8 @@ pub trait ReadTable: Send + Sync {
         aliases: &FxHashMap<String, String>,
     ) -> Result<Box<dyn QueryResult>>;
 
-    /// Executes a temporal SELECT query as of a specific point in time
-    ///
-    /// # Arguments
-    /// * `columns` - Column names to include in the result
-    /// * `expr` - Optional filter expression
-    /// * `temporal_type` - Either "TRANSACTION" or "TIMESTAMP"
-    /// * `temporal_value` - Transaction ID or timestamp in nanoseconds
-    ///
-    /// # Returns
-    /// A QueryResult with rows as they were at the specified point
+    /// Temporal SELECT. `temporal_type` is `"TRANSACTION"` or `"TIMESTAMP"`;
+    /// `temporal_value` is the txn id or nanoseconds since epoch.
     fn select_as_of(
         &self,
         columns: &[&str],
@@ -781,171 +530,81 @@ pub trait ReadTable: Send + Sync {
         temporal_value: i64,
     ) -> Result<Box<dyn QueryResult>>;
 
-    /// Explains what access method would be used for a scan
-    ///
-    /// This method analyzes the WHERE expression and returns a ScanPlan
-    /// describing how the query would be executed (without actually executing it).
-    /// Used by EXPLAIN to show users the query execution strategy.
-    ///
-    /// # Arguments
-    /// * `where_expr` - Optional filter expression to analyze
-    ///
-    /// # Returns
-    /// A ScanPlan describing the access method that would be used
+    /// Returns a [`ScanPlan`] describing how `where_expr` would be executed
+    /// (used by EXPLAIN). Default returns [`ScanPlan::SeqScan`].
     fn explain_scan(&self, where_expr: Option<&dyn Expression>) -> ScanPlan {
-        // Default implementation returns SeqScan
         ScanPlan::SeqScan {
             table: self.name().to_string(),
             filter: where_expr.map(|e| format!("{:?}", e)),
         }
     }
 
-    /// Gets the zone maps for this table
-    ///
-    /// Returns None if zone maps have not been built (ANALYZE not run)
-    /// Uses Arc to avoid expensive cloning on high QPS workloads
+    /// Returns the table's zone maps if ANALYZE has been run.
     fn get_zone_maps(&self) -> Option<std::sync::Arc<crate::storage::mvcc::zonemap::TableZoneMap>> {
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Gets the segments that need to be scanned for a given predicate
-    ///
-    /// Uses zone maps to determine which segments can be pruned (skipped)
-    /// based on the predicate's column, operator, and value.
-    ///
-    /// # Arguments
-    /// * `column` - The column name in the predicate
-    /// * `operator` - The comparison operator
-    /// * `value` - The value being compared against
-    ///
-    /// # Returns
-    /// Some(Vec<segment_ids>) if zone maps exist, None otherwise
+    /// Returns segment ids that survive zone-map pruning for `(column, operator, value)`,
+    /// or None when zone maps are absent.
     fn get_segments_to_scan(
         &self,
         _column: &str,
         _operator: crate::core::Operator,
         _value: &Value,
     ) -> Option<Vec<u32>> {
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    // ---- Deferred Aggregation Methods ----
-    // These methods enable aggregation pushdown to avoid full row materialization.
-    // For `SELECT SUM(col) FROM table`, we can compute SUM directly from arena data
-    // without cloning any rows.
+    // ---- Deferred Aggregation (pushdown) ----
 
-    /// Compute SUM of a column without materializing rows (deferred aggregation)
-    ///
-    /// Returns (sum, count_non_null) for proper NULL handling.
-    /// Returns None if the optimization is not available.
-    ///
-    /// # Arguments
-    /// * `col_idx` - Column index to sum
+    /// Pushed-down SUM. Returns `(sum, count_non_null)` or None if unavailable.
     fn sum_column(&self, _col_idx: usize) -> Option<(f64, usize)> {
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Compute AVG of a column without materializing rows (deferred aggregation)
-    ///
-    /// Returns (sum, count_non_null) for computing average as sum/count.
-    /// Returns None if the optimization is not available.
-    ///
-    /// # Arguments
-    /// * `col_idx` - Column index to average
+    /// Pushed-down AVG. Returns `(sum, count_non_null)` for caller to divide.
     fn avg_column(&self, _col_idx: usize) -> Option<(f64, usize)> {
-        // Default: use sum_column if available
         self.sum_column(_col_idx)
     }
 
-    /// Compute MIN of a column without materializing rows (deferred aggregation)
-    ///
-    /// Returns the minimum value, or None if no non-NULL values exist.
-    /// Returns None for the outer Option if the optimization is not available.
-    ///
-    /// # Arguments
-    /// * `col_idx` - Column index to find minimum
+    /// Pushed-down MIN. Outer None means unavailable; inner None means no non-NULL rows.
     fn min_column(&self, _col_idx: usize) -> Option<Option<Value>> {
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Compute MAX of a column without materializing rows (deferred aggregation)
-    ///
-    /// Returns the maximum value, or None if no non-NULL values exist.
-    /// Returns None for the outer Option if the optimization is not available.
-    ///
-    /// # Arguments
-    /// * `col_idx` - Column index to find maximum
+    /// Pushed-down MAX. Outer None means unavailable; inner None means no non-NULL rows.
     fn max_column(&self, _col_idx: usize) -> Option<Option<Value>> {
-        None // Default implementation - override in concrete tables
+        None
     }
 
-    /// Compute aggregates with a WHERE filter at the storage level.
-    ///
-    /// This pushes filtered aggregation (e.g. `SELECT SUM(col) FROM t WHERE x > 5`)
-    /// directly into the storage layer, scanning only rows that match the predicate
-    /// and computing aggregates without materializing full Row objects in the executor.
-    ///
-    /// # Arguments
-    /// * `aggregates` - List of (operation, column_index) pairs
-    /// * `where_expr` - Storage expression representing the WHERE clause filter
-    ///
-    /// # Returns
-    /// Some(values) with one Value per aggregate if optimization is available, None otherwise
+    /// Pushed-down filtered aggregation: one Value per `(op, col_idx)` pair.
     fn compute_filtered_aggregates(
         &self,
         _aggregates: &[(AggregateOp, usize)],
         _where_expr: &dyn Expression,
     ) -> Option<Vec<crate::core::Value>> {
-        None // Default: not supported
+        None
     }
 
-    /// Compute grouped aggregates at the storage level.
-    ///
-    /// This performs GROUP BY aggregation directly on arena storage without
-    /// materializing Row objects, significantly reducing memory allocations.
-    ///
-    /// # Arguments
-    /// * `group_by_indices` - Column indices to group by
-    /// * `aggregates` - List of (operation, column_index) pairs
-    ///
-    /// # Returns
-    /// Some(results) if optimization is available, None otherwise
+    /// Pushed-down GROUP BY aggregation directly on arena storage.
     fn compute_grouped_aggregates(
         &self,
         _group_by_indices: &[usize],
         _aggregates: &[(AggregateOp, usize)],
     ) -> Option<Vec<GroupedAggregateResult>> {
-        None // Default: not supported
+        None
     }
 }
 
-/// Writable surface of a database table.
-///
-/// Extends [`ReadTable`] with mutators (DML, DDL, index management,
-/// commit, etc.). `Box<dyn WriteTable>` exposes both the inherited
-/// read methods and the additional write methods.
-///
-/// Read-only callers cannot reach this trait — they hold
-/// `Box<dyn ReadTable>` instead. Splitting the trait surface is what
-/// makes read-only mode bypass-proof at compile time.
+/// Writable surface of a database table. Extends [`ReadTable`] with
+/// DML, DDL, and commit. Read-only callers cannot reach this trait.
 pub trait WriteTable: ReadTable {
     // ---- Column DDL ----
 
-    /// Creates a new column in the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the column
-    /// * `column_type` - The data type of the column
-    /// * `nullable` - Whether the column can contain NULL values
+    /// Adds column `name` of `column_type`.
     fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()>;
 
-    /// Creates a new column in the table with default expression
-    ///
-    /// # Arguments
-    /// * `name` - The name of the column
-    /// * `column_type` - The data type of the column
-    /// * `nullable` - Whether the column can contain NULL values
-    /// * `default_expr` - Default value expression as string (to be evaluated during INSERT)
+    /// Adds a column with a `DEFAULT` expression evaluated on each INSERT.
     fn create_column_with_default(
         &mut self,
         name: &str,
@@ -953,21 +612,11 @@ pub trait WriteTable: ReadTable {
         nullable: bool,
         _default_expr: Option<String>,
     ) -> Result<()> {
-        // Default implementation ignores default_expr for backwards compatibility
         self.create_column(name, column_type, nullable)
     }
 
-    /// Creates a new column with both expression and pre-computed default value
-    ///
-    /// The pre-computed default value is used for schema evolution (backfilling existing rows)
-    /// while the expression string is used for new inserts.
-    ///
-    /// # Arguments
-    /// * `name` - The name of the column
-    /// * `column_type` - The data type of the column
-    /// * `nullable` - Whether the column can contain NULL values
-    /// * `default_expr` - Default value expression as string (for INSERT)
-    /// * `default_value` - Pre-computed default value (for schema evolution)
+    /// Adds a column with both a DEFAULT expression (for new inserts) and a
+    /// pre-computed value (for backfilling existing rows during schema evolution).
     fn create_column_with_default_value(
         &mut self,
         name: &str,
@@ -976,155 +625,75 @@ pub trait WriteTable: ReadTable {
         default_expr: Option<String>,
         _default_value: Option<crate::core::Value>,
     ) -> Result<()> {
-        // Default implementation ignores default_value for backwards compatibility
         self.create_column_with_default(name, column_type, nullable, default_expr)
     }
 
-    /// Drops a column from the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the column to drop
+    /// Drops the column named `name`.
     fn drop_column(&mut self, name: &str) -> Result<()>;
 
-    /// Renames a column in the table
-    ///
-    /// # Arguments
-    /// * `old_name` - Current column name
-    /// * `new_name` - New column name
+    /// Renames `old_name` to `new_name`.
     fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()>;
 
-    /// Modifies a column's definition
-    ///
-    /// # Arguments
-    /// * `name` - The column name
-    /// * `column_type` - The new data type
-    /// * `nullable` - Whether the column can contain NULL values
+    /// Changes the type and nullability of column `name`.
     fn modify_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()>;
 
     // ---- DML ----
 
-    /// Inserts a single row into the table
-    ///
-    /// # Arguments
-    /// * `row` - The row to insert
-    ///
-    /// # Returns
-    /// The inserted row (with AUTO_INCREMENT values applied)
+    /// Inserts `row`, returning the row with AUTO_INCREMENT values applied.
     fn insert(&mut self, row: Row) -> Result<Row>;
 
-    /// Inserts a single row without returning it (avoids clone overhead)
-    ///
-    /// Use this when the RETURNING clause is not needed.
-    /// This is ~7ms faster per 1000 rows by avoiding Row::clone().
-    ///
-    /// # Arguments
-    /// * `row` - The row to insert
+    /// Inserts `row` without returning it (skips a Row clone; use when no RETURNING).
     fn insert_discard(&mut self, row: Row) -> Result<()> {
         self.insert(row)?;
         Ok(())
     }
 
-    /// Inserts multiple rows into the table in a single batch operation
-    ///
-    /// This is more efficient than calling `insert` multiple times.
-    ///
-    /// # Arguments
-    /// * `rows` - The rows to insert
+    /// Inserts `rows` as a single batch.
     fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()>;
 
-    /// Updates rows matching the given expression
-    ///
-    /// # Arguments
-    /// * `where_expr` - Expression to filter rows to update (None means all rows)
-    /// * `setter` - Function that transforms a row in place, returns true if changed
-    ///
-    /// # Returns
-    /// The number of rows updated
+    /// Updates rows matching `where_expr` (None = all). `setter` returns
+    /// `(new_row, changed)`. Returns rows updated.
     fn update(
         &mut self,
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32>;
 
-    /// Updates rows by their row IDs directly (O(k) lookup instead of O(n) scan).
-    ///
-    /// This is an optimization for UPDATE with IN subquery on INTEGER PRIMARY KEY.
-    /// Instead of scanning all rows and filtering, we directly look up the specific row IDs.
-    ///
-    /// # Arguments
-    /// * `row_ids` - The row IDs to update (should be sorted for cache locality)
-    /// * `setter` - Function that transforms a row in place, returns true if changed
-    ///
-    /// # Returns
-    /// The number of rows updated
+    /// O(k) UPDATE by row id (used for `UPDATE ... WHERE pk IN (...)`).
+    /// Pass `row_ids` sorted for cache locality.
     fn update_by_row_ids(
         &mut self,
         row_ids: &[i64],
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32>;
 
-    /// Deletes rows matching the given expression
-    ///
-    /// # Arguments
-    /// * `where_expr` - Expression to filter rows to delete (None means all rows)
-    ///
-    /// # Returns
-    /// The number of rows deleted
+    /// Deletes rows matching `where_expr` (None = all). Returns rows deleted.
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32>;
 
-    /// Deletes rows by their row IDs directly (O(k) lookup instead of O(n) scan).
-    ///
-    /// This is an optimization for DELETE with IN subquery on INTEGER PRIMARY KEY.
-    ///
-    /// # Arguments
-    /// * `row_ids` - The row IDs to delete (should be sorted for cache locality)
-    ///
-    /// # Returns
-    /// The number of rows deleted
+    /// O(k) DELETE by row id. Pass `row_ids` sorted for cache locality.
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32>;
 
-    /// Truncates the table, removing all rows efficiently.
-    /// Unlike DELETE, this drops storage directly instead of creating delete versions.
-    /// Default implementation falls back to delete(None).
+    /// Drops storage directly instead of recording delete versions. Default
+    /// falls back to `delete(None)`.
     fn truncate(&mut self) -> Result<i32> {
         self.delete(None)
     }
 
-    /// Claim a row for update to prevent concurrent cold-row modifications.
-    /// When two transactions update the same cold row, both mirror it into hot
-    /// via insert_discard. Without claiming, neither detects the other because
-    /// the row starts absent from hot. This method uses the VersionStore's
-    /// uncommitted_writes map to serialize access.
-    ///
-    /// Takes `&self` but mutates internal claim state. Lives on `WriteTable`
-    /// because claiming a row is a write precondition; read-only callers
-    /// must not be able to call it.
+    /// Claims `row_id` in the VersionStore's `uncommitted_writes` map so that
+    /// concurrent transactions mirroring the same cold row detect each other.
+    /// Takes `&self` but mutates claim state. Required only on `WriteTable`.
     fn try_claim_row(&self, _row_id: i64) -> Result<()> {
         Ok(())
     }
 
     // ---- Index DDL ----
 
-    /// Creates an index on the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the index
-    /// * `columns` - The column names to include in the index
-    /// * `is_unique` - Whether this is a unique index
+    /// Creates an index named `name` over `columns`.
     fn create_index(&self, name: &str, columns: &[&str], is_unique: bool) -> Result<()>;
 
-    /// Creates an index on the table with a specific index type
-    ///
-    /// # Arguments
-    /// * `name` - The name of the index
-    /// * `columns` - The column names to include in the index
-    /// * `is_unique` - Whether this is a unique index
-    /// * `index_type` - Optional index type (Hash, BTree, Bitmap). If None, auto-selects based on column types.
-    ///
-    /// # Type-Based Index Selection (when index_type is None):
-    /// - TEXT/JSON columns → Hash index (avoids O(strlen) comparisons)
-    /// - BOOLEAN columns → Bitmap index (only 2 values, fast AND/OR)
-    /// - INTEGER/FLOAT/TIMESTAMP columns → BTree index (supports range queries)
+    /// Like [`create_index`](Self::create_index) but with an explicit
+    /// `index_type`. None auto-selects: TEXT/JSON -> Hash, BOOLEAN -> Bitmap,
+    /// INTEGER/FLOAT/TIMESTAMP -> BTree.
     fn create_index_with_type(
         &self,
         name: &str,
@@ -1132,21 +701,12 @@ pub trait WriteTable: ReadTable {
         is_unique: bool,
         index_type: Option<IndexType>,
     ) -> Result<()> {
-        // Default implementation calls create_index (ignores index_type)
         let _ = index_type;
         self.create_index(name, columns, is_unique)
     }
 
-    /// Creates an HNSW index with custom parameters
-    ///
-    /// # Arguments
-    /// * `name` - The name of the index
-    /// * `column` - The vector column to index
-    /// * `is_unique` - Whether this is a unique index
-    /// * `m` - Max connections per node per layer
-    /// * `ef_construction` - Build-time beam width
-    /// * `ef_search` - Search-time beam width
-    /// * `metric` - Distance metric (L2, Cosine, InnerProduct)
+    /// Creates an HNSW vector index. `m` is max connections per node per layer;
+    /// `ef_construction`/`ef_search` are build/search beam widths.
     #[allow(clippy::too_many_arguments)]
     fn create_hnsw_index(
         &self,
@@ -1172,18 +732,10 @@ pub trait WriteTable: ReadTable {
         ))
     }
 
-    /// Drops an index from the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the index to drop
+    /// Drops the index named `name`.
     fn drop_index(&self, name: &str) -> Result<()>;
 
-    /// Creates a btree index on a column
-    ///
-    /// # Arguments
-    /// * `column_name` - The column to index
-    /// * `is_unique` - Whether this is a unique index
-    /// * `custom_name` - Optional custom name for the index
+    /// Creates a btree index on `column_name`.
     fn create_btree_index(
         &self,
         column_name: &str,
@@ -1191,18 +743,10 @@ pub trait WriteTable: ReadTable {
         custom_name: Option<&str>,
     ) -> Result<()>;
 
-    /// Drops a btree index from the table
-    ///
-    /// # Arguments
-    /// * `column_name` - The column whose index to drop
+    /// Drops the btree index covering `column_name`.
     fn drop_btree_index(&self, column_name: &str) -> Result<()>;
 
-    /// Creates a multi-column index on the table
-    ///
-    /// # Arguments
-    /// * `name` - The name of the index
-    /// * `columns` - The column names to include in the index
-    /// * `is_unique` - Whether this is a unique index
+    /// Creates a multi-column index. Default returns NotSupported.
     fn create_multi_column_index(
         &self,
         name: &str,
@@ -1215,12 +759,11 @@ pub trait WriteTable: ReadTable {
         ))
     }
 
-    // ---- Unique constraint enforcement (write-side coordination) ----
+    // ---- Unique constraint enforcement ----
 
-    /// Finds a conflicting row ID for a unique-key lookup.
-    ///
-    /// Volume-backed tables can override this to probe cold storage directly
-    /// after the hot index path misses, avoiding a full table scan on upserts.
+    /// Returns the row id that conflicts with the unique key composed of
+    /// `row_values` on `(index_name, column_name)`. Volume-backed tables
+    /// override to probe cold storage after hot misses.
     fn find_unique_conflict_row_id(
         &self,
         _index_name: &str,
@@ -1230,35 +773,20 @@ pub trait WriteTable: ReadTable {
         Ok(None)
     }
 
-    /// Acquire per-table upsert mutex for ON CONFLICT serialization.
-    ///
-    /// Returns a mutex guard erased as `Box<dyn Any>`. The `Any` here is
-    /// type erasure for the mutex guard, not a downcast vector to engine
-    /// internals. Lives on `WriteTable` because only DML reaches it.
+    /// Acquires the per-table upsert mutex for ON CONFLICT serialization.
+    /// The returned `Box<dyn Any>` erases the guard type only.
     fn acquire_upsert_lock(&self) -> Option<Box<dyn std::any::Any>> {
         None
     }
 
     // ---- Zone maps (write side) ----
 
-    /// Sets the zone maps for this table
-    ///
-    /// Zone maps contain min/max statistics per segment, enabling the query
-    /// executor to skip entire segments when predicates fall outside the range.
-    /// This is typically called by ANALYZE.
-    ///
-    /// # Arguments
-    /// * `zone_maps` - The zone map statistics for the table
-    fn set_zone_maps(&self, _zone_maps: crate::storage::mvcc::zonemap::TableZoneMap) {
-        // Default implementation does nothing - override in concrete tables
-    }
+    /// Installs zone-map statistics (typically called by ANALYZE).
+    fn set_zone_maps(&self, _zone_maps: crate::storage::mvcc::zonemap::TableZoneMap) {}
 
     // ---- Lifecycle ----
 
-    /// Commits any pending changes in this table's transaction
-    ///
-    /// This applies the table's local transaction changes to the global store,
-    /// making them visible to other transactions.
+    /// Applies pending changes to the global store, making them visible.
     fn commit(&mut self) -> Result<()>;
 }
 
@@ -1266,11 +794,8 @@ pub trait WriteTable: ReadTable {
 mod tests {
     use super::*;
 
-    // Verify both traits are object-safe
     fn _assert_read_object_safe(_: &dyn ReadTable) {}
     fn _assert_write_object_safe(_: &dyn WriteTable) {}
-
-    // ScanPlan Display tests
 
     #[test]
     fn test_seq_scan_display_without_filter() {
@@ -1401,7 +926,6 @@ mod tests {
 
     #[test]
     fn test_scan_plan_debug() {
-        // Verify Debug is derived
         let plan = ScanPlan::SeqScan {
             table: "users".to_string(),
             filter: None,
@@ -1413,7 +937,6 @@ mod tests {
 
     #[test]
     fn test_scan_plan_clone() {
-        // Verify Clone is derived
         let plan = ScanPlan::IndexScan {
             table: "users".to_string(),
             index_name: "idx_id".to_string(),

@@ -322,14 +322,14 @@ pub enum Error {
     #[error("schema changed since open: {0}")]
     SchemaChanged(String),
 
-    /// SWMR v2 Phase H: the reader's pinned WAL LSN has been
-    /// truncated by the writer — the WAL bytes the reader needs to
-    /// tail-replay are gone. The reader must hard-reopen its handle
-    /// to recover. This is distinct from `SchemaChanged` (a cold-side
-    /// drift) and `SwmrWriterReincarnated` (a writer crash); it
-    /// surfaces specifically when the WAL pin protocol failed (e.g.
-    /// a lease that wasn't refreshed in time was reaped while a
-    /// large overlay rebuild was in flight).
+    /// The reader's pinned WAL LSN has been truncated by the writer
+    /// — the WAL bytes the reader needs to tail-replay are gone. The
+    /// reader must hard-reopen its handle to recover. This is distinct
+    /// from `SchemaChanged` (a cold-side drift) and
+    /// `SwmrWriterReincarnated` (a writer crash); it surfaces
+    /// specifically when the WAL pin protocol failed (e.g. a lease
+    /// that wasn't refreshed in time was reaped while a large overlay
+    /// rebuild was in flight).
     ///
     /// `pinned_lsn` is what the reader was trying to tail; it does
     /// not exist on disk anymore. The writer's `wal_chain_head`
@@ -341,12 +341,12 @@ pub enum Error {
     )]
     SwmrSnapshotExpired { pinned_lsn: u64, chain_head: u64 },
 
-    /// SWMR v2 Phase H: the writer process this reader was attached
-    /// to has been replaced (crash + restart, or a clean
-    /// close+reopen). `db.shm.writer_generation` advanced beyond the
-    /// value the reader observed at attach. Cached state (manifests,
-    /// overlay, plans) is no longer trustworthy — the new writer's
-    /// transaction registry uses fresh IDs. Caller must hard-reopen.
+    /// The writer process this reader was attached to has been
+    /// replaced (crash + restart, or a clean close+reopen).
+    /// `db.shm.writer_generation` advanced beyond the value the
+    /// reader observed at attach. Cached state (manifests, overlay,
+    /// plans) is no longer trustworthy — the new writer's transaction
+    /// registry uses fresh IDs. Caller must hard-reopen.
     #[error(
         "SWMR writer reincarnated: observed generation {observed_gen} \
          exceeds reader's expected {expected_gen}; reopen the \
@@ -357,13 +357,13 @@ pub enum Error {
         expected_gen: u64,
     },
 
-    /// SWMR v2 Phase H: the reader observed a DDL event in the
-    /// WAL-tail since the last refresh that cannot be applied to a
-    /// live read-only handle (CREATE/DROP/ALTER TABLE, CREATE/DROP
-    /// INDEX, CREATE/DROP VIEW, RENAME, TRUNCATE). v2 readers can
-    /// tail DML safely because the in-memory schema is stable; DDL
-    /// would require mutating the read-only engine's metadata, which
-    /// is not currently supported. Caller should reopen.
+    /// The reader observed a DDL event in the WAL-tail since the
+    /// last refresh that cannot be applied to a live read-only
+    /// handle (CREATE/DROP/ALTER TABLE, CREATE/DROP INDEX,
+    /// CREATE/DROP VIEW, RENAME, TRUNCATE). Readers can tail DML
+    /// safely because the in-memory schema is stable; DDL would
+    /// require mutating the read-only engine's metadata, which is
+    /// not currently supported. Caller should reopen.
     ///
     /// The string body is a short summary of the observed events
     /// (e.g. `"create_table:t,alter_table:orders"`) so callers can
@@ -374,12 +374,12 @@ pub enum Error {
     )]
     SwmrPendingDdl(String),
 
-    /// SWMR v2 Phase H: rebuilding the per-table overlay from the
-    /// WAL tail failed mid-stream. Distinct from `SwmrSnapshotExpired`
-    /// because the WAL bytes were available but a parse failed
-    /// (CRC mismatch, truncated entry, unsupported format version).
-    /// Caller can retry once; persistent failures indicate WAL
-    /// corruption requiring writer-side recovery.
+    /// Rebuilding the per-table overlay from the WAL tail failed
+    /// mid-stream. Distinct from `SwmrSnapshotExpired` because the
+    /// WAL bytes were available but a parse failed (CRC mismatch,
+    /// truncated entry, unsupported format version). Caller can
+    /// retry once; persistent failures indicate WAL corruption
+    /// requiring writer-side recovery.
     #[error("SWMR overlay rebuild failed: {0}")]
     SwmrOverlayApplyFailed(String),
 
@@ -542,17 +542,6 @@ impl Error {
             mode(requested_ro),
             mode(cached_ro)
         ))
-    }
-
-    /// Returns `true` if this error is a `ReadOnlyViolation` (write
-    /// rejected because the handle / engine / mount is read-only, or a
-    /// registry mode-mismatch).
-    ///
-    /// Useful for callers writing retry / fallback logic that wants to
-    /// avoid pattern-matching the variant directly. Pattern matching
-    /// still works; this is purely an ergonomics helper.
-    pub fn is_read_only_violation(&self) -> bool {
-        matches!(self, Error::ReadOnlyViolation(_))
     }
 
     /// Check if this is a "not found" type error

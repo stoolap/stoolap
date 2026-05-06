@@ -101,6 +101,18 @@ pub(crate) struct ReaderAttachment {
     /// the value is dropped, or if multiple shared owners race
     /// on shutdown.
     detached: AtomicBool,
+
+    /// Per-handle on-disk progress signal: the last `manifest_epoch`
+    /// this handle has successfully reloaded. Writer's reaper reads
+    /// MIN across live PIDs' epoch files to gate retire-sidecar
+    /// unlinks. `None` for half-attached handles (no pin → no need
+    /// to publish progress).
+    epoch_file: Option<crate::storage::mvcc::lease::EpochFile>,
+
+    /// Last epoch we wrote to the epoch file. Skip the write
+    /// syscall when unchanged so the no-change refresh path stays
+    /// syscall-free.
+    last_published_epoch: AtomicU64,
 }
 
 impl ReaderAttachment {
@@ -113,7 +125,7 @@ impl ReaderAttachment {
     /// half-attached handles (shm acquired but lease registration
     /// failed, or vice versa) record `false` and silently skip
     /// the WAL-tail/pin-advance fast paths.
-    pub(crate) fn attach(entry: Arc<EngineEntry>) -> Arc<Self> {
+    pub(crate) fn attach(entry: Arc<EngineEntry>) -> crate::core::Result<Arc<Self>> {
         let handle_id = crate::storage::mvcc::lease::next_handle_id();
         let expected_writer_gen = entry.attach_writer_gen;
         let attach_visible_commit_lsn = entry.attach_visible_commit_lsn;
@@ -132,17 +144,38 @@ impl ReaderAttachment {
         } else {
             false
         };
-        // Initialize `last_written_pin` to the value we actually
-        // installed so the first `advance_pin(initial_pin_lsn)` is
-        // a no-op rather than a redundant rewrite. `u64::MAX` is
-        // the "no pin in place" sentinel for the half-attached path.
+
+        // Every lease-backed handle gets an epoch file, including no-shm
+        // (writer-was-not-live-at-attach) handles. Without one, a
+        // sibling handle attached later (when a writer comes up) would
+        // have an epoch file and could false-certify reaping past this
+        // older lease-only handle's stale manifest.
+        let (epoch_file, initial_epoch) = if let Some(l) = entry.lease.as_ref() {
+            let readers_dir = l
+                .path()
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
+            let initial = entry.loaded_epoch;
+            match crate::storage::mvcc::lease::EpochFile::create(readers_dir, handle_id, initial) {
+                Ok(f) => (Some(f), initial),
+                Err(e) => {
+                    if swmr_pin_active {
+                        l.remove_handle_pin(handle_id);
+                    }
+                    return Err(e);
+                }
+            }
+        } else {
+            (None, 0)
+        };
+
         let last_written_pin = if swmr_pin_active {
             initial_pin_lsn
         } else {
             u64::MAX
         };
 
-        Arc::new(Self {
+        Ok(Arc::new(Self {
             entry,
             handle_id,
             last_written_pin: AtomicU64::new(last_written_pin),
@@ -151,7 +184,9 @@ impl ReaderAttachment {
             expected_writer_gen,
             swmr_pin_active,
             detached: AtomicBool::new(false),
-        })
+            epoch_file,
+            last_published_epoch: AtomicU64::new(initial_epoch),
+        }))
     }
 
     #[inline]
@@ -220,6 +255,26 @@ impl ReaderAttachment {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             self.last_touch_epoch_ms.store(now_ms, Ordering::Relaxed);
+        }
+    }
+
+    /// Publish the manifest_epoch this handle has just successfully
+    /// reloaded. Skip when unchanged (no-op refresh stays syscall-free)
+    /// or when this handle has no epoch file (half-attached / no pin).
+    /// Caller MUST only invoke after `reload_manifests()` returned
+    /// successfully — the writer treats this signal as a refresh
+    /// certificate.
+    #[inline]
+    pub(crate) fn publish_loaded_epoch(&self, epoch: u64) {
+        let Some(ref f) = self.epoch_file else {
+            return;
+        };
+        let last = self.last_published_epoch.load(Ordering::Relaxed);
+        if epoch == last {
+            return;
+        }
+        if f.write(epoch).is_ok() {
+            self.last_published_epoch.store(epoch, Ordering::Relaxed);
         }
     }
 

@@ -420,9 +420,9 @@ impl PersistenceManager {
     }
 
     /// Record a DDL operation (CREATE TABLE, DROP TABLE, etc.).
-    /// Returns the WAL LSN of the auto-commit marker so the engine can
-    /// publish it to `db.shm` (SWMR v2 Phase C). Returns `0` when
-    /// persistence is disabled.
+    /// Returns the WAL LSN of the auto-commit marker so the engine
+    /// can publish it to `db.shm` for cross-process readers.
+    /// Returns `0` when persistence is disabled.
     pub fn record_ddl_operation(
         &self,
         table_name: &str,
@@ -448,10 +448,10 @@ impl PersistenceManager {
         // DDL operations are auto-committed (they don't participate in user transactions).
         // Write a commit marker with commit_seq=0; DDL doesn't allocate from
         // start_commit and doesn't participate in snapshot_seq filtering.
-        // Returns the marker LSN so the engine can publish to db.shm
-        // (SWMR v2 Phase C). Cross-process readers need DDL events too:
-        // a CREATE TABLE bumps visible_commit_lsn so subsequent reader
-        // tail-WAL replay observes the new schema.
+        // Returns the marker LSN so the engine can publish to db.shm.
+        // Cross-process readers need DDL events too: a CREATE TABLE
+        // bumps visible_commit_lsn so subsequent reader tail-WAL replay
+        // observes the new schema.
         let lsn = wal.write_commit_marker(DDL_TXN_ID, 0)?;
 
         // Attempt WAL rotation if file exceeds max size.
@@ -496,8 +496,8 @@ impl PersistenceManager {
 
     /// Record an index operation (CREATE INDEX, DROP INDEX). Returns
     /// the WAL LSN of the auto-commit marker so the engine can publish
-    /// it to `db.shm` (SWMR v2 Phase C). Returns `0` when persistence
-    /// is disabled.
+    /// it to `db.shm` for cross-process readers. Returns `0` when
+    /// persistence is disabled.
     pub fn record_index_operation(
         &self,
         table_name: &str,
@@ -555,8 +555,8 @@ impl PersistenceManager {
         Ok(())
     }
 
-    /// SWMR v2 Phase E: borrow the live `WALManager`, if persistence
-    /// is initialized. Reader-side overlay rebuild calls
+    /// Borrow the live `WALManager`, if persistence is initialized.
+    /// Reader-side overlay rebuild calls
     /// `WALManager::tail_committed_entries` through this. Returns
     /// `None` for in-memory engines or when persistence init failed.
     pub fn wal(&self) -> Option<&WALManager> {
@@ -568,8 +568,8 @@ impl PersistenceManager {
     /// reader's WAL-tail can tag tombstones consistently with the
     /// writer's snapshot_seq scheme. Returns the LSN of the commit
     /// marker entry; the caller (engine) publishes it to db.shm so
-    /// reader processes can advance their `visible_commit_lsn`
-    /// (SWMR v2 Phase C). Returns `0` when persistence is disabled.
+    /// reader processes can advance their `visible_commit_lsn`.
+    /// Returns `0` when persistence is disabled.
     pub fn record_commit(&self, txn_id: i64, commit_seq: i64) -> Result<u64> {
         if !self.is_enabled() {
             return Ok(0);

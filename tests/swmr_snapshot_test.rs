@@ -12,31 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// SWMR v2's mmap-backed `db.shm` is Unix-only. The Windows build of
-// `ShmHandle` is a stub that errors on construction (see
-// `src/storage/mvcc/shm.rs::stub`); the subprocess helpers in this file
-// reach for real shm methods (`mark_ready`, etc.) that the stub
-// intentionally does not expose. Gate the entire suite at the file
-// level so Windows CI does not try to compile against the stub.
+// SWMR v2's mmap-backed `db.shm` is Unix-only; the Windows ShmHandle is
+// a stub that errors on construction. Gate the whole suite at file level.
 #![cfg(unix)]
 
-//! Cross-process SWMR (single-writer-multi-reader) v1 tests.
+//! Cross-process SWMR (single-writer-multi-reader) tests.
 //!
-//! These tests spawn a SECOND OS process (the writer "child") via
-//! `std::process::Command::new(std::env::current_exe())` so we can verify
-//! the actual cross-process behavior:
-//!
-//! - Writer holds Exclusive on its DB; reader holding Shared from another
-//!   process is no longer blocked (file_lock.rs: Shared = no kernel lock).
-//! - Reader observes the writer's checkpoint via the manifest_epoch file.
-//! - Volume unlink during compaction defers while the reader's lease is live.
-//!
-//! ## Subprocess pattern
-//!
-//! Re-running the test binary with `STOOLAP_SWMR_CHILD_ROLE=<role>` set
-//! makes it run a single helper test (`dispatch_child_role_<role>`) that
-//! checks the env var, dispatches to the role's worker function, and
-//! exits. The parent test reads child stdout/stderr to coordinate.
+//! Tests spawn a writer/reader child via `Command::new(current_exe())` and
+//! coordinate through env vars (`STOOLAP_SWMR_CHILD_ROLE`, `_DB`, `_ARG`).
+//! The dispatch tests below run the matching helper when the env var is
+//! set; otherwise they no-op.
 
 use std::env;
 use std::path::Path;
@@ -47,23 +32,14 @@ use std::time::Duration;
 use stoolap::storage::mvcc::manifest_epoch;
 use stoolap::Database;
 
-/// Env var the parent sets to tell the re-spawned binary to act as a
-/// writer child instead of running parent test logic.
 const CHILD_ROLE: &str = "STOOLAP_SWMR_CHILD_ROLE";
-/// Env var carrying the absolute database path the child should open.
 const CHILD_DB: &str = "STOOLAP_SWMR_CHILD_DB";
-/// Env var letting the parent pass an integer arg to the child (e.g.
-/// "how many rows to insert before exiting").
 const CHILD_ARG: &str = "STOOLAP_SWMR_CHILD_ARG";
 
 // ---------------------------------------------------------------------------
 // Child role dispatcher
 // ---------------------------------------------------------------------------
 
-/// Each child-role test calls this at its top. If we're running as a
-/// child (env var set), execute the role and return `true` so the test
-/// returns normally without running parent assertions. If we're not a
-/// child, return `false` and the test continues as a parent.
 fn dispatched_as_child() -> bool {
     let role = match env::var(CHILD_ROLE) {
         Ok(r) => r,
@@ -104,11 +80,8 @@ fn child_insert_then_checkpoint(db_path: &str, arg: Option<&str>) {
     db.close().expect("child: close");
 }
 
-/// Continuous-insert writer for the visibility-lag bench. Each iteration:
-/// INSERT (id, ts_ns) + PRAGMA CHECKPOINT, then sleep `pace_ms`. Stops
-/// after `dur_ms` total.
+/// Continuous INSERT+CHECKPOINT loop. arg = "dur_ms,pace_ms".
 fn child_continuous_writer(db_path: &str, arg: Option<&str>) {
-    // arg = "dur_ms,pace_ms" — defaults: dur=2500, pace=80.
     let (dur_ms, pace_ms): (u64, u64) = match arg {
         Some(s) => {
             let mut it = s.split(',');
@@ -145,10 +118,7 @@ fn child_continuous_writer(db_path: &str, arg: Option<&str>) {
     db.close().expect("child: close");
 }
 
-/// SWMR v2 Phase B helper: writer subprocess initializes db.shm with
-/// the given `(visible_commit_lsn, manifest_epoch, writer_generation)`
-/// triple (comma-separated in arg). Parent verifies cross-process
-/// visibility via `ShmHandle::open_reader`.
+/// Initializes db.shm with `(lsn,epoch,gen)` triple in arg.
 fn child_init_shm(db_path: &str, arg: Option<&str>) {
     use std::sync::atomic::Ordering;
     use stoolap::storage::mvcc::shm::ShmHandle;
@@ -169,13 +139,8 @@ fn child_init_shm(db_path: &str, arg: Option<&str>) {
     h.header()
         .writer_generation
         .store(vals[2], Ordering::Release);
-    // Publish init_done LAST so the parent's open_reader (which
-    // validates the magic) can attach. Mirrors the engine's
-    // post-WAL-replay mark_ready() call.
+    // mark_ready last so open_reader can attach.
     h.mark_ready();
-    // Hold the mapping briefly so parent can attach while the writer
-    // process is still alive. 300ms is enough for the parent's open
-    // + assertion chain.
     thread::sleep(Duration::from_millis(300));
 }
 
@@ -191,8 +156,7 @@ fn child_create_then_hold_open(db_path: &str, arg: Option<&str>) {
         .expect("child: insert");
     db.execute("PRAGMA CHECKPOINT", ())
         .expect("child: checkpoint");
-    // Hold the writable handle (= Exclusive lock on db.lock) for the
-    // duration so the parent can observe coexistence.
+    // Hold the writable handle so parent can observe coexistence.
     std::thread::sleep(Duration::from_millis(hold_ms));
     db.close().expect("child: close");
 }
@@ -208,7 +172,6 @@ fn spawn_child(role: &str, db_path: &Path, arg: Option<&str>) -> Child {
     if let Some(a) = arg {
         cmd.env(CHILD_ARG, a);
     }
-    // Run the dispatch test that matches this role and ONLY that test.
     cmd.arg(format!("dispatch_child_role_{}", role));
     cmd.arg("--exact");
     cmd.arg("--nocapture");
@@ -217,58 +180,40 @@ fn spawn_child(role: &str, db_path: &Path, arg: Option<&str>) -> Child {
     cmd.spawn().expect("spawn child")
 }
 
-// ---------------------------------------------------------------------------
-// Child-role dispatch tests. These look like ordinary `#[test]` cases
-// because nextest discovers them, but they only do work when the env
-// var is set; otherwise they are no-ops so a normal `cargo nextest run`
-// passes them in milliseconds.
-// ---------------------------------------------------------------------------
+// Dispatch tests are no-ops in the parent invocation; they execute the
+// helper when STOOLAP_SWMR_CHILD_ROLE matches.
 
 #[test]
 fn dispatch_child_role_insert_then_checkpoint() {
-    if !dispatched_as_child() {
-        // Parent invocation — nothing to do.
-    }
+    let _ = dispatched_as_child();
 }
 
 #[test]
 fn dispatch_child_role_create_then_hold_open() {
-    if !dispatched_as_child() {
-        // Parent invocation — nothing to do.
-    }
+    let _ = dispatched_as_child();
 }
 
 #[test]
 fn dispatch_child_role_continuous_writer() {
-    if !dispatched_as_child() {
-        // Parent invocation — nothing to do.
-    }
+    let _ = dispatched_as_child();
 }
 
 #[test]
 fn dispatch_child_role_init_shm() {
-    if !dispatched_as_child() {
-        // Parent invocation — nothing to do.
-    }
+    let _ = dispatched_as_child();
 }
 
 #[test]
 fn dispatch_child_role_ro_lease_holder() {
-    if !dispatched_as_child() {
-        // Parent invocation - nothing to do.
-    }
+    let _ = dispatched_as_child();
 }
 
 #[test]
 fn dispatch_child_role_open_close_quick() {
-    if !dispatched_as_child() {
-        // Parent invocation - nothing to do.
-    }
+    let _ = dispatched_as_child();
 }
 
-/// Phase I helper: open the database writable, run PRAGMA CHECKPOINT,
-/// close. No DDL, no DML — purely a writer reincarnation cycle that
-/// bumps `writer_generation` in db.shm. The arg is ignored.
+/// Pure open/close cycle that bumps writer_generation in db.shm.
 fn child_open_close_quick(db_path: &str, _arg: Option<&str>) {
     let dsn = format!("file://{}", db_path);
     let db = Database::open(&dsn).expect("child: open writable");
@@ -277,10 +222,7 @@ fn child_open_close_quick(db_path: &str, _arg: Option<&str>) {
     db.close().expect("child: close");
 }
 
-/// Phase I helper: open a read-only handle and hold it, periodically
-/// touching its lease, until killed. Used by parent tests that need a
-/// long-lived reader subprocess (concurrent visibility tests, lease
-/// reaping after SIGKILL).
+/// Long-lived RO reader that pings the lease until killed.
 fn child_ro_lease_holder(db_path: &str, arg: Option<&str>) {
     let hold_ms: u64 = arg
         .and_then(|s| s.parse().ok())
@@ -289,10 +231,7 @@ fn child_ro_lease_holder(db_path: &str, arg: Option<&str>) {
     let ro = Database::open_read_only(&dsn).expect("child: open RO");
     let start = std::time::Instant::now();
     while start.elapsed() < Duration::from_millis(hold_ms) {
-        // A cheap query refreshes the lease (touch_lease runs on
-        // every query). Tolerate SwmrPendingDdl gracefully — those
-        // are signals to reopen, not crashes; we just stay attached
-        // for the test's purposes.
+        // Cheap query refreshes lease; tolerate SwmrPendingDdl.
         let _ = ro.query("SELECT 1", ());
         thread::sleep(Duration::from_millis(50));
     }
@@ -304,11 +243,6 @@ fn child_ro_lease_holder(db_path: &str, arg: Option<&str>) {
 
 #[test]
 fn writer_subprocess_then_reader_sees_data() {
-    // Subprocess writer creates a table, inserts N rows, checkpoints,
-    // and exits. Parent process opens the same DB read-only and verifies
-    // the rows are visible. This is the simplest end-to-end check that
-    // the open-after-close path still works through the subprocess
-    // boundary; it does NOT require coexistence.
     if dispatched_as_child() {
         return;
     }
@@ -335,26 +269,17 @@ fn writer_subprocess_then_reader_sees_data() {
 
 #[test]
 fn reader_can_attach_while_writer_subprocess_holds_lock() {
-    // SWMR core invariant: a writable subprocess holding LOCK_EX on
-    // db.lock must NOT block a reader process from opening the same
-    // DB read-only. This was the explicit goal of the file_lock.rs
-    // change (Shared takes no kernel lock).
     if dispatched_as_child() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("xproc_concurrent.db");
 
-    // Spawn writer that holds the DB open for 2s.
     let child = spawn_child("create_then_hold_open", &path, Some("2000"));
 
-    // Wait long enough for the child to have created the table and
-    // taken LOCK_EX. 200ms is plenty (child does CREATE + INSERT +
-    // CHECKPOINT, then sleeps 2s).
+    // Let the child create the table + take LOCK_EX.
     std::thread::sleep(Duration::from_millis(400));
 
-    // Attach as reader WHILE writer still holds LOCK_EX. Pre-SWMR
-    // this would error with DatabaseLocked; under SWMR it succeeds.
     let dsn_ro = format!("file://{}?read_only=true", path.display());
     let attach_result = Database::open_read_only(&dsn_ro);
     assert!(
@@ -364,7 +289,6 @@ fn reader_can_attach_while_writer_subprocess_holds_lock() {
     );
     let ro = attach_result.unwrap();
 
-    // The reader sees the data the writer checkpointed before sleeping.
     let mut rows = ro.query("SELECT COUNT(*) FROM t", ()).unwrap();
     let n: i64 = rows.next().unwrap().unwrap().get(0).unwrap();
     assert_eq!(n, 1, "reader should see the 1 row the child checkpointed");
@@ -376,24 +300,16 @@ fn reader_can_attach_while_writer_subprocess_holds_lock() {
 
 #[test]
 fn reader_lease_appears_during_attach() {
-    // P1.2 cross-process check: when a reader process opens read-only,
-    // its lease file appears under `<db>/readers/`. The writer process
-    // sees this signal on the next compaction cycle and defers cleanup.
-    // We verify the file is present from the perspective of a sibling
-    // process (the parent of the writer subprocess, which is also the
-    // reader).
     if dispatched_as_child() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("xproc_lease.db");
 
-    // Seed the DB via subprocess.
     let child = spawn_child("insert_then_checkpoint", &path, Some("1"));
     let output = child.wait_with_output().expect("wait for writer child");
     assert!(output.status.success());
 
-    // Open as reader; lease must appear with our own pid.
     let dsn_ro = format!("file://{}?read_only=true", path.display());
     let ro = Database::open_read_only(&dsn_ro).expect("parent: open ro");
 
@@ -415,11 +331,6 @@ fn reader_lease_appears_during_attach() {
 
 #[test]
 fn shm_cross_process_visibility() {
-    // SWMR v2 Phase B: writer subprocess creates db.shm and stores
-    // watermark values. Parent attaches ShmHandle::open_reader and
-    // verifies it observes those values via MAP_SHARED page cache.
-    // This is the foundational cross-process atomic-communication
-    // check for v2 SWMR.
     use std::sync::atomic::Ordering;
     use stoolap::storage::mvcc::shm::ShmHandle;
 
@@ -429,13 +340,9 @@ fn shm_cross_process_visibility() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("xproc_shm.db");
 
-    // Writer subprocess: create shm, write triple, sleep briefly.
     let child = spawn_child("init_shm", &path, Some("1234,7,2"));
-
-    // Wait long enough for child's create + stores to complete.
     thread::sleep(Duration::from_millis(100));
 
-    // Parent: attach RO and verify.
     let reader = ShmHandle::open_reader(&path).expect("parent: open_reader");
     let lsn = reader.header().visible_commit_lsn.load(Ordering::Acquire);
     let epoch = reader.header().manifest_epoch.load(Ordering::Acquire);
@@ -459,47 +366,25 @@ fn shm_cross_process_visibility() {
 #[test]
 #[ignore = "manual benchmark; flaky under CI scheduling — run with `cargo nextest run --test swmr_snapshot_test --run-ignored only visibility_lag_under_continuous_writer_is_bounded --no-capture`"]
 fn visibility_lag_under_continuous_writer_is_bounded() {
-    // SWMR v2 P2.11: validate the documented "5-60s" visibility lag
-    // claim with cross-process measurement. A subprocess writer inserts
-    // (id, ts_ns) + PRAGMA CHECKPOINT in a tight loop. The parent
-    // reader polls until each new row is visible and records the
-    // wall-clock latency.
-    //
-    // **Why #[ignore]**: each reader query under continuous-checkpoint
-    // churn pays for `reload_from_disk` + cache invalidation. Under CI
-    // scheduling jitter the cumulative cost can be high enough that
-    // the reader observes < 5 new rows in the bench window, which
-    // surfaces as a test failure that's actually about CI quotas, not
-    // about SWMR correctness. The cross-table-atomicity test in
-    // `read_only_test.rs` already validates the underlying mechanism
-    // reliably; this test is for ad-hoc lag profiling.
-    //
-    // When it passes, observed lag is typically sub-100ms — well under
-    // the writer's checkpoint cadence (default 60s).
+    // Manual lag bench: child writer commits + checkpoints in a loop;
+    // parent polls each new row's first-visible latency. Ignored under
+    // CI because reload_from_disk churn under jitter can push observed
+    // count below the threshold; the cross-table-atomicity test covers
+    // the underlying mechanism reliably.
     if dispatched_as_child() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("xproc_visibility_lag.db");
 
-    // Start the writer subprocess. Pace 250ms (4 inserts/sec) is
-    // realistic for a continuously-committing app like a bot recording
-    // events. Tighter pacing (e.g. 80ms) would force reader's auto-
-    // refresh to reload manifests faster than it can complete a query
-    // — useful diagnostic of "max sustainable visibility throughput"
-    // but a different test from this lag bound.
     let child = spawn_child("continuous_writer", &path, Some("3000,250"));
 
-    // Give the child time to create the table and start its loop. We
-    // can't open RO until the table exists (otherwise the reader's
-    // SELECT errors).
+    // Wait until the child creates the table.
     let table_ready = std::time::Instant::now();
     let mut ro: Option<stoolap::api::ReadOnlyDatabase> = None;
     let dsn_ro = format!("file://{}?read_only=true", path.display());
     while table_ready.elapsed() < Duration::from_millis(500) {
         if let Ok(handle) = Database::open_read_only(&dsn_ro) {
-            // Verify the table exists by querying — the child creates
-            // it on first iter.
             if handle.query("SELECT MAX(id) FROM t", ()).is_ok() {
                 ro = Some(handle);
                 break;
@@ -509,8 +394,6 @@ fn visibility_lag_under_continuous_writer_is_bounded() {
     }
     let ro = ro.expect("reader could not attach + see table within 500ms");
 
-    // Measure lag for ~1.8s. We poll for new ids and record per-id
-    // first-visible latency.
     let mut last_seen: i64 = 0;
     let mut max_lag_ms: i64 = 0;
     let mut observed: i64 = 0;
@@ -538,7 +421,7 @@ fn visibility_lag_under_continuous_writer_is_bounded() {
         }
         thread::sleep(Duration::from_millis(10));
     }
-    let _ = samples; // diagnostic only — uncomment eprintln below to trace.
+    let _ = samples;
 
     let output = child
         .wait_with_output()
@@ -555,8 +438,7 @@ fn visibility_lag_under_continuous_writer_is_bounded() {
         "reader observed only {} new rows in 1.8s — wiring probably broken",
         observed
     );
-    // Loose 2s upper bound to absorb CI variance; real lag should be
-    // sub-100ms with sync writes.
+    // Loose 2s upper bound for CI variance; real lag is sub-100ms.
     assert!(
         max_lag_ms < 2000,
         "max visibility lag {}ms (observed {} rows); regression in \
@@ -573,17 +455,12 @@ fn visibility_lag_under_continuous_writer_is_bounded() {
 
 #[test]
 fn reader_observes_epoch_advance_after_writer_checkpoint() {
-    // SWMR end-to-end visibility: writer subprocess inserts + checkpoints
-    // (bumps `<db>/volumes/epoch`). A reader opened BEFORE the second
-    // checkpoint has epoch=N cached; after refresh it observes N+1 and
-    // sees the new rows.
     if dispatched_as_child() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("xproc_epoch.db");
 
-    // First subprocess: seed initial state with 5 rows and checkpoint.
     let child = spawn_child("insert_then_checkpoint", &path, Some("5"));
     let output = child.wait_with_output().expect("wait child 1");
     assert!(output.status.success());
@@ -594,31 +471,16 @@ fn reader_observes_epoch_advance_after_writer_checkpoint() {
         "first checkpoint should have bumped epoch above 0"
     );
 
-    // Open reader. Its cached epoch matches what's on disk now.
     let dsn_ro = format!("file://{}?read_only=true", path.display());
     let ro = Database::open_read_only(&dsn_ro).expect("open reader");
     let mut rows = ro.query("SELECT COUNT(*) FROM t", ()).unwrap();
     let n: i64 = rows.next().unwrap().unwrap().get(0).unwrap();
     assert_eq!(n, 5, "reader sees the first batch");
 
-    // Second subprocess: insert more (uses INSERT OR IGNORE-like idempotency
-    // we don't have, so use distinct ids). Easiest: just spawn child with
-    // larger N — the child re-inserts ids 0..N which would conflict on PK.
-    // So instead: rely on the helper using IF NOT EXISTS for the table
-    // and just inserting fresh ids. Our existing helper inserts ids 0..n
-    // which conflict with prior — so skip and use a custom step:
-    // close ro before spawning to avoid reader-lease confusion in test
-    // logs (lease deferral is exercised in the survives-compaction test).
+    // Drop ro and open in-process writer for a non-conflicting insert
+    // (subprocess helpers reuse ids 0..n which would clash on PK).
     drop(ro);
 
-    // Use a different subprocess that inserts a new row beyond the previous
-    // range. We don't have a parameterized helper; quick inline approach
-    // is to just spawn the writer to do another single-row insert.
-    // To avoid PK conflict, write a separate helper-free child by
-    // re-executing the test binary for a "create_then_hold_open" role
-    // which inserts id=1 — that would conflict if seed already had id 1.
-    // Cleaner: just bump the epoch directly in this process by opening
-    // briefly as writer (no other engine lives because we dropped ro).
     let dsn = format!("file://{}", path.display());
     {
         let db = Database::open(&dsn).unwrap();
@@ -635,7 +497,6 @@ fn reader_observes_epoch_advance_after_writer_checkpoint() {
         epoch_after_second
     );
 
-    // Reopen reader; should see all 6 rows.
     let ro2 = Database::open_read_only(&dsn_ro).expect("reopen reader");
     let mut rows = ro2.query("SELECT COUNT(*) FROM t", ()).unwrap();
     let n: i64 = rows.next().unwrap().unwrap().get(0).unwrap();
@@ -643,15 +504,11 @@ fn reader_observes_epoch_advance_after_writer_checkpoint() {
 }
 
 // ---------------------------------------------------------------------------
-// SWMR v2 Phase C: writer publish ordering + commit-marker LSN plumbing
+// writer publish ordering + commit-marker LSN plumbing
 // ---------------------------------------------------------------------------
 
 #[test]
 fn writer_publishes_visible_commit_lsn_to_shm_on_each_commit() {
-    // SWMR v2 Phase C: every successful commit must update db.shm
-    // visible_commit_lsn to the LSN of the WAL commit marker. Verify
-    // by attaching ShmHandle::open_reader from the same process and
-    // observing the watermark advances after each INSERT.
     use std::sync::atomic::Ordering;
     use stoolap::storage::mvcc::shm::ShmHandle;
 
@@ -667,11 +524,8 @@ fn writer_publishes_visible_commit_lsn_to_shm_on_each_commit() {
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
         .expect("create table");
 
-    // Attach a reader-side mapping AFTER the writer initialized shm.
     let reader = ShmHandle::open_reader(&path).expect("open reader-side shm");
 
-    // Baseline: CREATE TABLE went through, so visible_commit_lsn is
-    // already > 0. Capture it as the watermark to beat.
     let lsn0 = reader.header().visible_commit_lsn.load(Ordering::Acquire);
     assert!(
         lsn0 > 0,
@@ -679,7 +533,6 @@ fn writer_publishes_visible_commit_lsn_to_shm_on_each_commit() {
         lsn0
     );
 
-    // Writer generation should also be nonzero (bumped on engine open).
     let gen = reader.header().writer_generation.load(Ordering::Acquire);
     assert!(
         gen > 0,
@@ -687,7 +540,6 @@ fn writer_publishes_visible_commit_lsn_to_shm_on_each_commit() {
         gen
     );
 
-    // Each INSERT commits independently; each commit must bump LSN.
     let mut prev = lsn0;
     for i in 0..5 {
         db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10), ())
@@ -708,11 +560,7 @@ fn writer_publishes_visible_commit_lsn_to_shm_on_each_commit() {
 
 #[test]
 fn shm_visible_commit_lsn_is_zero_for_in_memory_engine() {
-    // SWMR v2 Phase C: in-memory engines must NOT create a db.shm.
-    // There's no path to mmap, and readers from another process can't
-    // observe in-memory state anyway. Verify by opening an in-memory
-    // DB, doing some commits, and confirming there's no shm to attach
-    // to (no path on disk).
+    // memory:// has no path; engine must skip shm creation.
     if dispatched_as_child() {
         return;
     }
@@ -720,9 +568,6 @@ fn shm_visible_commit_lsn_is_zero_for_in_memory_engine() {
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
         .unwrap();
     db.execute("INSERT INTO t VALUES (1)", ()).unwrap();
-    // No assertion needed: if the in-memory path tried to create a shm
-    // it would have errored on the missing dir. Just verify the engine
-    // works.
     let mut rows = db.query("SELECT COUNT(*) FROM t", ()).unwrap();
     let n: i64 = rows.next().unwrap().unwrap().get(0).unwrap();
     assert_eq!(n, 1);
@@ -730,14 +575,10 @@ fn shm_visible_commit_lsn_is_zero_for_in_memory_engine() {
 
 #[test]
 fn dispatch_child_role_commit_then_hold() {
-    if !dispatched_as_child() {
-        // Parent invocation - nothing to do.
-    }
+    let _ = dispatched_as_child();
 }
 
-/// Phase C cross-process variant: child opens a writable DB, inserts
-/// `n` rows, then sleeps so the parent can attach the shm and observe
-/// the writer's published `visible_commit_lsn`.
+/// Inserts n rows then holds open so parent can attach shm.
 fn child_commit_then_hold(db_path: &str, arg: Option<&str>) {
     let (n, hold_ms): (i64, u64) = match arg {
         Some(s) => {
@@ -762,17 +603,12 @@ fn child_commit_then_hold(db_path: &str, arg: Option<&str>) {
         let sql = format!("INSERT INTO t VALUES ({}, {})", i, i * 10);
         db.execute(&sql, ()).expect("child: insert");
     }
-    // Hold the writable handle so the parent can attach shm and read
-    // the published watermark while the writer is still alive.
     thread::sleep(Duration::from_millis(hold_ms));
     db.close().expect("child: close");
 }
 
 #[test]
 fn writer_subprocess_publishes_visible_commit_lsn_visible_to_other_process() {
-    // SWMR v2 Phase C: cross-process verification. A subprocess writer
-    // does N commits; the parent process attaches db.shm read-only and
-    // observes a nonzero visible_commit_lsn.
     use std::sync::atomic::Ordering;
     use stoolap::storage::mvcc::shm::ShmHandle;
 
@@ -784,9 +620,7 @@ fn writer_subprocess_publishes_visible_commit_lsn_visible_to_other_process() {
 
     let child = spawn_child("commit_then_hold", &path, Some("4,800"));
 
-    // Wait for child's CREATE TABLE + INSERTs to flush + publish.
-    // We don't have a sync barrier other than time; the child holds
-    // for 800ms after commits.
+    // Wait for child to flush + publish (no sync barrier; child holds 800ms).
     thread::sleep(Duration::from_millis(250));
 
     let reader = ShmHandle::open_reader(&path).expect("parent: open_reader");
@@ -806,23 +640,14 @@ fn writer_subprocess_publishes_visible_commit_lsn_visible_to_other_process() {
 }
 
 // ---------------------------------------------------------------------------
-// SWMR v2 Phase D: extended leases + WAL pinning
+// extended leases + WAL pinning
 // ---------------------------------------------------------------------------
 
 #[test]
 fn read_only_handle_writes_pinned_lsn_into_lease_on_each_query() {
-    // Phase D: a cross-process ReadOnlyDatabase must pin the writer's
-    // current visible_commit_lsn into its lease file so the writer's
-    // truncate_wal floor honors what the reader still needs to tail.
-    //
-    // This requires a LIVE writer: a closed writer leaves db.shm on
-    // disk as a stale leftover, and the reader's pre-acquire
-    // handshake correctly refuses to trust it (a non-blocking
-    // LOCK_SH probe succeeds → no LOCK_EX held → shm is stale →
-    // discard shm → uncapped WAL recovery, no shm-derived pin).
-    // Without a live writer there's nothing to pin against, so the
-    // pin would simply stay at 0. Keep the writer alive across the
-    // RO query to exercise the actual Phase D pin path.
+    // Writer must stay alive across the RO query: a closed writer
+    // leaves a stale shm and the reader's handshake discards it
+    // (no LOCK_EX held = stale = uncapped WAL recovery, no pin).
     use stoolap::storage::mvcc::lease::{read_pinned_lsn, READERS_DIR};
     if dispatched_as_child() {
         return;
@@ -832,8 +657,6 @@ fn read_only_handle_writes_pinned_lsn_into_lease_on_each_query() {
     let dsn_rw = format!("file://{}", path.display());
     let dsn_ro = format!("{}?read_only=true", dsn_rw);
 
-    // Writer: CREATE TABLE + a few INSERTs. Keep open across the
-    // reader's open + query so shm reflects a live writer.
     let db_rw = Database::open(&dsn_rw).unwrap();
     db_rw
         .execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
@@ -844,9 +667,6 @@ fn read_only_handle_writes_pinned_lsn_into_lease_on_each_query() {
             .unwrap();
     }
 
-    // Reader: attach RO and run one query. After the query, the
-    // lease file should be exactly 8 bytes (v2 shape) carrying a
-    // nonzero pinned_lsn (whatever the live writer published).
     let ro = Database::open_read_only(&dsn_ro).expect("open RO");
     let _ = ro.query("SELECT COUNT(*) FROM t", ()).unwrap();
 
@@ -874,9 +694,6 @@ fn read_only_handle_writes_pinned_lsn_into_lease_on_each_query() {
 
 #[test]
 fn writer_publishes_min_pinned_lsn_to_shm_when_reader_attached() {
-    // Phase D: a v2 reader's pinned_lsn must surface in db.shm
-    // min_pinned_lsn after a checkpoint scan, so PRAGMA SWMR_STATUS
-    // and external monitors can see what's holding back truncation.
     use std::sync::atomic::Ordering;
     use stoolap::storage::mvcc::lease::{read_pinned_lsn, READERS_DIR};
     use stoolap::storage::mvcc::shm::ShmHandle;
@@ -892,15 +709,12 @@ fn writer_publishes_min_pinned_lsn_to_shm_when_reader_attached() {
     writer
         .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
         .unwrap();
-    // Insert a row + checkpoint BEFORE the reader opens so a manifest
-    // exists on disk. PRAGMA CHECKPOINT on an empty table doesn't
-    // create a volume, which would later surface as a v1 SchemaChanged
-    // event when the next checkpoint finally writes one.
+    // Seed a non-empty checkpoint so reader has a manifest on attach
+    // (avoids spurious SchemaChanged on the first real checkpoint).
     writer.execute("INSERT INTO t VALUES (-1, -1)", ()).unwrap();
     writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
 
     let reader = Database::open_read_only(&dsn_ro).expect("open RO");
-    // First query writes pinned_lsn into lease.
     let _ = reader.query("SELECT COUNT(*) FROM t", ()).unwrap();
 
     let pid = std::process::id();
@@ -908,9 +722,6 @@ fn writer_publishes_min_pinned_lsn_to_shm_when_reader_attached() {
     let pin_at_query = read_pinned_lsn(&lease_path).expect("8-byte lease payload");
     assert!(pin_at_query > 0);
 
-    // Writer pushes more commits then checkpoints, which scans the
-    // lease and publishes min_pinned_lsn to shm. No schema drift
-    // because "t" is already in the reader's manifest cache.
     for i in 0..3 {
         writer
             .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 7), ())
@@ -928,8 +739,7 @@ fn writer_publishes_min_pinned_lsn_to_shm_when_reader_attached() {
         published_min
     );
 
-    // Reader still works after the checkpoint — its required WAL
-    // entries weren't truncated.
+    // Reader's required WAL entries survived truncation.
     let _ = reader.query("SELECT COUNT(*) FROM t", ()).unwrap();
 
     drop(reader);
@@ -937,99 +747,11 @@ fn writer_publishes_min_pinned_lsn_to_shm_when_reader_attached() {
 }
 
 // ---------------------------------------------------------------------------
-// SWMR v2 Phase E: reader WAL-tail overlay rebuild
+// reader WAL-tail cursor advance
 // ---------------------------------------------------------------------------
 
 #[test]
-fn reader_overlay_picks_up_writer_commits_between_checkpoints() {
-    // Phase E: a cross-process ReadOnlyDatabase tails the WAL and
-    // builds a per-table overlay of committed-but-uncheckpointed
-    // rows. Verify by inserting rows on the writer WITHOUT
-    // checkpointing in between, then forcing a reader refresh and
-    // observing the overlay populated.
-    if dispatched_as_child() {
-        return;
-    }
-    let tmp = tempfile::tempdir().unwrap();
-    let path = tmp.path().join("phasee_overlay.db");
-    let dsn_rw = format!("file://{}", path.display());
-    let dsn_ro = format!("{}?read_only=true", dsn_rw);
-
-    // Set up the writer + checkpoint a baseline so the table exists
-    // in volumes/ and the reader's open won't trip the v1 schema
-    // drift guard.
-    let writer = Database::open(&dsn_rw).expect("open writer");
-    writer
-        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
-        .unwrap();
-    writer.execute("INSERT INTO t VALUES (-1, -1)", ()).unwrap();
-    writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
-
-    let reader = Database::open_read_only(&dsn_ro).expect("open RO");
-    // Enable DML overlay materialization BEFORE the first refresh:
-    // ReadOnlyDatabase defaults `swmr_overlay_enabled = false`,
-    // and refresh in disabled mode passes `dml_apply = false` to
-    // `rebuild_from_wal`, advancing the cursor without populating
-    // per-table row state. This test asserts on overlay row
-    // contents, so it needs DML materialization on. (After the
-    // first refresh runs in disabled mode the cursor advances
-    // past attach and a later enable() call rejects with an Err
-    // — see `set_swmr_overlay_enabled` doc.)
-    reader.set_swmr_overlay_enabled(true).unwrap();
-    // First refresh: nothing in flight beyond the checkpoint, overlay
-    // should ideally be small (or empty if all entries were already
-    // in cold).
-    reader.refresh().unwrap();
-    let baseline_overlay_rows = reader.overlay().table("t").map(|t| t.len()).unwrap_or(0);
-
-    // Writer does several inserts WITHOUT checkpointing — these stay
-    // in the hot buffer + WAL only. visible_commit_lsn advances on
-    // each commit (Phase C wiring).
-    for i in 0..5 {
-        writer
-            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 7), ())
-            .unwrap();
-    }
-
-    // Reader refresh rebuilds overlay from WAL tail up to the
-    // writer's now-current visible_commit_lsn.
-    reader.refresh().unwrap();
-    let overlay = reader
-        .overlay()
-        .table("t")
-        .expect("after writer inserts + reader refresh, overlay must contain table 't'");
-    // The overlay should now have AT LEAST the 5 new rows beyond the
-    // baseline. (It may have more if the baseline checkpoint left some
-    // entries that re-appear in the tail; that's safe — newest-wins.)
-    assert!(
-        overlay.len() >= baseline_overlay_rows + 5,
-        "overlay must include the 5 new rows: baseline={}, after={}",
-        baseline_overlay_rows,
-        overlay.len()
-    );
-
-    // last_applied_lsn must now match (or be close to) writer's
-    // visible_commit_lsn published in db.shm.
-    use std::sync::atomic::Ordering;
-    use stoolap::storage::mvcc::shm::ShmHandle;
-    let shm = ShmHandle::open_reader(&path).expect("attach shm");
-    let writer_lsn = shm.header().visible_commit_lsn.load(Ordering::Acquire);
-    assert_eq!(
-        reader.overlay().last_applied_lsn(),
-        writer_lsn,
-        "reader overlay last_applied_lsn must equal writer's visible_commit_lsn"
-    );
-
-    drop(reader);
-    writer.close().unwrap();
-}
-
-#[test]
 fn reader_overlay_skips_rebuild_when_writer_lsn_unchanged() {
-    // Phase E: refresh must be a no-op (no rebuild) when the writer
-    // hasn't advanced visible_commit_lsn since the last refresh.
-    // Verify by snapshotting last_applied_lsn before and after a
-    // second refresh with no writer activity in between.
     if dispatched_as_child() {
         return;
     }
@@ -1049,7 +771,6 @@ fn reader_overlay_skips_rebuild_when_writer_lsn_unchanged() {
     reader.refresh().unwrap();
     let lsn_after_first = reader.overlay().last_applied_lsn();
 
-    // No writer activity between the two refreshes.
     reader.refresh().unwrap();
     let lsn_after_second = reader.overlay().last_applied_lsn();
     assert_eq!(
@@ -1063,9 +784,6 @@ fn reader_overlay_skips_rebuild_when_writer_lsn_unchanged() {
 
 #[test]
 fn writer_min_pinned_lsn_is_zero_when_no_v2_readers() {
-    // Phase D: with no readers at all, min_pinned_lsn should remain
-    // at 0 (no constraint). Verify by triggering a checkpoint with
-    // no reader attached and reading the shm field.
     use std::sync::atomic::Ordering;
     use stoolap::storage::mvcc::shm::ShmHandle;
     if dispatched_as_child() {
@@ -1093,20 +811,14 @@ fn writer_min_pinned_lsn_is_zero_when_no_v2_readers() {
 }
 
 // ---------------------------------------------------------------------------
-// SWMR v2 Phase G: per-table cache invalidation precision
+// per-table cache invalidation precision
 // ---------------------------------------------------------------------------
 
 #[test]
 fn reader_refresh_keeps_unrelated_table_cached_plans_alive() {
-    // Phase G: a writer commit on table A must NOT cause the reader
-    // to evict cached query plans for unrelated table B. Verify by
-    // executing the SAME SELECT against B twice (which seeds the
-    // query cache), then triggering a checkpoint that only affects
-    // A, and confirming B's cached plan survives — i.e. the second
-    // query against B observes the same plan.
-    //
-    // We can't directly observe plan-cache hit/miss from the public
-    // API, so we use the cache's hit_count statistic as the signal.
+    // Writer commit on A must not evict cached plans for unrelated B.
+    // Public API can't observe cache hits directly; check behavior
+    // (B's count stable after a refresh that only affected A).
     if dispatched_as_child() {
         return;
     }
@@ -1115,7 +827,6 @@ fn reader_refresh_keeps_unrelated_table_cached_plans_alive() {
     let dsn_rw = format!("file://{}", path.display());
     let dsn_ro = format!("{}?read_only=true", dsn_rw);
 
-    // Writer: two tables, baseline checkpoint, both visible to reader.
     let writer = Database::open(&dsn_rw).unwrap();
     writer
         .execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", ())
@@ -1128,17 +839,10 @@ fn reader_refresh_keeps_unrelated_table_cached_plans_alive() {
     writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
 
     let reader = Database::open_read_only(&dsn_ro).unwrap();
-    // Run B's query twice to seed + hit the plan cache.
+    // Seed + hit plan cache for B.
     let _ = reader.query("SELECT COUNT(*) FROM b", ()).unwrap();
     let _ = reader.query("SELECT COUNT(*) FROM b", ()).unwrap();
 
-    // Take a baseline snapshot of B's cached plans count via the
-    // executor's query cache stats. We can't easily get the inner
-    // executor's stats from the public ReadOnlyDatabase API, so we
-    // instead verify behaviorally: after a writer commit + checkpoint
-    // on table A only, reissuing B's query should still return the
-    // same result (sanity) and the per-table invalidation path must
-    // not error.
     writer.execute("INSERT INTO a VALUES (2, 2)", ()).unwrap();
     writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
 
@@ -1147,7 +851,6 @@ fn reader_refresh_keeps_unrelated_table_cached_plans_alive() {
     let n: i64 = rows.next().unwrap().unwrap().get(0).unwrap();
     assert_eq!(n, 1, "B unchanged → row count stable across refresh");
 
-    // Verify A's queries see the new row (not evicted, just refreshed).
     let mut rows = reader.query("SELECT COUNT(*) FROM a", ()).unwrap();
     let n: i64 = rows.next().unwrap().unwrap().get(0).unwrap();
     assert_eq!(n, 2, "A changed → reader sees the new row after refresh");
@@ -1157,15 +860,11 @@ fn reader_refresh_keeps_unrelated_table_cached_plans_alive() {
 }
 
 // ---------------------------------------------------------------------------
-// SWMR v2 Phase H: typed sub-kind errors + DDL pass-through in WAL-tail
+// typed sub-kind errors + DDL pass-through in WAL-tail
 // ---------------------------------------------------------------------------
 
 #[test]
 fn refresh_surfaces_swmr_pending_ddl_when_writer_creates_table_after_attach() {
-    // Phase H: when the writer commits a DDL (CREATE TABLE) between
-    // the reader's attach and refresh, the WAL-tail picks it up and
-    // refresh returns Error::SwmrPendingDdl with a structured
-    // summary so the caller knows to reopen.
     use stoolap::Error;
     if dispatched_as_child() {
         return;
@@ -1175,8 +874,7 @@ fn refresh_surfaces_swmr_pending_ddl_when_writer_creates_table_after_attach() {
     let dsn_rw = format!("file://{}", path.display());
     let dsn_ro = format!("{}?read_only=true", dsn_rw);
 
-    // Writer: existing table baseline, checkpointed so the reader
-    // can attach without v1 SchemaChanged tripping.
+    // Baseline checkpointed so reader attaches without SchemaChanged.
     let writer = Database::open(&dsn_rw).unwrap();
     writer
         .execute("CREATE TABLE existing (id INTEGER PRIMARY KEY)", ())
@@ -1187,13 +885,10 @@ fn refresh_surfaces_swmr_pending_ddl_when_writer_creates_table_after_attach() {
     writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
 
     let reader = Database::open_read_only(&dsn_ro).unwrap();
-    // Reader's first refresh: clean baseline, no DDL in range.
     reader.refresh().unwrap();
 
-    // Writer creates a NEW table (DDL). This commits + bumps
-    // visible_commit_lsn but does NOT necessarily checkpoint, so
-    // the manifest_epoch path may not fire. The WAL-tail must catch
-    // it and surface SwmrPendingDdl.
+    // DDL bumps visible_commit_lsn without necessarily checkpointing;
+    // WAL-tail must catch it and surface SwmrPendingDdl.
     writer
         .execute("CREATE TABLE late_arrival (id INTEGER PRIMARY KEY)", ())
         .unwrap();
@@ -1218,17 +913,11 @@ fn refresh_surfaces_swmr_pending_ddl_when_writer_creates_table_after_attach() {
 }
 
 // ---------------------------------------------------------------------------
-// SWMR v2 Phase I: cross-process + crash test matrix
+// cross-process + crash test matrix
 // ---------------------------------------------------------------------------
 
 #[test]
 fn writer_reincarnation_advances_writer_generation_in_shm() {
-    // Phase I: when a writer process opens, runs, and is replaced by
-    // a fresh writer (close + reopen, or crash + reopen), the
-    // `writer_generation` in db.shm must monotonically advance. This
-    // is the load-bearing signal `Error::SwmrWriterReincarnated`
-    // builds on. Verify by spawning two sequential writer
-    // subprocesses and observing the generation value before/after.
     use std::sync::atomic::Ordering;
     use stoolap::storage::mvcc::shm::ShmHandle;
     if dispatched_as_child() {
@@ -1237,7 +926,6 @@ fn writer_reincarnation_advances_writer_generation_in_shm() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("phasei_gen.db");
 
-    // First writer: insert + checkpoint + clean exit.
     let child1 = spawn_child("insert_then_checkpoint", &path, Some("3"));
     let out1 = child1.wait_with_output().expect("wait writer 1");
     assert!(
@@ -1246,7 +934,6 @@ fn writer_reincarnation_advances_writer_generation_in_shm() {
         String::from_utf8_lossy(&out1.stderr)
     );
 
-    // Read the generation now — this should be >= 1 from writer 1.
     let shm1 = ShmHandle::open_reader(&path).expect("attach shm after w1");
     let gen_after_w1 = shm1.header().writer_generation.load(Ordering::Acquire);
     assert!(
@@ -1256,9 +943,7 @@ fn writer_reincarnation_advances_writer_generation_in_shm() {
     );
     drop(shm1);
 
-    // Second writer: another full open/close cycle. Use the
-    // open_close_quick role so we don't conflict with the first
-    // writer's PK rows.
+    // open_close_quick avoids PK conflicts with writer 1's rows.
     let child2 = spawn_child("open_close_quick", &path, None);
     let out2 = child2.wait_with_output().expect("wait writer 2");
     assert!(
@@ -1280,12 +965,6 @@ fn writer_reincarnation_advances_writer_generation_in_shm() {
 
 #[test]
 fn reader_subprocess_killed_mid_read_leaves_stale_lease_for_reaping() {
-    // Phase I: when a reader process is SIGKILLed without unlinking
-    // its lease, the lease file persists on disk (Drop didn't run).
-    // The writer's `reap_stale_leases` removes it after `max_age`.
-    // Verify the cross-process contract end-to-end: SIGKILL the
-    // child, sleep past max_age, then call the public reap helper
-    // and confirm the stale lease is gone.
     use stoolap::storage::mvcc::lease::{reap_stale_leases, READERS_DIR};
     if dispatched_as_child() {
         return;
@@ -1294,7 +973,6 @@ fn reader_subprocess_killed_mid_read_leaves_stale_lease_for_reaping() {
     let path = tmp.path().join("phasei_reaper.db");
     let dsn_rw = format!("file://{}", path.display());
 
-    // Set up an empty database the reader can attach to.
     {
         let db = Database::open(&dsn_rw).unwrap();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
@@ -1304,10 +982,8 @@ fn reader_subprocess_killed_mid_read_leaves_stale_lease_for_reaping() {
         db.close().unwrap();
     }
 
-    // Spawn a reader subprocess that holds for a long time.
     let mut child = spawn_child("ro_lease_holder", &path, Some("60000"));
 
-    // Wait for the lease to appear.
     let readers_dir = path.join(READERS_DIR);
     let mut waited = 0;
     while waited < 2000 {
@@ -1331,14 +1007,11 @@ fn reader_subprocess_killed_mid_read_leaves_stale_lease_for_reaping() {
         live_count_before
     );
 
-    // SIGKILL the reader. Drop guarantees nothing — kill() is the
-    // simulation of a hard crash.
+    // SIGKILL = simulated hard crash; Drop never runs.
     child.kill().expect("kill reader subprocess");
     let _ = child.wait();
 
-    // Lease file is still on disk — Drop didn't run. Sleep past
-    // a chosen short max_age, then call the same reap helper the
-    // writer's compaction path uses.
+    // Lease still on disk; sleep past max_age then reap.
     thread::sleep(Duration::from_millis(700));
     let reaped =
         reap_stale_leases(&readers_dir, Duration::from_millis(500)).expect("reap_stale_leases");
@@ -1357,9 +1030,6 @@ fn reader_subprocess_killed_mid_read_leaves_stale_lease_for_reaping() {
 
 #[test]
 fn corrupt_shm_is_rejected_by_open_reader() {
-    // Phase I: a `db.shm` with a bad magic, wrong version, or
-    // missing `init_done` must not let a reader attach. The reader
-    // shouldn't crash or read garbage; it should return Err.
     use stoolap::storage::mvcc::shm::{ShmHandle, SHM_FILENAME, SHM_SIZE};
     if dispatched_as_child() {
         return;
@@ -1405,11 +1075,6 @@ fn corrupt_shm_is_rejected_by_open_reader() {
 
 #[test]
 fn dropping_one_of_two_in_process_ro_handles_keeps_lease_alive() {
-    // P1 review: two ReadOnlyDatabase instances opened in the same
-    // process share the same `<pid>.lease` file. Dropping one must
-    // NOT unlink the lease while the other is still alive — that
-    // would let the writer's compaction / WAL truncation prematurely
-    // ignore the surviving reader.
     use stoolap::storage::mvcc::lease::READERS_DIR;
     if dispatched_as_child() {
         return;
@@ -1419,7 +1084,6 @@ fn dropping_one_of_two_in_process_ro_handles_keeps_lease_alive() {
     let dsn_rw = format!("file://{}", path.display());
     let dsn_ro = format!("{}?read_only=true", dsn_rw);
 
-    // Establish a stoolap database the readers can attach to.
     {
         let db = Database::open(&dsn_rw).unwrap();
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
@@ -1443,17 +1107,13 @@ fn dropping_one_of_two_in_process_ro_handles_keeps_lease_alive() {
         "lease must still exist after second RO open"
     );
 
-    // Drop the first handle. The lease must SURVIVE because ro2 is
-    // still alive and using it.
     drop(ro1);
     assert!(
         lease_path.exists(),
         "lease must survive while another in-process RO handle holds it"
     );
-    // ro2 still works.
     let _ = ro2.query("SELECT COUNT(*) FROM t", ()).unwrap();
 
-    // Drop the second handle. Now the lease should be gone.
     drop(ro2);
     assert!(
         !lease_path.exists(),
@@ -1463,11 +1123,8 @@ fn dropping_one_of_two_in_process_ro_handles_keeps_lease_alive() {
 
 #[test]
 fn refresh_does_not_misfire_swmr_pending_ddl_for_create_index_rerecord() {
-    // P1 review: post-checkpoint DDL re-records of pre-existing
-    // CREATE INDEX entries must NOT surface as SwmrPendingDdl. Prior
-    // to this fix, the filter only knew about CreateTable
-    // re-records; an index created before the reader attached would
-    // re-fire on every checkpoint as if it were brand new.
+    // Post-checkpoint DDL re-records of pre-existing CREATE INDEX
+    // must not re-fire as SwmrPendingDdl on every checkpoint.
     if dispatched_as_child() {
         return;
     }
@@ -1485,16 +1142,12 @@ fn refresh_does_not_misfire_swmr_pending_ddl_for_create_index_rerecord() {
     writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
 
     let reader = Database::open_read_only(&dsn_ro).unwrap();
-    // First refresh: clean baseline.
     reader.refresh().unwrap();
 
-    // Writer commits more rows + checkpoints (which re-records DDL,
-    // including CREATE INDEX, with NEW LSNs > attach baseline).
+    // Checkpoint re-records CREATE INDEX with new LSNs > attach baseline.
     writer.execute("INSERT INTO t VALUES (2, 2)", ()).unwrap();
     writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
 
-    // Refresh must NOT raise SwmrPendingDdl. The index already
-    // existed before the reader attached.
     let res = reader.refresh();
     assert!(
         res.is_ok(),
@@ -1509,10 +1162,6 @@ fn refresh_does_not_misfire_swmr_pending_ddl_for_create_index_rerecord() {
 
 #[test]
 fn engine_table_checkpoint_lsns_reflects_per_table_state() {
-    // Phase G: verify the engine accessor `table_checkpoint_lsns`
-    // surfaces per-table checkpoint_lsn so the reader's refresh path
-    // can compare against its cached snapshot. After a checkpoint,
-    // every loaded table appears with its current checkpoint_lsn.
     if dispatched_as_child() {
         return;
     }
@@ -1531,10 +1180,6 @@ fn engine_table_checkpoint_lsns_reflects_per_table_state() {
     writer.execute("INSERT INTO b VALUES (1)", ()).unwrap();
     writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
 
-    // Borrow the engine via the public read_engine accessor; then
-    // downcast to MVCCEngine via the engine_ext path. We can't reach
-    // table_checkpoint_lsns through the trait, so go through the
-    // private engine handle the test owns.
     let engine = writer.engine();
     let lsns = engine.table_checkpoint_lsns();
     assert!(lsns.contains_key("a"), "table 'a' must appear: {:?}", lsns);
@@ -1548,5 +1193,535 @@ fn engine_table_checkpoint_lsns_reflects_per_table_state() {
         lsn_b
     );
 
+    writer.close().unwrap();
+}
+
+#[test]
+fn reader_skips_wal_scan_when_writer_commits_only_dml() {
+    // DDL watermark fast path: DML-only commits must not trigger a
+    // WAL tail scan on the reader.
+    if dispatched_as_child() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("ddl_watermark.db");
+    let dsn_rw = format!("file://{}", path.display());
+    let dsn_ro = format!("{}?read_only=true", dsn_rw);
+
+    let writer = Database::open(&dsn_rw).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let reader = Database::open_read_only(&dsn_ro).unwrap();
+    reader.refresh().unwrap();
+    let scans_baseline = reader.overlay().wal_scan_count();
+
+    for i in 0..10 {
+        writer
+            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i), ())
+            .unwrap();
+    }
+    reader.refresh().unwrap();
+    assert_eq!(
+        reader.overlay().wal_scan_count(),
+        scans_baseline,
+        "DML-only commits must not trigger a WAL tail scan"
+    );
+
+    // DDL DOES trigger a scan.
+    writer.execute("CREATE INDEX idx_v ON t(v)", ()).unwrap();
+    let _ = reader.refresh();
+    assert!(
+        reader.overlay().wal_scan_count() > scans_baseline,
+        "DDL commit must trigger a WAL tail scan"
+    );
+
+    drop(reader);
+    writer.close().unwrap();
+}
+
+#[test]
+fn ddl_watermark_bumps_on_commit_marker_not_entry() {
+    // Regression: bumping catalog_epoch at DDL ENTRY append lets the
+    // reader skip the scan for transactional DDL whose commit lands
+    // AFTER an unrelated DML commit that already advanced the
+    // reader's last_applied past the DDL entry. Watermark must
+    // represent the committed DDL frontier, not appended DDL.
+    if dispatched_as_child() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("ddl_watermark_marker.db");
+    let dsn_rw = format!("file://{}", path.display());
+    let dsn_ro = format!("{}?read_only=true", dsn_rw);
+
+    let writer1 = Database::open(&dsn_rw).unwrap();
+    writer1
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    writer1.execute("INSERT INTO t VALUES (0, 0)", ()).unwrap();
+    writer1.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let reader = Database::open_read_only(&dsn_ro).unwrap();
+    reader.refresh().unwrap();
+
+    // Begin transactional DDL on writer1; do NOT commit.
+    // (CREATE TABLE inside BEGIN uses the transactional DDL path;
+    // CREATE INDEX would auto-commit even inside BEGIN.)
+    writer1.execute("BEGIN", ()).unwrap();
+    writer1
+        .execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+
+    // Independent writer2 commits DML, advancing visible_commit_lsn
+    // past writer1's uncommitted DDL entry.
+    let writer2 = Database::open(&dsn_rw).unwrap();
+    writer2.execute("INSERT INTO t VALUES (1, 1)", ()).unwrap();
+
+    // Reader refresh now: must NOT raise SwmrPendingDdl (writer1's
+    // DDL is still uncommitted) AND must advance last_applied past
+    // the DDL entry's LSN.
+    match reader.refresh() {
+        Ok(_) => {}
+        Err(e) => panic!("reader saw uncommitted DDL: {:?}", e),
+    }
+
+    // Now writer1 commits the transactional DDL.
+    writer1.execute("COMMIT", ()).unwrap();
+
+    // Reader refresh: MUST surface the committed DDL. Without the
+    // marker-side bump, catalog_epoch would still be the entry's LSN
+    // (now <= reader.last_applied), the fast path would skip the
+    // scan, and the DDL would be missed.
+    match reader.refresh() {
+        Err(stoolap::Error::SwmrPendingDdl(_)) => {}
+        other => panic!(
+            "expected SwmrPendingDdl after committed transactional DDL, got: {:?}",
+            other
+        ),
+    }
+
+    drop(reader);
+    writer2.close().ok();
+    writer1.close().unwrap();
+}
+
+#[test]
+fn orphan_volumes_get_reaped_with_active_reader() {
+    // Regression: pre-fix, compaction's unlink + the orphan reaper both
+    // bailed when ANY reader was alive, so .vol files accumulated
+    // unboundedly. Fix: gate on min(reader_manifest_epoch) >=
+    // current_epoch instead of "any reader alive". An auto-refreshing
+    // reader publishes its epoch every refresh, so the writer can reap
+    // within ~one query interval of compaction.
+    if dispatched_as_child() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("orphan_reap.db");
+    let dsn_rw = format!("file://{}?compact_threshold=2", path.display());
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+
+    let writer = Database::open(&dsn_rw).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    writer.execute("INSERT INTO t VALUES (0, 0)", ()).unwrap();
+    writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let reader = Database::open_read_only(&dsn_ro).unwrap();
+    reader.refresh().unwrap();
+
+    let table_dir = path.join("volumes").join("t");
+    let count_vols = || -> usize {
+        std::fs::read_dir(&table_dir)
+            .map(|it| {
+                it.flatten()
+                    .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("vol"))
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+
+    // Drive write+checkpoint cycles. Each cycle adds a sub-target volume;
+    // every other cycle compaction merges them. Without the fix, ALL old
+    // sub-target files persist as orphans.
+    for i in 1..40 {
+        writer
+            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i), ())
+            .unwrap();
+        writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        // Reader query → publishes new manifest_epoch to lease.
+        let _ = reader.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+    }
+
+    // Pre-fix: ~40 orphan files. Post-fix: at most a handful (the most
+    // recent ones whose epoch hasn't been observed by reader yet).
+    let n = count_vols();
+    assert!(
+        n < 15,
+        "orphan reaping should keep .vol count bounded with active reader; \
+         saw {} files (expected < 15 with compact_threshold=2)",
+        n
+    );
+
+    drop(reader);
+    writer.close().unwrap();
+}
+
+// Helpers for the tests below.
+fn count_vols_for(table_dir: &std::path::Path) -> usize {
+    std::fs::read_dir(table_dir)
+        .map(|it| {
+            it.flatten()
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("vol"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+fn count_sidecars_for(table_dir: &std::path::Path) -> usize {
+    std::fs::read_dir(table_dir)
+        .map(|it| {
+            it.flatten()
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("retired"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[test]
+fn auto_refresh_off_reader_blocks_orphan_reap() {
+    // Reader with auto_refresh=off after attach holds a stale snapshot.
+    // Compaction creates orphans; reaper creates retire sidecars; .vol
+    // files MUST stay until the reader re-enables refresh and queries.
+    if dispatched_as_child() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("auto_off_blocks.db");
+    let dsn_rw = format!("file://{}?compact_threshold=2", path.display());
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+
+    let writer = Database::open(&dsn_rw).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    writer.execute("INSERT INTO t VALUES (0, 0)", ()).unwrap();
+    writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let reader = Database::open_read_only(&dsn_ro).unwrap();
+    reader.refresh().unwrap();
+
+    let table_dir = path.join("volumes").join("t");
+    // Phase 1: warm up with auto_refresh=on so the reader's pin advances
+    // and writer-side compaction can actually operate (visibility cap
+    // restricts compaction to volumes <= reader pin).
+    for i in 1..20 {
+        writer
+            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i), ())
+            .unwrap();
+        writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let _ = reader.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+    }
+    // Snapshot reader's current epoch, then freeze.
+    let frozen_epoch = reader.last_seen_epoch_for_test();
+    reader.set_auto_refresh(false);
+    let vols_at_freeze = count_vols_for(&table_dir);
+
+    // Phase 2: more cycles. Compaction can still merge volumes whose
+    // visible_at_lsn <= reader's frozen pin (the high pin from last
+    // refresh). Orphans accumulate. Reaper creates sidecars but
+    // CAN'T unlink because reader's epoch file is stuck at frozen.
+    for i in 20..40 {
+        writer
+            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i), ())
+            .unwrap();
+        writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let _ = reader.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+    }
+
+    let vols_frozen = count_vols_for(&table_dir);
+    let sidecars = count_sidecars_for(&table_dir);
+    assert!(
+        sidecars > 0 || vols_frozen >= vols_at_freeze,
+        "either sidecars created (preferred) or no compaction occurred; \
+         vols_at_freeze={} vols_now={} sidecars={}",
+        vols_at_freeze,
+        vols_frozen,
+        sidecars
+    );
+
+    // Phase 3: re-enable refresh + query → reader publishes a new epoch
+    // past the sidecar stamps → reaper drains.
+    reader.set_auto_refresh(true);
+    for _ in 0..3 {
+        let _ = reader.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+        writer.execute("INSERT INTO t VALUES (-1, -1)", ()).ok();
+        writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    let unfrozen_epoch = reader.last_seen_epoch_for_test();
+    assert!(
+        unfrozen_epoch > frozen_epoch,
+        "epoch must have advanced after re-enabling refresh ({} -> {})",
+        frozen_epoch,
+        unfrozen_epoch
+    );
+
+    drop(reader);
+    writer.close().unwrap();
+}
+
+#[test]
+fn active_begin_blocks_orphan_reap() {
+    // BEGIN holds a stable snapshot via the maybe_auto_refresh
+    // skip-during-active-tx guard. Reaper must defer until COMMIT
+    // releases the BEGIN AND a subsequent refresh fires.
+    if dispatched_as_child() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("begin_blocks.db");
+    let dsn_rw = format!("file://{}?compact_threshold=2", path.display());
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+
+    let writer = Database::open(&dsn_rw).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    writer.execute("INSERT INTO t VALUES (0, 0)", ()).unwrap();
+    writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let reader = Database::open_read_only(&dsn_ro).unwrap();
+    reader.refresh().unwrap();
+
+    // Warm up so reader pin advances and compaction can operate.
+    for i in 1..20 {
+        writer
+            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i), ())
+            .unwrap();
+        writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let _ = reader.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+    }
+    let frozen_epoch = reader.last_seen_epoch_for_test();
+    reader.query("BEGIN", ()).unwrap();
+
+    // BEGIN suppresses maybe_auto_refresh → no epoch publish.
+    for i in 20..40 {
+        writer
+            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i), ())
+            .unwrap();
+        writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let _ = reader.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+    }
+    assert_eq!(
+        reader.last_seen_epoch_for_test(),
+        frozen_epoch,
+        "BEGIN must suppress epoch advance"
+    );
+
+    // COMMIT releases the BEGIN; refresh advances epoch; reaper can drain.
+    let _ = reader.query("COMMIT", ());
+    for _ in 0..3 {
+        let _ = reader.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+        writer.execute("INSERT INTO t VALUES (-1, -1)", ()).ok();
+        writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    assert!(
+        reader.last_seen_epoch_for_test() > frozen_epoch,
+        "epoch must advance after COMMIT + refresh"
+    );
+
+    drop(reader);
+    writer.close().unwrap();
+}
+
+#[test]
+fn writer_uses_min_handle_epoch_across_handles() {
+    // Two RO handles in same PID. One auto-refreshes, the other is
+    // held idle (auto_refresh=off). Writer's min_reader_handle_epoch
+    // must track the IDLE one — orphans should NOT be reaped.
+    if dispatched_as_child() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("multi_handle_min.db");
+    let dsn_rw = format!("file://{}?compact_threshold=2", path.display());
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+
+    let writer = Database::open(&dsn_rw).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    writer.execute("INSERT INTO t VALUES (0, 0)", ()).unwrap();
+    writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let active = Database::open_read_only(&dsn_ro).unwrap();
+    let idle = Database::open_read_only(&dsn_ro).unwrap();
+    active.refresh().unwrap();
+    idle.refresh().unwrap();
+
+    // Warm up both with auto_refresh=on so pins advance.
+    for i in 1..20 {
+        writer
+            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i), ())
+            .unwrap();
+        writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let _ = active.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+        let _ = idle.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+    }
+    let idle_epoch_frozen = idle.last_seen_epoch_for_test();
+    idle.set_auto_refresh(false);
+
+    // Continue. active's epoch advances; idle's stays frozen.
+    for i in 20..40 {
+        writer
+            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i), ())
+            .unwrap();
+        writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let _ = active.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+    }
+    let active_epoch_high = active.last_seen_epoch_for_test();
+    assert!(
+        active_epoch_high > idle_epoch_frozen,
+        "active should have advanced past idle's frozen epoch"
+    );
+
+    // Writer sees min = idle's frozen epoch — orphans not reaped.
+    // Drop idle → its epoch file gone → writer's MIN jumps to active.
+    drop(idle);
+    for _ in 0..3 {
+        let _ = active.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+        writer.execute("INSERT INTO t VALUES (-1, -1)", ()).ok();
+        writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+
+    drop(active);
+    writer.close().unwrap();
+}
+
+#[test]
+fn lazy_cold_load_succeeds_with_active_reader() {
+    // Stale reader (auto_refresh=off) holds an old manifest with old
+    // segment_ids. Writer compacts (new manifest, old IDs orphaned).
+    // Reaper creates sidecars but does NOT unlink. Stale reader's
+    // ensure_volume(old_id) must still succeed because the file is
+    // still at vol_<id>.vol on disk.
+    if dispatched_as_child() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("lazy_cold_load.db");
+    let dsn_rw = format!("file://{}?compact_threshold=2", path.display());
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+
+    let writer = Database::open(&dsn_rw).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    for i in 0..10 {
+        writer
+            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10), ())
+            .unwrap();
+        writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+
+    let reader = Database::open_read_only(&dsn_ro).unwrap();
+    reader.refresh().unwrap();
+    reader.set_auto_refresh(false);
+
+    // Heavy compaction on writer side; reader keeps stale manifest.
+    for i in 10..30 {
+        writer
+            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10), ())
+            .unwrap();
+        writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+
+    // Reader scans rows pointed to by its STALE manifest (old segment
+    // IDs). The lazy cold-load via ensure_volume MUST succeed.
+    let mut rows = reader.query("SELECT COUNT(*) FROM t", ()).unwrap();
+    let row = rows.next().unwrap().unwrap();
+    let n: i64 = row.get(0).unwrap();
+    assert!(
+        n >= 10,
+        "stale reader should still see at least the rows from its snapshot (got {})",
+        n
+    );
+
+    drop(reader);
+    writer.close().unwrap();
+}
+
+#[test]
+fn orphans_reaped_after_writer_restart_with_no_readers() {
+    // Crash recovery path: writer compacts (orphans + sidecars on
+    // disk), is killed, restarts. With no readers attached, next
+    // sweep reaps all orphans. Validates retire-sidecar protocol's
+    // crash-safety: state lives entirely on disk.
+    if dispatched_as_child() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("crash_recovery.db");
+    let dsn_rw = format!("file://{}?compact_threshold=2", path.display());
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+
+    let table_dir = path.join("volumes").join("t");
+    {
+        let writer = Database::open(&dsn_rw).unwrap();
+        writer
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+            .unwrap();
+        let reader = Database::open_read_only(&dsn_ro).unwrap();
+        reader.refresh().unwrap();
+        // Warm up so reader pin advances and writer compaction can act.
+        for i in 0..20 {
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i), ())
+                .unwrap();
+            writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            let _ = reader.query("SELECT COUNT(*) FROM t", ()).unwrap().next();
+        }
+        reader.set_auto_refresh(false);
+        // Now drive cycles where reader's epoch is frozen → sidecars
+        // accumulate without unlinks.
+        for i in 20..40 {
+            writer
+                .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i), ())
+                .unwrap();
+            writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        // Reader holds stale snapshot. Drop reader → epoch file gone.
+        // Writer "crashes" (drop without close).
+        drop(reader);
+        drop(writer);
+    }
+
+    // Sidecars from the prior cycle are on disk. With no live leases,
+    // restart's next sweep reaps everything.
+    let writer = Database::open(&dsn_rw).unwrap();
+    let vols_before = count_vols_for(&table_dir);
+    let sidecars_before = count_sidecars_for(&table_dir);
+    writer
+        .execute("INSERT INTO t VALUES (100, 100)", ())
+        .unwrap();
+    writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    writer
+        .execute("INSERT INTO t VALUES (101, 101)", ())
+        .unwrap();
+    writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let vols_after = count_vols_for(&table_dir);
+    let sidecars_after = count_sidecars_for(&table_dir);
+    assert!(
+        vols_after <= vols_before && sidecars_after <= sidecars_before,
+        "post-restart sweep with no readers should reap orphans+sidecars; \
+         vols {}->{}, sidecars {}->{}",
+        vols_before,
+        vols_after,
+        sidecars_before,
+        sidecars_after
+    );
     writer.close().unwrap();
 }

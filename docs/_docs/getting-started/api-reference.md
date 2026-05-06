@@ -725,8 +725,6 @@ For prepared-statement ergonomics, use `cached_plan(sql)` plus `query_plan` / `q
 | `set_refresh_interval(Option<Duration>)` | `Result<()>` | Configure the background refresh ticker. `Some(d)` spawns a thread calling `refresh()` every `d` (min 100ms); `None` stops it. Use for idle handles so the WAL pin advances. Pauses while `auto_refresh=false` or a `BEGIN` is active. Equivalent DSN flag: `?refresh_interval=30s`. |
 | `refresh_interval()` | `Option<Duration>` | Currently configured ticker interval, or `None` if no ticker is running. |
 | `try_clone()` | `Self` | Clone for multi-threaded use. Each clone has its own executor, WAL pin, auto_refresh flag, and ticker (inherits parent's interval). |
-| `set_swmr_overlay_enabled(enabled)` | `Result<()>` | Opt into per-row WAL-tail materialization. Off by default; DDL detection is always on. |
-| `swmr_overlay_enabled()` | `bool` | Whether overlay materialization is enabled |
 | `read_engine()` | `Arc<dyn ReadEngine>` | Get the underlying read engine for libraries accepting `&dyn ReadEngine` |
 
 ```rust

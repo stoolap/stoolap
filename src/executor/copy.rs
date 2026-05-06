@@ -587,7 +587,8 @@ fn json_value_to_stoolap(
     };
 
     let coerced = val.coerce_to_type(target_type);
-    // P1 fix: detect silent coercion failure (non-null -> null)
+    // Detect silent coercion failure: non-null input becoming null
+    // means the cast lost the value (e.g. out-of-range integer).
     if !val.is_null() && coerced.is_null() {
         return Err(Error::Type(format!(
             "cannot convert value '{}' to {:?} for column '{}'",
