@@ -17,13 +17,15 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::panic;
-use std::sync::Arc;
 
 use crate::api::Database;
 use crate::common::version::VERSION;
 
 use super::error::{self, LastErrorState};
-use super::types::{StoolapDB, StoolapErrorDetails, StoolapNamedParam, StoolapRows, StoolapValue};
+use super::types::{
+    build_rows_handle, ColumnCStrCache, StoolapDB, StoolapErrorDetails, StoolapNamedParam,
+    StoolapRows, StoolapValue,
+};
 use super::value;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
 
@@ -73,6 +75,7 @@ pub unsafe extern "C" fn stoolap_open(dsn: *const c_char, out_db: *mut *mut Stoo
                     db,
                     last_error: LastErrorState::default(),
                     _engine_keepalive: None,
+                    col_cstr_cache: ColumnCStrCache::default(),
                 });
                 *out_db = Box::into_raw(handle);
                 STOOLAP_OK
@@ -109,6 +112,7 @@ pub unsafe extern "C" fn stoolap_open_in_memory(out_db: *mut *mut StoolapDB) -> 
                     db,
                     last_error: LastErrorState::default(),
                     _engine_keepalive: None,
+                    col_cstr_cache: ColumnCStrCache::default(),
                 });
                 *out_db = Box::into_raw(handle);
                 STOOLAP_OK
@@ -211,6 +215,7 @@ pub unsafe extern "C" fn stoolap_clone(db: *const StoolapDB, out_db: *mut *mut S
             db: cloned,
             last_error: LastErrorState::default(),
             _engine_keepalive: Some(keepalive),
+            col_cstr_cache: ColumnCStrCache::default(),
         });
         *out_db = Box::into_raw(new_handle);
         STOOLAP_OK
@@ -511,23 +516,7 @@ pub unsafe extern "C" fn stoolap_query_params(
 
         match handle.db.query(sql_str, param_vec) {
             Ok(rows) => {
-                let column_names: Vec<CString> = rows
-                    .columns()
-                    .iter()
-                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                    .collect();
-                let affected = rows.rows_affected();
-
-                let rows_handle = Box::new(StoolapRows {
-                    rows: Some(rows),
-                    has_row: false,
-                    last_error: LastErrorState::default(),
-                    column_names: Arc::new(column_names),
-                    text_cache: Vec::new(),
-                    text_cache_dirty: false,
-                    rows_affected: affected,
-                });
-                *out_rows = Box::into_raw(rows_handle);
+                *out_rows = Box::into_raw(build_rows_handle(rows, &mut handle.col_cstr_cache));
                 STOOLAP_OK
             }
             Err(e) => {
@@ -646,23 +635,7 @@ pub unsafe extern "C" fn stoolap_query_named(
 
         match handle.db.query_named(sql_str, named) {
             Ok(rows) => {
-                let column_names: Vec<CString> = rows
-                    .columns()
-                    .iter()
-                    .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                    .collect();
-                let affected = rows.rows_affected();
-
-                let rows_handle = Box::new(StoolapRows {
-                    rows: Some(rows),
-                    has_row: false,
-                    last_error: LastErrorState::default(),
-                    column_names: Arc::new(column_names),
-                    text_cache: Vec::new(),
-                    text_cache_dirty: false,
-                    rows_affected: affected,
-                });
-                *out_rows = Box::into_raw(rows_handle);
+                *out_rows = Box::into_raw(build_rows_handle(rows, &mut handle.col_cstr_cache));
                 STOOLAP_OK
             }
             Err(e) => {

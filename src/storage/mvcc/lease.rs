@@ -357,6 +357,7 @@ impl EpochFile {
     /// would defer reaping).
     pub fn write(&self, epoch: u64) -> Result<()> {
         let mut f = OpenOptions::new()
+            .create(true)
             .write(true)
             .truncate(false)
             .open(&self.path)
@@ -894,6 +895,39 @@ mod tests {
             read_pinned_lsn(&path),
             None,
             "non-8-byte lease must read as None (caller treats as no-pin)"
+        );
+    }
+
+    #[test]
+    fn epoch_write_recreates_missing_file_and_restores_min() {
+        let dir = tmp_db();
+        let lease = LeaseManager::register(dir.path()).unwrap();
+        let readers_dir = lease.path().parent().unwrap().to_path_buf();
+        let epoch = EpochFile::create(&readers_dir, next_handle_id(), 7).unwrap();
+        let path = epoch.path().to_path_buf();
+
+        assert_eq!(
+            min_reader_handle_epoch(&readers_dir, Duration::from_secs(60)).unwrap(),
+            Some(7)
+        );
+
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            min_reader_handle_epoch(&readers_dir, Duration::from_secs(60)).unwrap(),
+            Some(0),
+            "a live reader with a missing epoch file must fail closed"
+        );
+
+        epoch.write(42).unwrap();
+
+        assert_eq!(
+            read_epoch_file(&path),
+            Some(42),
+            "epoch write must self-heal when a stale reaper removed the file"
+        );
+        assert_eq!(
+            min_reader_handle_epoch(&readers_dir, Duration::from_secs(60)).unwrap(),
+            Some(42)
         );
     }
 

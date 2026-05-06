@@ -103,6 +103,12 @@ pub struct StoolapDB {
     /// Prevents premature engine shutdown when the original handle is closed
     /// before its clones. `None` for the original handle, `Some` for clones.
     pub(crate) _engine_keepalive: Option<Arc<DatabaseInner>>,
+    /// Most-recent column-name `CString` set, keyed by the
+    /// `CompactArc<Vec<String>>` pointer identity of the source `Rows`.
+    /// Hits when two consecutive queries on this handle resolve to the
+    /// same projection plan (very common in HFT-style hot loops); misses
+    /// are no worse than the prior unconditional rebuild.
+    pub(crate) col_cstr_cache: ColumnCStrCache,
 }
 
 /// Opaque handle wrapping a [`ReadOnlyDatabase`] view.
@@ -119,6 +125,7 @@ pub struct StoolapRoDB {
     /// first `stoolap_ro_dsn()` call so the returned pointer is stable
     /// for the lifetime of the handle without leaking on every call.
     pub(crate) dsn_cstr: std::sync::OnceLock<CString>,
+    pub(crate) col_cstr_cache: ColumnCStrCache,
 }
 
 /// Opaque handle wrapping a [`Statement`].
@@ -149,6 +156,72 @@ pub struct StoolapTx {
     /// For transactions begun from a clone handle, holds the engine-owning
     /// `DatabaseInner` to prevent `close_engine()`. `None` for original handles.
     pub(crate) _engine_keepalive: Option<Arc<DatabaseInner>>,
+    pub(crate) col_cstr_cache: ColumnCStrCache,
+}
+
+/// Single cached column-name set: the source `CompactArc` we matched
+/// against, kept alive so its address can't be recycled, paired with the
+/// `CString`s we built from it.
+type ColumnCacheEntry = (crate::common::CompactArc<Vec<String>>, Arc<Vec<CString>>);
+
+/// Single-slot column-name cache. Two queries that share the same column
+/// `CompactArc` (same projection plan) skip a `Vec<CString>` rebuild.
+///
+/// The cache holds a strong clone of the source `CompactArc` — comparing
+/// raw pointers without keeping the allocation alive is unsound: when the
+/// previous `Rows` handle is closed and its `CompactArc` drops, the
+/// allocator can reuse that address for a brand-new projection, and a
+/// pointer-equality check would falsely report a hit and return the
+/// previous projection's `CString`s. Equality is therefore checked via
+/// `CompactArc::ptr_eq` against an Arc we own.
+#[derive(Default)]
+pub(crate) struct ColumnCStrCache {
+    held: Option<ColumnCacheEntry>,
+}
+
+impl ColumnCStrCache {
+    /// Look up by `Rows::columns_arc()` identity. On miss, build fresh
+    /// `CString`s, store them alongside an owning clone of the source
+    /// `CompactArc`, and return the new cache entry.
+    pub(crate) fn get_or_build(
+        &mut self,
+        arc: &crate::common::CompactArc<Vec<String>>,
+    ) -> Arc<Vec<CString>> {
+        if let Some((held_arc, cstrs)) = &self.held {
+            if crate::common::CompactArc::ptr_eq(held_arc, arc) {
+                return Arc::clone(cstrs);
+            }
+        }
+        let cstrs: Arc<Vec<CString>> = Arc::new(
+            arc.iter()
+                .map(|name| CString::new(name.as_str()).unwrap_or_default())
+                .collect(),
+        );
+        self.held = Some((arc.clone(), Arc::clone(&cstrs)));
+        cstrs
+    }
+}
+
+/// Build a [`StoolapRows`] handle, looking up cached column-name
+/// `CString`s by `Rows::columns_arc()` identity. Used by every FFI query
+/// entry point (DB / Tx / RO / Statement) so they share one cache hit
+/// path.
+pub(crate) fn build_rows_handle(
+    rows: crate::api::Rows,
+    cache: &mut ColumnCStrCache,
+) -> Box<StoolapRows> {
+    let column_names = cache.get_or_build(rows.columns_arc());
+    let affected = rows.rows_affected();
+    let col_count = column_names.len();
+    Box::new(StoolapRows {
+        rows: Some(rows),
+        has_row: false,
+        last_error: LastErrorState::default(),
+        column_names,
+        text_cache: vec![Vec::new(); col_count],
+        text_cache_dirty: smallvec::SmallVec::new(),
+        rows_affected: affected,
+    })
 }
 
 /// Opaque handle wrapping a [`Rows`] result set.
@@ -158,15 +231,16 @@ pub struct StoolapRows {
     pub(crate) last_error: LastErrorState,
     /// Column names as CStrings (shared via Arc for prepared statement reuse).
     pub(crate) column_names: Arc<Vec<CString>>,
-    /// Lazy text cache for the current row. Starts empty; grown on demand by
-    /// `stoolap_rows_column_text()`. Cleared only when at least one entry was
-    /// populated (`text_cache_dirty`), so numeric-only scans pay zero overhead.
-    /// Each populated entry is `[text_bytes..., 0]` — the original text (may
-    /// contain interior NULs) with a trailing NUL terminator for C compat.
-    pub(crate) text_cache: Vec<Option<Vec<u8>>>,
-    /// True when at least one entry in `text_cache` was populated for the
-    /// current row. Avoids clearing the entire Vec when no text was accessed.
-    pub(crate) text_cache_dirty: bool,
+    /// Lazy text cache for the current row. One slot per column; each slot's
+    /// `Vec<u8>` is reused across rows (cleared, not dropped) so a long scan
+    /// pays at most one allocation per (row, column) pair amortized.
+    /// Empty `Vec` (`len == 0`) means "not populated for the current row";
+    /// populated buffers always end in a trailing NUL byte (so length >= 1).
+    /// Numeric-only scans pay zero overhead because no slot is ever populated.
+    pub(crate) text_cache: Vec<Vec<u8>>,
+    /// Indices populated for the current row. On row advance we only clear
+    /// these (preserving capacity), avoiding an O(N) sweep over wide tables.
+    pub(crate) text_cache_dirty: smallvec::SmallVec<[u32; 4]>,
     /// Number of rows affected (for DML results).
     pub(crate) rows_affected: i64,
 }

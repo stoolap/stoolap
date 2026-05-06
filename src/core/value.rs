@@ -175,11 +175,16 @@ impl Value {
         Value::Extension(CompactArc::from(bytes))
     }
 
-    /// Create a vector value from pre-packed f32 bytes (prepends tag)
-    pub fn vector_from_bytes(raw_f32_bytes: CompactArc<[u8]>) -> Self {
+    /// Create a vector value from pre-packed f32 bytes (prepends tag).
+    ///
+    /// Takes `&[u8]` rather than `CompactArc<[u8]>`: we always rebuild the
+    /// buffer to prepend the type tag, so any owned input would be copied
+    /// regardless. Borrowing avoids the caller having to allocate an Arc
+    /// just to hand it over.
+    pub fn vector_from_bytes(raw_f32_bytes: &[u8]) -> Self {
         let mut bytes = Vec::with_capacity(1 + raw_f32_bytes.len());
         bytes.push(DataType::Vector as u8);
-        bytes.extend_from_slice(&raw_f32_bytes);
+        bytes.extend_from_slice(raw_f32_bytes);
         Value::Extension(CompactArc::from(bytes))
     }
 

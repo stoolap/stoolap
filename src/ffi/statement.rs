@@ -292,14 +292,15 @@ pub unsafe extern "C" fn stoolap_stmt_query(
                     arc
                 };
                 let affected = rows.rows_affected();
+                let col_count = column_names.len();
 
                 let rows_handle = Box::new(StoolapRows {
                     rows: Some(rows),
                     has_row: false,
                     last_error: LastErrorState::default(),
                     column_names,
-                    text_cache: Vec::new(),
-                    text_cache_dirty: false,
+                    text_cache: vec![Vec::new(); col_count],
+                    text_cache_dirty: smallvec::SmallVec::new(),
                     rows_affected: affected,
                 });
                 *out_rows = Box::into_raw(rows_handle);

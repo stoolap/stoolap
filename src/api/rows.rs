@@ -250,6 +250,16 @@ impl Rows {
         &self.columns
     }
 
+    /// Borrow the shared column-name `CompactArc`.
+    ///
+    /// Exposed so callers (notably the FFI layer) can use the underlying
+    /// allocation's pointer identity as a cache key: when two consecutive
+    /// queries return the same `Arc`, derived data (CStrings, schema
+    /// projections) can be reused without a per-row scan or rebuild.
+    pub fn columns_arc(&self) -> &CompactArc<Vec<String>> {
+        &self.columns
+    }
+
     /// Get the number of columns
     pub fn column_count(&self) -> usize {
         self.columns.len()

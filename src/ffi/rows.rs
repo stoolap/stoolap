@@ -27,17 +27,27 @@ use super::{
     STOOLAP_TYPE_TEXT, STOOLAP_TYPE_TIMESTAMP,
 };
 
-/// Build a NUL-terminated byte buffer from a string.
+/// Fill `buf` (cleared first) with `val`'s text representation plus a
+/// trailing NUL. Returns true on success, false for SQL NULL or values
+/// without a text rendering.
 ///
-/// Unlike `CString`, this preserves interior NUL bytes so that callers
-/// using the `out_len` parameter can access the full data.  Callers
-/// treating the pointer as a C string will naturally see a truncated
-/// view at the first embedded NUL — this matches C convention.
-fn make_text_buf(s: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(s.len() + 1);
-    buf.extend_from_slice(s.as_bytes());
-    buf.push(0); // trailing NUL for C compatibility
-    buf
+/// Fast path: `as_str()` borrows directly from the value's storage for
+/// Text/Json (no `String` allocation, just one copy into `buf`).
+/// Slow path: integers/floats/timestamps/etc. go through `as_string()`,
+/// which allocates a `String`; we copy once into the reused `buf`.
+fn fill_text_buf(buf: &mut Vec<u8>, val: &Value) -> bool {
+    buf.clear();
+    if let Some(s) = val.as_str() {
+        buf.reserve(s.len() + 1);
+        buf.extend_from_slice(s.as_bytes());
+    } else if let Some(s) = val.as_string() {
+        buf.reserve(s.len() + 1);
+        buf.extend_from_slice(s.as_bytes());
+    } else {
+        return false;
+    }
+    buf.push(0);
+    true
 }
 
 /// Advance to the next row.
@@ -61,12 +71,17 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
             None => return STOOLAP_DONE,
         };
 
-        // Clear text cache from previous row (only if anything was cached)
-        if handle.text_cache_dirty {
-            for slot in &mut handle.text_cache {
-                *slot = None;
+        // Clear only the slots that were populated for the previous row.
+        // `clear()` retains capacity, so the next row reuses the same
+        // allocations: at most one allocation per (column, row) pair on the
+        // first hit, zero thereafter.
+        if !handle.text_cache_dirty.is_empty() {
+            for &idx in &handle.text_cache_dirty {
+                if let Some(slot) = handle.text_cache.get_mut(idx as usize) {
+                    slot.clear();
+                }
             }
-            handle.text_cache_dirty = false;
+            handle.text_cache_dirty.clear();
         }
 
         if rows_inner.advance() {
@@ -236,56 +251,48 @@ pub unsafe extern "C" fn stoolap_rows_column_text(
 
     let idx = index as usize;
 
-    // Check text cache first
-    if let Some(Some(ref cached)) = handle.text_cache.get(idx) {
+    // Bounds check against the canonical column count BEFORE touching the
+    // cache. Construction pre-sizes `text_cache` to `column_names.len()`,
+    // so any larger index is invalid and must short-circuit — otherwise
+    // a hostile or accidental `i32::MAX` would let `resize_with` ask the
+    // allocator for an `idx + 1` Vec slot.
+    if idx >= handle.column_names.len() {
+        return std::ptr::null();
+    }
+
+    // Cache hit: populated buffers always end in a trailing NUL, so a
+    // non-empty `Vec` at this index represents a value already rendered for
+    // the current row. Callers can re-read repeatedly at zero cost.
+    let cached = &handle.text_cache[idx];
+    if !cached.is_empty() {
         if !out_len.is_null() {
-            // Length excludes the trailing NUL terminator
             *out_len = (cached.len() - 1) as i64;
         }
         return cached.as_ptr() as *const c_char;
     }
 
-    // Get the value and build a NUL-terminated byte buffer.
-    // Fast path: for Text/Json values, use as_str() to avoid an intermediate String allocation.
-    // Slow path: for other types (Integer, Float, etc.), fall back to as_string().
-    //
-    // Interior NUL bytes are preserved in the buffer; callers using out_len
-    // can access the full data.  Callers treating the pointer as a C string
-    // will see a truncated view at the first embedded NUL.
-    let buf = {
-        let rows_inner = match &handle.rows {
-            Some(r) => r,
+    // Render the value into the slot's reusable buffer. We split the
+    // borrow over disjoint fields: `handle.rows` (read) and
+    // `handle.text_cache` (write). Going through `as_ref()` keeps the
+    // borrow on `rows` only so the mut borrow of `text_cache` is allowed.
+    let val: &Value = match handle.rows.as_ref() {
+        Some(r) => match r.current_row().get(idx) {
+            Some(v) => v,
             None => return std::ptr::null(),
-        };
-        let row = rows_inner.current_row();
-        match row.get(idx) {
-            Some(val) => {
-                if let Some(s) = val.as_str() {
-                    Some(make_text_buf(s))
-                } else {
-                    val.as_string().map(|s| make_text_buf(&s))
-                }
-            }
-            None => None,
-        }
+        },
+        None => return std::ptr::null(),
     };
-
-    match buf {
-        Some(b) => {
-            // Grow the cache lazily to fit this column index
-            if handle.text_cache.len() <= idx {
-                handle.text_cache.resize_with(idx + 1, || None);
-            }
-            handle.text_cache[idx] = Some(b);
-            handle.text_cache_dirty = true;
-            let cached = handle.text_cache[idx].as_ref().unwrap();
-            if !out_len.is_null() {
-                *out_len = (cached.len() - 1) as i64;
-            }
-            cached.as_ptr() as *const c_char
-        }
-        None => std::ptr::null(),
+    let slot = &mut handle.text_cache[idx];
+    if !fill_text_buf(slot, val) {
+        return std::ptr::null();
     }
+    handle.text_cache_dirty.push(idx as u32);
+    // Interior NULs in text are preserved; C-string callers see a
+    // truncated view, callers using `out_len` see the full byte run.
+    if !out_len.is_null() {
+        *out_len = (slot.len() - 1) as i64;
+    }
+    slot.as_ptr() as *const c_char
 }
 
 /// Get a boolean value from the current row. Returns 0 (false) if NULL or not convertible.

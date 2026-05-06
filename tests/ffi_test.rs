@@ -3872,3 +3872,62 @@ fn test_ro_query_rejects_write_sql() {
         stoolap_ro_close(ro);
     }
 }
+
+// =========================================================================
+// Regression: column-name cache must not return stale projections after the
+// previous source CompactArc is dropped and the allocator reuses the
+// address (ABA on a raw-pointer cache key).
+// =========================================================================
+
+#[test]
+fn test_column_name_cache_no_aba() {
+    unsafe {
+        let mut db: *mut StoolapDB = std::ptr::null_mut();
+        stoolap_open_in_memory(&mut db);
+        let create = cstr("CREATE TABLE t (a INTEGER, b INTEGER)");
+        stoolap_exec(db, create.as_ptr(), std::ptr::null_mut());
+        let ins = cstr("INSERT INTO t VALUES (1, 2)");
+        stoolap_exec(db, ins.as_ptr(), std::ptr::null_mut());
+
+        // First query projects column "a". Open, read column name, close —
+        // dropping the source CompactArc and freeing its allocation.
+        let q1 = cstr("SELECT a FROM t");
+        let mut r1: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, q1.as_ptr(), &mut r1), STOOLAP_OK);
+        let n1 = read_cstr(stoolap_rows_column_name(r1, 0));
+        assert_eq!(n1, "a");
+        assert_eq!(stoolap_rows_column_count(r1), 1);
+        stoolap_rows_close(r1);
+
+        // Second query projects a *different* column "b". The cache entry
+        // must NOT return "a" — even if the allocator happens to recycle
+        // the prior address.
+        let q2 = cstr("SELECT b FROM t");
+        let mut r2: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, q2.as_ptr(), &mut r2), STOOLAP_OK);
+        assert_eq!(stoolap_rows_column_count(r2), 1);
+        let n2 = read_cstr(stoolap_rows_column_name(r2, 0));
+        assert_eq!(n2, "b", "column-name cache leaked stale projection");
+        stoolap_rows_close(r2);
+
+        // Repeat with different widths: address reuse + width mismatch
+        // would also corrupt column_count() and fetch_all().
+        let q3 = cstr("SELECT a, b FROM t");
+        let mut r3: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, q3.as_ptr(), &mut r3), STOOLAP_OK);
+        assert_eq!(stoolap_rows_column_count(r3), 2);
+        assert_eq!(read_cstr(stoolap_rows_column_name(r3, 0)), "a");
+        assert_eq!(read_cstr(stoolap_rows_column_name(r3, 1)), "b");
+        stoolap_rows_close(r3);
+
+        // And back to a single-column projection — still no carryover.
+        let q4 = cstr("SELECT b FROM t");
+        let mut r4: *mut StoolapRows = std::ptr::null_mut();
+        assert_eq!(stoolap_query(db, q4.as_ptr(), &mut r4), STOOLAP_OK);
+        assert_eq!(stoolap_rows_column_count(r4), 1);
+        assert_eq!(read_cstr(stoolap_rows_column_name(r4, 0)), "b");
+        stoolap_rows_close(r4);
+
+        stoolap_close(db);
+    }
+}

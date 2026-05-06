@@ -69,8 +69,12 @@ pub(crate) unsafe fn ffi_value_to_rust(v: &StoolapValue) -> Value {
                 let slice = std::slice::from_raw_parts(text.ptr as *const u8, text.len as usize);
                 match std::str::from_utf8(slice) {
                     Ok(s) => {
-                        // Validate JSON before tagging
-                        if serde_json::from_str::<serde_json::Value>(s).is_ok() {
+                        // Validate JSON shape without materializing the tree:
+                        // `IgnoredAny` accepts any well-formed value and
+                        // discards it, so we pay the parse cost once but
+                        // skip the per-node Map/Vec/String allocations that
+                        // `serde_json::Value` would build.
+                        if serde_json::from_str::<serde::de::IgnoredAny>(s).is_ok() {
                             Value::json(s)
                         } else {
                             Value::null_unknown()
@@ -94,7 +98,7 @@ pub(crate) unsafe fn ffi_value_to_rust(v: &StoolapValue) -> Value {
                     Value::null_unknown()
                 } else {
                     let slice = std::slice::from_raw_parts(blob.ptr, len);
-                    Value::vector_from_bytes(slice.into())
+                    Value::vector_from_bytes(slice)
                 }
             }
         }
