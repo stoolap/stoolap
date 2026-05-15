@@ -81,8 +81,7 @@ mod window;
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::api::params::ParamVec;
-use crate::core::{Error, Result, Value};
+use crate::core::{Error, ParamVec, Result, Value};
 use crate::functions::FunctionRegistry;
 
 /// Default function registry - shared across all executors to avoid per-database allocation

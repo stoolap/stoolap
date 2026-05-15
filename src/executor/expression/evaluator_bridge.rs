@@ -31,8 +31,8 @@ use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use crate::api::params::ParamVec;
 use crate::common::{CompactArc, StringMap};
+use crate::core::ParamVec;
 use lru::LruCache;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHasher};

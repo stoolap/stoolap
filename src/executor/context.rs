@@ -33,9 +33,8 @@ const SCALAR_SUBQUERY_CACHE_SIZE: usize = 128;
 const IN_SUBQUERY_CACHE_SIZE: usize = 128;
 const SEMI_JOIN_CACHE_SIZE: usize = 256;
 
-use crate::api::params::ParamVec;
 use crate::common::{CompactArc, StringMap};
-use crate::core::{Result, Row, Value, ValueMap, ValueSet};
+use crate::core::{ParamVec, Result, Row, Value, ValueMap, ValueSet};
 
 // Static defaults for ExecutionContext to avoid allocations for empty values.
 // These are shared across all contexts and only require Arc refcount bump on clone.

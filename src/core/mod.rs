@@ -40,12 +40,27 @@ pub use types::{DataType, ForeignKeyAction, IndexEntry, IndexType, IsolationLeve
 pub use value::{parse_timestamp, Value, NULL_VALUE};
 
 use ahash::{AHashMap, AHashSet};
+use smallvec::SmallVec;
 
 /// Hash map for Value keys with randomized hashing (HashDoS resistant)
 pub type ValueMap<V> = AHashMap<Value, V>;
 
 /// Hash set for Value keys with randomized hashing (HashDoS resistant)
 pub type ValueSet = AHashSet<Value>;
+
+/// Parameter vector for SQL queries. Inline up to 8 values to avoid heap
+/// allocation in the common case.
+///
+/// Lives in `core` (rather than `api`) so executor and optimizer can name
+/// it without depending on the `api` facade — a workspace-split prerequisite.
+pub type ParamVec = SmallVec<[Value; 8]>;
+
+/// Default row-count thresholds at which executor switches to parallel
+/// execution. Defined in `core` so `optimizer::cost` can reference them
+/// without depending on `executor` (cycle break).
+pub const DEFAULT_PARALLEL_FILTER_THRESHOLD: usize = 10_000;
+pub const DEFAULT_PARALLEL_SORT_THRESHOLD: usize = 50_000;
+pub const DEFAULT_PARALLEL_JOIN_THRESHOLD: usize = 10_000;
 
 #[cfg(test)]
 mod integration_tests {

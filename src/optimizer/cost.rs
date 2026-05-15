@@ -61,9 +61,8 @@
 
 use ahash::AHashMap;
 
-use crate::core::IndexType;
-use crate::executor::{
-    DEFAULT_PARALLEL_FILTER_THRESHOLD, DEFAULT_PARALLEL_JOIN_THRESHOLD,
+use crate::core::{
+    IndexType, DEFAULT_PARALLEL_FILTER_THRESHOLD, DEFAULT_PARALLEL_JOIN_THRESHOLD,
     DEFAULT_PARALLEL_SORT_THRESHOLD,
 };
 use crate::storage::statistics::{

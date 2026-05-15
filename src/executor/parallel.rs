@@ -70,11 +70,13 @@ fn num_threads() -> usize {
 // Re-export JoinType from operators::hash_join - single source of truth
 pub use super::operators::hash_join::JoinType;
 
-// Default thresholds for parallel execution - single source of truth
-// These are used by both ParallelConfig and CostEstimator
-pub const DEFAULT_PARALLEL_FILTER_THRESHOLD: usize = 10_000;
-pub const DEFAULT_PARALLEL_SORT_THRESHOLD: usize = 50_000;
-pub const DEFAULT_PARALLEL_JOIN_THRESHOLD: usize = 10_000;
+// Filter / sort / join thresholds live in `core` so optimizer::cost can
+// reference them without cycling back through executor; chunk size stays
+// here (executor-only).
+pub use crate::core::{
+    DEFAULT_PARALLEL_FILTER_THRESHOLD, DEFAULT_PARALLEL_JOIN_THRESHOLD,
+    DEFAULT_PARALLEL_SORT_THRESHOLD,
+};
 pub const DEFAULT_PARALLEL_CHUNK_SIZE: usize = 2048;
 
 /// Configuration for parallel execution
