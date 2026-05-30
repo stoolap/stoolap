@@ -85,8 +85,9 @@ file:///path/to/data?sync_mode=normal&checkpoint_interval=60
 | `target_volume_rows` | Integer | 1048576 | Target rows per cold volume (min: 65536). Controls compaction split boundary. |
 | `read_only` / `readonly` | true/false (or 1/0, yes/no, on/off) | false | Open in read-only mode. Must be passed to `Database::open_read_only(dsn)` (returns `ReadOnlyDatabase`); `Database::open(dsn)` REJECTS this flag with a clear error pointing to the right entry point. |
 | `mode` | ro / rw | rw | SQLite-style alias for `read_only`. `mode=ro` is equivalent to `read_only=true`. Same routing rule applies. |
-| `auto_refresh` | on/off (or true/false, 1/0, yes/no) | on | Read-only handles only. `on` (default): every query polls the manifest epoch (~1µs) and reloads if the writer advanced past a checkpoint. `off` is the master switch for "no implicit refresh on this handle" — both the per-query path AND the background ticker (if any) pause until you re-enable it (or call `refresh()` explicitly). Visibility is checkpoint-bounded either way. |
+| `auto_refresh` | on/off (or true/false, 1/0, yes/no) | on | Read-only handles only. `on` (default): every query polls the manifest epoch (~1µs) and reloads if the writer advanced past a checkpoint. `off` is the master switch for "no implicit refresh on this handle", both the per-query path AND the background ticker (if any) pause until you re-enable it (or call `refresh()` explicitly). Visibility is checkpoint-bounded either way. |
 | `refresh_interval` | Duration (`Nms` / `Ns` / `Nm`, or `0`) | `0` | Read-only handles only. Spawns a background thread that calls `refresh()` every interval to advance the per-handle WAL pin while the handle is idle (otherwise the writer can't truncate WAL past it). Minimum 100ms. `0` disables. Pauses while `auto_refresh=off`. |
+| `lease_max_age` | Integer (seconds) | `0` (auto) | How long a reader's lease stays valid before the writer's GC treats it as stale and reaps it. `0` derives a default of `max(120s, 2 * checkpoint_interval)`. Raise it for readers that run long scans with large gaps between queries, e.g. `?lease_max_age=2400` (40 minutes), so a still-live reader is never reaped mid-scan. |
 
 Legacy parameter names are accepted for backward compatibility:
 - `snapshot_interval` maps to `checkpoint_interval`
@@ -94,7 +95,7 @@ Legacy parameter names are accepted for backward compatibility:
 
 ### Read-only mode
 
-Read-only access is enforced at the type system. There is one entry point — `Database::open_read_only(dsn)` — and one return type — `ReadOnlyDatabase` — which exposes only read methods (`query`, `query_named`, `cached_plan`, `query_plan`, `query_named_plan`, `table_exists`, `refresh`, `read_engine`, `set_auto_refresh`, `set_refresh_interval`, `try_clone`). `execute` and `begin` are not on `ReadOnlyDatabase` at all, so write SQL is a *compile-time* error rather than a runtime `ReadOnlyViolation`.
+Read-only access is enforced at the type system. There is one entry point, `Database::open_read_only(dsn)`, and one return type, `ReadOnlyDatabase`, which exposes only read methods (`query`, `query_named`, `cached_plan`, `query_plan`, `query_named_plan`, `table_exists`, `refresh`, `read_engine`, `set_auto_refresh`, `set_refresh_interval`, `try_clone`). `execute` and `begin` are not on `ReadOnlyDatabase` at all, so write SQL is a *compile-time* error rather than a runtime `ReadOnlyViolation`.
 
 `Database::open(dsn)` REJECTS `?read_only=true` / `?readonly=true` / `?mode=ro` with `Error::InvalidArgument` containing the message *"read-only DSN flag passed to Database::open. Read-only handles must be opened via Database::open_read_only(dsn)..."*. The DSN string itself can be passed unchanged to `open_read_only`; the flag is accepted there as a redundant no-op.
 
@@ -108,10 +109,10 @@ Read-only opens:
 - Read-only opens work against directories on read-only mounts (the kernel-level read-only flag) AND chmod-read-only directories. Chmod-RO opens hold a long-lived `LOCK_SH` on `db.lock` so a privileged writer (different uid) cannot acquire `LOCK_EX` and reclaim WAL/volumes under the reader.
 
 ```
-file:///data/mydb?read_only=true       # passed to open_read_only — accepted
+file:///data/mydb?read_only=true       # passed to open_read_only, accepted
 file:///data/mydb?mode=ro              # same
 file:///data/mydb?read_only=true&sync_mode=normal
-file:///data/mydb                      # equally valid for open_read_only — flag is redundant
+file:///data/mydb                      # equally valid for open_read_only, flag is redundant
 
 # Long-lived idle reader: keep WAL pin advancing every 30s so the
 # writer can truncate WAL even when this handle issues no queries.
@@ -167,13 +168,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // With configuration options
     let db = Database::open("file:///data/mydb?sync_mode=full&checkpoint_interval=60")?;
 
-    // Read-only handles MUST come from open_read_only — Database::open
+    // Read-only handles MUST come from open_read_only, Database::open
     // rejects ?read_only=true with a clear error pointing here.
     let ro = Database::open_read_only("file:///data/mydb")?;
     // The DSN flag is also accepted (redundant) so existing driver
     // DSN strings keep working unchanged:
     let ro = Database::open_read_only("file:///data/mydb?read_only=true")?;
-    // Or wrap an existing writable Database — in-process typed read surface,
+    // Or wrap an existing writable Database, in-process typed read surface,
     // shares the engine. No SWMR coordination concerns (same engine).
     let ro = db.as_read_only();
 

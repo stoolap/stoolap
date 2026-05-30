@@ -51,7 +51,7 @@ pub struct DdlEvent {
     /// Lower-case target table name (or index/view name for non-table
     /// DDL). Empty when the DDL has no table affinity.
     pub table_name: String,
-    /// WAL operation type — distinguishes CreateTable vs AlterTable,
+    /// WAL operation type, distinguishes CreateTable vs AlterTable,
     /// etc. Stored as a `WALOperationType` so the reader can render
     /// a precise diagnostic without re-parsing the entry.
     pub operation: WALOperationType,
@@ -76,7 +76,7 @@ pub struct OverlayStore {
     last_applied_lsn: AtomicU64,
     /// Snapshot of the writer's published `oldest_active_txn_lsn`
     /// taken at the END of the previous rebuild. Used as the Phase 2
-    /// entry-scan floor on the NEXT rebuild — anything below this
+    /// entry-scan floor on the NEXT rebuild, anything below this
     /// LSN belongs to a transaction that committed (and was applied)
     /// before the previous rebuild, so the next rebuild can skip
     /// those entries entirely. `0` means "no snapshot yet, scan
@@ -92,7 +92,7 @@ pub struct OverlayStore {
     /// offset)` such that bytes in `[0, offset)` of `path` have
     /// been verified by THIS reader's prior tail. The next
     /// `tail_committed_entries` call passes this in to skip
-    /// re-reading + re-CRC-validating those bytes — refresh
+    /// re-reading + re-CRC-validating those bytes, refresh
     /// cost on a polling read-only handle drops from
     /// O(WAL size) to O(delta).
     ///
@@ -131,7 +131,7 @@ impl OverlayStore {
     /// `visible_commit_lsn + 1` (skip what we've already applied).
     /// Sentinel handling:
     ///   - `writer_oldest_active_txn_lsn = 0`: writer hasn't
-    ///     published the watermark yet (e.g. fresh shm) — treat as
+    ///     published the watermark yet (e.g. fresh shm), treat as
     ///     "scan from 0" so we don't accidentally skip pre-attach
     ///     DML for any transaction.
     ///   - `writer_oldest_active_txn_lsn = u64::MAX`: writer says
@@ -252,7 +252,7 @@ impl OverlayStore {
     /// in range).
     ///
     /// Correctness contract: `tail_committed_entries` scans commit
-    /// markers in `(last_applied_lsn, to_lsn]` (incremental — small)
+    /// markers in `(last_applied_lsn, to_lsn]` (incremental, small)
     /// but scans DML/DDL entries up to `to_lsn` from a watermark-
     /// derived floor (full enough that long-running explicit
     /// transactions that only just now committed still surface their
@@ -284,7 +284,7 @@ impl OverlayStore {
         // The watermark MUST come from the WRITER's published
         // `db.shm.oldest_active_txn_lsn` (the caller's
         // `writer_oldest_active_txn_lsn` parameter), NOT from
-        // `wal.oldest_active_txn_lsn()` — the latter is a
+        // `wal.oldest_active_txn_lsn()`, the latter is a
         // reader-LOCAL cache that's always empty in cross-process
         // SWMR (the reader process doesn't write DML, so its WAL
         // manager has no active user txns to track). Using the
@@ -293,7 +293,7 @@ impl OverlayStore {
         // lives below to_lsn, silently losing those rows on the
         // next refresh.
         //
-        // For THIS rebuild, use `next_entry_floor` — the snapshot
+        // For THIS rebuild, use `next_entry_floor`, the snapshot
         // taken at the END of the PRIOR rebuild. On the very first
         // rebuild this is 0 (full DML scan).
         let entry_floor_now = self.next_entry_floor.load(Ordering::Acquire);
@@ -311,7 +311,7 @@ impl OverlayStore {
         // `SwmrOverlayApplyFailed` would make that branch
         // unreachable and report a missing-WAL snapshot as a
         // retryable overlay failure. Only decode/CRC/IO failures
-        // get wrapped — those are genuinely retryable from the
+        // get wrapped, those are genuinely retryable from the
         // caller's perspective.
         //
         // Snapshot the per-reader CRC-validated WAL byte cursor
@@ -371,13 +371,13 @@ impl OverlayStore {
         // Persist the watermark snapshot taken at the start of this
         // rebuild as the entry-scan floor for the NEXT rebuild. Clamp to `<= to_lsn` so we never advance
         // the floor past what we've actually applied. `u64::MAX`
-        // from the writer means "no active user txns" — there's
+        // from the writer means "no active user txns", there's
         // nothing below `to_lsn` we still need to scan, so advance
         // the floor PAST `to_lsn` (to `to_lsn + 1`) instead of
         // landing on it. Otherwise the writer's WAL pin floor
         // (`min_pinned_lsn = next_entry_floor`) holds the last
-        // consumed commit marker — and the entire WAL file
-        // containing it — pinned until a later commit advances
+        // consumed commit marker, and the entire WAL file
+        // containing it, pinned until a later commit advances
         // the floor. Mirrors the `with_baseline` initial seed of
         // `visible_commit_lsn + 1` for the same reason.
         let next_floor = if watermark_snapshot == u64::MAX {
@@ -398,7 +398,7 @@ mod tests {
     use crate::storage::mvcc::{RowVersion, WALEntry, WALOperationType};
 
     fn make_version(value: i64) -> RowVersion {
-        // RowVersion has no row_id field — that's on the WAL entry.
+        // RowVersion has no row_id field, that's on the WAL entry.
         // The version carries txn_id, deleted_at_txn_id, data, create_time.
         RowVersion::new(100, Row::from_values(vec![Value::Integer(value)]))
     }
@@ -524,7 +524,7 @@ mod tests {
         // pending_ddl reflects ONLY events in the most recent
         // rebuild window. A second rebuild at the same to_lsn is a
         // true no-op AND explicitly clears pending_ddl from the
-        // prior call — otherwise refresh() would re-raise
+        // prior call, otherwise refresh() would re-raise
         // SwmrPendingDdl on every query without any new DDL.
         let (_dir, wal) = tmp_wal();
         let _ = wal
@@ -579,7 +579,7 @@ mod tests {
         wal.flush().unwrap();
 
         // `write_commit_marker` no longer clears
-        // active_txn_first_lsn — that's deferred to the engine's
+        // active_txn_first_lsn, that's deferred to the engine's
         // publish_visible_commit_lsn so concurrent publishes see a
         // consistent snapshot. Simulate the engine's
         // post-publish clear here.
@@ -631,7 +631,7 @@ mod tests {
         wal.flush().unwrap();
 
         let s = OverlayStore::new();
-        // Reader refresh — explicitly pass writer's
+        // Reader refresh, explicitly pass writer's
         // watermark = L1 (txn 1 still active in writer).
         s.rebuild_from_wal(&wal, lsn_a, l1, u64::MAX).unwrap();
         // The next_entry_floor must be min(l1, lsn_a) = l1.
@@ -647,7 +647,7 @@ mod tests {
     fn rebuild_keeps_low_entry_floor_while_long_running_txn_active() {
         // While a long-running explicit txn is in-flight, the
         // watermark stays low (its first DML LSN), so subsequent
-        // refreshes scan from that low floor — which is exactly
+        // refreshes scan from that low floor, which is exactly
         // what's needed to catch the txn's pre-window DDL when it
         // eventually commits.
         let (_dir, wal) = tmp_wal();
@@ -671,7 +671,7 @@ mod tests {
         let lsn_a = wal.write_commit_marker(99, 99).unwrap();
         wal.flush().unwrap();
 
-        // Reader rebuilds — txn 1 still active, watermark = l1.
+        // Reader rebuilds, txn 1 still active, watermark = l1.
         let s = OverlayStore::new();
         s.rebuild_from_wal(&wal, lsn_a, wal.oldest_active_txn_lsn(), u64::MAX)
             .unwrap();

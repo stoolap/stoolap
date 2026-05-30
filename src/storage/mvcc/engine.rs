@@ -996,7 +996,7 @@ impl MVCCEngine {
 
         // Release the startup gate. From this point on, readers
         // probing `db.shm` are allowed to classify a READY shm as
-        // "live writer authoritative" — see the matching reader
+        // "live writer authoritative", see the matching reader
         // half in `await_writer_startup_quiescent`. Held above the
         // mark_ready boundary so a reader that gets through the
         // gate and finds db.lock still EX-locked has a guarantee
@@ -1014,7 +1014,7 @@ impl MVCCEngine {
         // dropped a table while readers were live (and the
         // defer-on-live-readers path skipped the unlink) or
         // crashed mid-DROP. Inside `open_engine` we hold the
-        // file lock — at most one writer process can be
+        // file lock, at most one writer process can be
         // running, but live RO readers may exist; the sweep
         // itself gates on `defer_for_live_readers` and skips
         // when any are.
@@ -2047,7 +2047,7 @@ impl MVCCEngine {
                     // Recovery tombstones get commit_seq=0, which is always visible
                     // to all new snapshots (any begin_seq > 0). This is correct:
                     // these tombstones were committed before the restart.
-                    // visible_at_lsn=0 marks "always visible" cross-process —
+                    // visible_at_lsn=0 marks "always visible" cross-process,
                     // recovery-rebuilt tombstones predate any current
                     // capped attach.
                     mgr.add_tombstones(&[entry.row_id], 0, 0);
@@ -2629,7 +2629,7 @@ impl MVCCEngine {
         // an on-disk volumes dir, ensure a SegmentManager exists.
         // A table replayed from WAL DDL but never inserted on the
         // reader yet has no manager, so a writer's first checkpoint
-        // would otherwise leave its new manifest unloaded — the
+        // would otherwise leave its new manifest unloaded, the
         // reader would still see count 0 after refresh. `get_or_
         // create_segment_manager` is idempotent, so existing
         // managers are returned unchanged.
@@ -3250,7 +3250,7 @@ impl MVCCEngine {
         // record_create_index / alter / truncate helpers) and from
         // already-open transactions that bypassed the begin-time
         // check. Refuse here so no DDL LSN is ever published after
-        // the catastrophic-failure latch — recovery will discard
+        // the catastrophic-failure latch, recovery will discard
         // the markerless transaction, and any DDL that landed after
         // it would diverge live state from on-disk state.
         if self.failed.load(Ordering::Acquire) {
@@ -3314,7 +3314,7 @@ impl MVCCEngine {
             // Seqlock publish: bump to ODD BEFORE the field
             // stores so a concurrent reader sample observes
             // "publish in progress" and retries. Then store both
-            // fields. Then bump to EVEN AFTER both stores — the
+            // fields. Then bump to EVEN AFTER both stores, the
             // pair is now coherent for reader sampling. See
             // `ShmHeader::publish_seq` doc for why "bump-after-
             // only" admits a torn read.
@@ -3328,7 +3328,7 @@ impl MVCCEngine {
                         .store(wal.oldest_active_txn_lsn(), Ordering::Release);
                 }
             }
-            // Then visible_commit_lsn — readers Acquire-loading
+            // Then visible_commit_lsn, readers Acquire-loading
             // this also see the watermark store above.
             handle
                 .header()
@@ -3674,7 +3674,7 @@ impl MVCCEngine {
             return Err(e);
         }
 
-        // WAL succeeded — close the now-orphaned VersionStore.
+        // WAL succeeded, close the now-orphaned VersionStore.
         if let Some(store) = removed_store {
             store.close();
         }
@@ -4100,7 +4100,7 @@ impl MVCCEngine {
                         } else if manifest_lsn > 0 && manifest_lsn < min_checkpoint_lsn {
                             // Uncapped / writable open: keep the
                             // historical "skip 0" semantic to avoid
-                            // regressing writable recovery — a
+                            // regressing writable recovery, a
                             // manifest at `checkpoint_lsn = 0` here
                             // means "no prior checkpoint info" rather
                             // than "must replay from 0".
@@ -4869,7 +4869,7 @@ impl MVCCEngine {
                 // snapshots/<new>/tombstones.dat. The original
                 // pub `rename_table` does this; the unchecked
                 // helper must match so a revert doesn't leave
-                // tombstones under the failed name. Best-effort —
+                // tombstones under the failed name. Best-effort,
                 // missing source is fine (no legacy tombstones).
                 let snap_dir = pm.path().join("snapshots");
                 let old_ts = snap_dir.join(old_name_lower).join("tombstones.dat");
@@ -5040,7 +5040,7 @@ impl MVCCEngine {
         }
 
         // Hold SH on `transactional_ddl_fence` across the
-        // mutation-to-WAL window — same rationale as
+        // mutation-to-WAL window, same rationale as
         // `create_table`. Without this guard a checkpoint
         // that landed mid-window could snapshot the
         // transient view in `rerecord_ddl_to_wal` and emit a
@@ -5084,7 +5084,7 @@ impl MVCCEngine {
         // in-memory insert if `record_ddl` fails (catastrophic-
         // failure latch tripped or WAL I/O failed). Without
         // rollback the view stays visible in this process while
-        // restart's WAL recovery would not replay it — a CREATE
+        // restart's WAL recovery would not replay it, a CREATE
         // VIEW that succeeded then "vanishes" on next restart.
         let data = view_def.serialize();
         if let Err(e) = self.record_ddl(&name_lower, WALOperationType::CreateView, &data) {
@@ -5292,8 +5292,8 @@ impl MVCCEngine {
                     // Strip ephemeral (u64::MAX) tombstones from the
                     // backup snapshot's skip-set. These are failed-
                     // marker tombstones (record_commit IO failure
-                    // after partial commit) that exist only in-memory
-                    // — backing them up to a snapshot .bin file would
+                    // after partial commit) that exist only in-memory,
+                    // backing them up to a snapshot .bin file would
                     // let a later restore physically drop cold rows
                     // for a markerless commit.
                     let live = mgr.tombstone_set_arc();
@@ -5815,7 +5815,7 @@ impl MVCCEngine {
         // truncation, decode failure, per-entry create failure).
         // RESTORE depends on this output for correctness:
         // UNIQUE / FK enforcement is driven from the restored
-        // indexes — silently skipping a corrupted entry would
+        // indexes, silently skipping a corrupted entry would
         // make RESTORE report success while leaving the
         // database with missing constraints. Recovery cannot
         // recover from this without operator intervention.
@@ -6099,7 +6099,7 @@ impl MVCCEngine {
                 let entries = std::fs::read_dir(&snapshot_dir).map_err(|e| {
                     self.registry.start_accepting_transactions();
                     Error::internal(format!(
-                        "PRAGMA RESTORE: cannot enumerate snapshots directory {:?}: {} — \
+                        "PRAGMA RESTORE: cannot enumerate snapshots directory {:?}: {}, \
                          refusing to fall back to all-directories scan (would resurrect \
                          tables that were dropped after older backups).",
                         snapshot_dir, e
@@ -6110,7 +6110,7 @@ impl MVCCEngine {
                     let entry = entry.map_err(|e| {
                         self.registry.start_accepting_transactions();
                         Error::internal(format!(
-                            "PRAGMA RESTORE: cannot read entry in snapshots directory {:?}: {} — \
+                            "PRAGMA RESTORE: cannot read entry in snapshots directory {:?}: {}, \
                              refusing to fall back to all-directories scan.",
                             snapshot_dir, e
                         ))
@@ -6137,7 +6137,7 @@ impl MVCCEngine {
                 self.registry.start_accepting_transactions();
                 Error::internal(format!(
                     "PRAGMA RESTORE: snapshot manifest {:?} exists but \
-                         could not be read: {} — refusing to fall back to \
+                         could not be read: {}, refusing to fall back to \
                          all-directories scan (would resurrect tables that \
                          were dropped after older backups).",
                     latest, e
@@ -6147,7 +6147,7 @@ impl MVCCEngine {
                 self.registry.start_accepting_transactions();
                 Error::internal(format!(
                     "PRAGMA RESTORE: snapshot manifest {:?} could not \
-                         be parsed: {} — refusing to fall back to all-\
+                         be parsed: {}, refusing to fall back to all-\
                          directories scan.",
                     latest, e
                 ))
@@ -6162,7 +6162,7 @@ impl MVCCEngine {
                         self.registry.start_accepting_transactions();
                         Error::internal(format!(
                             "PRAGMA RESTORE: snapshot manifest {:?} missing or non-array \
-                             `tables` field — refusing to fall back to all-directories scan \
+                             `tables` field, refusing to fall back to all-directories scan \
                              (would resurrect dropped tables).",
                             latest
                         ))
@@ -6175,7 +6175,7 @@ impl MVCCEngine {
                         self.registry.start_accepting_transactions();
                         return Err(Error::internal(format!(
                             "PRAGMA RESTORE: snapshot manifest {:?} has non-string \
-                                 entry at `tables[{}]` ({}) — refusing to restore from a \
+                                 entry at `tables[{}]` ({}), refusing to restore from a \
                                  corrupt manifest (would silently omit a table).",
                             latest, i, v
                         )));
@@ -6202,7 +6202,7 @@ impl MVCCEngine {
                     return Err(Error::internal(format!(
                         "PRAGMA RESTORE: snapshot manifest {:?} has \
                          `timestamp` field '{}' that disagrees with the \
-                         filename suffix '{}' — refusing to restore from \
+                         filename suffix '{}', refusing to restore from \
                          corrupt metadata (would load the wrong batch).",
                         latest, field_ts, filename_ts
                     )));
@@ -6213,7 +6213,7 @@ impl MVCCEngine {
                 Error::internal(format!(
                     "PRAGMA RESTORE: snapshot manifest {:?} has no \
                          resolvable timestamp (neither `timestamp` field nor \
-                         `manifest-{{ts}}.json` filename) — refusing to fall \
+                         `manifest-{{ts}}.json` filename), refusing to fall \
                          back to newest-per-table scan (could mix data from \
                          different backup batches).",
                     latest
@@ -6233,18 +6233,18 @@ impl MVCCEngine {
             let entry = entry.map_err(|e| {
                 self.registry.start_accepting_transactions();
                 Error::internal(format!(
-                    "PRAGMA RESTORE: cannot read entry in snapshots directory {:?}: {} — \
+                    "PRAGMA RESTORE: cannot read entry in snapshots directory {:?}: {}, \
                      refusing to proceed (would silently omit a table from a legacy backup).",
                     snapshot_dir, e
                 ))
             })?;
-            // file_type() failure is also fatal — we cannot
+            // file_type() failure is also fatal, we cannot
             // tell if this entry is a table dir whose contents
             // we'd otherwise process.
             let ft = entry.file_type().map_err(|e| {
                 self.registry.start_accepting_transactions();
                 Error::internal(format!(
-                    "PRAGMA RESTORE: cannot stat snapshot dir entry {:?}: {} — \
+                    "PRAGMA RESTORE: cannot stat snapshot dir entry {:?}: {}, \
                      refusing to proceed (could silently omit a table).",
                     entry.path(),
                     e
@@ -6320,7 +6320,7 @@ impl MVCCEngine {
                     self.registry.start_accepting_transactions();
                     return Err(Error::internal(format!(
                         "PRAGMA RESTORE: snapshot manifest pinned timestamp \
-                         '{}' but table '{}' has no '{}' on disk — refusing \
+                         '{}' but table '{}' has no '{}' on disk, refusing \
                          to mix an older snapshot of this table with the \
                          rest of the batch (would be a partial point-in-time \
                          restore).",
@@ -6360,7 +6360,7 @@ impl MVCCEngine {
         //   1. Manifest-pinned timestamp (matches the batch the manifest published).
         //   2. Explicit `timestamp` arg (legacy timestamped restore with no manifest).
         //   3. Oldest timestamp across the selected snapshot files (latest restore
-        //      with no manifest — conservative, never newer than any restored data).
+        //      with no manifest, conservative, never newer than any restored data).
         let ddl_data = {
             let effective_ts = if let Some((ref manifest_ts, _)) = effective_manifest {
                 Some(manifest_ts.clone())
@@ -6390,7 +6390,7 @@ impl MVCCEngine {
                     self.registry.start_accepting_transactions();
                     Error::internal(format!(
                         "PRAGMA RESTORE: ddl metadata file {:?} exists but \
-                         could not be read: {} — refusing to fall back to \
+                         could not be read: {}, refusing to fall back to \
                          current in-memory indexes / views (would restore \
                          wrong constraints).",
                         ddl_path, e
@@ -6410,7 +6410,7 @@ impl MVCCEngine {
                 self.registry.start_accepting_transactions();
                 return Err(Error::internal(format!(
                     "PRAGMA RESTORE: snapshot manifest pinned timestamp but \
-                     DDL metadata {:?} is missing — refusing to fall back to \
+                     DDL metadata {:?} is missing, refusing to fall back to \
                      current in-memory indexes / views (would restore wrong \
                      constraints).",
                     ddl_path
@@ -6536,7 +6536,7 @@ impl MVCCEngine {
             self.latch_attach_gate_on_failure(restore_attach_gate.take());
             return Err(Error::internal(format!(
                 "PRAGMA RESTORE: WAL reset failed after volume directories were \
-                 cleared: {} — engine latched into catastrophic-failure state. \
+                 cleared: {}, engine latched into catastrophic-failure state. \
                  Restart the process and retry the restore.",
                 e
             )));
@@ -6591,7 +6591,7 @@ impl MVCCEngine {
                     // so neither the original database nor the full requested
                     // snapshot can be reconstructed by recovery from this state.
                     // Persist what we have so a crash doesn't lose everything,
-                    // then LATCH the engine — letting `start_accepting_transactions`
+                    // then LATCH the engine, letting `start_accepting_transactions`
                     // run here would let new auto-commit DDL / DML append WAL
                     // on top of a partial restore that recovery can't reason
                     // about. Same fail-closed policy as the later DDL re-record
@@ -6611,7 +6611,7 @@ impl MVCCEngine {
                     self.enter_catastrophic_failure();
                     self.latch_attach_gate_on_failure(restore_attach_gate.take());
                     return Err(Error::internal(format!(
-                        "PRAGMA RESTORE: failed to restore table '{}': {} — engine \
+                        "PRAGMA RESTORE: failed to restore table '{}': {}, engine \
                          latched into catastrophic-failure state. Restart the \
                          process and retry the restore against the snapshot.",
                         table_name, e
@@ -6627,7 +6627,7 @@ impl MVCCEngine {
         // enforcement is driven from the restored indexes,
         // so silently skipping a corrupted entry would make
         // RESTORE report success against a database that
-        // can't enforce its constraints. Latch the engine —
+        // can't enforce its constraints. Latch the engine,
         // the destructive boundary is past, so reopening
         // writes against a partial DDL load could append WAL
         // mutating tables whose indexes are missing.
@@ -6636,7 +6636,7 @@ impl MVCCEngine {
                 self.enter_catastrophic_failure();
                 self.latch_attach_gate_on_failure(restore_attach_gate.take());
                 return Err(Error::internal(format!(
-                    "PRAGMA RESTORE: ddl.bin validation/restore failed: {} — \
+                    "PRAGMA RESTORE: ddl.bin validation/restore failed: {}, \
                      engine latched into catastrophic-failure state. The \
                      restored snapshot is missing one or more indexes / views, \
                      so UNIQUE / FK enforcement would be silently broken. \
@@ -6691,7 +6691,7 @@ impl MVCCEngine {
             self.latch_attach_gate_on_failure(restore_attach_gate.take());
             return Err(Error::internal(format!(
                 "PRAGMA RESTORE: failed to re-record DDL to WAL after the WAL \
-                 reset: {} — engine latched into catastrophic-failure state. \
+                 reset: {}, engine latched into catastrophic-failure state. \
                  Restart the process; recovery converges from the on-disk \
                  manifests + whatever DDL entries landed before the failure.",
                 e
@@ -6718,7 +6718,7 @@ impl MVCCEngine {
             return Err(Error::Internal {
                 message: format!(
                     "PRAGMA RESTORE: forced checkpoint failed; restored data is \
-                     non-durable: {} — engine latched into catastrophic-failure \
+                     non-durable: {}, engine latched into catastrophic-failure \
                      state. Restart the process to converge.",
                     e
                 ),
@@ -6740,8 +6740,8 @@ impl MVCCEngine {
     fn checkpoint_cycle(&self) -> Result<()> {
         self.checkpoint_cycle_inner(false)?;
         // Run compaction synchronously so direct callers (Rust API, trait users) get
-        // the full seal+compact behavior. Both paths drive sweep_orphan_table_dirs
-        // — covers explicit AND background cycles.
+        // the full seal+compact behavior. Both paths drive sweep_orphan_table_dirs,
+        // covering explicit AND background cycles.
         self.compact_after_checkpoint_forced();
         Ok(())
     }
@@ -6855,7 +6855,7 @@ impl MVCCEngine {
         }
 
         // Whole-table sweep (DROP defer / crash leftovers): keeps the
-        // simpler defer_for_live_readers gate — these orphans are
+        // simpler defer_for_live_readers gate, these orphans are
         // whole tables, not individual segments, and DROP recovery is
         // rare enough that the all-or-nothing behavior is acceptable.
         if self.defer_for_live_readers() {
@@ -6950,8 +6950,8 @@ impl MVCCEngine {
                 // entry-time check passed; the wait above (seal_hot_buffers
                 // + acquiring the seal_fence write lock) can block while
                 // a marker-failure commit completes its drain, latches
-                // the engine, and drops its own seal_fence read guard
-                // — handing us the write lock. Without this recheck
+                // the engine, and drops its own seal_fence read guard,
+                // handing us the write lock. Without this recheck
                 // we'd call create_checkpoint, persist manifests, bump
                 // the manifest epoch, and truncate WAL after the
                 // catastrophic-failure latch was set.
@@ -7533,7 +7533,7 @@ impl MVCCEngine {
             // across the merged segments, NOT the writer's current
             // WAL LSN. The compacted rows were already visible at
             // each merged segment's `visible_at_lsn`, so the
-            // compaction must not raise that floor — otherwise a
+            // compaction must not raise that floor, otherwise a
             // capped reader at P (where old_min <= P < current_lsn)
             // would drop the new segment even though the same rows
             // were visible to it through the merged-out segments.
@@ -8208,7 +8208,7 @@ impl Engine for MVCCEngine {
 
     fn create_snapshot(&self) -> Result<()> {
         // Snapshot writes new files to disk. A read-only engine refuses
-        // even though the I/O layer would also fail with EROFS / EACCES —
+        // even though the I/O layer would also fail with EROFS / EACCES,
         // a clear `ReadOnlyViolation` here beats a confusing late error
         // and is consistent with how the SQL `PRAGMA SNAPSHOT` is gated
         // by the parser write-reason classifier.
@@ -8219,7 +8219,7 @@ impl Engine for MVCCEngine {
     fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
         // Restore is destructive: it replaces engine state in-place from
         // a backup. Refusing on read-only engines is mandatory, not
-        // defense-in-depth — the on-disk replacement bypasses anything
+        // defense-in-depth, the on-disk replacement bypasses anything
         // the read-only file-lock contract was supposed to guarantee.
         self.ensure_writable()?;
         MVCCEngine::restore_from_snapshot(self, timestamp)
@@ -8447,7 +8447,7 @@ impl Engine for MVCCEngine {
         // drift check sees this MODIFY COLUMN even when the next
         // checkpoint produces no new segment. See the matching
         // block in `record_alter_table_add_column` for the full
-        // rationale — same SQL ALTER path bypass.
+        // rationale, same SQL ALTER path bypass.
         self.propagate_schema_bump(table_name);
         Ok(())
     }
@@ -8476,7 +8476,7 @@ impl Engine for MVCCEngine {
         // The `transactional_ddl_fence` is held by the
         // CALLER (`Executor::execute_truncate`), spanning
         // both `table.truncate()` AND this WAL write. We do
-        // NOT re-acquire SH here — parking_lot's RwLock can
+        // NOT re-acquire SH here, parking_lot's RwLock can
         // deadlock on reentrant SH if a checkpoint EX is
         // waiting for the outer guard to drop.
 
@@ -9238,7 +9238,7 @@ impl TransactionEngineOperations for EngineOperations {
         // trait method is reachable from inside an open transaction
         // (`MvccTransaction::create_table`) where `check_active()`
         // is the only gate. Without this guard, transactional
-        // CREATE could insert the schema + VersionStore — a later
+        // CREATE could insert the schema + VersionStore, a later
         // record_commit would then hit the failed latch and return
         // Err, but the new table would remain live in memory and
         // `rollback_ddl` couldn't remove it (drop_table now refuses
@@ -9498,7 +9498,7 @@ impl TransactionEngineOperations for EngineOperations {
             }
         }
 
-        // Bump schema_epoch — same rationale as in
+        // Bump schema_epoch, same rationale as in
         // `create_table` / `drop_table`. A rename invalidates
         // any cached lookup keyed by the old or new name and
         // any compiled DML targeting either entry.
@@ -9891,7 +9891,7 @@ impl TransactionEngineOperations for EngineOperations {
             // Step 1: recreate the index structure +
             // populate from the (currently empty) hot store.
             store.create_index_from_metadata(&meta, false)?;
-            // Step 2: HNSW-only — populate from cold
+            // Step 2: HNSW-only, populate from cold
             // segments. Other index types (BTree, Hash,
             // Bitmap, MultiColumn) intentionally cover only
             // hot rows; cold scans use zone maps + dictionary
@@ -9925,7 +9925,7 @@ impl TransactionEngineOperations for EngineOperations {
                 }
             }
         }
-        // Bump schema_epoch — restoring secondary indexes
+        // Bump schema_epoch, restoring secondary indexes
         // changes the index set on the table, so cached
         // compiled DML / planner choices keyed on the prior
         // (no-index) state must rederive.
@@ -9984,7 +9984,7 @@ impl TransactionEngineOperations for EngineOperations {
         // an active_txn record, only a marker LSN parked in
         // pending). `lsn = 0` means no marker was actually
         // pinned (in-memory engine, persistence disabled, or
-        // `should_skip_wal()` true) — nothing to do.
+        // `should_skip_wal()` true), nothing to do.
         if lsn == 0 {
             return;
         }
@@ -10006,7 +10006,7 @@ impl TransactionEngineOperations for EngineOperations {
         }
         if let Some(handle) = self.shm.as_ref() {
             // Same shm publish dance as
-            // `publish_visible_commit_lsn` — see that method
+            // `publish_visible_commit_lsn`, see that method
             // for the seqlock + watermark ordering rationale.
             let _publish_guard = self.shm_publish_lock.lock();
             if publish_lsn > handle.header().visible_commit_lsn.load(Ordering::Acquire) {
@@ -10423,14 +10423,14 @@ impl TransactionEngineOperations for EngineOperations {
 
         let mgrs = self.segment_managers.read().unwrap();
         if touched.is_empty() {
-            // Cache was already drained — typically by `commit_all_tables`
+            // Cache was already drained, typically by `commit_all_tables`
             // which removes the txn entry before returning. The
             // partial-commit failure path in `MvccTransaction::commit`
             // calls us here to clear leftover pending tombstones for
             // tables that successfully committed (their tombstones were
             // kept pending by `commit_all_tables` so a subsequent
             // `stamp_pending_tombstones` could finalize them with the
-            // marker LSN — but record_commit failed, so they need to
+            // marker LSN, but record_commit failed, so they need to
             // go away). We can't recover the touched list, so iterate
             // every manager. `rollback_pending_tombstones` is an O(1)
             // HashMap lookup keyed by `txn_id` and a no-op when nothing

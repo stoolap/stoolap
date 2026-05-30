@@ -2677,7 +2677,7 @@ impl ReadTable for MVCCTable {
                         filter: None,
                     };
                 }
-                // Mixed OR: some operands indexed, some not — hybrid scan
+                // Mixed OR: some operands indexed, some not, hybrid scan
                 // Show as Multi-Index Scan with a Filter for the non-indexed operands
                 let non_indexed_parts: Vec<String> = or_operands
                     .iter()
@@ -2759,7 +2759,7 @@ impl ReadTable for MVCCTable {
                     }
 
                     // Check if the next index column (after the equality prefix) has
-                    // range predicates — the composite index BTree can serve these too
+                    // range predicates, the composite index BTree can serve these too
                     if matched_count < index_columns.len() {
                         let next_col = &index_columns[matched_count];
                         if let Some(ops) = column_conditions.get(next_col.as_str()) {
@@ -3047,7 +3047,7 @@ impl WriteTable for MVCCTable {
                     let txn_versions = self.txn_versions.read().unwrap();
                     if let Some(local) = txn_versions.get_local_version(pk_id) {
                         if local.is_deleted() {
-                            None // Locally deleted — can't update
+                            None // Locally deleted, can't update
                         } else {
                             // Local version - no need to track original (already in write-set)
                             Some((local.data.clone(), None))
@@ -3114,7 +3114,7 @@ impl WriteTable for MVCCTable {
                                     local_rows.push((row_id, updated_row));
                                 }
                             }
-                            // Locally deleted — skip, don't fall through
+                            // Locally deleted, skip, don't fall through
                         } else {
                             remaining_row_ids.push(row_id);
                         }
@@ -3166,7 +3166,7 @@ impl WriteTable for MVCCTable {
                                     local_rows_to_update.push((row_id, row));
                                 }
                             }
-                            // Locally deleted — skip, don't fall through
+                            // Locally deleted, skip, don't fall through
                         } else {
                             remaining_row_ids.push(row_id);
                         }
@@ -3193,7 +3193,7 @@ impl WriteTable for MVCCTable {
                 }
 
                 // Step 3: Apply setter to all rows, filtering out unchanged rows
-                // Setter returns Result — on error, abort BEFORE batch put
+                // Setter returns Result, on error, abort BEFORE batch put
                 // to guarantee statement-level atomicity.
                 let mut setter_error: Option<crate::core::Error> = None;
                 local_rows_to_update.retain_mut(|(_, row)| {
@@ -3286,10 +3286,10 @@ impl WriteTable for MVCCTable {
                 rows_with_originals.retain_mut(|(row_id, row, _orig)| {
                     if let Some(local_version) = txn_versions.get_latest_local(*row_id) {
                         if local_version.is_deleted() {
-                            // Locally deleted — exclude from update
+                            // Locally deleted, exclude from update
                             return false;
                         }
-                        // Locally modified — use local data instead of stale global data
+                        // Locally modified, use local data instead of stale global data
                         *row = self.normalize_row_to_schema(local_version.data.clone(), schema);
                         // Re-check filter against local data
                         if let Some(expr) = where_expr {
@@ -3325,7 +3325,7 @@ impl WriteTable for MVCCTable {
         };
 
         // Apply setter to rows with originals (from version store), filtering out unchanged
-        // Setter returns Result — on error, abort BEFORE batch put for statement atomicity.
+        // Setter returns Result, on error, abort BEFORE batch put for statement atomicity.
         let mut setter_error: Option<crate::core::Error> = None;
         rows_with_originals.retain_mut(|(_, row, _)| {
             if setter_error.is_some() {
@@ -3402,7 +3402,7 @@ impl WriteTable for MVCCTable {
                             local_rows.push((row_id, updated_row));
                         }
                     }
-                    // Locally deleted — skip, don't fall through
+                    // Locally deleted, skip, don't fall through
                 } else {
                     remaining_row_ids.push(row_id);
                 }
@@ -3456,7 +3456,7 @@ impl WriteTable for MVCCTable {
                         let row = self.normalize_row_to_schema(local.data.clone(), schema);
                         local_deletes.push((row_id, row));
                     }
-                    // Already locally deleted — skip, don't fall through
+                    // Already locally deleted, skip, don't fall through
                 } else {
                     remaining_row_ids.push(row_id);
                 }
@@ -3545,7 +3545,7 @@ impl WriteTable for MVCCTable {
                     let txn_versions = self.txn_versions.read().unwrap();
                     if let Some(local) = txn_versions.get_local_version(pk_id) {
                         if local.is_deleted() {
-                            None // Already locally deleted — don't double-count
+                            None // Already locally deleted, don't double-count
                         } else {
                             // Local version - no need to track original (already in write-set)
                             Some((local.data.clone(), None))
@@ -3598,7 +3598,7 @@ impl WriteTable for MVCCTable {
                             if !local.is_deleted() {
                                 local_rows.push((row_id, local.data.clone()));
                             }
-                            // Already locally deleted — skip, don't fall through
+                            // Already locally deleted, skip, don't fall through
                         } else {
                             remaining_row_ids.push(row_id);
                         }
@@ -3648,7 +3648,7 @@ impl WriteTable for MVCCTable {
                                     rows_to_delete.push((row_id, row));
                                 }
                             }
-                            // Already locally deleted — skip, don't fall through
+                            // Already locally deleted, skip, don't fall through
                         } else {
                             remaining_row_ids.push(row_id);
                         }
@@ -3701,7 +3701,7 @@ impl WriteTable for MVCCTable {
 
             if let Some((is_deleted, row)) = local_version {
                 if is_deleted {
-                    continue; // Already locally deleted — skip
+                    continue; // Already locally deleted, skip
                 }
                 // Apply filter on local row
                 if let Some(expr) = where_expr {

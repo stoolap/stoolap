@@ -2358,7 +2358,7 @@ impl ReadTable for SegmentedTable {
             return self.hot.get_partition_count(column_name);
         }
 
-        // During seal, hot+cold overlap — can't reliably count
+        // During seal, hot+cold overlap, can't reliably count
         if self.segment_mgr.seal_overlap() > 0 {
             return None;
         }
@@ -4773,7 +4773,7 @@ impl WriteTable for SegmentedTable {
     }
 
     // =========================================================================
-    // DML — writes go to hot buffer, constraints checked against segments
+    // DML, writes go to hot buffer, constraints checked against segments
     // =========================================================================
     fn insert(&mut self, row: Row) -> Result<Row> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
@@ -4800,7 +4800,7 @@ impl WriteTable for SegmentedTable {
     fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
         if self.segment_mgr.has_segments() {
-            // Snapshot once for the entire batch — eliminates 3 lock reads per row.
+            // Snapshot once for the entire batch, eliminates 3 lock reads per row.
             let snapshot = self.segment_mgr.cold_snapshot();
             for row in &rows {
                 self.check_segment_constraints_with_snapshot(&snapshot, row)?;
@@ -5189,7 +5189,7 @@ impl WriteTable for SegmentedTable {
     }
 
     // =========================================================================
-    // Read operations — merge segments + hot buffer
+    // Read operations, merge segments + hot buffer
     // =========================================================================
     fn commit(&mut self) -> Result<()> {
         self.hot.commit()?;
@@ -5827,7 +5827,7 @@ mod tests {
 
         // After commit, tombstones are applied to the shared segment manager.
         // total_row_count is the upper-bound hint and does NOT subtract
-        // tombstones (orphan tombstones must not collapse the hint —
+        // tombstones (orphan tombstones must not collapse the hint,
         // see SegmentManager::total_row_count). The exact post-delete
         // count comes from deduped_row_count.
         table.commit().unwrap();

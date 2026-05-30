@@ -95,7 +95,7 @@ impl Statement {
 
             // Check if already cached (e.g. same SQL prepared twice).
             //
-            // On a read-only executor, refuse write-intent SQL up front —
+            // On a read-only executor, refuse write-intent SQL up front,
             // even on a cache hit produced by an earlier writable caller.
             // Without this, `prepare()` would succeed against a read-only
             // Database and the refusal would only fire later at
@@ -150,7 +150,7 @@ impl Statement {
                     }
                     // Multi-statement SQL on a read-only executor: refuse
                     // any program containing at least one write-intent
-                    // statement. Single fresh parse — no re-parse needed.
+                    // statement. Single fresh parse, no re-parse needed.
                     if executor.is_read_only() {
                         for s in &program.statements {
                             if let Some(reason) = s.write_reason() {
@@ -194,7 +194,7 @@ impl Statement {
             // Prepared-statement cached-plan path bypasses the
             // `Database::execute` entry point, so the SWMR
             // lease heartbeat / refresh that lives there
-            // doesn't fire — call it explicitly here. The
+            // doesn't fire, call it explicitly here. The
             // multi-statement fallback below already routes
             // through `db.execute`, which heartbeats
             // internally; doing it here too would double the
@@ -229,7 +229,7 @@ impl Statement {
     pub fn query<P: Params>(&self, params: P) -> Result<Rows> {
         let db = self.get_db()?;
         if let Some(plan) = &self.plan {
-            // See `Statement::execute` for the rationale —
+            // See `Statement::execute` for the rationale,
             // heartbeat lives on the cached-plan branch only,
             // since the multi-statement fallback below routes
             // through `db.query` which heartbeats internally.

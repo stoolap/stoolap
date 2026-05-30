@@ -556,7 +556,7 @@ impl Executor {
         if let Some(cached) = self.query_cache.get(sql) {
             // On a read-only executor, refuse any cached statement that
             // mutates persistent state. The check uses the parsed-once
-            // cached AST — no extra parse on the hot path.
+            // cached AST, no extra parse on the hot path.
             if self.read_only {
                 if let Some(reason) = cached.statement.write_reason() {
                     return Err(crate::core::Error::read_only_violation_at("parser", reason));
@@ -627,7 +627,7 @@ impl Executor {
             .map_err(|e| Error::parse(e.to_string()))?;
 
         // On a read-only executor, refuse any statement in the program that
-        // mutates persistent state. Single fresh parse — checks happen on
+        // mutates persistent state. Single fresh parse, checks happen on
         // the parsed AST without re-parsing.
         if self.read_only {
             for stmt in &program.statements {
@@ -972,7 +972,7 @@ impl Executor {
         // Read-only refusal at parse time. Without this, write SQL would
         // parse and cache successfully against a read-only executor,
         // and the refusal would only fire later at `execute_plan` /
-        // `query_plan` — confusing to debug.
+        // `query_plan`, confusing to debug.
         if self.read_only {
             if let Some(reason) = stmt.write_reason() {
                 return Err(crate::core::Error::read_only_violation_at("parser", reason));

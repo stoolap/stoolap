@@ -470,7 +470,7 @@ impl PersistenceManager {
     /// gated by the surrounding transaction's commit marker
     /// (which `record_commit` writes from the txn commit path).
     /// A crash between this write and the txn commit therefore
-    /// leaves the DDL entry orphaned in WAL — recovery will not
+    /// leaves the DDL entry orphaned in WAL, recovery will not
     /// find a commit marker for `txn_id` and will skip the
     /// entry. This is the property `MvccTransaction::commit`
     /// relies on for transactional DDL semantics.
@@ -487,7 +487,7 @@ impl PersistenceManager {
         let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
         let entry = WALEntry::new(txn_id, table_name.to_string(), 0, op, schema_data.to_vec());
         let lsn = wal.append_entry(entry)?;
-        // Don't rotate here — rotation is fine to happen at the
+        // Don't rotate here, rotation is fine to happen at the
         // next auto-commit DDL or at the txn's commit marker
         // write. Avoiding rotation here keeps this batch tightly
         // packed in one file segment, easing recovery's locality.

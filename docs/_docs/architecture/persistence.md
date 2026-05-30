@@ -299,7 +299,19 @@ Each table has its own subdirectory. Filenames include the timestamp of creation
 
 ### Lock File
 
-The database lock file (`db.lock`) uses OS-level file locking (flock) to prevent concurrent access. The lock file is **not** deleted on shutdown because flock protects the inode, not the pathname. Deleting the file while the lock is held would allow a race where another process creates a new inode and acquires its own lock. The stale file on disk is harmless and is re-locked on the next open.
+The database lock file (`db.lock`) uses OS-level file locking (flock) to enforce a single writer per directory. A writable handle (`Database::open`) takes an exclusive lock; a second writer process is rejected. The lock file is **not** deleted on shutdown because flock protects the inode, not the pathname. Deleting the file while the lock is held would allow a race where another process creates a new inode and acquires its own lock. The stale file on disk is harmless and is re-locked on the next open.
+
+### Cross-Process Readers (Single-Writer, Multi-Reader)
+
+A read-only handle (`Database::open_read_only`, or the `--read-only` CLI flag) can run **at the same time** as a separate writer process against the same `file://` directory. On Unix the reader takes **no** exclusive flock, so one writer and many readers coexist. Coordination is lock-free:
+
+- **`db.shm`**: a small shared-memory file the writer publishes state into (visible commit LSN, oldest active transaction LSN, writer generation). Readers sample it to learn what the writer has made durable.
+- **Lease files**: each reader registers a lease so the writer knows live readers exist and does not truncate WAL or reap volumes a reader still needs. Crashed readers' leases age out and are reaped; a live reader's lease is never reaped.
+- **Manifest-epoch poll**: with `auto_refresh=on` (default) each query polls a manifest epoch (~1µs) and reloads if the writer advanced past a checkpoint.
+
+**Visibility is checkpoint-bounded.** A reader observes the writer's data as of the last checkpoint it has picked up, not the writer's uncommitted or uncheckpointed in-flight writes. Call `refresh()` (or set a `refresh_interval`) to advance the snapshot; `set_auto_refresh(false)` freezes it for a stable read window. Post-attach DDL or a writer crash + restart surface as sticky must-reopen errors (`SwmrPendingDdl`, `SwmrWriterReincarnated`); reopen the handle to recover. See the [Connection Strings]({% link _docs/getting-started/connection-strings.md %}) reference for the `read_only`, `auto_refresh`, and `refresh_interval` flags.
+
+In-memory databases (`memory://`) are in-process only and have no cross-process coordination.
 
 ## Recovery Process
 

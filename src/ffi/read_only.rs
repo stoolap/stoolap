@@ -40,7 +40,7 @@ use super::{STOOLAP_ERROR, STOOLAP_OK};
 ///
 /// Accepts the same DSN spellings as `stoolap_open` plus the read-only
 /// flags `?read_only=1` / `?readonly=true` / `?mode=ro` (which
-/// `stoolap_open` REJECTS). The DSN flag is redundant — the function
+/// `stoolap_open` REJECTS). The DSN flag is redundant, the function
 /// is the read-only entry point.
 ///
 /// # Safety

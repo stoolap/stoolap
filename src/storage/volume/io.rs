@@ -435,7 +435,7 @@ pub fn delete_volume(path: &Path) -> Result<()> {
     })
 }
 
-/// Delete every artifact for a table — `vol_*.vol` files,
+/// Delete every artifact for a table, `vol_*.vol` files,
 /// `manifest.bin`, and the table directory itself. Used by
 /// the immediate-DROP / immediate-TRUNCATE path
 /// (`delete_table_volumes_when_safe(..., defer=false)`); the
@@ -469,7 +469,7 @@ pub fn delete_all_volumes(dir: &Path, table_name: &str) -> Result<()> {
 /// Defer-aware DROP/TRUNCATE volume cleanup.
 ///
 /// When `defer` is `false`, immediately deletes every volume
-/// for the table and the (empty) table directory — same
+/// for the table and the (empty) table directory, same
 /// behaviour as `delete_all_volumes`.
 ///
 /// When `defer` is `true`, leaves the directory and every
@@ -500,7 +500,7 @@ pub fn delete_table_volumes_when_safe(dir: &Path, table_name: &str, defer: bool)
         return Ok(());
     }
     // Propagate the failure. Correctness now depends on
-    // removing `manifest.bin` along with the .vol files —
+    // removing `manifest.bin` along with the .vol files,
     // leaving the manifest behind would let a checkpoint
     // re-record only the live tables, bump the manifest
     // epoch, and truncate WAL past the `DropTable` record
@@ -514,7 +514,7 @@ pub fn delete_table_volumes_when_safe(dir: &Path, table_name: &str, defer: bool)
 /// Remove every `<dir>/<table_name>/vol_*.vol` file whose
 /// 64-bit segment id is NOT in `keep_segment_ids`. Caller is
 /// responsible for confirming `defer_for_live_readers() ==
-/// false` BEFORE invoking — same safety contract as
+/// false` BEFORE invoking, same safety contract as
 /// `sweep_orphan_table_dirs`. Used to reap obsolete .vol
 /// files for an ACTIVE table whose manifest was emptied (e.g.
 /// TRUNCATE while readers were live, leaving the old files
@@ -543,7 +543,7 @@ pub fn sweep_orphan_volumes_in_table(
             continue;
         }
         // Filename layout (matches `write_volume_to_disk`):
-        // `vol_{:016x}.vol` — strip the `vol_` prefix and
+        // `vol_{:016x}.vol`, strip the `vol_` prefix and
         // `.vol` suffix, parse the hex id.
         let stem = match path.file_stem().and_then(|s| s.to_str()) {
             Some(s) => s,
@@ -675,8 +675,8 @@ fn write_sidecar_atomic(path: &Path, epoch: u64) -> std::io::Result<()> {
 
 /// Reap every `<dir>/<subdir>` whose lowercased name is NOT
 /// in `active_tables`. Caller is responsible for confirming
-/// `defer_for_live_readers() == false` BEFORE invoking this
-/// — the sweep's safety contract is "no live reader can hold
+/// `defer_for_live_readers() == false` BEFORE invoking this,
+/// the sweep's safety contract is "no live reader can hold
 /// a stale manifest pointer into the directory being unlinked."
 ///
 /// `active_tables` is the set of lowercased table names the

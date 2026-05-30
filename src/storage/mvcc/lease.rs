@@ -240,7 +240,7 @@ impl LeaseManager {
         })?;
         // mtime failure is a warning, not an error: the pin VALUE is already
         // on disk. Returning Err would let set_handle_pin roll back its
-        // registry contribution while the file still advertises the floor —
+        // registry contribution while the file still advertises the floor,
         // a strictly worse outcome than just relying on the next touch.
         if let Err(e) = f.set_modified(SystemTime::now()) {
             eprintln!(
@@ -290,7 +290,7 @@ impl LeaseManager {
     /// writer no longer pins WAL on this PID's behalf even if a non-overlay
     /// handle keeps the LeaseManager alive via the refcount.
     pub fn remove_handle_pin(&self, handle_id: u64) {
-        // Lock held across the file write — same ordering invariant as set.
+        // Lock held across the file write, same ordering invariant as set.
         let mut reg = lease_pin_contributions()
             .lock()
             .unwrap_or_else(|p| p.into_inner());

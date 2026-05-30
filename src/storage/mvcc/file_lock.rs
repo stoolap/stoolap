@@ -49,7 +49,7 @@ impl FileLock {
         Self::acquire_with_mode(db_path, LockMode::Exclusive)
     }
 
-    /// Take a shared lock. On Unix (SWMR) this takes no kernel flock —
+    /// Take a shared lock. On Unix (SWMR) this takes no kernel flock,
     /// reader presence is signaled via lease files in `<db>/readers/`. On
     /// non-Unix it takes a real LockFileEx SH. Falls back to lockless
     /// (`file: None`) on a verified read-only mount where `db.lock` is
@@ -288,7 +288,7 @@ impl FileLock {
                             "failed to open db.lock for SWMR attach handshake at '{}': \
                              create failed ({}); read-only fallback also failed ({}); \
                              the directory looks writable but another process could \
-                             still start a writer — refusing to skip the handshake",
+                             still start a writer, refusing to skip the handshake",
                             lock_path.display(),
                             e,
                             open_err

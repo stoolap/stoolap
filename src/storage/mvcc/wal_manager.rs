@@ -1816,7 +1816,7 @@ impl WALManager {
             )?;
         }
 
-        // Phase 2: streaming redo — apply one entry at a time.
+        // Phase 2: streaming redo, apply one entry at a time.
         let mut applied_count = 0u64;
         let mut skipped_count = 0u64;
 
@@ -2116,7 +2116,7 @@ impl WALManager {
     /// (no callback, no state mutation). Two-pass like `replay_two_phase`.
     ///
     /// `from_lsn` is exclusive (commit-marker window lower bound, also DDL entry
-    /// filter); `to_lsn` is inclusive. `entry_floor` is the DML scan floor —
+    /// filter); `to_lsn` is inclusive. `entry_floor` is the DML scan floor,
     /// pass the writer's `oldest_active_txn_lsn` at the prior tail (or 0 for
     /// a full scan). `to_lsn = u64::MAX` tails every committed entry.
     ///
@@ -2124,7 +2124,7 @@ impl WALManager {
     /// so DDL detection stays current).
     ///
     /// Returns `Err(Error::SwmrSnapshotExpired)` when `from_lsn`/`entry_floor`
-    /// falls below the first live WAL entry — caller must reopen the handle.
+    /// falls below the first live WAL entry, caller must reopen the handle.
     pub fn tail_committed_entries(
         &self,
         from_lsn: u64,
@@ -2198,7 +2198,7 @@ impl WALManager {
             last_lsn_p1 = end_lsn;
         }
         if committed_txns.is_empty() {
-            // No new commits — still publish the cursor
+            // No new commits, still publish the cursor
             // advance so the next refresh skips the bytes we
             // just CRC-validated.
             if let (Some(out_c), Some(p)) = (out_cursor, last_path_p1) {
@@ -2222,7 +2222,7 @@ impl WALManager {
         //
         // For DDL entries (which all share the synthetic
         // `DDL_TXN_ID = -2`), the per-entry filter `entry.lsn >
-        // from_lsn` is enforced inside the helper — DDL is
+        // from_lsn` is enforced inside the helper, DDL is
         // auto-committed at its own LSN so this distinguishes new
         // DDL from stale re-records.
         //
@@ -2242,7 +2242,7 @@ impl WALManager {
         for wal_path in phase2_files {
             // Phase 2 needs records with `lsn >= entry_floor`,
             // so cursor reuse requires the cached LSN to be
-            // STRICTLY less than `entry_floor` — equality means
+            // STRICTLY less than `entry_floor`, equality means
             // a record at exactly `entry_floor` is already past
             // the cursor and would be missed. The cold-start
             // case (cursor LSN == 0, entry_floor == 0) falls
@@ -2344,7 +2344,7 @@ impl WALManager {
             Err(_) => return Ok((start_offset, start_offset_lsn)),
         };
         if start_offset > 0 && file.seek(SeekFrom::Start(start_offset)).is_err() {
-            // Seek failed (file shorter than cursor) — rescan from beginning.
+            // Seek failed (file shorter than cursor), rescan from beginning.
             if file.seek(SeekFrom::Start(0)).is_err() {
                 return Ok((0, 0));
             }
@@ -2441,7 +2441,7 @@ impl WALManager {
                     out.insert(txn_id);
                 }
             } else {
-                // Layout corruption — fall back to full decode for a precise error.
+                // Layout corruption, fall back to full decode for a precise error.
                 let _ = WALEntry::decode(lsn, previous_lsn, flags, version, &data, &header_buf)
                     .map_err(|e| {
                         Error::internal(format!(

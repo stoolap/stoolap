@@ -18,7 +18,7 @@
 //! zero-allocation: success leaves all fields `None`. On the error path
 //! `set_from_error` builds the message CString once and, for constraint
 //! / not-found / type-mismatch cases, also captures `{table, column,
-//! constraint, detail}` as small CStrings — only the fields that are
+//! constraint, detail}` as small CStrings, only the fields that are
 //! present, so a generic error costs one CString (same as today's
 //! string-only error path).
 //!

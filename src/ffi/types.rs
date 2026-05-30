@@ -75,7 +75,7 @@ pub struct StoolapNamedParam {
 
 /// FFI-safe structured error detail. Pointers are valid until the next
 /// FFI call on the originating handle. NULL fields indicate "not
-/// applicable for this error code". `message` is never NULL — empty
+/// applicable for this error code". `message` is never NULL, empty
 /// string when no error.
 #[repr(C)]
 pub struct StoolapErrorDetails {
@@ -117,7 +117,7 @@ pub struct StoolapDB {
 /// (`stoolap_ro_query*`, `stoolap_ro_table_*`, `stoolap_ro_refresh`).
 /// There are no `_exec` / `_begin` / savepoint entry points, so attempting
 /// to write through a read-only handle is a compile-time error on the C
-/// side too — not a runtime `STOOLAP_ERR_READ_ONLY`.
+/// side too, not a runtime `STOOLAP_ERR_READ_ONLY`.
 pub struct StoolapRoDB {
     pub(crate) ro: ReadOnlyDatabase,
     pub(crate) last_error: LastErrorState,
@@ -169,7 +169,7 @@ type ColumnCacheEntry = (crate::common::CompactArc<Vec<String>>, Arc<Vec<CString
 /// Single-slot column-name cache. Two queries that share the same column
 /// `CompactArc` (same projection plan) skip a `Vec<CString>` rebuild.
 ///
-/// The cache holds a strong clone of the source `CompactArc` — comparing
+/// The cache holds a strong clone of the source `CompactArc`, comparing
 /// raw pointers without keeping the allocation alive is unsound: when the
 /// previous `Rows` handle is closed and its `CompactArc` drops, the
 /// allocator can reuse that address for a brand-new projection, and a

@@ -881,7 +881,7 @@ fn as_read_only_does_not_observe_uncommitted_writes_on_source() {
     assert_eq!(
         n, 1,
         "as_read_only must not observe uncommitted writes from the source \
-         Database — separate executor / separate transaction state"
+         Database, separate executor / separate transaction state"
     );
 
     tx.commit().unwrap();
@@ -1847,7 +1847,7 @@ fn open_read_only_works_on_read_only_dir() {
         let dsn = format!("file://{}", path.display());
         let ro = Database::open_read_only(&dsn).expect(
             "open_read_only must succeed on a read-only dir / read-only \
-             db.lock — it shouldn't require write perm to acquire LOCK_SH",
+             db.lock, it shouldn't require write perm to acquire LOCK_SH",
         );
         let mut rows = ro.query("SELECT COUNT(*) FROM t", ()).unwrap();
         let row = rows.next().unwrap().unwrap();

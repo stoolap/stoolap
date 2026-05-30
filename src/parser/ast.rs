@@ -1425,7 +1425,7 @@ impl Statement {
             }
             Statement::Explain(e) => {
                 // EXPLAIN of a write statement is read (it analyzes, doesn't execute).
-                // EXPLAIN ANALYZE actually executes — treat it as a write if inner is a write.
+                // EXPLAIN ANALYZE actually executes, treat it as a write if inner is a write.
                 if e.analyze {
                     e.statement.write_reason()
                 } else {

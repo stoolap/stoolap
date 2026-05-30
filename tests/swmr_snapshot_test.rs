@@ -364,7 +364,7 @@ fn shm_cross_process_visibility() {
 }
 
 #[test]
-#[ignore = "manual benchmark; flaky under CI scheduling — run with `cargo nextest run --test swmr_snapshot_test --run-ignored only visibility_lag_under_continuous_writer_is_bounded --no-capture`"]
+#[ignore = "manual benchmark; flaky under CI scheduling, run with `cargo nextest run --test swmr_snapshot_test --run-ignored only visibility_lag_under_continuous_writer_is_bounded --no-capture`"]
 fn visibility_lag_under_continuous_writer_is_bounded() {
     // Manual lag bench: child writer commits + checkpoints in a loop;
     // parent polls each new row's first-visible latency. Ignored under
@@ -435,7 +435,7 @@ fn visibility_lag_under_continuous_writer_is_bounded() {
 
     assert!(
         observed >= 5,
-        "reader observed only {} new rows in 1.8s — wiring probably broken",
+        "reader observed only {} new rows in 1.8s, wiring probably broken",
         observed
     );
     // Loose 2s upper bound for CI variance; real lag is sub-100ms.
@@ -1477,7 +1477,7 @@ fn auto_refresh_off_reader_blocks_orphan_reap() {
 fn writer_uses_min_handle_epoch_across_handles() {
     // Two RO handles in same PID. One auto-refreshes, the other is
     // held idle (auto_refresh=off). Writer's min_reader_handle_epoch
-    // must track the IDLE one — orphans should NOT be reaped.
+    // must track the IDLE one, orphans should NOT be reaped.
     if dispatched_as_child() {
         return;
     }
@@ -1524,7 +1524,7 @@ fn writer_uses_min_handle_epoch_across_handles() {
         "active should have advanced past idle's frozen epoch"
     );
 
-    // Writer sees min = idle's frozen epoch — orphans not reaped.
+    // Writer sees min = idle's frozen epoch, orphans not reaped.
     // Drop idle → its epoch file gone → writer's MIN jumps to active.
     drop(idle);
     for _ in 0..3 {

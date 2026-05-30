@@ -2777,13 +2777,13 @@ impl Executor {
         // in the gap. Without this guard a checkpoint that
         // landed between `table.truncate()` and the WAL
         // write would persist the already-empty manifest /
-        // checkpoint_lsn and truncate older WAL — recovery
+        // checkpoint_lsn and truncate older WAL, recovery
         // would then see the checkpointed empty table even
         // though the TRUNCATE was not durable, surfacing a
         // truncate that the user may not have completed.
         // The fence is held HERE in the executor (not also
         // inside `record_truncate_table`) to avoid reentrant
-        // SH on the same fence — parking_lot's RwLock can
+        // SH on the same fence, parking_lot's RwLock can
         // deadlock if a checkpoint EX is waiting for the
         // outer SH to drop and we then try to acquire SH
         // again from inside.
@@ -2802,7 +2802,7 @@ impl Executor {
         // releasing the fence on this function's return would let a later
         // background checkpoint persist the empty manifest /
         // `checkpoint_lsn` and truncate older WAL even though the
-        // `TruncateTable` record never landed durably — recovery would then
+        // `TruncateTable` record never landed durably, recovery would then
         // see a checkpointed empty table with no `TruncateTable` record to
         // explain it. Latching forces every subsequent durability path to
         // refuse so the operator restarts; recovery converges from the WAL

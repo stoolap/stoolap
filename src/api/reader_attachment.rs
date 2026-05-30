@@ -24,7 +24,7 @@
 //! Out of scope: overlay rebuild, sticky must-reopen state,
 //! per-table cache invalidation, manifest-epoch poll. Those are
 //! per-surface refresh state owned by `ReadOnlyDatabaseInner`
-//! (overlay-aware) or — in a follow-up slice — a thin
+//! (overlay-aware) or, in a follow-up slice, a thin
 //! `PlainReadOnlyRefreshState` on `DatabaseInner` (no overlay).
 //! Keeping the attachment lifecycle-only avoids leaking
 //! refresh-policy concerns into the cross-process claim.
@@ -41,7 +41,7 @@ use crate::storage::mvcc::overlay::OverlayStore;
 pub(crate) struct ReaderAttachment {
     /// Keeps the engine alive for the duration of the attachment.
     /// Same Arc the owning `ReadOnlyDatabaseInner` /
-    /// `DatabaseInner` holds — bumping the entry's strong count by
+    /// `DatabaseInner` holds, bumping the entry's strong count by
     /// 1, which the close-path baseline check accounts for
     /// (`baseline = if attachment.is_some() { 2 } else { 1 }`).
     pub(crate) entry: Arc<EngineEntry>,
@@ -66,7 +66,7 @@ pub(crate) struct ReaderAttachment {
     /// Epoch-millis of the last lease mtime touch. `touch_lease`
     /// skips the syscall when the prior touch is recent enough
     /// that the writer's lease reaper still considers us live (1
-    /// second floor — far below the default
+    /// second floor, far below the default
     /// `2 * checkpoint_interval = 120s` reaper window).
     last_touch_epoch_ms: AtomicU64,
 
@@ -82,7 +82,7 @@ pub(crate) struct ReaderAttachment {
     /// compare this against the current shm value; if it
     /// advanced, the writer crashed and recovered (or
     /// closed+reopened) and our cached state (manifests, overlay,
-    /// pinned_lsn) is no longer trustworthy — the surface
+    /// pinned_lsn) is no longer trustworthy, the surface
     /// surfaces `Error::SwmrWriterReincarnated`. `0` when no shm
     /// is attached. Read-only after attach.
     expected_writer_gen: u64,
@@ -121,7 +121,7 @@ impl ReaderAttachment {
     /// install a per-handle WAL pin (when shm + lease are both
     /// present), and return the wrapped `Arc`.
     ///
-    /// `pin_active()` reflects whether the pin install succeeded —
+    /// `pin_active()` reflects whether the pin install succeeded,
     /// half-attached handles (shm acquired but lease registration
     /// failed, or vice versa) record `false` and silently skip
     /// the WAL-tail/pin-advance fast paths.
@@ -229,7 +229,7 @@ impl ReaderAttachment {
     /// Advance this handle's WAL pin to `next_floor` if it
     /// changed since the last write. The caller passes the value
     /// from its own refresh state (e.g. `overlay.next_entry_floor()`
-    /// floored at 1) — the attachment does not know about
+    /// floored at 1), the attachment does not know about
     /// overlay internals.
     ///
     /// No-op when the pin isn't active (no shm, no lease, or
@@ -262,7 +262,7 @@ impl ReaderAttachment {
     /// reloaded. Skip when unchanged (no-op refresh stays syscall-free)
     /// or when this handle has no epoch file (half-attached / no pin).
     /// Caller MUST only invoke after `reload_manifests()` returned
-    /// successfully — the writer treats this signal as a refresh
+    /// successfully, the writer treats this signal as a refresh
     /// certificate.
     #[inline]
     pub(crate) fn publish_loaded_epoch(&self, epoch: u64) {

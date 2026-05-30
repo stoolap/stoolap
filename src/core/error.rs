@@ -322,8 +322,8 @@ pub enum Error {
     #[error("schema changed since open: {0}")]
     SchemaChanged(String),
 
-    /// The reader's pinned WAL LSN has been truncated by the writer
-    /// — the WAL bytes the reader needs to tail-replay are gone. The
+    /// The reader's pinned WAL LSN has been truncated by the writer,
+    /// the WAL bytes the reader needs to tail-replay are gone. The
     /// reader must hard-reopen its handle to recover. This is distinct
     /// from `SchemaChanged` (a cold-side drift) and
     /// `SwmrWriterReincarnated` (a writer crash); it surfaces
@@ -345,7 +345,7 @@ pub enum Error {
     /// replaced (crash + restart, or a clean close+reopen).
     /// `db.shm.writer_generation` advanced beyond the value the
     /// reader observed at attach. Cached state (manifests, overlay,
-    /// plans) is no longer trustworthy — the new writer's transaction
+    /// plans) is no longer trustworthy, the new writer's transaction
     /// registry uses fresh IDs. Caller must hard-reopen.
     #[error(
         "SWMR writer reincarnated: observed generation {observed_gen} \

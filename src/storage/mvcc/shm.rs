@@ -111,8 +111,8 @@ impl ShmHeader {
 
     /// Stable attach snapshot of `(writer_generation, visible, oldest)` sampled
     /// against the SAME writer incarnation with `init_done == MAGIC_READY`
-    /// before and after. Returns `None` if mid-reincarnation across all retries
-    /// — caller must refuse the attach rather than seed from a half-init header.
+    /// before and after. Returns `None` if mid-reincarnation across all retries,
+    /// caller must refuse the attach rather than seed from a half-init header.
     pub fn sample_attach_snapshot(&self) -> Option<(u64, u64, u64)> {
         for _ in 0..Self::SAMPLE_MAX_RETRIES {
             if self.init_done.load(Ordering::Acquire) != SHM_INIT_DONE_MAGIC {
@@ -370,7 +370,7 @@ mod unix {
                     SHM_VERSION
                 )));
             }
-            // Acquire pairs with the writer's Release on init_done — a successful
+            // Acquire pairs with the writer's Release on init_done, a successful
             // load means earlier field stores are visible too.
             let init_done = handle.header().init_done.load(Ordering::Acquire);
             if init_done != SHM_INIT_DONE_MAGIC {
@@ -409,7 +409,7 @@ mod unix {
 }
 
 // ---------------------------------------------------------------------------
-// Non-Unix: stub that errors — SWMR `db.shm` requires Unix-native mmap.
+// Non-Unix: stub that errors, SWMR `db.shm` requires Unix-native mmap.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(unix))]

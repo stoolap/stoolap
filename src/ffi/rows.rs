@@ -257,7 +257,7 @@ pub unsafe extern "C" fn stoolap_rows_column_text(
 
     // Bounds check against the canonical column count BEFORE touching the
     // cache. Construction pre-sizes `text_cache` to `column_names.len()`,
-    // so any larger index is invalid and must short-circuit — otherwise
+    // so any larger index is invalid and must short-circuit, otherwise
     // a hostile or accidental `i32::MAX` would let `resize_with` ask the
     // allocator for an `idx + 1` Vec slot.
     if idx >= handle.column_names.len() {

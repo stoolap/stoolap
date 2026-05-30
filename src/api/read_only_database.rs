@@ -205,7 +205,7 @@ impl ReadOnlyDatabase {
             crate::api::reader_attachment::ReaderAttachment::attach(Arc::clone(&entry))?;
 
         // Seed the overlay cursor at the entry's saved attach values
-        // verbatim — re-sampling shm here would race a writer publish
+        // verbatim, re-sampling shm here would race a writer publish
         // and seed past WAL the engine never replayed.
         let overlay = Arc::new(if attachment.pin_active() {
             OverlayStore::with_baseline(
@@ -304,7 +304,7 @@ impl ReadOnlyDatabase {
         Ok(table.row_count() as u64)
     }
 
-    /// Rate-limited lease mtime touch. Does NOT advance `pinned_lsn` —
+    /// Rate-limited lease mtime touch. Does NOT advance `pinned_lsn`,
     /// pin advance lives in `advance_pin_after_refresh()`, called only
     /// after the overlay actually applied the entries.
     #[inline]
@@ -607,7 +607,7 @@ impl ReadOnlyDatabase {
         // not already known. The writer re-records DDL after every WAL
         // truncation; without the known-catalog filter every checkpoint
         // would falsely surface SwmrPendingDdl for pre-existing objects.
-        // Drop/Alter/Rename/Truncate are NOT filtered — those are real
+        // Drop/Alter/Rename/Truncate are NOT filtered, those are real
         // schema changes the cached metadata can't apply live.
         let known_catalog = self.entry.engine.known_catalog_objects();
         let known_indexes = self.entry.engine.known_index_names();

@@ -20,7 +20,7 @@
 //! `checkpoint_cycle_inner` after all per-table manifests are durable.
 //! Readers poll the file at refresh time and reload manifests on
 //! advance. The poll is the cheap path that gates the (more expensive)
-//! per-table reload — comparing two u64s before any I/O work.
+//! per-table reload, comparing two u64s before any I/O work.
 //!
 //! ## File format
 //!
@@ -57,7 +57,7 @@ pub fn epoch_path(db_path: &Path) -> PathBuf {
 
 /// Read the current epoch. Returns 0 if the file does not exist (fresh
 /// database, no checkpoint yet). Treats short reads / unexpected size as
-/// 0 too — the writer always rewrites the full 8 bytes via tmp+rename, so
+/// 0 too, the writer always rewrites the full 8 bytes via tmp+rename, so
 /// any non-8-byte read indicates a corrupted file from an older format
 /// or a foreign process; in v1 we silently rebuild from 0 next checkpoint.
 pub fn read_epoch(db_path: &Path) -> Result<u64> {
@@ -149,7 +149,7 @@ pub fn write_epoch(db_path: &Path, value: u64) -> Result<()> {
 }
 
 /// Read the current epoch and write back `current + 1` atomically.
-/// Returns the new value. Single-writer semantics — caller (the engine
+/// Returns the new value. Single-writer semantics, caller (the engine
 /// during checkpoint) is the only producer, no inter-process CAS needed.
 pub fn bump_epoch(db_path: &Path) -> Result<u64> {
     let next = read_epoch(db_path)?.saturating_add(1);
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn write_epoch_creates_volumes_dir_if_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        // Don't pre-create volumes/ — write_epoch must materialize it.
+        // Don't pre-create volumes/, write_epoch must materialize it.
         write_epoch(tmp.path(), 42).unwrap();
         assert!(tmp.path().join(VOLUMES_DIR).is_dir());
         assert_eq!(read_epoch(tmp.path()).unwrap(), 42);

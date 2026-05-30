@@ -29,6 +29,7 @@ It targets low-latency transactional workloads and real-time analytical queries,
 Stoolap is designed around practical embedded database needs:
 
 - **ACID + MVCC**: concurrent reads and writes with transaction isolation
+- **Single-writer, multi-reader**: read-only handles can run alongside a separate writer process against the same on-disk database
 - **Cost-based optimization**: statistics-aware planning with adaptive execution
 - **Rich SQL surface**: joins, subqueries, CTEs, window functions, advanced aggregations
 - **Multiple index types**: B-tree, Hash, Bitmap, multi-column, and HNSW for vectors

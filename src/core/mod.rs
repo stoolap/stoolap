@@ -52,7 +52,7 @@ pub type ValueSet = AHashSet<Value>;
 /// allocation in the common case.
 ///
 /// Lives in `core` (rather than `api`) so executor and optimizer can name
-/// it without depending on the `api` facade — a workspace-split prerequisite.
+/// it without depending on the `api` facade, a workspace-split prerequisite.
 pub type ParamVec = SmallVec<[Value; 8]>;
 
 /// Default row-count thresholds at which executor switches to parallel

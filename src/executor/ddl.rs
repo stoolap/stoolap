@@ -450,7 +450,7 @@ impl Executor {
                 if let Err(undo_e) = tx_state.transaction.drop_table(table_name) {
                     eprintln!(
                         "Error: Failed to undo CREATE TABLE '{}' after auto-index \
-                         failure: {} — rolling back the entire transaction so the \
+                         failure: {}, rolling back the entire transaction so the \
                          failed CREATE cannot be committed.",
                         table_name, undo_e
                     );
@@ -464,7 +464,7 @@ impl Executor {
             self.engine.create_table(schema)?;
 
             // Create unique indexes and FK indexes. CREATE TABLE
-            // is documented as atomic from the SQL caller's view —
+            // is documented as atomic from the SQL caller's view,
             // any failure between the table CREATE and the last
             // generated index must roll the table BACK so an Err
             // doesn't leave the table half-indexed (some
@@ -501,7 +501,7 @@ impl Executor {
                 // fails and the rollback drops the index,
                 // recovery would still rebuild that index
                 // (and its parent table) from the
-                // checkpoint's re-records — surfacing schema
+                // checkpoint's re-records, surfacing schema
                 // state belonging to a CREATE TABLE
                 // statement that ultimately failed.
                 let mut autoindex_err: Option<Error> = None;
@@ -605,7 +605,7 @@ impl Executor {
                     // calls `drop_table_internal`, which
                     // takes its OWN SH guard) doesn't
                     // attempt reentrant SH on the same
-                    // fence — parking_lot can deadlock if a
+                    // fence, parking_lot can deadlock if a
                     // checkpoint EX is waiting.
                 }
                 if let Some(e) = autoindex_err {
@@ -634,7 +634,7 @@ impl Executor {
                     // restart; WAL recovery converges to
                     // either CREATE+DROP (table gone) or just
                     // CREATE (table present but
-                    // partially indexed — visible at the
+                    // partially indexed, visible at the
                     // schema/index level) depending on how
                     // far the original failure got. Surface
                     // both errors to the caller.
@@ -1038,7 +1038,7 @@ impl Executor {
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         // Hold SH on the engine's `transactional_ddl_fence`
-        // across the WAL-to-mutation window — same rationale
+        // across the WAL-to-mutation window, same rationale
         // as `execute_create_index`. Without the guard a
         // checkpoint that landed between `record_drop_index`
         // and `table.drop_index` could re-record the
@@ -1105,8 +1105,8 @@ impl Executor {
         // crash recovery still sees the checkpoint's
         // re-recorded post-ALTER schema and the two views
         // diverge. Same hazard applies to add / drop /
-        // rename / modify column and rename table — all
-        // inside this same function — so a single
+        // rename / modify column and rename table, all
+        // inside this same function, so a single
         // function-scoped guard covers every variant.
         let _ddl_fence_guard = self.engine.ddl_fence().read();
 
@@ -1128,7 +1128,7 @@ impl Executor {
         // create_column_with_default_value / drop_column / etc.
         // Without this check the schema mutation lands in memory,
         // then `record_alter_table_*` (which routes through
-        // record_ddl) hits the failed-latch guard and returns Err —
+        // record_ddl) hits the failed-latch guard and returns Err,
         // leaving the in-memory ALTER live but never recorded to
         // WAL. `MvccTransaction::Drop` only rolls back created /
         // dropped tables, not column-level edits, so the divergence
@@ -1197,7 +1197,7 @@ impl Executor {
                     // latch was set after our up-front check (between
                     // create_column_with_default_value above and this
                     // call), the WAL record fails and we MUST revert
-                    // the in-memory mutation — otherwise the column
+                    // the in-memory mutation, otherwise the column
                     // stays live in memory but recovery has no record
                     // of it, and `MvccTransaction::Drop` only rolls
                     // back created/dropped tables, not column edits.
@@ -1227,7 +1227,7 @@ impl Executor {
             AlterTableOperation::DropColumn => {
                 if let Some(ref col_name) = stmt.column_name {
                     // Snapshot the entire pre-drop schema so revert
-                    // restores every column field verbatim — id,
+                    // restores every column field verbatim, id,
                     // position, PK / auto-increment / check / default
                     // metadata. Reconstructing via
                     // create_column_with_default_value would silently
@@ -1251,7 +1251,7 @@ impl Executor {
                     {
                         // Restore the entire pre-mutation schema.
                         // Indexes the original column had are NOT
-                        // re-attached here — restart's WAL replay
+                        // re-attached here, restart's WAL replay
                         // will rebuild them from DDL since no DROP
                         // COLUMN landed in WAL.
                         let _ = self.engine.restore_table_schema(table_name, pre_schema);
@@ -1373,7 +1373,7 @@ impl Executor {
                     // now) we MUST undo the in-memory + on-disk
                     // rename. Routing the revert back through
                     // tx.rename_table would be refused by the same
-                    // latch — use the engine's
+                    // latch, use the engine's
                     // `rename_table_revert` path which bypasses the
                     // latch check (the latch was set BY the failure
                     // we're reverting from, so refusing the revert

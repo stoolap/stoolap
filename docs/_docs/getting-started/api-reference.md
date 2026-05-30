@@ -35,7 +35,7 @@ let db = Database::open("file:///path/to/database")?;
 // File-based with configuration
 let db = Database::open("file:///path/to/db?sync=full&checkpoint_interval=60")?;
 
-// Read-only handles come from the dedicated entry point — returns
+// Read-only handles come from the dedicated entry point, returns
 // `ReadOnlyDatabase`, which has no `execute` / `begin` methods so write
 // SQL is a compile-time error rather than a runtime ReadOnlyViolation.
 let ro = Database::open_read_only("file:///path/to/database")?;
@@ -49,7 +49,7 @@ let ro = Database::open_read_only("file:///path/to/database?mode=ro")?;
 // enforces the read-only contract instead of runtime checks.
 
 // Wrap an existing writable handle as read-only (shares the engine,
-// in-process — no SWMR coordination concerns).
+// in-process, no SWMR coordination concerns).
 let ro = db.as_read_only();
 ```
 
@@ -76,7 +76,7 @@ On Unix SWMR opens, the read-only path takes NO kernel `flock`; cross-process co
 | `volume_compression` | `on` | LZ4 compression for cold volume files |
 | `checkpoint_on_close` | `on` | Seal all hot rows to volumes on clean shutdown |
 | `target_volume_rows` | `1048576` | Target rows per cold volume. Controls compaction split boundary. |
-| `read_only` / `readonly` | `false` | Read-only mode. Pass to `Database::open_read_only(dsn)` — `Database::open(dsn)` rejects this flag with a migration error. |
+| `read_only` / `readonly` | `false` | Read-only mode. Pass to `Database::open_read_only(dsn)`, `Database::open(dsn)` rejects this flag with a migration error. |
 | `mode` | `rw` | SQLite-style alias for `read_only`. `mode=ro` matches `read_only=true`. Same routing rule. |
 
 ### execute()
@@ -691,7 +691,7 @@ fn main() -> Result<()> {
 | `close()` | `Result<()>` | Close database, release file lock |
 | `table_exists(name)` | `Result<bool>` | Check if table exists |
 | `dsn()` | `&str` | Get the DSN |
-| `is_read_only()` | `bool` | Always `false` — `Database` is always writable. Read-only handles are `ReadOnlyDatabase` (whose `is_read_only()` always returns `true`). |
+| `is_read_only()` | `bool` | Always `false`, `Database` is always writable. Read-only handles are `ReadOnlyDatabase` (whose `is_read_only()` always returns `true`). |
 | `set_default_isolation_level(level)` | `Result<()>` | Set default isolation |
 | `create_snapshot()` | `Result<()>` | Create point-in-time snapshot |
 | `semantic_cache_stats()` | `Result<Stats>` | Get cache statistics |
@@ -699,7 +699,7 @@ fn main() -> Result<()> {
 
 ### ReadOnlyDatabase
 
-Returned by `Database::open_read_only(dsn)` and `Database::as_read_only()`. The type has NO `execute` / `begin` / `prepare` methods — write SQL is a *compile-time* error rather than a runtime `Error::ReadOnlyViolation`. Read SQL (SELECT, SHOW, EXPLAIN) goes through `query` / `query_named` / `cached_plan` + `query_plan`. SQL `BEGIN` / `COMMIT` / `ROLLBACK` are also rejected on `ReadOnlyDatabase` (they would otherwise construct a writable transaction object reachable from internal paths). For stable visibility across multiple reads, use `set_auto_refresh(false)` and call `refresh()` manually when you want to advance.
+Returned by `Database::open_read_only(dsn)` and `Database::as_read_only()`. The type has NO `execute` / `begin` / `prepare` methods, write SQL is a *compile-time* error rather than a runtime `Error::ReadOnlyViolation`. Read SQL (SELECT, SHOW, EXPLAIN) goes through `query` / `query_named` / `cached_plan` + `query_plan`. SQL `BEGIN` / `COMMIT` / `ROLLBACK` are also rejected on `ReadOnlyDatabase` (they would otherwise construct a writable transaction object reachable from internal paths). For stable visibility across multiple reads, use `set_auto_refresh(false)` and call `refresh()` manually when you want to advance.
 
 `ReadOnlyDatabase` is a *view*, not a connection sharing a session with the source `Database`. Each handle owns its own executor and transaction state, so an uncommitted `BEGIN` on the source `Database` is **not** visible through `as_read_only()`. To observe uncommitted writes, run the read SQL inside the same `Transaction`.
 
@@ -707,7 +707,7 @@ For cross-process readers (`Database::open_read_only` against a `file://` DSN), 
 
 **Visibility is checkpoint-bounded.** A read-only handle sees writer state as of the writer's most recent checkpoint. Commits the writer has accepted but not yet checkpointed (rows in the writer's hot buffer + WAL tail) are NOT visible to query execution on the read-only handle. To make a writer commit visible across processes, the writer must run `PRAGMA CHECKPOINT` (or wait for the periodic background checkpoint at `checkpoint_interval`, default 60s). The WAL-tail overlay infrastructure exists on the read-only side but is not yet wired into query execution; sub-checkpoint visibility ships in a follow-up phase.
 
-For prepared-statement ergonomics, use `cached_plan(sql)` plus `query_plan` / `query_named_plan` — same parse-once / execute-many shape `Database::prepare` provides.
+For prepared-statement ergonomics, use `cached_plan(sql)` plus `query_plan` / `query_named_plan`, same parse-once / execute-many shape `Database::prepare` provides.
 
 | Method | Returns | Description |
 |--------|---------|-------------|
@@ -719,8 +719,8 @@ For prepared-statement ergonomics, use `cached_plan(sql)` plus `query_plan` / `q
 | `dsn()` | `&str` | Get the DSN |
 | `is_read_only()` | `bool` | Always `true`. |
 | `table_exists(name)` | `Result<bool>` | Check if a table exists |
-| `refresh()` | `Result<bool>` | Force a manifest reload to pick up any new writer checkpoint; returns `true` if state advanced. Visibility is checkpoint-bounded — uncheckpointed writer commits are not yet exposed to query execution. |
-| `set_auto_refresh(enabled)` | `()` | Master switch for implicit refresh. `false` pauses BOTH the per-query auto-refresh path AND the background ticker (if any) — the snapshot only moves on explicit `refresh()`. WAL pin advancement also stalls; keep stable windows short. |
+| `refresh()` | `Result<bool>` | Force a manifest reload to pick up any new writer checkpoint; returns `true` if state advanced. Visibility is checkpoint-bounded, uncheckpointed writer commits are not yet exposed to query execution. |
+| `set_auto_refresh(enabled)` | `()` | Master switch for implicit refresh. `false` pauses BOTH the per-query auto-refresh path AND the background ticker (if any), the snapshot only moves on explicit `refresh()`. WAL pin advancement also stalls; keep stable windows short. |
 | `auto_refresh_enabled()` | `bool` | Read the auto-refresh flag |
 | `set_refresh_interval(Option<Duration>)` | `Result<()>` | Configure the background refresh ticker. `Some(d)` spawns a thread calling `refresh()` every `d` (min 100ms); `None` stops it. Use for idle handles so the WAL pin advances. Pauses while `auto_refresh=false`. Equivalent DSN flag: `?refresh_interval=30s`. |
 | `refresh_interval()` | `Option<Duration>` | Currently configured ticker interval, or `None` if no ticker is running. |

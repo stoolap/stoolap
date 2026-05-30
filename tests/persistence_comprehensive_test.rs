@@ -556,7 +556,7 @@ fn test_unique_multi_column_index_persistence() {
 }
 
 /// TRUNCATE's affected-row return value must match COUNT(*) immediately
-/// before the TRUNCATE — i.e., the live row count after deduping
+/// before the TRUNCATE, i.e., the live row count after deduping
 /// across hot/cold and applying tombstones.
 ///
 /// Regression: TRUNCATE used `SegmentManager::total_row_count()`, which

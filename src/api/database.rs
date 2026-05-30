@@ -301,7 +301,7 @@ impl EngineEntry {
                     attach_lsn = 0;
                 }
                 None => {
-                    // Writer still alive. Require shm — uncapped replay would race appends.
+                    // Writer still alive. Require shm, uncapped replay would race appends.
                     if shm.is_none() {
                         if let Some(ref l) = lease {
                             l.remove_handle_pin(pre_acquire_pin_handle_id);
@@ -520,8 +520,8 @@ impl Database {
     /// Open a database connection.
     ///
     /// DSN forms:
-    /// - `memory://` — in-memory (data lost on close).
-    /// - `file:///path/to/db` — persistent.
+    /// - `memory://`, in-memory (data lost on close).
+    /// - `file:///path/to/db`, persistent.
     ///
     /// Opening the same DSN multiple times returns the same engine instance.
     /// Read-only DSNs (`?read_only=true` / `?mode=ro`) must use `open_read_only`.
@@ -664,7 +664,7 @@ impl Database {
                 "Database::open_read_only called with a DSN flag that \
                  explicitly requests writable mode (?read_only=false / \
                  ?readonly=false / ?mode=rw). The function name and the \
-                 DSN flag disagree — drop the flag (it's redundant on \
+                 DSN flag disagree, drop the flag (it's redundant on \
                  open_read_only) or use Database::open(dsn) instead.",
             ));
         }
@@ -1489,7 +1489,7 @@ impl Database {
         self.inner.entry.engine.is_read_only_mode()
     }
 
-    /// Get the engine as a read-only trait object — type-level enforcement of the
+    /// Get the engine as a read-only trait object, type-level enforcement of the
     /// read-only contract. Works on writable Databases too.
     pub fn read_engine(&self) -> Arc<dyn crate::storage::traits::ReadEngine> {
         // Wrap so trait-object callers also get lease heartbeat + refresh maintenance.

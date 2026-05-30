@@ -108,7 +108,7 @@ impl CliDb {
     fn close(&self) -> stoolap::Result<()> {
         match self {
             CliDb::Writable(db) => db.close(),
-            // ReadOnlyDatabase has no explicit close — the
+            // ReadOnlyDatabase has no explicit close, the
             // engine closes when the last `Arc<EngineEntry>`
             // drops. The CLI's `db.close()` call here returns
             // Ok and lets the value drop naturally.
@@ -258,7 +258,7 @@ struct Args {
     ///
     /// Routes through `Database::open_read_only(dsn)` (the
     /// programmatic equivalent), which returns the
-    /// `ReadOnlyDatabase` type — write SQL is rejected at the
+    /// `ReadOnlyDatabase` type, write SQL is rejected at the
     /// API surface as well as the parser. For file:// the path
     /// must already exist and contain a stoolap database; a
     /// fresh DB is never created on disk in read-only mode.
@@ -852,7 +852,7 @@ fn build_dsn(args: &Args) -> String {
         params.push("checkpoint_on_close=off".to_string());
     }
 
-    // `--read-only` is NOT encoded into the DSN — the caller
+    // `--read-only` is NOT encoded into the DSN, the caller
     // dispatches at open time via `Database::open_read_only(dsn)`.
     // `Database::open` rejects `?read_only=true` so the user
     // can't accidentally produce a `Database` value backed by a
@@ -1252,7 +1252,7 @@ fn main() {
 
     // Open the database. `--read-only` dispatches to
     // `Database::open_read_only(dsn)` (returns `ReadOnlyDatabase`)
-    // because `Database::open` rejects read-only DSN flags — the
+    // because `Database::open` rejects read-only DSN flags, the
     // type system enforces the read-only contract instead of
     // runtime checks. The CLI wraps the result in `CliDb` so
     // execute / query / begin etc. dispatch uniformly.

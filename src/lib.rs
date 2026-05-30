@@ -111,7 +111,7 @@ pub use storage::{
 // Backwards-compatibility aliases at the crate root for the trait names that
 // existed before the read/write split. Code using `use stoolap::{Table,
 // Transaction};` continues to compile against the writable surface (the
-// conservative choice — old code that called write methods keeps working).
+// conservative choice, old code that called write methods keeps working).
 // New code should prefer the explicit `WriteTable` / `WriteTransaction` (or
 // `ReadTable` / `ReadTransaction` for read-only paths). Mirrors the aliases
 // in `stoolap::storage`.

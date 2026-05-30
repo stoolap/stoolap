@@ -55,8 +55,8 @@ use super::rows::Rows;
 ///
 /// Holds an `Arc<EngineEntry>` (not just `Arc<MVCCEngine>`) so the
 /// engine entry's strong count reflects this transaction. Without
-/// that, `Database::close()` — which decides whether to close the
-/// engine using `Arc::strong_count(&entry)` — could fire
+/// that, `Database::close()`, which decides whether to close the
+/// engine using `Arc::strong_count(&entry)`, could fire
 /// `engine.close_engine()` while a transaction is alive, and the next
 /// statement on the transaction would error with `EngineNotOpen`. The
 /// engine itself is reachable via `entry.engine`.

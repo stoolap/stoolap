@@ -54,7 +54,7 @@ pub use traits::{
 // Backwards-compatibility aliases for the trait names that existed before
 // the read/write split. External crates that imported `stoolap::storage::Table`
 // or `stoolap::storage::Transaction` continue to compile against the writable
-// surface (which is the conservative choice — old code that called write
+// surface (which is the conservative choice, old code that called write
 // methods keeps working). New code should prefer the explicit `WriteTable` /
 // `WriteTransaction` (or `ReadTable` / `ReadTransaction` for read-only paths).
 #[deprecated(

@@ -3275,7 +3275,7 @@ fn test_close_db_with_live_stmt_keeps_registry_pointing_at_live_engine() {
     // entry.strong_count (they all share the same DatabaseInner.entry
     // field). If try_unregister_arc only checks entry.strong_count, it
     // unregisters the still-live engine on stoolap_close, and the next
-    // stoolap_open(dsn) creates a fresh empty engine — orphaning the
+    // stoolap_open(dsn) creates a fresh empty engine, orphaning the
     // original from the registry. The reviewer's repro: prepare a
     // statement, close the DB, reopen the same DSN; SELECT COUNT(*) FROM t
     // failed with "table not found" against the fresh engine.
@@ -3296,7 +3296,7 @@ fn test_close_db_with_live_stmt_keeps_registry_pointing_at_live_engine() {
             STOOLAP_OK
         );
 
-        // Prepare a statement — its _db_keepalive holds an Arc<DatabaseInner>.
+        // Prepare a statement, its _db_keepalive holds an Arc<DatabaseInner>.
         let select = cstr("SELECT COUNT(*) FROM t");
         let mut stmt: *mut StoolapStmt = std::ptr::null_mut();
         assert_eq!(stoolap_prepare(db, select.as_ptr(), &mut stmt), STOOLAP_OK);
@@ -3307,7 +3307,7 @@ fn test_close_db_with_live_stmt_keeps_registry_pointing_at_live_engine() {
         assert_eq!(stoolap_close(db), STOOLAP_OK);
 
         // Reopen the same DSN. Must reuse the engine that's still alive
-        // through the stmt — for memory:// that means seeing the row
+        // through the stmt, for memory:// that means seeing the row
         // inserted above. A fresh engine would be empty, and the
         // table_exists check would fail.
         let mut db2: *mut StoolapDB = std::ptr::null_mut();
@@ -3359,14 +3359,14 @@ fn test_close_db_with_live_tx_keeps_registry_pointing_at_live_engine() {
             STOOLAP_OK
         );
 
-        // Begin a transaction — tx keepalive holds Arc<DatabaseInner>.
+        // Begin a transaction, tx keepalive holds Arc<DatabaseInner>.
         let mut tx: *mut StoolapTx = std::ptr::null_mut();
         assert_eq!(stoolap_begin(db, &mut tx), STOOLAP_OK);
 
         // Close the original DB handle.
         assert_eq!(stoolap_close(db), STOOLAP_OK);
 
-        // Reopen — must reuse the still-live engine.
+        // Reopen, must reuse the still-live engine.
         let mut db2: *mut StoolapDB = std::ptr::null_mut();
         assert_eq!(stoolap_open(dsn.as_ptr(), &mut db2), STOOLAP_OK);
 
@@ -3392,8 +3392,8 @@ fn test_close_db_with_live_tx_keeps_registry_pointing_at_live_engine() {
 // typed errors, table_count, savepoints, read-only handle
 // =========================================================================
 
-/// Build a fresh `StoolapErrorDetails` zeroed out — code OK, all pointers
-/// NULL — to make assertions on what `errdetails` actually populates.
+/// Build a fresh `StoolapErrorDetails` zeroed out, code OK, all pointers
+/// NULL, to make assertions on what `errdetails` actually populates.
 fn empty_details() -> StoolapErrorDetails {
     StoolapErrorDetails {
         code: -1,
@@ -3522,7 +3522,7 @@ fn test_errdetails_not_null_constraint() {
         );
         // Explicit NULL on a NOT NULL column reaches the constraint check
         // (a missing column is a different error path that the engine
-        // classifies as Internal — that one is not NOT_NULL).
+        // classifies as Internal, that one is not NOT_NULL).
         let rc = stoolap_exec(
             db,
             cstr("INSERT INTO t (id, name) VALUES (1, NULL)").as_ptr(),
@@ -3889,7 +3889,7 @@ fn test_column_name_cache_no_aba() {
         let ins = cstr("INSERT INTO t VALUES (1, 2)");
         stoolap_exec(db, ins.as_ptr(), std::ptr::null_mut());
 
-        // First query projects column "a". Open, read column name, close —
+        // First query projects column "a". Open, read column name, close,
         // dropping the source CompactArc and freeing its allocation.
         let q1 = cstr("SELECT a FROM t");
         let mut r1: *mut StoolapRows = std::ptr::null_mut();
@@ -3900,7 +3900,7 @@ fn test_column_name_cache_no_aba() {
         stoolap_rows_close(r1);
 
         // Second query projects a *different* column "b". The cache entry
-        // must NOT return "a" — even if the allocator happens to recycle
+        // must NOT return "a", even if the allocator happens to recycle
         // the prior address.
         let q2 = cstr("SELECT b FROM t");
         let mut r2: *mut StoolapRows = std::ptr::null_mut();
@@ -3920,7 +3920,7 @@ fn test_column_name_cache_no_aba() {
         assert_eq!(read_cstr(stoolap_rows_column_name(r3, 1)), "b");
         stoolap_rows_close(r3);
 
-        // And back to a single-column projection — still no carryover.
+        // And back to a single-column projection, still no carryover.
         let q4 = cstr("SELECT b FROM t");
         let mut r4: *mut StoolapRows = std::ptr::null_mut();
         assert_eq!(stoolap_query(db, q4.as_ptr(), &mut r4), STOOLAP_OK);
