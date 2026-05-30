@@ -240,7 +240,7 @@ impl Statement {
                 .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
             let ctx = ExecutionContext::with_params(params.into_params());
             let result = executor.execute_with_cached_plan(plan, &ctx)?;
-            Ok(Rows::new(result))
+            Ok(Rows::with_entry(result, std::sync::Arc::clone(db.entry())))
         } else {
             db.query(&self.sql, params)
         }

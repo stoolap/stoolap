@@ -154,8 +154,24 @@ impl LeaseManager {
 
     /// Bump the lease's mtime to the current time. Called from query /
     /// execute / refresh entry points.
+    ///
+    /// Self-heals like `EpochFile::write`: if the writer reaped this PID's
+    /// lease while the process slept past `max_age`, route through
+    /// `set_pinned_lsn` (which uses `.create(true)`) and rewrite the
+    /// current MIN from the in-process registry. A plain mtime touch on a
+    /// reaped file returns `NotFound`, the lease stays absent, and the
+    /// writer is free to truncate WAL ranges this reader still references.
     pub fn touch(&self) -> Result<()> {
-        touch_path(&self.lease_path)
+        let reg = lease_pin_contributions()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let pin = reg
+            .get(&self.lease_path)
+            .and_then(|m| m.values().copied().min())
+            .unwrap_or(0);
+        let result = self.set_pinned_lsn(pin);
+        drop(reg);
+        result
     }
 
     /// Overwrite the 8-byte `pinned_lsn` payload in place and bump mtime.
@@ -929,6 +945,29 @@ mod tests {
             min_reader_handle_epoch(&readers_dir, Duration::from_secs(60)).unwrap(),
             Some(42)
         );
+    }
+
+    #[test]
+    fn touch_recreates_missing_lease_and_restores_pin() {
+        let dir = tmp_db();
+        let lease = LeaseManager::register(dir.path()).unwrap();
+        let handle_id = next_handle_id();
+        lease.set_handle_pin(handle_id, 1234).unwrap();
+        let path = lease.path().to_path_buf();
+        assert_eq!(read_pinned_lsn(&path), Some(1234));
+
+        fs::remove_file(&path).unwrap();
+        assert!(!path.exists());
+
+        lease.touch().unwrap();
+
+        assert!(path.exists(), "touch must self-heal a reaped lease file");
+        assert_eq!(
+            read_pinned_lsn(&path),
+            Some(1234),
+            "touch must restore the registry MIN pin"
+        );
+        lease.remove_handle_pin(handle_id);
     }
 
     #[test]

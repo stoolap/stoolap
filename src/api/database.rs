@@ -79,6 +79,10 @@ pub(crate) struct EngineEntry {
     pub(crate) semantic_cache: Arc<crate::executor::SemanticCache>,
     /// Shared so ANALYZE updates reach all readers' plans.
     pub(crate) query_planner: Arc<crate::executor::QueryPlanner>,
+    /// Shared compiled-plan cache so DDL on the writable handle invalidates
+    /// every in-process sibling's query cache (including `as_read_only`
+    /// views, whose `refresh()` short-circuits on writable engines).
+    pub(crate) query_cache: Arc<crate::executor::QueryCache>,
     /// SWMR lease for read-only file:// engines. `None` for in-memory or writable.
     pub(crate) lease: Option<crate::storage::mvcc::lease::LeaseManager>,
     /// Read-only mmap of writer's `db.shm`. `None` falls back to v1 mtime-only presence.
@@ -390,7 +394,13 @@ impl DatabaseInner {
         let engine = Arc::clone(&entry.engine);
         let semantic_cache = Arc::clone(&entry.semantic_cache);
         let query_planner = Arc::clone(&entry.query_planner);
-        let executor = Executor::with_shared_semantic_cache(engine, semantic_cache, query_planner);
+        let query_cache = Arc::clone(&entry.query_cache);
+        let executor = Executor::with_shared_semantic_cache(
+            engine,
+            semantic_cache,
+            query_planner,
+            query_cache,
+        );
         Self {
             entry,
             executor: Arc::new(Mutex::new(executor)),
@@ -607,11 +617,13 @@ impl Database {
 
         let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
         let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
+        let query_cache = Arc::new(crate::executor::QueryCache::default());
         let entry = Arc::new(EngineEntry {
             engine,
             dsn: dsn.to_string(),
             semantic_cache,
             query_planner,
+            query_cache,
             lease: None,
             shm: None,
             attach_writer_gen: 0,
@@ -825,12 +837,14 @@ impl Database {
 
         let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
         let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
+        let query_cache = Arc::new(crate::executor::QueryCache::default());
         // No entry-scoped pin: `from_entry` installs an advancing per-handle pin instead.
         let entry = Arc::new(EngineEntry {
             engine,
             dsn: dsn.to_string(),
             semantic_cache,
             query_planner,
+            query_cache,
             lease,
             shm,
             attach_writer_gen,
@@ -887,11 +901,13 @@ impl Database {
         engine.start_cleanup();
         let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
         let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
+        let query_cache = Arc::new(crate::executor::QueryCache::default());
         let entry = Arc::new(EngineEntry {
             engine,
             dsn: "memory://".to_string(),
             semantic_cache,
             query_planner,
+            query_cache,
             lease: None,
             shm: None,
             attach_writer_gen: 0,
@@ -913,11 +929,13 @@ impl Database {
         engine.start_cleanup();
         let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
         let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
+        let query_cache = Arc::new(crate::executor::QueryCache::default());
         let entry = Arc::new(EngineEntry {
             engine,
             dsn: "memory://".to_string(),
             semantic_cache,
             query_planner,
+            query_cache,
             lease: None,
             shm: None,
             attach_writer_gen: 0,
@@ -1307,7 +1325,7 @@ impl Database {
         } else {
             executor.execute_with_params(sql, param_values)?
         };
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.inner.entry)))
     }
 
     /// Query a single value from a single-row, single-column result.
@@ -1373,7 +1391,7 @@ impl Database {
             .build();
 
         let result = executor.execute_with_context(sql, &ctx)?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.inner.entry)))
     }
 
     /// Prepare a SQL statement for repeated execution with different params.
@@ -1384,6 +1402,13 @@ impl Database {
     /// Used by Statement to upgrade weak references back to a Database handle.
     pub(crate) fn from_inner(inner: Arc<DatabaseInner>) -> Self {
         Database { inner }
+    }
+
+    /// Borrow this handle's `EngineEntry`. Used by `Statement::query` to
+    /// pin the entry into the returned `Rows` so a concurrent
+    /// `Database::close()` defers until iteration finishes.
+    pub(crate) fn entry(&self) -> &Arc<EngineEntry> {
+        &self.inner.entry
     }
 
     /// Execute a statement with `:name`-style named parameters.
@@ -1409,7 +1434,7 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let result = executor.execute_with_named_params(sql, params.into_inner())?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.inner.entry)))
     }
 
     /// Query a single value with named parameters.
@@ -1478,7 +1503,12 @@ impl Database {
     /// Close the database. If sibling handles exist, defer until the last drops.
     /// Engine also closes automatically when the last handle drops.
     pub fn close(&self) -> Result<()> {
-        // Decision under the registry write lock so a concurrent open can't upgrade.
+        // Hold the registry write lock across the entire close so a
+        // concurrent `Database::open(same_dsn)` can't slip between the
+        // remove + close and instantiate a brand-new engine while ours is
+        // mid-shutdown. The file lock would block the new engine's open
+        // anyway, but transient parallel `EngineEntry`s on the same DSN
+        // are still observable to in-process readers.
         let mut registry = match DATABASE_REGISTRY.write() {
             Ok(g) => g,
             Err(_) => return Err(Error::LockAcquisitionFailed("registry write".to_string())),
@@ -1495,8 +1525,8 @@ impl Database {
                 registry.remove(&self.inner.entry.dsn);
             }
         }
-        drop(registry);
         self.inner.entry.engine.close_engine()?;
+        drop(registry);
 
         Ok(())
     }
@@ -1545,7 +1575,7 @@ impl Database {
             ExecutionContext::with_params(param_values)
         };
         let result = executor.execute_with_cached_plan(plan, &ctx)?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.inner.entry)))
     }
 
     /// Execute a pre-cached plan with named parameters (no parsing, no cache lookup).
@@ -1571,7 +1601,7 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
         let ctx = ExecutionContext::with_named_params(params.into_inner());
         let result = executor.execute_with_cached_plan(plan, &ctx)?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.inner.entry)))
     }
 
     /// Check if a table exists.

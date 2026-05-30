@@ -656,8 +656,21 @@ fn write_sidecar_atomic(path: &Path, epoch: u64) -> std::io::Result<()> {
             .truncate(true)
             .open(&tmp)?;
         f.write_all(&epoch.to_le_bytes())?;
+        // fsync tmp BEFORE rename: a kill -9 between rename and a deferred
+        // page-cache flush can otherwise land the 8-byte payload as zeros
+        // and make `read_sidecar_epoch` return 0 (a value that trivially
+        // satisfies `min_reader >= retire_epoch`), reaping the orphan .vol
+        // before any pre-stamp capped reader has caught up.
+        f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)
+    std::fs::rename(&tmp, path)?;
+    // fsync parent dir so the rename itself survives a crash.
+    if let Some(parent) = path.parent() {
+        if let Ok(d) = std::fs::File::open(parent) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
 }
 
 /// Reap every `<dir>/<subdir>` whose lowercased name is NOT

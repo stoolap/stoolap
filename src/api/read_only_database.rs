@@ -185,8 +185,13 @@ impl ReadOnlyDatabase {
         let engine = Arc::clone(&entry.engine);
         let semantic_cache = Arc::clone(&entry.semantic_cache);
         let query_planner = Arc::clone(&entry.query_planner);
-        let executor =
-            Executor::with_shared_semantic_cache_read_only(engine, semantic_cache, query_planner);
+        let query_cache = Arc::clone(&entry.query_cache);
+        let executor = Executor::with_shared_semantic_cache_read_only(
+            engine,
+            semantic_cache,
+            query_planner,
+            query_cache,
+        );
 
         // Seed from the entry's load-time epoch (not the live file): a
         // checkpoint that lands between entry creation and now would
@@ -685,7 +690,7 @@ impl ReadOnlyDatabase {
         } else {
             executor.execute_with_params(sql, param_values)?
         };
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.entry)))
     }
 
     /// Execute with `:name` named parameters.
@@ -698,7 +703,7 @@ impl ReadOnlyDatabase {
             .map_err(|_| Error::LockAcquisitionFailed("read-only executor".to_string()))?;
 
         let result = executor.execute_with_named_params(sql, params.into_inner())?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.entry)))
     }
 
     /// Cache a parsed plan. Read-only equivalent of
@@ -734,7 +739,7 @@ impl ReadOnlyDatabase {
             ExecutionContext::with_params(param_values)
         };
         let result = executor.execute_with_cached_plan(plan, &ctx)?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.entry)))
     }
 
     /// Read-only equivalent of [`crate::api::Database::query_named_plan`].
@@ -752,7 +757,7 @@ impl ReadOnlyDatabase {
             .map_err(|_| Error::LockAcquisitionFailed("read-only executor".to_string()))?;
         let ctx = ExecutionContext::with_named_params(params.into_inner());
         let result = executor.execute_with_cached_plan(plan, &ctx)?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.entry)))
     }
 }
 

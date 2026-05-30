@@ -22,7 +22,10 @@ use std::sync::Arc;
 use crate::api::Database;
 
 use super::error::LastErrorState;
-use super::types::{StoolapDB, StoolapErrorDetails, StoolapRows, StoolapStmt, StoolapValue};
+use super::types::{
+    build_rows_handle, ColumnCStrCache, StoolapDB, StoolapErrorDetails, StoolapRows, StoolapStmt,
+    StoolapValue,
+};
 use super::value;
 use super::{STOOLAP_ERROR, STOOLAP_OK};
 
@@ -73,7 +76,7 @@ pub unsafe extern "C" fn stoolap_prepare(
                     stmt,
                     last_error: LastErrorState::default(),
                     sql_cstr,
-                    cached_columns: None,
+                    col_cstr_cache: ColumnCStrCache::default(),
                     _db_keepalive: db_keepalive,
                     _engine_keepalive: engine_keepalive,
                 });
@@ -269,40 +272,7 @@ pub unsafe extern "C" fn stoolap_stmt_query(
 
         match handle.stmt.query(param_vec) {
             Ok(rows) => {
-                let actual_columns = rows.columns();
-                let actual_count = actual_columns.len();
-
-                // Validate cache: rebuild if column count or names changed (DDL)
-                let cache_valid = handle.cached_columns.as_ref().is_some_and(|cached| {
-                    cached.len() == actual_count
-                        && cached
-                            .iter()
-                            .zip(actual_columns.iter())
-                            .all(|(c, a)| c.as_bytes() == a.as_str().as_bytes())
-                });
-                let column_names = if cache_valid {
-                    Arc::clone(handle.cached_columns.as_ref().unwrap())
-                } else {
-                    let names: Vec<CString> = actual_columns
-                        .iter()
-                        .map(|name| CString::new(name.as_str()).unwrap_or_default())
-                        .collect();
-                    let arc = Arc::new(names);
-                    handle.cached_columns = Some(Arc::clone(&arc));
-                    arc
-                };
-                let affected = rows.rows_affected();
-                let col_count = column_names.len();
-
-                let rows_handle = Box::new(StoolapRows {
-                    rows: Some(rows),
-                    has_row: false,
-                    last_error: LastErrorState::default(),
-                    column_names,
-                    text_cache: vec![Vec::new(); col_count],
-                    text_cache_dirty: smallvec::SmallVec::new(),
-                    rows_affected: affected,
-                });
+                let rows_handle = build_rows_handle(rows, &mut handle.col_cstr_cache);
                 *out_rows = Box::into_raw(rows_handle);
                 STOOLAP_OK
             }

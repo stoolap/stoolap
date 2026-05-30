@@ -1619,8 +1619,12 @@ impl SegmentManager {
                     // Re-record with fresh seq so repeated seal-skip tombstones
                     // don't match an older compaction snapshot. visible_at_lsn
                     // also advances (capped readers below the new LSN keep
-                    // seeing the original cold row).
-                    if *e.get() != commit_seq {
+                    // seeing the original cold row). Monotonic on commit_seq:
+                    // WAL recovery calls this with commit_seq=0 to rebuild
+                    // tombstones; never downgrade a pre-existing higher seq
+                    // (would make snapshot filtering treat the row as always
+                    // visible and preserve a stale on-disk segment shadow).
+                    if commit_seq > *e.get() {
                         let old_seq = *e.get();
                         e.insert(commit_seq);
                         if let Some(entry) = manifest

@@ -201,7 +201,7 @@ impl Transaction {
             ExecutionContext::with_params(param_values)
         };
         let result = self.execute_statement(statement, &ctx)?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.entry)))
     }
 
     /// Execute a query within the transaction
@@ -221,7 +221,7 @@ impl Transaction {
 
         let param_values = params.into_params();
         let result = self.execute_sql(sql, param_values)?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.entry)))
     }
 
     /// Execute a query and return a single value
@@ -287,7 +287,7 @@ impl Transaction {
         self.check_active()?;
         let ctx = ExecutionContext::with_named_params(params.into_inner());
         let result = self.execute_sql_with_ctx(sql, ctx)?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.entry)))
     }
 
     /// Execute a pre-parsed statement with named parameters.
@@ -315,7 +315,7 @@ impl Transaction {
         self.check_active()?;
         let ctx = ExecutionContext::with_named_params(params.into_inner());
         let result = self.execute_statement(statement, &ctx)?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.entry)))
     }
 
     /// Internal SQL execution
@@ -374,6 +374,7 @@ impl Transaction {
                 self.entry.engine.clone(),
                 Arc::clone(&self.entry.semantic_cache),
                 Arc::clone(&self.entry.query_planner),
+                Arc::clone(&self.entry.query_cache),
             );
             executor.install_transaction(tx);
             let result = executor.execute_statement(statement, ctx);

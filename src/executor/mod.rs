@@ -171,8 +171,13 @@ pub struct Executor {
     function_registry: Arc<FunctionRegistry>,
     /// Default isolation level for transactions
     default_isolation_level: crate::core::IsolationLevel,
-    /// Query cache for parsed statements
-    query_cache: QueryCache,
+    /// Query cache for parsed statements.
+    ///
+    /// Held as `Arc<QueryCache>` so every per-handle `Executor` for the
+    /// same `EngineEntry` shares one compiled-plan cache. DDL invalidation
+    /// on any handle reaches every sibling reader, including `as_read_only`
+    /// views whose `refresh()` short-circuits on writable engines.
+    query_cache: Arc<QueryCache>,
     /// Semantic cache for query results with subsumption detection.
     ///
     /// Held as `Arc<SemanticCache>` so every per-handle `Executor` for
@@ -220,7 +225,7 @@ impl Executor {
             engine,
             function_registry: default_function_registry(),
             default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
-            query_cache: QueryCache::default(),
+            query_cache: Arc::new(QueryCache::default()),
             semantic_cache: Arc::new(SemanticCache::default()),
             active_transaction: Mutex::new(None),
             query_planner,
@@ -242,7 +247,7 @@ impl Executor {
             engine,
             function_registry: default_function_registry(),
             default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
-            query_cache: QueryCache::default(),
+            query_cache: Arc::new(QueryCache::default()),
             semantic_cache: Arc::new(SemanticCache::default()),
             active_transaction: Mutex::new(None),
             query_planner,
@@ -262,13 +267,14 @@ impl Executor {
         engine: Arc<MVCCEngine>,
         semantic_cache: Arc<SemanticCache>,
         query_planner: Arc<QueryPlanner>,
+        query_cache: Arc<QueryCache>,
     ) -> Self {
         let read_only = engine.is_read_only_mode();
         Self {
             engine,
             function_registry: default_function_registry(),
             default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
-            query_cache: QueryCache::default(),
+            query_cache,
             semantic_cache,
             active_transaction: Mutex::new(None),
             query_planner,
@@ -281,12 +287,13 @@ impl Executor {
         engine: Arc<MVCCEngine>,
         semantic_cache: Arc<SemanticCache>,
         query_planner: Arc<QueryPlanner>,
+        query_cache: Arc<QueryCache>,
     ) -> Self {
         Self {
             engine,
             function_registry: default_function_registry(),
             default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
-            query_cache: QueryCache::default(),
+            query_cache,
             semantic_cache,
             active_transaction: Mutex::new(None),
             query_planner,
@@ -306,7 +313,7 @@ impl Executor {
             engine,
             function_registry,
             default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
-            query_cache: QueryCache::default(),
+            query_cache: Arc::new(QueryCache::default()),
             semantic_cache: Arc::new(SemanticCache::default()),
             active_transaction: Mutex::new(None),
             query_planner,
@@ -323,7 +330,7 @@ impl Executor {
             engine,
             function_registry: default_function_registry(),
             default_isolation_level: crate::core::IsolationLevel::ReadCommitted,
-            query_cache: QueryCache::new(cache_size),
+            query_cache: Arc::new(QueryCache::new(cache_size)),
             semantic_cache: Arc::new(SemanticCache::default()),
             active_transaction: Mutex::new(None),
             query_planner,

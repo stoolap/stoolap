@@ -134,8 +134,10 @@ pub struct StoolapStmt {
     pub(crate) last_error: LastErrorState,
     /// Pre-computed CString for `stoolap_stmt_sql()`.
     pub(crate) sql_cstr: CString,
-    /// Cached column name CStrings (computed on first query, reused thereafter).
-    pub(crate) cached_columns: Option<Arc<Vec<CString>>>,
+    /// Shared column-name CString cache. Skips rebuild when the next query
+    /// returns the same projection `CompactArc` as the previous one (the
+    /// prepared-statement hot loop).
+    pub(crate) col_cstr_cache: ColumnCStrCache,
     /// Keeps the originating `DatabaseInner` alive so the `Statement`'s `Weak`
     /// reference can be upgraded. For original handles this is the engine-owning
     /// inner; for clone handles it is the clone's own (non-owning) inner.
@@ -219,6 +221,7 @@ pub(crate) fn build_rows_handle(
         last_error: LastErrorState::default(),
         column_names,
         text_cache: vec![Vec::new(); col_count],
+        text_cache_populated: vec![false; col_count],
         text_cache_dirty: smallvec::SmallVec::new(),
         rows_affected: affected,
     })
@@ -234,10 +237,16 @@ pub struct StoolapRows {
     /// Lazy text cache for the current row. One slot per column; each slot's
     /// `Vec<u8>` is reused across rows (cleared, not dropped) so a long scan
     /// pays at most one allocation per (row, column) pair amortized.
-    /// Empty `Vec` (`len == 0`) means "not populated for the current row";
-    /// populated buffers always end in a trailing NUL byte (so length >= 1).
-    /// Numeric-only scans pay zero overhead because no slot is ever populated.
+    /// Populated buffers always end in a trailing NUL byte (length >= 1).
+    /// `text_cache_populated` is the authoritative populated flag; do NOT
+    /// rely on `slot.is_empty()` as a sentinel.
     pub(crate) text_cache: Vec<Vec<u8>>,
+    /// Per-column populated flag for the current row. Set when `fill_text_buf`
+    /// successfully renders; cleared in `stoolap_rows_next` alongside the
+    /// buffer reset. Explicit flag (vs implicit `is_empty()`) so an empty
+    /// text value or a future change to `fill_text_buf`'s error path can't
+    /// collapse with the "no value cached yet" state.
+    pub(crate) text_cache_populated: Vec<bool>,
     /// Indices populated for the current row. On row advance we only clear
     /// these (preserving capacity), avoiding an O(N) sweep over wide tables.
     pub(crate) text_cache_dirty: smallvec::SmallVec<[u32; 4]>,

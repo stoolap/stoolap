@@ -77,8 +77,12 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
         // first hit, zero thereafter.
         if !handle.text_cache_dirty.is_empty() {
             for &idx in &handle.text_cache_dirty {
-                if let Some(slot) = handle.text_cache.get_mut(idx as usize) {
+                let idx = idx as usize;
+                if let Some(slot) = handle.text_cache.get_mut(idx) {
                     slot.clear();
+                }
+                if let Some(flag) = handle.text_cache_populated.get_mut(idx) {
+                    *flag = false;
                 }
             }
             handle.text_cache_dirty.clear();
@@ -260,13 +264,12 @@ pub unsafe extern "C" fn stoolap_rows_column_text(
         return std::ptr::null();
     }
 
-    // Cache hit: populated buffers always end in a trailing NUL, so a
-    // non-empty `Vec` at this index represents a value already rendered for
-    // the current row. Callers can re-read repeatedly at zero cost.
-    let cached = &handle.text_cache[idx];
-    if !cached.is_empty() {
+    // Cache hit: `text_cache_populated[idx]` is the authoritative flag.
+    // Callers can re-read the same column repeatedly at zero cost.
+    if handle.text_cache_populated[idx] {
+        let cached = &handle.text_cache[idx];
         if !out_len.is_null() {
-            *out_len = (cached.len() - 1) as i64;
+            *out_len = cached.len().saturating_sub(1) as i64;
         }
         return cached.as_ptr() as *const c_char;
     }
@@ -286,11 +289,12 @@ pub unsafe extern "C" fn stoolap_rows_column_text(
     if !fill_text_buf(slot, val) {
         return std::ptr::null();
     }
+    handle.text_cache_populated[idx] = true;
     handle.text_cache_dirty.push(idx as u32);
     // Interior NULs in text are preserved; C-string callers see a
     // truncated view, callers using `out_len` see the full byte run.
     if !out_len.is_null() {
-        *out_len = (slot.len() - 1) as i64;
+        *out_len = slot.len().saturating_sub(1) as i64;
     }
     slot.as_ptr() as *const c_char
 }

@@ -688,6 +688,12 @@ impl CheckpointMetadata {
         pos += 4;
 
         let version = data[pos];
+        if version > CHECKPOINT_FORMAT_VERSION {
+            return Err(Error::internal(format!(
+                "checkpoint format version {} is newer than supported version {}",
+                version, CHECKPOINT_FORMAT_VERSION
+            )));
+        }
         pos += 1;
 
         let _flags = data[pos];
