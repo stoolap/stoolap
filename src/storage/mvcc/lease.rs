@@ -22,6 +22,7 @@
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
@@ -146,8 +147,24 @@ impl LeaseManager {
             }
         }
 
-        // Refresh mtime so live_leases sees us immediately.
-        touch_path(&lease_path)?;
+        // Refresh mtime so live_leases sees us immediately. On failure roll
+        // back the refcount: returning Err here without rollback would
+        // strand the entry at >0, making future same-process register()s
+        // skip truncate and inherit stale content forever.
+        if let Err(e) = touch_path(&lease_path) {
+            let mut reg = lease_refcount().lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(count) = reg.get_mut(&lease_path) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    reg.remove(&lease_path);
+                }
+            }
+            return Err(Error::internal(format!(
+                "failed to touch lease '{}' after create: {}",
+                lease_path.display(),
+                e
+            )));
+        }
 
         Ok(Self { lease_path })
     }
@@ -156,22 +173,37 @@ impl LeaseManager {
     /// execute / refresh entry points.
     ///
     /// Self-heals like `EpochFile::write`: if the writer reaped this PID's
-    /// lease while the process slept past `max_age`, route through
-    /// `set_pinned_lsn` (which uses `.create(true)`) and rewrite the
-    /// current MIN from the in-process registry. A plain mtime touch on a
-    /// reaped file returns `NotFound`, the lease stays absent, and the
-    /// writer is free to truncate WAL ranges this reader still references.
+    /// lease while the process slept past `max_age`, rewrite the current
+    /// MIN from the in-process registry via `set_pinned_lsn` (which uses
+    /// `.create(true)`). A plain mtime touch on a reaped file returns
+    /// `NotFound`, the lease stays absent, and the writer is free to
+    /// truncate WAL ranges this reader still references.
+    ///
+    /// Fast path: try the cheap `touch_path` (`open + set_modified`) first;
+    /// only fall through to the heavier `set_pinned_lsn` self-heal when
+    /// the file is missing. Steady-state heartbeats (the common case) pay
+    /// one syscall instead of three.
     pub fn touch(&self) -> Result<()> {
-        let reg = lease_pin_contributions()
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let pin = reg
-            .get(&self.lease_path)
-            .and_then(|m| m.values().copied().min())
-            .unwrap_or(0);
-        let result = self.set_pinned_lsn(pin);
-        drop(reg);
-        result
+        match touch_path(&self.lease_path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                let reg = lease_pin_contributions()
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let pin = reg
+                    .get(&self.lease_path)
+                    .and_then(|m| m.values().copied().min())
+                    .unwrap_or(0);
+                let result = self.set_pinned_lsn(pin);
+                drop(reg);
+                result
+            }
+            Err(e) => Err(Error::internal(format!(
+                "failed to touch lease '{}': {}",
+                self.lease_path.display(),
+                e
+            ))),
+        }
     }
 
     /// Overwrite the 8-byte `pinned_lsn` payload in place and bump mtime.
@@ -506,22 +538,11 @@ pub fn min_reader_handle_epoch(dir: &Path, max_age: Duration) -> Result<Option<u
 }
 
 /// Update the mtime of `path` to now (open w/o truncate, set_modified).
-fn touch_path(path: &Path) -> Result<()> {
-    let f = OpenOptions::new().write(true).open(path).map_err(|e| {
-        Error::internal(format!(
-            "failed to open lease '{}' for touch: {}",
-            path.display(),
-            e
-        ))
-    })?;
-    f.set_modified(SystemTime::now()).map_err(|e| {
-        Error::internal(format!(
-            "failed to set mtime on lease '{}': {}",
-            path.display(),
-            e
-        ))
-    })?;
-    Ok(())
+/// Returns the raw `io::Error` so callers can detect `NotFound` and route
+/// through a self-heal path; wrapping in our error type erases that kind.
+fn touch_path(path: &Path) -> std::io::Result<()> {
+    let f = OpenOptions::new().write(true).open(path)?;
+    f.set_modified(SystemTime::now())
 }
 
 /// Age of a lease relative to `now`. Future mtimes clamp to zero so a

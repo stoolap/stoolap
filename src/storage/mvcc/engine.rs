@@ -1505,6 +1505,15 @@ impl MVCCEngine {
                         std::fs::rename(&tmp_path, &vol_path).map_err(|e| {
                             crate::core::Error::internal(format!("failed to rename volume: {}", e))
                         })?;
+                        // Dir fsync so the rename survives a crash; without it the
+                        // tmp could disappear and vol_path stay absent, leaving a
+                        // promoted standalone with no source to reload.
+                        #[cfg(not(windows))]
+                        if let Some(parent) = vol_path.parent() {
+                            if let Ok(dir) = std::fs::File::open(parent) {
+                                let _ = dir.sync_all();
+                            }
+                        }
                         Ok(())
                     })() {
                         eprintln!(
@@ -1619,15 +1628,29 @@ impl MVCCEngine {
             let _ = std::fs::remove_file(&tmp_path);
             return None;
         }
+        // Dir fsync so the rename survives a crash; otherwise the entry
+        // can vanish post-reboot and the marker (written next) points at
+        // a missing standalone, triggering re-promotion + duplicate ID.
+        #[cfg(not(windows))]
+        if let Ok(dir) = std::fs::File::open(&table_vol_dir) {
+            let _ = dir.sync_all();
+        }
 
         // Write marker with the volume_id so subsequent opens register
         // with the same segment_id as the standalone copy.
-        // Fsync the marker to prevent re-promotion (and duplicate volumes) after crash.
+        // Fsync the marker AND its directory to prevent re-promotion (and
+        // duplicate volumes) after crash.
         if std::fs::write(&marker_path, volume_id.to_string()).is_ok() {
             let _ = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&marker_path)
                 .and_then(|f| f.sync_all());
+            #[cfg(not(windows))]
+            if let Some(parent) = marker_path.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
         }
         Some(volume_id)
     }
@@ -5649,6 +5672,10 @@ impl MVCCEngine {
                     std::io::Write::write_all(&mut &f, manifest_json.as_bytes())?;
                     f.sync_all()?;
                     std::fs::rename(&manifest_tmp, &manifest_path)?;
+                    #[cfg(not(windows))]
+                    if let Ok(dir) = std::fs::File::open(&snapshot_dir) {
+                        let _ = dir.sync_all();
+                    }
                     Ok(())
                 })()
             } else {

@@ -1503,12 +1503,13 @@ impl Database {
     /// Close the database. If sibling handles exist, defer until the last drops.
     /// Engine also closes automatically when the last handle drops.
     pub fn close(&self) -> Result<()> {
-        // Hold the registry write lock across the entire close so a
-        // concurrent `Database::open(same_dsn)` can't slip between the
-        // remove + close and instantiate a brand-new engine while ours is
-        // mid-shutdown. The file lock would block the new engine's open
-        // anyway, but transient parallel `EngineEntry`s on the same DSN
-        // are still observable to in-process readers.
+        // Decision under the registry write lock so a concurrent open can't
+        // upgrade the Weak between our strong-count check and removal. The
+        // lock is dropped BEFORE `close_engine()` because `close_engine`
+        // runs several checkpoint passes plus busy-loop compaction waits;
+        // holding the global registry lock for that duration would stall
+        // every unrelated-DSN open in the process. Any racing
+        // `open(same_dsn)` is blocked at the file-lock layer instead.
         let mut registry = match DATABASE_REGISTRY.write() {
             Ok(g) => g,
             Err(_) => return Err(Error::LockAcquisitionFailed("registry write".to_string())),
@@ -1525,8 +1526,8 @@ impl Database {
                 registry.remove(&self.inner.entry.dsn);
             }
         }
-        self.inner.entry.engine.close_engine()?;
         drop(registry);
+        self.inner.entry.engine.close_engine()?;
 
         Ok(())
     }
