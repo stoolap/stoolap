@@ -166,6 +166,18 @@ impl SegmentedTable {
         self.hot.txn_id()
     }
 
+    /// True when cold zone maps / volume stats reflect the logical table:
+    /// no tombstones, no per-txn pending tombstones, no inter-volume
+    /// overlap, and not an SWMR read-only view (whose hot WAL overlay can
+    /// shadow cold rows). Same condition as the sum/min/max stats paths.
+    fn cold_stats_safe(&self) -> bool {
+        let (volumes_arc, tombstones_full) = self.segment_mgr.volumes_and_tombstones_newest_first();
+        tombstones_full.is_empty()
+            && !self.segment_mgr.has_pending_tombstones(self.txn_id())
+            && volumes_arc.iter().all(|(_, cs)| cs.visible.is_none())
+            && !(self.read_only && self.segment_mgr.has_segments())
+    }
+
     /// SWMR scan-based row count: live hot count + cold rows visible AND not
     /// in tombstones AND not shadowed by `hot_skip` (which includes hot live
     /// rows + WAL-replayed delete markers). Per-volume visibility bitmap dedupes
@@ -1653,10 +1665,15 @@ impl ReadTable for SegmentedTable {
         // reload swapping in new volumes whose tombstones we'd then ignore.
         // No-overlap iff every segment's `visible` bitmap is None (set by
         // compute_visibility_bitmaps whenever overlap exists).
+        // SWMR read-only: hot WAL overlay can shadow cold row_ids (see
+        // row_count); volume stats would double-count them.
         let (volumes_arc, tombstones_full) = self.segment_mgr.volumes_and_tombstones_newest_first();
         let has_pending = self.segment_mgr.has_pending_tombstones(self.txn_id());
         let no_overlap = volumes_arc.iter().all(|(_, cs)| cs.visible.is_none());
-        let can_use_stats = tombstones_full.is_empty() && !has_pending && no_overlap;
+        let can_use_stats = tombstones_full.is_empty()
+            && !has_pending
+            && no_overlap
+            && !(self.read_only && self.segment_mgr.has_segments());
 
         if can_use_stats {
             // Fast path via pre-computed volume stats. Accumulate i128 + f64
@@ -1766,10 +1783,15 @@ impl ReadTable for SegmentedTable {
         let has_non_null_default = !default_val.is_null();
 
         // Atomic capture; derive can_use_stats from the SAME snapshot.
+        // SWMR read-only: cold stats can report values shadowed by hot
+        // WAL-overlay versions of the same row_ids (see row_count).
         let (volumes_arc, tombstones_full) = self.segment_mgr.volumes_and_tombstones_newest_first();
         let has_pending = self.segment_mgr.has_pending_tombstones(self.txn_id());
         let no_overlap = volumes_arc.iter().all(|(_, cs)| cs.visible.is_none());
-        let can_use_stats = tombstones_full.is_empty() && !has_pending && no_overlap;
+        let can_use_stats = tombstones_full.is_empty()
+            && !has_pending
+            && no_overlap
+            && !(self.read_only && self.segment_mgr.has_segments());
 
         if can_use_stats {
             // Fast path via zone-map min from the captured snapshot.
@@ -2065,10 +2087,15 @@ impl ReadTable for SegmentedTable {
         // captured snapshot so a refresh between the eligibility
         // check and the segment iteration can't make us run the
         // fast path on a different segment set than we validated.
+        // SWMR read-only: cold stats can report values shadowed by hot
+        // WAL-overlay versions of the same row_ids (see row_count).
         let (volumes_arc, tombstones_full) = self.segment_mgr.volumes_and_tombstones_newest_first();
         let has_pending = self.segment_mgr.has_pending_tombstones(self.txn_id());
         let no_overlap = volumes_arc.iter().all(|(_, cs)| cs.visible.is_none());
-        let can_use_stats = tombstones_full.is_empty() && !has_pending && no_overlap;
+        let can_use_stats = tombstones_full.is_empty()
+            && !has_pending
+            && no_overlap
+            && !(self.read_only && self.segment_mgr.has_segments());
 
         if can_use_stats {
             // Fast path: use pre-computed volume stats (zone map max)
@@ -3024,6 +3051,12 @@ impl ReadTable for SegmentedTable {
         if !self.segment_mgr.has_segments() {
             return self.hot.get_index_min_value(column_name);
         }
+        // Zone maps ignore tombstoned/superseded rows and the SWMR read-only
+        // hot overlay; bail to the scan fallback whenever those can shadow
+        // cold extremes (same conditions as the sum/min/max stats paths).
+        if !self.cold_stats_safe() {
+            return None;
+        }
         let hot_min = self.hot.get_index_min_value(column_name);
         let segments = self.segment_mgr.get_segments_ordered_meta();
         let mut vol_min: Option<Value> = None;
@@ -3062,6 +3095,10 @@ impl ReadTable for SegmentedTable {
     fn get_index_max_value(&self, column_name: &str) -> Option<Value> {
         if !self.segment_mgr.has_segments() {
             return self.hot.get_index_max_value(column_name);
+        }
+        // Same zone-map shadowing bail as get_index_min_value.
+        if !self.cold_stats_safe() {
+            return None;
         }
         let hot_max = self.hot.get_index_max_value(column_name);
         let segments = self.segment_mgr.get_segments_ordered_meta();

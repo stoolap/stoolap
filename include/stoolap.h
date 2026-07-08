@@ -502,7 +502,10 @@ void stoolap_string_free(char* s);
 #define STOOLAP_ERR_VALUE_TOO_LONG     24
 #define STOOLAP_ERR_VIEW_NOT_FOUND     25
 #define STOOLAP_ERR_VIEW_EXISTS        26
-#define STOOLAP_ERR_REOPEN_REQUIRED    27 /**< SWMR readers: hard-reopen required */
+#define STOOLAP_ERR_REOPEN_REQUIRED    27 /**< SWMR readers: hard-reopen required (schema change,
+                                                writer reincarnation, snapshot expiry, pending DDL,
+                                                partial reload). Transient WAL-tail decode errors
+                                                surface as STOOLAP_ERR_IO and may be retried. */
 
 typedef struct StoolapErrorDetails {
     int32_t code;
@@ -579,7 +582,8 @@ int32_t      stoolap_ro_table_count    (StoolapRoDB* db, const char* table, uint
  * Advance the snapshot to the writer's latest visible state.
  * Returns STOOLAP_REFRESH_ADVANCED on advance, STOOLAP_OK if already
  * current, STOOLAP_ERROR on failure (STOOLAP_ERR_REOPEN_REQUIRED
- * means the caller MUST close and reopen this handle).
+ * means the caller MUST close and reopen this handle; transient
+ * WAL-tail decode errors surface as STOOLAP_ERR_IO and may be retried).
  */
 int32_t      stoolap_ro_refresh        (StoolapRoDB* db);
 
@@ -588,7 +592,8 @@ void         stoolap_ro_set_auto_refresh(StoolapRoDB* db, int32_t enabled);
 
 /**
  * Configure background refresh ticker. 0 stops it; >0 (re)starts at that cadence.
- * Minimum 100ms; smaller values return STOOLAP_ERR_INVALID_ARGUMENT.
+ * Minimum 100ms; smaller values fail with STOOLAP_ERROR
+ * (STOOLAP_ERR_INVALID_ARGUMENT via stoolap_ro_errcode()).
  * The ticker advances the WAL pin so idle readers do not block writer WAL truncation.
  * On must-reopen the ticker exits and the next query/refresh surfaces the error.
  * Equivalent DSN flag: `?refresh_interval=30s`.

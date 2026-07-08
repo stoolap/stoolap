@@ -137,7 +137,7 @@ pub struct ReadOnlyDatabaseInner {
     overlay: Arc<OverlayStore>,
     /// Per-table checkpoint_lsn snapshot from the last refresh, used
     /// to scope cache invalidation on reload.
-    last_seen_table_lsns: Mutex<rustc_hash::FxHashMap<String, u64>>,
+    last_seen_table_lsns: Mutex<ahash::AHashMap<String, u64>>,
     /// Last manifest epoch this handle observed.
     last_seen_epoch: AtomicU64,
     auto_refresh: AtomicBool,
@@ -180,6 +180,26 @@ impl std::ops::Deref for ReadOnlyDatabase {
 
 impl ReadOnlyDatabase {
     pub(crate) fn from_entry(entry: Arc<EngineEntry>) -> Result<Self> {
+        let attachment =
+            crate::api::reader_attachment::ReaderAttachment::attach(Arc::clone(&entry))?;
+        // Seed the overlay cursor at the entry's saved attach values
+        // verbatim, re-sampling shm here would race a writer publish
+        // and seed past WAL the engine never replayed.
+        let baseline = (
+            entry.attach_visible_commit_lsn,
+            entry.attach_oldest_active_txn_lsn,
+        );
+        Self::from_parts(entry, attachment, baseline)
+    }
+
+    /// Assemble a handle from an already-installed attachment and an
+    /// overlay baseline pair (`OverlayStore::with_baseline` argument
+    /// order: `(visible_commit_lsn, writer_oldest_active_txn_lsn)`).
+    fn from_parts(
+        entry: Arc<EngineEntry>,
+        attachment: Arc<crate::api::reader_attachment::ReaderAttachment>,
+        baseline: (u64, u64),
+    ) -> Result<Self> {
         // Read-only executor sharing the entry's semantic + planner
         // caches so writer-side DML/ANALYZE invalidates this view too.
         let engine = Arc::clone(&entry.engine);
@@ -201,17 +221,9 @@ impl ReadOnlyDatabase {
         } else {
             0
         };
-        let attachment =
-            crate::api::reader_attachment::ReaderAttachment::attach(Arc::clone(&entry))?;
 
-        // Seed the overlay cursor at the entry's saved attach values
-        // verbatim, re-sampling shm here would race a writer publish
-        // and seed past WAL the engine never replayed.
         let overlay = Arc::new(if attachment.pin_active() {
-            OverlayStore::with_baseline(
-                entry.attach_visible_commit_lsn,
-                entry.attach_oldest_active_txn_lsn,
-            )
+            OverlayStore::with_baseline(baseline.0, baseline.1)
         } else {
             OverlayStore::new()
         });
@@ -225,7 +237,7 @@ impl ReadOnlyDatabase {
                 auto_refresh: AtomicBool::new(true),
                 swmr_must_reopen_summary: Mutex::new(None),
                 overlay,
-                last_seen_table_lsns: Mutex::new(rustc_hash::FxHashMap::default()),
+                last_seen_table_lsns: Mutex::new(ahash::AHashMap::default()),
                 refresh_ticker: Mutex::new(None),
                 refresh_interval: Mutex::new(None),
                 refresh_fence: Mutex::new(()),
@@ -235,21 +247,53 @@ impl ReadOnlyDatabase {
 
     /// Clone for multi-threaded use. Each clone shares the engine and
     /// caches but gets its own executor, attachment (fresh WAL pin),
-    /// auto-refresh flag, and overlay cursor. Mirrors
-    /// [`crate::api::Database::clone`].
+    /// auto-refresh flag, and overlay cursor, seeded from this handle's
+    /// CURRENT refresh state, not the entry's attach-time snapshot,
+    /// which the writer's WAL-truncate floor may have passed.
     pub fn try_clone(&self) -> Result<Self> {
-        let cloned = Self::from_entry(Arc::clone(&self.inner.entry))?;
-        cloned.set_auto_refresh(self.auto_refresh_enabled());
-        if let Some(d) = self.refresh_interval() {
+        // Sample config BEFORE taking refresh_fence: set_refresh_interval
+        // holds refresh_interval while joining the ticker, and the ticker
+        // blocks on refresh_fence, so touching refresh_interval under the
+        // fence would form a three-way lock cycle.
+        let auto_refresh = self.auto_refresh_enabled();
+        let interval = self.refresh_interval();
+        let entry = Arc::clone(&self.inner.entry);
+        let cloned = {
+            // Fence out ticker-driven refresh while sampling pin + cursors.
+            let _fence = self.refresh_fence.lock().ok();
+            match self.attachment.current_pin_lsn() {
+                Some(pin) => {
+                    // Install the clone's pin at the source's current floor
+                    // FIRST: the source pin still protects WAL >= pin, so
+                    // the cursors sampled next stay tailable by the clone.
+                    let attachment =
+                        crate::api::reader_attachment::ReaderAttachment::attach_at_pin(
+                            Arc::clone(&entry),
+                            pin,
+                        )?;
+                    let baseline = (
+                        self.overlay.last_applied_lsn(),
+                        self.overlay.next_entry_floor(),
+                    );
+                    Self::from_parts(entry, attachment, baseline)?
+                }
+                None => Self::from_entry(entry)?,
+            }
+        };
+        // Inherit the sticky must-reopen state: the clone's baseline is
+        // past the DDL the source already surfaced, so it would
+        // otherwise query a stale schema without ever erroring.
+        if let (Ok(src), Ok(mut dst)) = (
+            self.swmr_must_reopen_summary.lock(),
+            cloned.swmr_must_reopen_summary.lock(),
+        ) {
+            *dst = src.clone();
+        }
+        cloned.set_auto_refresh(auto_refresh);
+        if let Some(d) = interval {
             cloned.set_refresh_interval(Some(d))?;
         }
         Ok(cloned)
-    }
-}
-
-impl Clone for ReadOnlyDatabase {
-    fn clone(&self) -> Self {
-        self.try_clone().expect("ReadOnlyDatabase clone failed")
     }
 }
 
@@ -499,7 +543,12 @@ impl ReadOnlyDatabase {
             // Per-table cache invalidation: only tables whose
             // checkpoint_lsn advanced (or are newly present) get
             // invalidated. Unchanged tables keep their cached entries.
-            let now_lsns = self.entry.engine.table_checkpoint_lsns();
+            let now_lsns: ahash::AHashMap<String, u64> = self
+                .entry
+                .engine
+                .table_checkpoint_lsns()
+                .into_iter()
+                .collect();
             let mut prev = self
                 .last_seen_table_lsns
                 .lock()
@@ -690,6 +739,31 @@ impl ReadOnlyDatabase {
         } else {
             executor.execute_with_params(sql, param_values)?
         };
+        Ok(Rows::with_entry(result, Arc::clone(&self.entry)))
+    }
+
+    /// Like `query` with a timeout in ms. `0` = no timeout. Read-only
+    /// equivalent of [`crate::api::Database::query_with_timeout`].
+    pub fn query_with_timeout<P: Params>(
+        &self,
+        sql: &str,
+        params: P,
+        timeout_ms: u64,
+    ) -> Result<Rows> {
+        self.touch_lease();
+        self.maybe_auto_refresh()?;
+        let executor = self
+            .executor
+            .lock()
+            .map_err(|_| Error::LockAcquisitionFailed("read-only executor".to_string()))?;
+
+        let param_values = params.into_params();
+        let ctx = crate::executor::context::ExecutionContextBuilder::new()
+            .params(param_values)
+            .timeout_ms(timeout_ms)
+            .build();
+
+        let result = executor.execute_with_context(sql, &ctx)?;
         Ok(Rows::with_entry(result, Arc::clone(&self.entry)))
     }
 

@@ -66,7 +66,8 @@ pub mod codes {
     pub const STOOLAP_ERR_VIEW_EXISTS: i32 = 26;
     /// SWMR: caller must reopen the read-only handle. Covers
     /// `SchemaChanged`, `SwmrWriterReincarnated`, `SwmrSnapshotExpired`,
-    /// `SwmrPendingDdl`, `SwmrPartialReload`, `SwmrOverlayApplyFailed`.
+    /// `SwmrPendingDdl`, `SwmrPartialReload`. Transient WAL-tail decode
+    /// errors (`SwmrOverlayApplyFailed`) map to `STOOLAP_ERR_IO` instead.
     pub const STOOLAP_ERR_REOPEN_REQUIRED: i32 = 27;
 }
 
@@ -221,7 +222,9 @@ impl LastErrorState {
             Error::DatabaseLocked => {
                 self.code = STOOLAP_ERR_DB_LOCKED;
             }
-            Error::Io { .. } => {
+            // SwmrOverlayApplyFailed is a transient WAL-tail decode
+            // error; retryable, not a must-reopen condition.
+            Error::Io { .. } | Error::SwmrOverlayApplyFailed(_) => {
                 self.code = STOOLAP_ERR_IO;
             }
             Error::NotSupported(_) | Error::CannotDropPrimaryKey => {
@@ -237,8 +240,7 @@ impl LastErrorState {
             | Error::SwmrWriterReincarnated { .. }
             | Error::SwmrSnapshotExpired { .. }
             | Error::SwmrPendingDdl(_)
-            | Error::SwmrPartialReload(_)
-            | Error::SwmrOverlayApplyFailed(_) => {
+            | Error::SwmrPartialReload(_) => {
                 self.code = STOOLAP_ERR_REOPEN_REQUIRED;
             }
             Error::Internal { .. }

@@ -85,10 +85,7 @@ impl CliDb {
     ) -> stoolap::Result<Rows> {
         match self {
             CliDb::Writable(db) => db.query_with_timeout(sql, params, timeout_ms),
-            // ReadOnlyDatabase doesn't expose query_with_timeout
-            // yet; fall back to the untimed path. The CLI's
-            // timeout is best-effort already.
-            CliDb::ReadOnly(rod) => rod.query(sql, params),
+            CliDb::ReadOnly(rod) => rod.query_with_timeout(sql, params, timeout_ms),
         }
     }
 

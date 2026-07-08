@@ -148,9 +148,10 @@ pub fn write_epoch(db_path: &Path, value: u64) -> Result<()> {
     Ok(())
 }
 
-/// Read the current epoch and write back `current + 1` atomically.
-/// Returns the new value. Single-writer semantics, caller (the engine
-/// during checkpoint) is the only producer, no inter-process CAS needed.
+/// Read the current epoch and write back `current + 1`. Returns the new
+/// value. The read-modify-write is NOT internally serialized: in-process
+/// callers must hold the engine's `epoch_bump_lock` (SWMR means one writer
+/// process, so no inter-process CAS is needed).
 pub fn bump_epoch(db_path: &Path) -> Result<u64> {
     let next = read_epoch(db_path)?.saturating_add(1);
     write_epoch(db_path, next)?;

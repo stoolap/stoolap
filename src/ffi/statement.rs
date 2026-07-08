@@ -322,12 +322,15 @@ pub unsafe extern "C" fn stoolap_stmt_finalize(stmt: *mut StoolapStmt) {
     // Clone the engine-owning Arc before dropping the statement.
     // After the statement drops, this may be the last non-registry reference,
     // so we retry registry cleanup (try_unregister_arc checks strong_count == 2).
-    let engine_owning = match &handle._engine_keepalive {
-        Some(arc) => Arc::clone(arc),
-        None => Arc::clone(&handle._db_keepalive),
-    };
-    drop(handle);
-    Database::try_unregister_arc(&engine_owning);
+    // catch_unwind: a panic in the drop/cleanup chain must not cross the C ABI.
+    let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        let engine_owning = match &handle._engine_keepalive {
+            Some(arc) => Arc::clone(arc),
+            None => Arc::clone(&handle._db_keepalive),
+        };
+        drop(handle);
+        Database::try_unregister_arc(&engine_owning);
+    }));
 }
 
 /// Get the last error message for a statement handle.

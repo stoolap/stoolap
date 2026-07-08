@@ -1370,17 +1370,6 @@ impl WALManager {
             return Err(Error::WalNotRunning);
         }
 
-        let prev_lsn = self.previous_lsn.load(Ordering::Acquire);
-        entry.previous_lsn = prev_lsn;
-
-        let current = self.current_lsn.load(Ordering::Acquire);
-        if current == u64::MAX {
-            return Err(Error::internal(
-                "WAL LSN overflow: maximum sequence number reached. Database requires maintenance.",
-            ));
-        }
-        entry.lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
-        self.previous_lsn.store(entry.lsn, Ordering::Release);
         // Cover the gap between LSN allocation and disk durability so
         // create_checkpoint's wait_for_in_flight_writes can't sample a
         // current_lsn ahead of the buffered entry. RAII guard
@@ -1394,65 +1383,79 @@ impl WALManager {
         }
         let _in_flight = InFlightGuard(&self.in_flight_writes);
 
-        // Track first DML LSN per active user txn (skip synthetic ids and markers).
-        if entry.txn_id > 0 && !entry.is_marker_entry() {
-            let mut map = self.active_txn_first_lsn.lock();
-            if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(entry.txn_id) {
-                slot.insert(entry.lsn);
-                self.refresh_oldest_active_cache_locked(&map);
-            }
-        }
+        // Full: flush every entry. Normal: flush on commit/DDL. None: never force
+        // (SWMR visibility capped by `flushed_lsn` so buffered markers stay hidden).
+        let force_flush = self.sync_mode == SyncMode::Full
+            || (self.sync_mode == SyncMode::Normal
+                && (entry.operation.is_transaction_end() || entry.operation.is_ddl()));
 
-        // DDL watermark for SWMR readers. Track DDL-bearing txns at
-        // entry append; bump catalog_epoch only when the COMMIT marker
-        // lands so an uncommitted transactional DDL doesn't poison
-        // the watermark. Abort marker just clears the flag.
-        match entry.operation {
-            op if op.is_ddl() => {
-                self.txns_with_ddl.lock().insert(entry.txn_id);
+        // Allocate the LSN and append inside one buffer critical section so
+        // buffer contents are always LSN-ordered (tail scanners assume the WAL
+        // file is LSN-monotonic).
+        let needs_flush = {
+            let mut buffer = self.buffer.lock().unwrap();
+
+            let current = self.current_lsn.load(Ordering::Acquire);
+            if current == u64::MAX {
+                return Err(Error::internal(
+                    "WAL LSN overflow: maximum sequence number reached. Database requires maintenance.",
+                ));
             }
-            WALOperationType::Commit => {
-                let was_flagged = self.txns_with_ddl.lock().remove(&entry.txn_id);
-                if was_flagged {
-                    if let Some(handle) = self.shm_oldest_mirror.get() {
-                        handle
-                            .header()
-                            .catalog_epoch
-                            .fetch_max(entry.lsn, Ordering::Release);
-                    }
+            entry.previous_lsn = self.previous_lsn.load(Ordering::Acquire);
+            entry.lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+            self.previous_lsn.store(entry.lsn, Ordering::Release);
+
+            // Track first DML LSN per active user txn (skip synthetic ids and markers).
+            if entry.txn_id > 0 && !entry.is_marker_entry() {
+                let mut map = self.active_txn_first_lsn.lock();
+                if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(entry.txn_id) {
+                    slot.insert(entry.lsn);
+                    self.refresh_oldest_active_cache_locked(&map);
                 }
             }
-            WALOperationType::Rollback => {
-                self.txns_with_ddl.lock().remove(&entry.txn_id);
+
+            // DDL watermark for SWMR readers. Track DDL-bearing txns at
+            // entry append; bump catalog_epoch only when the COMMIT marker
+            // lands so an uncommitted transactional DDL doesn't poison
+            // the watermark. Abort marker just clears the flag.
+            match entry.operation {
+                op if op.is_ddl() => {
+                    self.txns_with_ddl.lock().insert(entry.txn_id);
+                }
+                WALOperationType::Commit => {
+                    let was_flagged = self.txns_with_ddl.lock().remove(&entry.txn_id);
+                    if was_flagged {
+                        if let Some(handle) = self.shm_oldest_mirror.get() {
+                            handle
+                                .header()
+                                .catalog_epoch
+                                .fetch_max(entry.lsn, Ordering::Release);
+                        }
+                    }
+                }
+                WALOperationType::Rollback => {
+                    self.txns_with_ddl.lock().remove(&entry.txn_id);
+                }
+                _ => {}
             }
-            _ => {}
-        }
 
-        let encoded = entry.encode();
-
-        {
-            let mut buffer = self.buffer.lock().unwrap();
+            let encoded = entry.encode();
             buffer.extend_from_slice(&encoded);
             self.buffer_highest_lsn
                 .fetch_max(entry.lsn, Ordering::AcqRel);
 
-            let needs_flush = buffer.len() >= self.flush_trigger as usize;
-            // Full: flush every entry. Normal: flush on commit/DDL. None: never force
-            // (SWMR visibility capped by `flushed_lsn` so buffered markers stay hidden).
-            let force_flush = self.sync_mode == SyncMode::Full
-                || (self.sync_mode == SyncMode::Normal
-                    && (entry.operation.is_transaction_end() || entry.operation.is_ddl()));
+            buffer.len() >= self.flush_trigger as usize
+        };
 
-            if needs_flush || force_flush {
-                let buffer_data = std::mem::take(&mut *buffer);
-                let max_lsn = self.buffer_highest_lsn.swap(0, Ordering::AcqRel);
-                drop(buffer);
+        if needs_flush || force_flush {
+            // Lock ordering: wal_file first, then buffer. Taking the buffer and
+            // writing it under the file lock keeps file bytes LSN-ordered, so
+            // flushed_lsn always covers a prefix.
+            let mut wal_file = self.wal_file.lock().unwrap();
+            self.flush_buffer_locked(&mut wal_file)?;
 
-                self.write_to_file(&buffer_data, max_lsn)?;
-
-                if self.should_sync(entry.operation) {
-                    self.sync_locked()?;
-                }
+            if self.should_sync(entry.operation) {
+                self.sync_file_locked(&wal_file)?;
             }
         }
 
@@ -1515,8 +1518,8 @@ impl WALManager {
         self.oldest_active_lsn_cache.load(Ordering::Acquire)
     }
 
-    /// Write data to WAL file
-    fn write_to_file(&self, data: &[u8], max_lsn: u64) -> Result<()> {
+    /// Write data to the WAL file via an already-held `wal_file` guard.
+    fn write_locked(&self, wal_file: &mut Option<File>, data: &[u8], max_lsn: u64) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -1526,7 +1529,6 @@ impl WALManager {
             return Err(Error::internal("failpoint: WAL write"));
         }
 
-        let mut wal_file = self.wal_file.lock().unwrap();
         if let Some(file) = wal_file.as_mut() {
             file.write_all(data)
                 .map_err(|e| Error::internal(format!("failed to write to WAL: {}", e)))?;
@@ -1542,8 +1544,30 @@ impl WALManager {
         Ok(())
     }
 
-    /// Sync WAL to disk (assumes lock is held)
-    fn sync_locked(&self) -> Result<()> {
+    /// Take the buffer and write it while holding the `wal_file` lock.
+    /// Lock ordering: callers hold `wal_file` BEFORE the buffer lock (never
+    /// the reverse), so concurrent flushers reach the file in LSN order and
+    /// `flushed_lsn` always covers a prefix.
+    fn flush_buffer_locked(&self, wal_file: &mut Option<File>) -> Result<()> {
+        let (data, max_lsn) = {
+            let mut buffer = self.buffer.lock().unwrap();
+            if buffer.is_empty() {
+                return Ok(());
+            }
+            // Bump in_flight before releasing the lock so checkpoint can't read ahead of disk.
+            self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
+            let data = std::mem::take(&mut *buffer);
+            let max_lsn = self.buffer_highest_lsn.swap(0, Ordering::AcqRel);
+            (data, max_lsn)
+        };
+
+        let write_result = self.write_locked(wal_file, &data, max_lsn);
+        self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
+        write_result
+    }
+
+    /// Fsync the WAL file via an already-held `wal_file` guard.
+    fn sync_file_locked(&self, wal_file: &Option<File>) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
         }
@@ -1553,7 +1577,6 @@ impl WALManager {
             return Err(Error::internal("failpoint: WAL sync"));
         }
 
-        let wal_file = self.wal_file.lock().unwrap();
         if let Some(file) = wal_file.as_ref() {
             file.sync_all()
                 .map_err(|e| Error::internal(format!("failed to sync WAL: {}", e)))?;
@@ -1566,6 +1589,12 @@ impl WALManager {
         self.last_sync_time.store(now, Ordering::Relaxed);
 
         Ok(())
+    }
+
+    /// Sync WAL to disk (acquires the file lock).
+    fn sync_locked(&self) -> Result<()> {
+        let wal_file = self.wal_file.lock().unwrap();
+        self.sync_file_locked(&wal_file)
     }
 
     /// Check if WAL file should be rotated based on size
@@ -1593,32 +1622,39 @@ impl WALManager {
 
     /// Rotate WAL: create new file with incremented sequence and update checkpoint.meta.
     fn rotate_wal(&self) -> Result<()> {
-        let current_lsn = self.current_lsn.load(Ordering::Acquire);
         let new_sequence = self.wal_sequence.fetch_add(1, Ordering::SeqCst) + 1;
-
         let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-        let new_filename = format!(
-            "wal_{:08}-{}-lsn-{}.log",
-            new_sequence, timestamp, current_lsn
-        );
-        let new_path = self.path.join(&new_filename);
-
-        let new_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&new_path)
-            .map_err(|e| Error::internal(format!("failed to create rotated WAL file: {}", e)))?;
 
         {
-            let old_filename = {
+            let (old_filename, new_filename) = {
                 let mut wal_file = self.wal_file.lock().unwrap();
-                let mut current_filename = self.current_wal_file.lock().unwrap();
+                // Drain buffered entries into the old file, THEN sample the
+                // boundary LSN, all under the file lock: no append can slip
+                // bytes above the sampled boundary into the old file, so the
+                // "lsn-N" embedded in the new filename is a true upper bound
+                // for the old file (cleanup_old_wal_files relies on it).
+                self.flush_buffer_locked(&mut wal_file)?;
+                let current_lsn = self.current_lsn.load(Ordering::Acquire);
 
+                let new_filename = format!(
+                    "wal_{:08}-{}-lsn-{}.log",
+                    new_sequence, timestamp, current_lsn
+                );
+                let new_path = self.path.join(&new_filename);
+                let new_file = OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .append(true)
+                    .open(&new_path)
+                    .map_err(|e| {
+                        Error::internal(format!("failed to create rotated WAL file: {}", e))
+                    })?;
+
+                let mut current_filename = self.current_wal_file.lock().unwrap();
                 let old_filename = current_filename.clone();
                 *wal_file = Some(new_file);
                 *current_filename = new_filename.clone();
-                old_filename
+                (old_filename, new_filename)
             };
 
             self.current_file_position.store(0, Ordering::Release);
@@ -1669,11 +1705,10 @@ impl WALManager {
             return Err(Error::WalNotRunning);
         }
 
-        // First flush buffer
-        self.flush()?;
-
-        // Then sync
-        self.sync_locked()
+        // Flush then fsync under one file-lock hold.
+        let mut wal_file = self.wal_file.lock().unwrap();
+        self.flush_buffer_locked(&mut wal_file)?;
+        self.sync_file_locked(&wal_file)
     }
 
     /// Flush buffer to disk without syncing
@@ -1682,21 +1717,9 @@ impl WALManager {
             return Err(Error::WalNotRunning);
         }
 
-        let buffer_data = {
-            let mut buffer = self.buffer.lock().unwrap();
-            if buffer.is_empty() {
-                return Ok(());
-            }
-            let data = std::mem::take(&mut *buffer);
-            let max_lsn = self.buffer_highest_lsn.swap(0, Ordering::AcqRel);
-            // Bump in_flight before releasing lock so checkpoint can't read ahead of disk.
-            self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
-            (data, max_lsn)
-        };
-
-        let write_result = self.write_to_file(&buffer_data.0, buffer_data.1);
-        self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
-        write_result
+        // Lock ordering: wal_file first, then buffer (see flush_buffer_locked).
+        let mut wal_file = self.wal_file.lock().unwrap();
+        self.flush_buffer_locked(&mut wal_file)
     }
 
     /// Periodically flush `SyncMode::None` buffers so SWMR readers see commits

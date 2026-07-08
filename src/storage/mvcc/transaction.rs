@@ -308,9 +308,12 @@ unsafe impl Sync for TransactionalDdlFenceGuard {}
 
 impl TransactionalDdlFenceGuard {
     pub fn new(lock: Arc<parking_lot::RwLock<()>>) -> Self {
-        use parking_lot::lock_api::RawRwLock;
-        // SAFETY: lock_shared() balanced by unlock_shared() in Drop.
-        unsafe { lock.raw().lock_shared() };
+        use parking_lot::lock_api::RawRwLockRecursive;
+        // Recursive: the thread may already hold this fence SH (earlier DDL in
+        // the same txn); a plain lock_shared() would queue behind a parked
+        // checkpoint writer and deadlock.
+        // SAFETY: lock_shared_recursive() balanced by unlock_shared() in Drop.
+        unsafe { lock.raw().lock_shared_recursive() };
         Self {
             _raw: std::ptr::null(),
             _lock: lock,

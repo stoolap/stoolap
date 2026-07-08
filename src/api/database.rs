@@ -957,7 +957,7 @@ impl Database {
         let mut last: Option<bool> = None;
         for param in query.split('&') {
             let mut parts = param.splitn(2, '=');
-            let key = parts.next().unwrap_or("");
+            let key = parts.next().unwrap_or("").to_ascii_lowercase();
             let value = parts.next().unwrap_or("");
             if key == "auto_refresh" {
                 last = Some(match value.to_lowercase().as_str() {
@@ -984,7 +984,7 @@ impl Database {
         let mut last: Option<Duration> = None;
         for param in query.split('&') {
             let mut parts = param.splitn(2, '=');
-            let key = parts.next().unwrap_or("");
+            let key = parts.next().unwrap_or("").to_ascii_lowercase();
             let value = parts.next().unwrap_or("");
             if key == "refresh_interval" {
                 last = Some(parse_refresh_interval_value(value)?);
@@ -1001,9 +1001,9 @@ impl Database {
         let mut last: Option<bool> = None;
         for param in query.split('&') {
             let mut parts = param.splitn(2, '=');
-            let key = parts.next().unwrap_or("");
+            let key = parts.next().unwrap_or("").to_ascii_lowercase();
             let value = parts.next().unwrap_or("");
-            match key {
+            match key.as_str() {
                 "read_only" | "readonly" => {
                     last = Some(match value.to_lowercase().as_str() {
                         "true" | "1" | "yes" | "on" => true,
@@ -1083,10 +1083,10 @@ impl Database {
         if let Some(query) = query {
             for param in query.split('&') {
                 let mut parts = param.splitn(2, '=');
-                let key = parts.next().unwrap_or("");
+                let key = parts.next().unwrap_or("").to_ascii_lowercase();
                 let value = parts.next().unwrap_or("");
 
-                match key {
+                match key.as_str() {
                     // Sync mode: sync=none|normal|full
                     "sync_mode" | "sync" => {
                         config.persistence.sync_mode = match value.to_lowercase().as_str() {

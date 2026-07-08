@@ -29,12 +29,9 @@ use super::{
 
 /// Fill `buf` (cleared first) with `val`'s text representation plus a
 /// trailing NUL. Returns true on success, false for SQL NULL or values
-/// without a text rendering.
-///
-/// Fast path: `as_str()` borrows directly from the value's storage for
-/// Text/Json (no `String` allocation, just one copy into `buf`).
-/// Slow path: integers/floats/timestamps/etc. go through `as_string()`,
-/// which allocates a `String`; we copy once into the reused `buf`.
+/// without a text rendering. `as_str()` borrows Text/Json storage
+/// directly (no `String` allocation); other types allocate via
+/// `as_string()` and copy once into the reused `buf`.
 fn fill_text_buf(buf: &mut Vec<u8>, val: &Value) -> bool {
     buf.clear();
     if let Some(s) = val.as_str() {
@@ -641,7 +638,11 @@ pub unsafe extern "C" fn stoolap_buffer_free(buf: *mut u8, len: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_rows_close(rows: *mut StoolapRows) {
     if !rows.is_null() {
-        let _ = Box::from_raw(rows);
+        // catch_unwind: dropping Rows can run engine teardown (last
+        // EngineEntry); a panic must not cross the C ABI.
+        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            drop(Box::from_raw(rows));
+        }));
     }
 }
 

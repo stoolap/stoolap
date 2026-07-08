@@ -506,7 +506,10 @@ impl Executor {
                 // statement that ultimately failed.
                 let mut autoindex_err: Option<Error> = None;
                 {
-                    let _ddl_fence_guard = self.engine.ddl_fence().read();
+                    // read_recursive: an api::Transaction on this thread may
+                    // hold the fence SH even though this executor sees no
+                    // active transaction.
+                    let _ddl_fence_guard = self.engine.ddl_fence().read_recursive();
                     let tx = self.engine.begin_writable_transaction_internal()?;
                     let table = tx.get_table(table_name)?;
 
@@ -809,7 +812,10 @@ impl Executor {
         // later fails and the rollback drops the index from
         // the table, recovery would still rebuild it from
         // the checkpoint's CreateIndex re-record.
-        let _ddl_fence_guard = self.engine.ddl_fence().read();
+        // read_recursive: this thread may already hold the
+        // fence SH via an in-txn DDL guard; plain read()
+        // would deadlock behind a parked checkpoint EX.
+        let _ddl_fence_guard = self.engine.ddl_fence().read_recursive();
 
         let table_name = &stmt.table_name.value;
         let index_name = &stmt.index_name.value;
@@ -1044,7 +1050,9 @@ impl Executor {
         // and `table.drop_index` could re-record the
         // not-yet-removed index, leaving a later CreateIndex
         // entry past the durable DropIndex.
-        let _ddl_fence_guard = self.engine.ddl_fence().read();
+        // read_recursive: same reentrancy rationale as
+        // `execute_create_index`.
+        let _ddl_fence_guard = self.engine.ddl_fence().read_recursive();
 
         let index_name = &stmt.index_name.value;
 
@@ -1108,7 +1116,9 @@ impl Executor {
         // rename / modify column and rename table, all
         // inside this same function, so a single
         // function-scoped guard covers every variant.
-        let _ddl_fence_guard = self.engine.ddl_fence().read();
+        // read_recursive: same reentrancy rationale as
+        // `execute_create_index`.
+        let _ddl_fence_guard = self.engine.ddl_fence().read_recursive();
 
         let table_name = &stmt.table_name.value;
 

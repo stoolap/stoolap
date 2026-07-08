@@ -136,7 +136,13 @@ pub unsafe extern "C" fn stoolap_ro_clone(
     };
 
     let result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        let cloned = handle.ro.clone();
+        let cloned = match handle.ro.try_clone() {
+            Ok(ro) => ro,
+            Err(e) => {
+                error::set_global_error_from(&e);
+                return STOOLAP_ERROR;
+            }
+        };
         let new_handle = Box::new(StoolapRoDB {
             ro: cloned,
             last_error: LastErrorState::default(),
@@ -163,7 +169,9 @@ pub unsafe extern "C" fn stoolap_ro_clone(
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_ro_close(db: *mut StoolapRoDB) {
     if !db.is_null() {
-        let _ = Box::from_raw(db);
+        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            drop(Box::from_raw(db));
+        }));
     }
 }
 

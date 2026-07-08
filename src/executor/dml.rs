@@ -2781,13 +2781,12 @@ impl Executor {
         // would then see the checkpointed empty table even
         // though the TRUNCATE was not durable, surfacing a
         // truncate that the user may not have completed.
-        // The fence is held HERE in the executor (not also
-        // inside `record_truncate_table`) to avoid reentrant
-        // SH on the same fence, parking_lot's RwLock can
-        // deadlock if a checkpoint EX is waiting for the
-        // outer SH to drop and we then try to acquire SH
-        // again from inside.
-        let _ddl_fence_guard = self.engine.ddl_fence().read();
+        // read_recursive: an explicit txn's earlier DDL may
+        // already hold this fence SH on this thread; a plain
+        // read() would queue behind a parked checkpoint EX
+        // (fair lock) and deadlock until COMMIT, which is
+        // itself blocked. Recursive SH bypasses the queue.
+        let _ddl_fence_guard = self.engine.ddl_fence().read_recursive();
 
         // Truncate all rows (fast path: drops storage directly)
         // WAL is recorded AFTER success to prevent phantom records on failure.

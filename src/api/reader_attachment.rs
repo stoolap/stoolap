@@ -126,18 +126,32 @@ impl ReaderAttachment {
     /// failed, or vice versa) record `false` and silently skip
     /// the WAL-tail/pin-advance fast paths.
     pub(crate) fn attach(entry: Arc<EngineEntry>) -> crate::core::Result<Arc<Self>> {
-        let handle_id = crate::storage::mvcc::lease::next_handle_id();
-        let expected_writer_gen = entry.attach_writer_gen;
-        let attach_visible_commit_lsn = entry.attach_visible_commit_lsn;
-        let fresh_oldest_active = entry.attach_oldest_active_txn_lsn;
-
         // Install the WAL pin at the OVERLAY BASELINE LSN, not at
         // `attach_visible_commit_lsn` directly. `OverlayStore::initial_pin_lsn`
         // is the one source of truth shared with the bootstrap pin
         // in `Database::open` and the per-handle pin in
         // `DatabaseInner::new_with_entry`.
-        let initial_pin_lsn =
-            OverlayStore::initial_pin_lsn(attach_visible_commit_lsn, fresh_oldest_active);
+        let initial_pin_lsn = OverlayStore::initial_pin_lsn(
+            entry.attach_visible_commit_lsn,
+            entry.attach_oldest_active_txn_lsn,
+        );
+        Self::attach_at_pin(entry, initial_pin_lsn)
+    }
+
+    /// Attach with an explicit initial pin LSN instead of the entry's
+    /// attach-time values. Used by `ReadOnlyDatabase::try_clone` to pin
+    /// the clone at the SOURCE handle's current floor, which the source
+    /// pin still protects, before the source's overlay cursors are read.
+    pub(crate) fn attach_at_pin(
+        entry: Arc<EngineEntry>,
+        initial_pin_lsn: u64,
+    ) -> crate::core::Result<Arc<Self>> {
+        // Floor at 1: pin=0 is the lease's released sentinel.
+        let initial_pin_lsn = initial_pin_lsn.max(1);
+        let handle_id = crate::storage::mvcc::lease::next_handle_id();
+        let expected_writer_gen = entry.attach_writer_gen;
+        let attach_visible_commit_lsn = entry.attach_visible_commit_lsn;
+
         let swmr_pin_active = if let (Some(_), Some(l)) = (entry.shm.as_ref(), entry.lease.as_ref())
         {
             l.set_handle_pin(handle_id, initial_pin_lsn).is_ok()
@@ -202,6 +216,19 @@ impl ReaderAttachment {
     #[inline]
     pub(crate) fn pin_active(&self) -> bool {
         self.swmr_pin_active
+    }
+
+    /// Last pin LSN written into the lease, `None` when no pin is
+    /// installed. Read by `try_clone` to seed the clone's pin.
+    #[inline]
+    pub(crate) fn current_pin_lsn(&self) -> Option<u64> {
+        if !self.swmr_pin_active {
+            return None;
+        }
+        match self.last_written_pin.load(Ordering::Acquire) {
+            u64::MAX => None,
+            pin => Some(pin),
+        }
     }
 
     /// Bump the lease's mtime if it hasn't been touched in the

@@ -494,6 +494,10 @@ pub struct MVCCEngine {
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
     compaction_running: Arc<AtomicBool>,
+    /// Serializes epoch-file read-modify-write (bump_epoch) and the orphan
+    /// sweep's stamp read. In-process only: SWMR has a single writer process,
+    /// so no cross-process locking is needed.
+    epoch_bump_lock: parking_lot::Mutex<()>,
     /// Persistence init failure on read-only open (Some -> open_engine fails hard).
     persistence_init_error: Mutex<Option<Error>>,
     /// Cross-process db.shm. Some only on writable disk-backed Unix opens.
@@ -670,6 +674,7 @@ impl MVCCEngine {
             )),
             orphan_discovery_failed: Arc::new(AtomicBool::new(false)),
             compaction_running: Arc::new(AtomicBool::new(false)),
+            epoch_bump_lock: parking_lot::Mutex::new(()),
             persistence_init_error: Mutex::new(persistence_init_error),
             shm: Mutex::new(None),
             pending_marker_lsns: Arc::new(parking_lot::Mutex::new(
@@ -826,7 +831,7 @@ impl MVCCEngine {
                     // New path: load manifests + volumes BEFORE WAL replay.
                     // Volumes must be loaded so is_row_id_in_volume() can check
                     // row_ids for idempotent INSERT during replay.
-                    let lsn = self.load_manifests_from_volumes();
+                    let lsn = self.load_manifests_from_volumes()?;
                     self.load_standalone_volumes_no_schema_check();
                     lsn
                 } else if has_legacy_snapshots {
@@ -838,8 +843,11 @@ impl MVCCEngine {
                     0
                 };
 
-                // Clean up stale .dv files from previous versions
-                self.cleanup_stale_dv_files();
+                // Clean up stale .dv files from previous versions.
+                // Writer-only: a read-only open must not mutate the db dir.
+                if !self.is_read_only_mode() {
+                    self.cleanup_stale_dv_files();
+                }
 
                 // Replay WAL entries after the checkpoint/snapshot LSN
                 self.replay_wal(replay_from_lsn)?;
@@ -950,9 +958,7 @@ impl MVCCEngine {
                 // Always bump manifest epoch on writer recovery so attaching readers
                 // trigger reload_manifests (DDL-only crashes leave the epoch file untouched).
                 if !read_only && !self.path.is_empty() {
-                    if let Err(e) = crate::storage::mvcc::manifest_epoch::bump_epoch(
-                        std::path::Path::new(&self.path),
-                    ) {
+                    if let Err(e) = self.bump_manifest_epoch() {
                         eprintln!("Warning: post-recovery manifest epoch bump failed: {}", e);
                     }
                 }
@@ -1307,6 +1313,23 @@ impl MVCCEngine {
         // replay_two_phase to skip entries that need to be replayed.
         if !any_snapshot_loaded {
             let checkpoint_path = pm.path().join("wal").join("checkpoint.meta");
+            if read_only {
+                // Reader must not unlink writer-owned state. A published
+                // floor whose snapshot didn't load means replay would skip
+                // entries we have no data for; fail instead.
+                let published_floor =
+                    crate::storage::mvcc::wal_manager::CheckpointMetadata::read_from_file(
+                        &checkpoint_path,
+                    )
+                    .map(|c| c.lsn)
+                    .unwrap_or(0);
+                if published_floor == 0 {
+                    return Ok(0);
+                }
+                return Err(Error::SwmrPartialReload(
+                    "legacy snapshots unreadable despite a published checkpoint floor".to_string(),
+                ));
+            }
             let _ = std::fs::remove_file(checkpoint_path);
             return Ok(0);
         }
@@ -3503,7 +3526,9 @@ impl MVCCEngine {
 
         // SH transactional_ddl_fence: blocks concurrent checkpoint from snapshotting
         // the transient catalog (in-memory inserts done before record_ddl).
-        let _ddl_fence_guard = self.transactional_ddl_fence.read();
+        // read_recursive: reachable via CTAS while the txn already holds the
+        // fence SH; plain read() would deadlock behind a parked checkpoint EX.
+        let _ddl_fence_guard = self.transactional_ddl_fence.read_recursive();
 
         let table_name = schema.table_name_lower.clone();
 
@@ -3584,7 +3609,8 @@ impl MVCCEngine {
 
         // SH transactional_ddl_fence: prevents checkpoint from interleaving with this
         // DROP's schemas-remove + record_ddl (would leave catalog without DropTable record).
-        let _ddl_fence_guard = self.transactional_ddl_fence.read();
+        // read_recursive: an api::Transaction on this thread may hold the fence SH.
+        let _ddl_fence_guard = self.transactional_ddl_fence.read_recursive();
 
         let table_name = name.to_lowercase();
 
@@ -4024,15 +4050,16 @@ impl MVCCEngine {
 
     /// Load manifests for checkpoint-to-volume recovery. Returns min checkpoint_lsn
     /// (0 if none). Actual .vol files are loaded by load_standalone_volumes after replay.
-    fn load_manifests_from_volumes(&self) -> u64 {
+    /// Errors only on read-only opens that can't reach a consistent manifest view.
+    fn load_manifests_from_volumes(&self) -> Result<u64> {
         let pm = match self.persistence.as_ref() {
             Some(pm) if pm.is_enabled() => pm,
-            _ => return 0,
+            _ => return Ok(0),
         };
 
         let vol_dir = pm.path().join("volumes");
         if !vol_dir.exists() {
-            return 0;
+            return Ok(0);
         }
 
         let read_only_open = self.is_read_only_mode();
@@ -4041,7 +4068,7 @@ impl MVCCEngine {
         for attempt in 0..max_attempts {
             let entries = match std::fs::read_dir(&vol_dir) {
                 Ok(e) => e,
-                Err(_) => return 0,
+                Err(_) => return Ok(0),
             };
 
             let mut min_checkpoint_lsn: u64 = u64::MAX;
@@ -4119,10 +4146,36 @@ impl MVCCEngine {
             }
 
             if !any_loaded {
-                // No manifests: drop checkpoint.meta to force full WAL replay.
                 let checkpoint_path = pm.path().join("wal").join("checkpoint.meta");
-                let _ = std::fs::remove_file(checkpoint_path);
-                return 0;
+                if !read_only_open {
+                    // No manifests: drop checkpoint.meta to force full WAL replay.
+                    let _ = std::fs::remove_file(checkpoint_path);
+                    return Ok(0);
+                }
+                // Read-only must never unlink writer-owned state. A
+                // checkpoint.meta floor of 0 (absent, unreadable, or written
+                // by WAL rotation before any checkpoint) publishes no replay
+                // floor, so replay from 0 sees everything. A floor > 0 means
+                // a checkpoint published manifests we can't read yet (writer
+                // mid-first-checkpoint), so replay would skip entries whose
+                // data lives in volumes we can't load: retry until the
+                // manifests land, then fail rather than serve a torn view.
+                let published_floor =
+                    crate::storage::mvcc::wal_manager::CheckpointMetadata::read_from_file(
+                        &checkpoint_path,
+                    )
+                    .map(|c| c.lsn)
+                    .unwrap_or(0);
+                if published_floor == 0 {
+                    return Ok(0);
+                }
+                if attempt + 1 < max_attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                return Err(Error::SwmrPartialReload(
+                    "no readable table manifests despite an existing checkpoint.meta".to_string(),
+                ));
             }
 
             if read_only_open
@@ -4133,23 +4186,13 @@ impl MVCCEngine {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     continue;
                 }
-                eprintln!(
-                    "Warning: read-only open observed mixed checkpoint_lsn range {}..{}; \
-                     falling back to WAL replay from 0",
+                // Mid-checkpoint window never closed. Fail instead of
+                // proceeding with a torn view (and never touch the writer's
+                // checkpoint.meta from a reader).
+                return Err(Error::SwmrPartialReload(format!(
+                    "mixed checkpoint_lsn range {}..{} across table manifests",
                     observed_checkpoint_min, observed_checkpoint_max
-                );
-                // Install staged managers BEFORE returning so the
-                // load_standalone_volumes pass that follows finds
-                // per-table manifests and doesn't silently skip every
-                // .vol as orphan-not-in-manifest.
-                let mut mgrs = self.segment_managers.write().unwrap();
-                for (table_name, mgr) in staged {
-                    mgrs.insert(table_name, mgr);
-                }
-                drop(mgrs);
-                let checkpoint_path = pm.path().join("wal").join("checkpoint.meta");
-                let _ = std::fs::remove_file(checkpoint_path);
-                return 0;
+                )));
             }
 
             // Store managers so WAL replay can use is_row_id_in_volume_range for tombstones.
@@ -4158,14 +4201,14 @@ impl MVCCEngine {
                 mgrs.insert(table_name, mgr);
             }
 
-            return if min_checkpoint_lsn == u64::MAX {
+            return Ok(if min_checkpoint_lsn == u64::MAX {
                 0
             } else {
                 min_checkpoint_lsn
-            };
+            });
         }
 
-        0
+        Ok(0)
     }
 
     /// Load standalone volumes from the volumes/ directory.
@@ -4376,17 +4419,10 @@ impl MVCCEngine {
         }
     }
 
-    /// Sync auto-increment counters from segment data.
-    ///
-    /// After WAL replay, set `schema_epoch` to the highest segment
-    /// `schema_version` observed across all loaded manifests. WAL replay
-    /// loads schemas via direct map insertion (recovery path) rather
-    /// than the public DDL methods that bump `schema_epoch`, so without
-    /// this sync the counter would stay at 0 after recovering N tables.
-    /// The v2 SWMR drift check requires this baseline to distinguish
-    /// "segment from a writer DDL the reader has WAL-replayed" (safe)
-    /// from "segment from writer DDL since this reader opened" (must
-    /// fail with `Error::SchemaChanged`).
+    /// After WAL replay, raise `schema_epoch` to the highest segment
+    /// `schema_version` across loaded manifests. Replay inserts schemas
+    /// directly without bumping the epoch; without this baseline the
+    /// SWMR drift check would flag already-replayed writer DDL.
     fn sync_schema_epoch_from_segments(&self) {
         let mgrs = self.segment_managers.read().unwrap();
         if mgrs.is_empty() {
@@ -5047,7 +5083,8 @@ impl MVCCEngine {
         // CreateView re-record that survives recovery even
         // if the original `record_ddl` later fails and the
         // rollback removes the view from memory.
-        let _ddl_fence_guard = self.transactional_ddl_fence.read();
+        // read_recursive: the txn may already hold the fence SH.
+        let _ddl_fence_guard = self.transactional_ddl_fence.read_recursive();
 
         let name_lower = name.to_lowercase();
 
@@ -5105,7 +5142,8 @@ impl MVCCEngine {
         }
 
         // SH transactional_ddl_fence (same as drop_table_internal).
-        let _ddl_fence_guard = self.transactional_ddl_fence.read();
+        // read_recursive: the txn may already hold the fence SH.
+        let _ddl_fence_guard = self.transactional_ddl_fence.read_recursive();
 
         let name_lower = name.to_lowercase();
         let mut views = self.views.write().unwrap();
@@ -6828,10 +6866,15 @@ impl MVCCEngine {
 
         // Stamp = on_disk + 1 so a failed bump_epoch can't false-certify
         // the reap (reader can't reach on_disk + 1 without a future bump).
-        let on_disk =
-            crate::storage::mvcc::manifest_epoch::read_epoch(std::path::Path::new(&self.path))
-                .unwrap_or(0);
-        let stamp_epoch = on_disk.saturating_add(1);
+        // Read under epoch_bump_lock so the stamp is never computed against
+        // a value an in-flight bump is about to overwrite.
+        let stamp_epoch = {
+            let _epoch_guard = self.epoch_bump_lock.lock();
+            let on_disk =
+                crate::storage::mvcc::manifest_epoch::read_epoch(std::path::Path::new(&self.path))
+                    .unwrap_or(0);
+            on_disk.saturating_add(1)
+        };
         let min_reader_epoch = self.min_reader_handle_epoch();
         for (table, in_mem_ids) in &per_table_in_memory {
             let manifest_path = vol_dir.join(table).join("manifest.bin");
@@ -6880,6 +6923,15 @@ impl MVCCEngine {
                 self.orphan_discovery_failed.store(true, Ordering::Release);
             }
         }
+    }
+
+    /// Bump the on-disk manifest epoch under `epoch_bump_lock`. Every bump
+    /// site must route through here: the read+write in `bump_epoch` is not
+    /// atomic, and an unserialized interleave (e.g. a stalled compaction
+    /// bump vs a checkpoint bump) can regress the epoch.
+    fn bump_manifest_epoch(&self) -> Result<u64> {
+        let _guard = self.epoch_bump_lock.lock();
+        crate::storage::mvcc::manifest_epoch::bump_epoch(std::path::Path::new(&self.path))
     }
 
     /// Inner checkpoint implementation. When `force` is true, seals ALL hot rows
@@ -7031,9 +7083,7 @@ impl MVCCEngine {
         // state. Skip on memory engines (no path) and when the fence
         // didn't acquire (checkpoint_lsn==0).
         if checkpoint_lsn > 0 && all_manifests_persisted && !self.path.is_empty() {
-            if let Err(e) =
-                crate::storage::mvcc::manifest_epoch::bump_epoch(std::path::Path::new(&self.path))
-            {
+            if let Err(e) = self.bump_manifest_epoch() {
                 eprintln!("Warning: Failed to bump manifest epoch: {}", e);
             }
         }
@@ -7646,9 +7696,7 @@ impl MVCCEngine {
         // referencing orphaned old segment IDs. The reaper handles
         // file unlinks via the on-disk retire-sidecar protocol.
         if !self.path.is_empty() {
-            if let Err(e) =
-                crate::storage::mvcc::manifest_epoch::bump_epoch(std::path::Path::new(&self.path))
-            {
+            if let Err(e) = self.bump_manifest_epoch() {
                 eprintln!("Warning: post-compaction manifest epoch bump failed: {}", e);
             }
         }
@@ -9109,13 +9157,9 @@ impl EngineOperations {
 
 impl EngineOperations {
     /// Mirror of `MVCCEngine::defer_for_live_readers` for the
-    /// transactional-DDL DROP path. Uses the SHARED
-    /// `lease_max_age_nanos` so the effective window matches
-    /// the engine's; falls back to the 120s engine floor only
-    /// if the engine hasn't published a value yet (which
-    /// `MVCCEngine::open_engine` primes). Same fail-closed
-    /// semantics: an FS error reading reader leases returns
-    /// `true`.
+    /// transactional-DDL DROP path. Uses the shared `lease_max_age_nanos`
+    /// (120s engine floor if unset). Same fail-closed semantics: an FS
+    /// error reading reader leases returns `true`.
     fn defer_for_live_readers(&self) -> bool {
         if self.engine_path.is_empty() {
             return false;

@@ -3083,3 +3083,55 @@ fn last_drop_during_ticker_refresh_does_not_panic() {
         drop(ro);
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn ro_aggregates_correct_after_writer_checkpoint_seals_hot_rows() {
+    // Reader attaches while rows are WAL-only (hot overlay). After the
+    // writer checkpoints the same row_ids into a cold volume and the
+    // reader refreshes, rows exist in BOTH hot and cold; the stats fast
+    // path must not double-count SUM/AVG or report shadowed cold MIN/MAX.
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("ro_agg_seal.db");
+    let dsn_rw = format!("file://{}", path.display());
+
+    let writer = Database::open(&dsn_rw).unwrap();
+    writer
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    for i in 1..=5i64 {
+        writer
+            .execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10), ())
+            .unwrap();
+    }
+
+    let dsn_ro = format!("file://{}?read_only=true", path.display());
+    let ro = Database::open_read_only(&dsn_ro).unwrap();
+
+    let check = |phase: &str| {
+        let mut rows = ro
+            .query("SELECT COUNT(*), SUM(x), AVG(x), MIN(x), MAX(x) FROM t", ())
+            .unwrap();
+        let row = rows.next().expect("aggregate row").unwrap();
+        let cnt: i64 = row.get(0).unwrap();
+        let sum: i64 = row.get(1).unwrap();
+        let avg: f64 = row.get(2).unwrap();
+        let min: i64 = row.get(3).unwrap();
+        let max: i64 = row.get(4).unwrap();
+        assert_eq!(cnt, 5, "COUNT(*) {}", phase);
+        assert_eq!(sum, 150, "SUM(x) {}", phase);
+        assert_eq!(avg, 30.0, "AVG(x) {}", phase);
+        assert_eq!(min, 10, "MIN(x) {}", phase);
+        assert_eq!(max, 50, "MAX(x) {}", phase);
+    };
+
+    check("with rows in reader hot overlay only");
+
+    writer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    ro.refresh().unwrap();
+
+    check("after checkpoint sealed the same rows to cold");
+
+    drop(ro);
+    drop(writer);
+}

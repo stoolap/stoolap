@@ -106,7 +106,7 @@ impl Transaction {
     /// the SQL parsing / executor overhead.
     pub fn table_count(&self, name: &str) -> Result<u64> {
         self.check_active()?;
-        let txn_id = self.tx.as_ref().unwrap().id();
+        let txn_id = self.tx.as_ref().ok_or(Error::TransactionNotStarted)?.id();
         let table = self.entry.engine.get_table_for_txn(txn_id, name)?;
         if let Some(c) = table.fast_row_count() {
             return Ok(c as u64);
@@ -121,7 +121,10 @@ impl Transaction {
     /// existing name overwrites the prior savepoint with the same name.
     pub fn create_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
-        self.tx.as_mut().unwrap().create_savepoint(name)
+        self.tx
+            .as_mut()
+            .ok_or(Error::TransactionNotStarted)?
+            .create_savepoint(name)
     }
 
     /// Release a savepoint without rolling back.
@@ -131,7 +134,10 @@ impl Transaction {
     /// name is an error.
     pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
-        self.tx.as_mut().unwrap().release_savepoint(name)
+        self.tx
+            .as_mut()
+            .ok_or(Error::TransactionNotStarted)?
+            .release_savepoint(name)
     }
 
     /// Roll back to the named savepoint.
@@ -140,7 +146,10 @@ impl Transaction {
     /// The savepoint itself is removed, matching standard SQL semantics.
     pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
-        self.tx.as_mut().unwrap().rollback_to_savepoint(name)
+        self.tx
+            .as_mut()
+            .ok_or(Error::TransactionNotStarted)?
+            .rollback_to_savepoint(name)
     }
 
     /// Execute a SQL statement within the transaction
