@@ -22,17 +22,55 @@ use std::sync::Arc;
 
 use crate::core::{Error, IsolationLevel, Result, Schema, SchemaColumn};
 use crate::storage::mvcc::{get_fast_timestamp, TransactionRegistry};
-use crate::storage::traits::{QueryResult, Table, Transaction};
+use crate::storage::traits::{
+    QueryResult, ReadTable, ReadTransaction, WriteTable, WriteTransaction,
+};
 use crate::storage::Expression;
 
 /// DDL state captured at savepoint creation time.
-/// Used to rollback CREATE/DROP TABLE operations when rolling back to a savepoint.
 #[derive(Debug, Clone, Copy)]
 struct SavepointDdlState {
-    /// Number of created_tables entries at savepoint time
-    created_tables_len: usize,
-    /// Number of dropped_tables entries at savepoint time
-    dropped_tables_len: usize,
+    /// Length of `ddl_log` at savepoint time; rollback walks the suffix in reverse.
+    ddl_log_len: usize,
+}
+
+/// Pre-drop snapshot used to undo a transactional DROP TABLE on rollback.
+#[derive(Debug, Clone)]
+pub struct DropSnapshot {
+    /// Parent table schema, recreated on rollback.
+    pub parent_schema: Schema,
+    /// (child_table, pre-strip schema) for each child whose FK referenced the parent.
+    pub child_schemas: Vec<(String, Schema)>,
+    /// Serialized `IndexMetadata` for every non-PK index on the dropped table.
+    pub indexes: Vec<Vec<u8>>,
+}
+
+/// DDL operation queued for durable WAL write at commit time, gated by the txn's commit marker.
+#[derive(Debug, Clone)]
+pub enum DeferredDdlOp {
+    Create {
+        name: String,
+        schema_data: Vec<u8>,
+    },
+    Drop {
+        name: String,
+    },
+    CreateIndex {
+        table_name: String,
+        metadata: Vec<u8>,
+    },
+}
+
+/// One DDL op in an ordered log; rollback walks in reverse so CREATE/DROP sequences
+/// against the same name resolve correctly without coalescing.
+#[derive(Debug, Clone)]
+enum DdlOp {
+    Create(String, Schema),
+    /// DROP with pre-drop snapshot. No durable compensation on rollback (durable DROP
+    /// is only emitted from the commit path).
+    Drop(String, DropSnapshot),
+    /// Pre-serialized `IndexMetadata` for the deferred commit-time WAL flush.
+    CreateIndex(String, Vec<u8>),
 }
 
 /// State captured when a savepoint is created.
@@ -64,7 +102,7 @@ pub struct MvccTransaction {
     /// Transaction state
     state: TransactionState,
     /// Tables accessed in this transaction
-    tables: FxHashMap<String, Box<dyn Table>>,
+    tables: FxHashMap<String, Box<dyn WriteTable>>,
     /// Transaction-specific isolation level (if different from engine default)
     isolation_level: Option<IsolationLevel>,
     /// Reference to the transaction registry
@@ -77,10 +115,12 @@ pub struct MvccTransaction {
     engine_operations: Option<Arc<dyn TransactionEngineOperations>>,
     /// Savepoints: maps savepoint name to state (timestamp + DDL snapshot)
     savepoints: FxHashMap<String, SavepointState>,
-    /// Tables created in this transaction (for rollback)
-    created_tables: Vec<String>,
-    /// Tables dropped in this transaction (for rollback - stores name and schema)
-    dropped_tables: Vec<(String, Schema)>,
+    /// Ordered DDL log; rollback walks in reverse to apply inverses.
+    ddl_log: Vec<DdlOp>,
+    /// Shared hold on the transactional-DDL fence, acquired lazily on the first
+    /// CREATE/DROP and released on resolve. Blocks checkpoint's `rerecord_ddl_to_wal`
+    /// from snapshotting a half-mutated catalog.
+    transactional_ddl_guard: Option<TransactionalDdlFenceGuard>,
 }
 
 /// Operations that require engine access
@@ -89,13 +129,58 @@ pub struct MvccTransaction {
 /// without creating circular dependencies.
 pub trait TransactionEngineOperations: Send + Sync {
     /// Get a table by name, initializing transaction-local version store
-    fn get_table_for_transaction(&self, txn_id: i64, table_name: &str) -> Result<Box<dyn Table>>;
+    fn get_table_for_transaction(
+        &self,
+        txn_id: i64,
+        table_name: &str,
+    ) -> Result<Box<dyn WriteTable>>;
 
     /// Create a new table
-    fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn Table>>;
+    fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn WriteTable>>;
 
-    /// Drop a table
-    fn drop_table(&self, name: &str) -> Result<()>;
+    /// Drop a table within a transaction (in-memory only). Durable DropTable WAL is
+    /// deferred to the commit path; physical file deletion is deferred to
+    /// `finalize_committed_drops`. Returns the pre-drop snapshot needed for rollback.
+    fn drop_table(&self, name: &str) -> Result<DropSnapshot>;
+
+    /// Emit durable DDL WAL entries under `txn_id` (no auto-commit marker). Visibility
+    /// is gated by the txn's commit marker; orphans without a marker are skipped on recovery.
+    fn flush_transactional_ddl(&self, txn_id: i64, ops: &[DeferredDdlOp]) -> Result<()>;
+
+    /// Run post-commit physical side effects of every committed DROP: clear segment
+    /// state and delete on-disk volume files. Called after the commit marker is durable.
+    fn finalize_committed_drops(&self, names: &[String]);
+
+    /// Restore (child, schema) pairs in catalog and child VersionStores; inverse of
+    /// `strip_fk_references` from `drop_table`.
+    fn restore_child_fk_schemas(&self, schemas: &[(String, Schema)]) -> Result<()>;
+
+    /// Drain `name` from `pending_drop_cleanups` so a rollback's inverse `create_table`
+    /// isn't refused by the DROP-in-progress guard.
+    fn release_pending_drop_cleanup(&self, name: &str);
+
+    /// Rebuild secondary indexes on the re-inserted VersionStore from serialized metadata.
+    fn restore_table_indexes(&self, table_name: &str, indexes: &[Vec<u8>]) -> Result<()>;
+
+    /// Build the serialized `IndexMetadata` payload for staging on the txn's deferred
+    /// commit-time WAL flush. Mirrors `MVCCEngine::record_create_index` on auto-commit.
+    #[allow(clippy::too_many_arguments)]
+    fn build_index_metadata(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        column_names: &[String],
+        is_unique: bool,
+        index_type: crate::core::IndexType,
+        hnsw_m: Option<u16>,
+        hnsw_ef_construction: Option<u16>,
+        hnsw_ef_search: Option<u16>,
+        hnsw_distance_metric: Option<u8>,
+    ) -> Result<Vec<u8>>;
+
+    /// Release a pinned DDL marker LSN from `pending_marker_lsns` and publish the new
+    /// safe-visible watermark. `lsn = 0` is a no-op; idempotent.
+    fn release_pending_ddl_marker(&self, lsn: u64);
 
     /// List all tables
     fn list_tables(&self) -> Result<Vec<String>>;
@@ -104,34 +189,57 @@ pub trait TransactionEngineOperations: Send + Sync {
     fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()>;
 
     /// Commit table changes
-    fn commit_table(&self, txn_id: i64, table: &dyn Table) -> Result<()>;
+    fn commit_table(&self, txn_id: i64, table: &dyn WriteTable) -> Result<()>;
 
     /// Rollback table changes
-    fn rollback_table(&self, txn_id: i64, table: &dyn Table);
+    fn rollback_table(&self, txn_id: i64, table: &dyn WriteTable);
 
-    /// Record commit in WAL
-    fn record_commit(&self, txn_id: i64) -> Result<()>;
+    /// Record a commit marker in the WAL. Returns marker LSN (0 when not written:
+    /// recovery replay, in-memory engine, persistence disabled).
+    fn record_commit(&self, txn_id: i64, commit_seq: i64) -> Result<u64>;
+
+    /// Publish the marker LSN to `db.shm` header. Called AFTER `complete_commit` so
+    /// readers see durable + in-process visible together. Also clears this txn from
+    /// `active_txn_first_lsn` to keep the safe-visible watermark monotonic.
+    fn publish_visible_commit_lsn(&self, txn_id: i64, lsn: u64);
 
     /// Record rollback in WAL
     fn record_rollback(&self, txn_id: i64) -> Result<()>;
 
     /// Get all tables with pending changes for a transaction
-    fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn Table>>>;
+    fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn WriteTable>>>;
 
     /// Check if transaction has any pending DML changes (without allocating)
     fn has_pending_dml_changes(&self, txn_id: i64) -> bool;
 
     /// Commit all tables for a transaction at once (includes WAL recording).
     ///
-    /// Returns `(any_committed, optional_error)`:
-    /// - `(false, None)`: no tables had changes, nothing to do
-    /// - `(true, None)`: all tables committed successfully
-    /// - `(true, Some(e))`: partial commit - some tables committed before error
-    /// - `(false, Some(e))`: error before any table committed
+    /// Returns `(any_committed, optional_error, tables_with_pending_tombstones)`:
+    /// - `(false, None, [])`: no tables had changes, nothing to do
+    /// - `(true, None, tables)`: all tables committed successfully
+    /// - `(true, Some(e), tables)`: partial commit - some tables committed before error
+    /// - `(false, Some(e), [])`: error before any table committed
     ///
     /// Callers MUST complete_commit if any_committed is true, even on error,
     /// to avoid orphaning already-committed rows.
-    fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>);
+    fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>, Vec<String>);
+
+    /// Latch the engine into catastrophic-failure state so seal/compaction/backup
+    /// refuse until restart. Used when commit fails after parent VersionStores have
+    /// been drained but no commit marker is durable.
+    fn mark_engine_failed(&self);
+
+    /// Move this txn's pending cold tombstones into committed state, stamped with
+    /// `marker_lsn` as `visible_at_lsn` and `commit_seq` for snapshot-iso filtering.
+    /// `commit_seq` is passed in (not re-read) so the partial-commit path can stamp
+    /// after `complete_commit` has removed the txn from the registry.
+    fn stamp_pending_tombstones(
+        &self,
+        txn_id: i64,
+        commit_seq: u64,
+        marker_lsn: u64,
+        tables: &[String],
+    );
 
     /// Rollback all tables for a transaction at once
     /// This cleans up the transaction's entries in txn_version_stores
@@ -139,43 +247,38 @@ pub trait TransactionEngineOperations: Send + Sync {
 
     /// Defer table cleanup to background thread (avoids synchronous deallocation)
     /// Default implementation drops synchronously
-    fn defer_table_cleanup(&self, _tables: Vec<Box<dyn Table>>) {
+    fn defer_table_cleanup(&self, _tables: Vec<Box<dyn WriteTable>>) {
         // Default: just drop synchronously (tables dropped when _tables goes out of scope)
     }
 
-    /// Acquire the seal fence shared lock. Commits hold this to signal they
-    /// are in-flight. The checkpoint micro-seal acquires the exclusive lock,
-    /// waiting for all in-flight commits to complete before draining hot rows.
-    /// Returns None for in-memory engines (no persistence, no seal fence needed).
+    /// Acquire the seal fence shared lock; held by in-flight commits to make the
+    /// checkpoint micro-seal wait. None for in-memory engines.
     fn acquire_seal_fence(&self) -> Option<SealFenceGuard> {
+        None
+    }
+
+    /// Acquire the transactional-DDL fence shared lock. None for non-engine impls.
+    fn acquire_transactional_ddl_fence(&self) -> Option<TransactionalDdlFenceGuard> {
         None
     }
 }
 
-/// RAII guard that holds a seal fence read lock. When dropped, the read lock
-/// is released. The checkpoint micro-seal acquires the write lock, which
-/// blocks until all SealFenceGuards are dropped.
+/// RAII shared read-lock on the seal fence. Checkpoint micro-seal takes the write
+/// lock, blocking until all guards are dropped.
 pub struct SealFenceGuard {
-    /// Keep the Arc alive so the lock outlives the guard.
     _lock: Arc<parking_lot::RwLock<()>>,
-    /// Raw pointer to avoid lifetime issues with RwLockReadGuard.
-    /// SAFETY: The Arc above keeps the RwLock alive.
+    /// Raw pointer kept null; lock lifetime is managed via raw lock_shared/unlock_shared.
     _raw: *const (),
 }
 
-// SAFETY: SealFenceGuard only holds an Arc (Send+Sync) and a raw read-lock
-// that is released on drop. The guard is created and dropped on the same
-// thread (the commit thread). The raw pointer is not dereferenced.
+// SAFETY: holds an Arc and a balanced shared raw-lock; created/dropped on one thread.
 unsafe impl Send for SealFenceGuard {}
 unsafe impl Sync for SealFenceGuard {}
 
 impl SealFenceGuard {
     pub fn new(lock: Arc<parking_lot::RwLock<()>>) -> Self {
-        // Acquire the read lock via the raw API so we can control the lifetime.
-        // parking_lot::RawRwLock::lock_shared is balanced by unlock_shared in Drop.
         use parking_lot::lock_api::RawRwLock;
-        // SAFETY: lock_shared() is always safe to call. We balance it with
-        // unlock_shared() in Drop. The Arc keeps the RwLock alive.
+        // SAFETY: lock_shared() balanced by unlock_shared() in Drop; Arc keeps lock alive.
         unsafe { lock.raw().lock_shared() };
         Self {
             _raw: std::ptr::null(),
@@ -187,7 +290,41 @@ impl SealFenceGuard {
 impl Drop for SealFenceGuard {
     fn drop(&mut self) {
         use parking_lot::lock_api::RawRwLock;
-        // SAFETY: We acquired lock_shared() in new(), this is the balancing release.
+        // SAFETY: balancing release of the lock_shared() in new().
+        unsafe { self._lock.raw().unlock_shared() };
+    }
+}
+
+/// RAII shared read-lock on the transactional-DDL fence. Checkpoint's
+/// `rerecord_ddl_to_wal` takes the exclusive lock, blocking until all guards drop.
+pub struct TransactionalDdlFenceGuard {
+    _lock: Arc<parking_lot::RwLock<()>>,
+    _raw: *const (),
+}
+
+// SAFETY: same reasoning as `SealFenceGuard`.
+unsafe impl Send for TransactionalDdlFenceGuard {}
+unsafe impl Sync for TransactionalDdlFenceGuard {}
+
+impl TransactionalDdlFenceGuard {
+    pub fn new(lock: Arc<parking_lot::RwLock<()>>) -> Self {
+        use parking_lot::lock_api::RawRwLockRecursive;
+        // Recursive: the thread may already hold this fence SH (earlier DDL in
+        // the same txn); a plain lock_shared() would queue behind a parked
+        // checkpoint writer and deadlock.
+        // SAFETY: lock_shared_recursive() balanced by unlock_shared() in Drop.
+        unsafe { lock.raw().lock_shared_recursive() };
+        Self {
+            _raw: std::ptr::null(),
+            _lock: lock,
+        }
+    }
+}
+
+impl Drop for TransactionalDdlFenceGuard {
+    fn drop(&mut self) {
+        use parking_lot::lock_api::RawRwLock;
+        // SAFETY: balancing release of the lock_shared() in new().
         unsafe { self._lock.raw().unlock_shared() };
     }
 }
@@ -205,8 +342,8 @@ impl MvccTransaction {
             last_table_name: None,
             engine_operations: None,
             savepoints: FxHashMap::default(),
-            created_tables: Vec::new(),
-            dropped_tables: Vec::new(),
+            ddl_log: Vec::new(),
+            transactional_ddl_guard: None,
         }
     }
 
@@ -248,51 +385,157 @@ impl MvccTransaction {
 
     /// Clean up transaction resources
     fn cleanup(&mut self) {
-        // Clear fast path cache
         self.last_table_name = None;
-
-        // Clear tables
         self.tables.clear();
-
-        // Clear DDL tracking
-        self.created_tables.clear();
-        self.dropped_tables.clear();
-
-        // Remove transaction isolation level from registry
+        self.ddl_log.clear();
+        // Released LAST so checkpoint observing the unlock sees fully converged catalog state.
+        self.transactional_ddl_guard = None;
         self.registry.remove_transaction_isolation_level(self.id);
     }
 
-    /// Roll back DDL operations (CREATE TABLE / DROP TABLE) in reverse order.
-    /// Used by both explicit rollback() and implicit Drop.
-    fn rollback_ddl(&self, ops: &dyn TransactionEngineOperations) {
-        // Drop tables that were created in this transaction
-        for table_name in self.created_tables.iter().rev() {
-            if let Err(e) = ops.drop_table(table_name) {
-                eprintln!(
-                    "Warning: Failed to drop table '{}' during DDL rollback: {}",
-                    table_name, e
-                );
+    /// Walk `ddl_log` in reverse and apply each inverse. Continues across errors;
+    /// returns the first one and latches the engine into the failure state so further
+    /// durable writes refuse. Reverse-order undo handles CREATE/DROP interleavings
+    /// against the same name correctly without coalescing.
+    fn rollback_ddl(&self, ops: &dyn TransactionEngineOperations) -> Result<()> {
+        let mut undo_err: Option<Error> = None;
+        let mut latched = false;
+        for op in self.ddl_log.iter().rev() {
+            match op {
+                DdlOp::Create(table_name, _schema) => {
+                    // Inverse is in-memory drop only; original CREATE never wrote WAL.
+                    match ops.drop_table(table_name) {
+                        Ok(_snapshot) => {
+                            // Release the pending-drop mark deposited by drop_table;
+                            // otherwise it leaks for the process lifetime and blocks
+                            // same-name CREATE forever on in-memory engines.
+                            ops.release_pending_drop_cleanup(table_name);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Error: Failed to drop transaction-created table '{}' \
+                                 during DDL rollback: {} - latching engine and \
+                                 propagating; restart will reconverge via WAL \
+                                 recovery.",
+                                table_name, e
+                            );
+                            if undo_err.is_none() {
+                                undo_err = Some(e);
+                            }
+                            if !latched {
+                                ops.mark_engine_failed();
+                                latched = true;
+                            }
+                        }
+                    }
+                }
+                DdlOp::Drop(table_name, snapshot) => {
+                    // Inverse is in-memory restore; the deferred-DDL DROP never wrote WAL.
+                    // Release the DROP-in-progress mark before the inverse create_table.
+                    ops.release_pending_drop_cleanup(table_name);
+                    if let Err(e) = ops.create_table(table_name, snapshot.parent_schema.clone()) {
+                        eprintln!(
+                            "Error: Failed to recreate dropped table '{}' during \
+                             DDL rollback: {} - latching engine and propagating.",
+                            table_name, e
+                        );
+                        if undo_err.is_none() {
+                            undo_err = Some(e);
+                        }
+                        if !latched {
+                            ops.mark_engine_failed();
+                            latched = true;
+                        }
+                        continue;
+                    }
+                    // Restore child FK constraints stripped by `strip_fk_references`.
+                    if let Err(e) = ops.restore_child_fk_schemas(&snapshot.child_schemas) {
+                        eprintln!(
+                            "Error: Failed to restore child FK schemas while undoing \
+                             drop of '{}': {} - latching engine and propagating.",
+                            table_name, e
+                        );
+                        if undo_err.is_none() {
+                            undo_err = Some(e);
+                        }
+                        if !latched {
+                            ops.mark_engine_failed();
+                            latched = true;
+                        }
+                    }
+                    // Restore secondary indexes so live state matches recovery's view.
+                    if let Err(e) = ops.restore_table_indexes(table_name, &snapshot.indexes) {
+                        eprintln!(
+                            "Error: Failed to restore secondary indexes while undoing \
+                             drop of '{}': {} - latching engine and propagating.",
+                            table_name, e
+                        );
+                        if undo_err.is_none() {
+                            undo_err = Some(e);
+                        }
+                        if !latched {
+                            ops.mark_engine_failed();
+                            latched = true;
+                        }
+                    }
+                }
+                DdlOp::CreateIndex(_, _) => {
+                    // No inverse: index lives on the parent VersionStore which the
+                    // surrounding Create's rollback removes. Explicit tx.create_index
+                    // on a pre-existing table would need its own inverse.
+                }
             }
         }
+        match undo_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 
-        // Recreate tables that were dropped in this transaction
-        for (table_name, schema) in self.dropped_tables.iter().rev() {
-            if let Err(e) = ops.create_table(table_name, schema.clone()) {
-                eprintln!(
-                    "Warning: Failed to recreate table '{}' during DDL rollback: {}",
-                    table_name, e
-                );
+    /// Serialize `ddl_log` (in insertion order) into the deferred ops list for
+    /// `flush_transactional_ddl`.
+    fn build_deferred_ddl_ops(&self) -> Vec<DeferredDdlOp> {
+        let mut out = Vec::with_capacity(self.ddl_log.len());
+        for op in &self.ddl_log {
+            match op {
+                DdlOp::Create(name, schema) => {
+                    let schema_data =
+                        crate::storage::mvcc::engine::MVCCEngine::serialize_schema(schema);
+                    out.push(DeferredDdlOp::Create {
+                        name: name.clone(),
+                        schema_data,
+                    });
+                }
+                DdlOp::Drop(name, _snapshot) => {
+                    out.push(DeferredDdlOp::Drop { name: name.clone() });
+                }
+                DdlOp::CreateIndex(table_name, metadata) => {
+                    out.push(DeferredDdlOp::CreateIndex {
+                        table_name: table_name.clone(),
+                        metadata: metadata.clone(),
+                    });
+                }
             }
         }
+        out
+    }
+
+    /// Collect DROP names from `ddl_log` for `finalize_committed_drops` after commit.
+    fn collect_committed_drop_names(&self) -> Vec<String> {
+        self.ddl_log
+            .iter()
+            .filter_map(|op| match op {
+                DdlOp::Drop(name, _) => Some(name.clone()),
+                DdlOp::Create(_, _) | DdlOp::CreateIndex(_, _) => None,
+            })
+            .collect()
     }
 
     /// Check if this is a read-only transaction
     fn is_read_only(&self) -> bool {
-        // Check for DDL changes
-        if !self.created_tables.is_empty() || !self.dropped_tables.is_empty() {
+        if !self.ddl_log.is_empty() {
             return false;
         }
-        // Check for DML changes via engine operations
         if let Some(ops) = &self.engine_operations {
             if ops.has_pending_dml_changes(self.id) {
                 return false;
@@ -301,16 +544,12 @@ impl MvccTransaction {
         true
     }
 
-    /// Creates a savepoint with the given name
-    ///
-    /// Records the current timestamp and DDL state so we can rollback to this point later.
-    /// If a savepoint with this name already exists, it is overwritten.
+    /// Creates a savepoint, overwriting any existing one with the same name.
     pub fn create_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
         let timestamp = get_fast_timestamp();
         let ddl_state = SavepointDdlState {
-            created_tables_len: self.created_tables.len(),
-            dropped_tables_len: self.dropped_tables.len(),
+            ddl_log_len: self.ddl_log.len(),
         };
         self.savepoints.insert(
             name.to_string(),
@@ -322,10 +561,7 @@ impl MvccTransaction {
         Ok(())
     }
 
-    /// Releases (removes) a savepoint without rolling back
-    ///
-    /// The changes made after the savepoint remain intact.
-    /// Returns an error if the savepoint doesn't exist.
+    /// Releases a savepoint without rolling back. Errors if the savepoint doesn't exist.
     pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
         if self.savepoints.remove(name).is_none() {
@@ -337,11 +573,8 @@ impl MvccTransaction {
         Ok(())
     }
 
-    /// Rolls back to a savepoint, discarding all changes made after it
-    ///
-    /// All local DML changes with timestamps after the savepoint are discarded.
-    /// DDL operations (CREATE/DROP TABLE) after the savepoint are also reversed.
-    /// The savepoint itself is also removed (SQL standard behavior).
+    /// Rolls back to a savepoint, discarding all DML and DDL changes made after it.
+    /// The savepoint itself is removed (SQL standard).
     pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
 
@@ -358,31 +591,96 @@ impl MvccTransaction {
             }
         }
 
-        // Rollback DDL: undo CREATE TABLEs after savepoint
+        // Walk post-savepoint ddl_log suffix in reverse and apply inverses; mirrors
+        // `rollback_ddl`. Truncate only after success so a partial failure leaves the
+        // suffix intact for retry / hard rollback / Drop sweep.
         if let Some(ops) = &self.engine_operations {
-            // Tables created after savepoint need to be dropped
-            while self.created_tables.len() > sp_state.ddl_state.created_tables_len {
-                if let Some(table_name) = self.created_tables.pop() {
-                    if let Err(e) = ops.drop_table(&table_name) {
-                        eprintln!(
-                            "Warning: Failed to drop table '{}' during savepoint rollback: {}",
-                            table_name, e
-                        );
+            let after_save_lo = sp_state.ddl_state.ddl_log_len;
+            let mut undo_err: Option<Error> = None;
+            let mut latched = false;
+            for op in self.ddl_log[after_save_lo..].iter().rev() {
+                match op {
+                    DdlOp::Create(table_name, _schema) => match ops.drop_table(table_name) {
+                        Ok(_snapshot) => {
+                            ops.release_pending_drop_cleanup(table_name);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Error: Failed to drop transaction-created table '{}' \
+                                     during savepoint rollback: {} - latching engine and \
+                                     propagating.",
+                                table_name, e
+                            );
+                            if undo_err.is_none() {
+                                undo_err = Some(e);
+                            }
+                            if !latched {
+                                ops.mark_engine_failed();
+                                latched = true;
+                            }
+                        }
+                    },
+                    DdlOp::Drop(table_name, snapshot) => {
+                        ops.release_pending_drop_cleanup(table_name);
+                        if let Err(e) = ops.create_table(table_name, snapshot.parent_schema.clone())
+                        {
+                            eprintln!(
+                                "Error: Failed to recreate dropped table '{}' during \
+                                 savepoint rollback: {} - latching engine and \
+                                 propagating.",
+                                table_name, e
+                            );
+                            if undo_err.is_none() {
+                                undo_err = Some(e);
+                            }
+                            if !latched {
+                                ops.mark_engine_failed();
+                                latched = true;
+                            }
+                            continue;
+                        }
+                        if let Err(e) = ops.restore_child_fk_schemas(&snapshot.child_schemas) {
+                            eprintln!(
+                                "Error: Failed to restore child FK schemas while undoing \
+                                 drop of '{}' during savepoint rollback: {} - latching \
+                                 engine.",
+                                table_name, e
+                            );
+                            if undo_err.is_none() {
+                                undo_err = Some(e);
+                            }
+                            if !latched {
+                                ops.mark_engine_failed();
+                                latched = true;
+                            }
+                        }
+                        if let Err(e) = ops.restore_table_indexes(table_name, &snapshot.indexes) {
+                            eprintln!(
+                                "Error: Failed to restore secondary indexes while undoing \
+                                 drop of '{}' during savepoint rollback: {} - latching \
+                                 engine.",
+                                table_name, e
+                            );
+                            if undo_err.is_none() {
+                                undo_err = Some(e);
+                            }
+                            if !latched {
+                                ops.mark_engine_failed();
+                                latched = true;
+                            }
+                        }
                     }
+                    DdlOp::CreateIndex(_, _) => {}
                 }
             }
-
-            // Tables dropped after savepoint need to be recreated
-            while self.dropped_tables.len() > sp_state.ddl_state.dropped_tables_len {
-                if let Some((table_name, schema)) = self.dropped_tables.pop() {
-                    if let Err(e) = ops.create_table(&table_name, schema) {
-                        eprintln!(
-                            "Warning: Failed to recreate table '{}' during savepoint rollback: {}",
-                            table_name, e
-                        );
-                    }
-                }
+            if let Some(e) = undo_err {
+                // Leave suffix intact so a later sweep can re-apply inverses; still
+                // scrub savepoints for internal consistency.
+                self.savepoints
+                    .retain(|_, sp| sp.timestamp <= sp_state.timestamp);
+                return Err(e);
             }
+            self.ddl_log.truncate(after_save_lo);
         }
 
         // Remove this savepoint and all savepoints created after it
@@ -403,13 +701,13 @@ impl MvccTransaction {
     }
 }
 
-impl Transaction for MvccTransaction {
+impl ReadTransaction for MvccTransaction {
     fn id(&self) -> i64 {
         self.id
     }
 
     fn begin(&mut self) -> Result<()> {
-        // No-op for compatibility - transaction is initialized in new()
+        // No-op for compatibility; transaction is initialized in new().
         self.check_active()
     }
 
@@ -419,50 +717,36 @@ impl Transaction for MvccTransaction {
         // Update state to committing
         self.state = TransactionState::Committing;
 
-        // Check if read-only: no DDL changes and no DML changes
-        // Use has_pending_dml_changes() to avoid allocating Vec<Box<dyn Table>>
+        // has_pending_dml_changes() avoids allocating Vec<Box<dyn WriteTable>>.
         let has_dml_changes = self
             .engine_operations
             .as_ref()
             .is_some_and(|ops| ops.has_pending_dml_changes(self.id));
 
-        let is_read_only =
-            self.created_tables.is_empty() && self.dropped_tables.is_empty() && !has_dml_changes;
+        let is_read_only = self.ddl_log.is_empty() && !has_dml_changes;
 
-        // Two-phase commit protocol
         if !is_read_only {
-            // Acquire seal fence shared lock. This signals to the checkpoint
-            // micro-seal that a commit is in-flight. The micro-seal waits for
-            // all in-flight commits to finish before draining hot rows.
-            // Held until complete_commit (end of this block).
+            // Held until complete_commit so checkpoint micro-seal waits for in-flight commits.
             let _seal_guard = self
                 .engine_operations
                 .as_ref()
                 .and_then(|ops| ops.acquire_seal_fence());
 
-            // Phase 1: Start commit - mark transaction as "committing"
-            self.registry.start_commit(self.id);
+            // Phase 1: allocate commit_seq embedded in the WAL marker for snapshot-iso filtering.
+            let commit_seq = self.registry.start_commit(self.id);
 
-            // Phase 2: Commit all tables - apply local changes to global store
-            // This now includes WAL recording internally (before each table commit)
-            if let Some(ops) = &self.engine_operations {
-                let (any_committed, error) = ops.commit_all_tables(self.id);
-                if let Some(e) = error {
-                    if any_committed {
-                        // Partial commit: some tables already committed.
-                        // We MUST complete the commit to avoid orphaning those rows.
-                        self.registry.complete_commit(self.id);
-                        // Record commit marker so WAL recovery sees committed state
-                        ops.record_commit(self.id)?;
-                        self.state = TransactionState::Committed;
-                        self.cleanup();
-                        return Err(e);
-                    } else {
-                        // Nothing committed yet - safe to abort cleanly.
-                        // Release uncommitted_writes claims and remove from
-                        // txn_version_stores to prevent permanent row blocking.
+            // Phase 1.5: flush deferred DDL WAL BEFORE any DML so recovery applies
+            // CREATE TABLE before dependent INSERTs (LSN-strict ordering). Orphans
+            // without a commit marker are skipped on recovery.
+            let deferred_ddl_ops = self.build_deferred_ddl_ops();
+            if !deferred_ddl_ops.is_empty() {
+                if let Some(ops) = &self.engine_operations {
+                    if let Err(e) = ops.flush_transactional_ddl(self.id, &deferred_ddl_ops) {
+                        // No DML drained yet - safe abort.
                         self.registry.abort_transaction(self.id);
                         ops.rollback_all_tables(self.id);
+                        let _ = ops.record_rollback(self.id);
+                        let _ = self.rollback_ddl(ops.as_ref());
                         self.state = TransactionState::RolledBack;
                         self.cleanup();
                         return Err(e);
@@ -470,27 +754,155 @@ impl Transaction for MvccTransaction {
                 }
             }
 
-            // Phase 3: Record commit marker in WAL BEFORE making changes visible.
-            // This ensures crash recovery sees the COMMIT marker even if we crash
-            // before complete_commit(). WAL is only read during recovery, so writing
-            // the marker before visibility doesn't affect normal operation.
+            // Phase 2: commit all tables (per-table WAL recording is internal).
+            let mut pending_tombstone_tables = Vec::new();
             if let Some(ops) = &self.engine_operations {
-                if let Err(e) = ops.record_commit(self.id) {
-                    // WAL commit marker failed. Phase 2 data is in the version store
-                    // but not yet visible (complete_commit hasn't run). Abort so GC
-                    // can reclaim the orphaned entries and active_txn_count is correct.
-                    // On recovery, WAL has no COMMIT marker → entries are discarded.
-                    self.registry.abort_transaction(self.id);
-                    self.state = TransactionState::RolledBack;
-                    self.cleanup();
-                    return Err(e);
+                let (any_committed, error, tables_with_pending_tombstones) =
+                    ops.commit_all_tables(self.id);
+                pending_tombstone_tables = tables_with_pending_tombstones;
+                if let Some(e) = error {
+                    if any_committed {
+                        // Partial commit ordering (critical):
+                        //   1. record_commit -> marker_lsn
+                        //   2. stamp_pending_tombstones (move pending -> committed,
+                        //      keyed by commit_seq, visible_at_lsn = marker_lsn)
+                        //   3. complete_commit (in-process visibility)
+                        //   4. publish_visible_commit_lsn (cross-process visibility)
+                        // Stamp BEFORE complete_commit so readers never see commit_seq
+                        // published with tombstones still pending.
+                        match ops.record_commit(self.id, commit_seq) {
+                            Ok(lsn) => {
+                                if !pending_tombstone_tables.is_empty() {
+                                    ops.stamp_pending_tombstones(
+                                        self.id,
+                                        commit_seq as u64,
+                                        lsn,
+                                        &pending_tombstone_tables,
+                                    );
+                                }
+                                self.registry.complete_commit(self.id);
+                                ops.publish_visible_commit_lsn(self.id, lsn);
+                                let drops_partial = self.collect_committed_drop_names();
+                                if !drops_partial.is_empty() {
+                                    ops.finalize_committed_drops(&drops_partial);
+                                }
+                                self.state = TransactionState::Committed;
+                            }
+                            Err(_) => {
+                                // record_commit failed but parent VersionStores already
+                                // hold drained data. No real undo (rollback_all_tables
+                                // only clears pending tombstones; abort_transaction
+                                // becomes a "ghost commit" once the GC removes the
+                                // abort marker). Complete in-memory coherently and
+                                // latch into the failure state.
+                                //
+                                // visible_at_lsn = u64::MAX makes these tombstones
+                                // invisible to every capped cross-process reader (the
+                                // 0 sentinel would mean "always visible" and could
+                                // hide cold rows for a never-published commit).
+                                if !pending_tombstone_tables.is_empty() {
+                                    ops.stamp_pending_tombstones(
+                                        self.id,
+                                        commit_seq as u64,
+                                        u64::MAX,
+                                        &pending_tombstone_tables,
+                                    );
+                                }
+                                // Latch BEFORE complete_commit so safe_snapshot_cutoff
+                                // can't unblock and let backup/seal export this
+                                // markerless commit's rows.
+                                ops.mark_engine_failed();
+                                self.registry.complete_commit(self.id);
+                                let _ = ops.record_rollback(self.id);
+                                self.state = TransactionState::Committed;
+                            }
+                        }
+                        self.cleanup();
+                        return Err(e);
+                    } else {
+                        // Nothing committed - safe to abort cleanly.
+                        self.registry.abort_transaction(self.id);
+                        // Revert in-memory DDL: failed commit otherwise leaves a Drop
+                        // applied with no durable DROP, so restart would resurrect.
+                        let _ = self.rollback_ddl(ops.as_ref());
+                        ops.rollback_all_tables(self.id);
+                        // Record a rollback marker so future shm publishes don't see
+                        // a phantom low watermark from this txn's DML LSNs.
+                        let _ = ops.record_rollback(self.id);
+                        self.state = TransactionState::RolledBack;
+                        self.cleanup();
+                        return Err(e);
+                    }
                 }
             }
 
-            // Phase 4: Complete commit - make changes visible in registry
+            // Phase 3: write commit marker BEFORE visibility so crash recovery sees
+            // it. Capture marker LSN to publish to db.shm AFTER complete_commit.
+            let commit_marker_lsn = if let Some(ops) = &self.engine_operations {
+                match ops.record_commit(self.id, commit_seq) {
+                    Ok(lsn) => {
+                        // Stamp tombstones with marker_lsn BEFORE publish: closes the
+                        // SWMR race where a reader sampling another concurrent commit's
+                        // visible_commit_lsn could observe our tombstone before our
+                        // marker is visible at that cap.
+                        if !pending_tombstone_tables.is_empty() {
+                            ops.stamp_pending_tombstones(
+                                self.id,
+                                commit_seq as u64,
+                                lsn,
+                                &pending_tombstone_tables,
+                            );
+                        }
+                        lsn
+                    }
+                    Err(e) => {
+                        // Same situation as the partial-commit Err branch: parent
+                        // VersionStores hold drained data with no commit marker. No
+                        // real undo. Stamp tombstones with u64::MAX (excluded by every
+                        // capped reader), publish in-process visibility, write rollback
+                        // marker so recovery discards, latch the engine.
+                        if !pending_tombstone_tables.is_empty() {
+                            ops.stamp_pending_tombstones(
+                                self.id,
+                                commit_seq as u64,
+                                u64::MAX,
+                                &pending_tombstone_tables,
+                            );
+                        }
+                        // Latch BEFORE complete_commit (same ordering rule as partial-commit).
+                        ops.mark_engine_failed();
+                        self.registry.complete_commit(self.id);
+                        let _ = ops.record_rollback(self.id);
+                        self.state = TransactionState::Committed;
+                        self.cleanup();
+                        return Err(e);
+                    }
+                }
+            } else {
+                0
+            };
+
+            // Phase 4: in-process visibility.
             self.registry.complete_commit(self.id);
+
+            // Phase 5: publish marker LSN to db.shm for cross-process readers. The
+            // user marker LSN sits above every Phase 1.5 DDL entry LSN, so this one
+            // publish advances safe_visible past all of them.
+            if let Some(ops) = &self.engine_operations {
+                ops.publish_visible_commit_lsn(self.id, commit_marker_lsn);
+            }
+
+            // Phase 6: physical DROP cleanup (segment state + on-disk volume files).
+            // A crash between Phase 5 and here leaves orphan files for the next
+            // checkpoint / compaction to reclaim - recoverable.
+            let drops_to_finalize = self.collect_committed_drop_names();
+            if !drops_to_finalize.is_empty() {
+                if let Some(ops) = &self.engine_operations {
+                    ops.finalize_committed_drops(&drops_to_finalize);
+                }
+            }
         } else {
-            // Read-only transaction - just mark as committed in registry
+            // Read-only - just mark committed in registry.
             self.registry.complete_commit(self.id);
         }
 
@@ -504,85 +916,145 @@ impl Transaction for MvccTransaction {
     fn rollback(&mut self) -> Result<()> {
         self.check_active()?;
 
-        // Check if read-only before rolling back
         let is_read_only = self.is_read_only();
-
-        // Mark transaction as aborted in registry
         self.registry.abort_transaction(self.id);
 
-        // Rollback DDL operations (CREATE TABLE / DROP TABLE) in reverse order
+        // Capture (don't propagate yet) so the rest of the rollback bookkeeping still
+        // runs even when DDL compensation failed; in-memory state must be drained
+        // either way. Err means the engine has been latched.
+        let mut compensation_err: Option<Error> = None;
         if let Some(ops) = &self.engine_operations {
-            self.rollback_ddl(ops.as_ref());
+            if let Err(e) = self.rollback_ddl(ops.as_ref()) {
+                compensation_err = Some(e);
+            }
         }
 
-        // Rollback all tables - discard local changes
         for (_, table) in self.tables.iter_mut() {
             table.rollback();
         }
 
-        // Notify engine of rollback (per-table callbacks)
         if let Some(ops) = &self.engine_operations {
             for (_, table) in self.tables.iter() {
                 ops.rollback_table(self.id, table.as_ref());
             }
-            // Clean up txn_version_stores entry to prevent memory leak
+            // Clean up txn_version_stores entry to prevent memory leak.
             ops.rollback_all_tables(self.id);
         }
 
-        // Record in WAL if not read-only
         if !is_read_only {
             if let Some(ops) = &self.engine_operations {
                 let _ = ops.record_rollback(self.id);
             }
         }
 
-        // Mark as rolled back
         self.state = TransactionState::RolledBack;
         self.cleanup();
-        Ok(())
+        match compensation_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     fn create_savepoint(&mut self, name: &str) -> Result<()> {
-        // Delegate to the inherent method
         MvccTransaction::create_savepoint(self, name)
     }
 
     fn release_savepoint(&mut self, name: &str) -> Result<()> {
-        // Delegate to the inherent method
         MvccTransaction::release_savepoint(self, name)
     }
 
     fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
-        // Delegate to the inherent method
         MvccTransaction::rollback_to_savepoint(self, name)
     }
 
     fn get_savepoint_timestamp(&self, name: &str) -> Option<i64> {
-        // Delegate to the inherent method
         MvccTransaction::get_savepoint_ts(self, name)
     }
 
     fn set_isolation_level(&mut self, level: IsolationLevel) -> Result<()> {
         self.check_active()?;
-
-        // Set transaction-specific isolation level
         self.isolation_level = Some(level);
-
-        // Also set in registry
         self.registry
             .set_transaction_isolation_level(self.id, level);
-
         Ok(())
     }
 
-    fn create_table(&mut self, name: &str, schema: Schema) -> Result<Box<dyn Table>> {
+    fn list_tables(&self) -> Result<Vec<String>> {
         self.check_active()?;
 
         let ops = self.get_engine_ops()?;
+        ops.list_tables()
+    }
+
+    fn get_read_table(&self, name: &str) -> Result<Box<dyn ReadTable>> {
+        let write: Box<dyn WriteTable> = self.get_table(name)?;
+        Ok(write)
+    }
+
+    fn select(
+        &self,
+        table_name: &str,
+        columns_to_fetch: &[String],
+        expr: Option<&dyn Expression>,
+        _original_columns: Option<&[String]>,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.check_active()?;
+
+        let table = self.get_table(table_name)?;
+        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
+        table.select(&col_refs, expr)
+    }
+
+    fn select_with_aliases(
+        &self,
+        table_name: &str,
+        columns_to_fetch: &[String],
+        expr: Option<&dyn Expression>,
+        aliases: &FxHashMap<String, String>,
+        _original_columns: Option<&[String]>,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.check_active()?;
+
+        let table = self.get_table(table_name)?;
+        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
+        table.select_with_aliases(&col_refs, expr, aliases)
+    }
+
+    fn select_as_of(
+        &self,
+        table_name: &str,
+        columns_to_fetch: &[String],
+        expr: Option<&dyn Expression>,
+        temporal_type: &str,
+        temporal_value: i64,
+        _original_columns: Option<&[String]>,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.check_active()?;
+
+        let table = self.get_table(table_name)?;
+        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
+        table.select_as_of(&col_refs, expr, temporal_type, temporal_value)
+    }
+}
+
+impl WriteTransaction for MvccTransaction {
+    fn create_table(&mut self, name: &str, schema: Schema) -> Result<Box<dyn WriteTable>> {
+        self.check_active()?;
+
+        // Acquire transactional-DDL fence (idempotent) BEFORE mutating in-memory
+        // catalog so checkpoint can't snapshot a half-mutated state.
+        if self.transactional_ddl_guard.is_none() {
+            let ops = self.get_engine_ops()?;
+            self.transactional_ddl_guard = ops.acquire_transactional_ddl_fence();
+        }
+        let ops = self.get_engine_ops()?;
+        let schema_for_log = schema.clone();
         let table = ops.create_table(name, schema)?;
 
-        // Track for rollback - store the table name
-        self.created_tables.push(name.to_lowercase());
+        // Schema captured here for the commit-time deferred CreateTable WAL entry
+        // (create_table only stages in-memory state).
+        self.ddl_log
+            .push(DdlOp::Create(name.to_lowercase(), schema_for_log));
 
         Ok(table)
     }
@@ -590,35 +1062,28 @@ impl Transaction for MvccTransaction {
     /// Drop a table within this transaction.
     ///
     /// # Warning
-    /// DROP TABLE is NOT fully transactional. While the table structure can be
-    /// recreated on rollback, the data CANNOT be recovered. This is similar to
-    /// PostgreSQL's behavior where certain DDL operations are destructive.
-    ///
-    /// If you need to safely remove all data with rollback support, use
-    /// `DELETE FROM table_name` or `TRUNCATE TABLE table_name` instead.
+    /// DROP TABLE is NOT fully transactional: structure can be recreated on rollback
+    /// but data CANNOT (matches PostgreSQL behavior). Use DELETE or TRUNCATE for
+    /// rollback-safe data removal.
     fn drop_table(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
 
-        // Before dropping, get the schema so we can recreate on rollback
-        // We need to get the table to access its schema
-        // Scope the borrow to allow later mutable operations
-        let schema = {
+        if self.transactional_ddl_guard.is_none() {
             let ops = self.get_engine_ops()?;
-            let table = ops.get_table_for_transaction(self.id, name)?;
-            table.schema().clone()
-        };
-
-        // Save schema for potential rollback (note: data cannot be recovered)
-        self.dropped_tables.push((name.to_lowercase(), schema));
-
-        // Now drop the table
+            self.transactional_ddl_guard = ops.acquire_transactional_ddl_fence();
+        }
+        // Drop in-memory FIRST then log: logging a drop that didn't happen would let
+        // rollback try to recreate a still-existing table.
         let ops = self.get_engine_ops()?;
-        ops.drop_table(name)?;
+        let snapshot = ops.drop_table(name)?;
 
-        // Remove from cache
+        // Snapshot recorded for rollback (durable DROP WAL is deferred to commit;
+        // physical volume deletion to `finalize_committed_drops`).
+        self.ddl_log
+            .push(DdlOp::Drop(name.to_lowercase(), snapshot));
+
         self.tables.remove(name);
 
-        // Clear fast path cache if needed
         if let Some(last_name) = &self.last_table_name {
             if last_name == name {
                 self.last_table_name = None;
@@ -628,23 +1093,13 @@ impl Transaction for MvccTransaction {
         Ok(())
     }
 
-    fn get_table(&self, name: &str) -> Result<Box<dyn Table>> {
+    fn get_table(&self, name: &str) -> Result<Box<dyn WriteTable>> {
         self.check_active()?;
 
-        // Note: Cached tables would require Clone on Table trait, which isn't object-safe.
-        // For now, always get from engine (engine will handle caching internally).
-        // The tables HashMap is used for tracking which tables were accessed for commit/rollback.
-
-        // Get from engine
+        // Caching here would require Clone on Table trait (not object-safe). Engine
+        // handles caching internally. self.tables tracks accessed tables for commit/rollback.
         let ops = self.get_engine_ops()?;
         ops.get_table_for_transaction(self.id, name)
-    }
-
-    fn list_tables(&self) -> Result<Vec<String>> {
-        self.check_active()?;
-
-        let ops = self.get_engine_ops()?;
-        ops.list_tables()
     }
 
     fn rename_table(&mut self, old_name: &str, new_name: &str) -> Result<()> {
@@ -742,49 +1197,43 @@ impl Transaction for MvccTransaction {
         table.modify_column(&column.name, column.data_type, column.nullable)
     }
 
-    fn select(
-        &self,
+    fn stage_deferred_create_index(
+        &mut self,
         table_name: &str,
-        columns_to_fetch: &[String],
-        expr: Option<&dyn Expression>,
-        _original_columns: Option<&[String]>,
-    ) -> Result<Box<dyn QueryResult>> {
+        index_name: &str,
+        columns: &[String],
+        is_unique: bool,
+        index_type: crate::core::IndexType,
+        hnsw_m: Option<u16>,
+        hnsw_ef_construction: Option<u16>,
+        hnsw_ef_search: Option<u16>,
+        hnsw_distance_metric: Option<u8>,
+    ) -> Result<()> {
         self.check_active()?;
-
-        let table = self.get_table(table_name)?;
-        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
-        table.select(&col_refs, expr)
-    }
-
-    fn select_with_aliases(
-        &self,
-        table_name: &str,
-        columns_to_fetch: &[String],
-        expr: Option<&dyn Expression>,
-        aliases: &FxHashMap<String, String>,
-        _original_columns: Option<&[String]>,
-    ) -> Result<Box<dyn QueryResult>> {
-        self.check_active()?;
-
-        let table = self.get_table(table_name)?;
-        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
-        table.select_with_aliases(&col_refs, expr, aliases)
-    }
-
-    fn select_as_of(
-        &self,
-        table_name: &str,
-        columns_to_fetch: &[String],
-        expr: Option<&dyn Expression>,
-        temporal_type: &str,
-        temporal_value: i64,
-        _original_columns: Option<&[String]>,
-    ) -> Result<Box<dyn QueryResult>> {
-        self.check_active()?;
-
-        let table = self.get_table(table_name)?;
-        let col_refs: Vec<&str> = columns_to_fetch.iter().map(|s| s.as_str()).collect();
-        table.select_as_of(&col_refs, expr, temporal_type, temporal_value)
+        // Index staging is part of the same DDL window as the parent CREATE TABLE.
+        if self.transactional_ddl_guard.is_none() {
+            let ops = self.get_engine_ops()?;
+            self.transactional_ddl_guard = ops.acquire_transactional_ddl_fence();
+        }
+        let ops = self.get_engine_ops()?;
+        let metadata = ops.build_index_metadata(
+            table_name,
+            index_name,
+            columns,
+            is_unique,
+            index_type,
+            hnsw_m,
+            hnsw_ef_construction,
+            hnsw_ef_search,
+            hnsw_distance_metric,
+        )?;
+        // Empty payload = column lookup failed; matches auto-commit no-op behaviour.
+        if metadata.is_empty() {
+            return Ok(());
+        }
+        self.ddl_log
+            .push(DdlOp::CreateIndex(table_name.to_lowercase(), metadata));
+        Ok(())
     }
 }
 
@@ -802,16 +1251,15 @@ impl std::fmt::Debug for MvccTransaction {
 impl Drop for MvccTransaction {
     fn drop(&mut self) {
         if self.state == TransactionState::Active {
-            // Silent rollback on drop
             self.registry.abort_transaction(self.id);
 
             if let Some(ops) = &self.engine_operations {
-                // Roll back DDL operations (CREATE TABLE / DROP TABLE)
-                self.rollback_ddl(ops.as_ref());
+                // Drop can't propagate; `rollback_ddl` latches the engine on failure
+                // so further durable writes refuse.
+                let _ = self.rollback_ddl(ops.as_ref());
 
-                // Clean up txn_version_stores to prevent memory leak
-                // This is critical for read-only transactions that call get_table()
-                // but are dropped without explicit commit/rollback
+                // Critical for read-only txns that called get_table() and were
+                // dropped without explicit commit/rollback.
                 ops.rollback_all_tables(self.id);
             }
 

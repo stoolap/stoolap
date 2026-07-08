@@ -26,7 +26,7 @@ use std::sync::Arc;
 use crate::common::{CompactArc, I64Set};
 use crate::core::{Result, Row, RowVec, Value, ValueSet};
 use crate::parser::ast::*;
-use crate::storage::traits::{QueryResult, Table};
+use crate::storage::traits::{QueryResult, ReadTable};
 
 /// Classification of a window expression's PARTITION BY for index optimization.
 #[allow(dead_code)]
@@ -70,7 +70,7 @@ impl Executor {
     pub(crate) fn try_min_max_index_optimization(
         &self,
         stmt: &SelectStatement,
-        table: &dyn Table,
+        table: &dyn ReadTable,
         _all_columns: &[String],
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
         // Only optimize single MIN or MAX without DISTINCT
@@ -146,7 +146,7 @@ impl Executor {
     pub(crate) fn try_count_star_optimization(
         &self,
         stmt: &SelectStatement,
-        table: &dyn Table,
+        table: &dyn ReadTable,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
         // Only optimize single COUNT(*) without DISTINCT
         if stmt.columns.len() != 1 {
@@ -215,7 +215,7 @@ impl Executor {
     pub(crate) fn try_order_by_index_optimization(
         &self,
         stmt: &SelectStatement,
-        table: &dyn Table,
+        table: &dyn ReadTable,
         all_columns: &[String],
         ctx: &ExecutionContext,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
@@ -289,7 +289,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         where_expr: Option<&Expression>,
-        table: &dyn Table,
+        table: &dyn ReadTable,
         all_columns: &[String],
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
@@ -861,7 +861,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         where_expr: &Expression,
-        table: &dyn Table,
+        table: &dyn ReadTable,
         all_columns: &[String],
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
@@ -1201,7 +1201,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         where_expr: &Expression,
-        table: &dyn Table,
+        table: &dyn ReadTable,
         all_columns: &[String],
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
@@ -1531,7 +1531,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         where_expr: &Expression,
-        table: &dyn Table,
+        table: &dyn ReadTable,
         all_columns: &[String],
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
@@ -1854,7 +1854,7 @@ impl Executor {
     pub(crate) fn try_vector_search_optimization(
         &self,
         stmt: &SelectStatement,
-        table: &dyn Table,
+        table: &dyn ReadTable,
         all_columns: &[String],
         ctx: &ExecutionContext,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {

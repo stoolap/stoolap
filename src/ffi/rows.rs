@@ -20,24 +20,31 @@ use std::panic;
 use crate::core::types::DataType;
 use crate::core::Value;
 
-use super::types::StoolapRows;
+use super::types::{StoolapErrorDetails, StoolapRows};
 use super::{
     STOOLAP_DONE, STOOLAP_ERROR, STOOLAP_OK, STOOLAP_ROW, STOOLAP_TYPE_BLOB, STOOLAP_TYPE_BOOLEAN,
     STOOLAP_TYPE_FLOAT, STOOLAP_TYPE_INTEGER, STOOLAP_TYPE_JSON, STOOLAP_TYPE_NULL,
     STOOLAP_TYPE_TEXT, STOOLAP_TYPE_TIMESTAMP,
 };
 
-/// Build a NUL-terminated byte buffer from a string.
-///
-/// Unlike `CString`, this preserves interior NUL bytes so that callers
-/// using the `out_len` parameter can access the full data.  Callers
-/// treating the pointer as a C string will naturally see a truncated
-/// view at the first embedded NUL — this matches C convention.
-fn make_text_buf(s: &str) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(s.len() + 1);
-    buf.extend_from_slice(s.as_bytes());
-    buf.push(0); // trailing NUL for C compatibility
-    buf
+/// Fill `buf` (cleared first) with `val`'s text representation plus a
+/// trailing NUL. Returns true on success, false for SQL NULL or values
+/// without a text rendering. `as_str()` borrows Text/Json storage
+/// directly (no `String` allocation); other types allocate via
+/// `as_string()` and copy once into the reused `buf`.
+fn fill_text_buf(buf: &mut Vec<u8>, val: &Value) -> bool {
+    buf.clear();
+    if let Some(s) = val.as_str() {
+        buf.reserve(s.len() + 1);
+        buf.extend_from_slice(s.as_bytes());
+    } else if let Some(s) = val.as_string() {
+        buf.reserve(s.len() + 1);
+        buf.extend_from_slice(s.as_bytes());
+    } else {
+        return false;
+    }
+    buf.push(0);
+    true
 }
 
 /// Advance to the next row.
@@ -61,12 +68,21 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
             None => return STOOLAP_DONE,
         };
 
-        // Clear text cache from previous row (only if anything was cached)
-        if handle.text_cache_dirty {
-            for slot in &mut handle.text_cache {
-                *slot = None;
+        // Clear only the slots that were populated for the previous row.
+        // `clear()` retains capacity, so the next row reuses the same
+        // allocations: at most one allocation per (column, row) pair on the
+        // first hit, zero thereafter.
+        if !handle.text_cache_dirty.is_empty() {
+            for &idx in &handle.text_cache_dirty {
+                let idx = idx as usize;
+                if let Some(slot) = handle.text_cache.get_mut(idx) {
+                    slot.clear();
+                }
+                if let Some(flag) = handle.text_cache_populated.get_mut(idx) {
+                    *flag = false;
+                }
             }
-            handle.text_cache_dirty = false;
+            handle.text_cache_dirty.clear();
         }
 
         if rows_inner.advance() {
@@ -76,7 +92,7 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
             handle.has_row = false;
             // Check for runtime filter errors (e.g., invalid parameterized REGEXP)
             if let Some(err) = rows_inner.error() {
-                handle.set_error(&err.to_string());
+                handle.set_error_from(&err);
                 return STOOLAP_ERROR;
             }
             STOOLAP_DONE
@@ -236,56 +252,48 @@ pub unsafe extern "C" fn stoolap_rows_column_text(
 
     let idx = index as usize;
 
-    // Check text cache first
-    if let Some(Some(ref cached)) = handle.text_cache.get(idx) {
+    // Bounds check against the canonical column count BEFORE touching the
+    // cache. Construction pre-sizes `text_cache` to `column_names.len()`,
+    // so any larger index is invalid and must short-circuit, otherwise
+    // a hostile or accidental `i32::MAX` would let `resize_with` ask the
+    // allocator for an `idx + 1` Vec slot.
+    if idx >= handle.column_names.len() {
+        return std::ptr::null();
+    }
+
+    // Cache hit: `text_cache_populated[idx]` is the authoritative flag.
+    // Callers can re-read the same column repeatedly at zero cost.
+    if handle.text_cache_populated[idx] {
+        let cached = &handle.text_cache[idx];
         if !out_len.is_null() {
-            // Length excludes the trailing NUL terminator
-            *out_len = (cached.len() - 1) as i64;
+            *out_len = cached.len().saturating_sub(1) as i64;
         }
         return cached.as_ptr() as *const c_char;
     }
 
-    // Get the value and build a NUL-terminated byte buffer.
-    // Fast path: for Text/Json values, use as_str() to avoid an intermediate String allocation.
-    // Slow path: for other types (Integer, Float, etc.), fall back to as_string().
-    //
-    // Interior NUL bytes are preserved in the buffer; callers using out_len
-    // can access the full data.  Callers treating the pointer as a C string
-    // will see a truncated view at the first embedded NUL.
-    let buf = {
-        let rows_inner = match &handle.rows {
-            Some(r) => r,
+    // Render the value into the slot's reusable buffer. We split the
+    // borrow over disjoint fields: `handle.rows` (read) and
+    // `handle.text_cache` (write). Going through `as_ref()` keeps the
+    // borrow on `rows` only so the mut borrow of `text_cache` is allowed.
+    let val: &Value = match handle.rows.as_ref() {
+        Some(r) => match r.current_row().get(idx) {
+            Some(v) => v,
             None => return std::ptr::null(),
-        };
-        let row = rows_inner.current_row();
-        match row.get(idx) {
-            Some(val) => {
-                if let Some(s) = val.as_str() {
-                    Some(make_text_buf(s))
-                } else {
-                    val.as_string().map(|s| make_text_buf(&s))
-                }
-            }
-            None => None,
-        }
+        },
+        None => return std::ptr::null(),
     };
-
-    match buf {
-        Some(b) => {
-            // Grow the cache lazily to fit this column index
-            if handle.text_cache.len() <= idx {
-                handle.text_cache.resize_with(idx + 1, || None);
-            }
-            handle.text_cache[idx] = Some(b);
-            handle.text_cache_dirty = true;
-            let cached = handle.text_cache[idx].as_ref().unwrap();
-            if !out_len.is_null() {
-                *out_len = (cached.len() - 1) as i64;
-            }
-            cached.as_ptr() as *const c_char
-        }
-        None => std::ptr::null(),
+    let slot = &mut handle.text_cache[idx];
+    if !fill_text_buf(slot, val) {
+        return std::ptr::null();
     }
+    handle.text_cache_populated[idx] = true;
+    handle.text_cache_dirty.push(idx as u32);
+    // Interior NULs in text are preserved; C-string callers see a
+    // truncated view, callers using `out_len` see the full byte run.
+    if !out_len.is_null() {
+        *out_len = slot.len().saturating_sub(1) as i64;
+    }
+    slot.as_ptr() as *const c_char
 }
 
 /// Get a boolean value from the current row. Returns 0 (false) if NULL or not convertible.
@@ -630,7 +638,11 @@ pub unsafe extern "C" fn stoolap_buffer_free(buf: *mut u8, len: i64) {
 #[no_mangle]
 pub unsafe extern "C" fn stoolap_rows_close(rows: *mut StoolapRows) {
     if !rows.is_null() {
-        let _ = Box::from_raw(rows);
+        // catch_unwind: dropping Rows can run engine teardown (last
+        // EngineEntry); a panic must not cross the C ABI.
+        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            drop(Box::from_raw(rows));
+        }));
     }
 }
 
@@ -645,4 +657,47 @@ pub unsafe extern "C" fn stoolap_rows_errmsg(rows: *const StoolapRows) -> *const
         Some(handle) => handle.error_ptr(),
         None => super::error::empty_cstr(),
     }
+}
+
+/// Get the typed error code for a rows handle's last error.
+///
+/// # Safety
+///
+/// `rows` must be a valid `StoolapRows` pointer or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_rows_errcode(rows: *const StoolapRows) -> i32 {
+    match rows.as_ref() {
+        Some(handle) => handle.last_error.code,
+        None => super::error::STOOLAP_ERR_OK,
+    }
+}
+
+/// Fill the caller's `StoolapErrorDetails` from this rows handle's last
+/// error. Pointers stay valid until the next API call on this handle.
+///
+/// # Safety
+///
+/// `rows` must be a valid `StoolapRows` pointer or NULL. `out` must
+/// point to a writable `StoolapErrorDetails`.
+#[no_mangle]
+pub unsafe extern "C" fn stoolap_rows_errdetails(
+    rows: *const StoolapRows,
+    out: *mut StoolapErrorDetails,
+) -> i32 {
+    if out.is_null() {
+        return STOOLAP_ERROR;
+    }
+    match rows.as_ref() {
+        Some(handle) => handle.last_error.fill_details(&mut *out),
+        None => {
+            (*out).code = super::error::STOOLAP_ERR_OK;
+            (*out)._padding = 0;
+            (*out).message = super::error::empty_cstr();
+            (*out).table = std::ptr::null();
+            (*out).column = std::ptr::null();
+            (*out).constraint = std::ptr::null();
+            (*out).detail = std::ptr::null();
+        }
+    }
+    STOOLAP_OK
 }

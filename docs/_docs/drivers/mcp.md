@@ -79,7 +79,7 @@ Omit the `--path` flag to use an in-memory database:
 
 ### Read-only mode
 
-Add `--read-only` to disable all write operations. Read-only transactions (begin, query, commit) are still allowed for consistent reads.
+Add `--read-only` to disable all write operations. SQL `BEGIN`/`COMMIT`/`ROLLBACK` are also rejected on read-only handles; for consistent reads across multiple queries, the Rust API exposes `set_auto_refresh(false)` (and the equivalent `?auto_refresh=off` DSN flag).
 
 ```json
 {

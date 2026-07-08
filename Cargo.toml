@@ -2,6 +2,13 @@
 name = "stoolap"
 version = "0.4.0"
 edition = "2021"
+# Minimum Supported Rust Version. Required by:
+# - Trait upcasting (`Box<dyn WriteTable>` -> `Box<dyn ReadTable>` via the
+#   `WriteTable: ReadTable` supertrait coercion in
+#   `ReadTransaction::get_read_table`), stabilized in Rust 1.86 (March 2025).
+# - Several stdlib APIs in query/hnsw/ffi/scalar/aggregate code that
+#   stabilized in Rust 1.87.
+rust-version = "1.87"
 authors = ["Stoolap Contributors"]
 description = "High-performance embedded SQL database with MVCC, time-travel queries, and full ACID compliance"
 license = "Apache-2.0"

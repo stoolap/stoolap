@@ -67,6 +67,9 @@ typedef struct StoolapRows   StoolapRows;
 /** stoolap_rows_next(): no more rows. */
 #define STOOLAP_DONE    101
 
+/** stoolap_ro_refresh(): snapshot advanced. STOOLAP_OK = unchanged. */
+#define STOOLAP_REFRESH_ADVANCED    102
+
 /* =========================================================================
  * Value type codes
  * ========================================================================= */
@@ -107,39 +110,33 @@ typedef struct StoolapValue {
     } v;
 } StoolapValue;
 
+/**
+ * Named parameter binding for `:name` placeholders.
+ * `name` need not be NUL-terminated; must be valid UTF-8. Invalid/empty names are silently skipped.
+ */
+typedef struct StoolapNamedParam {
+    /** Parameter name (without the ':' prefix). */
+    const char*  name;
+    /** Length of `name` in bytes. */
+    int32_t      name_len;
+    int32_t      _padding;
+    /** Parameter value. */
+    StoolapValue value;
+} StoolapNamedParam;
+
 /* =========================================================================
  * Library info
  * ========================================================================= */
 
-/**
- * Returns the stoolap version string (e.g. "0.4.0").
- * The returned pointer is static and must NOT be freed.
- */
+/** Stoolap version string (e.g. "0.4.0"). Static pointer; do NOT free. */
 const char* stoolap_version(void);
 
 /* =========================================================================
  * Thread safety
  * =========================================================================
  *
- * A single StoolapDB handle must NOT be used concurrently from multiple
- * threads. To use stoolap from multiple threads, clone the handle with
- * stoolap_clone(). Each clone shares the underlying engine (data, indexes,
- * transactions) but has its own executor and error state.
- *
- * StoolapRows and StoolapTx handles must remain on the thread that created
- * them. StoolapStmt handles must not be used concurrently.
- *
- * Recommended pattern:
- *   StoolapDB* db;
- *   stoolap_open("file:///path/to/db", &db);
- *
- *   // Per worker thread:
- *   StoolapDB* thread_db;
- *   stoolap_clone(db, &thread_db);
- *   // ... use thread_db exclusively in this thread ...
- *   stoolap_close(thread_db);
- *
- *   stoolap_close(db);
+ * A single handle is not concurrent-safe. Use stoolap_clone() per thread.
+ * StoolapRows/StoolapTx/StoolapStmt are single-thread only.
  */
 
 /* =========================================================================
@@ -148,53 +145,23 @@ const char* stoolap_version(void);
 
 /**
  * Open a database connection.
- *
- * @param dsn     DSN string. Supported schemes:
- *                  "memory://"           - in-memory database
- *                  "file:///path/to/db"  - persistent database
- *                File DSN supports query parameters:
- *                  sync_mode=none|normal|full
- *                  compression=on|off
- *                  wal_flush_trigger=<bytes>
- *                  checkpoint_interval=<seconds>
- *                Example: "file:///tmp/mydb?sync_mode=full&compression=on"
- * @param out_db  On success, receives the database handle.
- * @return STOOLAP_OK on success. On failure, *out_db is NULL.
- *         Use stoolap_errmsg(NULL) to get the error message.
+ * DSN: "memory://" or "file:///path?sync_mode=...&compression=...&wal_flush_trigger=...&checkpoint_interval=..."
+ * Returns STOOLAP_OK or STOOLAP_ERROR; on failure *out_db is NULL, see stoolap_errmsg(NULL).
  */
 int32_t stoolap_open(const char* dsn, StoolapDB** out_db);
 
-/**
- * Open a new in-memory database.
- * Each call creates a unique, isolated instance.
- */
+/** Open a new isolated in-memory database. */
 int32_t stoolap_open_in_memory(StoolapDB** out_db);
 
-/**
- * Clone a database handle for multi-threaded use.
- *
- * The new handle shares the same underlying engine but has its own
- * executor and error state. Each clone must be closed independently.
- *
- * @param db      Source database handle.
- * @param out_db  On success, receives the cloned handle.
- */
+/** Clone a handle for multi-threaded use; each clone must be closed independently. */
 int32_t stoolap_clone(const StoolapDB* db, StoolapDB** out_db);
 
-/**
- * Close a database connection and free all associated resources.
- * Safe to call with NULL (no-op).
- * After this call, the db pointer is invalid.
- */
+/** Close a database and free resources. NULL-safe. */
 int32_t stoolap_close(StoolapDB* db);
 
 /**
- * Get the last error message for a database handle.
- *
- * @param db  Database handle, or NULL for the last global error
- *            (e.g. from stoolap_open failures).
- * @return Pointer valid until the next API call on this handle.
- *         Returns "" if no error. Must NOT be freed.
+ * Last error message for a handle (NULL = last global error from stoolap_open).
+ * Pointer valid until next API call on this handle. Returns "" if no error. Do NOT free.
  */
 const char* stoolap_errmsg(const StoolapDB* db);
 
@@ -202,20 +169,10 @@ const char* stoolap_errmsg(const StoolapDB* db);
  * Execute (DDL/DML)
  * ========================================================================= */
 
-/**
- * Execute a SQL statement without parameters.
- *
- * @param rows_affected  If non-NULL, receives the number of affected rows.
- */
+/** Execute a SQL statement. `rows_affected` may be NULL. */
 int32_t stoolap_exec(StoolapDB* db, const char* sql, int64_t* rows_affected);
 
-/**
- * Execute a SQL statement with positional parameters ($1, $2, ...).
- *
- * @param params      Array of parameter values. May be NULL if params_len is 0.
- * @param params_len  Number of parameters.
- * @param rows_affected  If non-NULL, receives the number of affected rows.
- */
+/** Execute a SQL statement with positional parameters ($1, $2, ...). */
 int32_t stoolap_exec_params(
     StoolapDB* db,
     const char* sql,
@@ -228,16 +185,10 @@ int32_t stoolap_exec_params(
  * Query (returns result rows)
  * ========================================================================= */
 
-/**
- * Execute a query without parameters.
- * On success, *out_rows must be closed with stoolap_rows_close().
- */
+/** Execute a query. *out_rows must be closed with stoolap_rows_close(). */
 int32_t stoolap_query(StoolapDB* db, const char* sql, StoolapRows** out_rows);
 
-/**
- * Execute a query with positional parameters.
- * On success, *out_rows must be closed with stoolap_rows_close().
- */
+/** Execute a query with positional parameters. *out_rows must be closed with stoolap_rows_close(). */
 int32_t stoolap_query_params(
     StoolapDB* db,
     const char* sql,
@@ -247,21 +198,38 @@ int32_t stoolap_query_params(
 );
 
 /* =========================================================================
+ * Named parameters (`:name` placeholders)
+ * ========================================================================= */
+
+/** Execute a SQL statement with named parameters. */
+int32_t stoolap_exec_named(
+    StoolapDB* db,
+    const char* sql,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    int64_t* rows_affected
+);
+
+/** Execute a query with named parameters. */
+int32_t stoolap_query_named(
+    StoolapDB* db,
+    const char* sql,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    StoolapRows** out_rows
+);
+
+/* =========================================================================
  * Prepared statements
  * ========================================================================= */
 
 /**
- * Prepare a SQL statement for repeated execution.
- * On success, *out_stmt must be finalized with stoolap_stmt_finalize().
- *
- * The statement keeps the underlying database engine alive even if the
- * originating StoolapDB handle is closed before the statement is finalized.
+ * Prepare a SQL statement. *out_stmt must be finalized with stoolap_stmt_finalize().
+ * The statement keeps the engine alive even if the originating StoolapDB is closed first.
  */
 int32_t stoolap_prepare(StoolapDB* db, const char* sql, StoolapStmt** out_stmt);
 
-/**
- * Execute a prepared statement with parameters.
- */
+/** Execute a prepared statement with parameters. */
 int32_t stoolap_stmt_exec(
     StoolapStmt* stmt,
     const StoolapValue* params,
@@ -271,14 +239,8 @@ int32_t stoolap_stmt_exec(
 
 /**
  * Execute a prepared statement as a batch inside a single transaction.
- *
- * @param db             Database handle (used to begin the transaction).
- * @param stmt           Prepared statement to execute for each row.
- * @param params         Flat row-major array of row_count * params_per_row values.
- * @param params_per_row Number of parameters per row.
- * @param row_count      Number of rows to execute.
- * @param total_affected On success, receives the total rows affected.
- * @return STOOLAP_OK on success. On error the transaction is rolled back.
+ * `params` is a flat row-major array of row_count * params_per_row values.
+ * On error the transaction is rolled back.
  */
 int32_t stoolap_stmt_exec_batch(
     StoolapDB* db,
@@ -289,10 +251,7 @@ int32_t stoolap_stmt_exec_batch(
     int64_t* total_affected
 );
 
-/**
- * Query using a prepared statement with parameters.
- * On success, *out_rows must be closed with stoolap_rows_close().
- */
+/** Query using a prepared statement with parameters. *out_rows must be closed with stoolap_rows_close(). */
 int32_t stoolap_stmt_query(
     StoolapStmt* stmt,
     const StoolapValue* params,
@@ -300,19 +259,13 @@ int32_t stoolap_stmt_query(
     StoolapRows** out_rows
 );
 
-/**
- * Get the SQL text of a prepared statement.
- * Returns a pointer valid for the lifetime of the statement. Must NOT be freed.
- */
+/** Get the SQL text of a prepared statement. Pointer valid for the statement's lifetime. Do NOT free. */
 const char* stoolap_stmt_sql(const StoolapStmt* stmt);
 
-/**
- * Finalize (destroy) a prepared statement and free resources.
- * Safe to call with NULL (no-op).
- */
+/** Finalize a prepared statement. NULL-safe. */
 void stoolap_stmt_finalize(StoolapStmt* stmt);
 
-/** Get the last error message for a statement handle. */
+/** Last error message for a statement handle. */
 const char* stoolap_stmt_errmsg(const StoolapStmt* stmt);
 
 /* =========================================================================
@@ -320,18 +273,12 @@ const char* stoolap_stmt_errmsg(const StoolapStmt* stmt);
  * ========================================================================= */
 
 /**
- * Begin a transaction with the default isolation level (READ COMMITTED).
- * The transaction must be ended with stoolap_tx_commit() or stoolap_tx_rollback().
- *
- * The transaction keeps the underlying database engine alive even if the
- * originating StoolapDB handle is closed before the transaction ends.
+ * Begin a transaction (READ COMMITTED). End with stoolap_tx_commit/rollback.
+ * The transaction keeps the engine alive even if the originating StoolapDB is closed first.
  */
 int32_t stoolap_begin(StoolapDB* db, StoolapTx** out_tx);
 
-/**
- * Begin a transaction with a specific isolation level.
- * @param isolation  STOOLAP_ISOLATION_READ_COMMITTED or STOOLAP_ISOLATION_SNAPSHOT.
- */
+/** Begin a transaction with STOOLAP_ISOLATION_READ_COMMITTED or STOOLAP_ISOLATION_SNAPSHOT. */
 int32_t stoolap_begin_with_isolation(
     StoolapDB* db,
     int32_t isolation,
@@ -362,18 +309,7 @@ int32_t stoolap_tx_query_params(
     StoolapRows** out_rows
 );
 
-/**
- * Execute a prepared statement within a transaction (with parameters).
- *
- * Combines parse-once performance with transaction atomicity.
- * The statement must have been created via stoolap_prepare().
- *
- * @param tx             Transaction handle.
- * @param stmt           Prepared statement handle (not consumed).
- * @param params         Array of parameter values. May be NULL if params_len is 0.
- * @param params_len     Number of parameters.
- * @param rows_affected  If non-NULL, receives the number of affected rows.
- */
+/** Execute a prepared statement within a transaction. `stmt` is not consumed. */
 int32_t stoolap_tx_stmt_exec(
     StoolapTx* tx,
     const StoolapStmt* stmt,
@@ -382,18 +318,7 @@ int32_t stoolap_tx_stmt_exec(
     int64_t* rows_affected
 );
 
-/**
- * Query using a prepared statement within a transaction (with parameters).
- *
- * Combines parse-once performance with transaction atomicity.
- * On success, *out_rows must be closed with stoolap_rows_close().
- *
- * @param tx          Transaction handle.
- * @param stmt        Prepared statement handle (not consumed).
- * @param params      Array of parameter values. May be NULL if params_len is 0.
- * @param params_len  Number of parameters.
- * @param out_rows    On success, receives the result set handle.
- */
+/** Query using a prepared statement within a transaction. *out_rows must be closed with stoolap_rows_close(). */
 int32_t stoolap_tx_stmt_query(
     StoolapTx* tx,
     const StoolapStmt* stmt,
@@ -402,48 +327,65 @@ int32_t stoolap_tx_stmt_query(
     StoolapRows** out_rows
 );
 
-/**
- * Commit a transaction.
- * The tx handle is consumed (freed) regardless of success or failure.
- */
+/** Execute within a transaction (named parameters). */
+int32_t stoolap_tx_exec_named(
+    StoolapTx* tx,
+    const char* sql,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    int64_t* rows_affected
+);
+
+/** Query within a transaction (named parameters). */
+int32_t stoolap_tx_query_named(
+    StoolapTx* tx,
+    const char* sql,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    StoolapRows** out_rows
+);
+
+/** Execute a prepared statement within a transaction (named parameters). */
+int32_t stoolap_tx_stmt_exec_named(
+    StoolapTx* tx,
+    const StoolapStmt* stmt,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    int64_t* rows_affected
+);
+
+/** Query using a prepared statement within a transaction (named parameters). */
+int32_t stoolap_tx_stmt_query_named(
+    StoolapTx* tx,
+    const StoolapStmt* stmt,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    StoolapRows** out_rows
+);
+
+/** Commit a transaction. The tx handle is consumed regardless of result. */
 int32_t stoolap_tx_commit(StoolapTx* tx);
 
-/**
- * Rollback a transaction.
- * The tx handle is consumed (freed) regardless of success or failure.
- */
+/** Rollback a transaction. The tx handle is consumed regardless of result. */
 int32_t stoolap_tx_rollback(StoolapTx* tx);
 
-/** Get the last error message for a transaction handle. */
+/** Last error message for a transaction handle. */
 const char* stoolap_tx_errmsg(const StoolapTx* tx);
 
 /* =========================================================================
  * Result set iteration
  * ========================================================================= */
 
-/**
- * Advance to the next row.
- * @return STOOLAP_ROW if a row is available.
- *         STOOLAP_DONE when exhausted.
- *         STOOLAP_ERROR on error (check stoolap_rows_errmsg).
- */
+/** Advance to the next row. Returns STOOLAP_ROW, STOOLAP_DONE, or STOOLAP_ERROR. */
 int32_t stoolap_rows_next(StoolapRows* rows);
 
-/** Get the number of columns in the result set. */
+/** Number of columns in the result set. */
 int32_t stoolap_rows_column_count(const StoolapRows* rows);
 
-/**
- * Get the name of a column by index (0-based).
- * Returns a pointer valid until stoolap_rows_close(). Must NOT be freed.
- * Returns NULL if index is out of bounds.
- */
+/** Column name by 0-based index. Pointer valid until stoolap_rows_close(). NULL if out of bounds. */
 const char* stoolap_rows_column_name(const StoolapRows* rows, int32_t index);
 
-/**
- * Get the type of a column value in the current row.
- * Returns a STOOLAP_TYPE_* constant.
- * Only valid after a successful stoolap_rows_next().
- */
+/** STOOLAP_TYPE_* of a column value in the current row. Only valid after stoolap_rows_next() returns STOOLAP_ROW. */
 int32_t stoolap_rows_column_type(const StoolapRows* rows, int32_t index);
 
 /** Get an integer value. Returns 0 if NULL or not convertible. */
@@ -453,45 +395,34 @@ int64_t stoolap_rows_column_int64(const StoolapRows* rows, int32_t index);
 double stoolap_rows_column_double(const StoolapRows* rows, int32_t index);
 
 /**
- * Get a text value from the current row.
- * @param out_len  If non-NULL, receives the full byte length (excluding the
- *                 trailing NUL terminator). This may exceed strlen() if the
- *                 value contains embedded NUL bytes. Use out_len to read the
- *                 complete data in that case.
- * @return Pointer valid until the next stoolap_rows_next() call.
- *         Returns NULL if the column is NULL. Must NOT be freed.
+ * Get a text value. *out_len (if non-NULL) is the byte length excluding trailing NUL
+ * (may exceed strlen() with embedded NULs). Pointer valid until next stoolap_rows_next().
+ * NULL if column is NULL. Do NOT free.
  */
 const char* stoolap_rows_column_text(StoolapRows* rows, int32_t index, int64_t* out_len);
 
-/** Get a boolean value. Returns 0 (false) if NULL or not convertible. */
+/** Get a boolean (0 if NULL or not convertible). */
 int32_t stoolap_rows_column_bool(const StoolapRows* rows, int32_t index);
 
-/** Get a timestamp as nanoseconds since Unix epoch (UTC). Returns 0 if NULL. */
+/** Get a timestamp as nanoseconds since Unix epoch UTC (0 if NULL). */
 int64_t stoolap_rows_column_timestamp(const StoolapRows* rows, int32_t index);
 
 /**
- * Get a VECTOR column as packed little-endian f32 bytes.
- * Only returns data for VECTOR columns; returns NULL for JSON and other types.
- * @param out_len  Receives the byte length of the f32 payload.
- * @return Pointer valid until the next stoolap_rows_next() call.
- *         Returns NULL if not a VECTOR column or if NULL. Must NOT be freed.
+ * Get a VECTOR column as packed little-endian f32 bytes. NULL for non-VECTOR or NULL.
+ * Pointer valid until next stoolap_rows_next(). Do NOT free.
  */
 const uint8_t* stoolap_rows_column_blob(const StoolapRows* rows, int32_t index, int64_t* out_len);
 
-/** Check if the current row's column is NULL. Returns 1 if NULL, 0 otherwise. */
+/** Returns 1 if column is NULL, 0 otherwise. */
 int32_t stoolap_rows_column_is_null(const StoolapRows* rows, int32_t index);
 
-/** Get the number of rows affected (for DML results). */
+/** Number of rows affected (for DML results). */
 int64_t stoolap_rows_affected(const StoolapRows* rows);
 
-/**
- * Close the result set and free resources.
- * Safe to call with NULL (no-op).
- * Must be called even after STOOLAP_DONE.
- */
+/** Close the result set. NULL-safe. Must be called even after STOOLAP_DONE. */
 void stoolap_rows_close(StoolapRows* rows);
 
-/** Get the last error message for a rows handle. */
+/** Last error message for a rows handle. */
 const char* stoolap_rows_errmsg(const StoolapRows* rows);
 
 /* =========================================================================
@@ -499,7 +430,8 @@ const char* stoolap_rows_errmsg(const StoolapRows* rows);
  * ========================================================================= */
 
 /**
- * Fetch all remaining rows into a packed binary buffer (single call).
+ * Fetch all remaining rows into a packed binary buffer. Caller MUST free *out_buf with stoolap_buffer_free().
+ * The rows handle is consumed; call stoolap_rows_close() afterward.
  *
  * Format:
  *   [column_count: u32 LE]
@@ -517,10 +449,6 @@ const char* stoolap_rows_errmsg(const StoolapRows* rows);
  *       JSON(6):      len:u32 LE + bytes
  *       BLOB(7):      len:u32 LE + bytes (packed f32 for vectors)
  *   ]
- *
- * On success, *out_buf receives a heap-allocated buffer and *out_len its
- * byte length.  Caller MUST free with stoolap_buffer_free().
- * The rows handle's data is consumed; call stoolap_rows_close() afterward.
  */
 int32_t stoolap_rows_fetch_all(
     StoolapRows* rows,
@@ -528,22 +456,157 @@ int32_t stoolap_rows_fetch_all(
     int64_t* out_len
 );
 
-/**
- * Free a buffer allocated by stoolap_rows_fetch_all().
- * Safe to call with NULL (no-op).
- */
+/** Free a buffer allocated by stoolap_rows_fetch_all(). NULL-safe. */
 void stoolap_buffer_free(uint8_t* buf, int64_t len);
 
 /* =========================================================================
  * Memory management
  * ========================================================================= */
 
-/**
- * Free a string allocated by the library.
- * Safe to call with NULL (no-op).
- * Only use for strings explicitly documented as "must be freed".
- */
+/** Free a string returned by the library. NULL-safe. Only use for strings documented as "must be freed". */
 void stoolap_string_free(char* s);
+
+/* =========================================================================
+ * Typed error codes
+ * =========================================================================
+ *
+ * errdetails() fills StoolapErrorDetails; char* fields valid until next FFI
+ * call on the same handle. NULL = field not applicable. Codes are
+ * append-only; treat unknown codes as STOOLAP_ERR_GENERIC.
+ */
+
+#define STOOLAP_ERR_OK                  0
+#define STOOLAP_ERR_GENERIC             1
+#define STOOLAP_ERR_NOT_NULL            2
+#define STOOLAP_ERR_UNIQUE              3
+#define STOOLAP_ERR_PRIMARY_KEY         4
+#define STOOLAP_ERR_FOREIGN_KEY         5
+#define STOOLAP_ERR_CHECK               6
+#define STOOLAP_ERR_TABLE_NOT_FOUND     7
+#define STOOLAP_ERR_TABLE_EXISTS        8
+#define STOOLAP_ERR_COLUMN_NOT_FOUND    9
+#define STOOLAP_ERR_INDEX_NOT_FOUND    10
+#define STOOLAP_ERR_INDEX_EXISTS       11
+#define STOOLAP_ERR_TYPE_MISMATCH      12
+#define STOOLAP_ERR_INVALID_ARGUMENT   13
+#define STOOLAP_ERR_PARSE              14
+#define STOOLAP_ERR_TX_ABORTED         15
+#define STOOLAP_ERR_TX_CLOSED          16
+#define STOOLAP_ERR_READ_ONLY          17
+#define STOOLAP_ERR_DB_LOCKED          18
+#define STOOLAP_ERR_IO                 19
+#define STOOLAP_ERR_NOT_SUPPORTED      20
+#define STOOLAP_ERR_INTERNAL           21
+#define STOOLAP_ERR_QUERY_CANCELLED    22
+#define STOOLAP_ERR_DIVISION_BY_ZERO   23
+#define STOOLAP_ERR_VALUE_TOO_LONG     24
+#define STOOLAP_ERR_VIEW_NOT_FOUND     25
+#define STOOLAP_ERR_VIEW_EXISTS        26
+#define STOOLAP_ERR_REOPEN_REQUIRED    27 /**< SWMR readers: hard-reopen required (schema change,
+                                                writer reincarnation, snapshot expiry, pending DDL,
+                                                partial reload). Transient WAL-tail decode errors
+                                                surface as STOOLAP_ERR_IO and may be retried. */
+
+typedef struct StoolapErrorDetails {
+    int32_t code;
+    int32_t _padding;
+    /** Always non-NULL. Empty C string on success. */
+    const char* message;
+    /** Table name, or NULL if not applicable. */
+    const char* table;
+    /** Column name, or NULL if not applicable. */
+    const char* column;
+    /** Index name (UNIQUE) or referenced table (FK), or NULL. */
+    const char* constraint;
+    /** Free-form: conflicting value (UNIQUE), CHECK expression, FK detail. */
+    const char* detail;
+} StoolapErrorDetails;
+
+int32_t  stoolap_errcode      (const StoolapDB*    db);
+int32_t  stoolap_errdetails   (const StoolapDB*    db, StoolapErrorDetails* out);
+int32_t  stoolap_tx_errcode   (const StoolapTx*    tx);
+int32_t  stoolap_tx_errdetails(const StoolapTx*    tx, StoolapErrorDetails* out);
+int32_t  stoolap_stmt_errcode (const StoolapStmt*  stmt);
+int32_t  stoolap_stmt_errdetails(const StoolapStmt* stmt, StoolapErrorDetails* out);
+int32_t  stoolap_rows_errcode (const StoolapRows*  rows);
+int32_t  stoolap_rows_errdetails(const StoolapRows* rows, StoolapErrorDetails* out);
+
+/* =========================================================================
+ * MVCC-safe table count
+ * ========================================================================= */
+
+/** Visible row count of `table`. Autocommit-correct; safe in hot loop. */
+int32_t stoolap_table_count   (StoolapDB* db,    const char* table, uint64_t* out_count);
+/** Visible row count within a transaction; includes same-tx uncommitted INSERT/DELETE. */
+int32_t stoolap_tx_table_count(StoolapTx* tx,    const char* table, uint64_t* out_count);
+
+/* =========================================================================
+ * Savepoints
+ * =========================================================================
+ *
+ * `name_len` is the byte length; pass -1 for a NUL-terminated C string.
+ */
+
+int32_t stoolap_tx_savepoint            (StoolapTx* tx, const char* name, int32_t name_len);
+int32_t stoolap_tx_release_savepoint    (StoolapTx* tx, const char* name, int32_t name_len);
+int32_t stoolap_tx_rollback_to_savepoint(StoolapTx* tx, const char* name, int32_t name_len);
+
+/* =========================================================================
+ * Read-only handle
+ * =========================================================================
+ *
+ * StoolapRoDB exposes only read entry points. Write SQL passed to
+ * stoolap_ro_query is rejected with STOOLAP_ERR_READ_ONLY. The DSN flags
+ * ?read_only=true / ?readonly=true / ?mode=ro are accepted here as
+ * no-ops, but rejected by stoolap_open with STOOLAP_ERR_INVALID_ARGUMENT.
+ */
+
+/** Read-only database handle. */
+typedef struct StoolapRoDB StoolapRoDB;
+
+int32_t      stoolap_open_read_only(const char* dsn, StoolapRoDB** out_db);
+/** Clone a read-only handle for multi-threaded use. Each clone has its own WAL pin and must be closed independently. */
+int32_t      stoolap_ro_clone          (const StoolapRoDB* db, StoolapRoDB** out_db);
+void         stoolap_ro_close          (StoolapRoDB* db);
+const char*  stoolap_ro_errmsg         (const StoolapRoDB* db);
+int32_t      stoolap_ro_errcode        (const StoolapRoDB* db);
+int32_t      stoolap_ro_errdetails     (const StoolapRoDB* db, StoolapErrorDetails* out);
+const char*  stoolap_ro_dsn            (const StoolapRoDB* db);
+
+/** Returns 1 if `name` exists, 0 if not, -1 on error (use stoolap_ro_errmsg). */
+int32_t      stoolap_ro_table_exists   (StoolapRoDB* db, const char* name);
+
+int32_t      stoolap_ro_table_count    (StoolapRoDB* db, const char* table, uint64_t* out_count);
+
+/**
+ * Advance the snapshot to the writer's latest visible state.
+ * Returns STOOLAP_REFRESH_ADVANCED on advance, STOOLAP_OK if already
+ * current, STOOLAP_ERROR on failure (STOOLAP_ERR_REOPEN_REQUIRED
+ * means the caller MUST close and reopen this handle; transient
+ * WAL-tail decode errors surface as STOOLAP_ERR_IO and may be retried).
+ */
+int32_t      stoolap_ro_refresh        (StoolapRoDB* db);
+
+/** Toggle auto-refresh on every query (default enabled). Disable for stable cross-query snapshot. */
+void         stoolap_ro_set_auto_refresh(StoolapRoDB* db, int32_t enabled);
+
+/**
+ * Configure background refresh ticker. 0 stops it; >0 (re)starts at that cadence.
+ * Minimum 100ms; smaller values fail with STOOLAP_ERROR
+ * (STOOLAP_ERR_INVALID_ARGUMENT via stoolap_ro_errcode()).
+ * The ticker advances the WAL pin so idle readers do not block writer WAL truncation.
+ * On must-reopen the ticker exits and the next query/refresh surfaces the error.
+ * Equivalent DSN flag: `?refresh_interval=30s`.
+ */
+int32_t      stoolap_ro_set_refresh_interval(StoolapRoDB* db, uint64_t interval_millis);
+
+int32_t      stoolap_ro_query          (StoolapRoDB* db, const char* sql, StoolapRows** out_rows);
+int32_t      stoolap_ro_query_params   (StoolapRoDB* db, const char* sql,
+                                         const StoolapValue* params, int32_t params_len,
+                                         StoolapRows** out_rows);
+int32_t      stoolap_ro_query_named    (StoolapRoDB* db, const char* sql,
+                                         const StoolapNamedParam* params, int32_t params_len,
+                                         StoolapRows** out_rows);
 
 #ifdef __cplusplus
 }

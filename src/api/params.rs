@@ -42,14 +42,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use smallvec::SmallVec;
 
 use crate::common::SmartString;
 use crate::core::Value;
 
-/// Type alias for parameter vectors.
-/// Uses SmallVec to avoid heap allocation for queries with ≤8 parameters (the common case).
-pub type ParamVec = SmallVec<[Value; 8]>;
+// Canonical home of `ParamVec` is `crate::core`; re-export keeps the
+// existing `crate::api::params::ParamVec` (and `stoolap::ParamVec`) import
+// paths stable for external callers.
+pub use crate::core::ParamVec;
 
 /// Trait for types that can be converted to SQL parameters
 ///

@@ -20,9 +20,32 @@ use rustc_hash::FxHashMap;
 use crate::common::CompactArc;
 use crate::core::{IsolationLevel, Result, RowVec, Schema};
 use crate::storage::config::Config;
-use crate::storage::traits::{Index, Transaction};
+use crate::storage::traits::{Index, ReadTransaction, WriteTransaction};
 
-/// Engine represents the storage engine
+/// Read-only surface of the storage engine.
+///
+/// Returns `Box<dyn ReadTransaction>` from transaction-start methods, so
+/// callers holding `&dyn ReadEngine` cannot reach DDL or any path that
+/// returns a writable transaction. The trait split is the bypass-proof
+/// contract for read-only mode.
+///
+/// `Engine: ReadEngine` (the writable trait inherits the read surface),
+/// so any concrete engine that implements `Engine` automatically exposes
+/// the read trait. A standalone read-only engine implements only
+/// `ReadEngine`.
+pub trait ReadEngine: Send + Sync {
+    /// Begins a new read-only transaction at the engine's default
+    /// isolation level.
+    fn begin_read_transaction(&self) -> Result<Box<dyn ReadTransaction>>;
+
+    /// Begins a new read-only transaction at a specific isolation level.
+    fn begin_read_transaction_with_level(
+        &self,
+        level: IsolationLevel,
+    ) -> Result<Box<dyn ReadTransaction>>;
+}
+
+/// Writable surface of the storage engine.
 ///
 /// This is the main entry point for interacting with the database.
 /// It manages transactions, tables, indexes, and persistence.
@@ -40,7 +63,7 @@ use crate::storage::traits::{Index, Transaction};
 ///
 /// engine.close()?;
 /// ```
-pub trait Engine: Send + Sync {
+pub trait Engine: ReadEngine + Send + Sync {
     /// Opens the storage engine
     ///
     /// This initializes the engine, opens the database path (if any),
@@ -56,13 +79,16 @@ pub trait Engine: Send + Sync {
     /// Begins a new transaction
     ///
     /// The transaction will use the engine's default isolation level.
-    fn begin_transaction(&self) -> Result<Box<dyn Transaction>>;
+    fn begin_transaction(&self) -> Result<Box<dyn WriteTransaction>>;
 
     /// Begins a new transaction with a specific isolation level
     ///
     /// # Arguments
     /// * `level` - The isolation level for the transaction
-    fn begin_transaction_with_level(&self, level: IsolationLevel) -> Result<Box<dyn Transaction>>;
+    fn begin_transaction_with_level(
+        &self,
+        level: IsolationLevel,
+    ) -> Result<Box<dyn WriteTransaction>>;
 
     /// Returns the path to the database directory
     ///
@@ -313,6 +339,7 @@ mod tests {
 
     use super::*;
 
-    // Verify trait is object-safe
-    fn _assert_object_safe(_: &dyn Engine) {}
+    // Verify both traits are object-safe
+    fn _assert_read_object_safe(_: &dyn ReadEngine) {}
+    fn _assert_write_object_safe(_: &dyn Engine) {}
 }

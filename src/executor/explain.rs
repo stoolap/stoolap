@@ -22,7 +22,7 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::registry::global_registry;
 use crate::optimizer::feedback::{fingerprint_predicate, global_feedback_cache};
 use crate::parser::ast::*;
-use crate::storage::traits::{Engine, QueryResult, ScanPlan};
+use crate::storage::traits::{Engine, QueryResult, ReadEngine, ScanPlan};
 
 use super::context::ExecutionContext;
 use super::operators::index_nested_loop::IndexLookupStrategy;
@@ -95,10 +95,10 @@ impl Executor {
                             let predicate_hash = fingerprint_predicate(&table_name, where_clause);
 
                             // Get estimated row count from planner
-                            let tx = self.engine.begin_transaction().ok();
+                            let tx = self.engine.begin_read_transaction().ok();
                             let estimated_rows = tx
                                 .as_ref()
-                                .and_then(|tx| tx.get_table(&table_name).ok())
+                                .and_then(|tx| tx.get_read_table(&table_name).ok())
                                 .map(|table| {
                                     let stats = self
                                         .get_query_planner()
@@ -328,8 +328,8 @@ impl Executor {
         match expr {
             Expression::TableSource(simple) => {
                 // Try to get the table and analyze access plan
-                if let Ok(tx) = self.engine.begin_transaction() {
-                    if let Ok(table) = tx.get_table(&simple.name.value) {
+                if let Ok(tx) = self.engine.begin_read_transaction() {
+                    if let Ok(table) = tx.get_read_table(&simple.name.value) {
                         // Build storage expression from WHERE clause for analysis
                         let storage_expr = if let Some(where_expr) = where_clause {
                             let schema = table.schema();
@@ -704,8 +704,8 @@ impl Executor {
         match expr {
             Expression::TableSource(simple) => {
                 // Try to get the table and analyze access plan
-                if let Ok(tx) = self.engine.begin_transaction() {
-                    if let Ok(table) = tx.get_table(&simple.name.value) {
+                if let Ok(tx) = self.engine.begin_read_transaction() {
+                    if let Ok(table) = tx.get_read_table(&simple.name.value) {
                         // Build storage expression from WHERE clause for analysis
                         let storage_expr = if let Some(where_expr) = where_clause {
                             let schema = table.schema();
@@ -1094,8 +1094,8 @@ impl Executor {
         // Check for WHERE clause filter text
         let filter = select.where_clause.as_ref().map(|w| format!("{}", w));
 
-        if let Ok(tx) = self.engine.begin_transaction() {
-            if let Ok(table) = tx.get_table(table_name) {
+        if let Ok(tx) = self.engine.begin_read_transaction() {
+            if let Ok(table) = tx.get_read_table(table_name) {
                 let hnsw_index = table.get_index_on_column(&vec_col_name).filter(|idx| {
                     idx.index_type() == crate::core::IndexType::Hnsw
                         && idx.hnsw_distance_metric() == Some(expected_metric)

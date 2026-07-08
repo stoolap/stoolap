@@ -5082,7 +5082,7 @@ impl Executor {
     /// - No FILTER clause on aggregates
     pub(crate) fn try_aggregation_pushdown(
         &self,
-        table: &dyn crate::storage::traits::Table,
+        table: &dyn crate::storage::traits::ReadTable,
         stmt: &SelectStatement,
         _ctx: &super::context::ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
@@ -5278,7 +5278,7 @@ impl Executor {
     /// - `Ok(None)` if the query is not eligible (falls through to next path)
     pub(crate) fn try_filtered_aggregation_pushdown(
         &self,
-        table: &dyn crate::storage::traits::Table,
+        table: &dyn crate::storage::traits::ReadTable,
         stmt: &SelectStatement,
         ctx: &super::context::ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
@@ -5459,7 +5459,7 @@ impl Executor {
     /// - `None` if the query is not eligible for streaming
     pub(crate) fn try_streaming_global_aggregation(
         &self,
-        table: &dyn crate::storage::traits::Table,
+        table: &dyn crate::storage::traits::ReadTable,
         stmt: &SelectStatement,
         ctx: &super::context::ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
@@ -6194,7 +6194,7 @@ impl Executor {
     /// - No WHERE, HAVING, ROLLUP, CUBE, or GROUPING SETS
     pub fn try_storage_aggregation(
         &self,
-        table: &dyn crate::storage::traits::Table,
+        table: &dyn crate::storage::traits::ReadTable,
         stmt: &SelectStatement,
         all_columns: &[String],
         classification: &QueryClassification,
@@ -6548,9 +6548,10 @@ impl Executor {
         &self,
         cd: &CompiledCountDistinct,
     ) -> Result<Box<dyn QueryResult>> {
-        // Get table and count distinct values directly
-        let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(&cd.table_name)?;
+        use crate::storage::traits::ReadEngine;
+        // Get table and count distinct values directly. Read-only path.
+        let tx = ReadEngine::begin_read_transaction(self.engine.as_ref())?;
+        let table = tx.get_read_table(&cd.table_name)?;
 
         let count = table
             .get_partition_count(&cd.column_name)
@@ -6712,7 +6713,8 @@ impl Executor {
         };
 
         // Try to get table and verify index exists
-        let tx = match self.engine.begin_transaction() {
+        use crate::storage::traits::ReadEngine;
+        let tx = match ReadEngine::begin_read_transaction(self.engine.as_ref()) {
             Ok(tx) => tx,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
@@ -6720,7 +6722,7 @@ impl Executor {
             }
         };
 
-        let table = match tx.get_table(&table_name) {
+        let table = match tx.get_read_table(&table_name) {
             Ok(t) => t,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
@@ -6824,9 +6826,10 @@ impl Executor {
         &self,
         cs: &crate::executor::query_cache::CompiledCountStar,
     ) -> Result<Box<dyn QueryResult>> {
-        // Get table and count rows directly
-        let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(&cs.table_name)?;
+        use crate::storage::traits::ReadEngine;
+        // Get table and count rows directly. Read-only path.
+        let tx = ReadEngine::begin_read_transaction(self.engine.as_ref())?;
+        let table = tx.get_read_table(&cs.table_name)?;
 
         let count = table.row_count();
 
@@ -7029,7 +7032,8 @@ impl Executor {
         };
 
         // Try to get table and get count
-        let tx = match self.engine.begin_transaction() {
+        use crate::storage::traits::ReadEngine;
+        let tx = match ReadEngine::begin_read_transaction(self.engine.as_ref()) {
             Ok(tx) => tx,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
@@ -7037,7 +7041,7 @@ impl Executor {
             }
         };
 
-        let table = match tx.get_table(&table_name) {
+        let table = match tx.get_read_table(&table_name) {
             Ok(t) => t,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());

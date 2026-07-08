@@ -20,7 +20,10 @@ use std::sync::Arc;
 
 use crate::api::database::DatabaseInner;
 use crate::api::transaction::Transaction;
-use crate::api::{Database, Rows, Statement};
+use crate::api::{Database, ReadOnlyDatabase, Rows, Statement};
+use crate::core::Error;
+
+use super::error::LastErrorState;
 
 /// FFI-safe tagged union for passing parameter values across the C boundary.
 #[repr(C)]
@@ -70,24 +73,71 @@ pub struct StoolapNamedParam {
     pub value: StoolapValue,
 }
 
+/// FFI-safe structured error detail. Pointers are valid until the next
+/// FFI call on the originating handle. NULL fields indicate "not
+/// applicable for this error code". `message` is never NULL, empty
+/// string when no error.
+#[repr(C)]
+pub struct StoolapErrorDetails {
+    /// One of `STOOLAP_ERR_*` constants.
+    pub code: i32,
+    pub _padding: i32,
+    /// Always non-NULL. Empty string on success.
+    pub message: *const c_char,
+    /// Table name for table-scoped errors. NULL otherwise.
+    pub table: *const c_char,
+    /// Column name for column-scoped errors. NULL otherwise.
+    pub column: *const c_char,
+    /// Index name (UNIQUE) or referenced table (FK). NULL otherwise.
+    pub constraint: *const c_char,
+    /// Free-form detail: conflicting value (UNIQUE), CHECK expression,
+    /// FK detail message. NULL otherwise.
+    pub detail: *const c_char,
+}
+
 /// Opaque handle wrapping a [`Database`] connection.
 pub struct StoolapDB {
     pub(crate) db: Database,
-    pub(crate) last_error: Option<CString>,
+    pub(crate) last_error: LastErrorState,
     /// Holds a reference to the original (engine-owning) DatabaseInner.
     /// Prevents premature engine shutdown when the original handle is closed
     /// before its clones. `None` for the original handle, `Some` for clones.
     pub(crate) _engine_keepalive: Option<Arc<DatabaseInner>>,
+    /// Most-recent column-name `CString` set, keyed by the
+    /// `CompactArc<Vec<String>>` pointer identity of the source `Rows`.
+    /// Hits when two consecutive queries on this handle resolve to the
+    /// same projection plan (very common in HFT-style hot loops); misses
+    /// are no worse than the prior unconditional rebuild.
+    pub(crate) col_cstr_cache: ColumnCStrCache,
+}
+
+/// Opaque handle wrapping a [`ReadOnlyDatabase`] view.
+///
+/// Mirrors the Rust type split: this handle exposes only read functions
+/// (`stoolap_ro_query*`, `stoolap_ro_table_*`, `stoolap_ro_refresh`).
+/// There are no `_exec` / `_begin` / savepoint entry points, so attempting
+/// to write through a read-only handle is a compile-time error on the C
+/// side too, not a runtime `STOOLAP_ERR_READ_ONLY`.
+pub struct StoolapRoDB {
+    pub(crate) ro: ReadOnlyDatabase,
+    pub(crate) last_error: LastErrorState,
+    /// One-time cache of the DSN as a CString, populated lazily on
+    /// first `stoolap_ro_dsn()` call so the returned pointer is stable
+    /// for the lifetime of the handle without leaking on every call.
+    pub(crate) dsn_cstr: std::sync::OnceLock<CString>,
+    pub(crate) col_cstr_cache: ColumnCStrCache,
 }
 
 /// Opaque handle wrapping a [`Statement`].
 pub struct StoolapStmt {
     pub(crate) stmt: Statement,
-    pub(crate) last_error: Option<CString>,
+    pub(crate) last_error: LastErrorState,
     /// Pre-computed CString for `stoolap_stmt_sql()`.
     pub(crate) sql_cstr: CString,
-    /// Cached column name CStrings (computed on first query, reused thereafter).
-    pub(crate) cached_columns: Option<Arc<Vec<CString>>>,
+    /// Shared column-name CString cache. Skips rebuild when the next query
+    /// returns the same projection `CompactArc` as the previous one (the
+    /// prepared-statement hot loop).
+    pub(crate) col_cstr_cache: ColumnCStrCache,
     /// Keeps the originating `DatabaseInner` alive so the `Statement`'s `Weak`
     /// reference can be upgraded. For original handles this is the engine-owning
     /// inner; for clone handles it is the clone's own (non-owning) inner.
@@ -101,87 +151,175 @@ pub struct StoolapStmt {
 /// Opaque handle wrapping a [`Transaction`].
 pub struct StoolapTx {
     pub(crate) tx: Option<Transaction>,
-    pub(crate) last_error: Option<CString>,
+    pub(crate) last_error: LastErrorState,
     /// Keeps the originating `DatabaseInner` alive so the transaction's
     /// storage references remain valid.
     pub(crate) _db_keepalive: Arc<DatabaseInner>,
     /// For transactions begun from a clone handle, holds the engine-owning
     /// `DatabaseInner` to prevent `close_engine()`. `None` for original handles.
     pub(crate) _engine_keepalive: Option<Arc<DatabaseInner>>,
+    pub(crate) col_cstr_cache: ColumnCStrCache,
+}
+
+/// Single cached column-name set: the source `CompactArc` we matched
+/// against, kept alive so its address can't be recycled, paired with the
+/// `CString`s we built from it.
+type ColumnCacheEntry = (crate::common::CompactArc<Vec<String>>, Arc<Vec<CString>>);
+
+/// Single-slot column-name cache. Two queries that share the same column
+/// `CompactArc` (same projection plan) skip a `Vec<CString>` rebuild.
+///
+/// The cache holds a strong clone of the source `CompactArc`, comparing
+/// raw pointers without keeping the allocation alive is unsound: when the
+/// previous `Rows` handle is closed and its `CompactArc` drops, the
+/// allocator can reuse that address for a brand-new projection, and a
+/// pointer-equality check would falsely report a hit and return the
+/// previous projection's `CString`s. Equality is therefore checked via
+/// `CompactArc::ptr_eq` against an Arc we own.
+#[derive(Default)]
+pub(crate) struct ColumnCStrCache {
+    held: Option<ColumnCacheEntry>,
+}
+
+impl ColumnCStrCache {
+    /// Look up by `Rows::columns_arc()` identity. On miss, build fresh
+    /// `CString`s, store them alongside an owning clone of the source
+    /// `CompactArc`, and return the new cache entry.
+    pub(crate) fn get_or_build(
+        &mut self,
+        arc: &crate::common::CompactArc<Vec<String>>,
+    ) -> Arc<Vec<CString>> {
+        if let Some((held_arc, cstrs)) = &self.held {
+            if crate::common::CompactArc::ptr_eq(held_arc, arc) {
+                return Arc::clone(cstrs);
+            }
+        }
+        let cstrs: Arc<Vec<CString>> = Arc::new(
+            arc.iter()
+                .map(|name| CString::new(name.as_str()).unwrap_or_default())
+                .collect(),
+        );
+        self.held = Some((arc.clone(), Arc::clone(&cstrs)));
+        cstrs
+    }
+}
+
+/// Build a [`StoolapRows`] handle, looking up cached column-name
+/// `CString`s by `Rows::columns_arc()` identity. Used by every FFI query
+/// entry point (DB / Tx / RO / Statement) so they share one cache hit
+/// path.
+pub(crate) fn build_rows_handle(
+    rows: crate::api::Rows,
+    cache: &mut ColumnCStrCache,
+) -> Box<StoolapRows> {
+    let column_names = cache.get_or_build(rows.columns_arc());
+    let affected = rows.rows_affected();
+    let col_count = column_names.len();
+    Box::new(StoolapRows {
+        rows: Some(rows),
+        has_row: false,
+        last_error: LastErrorState::default(),
+        column_names,
+        text_cache: vec![Vec::new(); col_count],
+        text_cache_populated: vec![false; col_count],
+        text_cache_dirty: smallvec::SmallVec::new(),
+        rows_affected: affected,
+    })
 }
 
 /// Opaque handle wrapping a [`Rows`] result set.
 pub struct StoolapRows {
     pub(crate) rows: Option<Rows>,
     pub(crate) has_row: bool,
-    pub(crate) last_error: Option<CString>,
+    pub(crate) last_error: LastErrorState,
     /// Column names as CStrings (shared via Arc for prepared statement reuse).
     pub(crate) column_names: Arc<Vec<CString>>,
-    /// Lazy text cache for the current row. Starts empty; grown on demand by
-    /// `stoolap_rows_column_text()`. Cleared only when at least one entry was
-    /// populated (`text_cache_dirty`), so numeric-only scans pay zero overhead.
-    /// Each populated entry is `[text_bytes..., 0]` — the original text (may
-    /// contain interior NULs) with a trailing NUL terminator for C compat.
-    pub(crate) text_cache: Vec<Option<Vec<u8>>>,
-    /// True when at least one entry in `text_cache` was populated for the
-    /// current row. Avoids clearing the entire Vec when no text was accessed.
-    pub(crate) text_cache_dirty: bool,
+    /// Lazy text cache for the current row. One slot per column; each slot's
+    /// `Vec<u8>` is reused across rows (cleared, not dropped) so a long scan
+    /// pays at most one allocation per (row, column) pair amortized.
+    /// Populated buffers always end in a trailing NUL byte (length >= 1).
+    /// `text_cache_populated` is the authoritative populated flag; do NOT
+    /// rely on `slot.is_empty()` as a sentinel.
+    pub(crate) text_cache: Vec<Vec<u8>>,
+    /// Per-column populated flag for the current row. Set when `fill_text_buf`
+    /// successfully renders; cleared in `stoolap_rows_next` alongside the
+    /// buffer reset. Explicit flag (vs implicit `is_empty()`) so an empty
+    /// text value or a future change to `fill_text_buf`'s error path can't
+    /// collapse with the "no value cached yet" state.
+    pub(crate) text_cache_populated: Vec<bool>,
+    /// Indices populated for the current row. On row advance we only clear
+    /// these (preserving capacity), avoiding an O(N) sweep over wide tables.
+    pub(crate) text_cache_dirty: smallvec::SmallVec<[u32; 4]>,
     /// Number of rows affected (for DML results).
     pub(crate) rows_affected: i64,
 }
 
 impl StoolapDB {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        let sanitized = msg.replace('\0', "\\0");
-        self.last_error = CString::new(sanitized).ok();
+        self.last_error.set_message(msg);
+    }
+
+    pub(crate) fn set_error_from(&mut self, err: &Error) {
+        self.last_error.set_from_error(err);
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
-        match &self.last_error {
-            Some(cs) => cs.as_ptr(),
-            None => super::error::empty_cstr(),
-        }
+        self.last_error.message_ptr()
+    }
+}
+
+impl StoolapRoDB {
+    pub(crate) fn set_error(&mut self, msg: &str) {
+        self.last_error.set_message(msg);
+    }
+
+    pub(crate) fn set_error_from(&mut self, err: &Error) {
+        self.last_error.set_from_error(err);
+    }
+
+    pub(crate) fn error_ptr(&self) -> *const c_char {
+        self.last_error.message_ptr()
     }
 }
 
 impl StoolapStmt {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        let sanitized = msg.replace('\0', "\\0");
-        self.last_error = CString::new(sanitized).ok();
+        self.last_error.set_message(msg);
+    }
+
+    pub(crate) fn set_error_from(&mut self, err: &Error) {
+        self.last_error.set_from_error(err);
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
-        match &self.last_error {
-            Some(cs) => cs.as_ptr(),
-            None => super::error::empty_cstr(),
-        }
+        self.last_error.message_ptr()
     }
 }
 
 impl StoolapTx {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        let sanitized = msg.replace('\0', "\\0");
-        self.last_error = CString::new(sanitized).ok();
+        self.last_error.set_message(msg);
+    }
+
+    pub(crate) fn set_error_from(&mut self, err: &Error) {
+        self.last_error.set_from_error(err);
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
-        match &self.last_error {
-            Some(cs) => cs.as_ptr(),
-            None => super::error::empty_cstr(),
-        }
+        self.last_error.message_ptr()
     }
 }
 
 impl StoolapRows {
     pub(crate) fn set_error(&mut self, msg: &str) {
-        let sanitized = msg.replace('\0', "\\0");
-        self.last_error = CString::new(sanitized).ok();
+        self.last_error.set_message(msg);
+    }
+
+    pub(crate) fn set_error_from(&mut self, err: &Error) {
+        self.last_error.set_from_error(err);
     }
 
     pub(crate) fn error_ptr(&self) -> *const c_char {
-        match &self.last_error {
-            Some(cs) => cs.as_ptr(),
-            None => super::error::empty_cstr(),
-        }
+        self.last_error.message_ptr()
     }
 }

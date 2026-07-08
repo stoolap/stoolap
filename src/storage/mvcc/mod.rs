@@ -38,9 +38,13 @@
 pub mod arena;
 pub mod engine;
 pub mod file_lock;
+pub mod lease;
+pub mod manifest_epoch;
+pub mod overlay;
 pub mod persistence;
 pub mod registry;
 pub mod scanner;
+pub mod shm;
 pub mod snapshot;
 pub mod streaming_result;
 pub mod table;
@@ -71,7 +75,8 @@ pub use streaming_result::{AggregationScanner, StreamingResult, VisibleRowInfo};
 pub use table::MVCCTable;
 pub use timestamp::get_fast_timestamp;
 pub use transaction::{
-    MvccTransaction, SealFenceGuard, TransactionEngineOperations, TransactionState,
+    DeferredDdlOp, DropSnapshot, MvccTransaction, SealFenceGuard, TransactionEngineOperations,
+    TransactionState, TransactionalDdlFenceGuard,
 };
 pub use version_store::{
     clear_version_map_pools, AggregateOp, AggregateResult, RowIndex, RowVersion,

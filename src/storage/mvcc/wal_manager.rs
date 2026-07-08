@@ -23,7 +23,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::common::I64Set;
 use crate::core::{Error, Result};
@@ -48,25 +48,12 @@ pub const DEFAULT_WAL_BUFFER_SIZE: usize = 64 * 1024;
 /// Magic number for checkpoint files ("CHKP")
 const CHECKPOINT_MAGIC: u32 = 0x43504F49;
 
-// ============================================================================
-// WAL Entry Header Format V2 (32 bytes)
-// ============================================================================
-// Provides extensible header with version field and reserved space for future growth.
-//
-// Layout:
-// ┌─────────────────────────────────────────────────────────────────┐
-// │ Magic          (4 bytes)  0x454C4157 "WALE"                     │
-// │ Version        (1 byte)   Format version (currently 2)          │
-// │ Flags          (1 byte)   Bit flags for entry properties        │
-// │ Header Size    (2 bytes)  Total header size (allows growth)     │
-// │ LSN            (8 bytes)  Log sequence number                   │
-// │ Previous LSN   (8 bytes)  LSN of previous entry (chain link)    │
-// │ Entry Size     (4 bytes)  Size of data payload                  │
-// │ Reserved       (4 bytes)  Reserved for future use               │
-// └─────────────────────────────────────────────────────────────────┘
-
-/// Current WAL entry format version
-const WAL_FORMAT_VERSION: u8 = 2;
+/// Current WAL entry format version.
+/// v3 layout: 32-byte header (magic, version, flags, header_size, lsn, prev_lsn,
+/// entry_size, reserved) + data portion (txn_id, table_name, row_id, op,
+/// commit_seq, timestamp, data_len, data) + CRC32 over header+data.
+/// v2 (legacy) omits commit_seq and CRC covers data only; selected by version byte.
+const WAL_FORMAT_VERSION: u8 = 3;
 
 /// WAL entry header size in bytes
 const WAL_HEADER_SIZE: u16 = 32;
@@ -239,6 +226,9 @@ pub struct WALEntry {
     pub data: Vec<u8>,
     /// Operation timestamp (nanoseconds since epoch)
     pub timestamp: i64,
+    /// Commit sequence number (v3+). Set on commit markers; 0 on DML entries
+    /// and v2 entries (back-compat).
+    pub commit_seq: i64,
 }
 
 impl WALEntry {
@@ -265,7 +255,14 @@ impl WALEntry {
             operation,
             data,
             timestamp,
+            commit_seq: 0,
         }
+    }
+
+    /// Builder: set `commit_seq` on this entry.
+    pub fn with_commit_seq(mut self, commit_seq: i64) -> Self {
+        self.commit_seq = commit_seq;
+        self
     }
 
     /// Create a new WAL entry with flags
@@ -282,9 +279,9 @@ impl WALEntry {
         entry
     }
 
-    /// Create a commit entry (with COMMIT_MARKER flag for two-phase recovery)
-    pub fn commit(txn_id: i64) -> Self {
-        // Always set COMMIT_MARKER flag so two-phase recovery can identify commits
+    /// Create a commit entry. Pass 0 for synthetic commits (DDL) that don't
+    /// participate in snapshot_seq.
+    pub fn commit(txn_id: i64, commit_seq: i64) -> Self {
         Self::with_flags(
             txn_id,
             String::new(),
@@ -293,17 +290,16 @@ impl WALEntry {
             Vec::new(),
             WalFlags::COMMIT_MARKER,
         )
+        .with_commit_seq(commit_seq)
     }
 
-    /// Create a commit marker entry (explicit commit record for two-phase recovery)
-    /// Note: This is now equivalent to commit() - kept for API compatibility
-    pub fn commit_marker(txn_id: i64) -> Self {
-        Self::commit(txn_id)
+    /// Create a commit marker entry. Equivalent to [`Self::commit`].
+    pub fn commit_marker(txn_id: i64, commit_seq: i64) -> Self {
+        Self::commit(txn_id, commit_seq)
     }
 
     /// Create a rollback entry (with ABORT_MARKER flag for two-phase recovery)
     pub fn rollback(txn_id: i64) -> Self {
-        // Always set ABORT_MARKER flag so two-phase recovery can identify aborts
         Self::with_flags(
             txn_id,
             String::new(),
@@ -320,45 +316,22 @@ impl WALEntry {
         Self::rollback(txn_id)
     }
 
-    /// Check if this entry is a commit marker
+    /// Check if this entry is a commit marker.
+    /// Classified via the CRC-protected `operation` byte (NOT the unauthenticated
+    /// header flags) so corruption can't silently flip marker status.
     pub fn is_commit_marker(&self) -> bool {
-        self.flags.contains(WalFlags::COMMIT_MARKER) || self.operation == WALOperationType::Commit
+        self.operation == WALOperationType::Commit
     }
 
-    /// Check if this entry is an abort marker
+    /// Check if this entry is an abort marker. Same operation-byte rule as
+    /// `is_commit_marker`.
     pub fn is_abort_marker(&self) -> bool {
-        self.flags.contains(WalFlags::ABORT_MARKER) || self.operation == WALOperationType::Rollback
+        self.operation == WALOperationType::Rollback
     }
 
-    /// Encode entry to binary format with integrity protection
-    ///
-    /// Format V2 (32-byte header with extensibility):
-    /// ┌─────────────────────────────────────────────────────────────────┐
-    /// │ HEADER (32 bytes)                                               │
-    /// ├─────────────────────────────────────────────────────────────────┤
-    /// │ Magic          (4 bytes)  0x454C4157 "WALE"                     │
-    /// │ Version        (1 byte)   Format version (currently 2)          │
-    /// │ Flags          (1 byte)   Entry flags                           │
-    /// │ Header Size    (2 bytes)  Total header size (32)                │
-    /// │ LSN            (8 bytes)  Log sequence number                   │
-    /// │ Previous LSN   (8 bytes)  Previous entry LSN (chain link)       │
-    /// │ Entry Size     (4 bytes)  Size of data payload                  │
-    /// │ Reserved       (4 bytes)  Reserved for future use               │
-    /// ├─────────────────────────────────────────────────────────────────┤
-    /// │ DATA PORTION (variable):                                        │
-    /// │   - TxnID (8 bytes)                                             │
-    /// │   - TableNameLen (2 bytes) + TableName                          │
-    /// │   - RowID (8 bytes)                                             │
-    /// │   - Operation (1 byte)                                          │
-    /// │   - Timestamp (8 bytes)                                         │
-    /// │   - DataLen (4 bytes) + Data                                    │
-    /// ├─────────────────────────────────────────────────────────────────┤
-    /// │ CRC32 (4 bytes): checksum of header + data                      │
-    /// └─────────────────────────────────────────────────────────────────┘
+    /// Encode entry to binary format. v3 layout: 32B header + data portion + CRC32
+    /// (over header+data).
     pub fn encode(&self) -> Vec<u8> {
-        // Determine if we should compress the data payload.
-        // Avoid cloning self.data for the uncompressed case — write it
-        // directly into buf via extend_from_slice instead.
         let compressed_data: Option<Vec<u8>>;
         let use_compression;
         if self.data.len() >= COMPRESSION_THRESHOLD {
@@ -376,95 +349,147 @@ impl WALEntry {
         }
         let payload: &[u8] = compressed_data.as_deref().unwrap_or(&self.data);
 
-        // Calculate data portion size: txnID(8) + tableNameLen(2) + tableName + rowID(8) + op(1) + ts(8) + dataLen(4) + data
-        let data_size = 8 + 2 + self.table_name.len() + 8 + 1 + 8 + 4 + payload.len();
-
-        // Total buffer: header(32) + data + CRC(4)
+        // data: txnID(8) + tableNameLen(2) + tableName + rowID(8) + op(1) + commitSeq(8) + ts(8) + dataLen(4) + data
+        let data_size = 8 + 2 + self.table_name.len() + 8 + 1 + 8 + 8 + 4 + payload.len();
         let mut buf = Vec::with_capacity(WAL_HEADER_SIZE as usize + data_size + 4);
 
-        // ========== HEADER (32 bytes) ==========
-        // Magic marker (4 bytes)
+        // Header (32 bytes)
         buf.extend_from_slice(&WAL_ENTRY_MAGIC.to_le_bytes());
-
-        // Version (1 byte)
         buf.push(WAL_FORMAT_VERSION);
-
-        // Flags (1 byte) - set COMPRESSED if using compression
         let mut flags = self.flags;
         if use_compression {
             flags.set(WalFlags::COMPRESSED);
         }
         buf.push(flags.as_byte());
-
-        // Header Size (2 bytes)
         buf.extend_from_slice(&WAL_HEADER_SIZE.to_le_bytes());
-
-        // LSN (8 bytes)
         buf.extend_from_slice(&self.lsn.to_le_bytes());
-
-        // Previous LSN (8 bytes)
         buf.extend_from_slice(&self.previous_lsn.to_le_bytes());
-
-        // Entry Size (4 bytes) - size of data portion only
         buf.extend_from_slice(&(data_size as u32).to_le_bytes());
+        buf.extend_from_slice(&[0u8; 4]); // reserved
 
-        // Reserved (4 bytes)
-        buf.extend_from_slice(&[0u8; 4]);
-
-        // ========== DATA PORTION ==========
-        // TxnID (8 bytes)
+        // Data portion
         buf.extend_from_slice(&self.txn_id.to_le_bytes());
-
-        // Table name length (2 bytes) + table name
         buf.extend_from_slice(&(self.table_name.len() as u16).to_le_bytes());
         buf.extend_from_slice(self.table_name.as_bytes());
-
-        // RowID (8 bytes)
         buf.extend_from_slice(&self.row_id.to_le_bytes());
-
-        // Operation (1 byte)
         buf.push(self.operation as u8);
+
+        // CommitSeq (8 bytes, v3). Version byte selects decoder layout.
+        buf.extend_from_slice(&self.commit_seq.to_le_bytes());
 
         // Timestamp (8 bytes)
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
 
         // Data length (4 bytes) + data (possibly compressed)
-        // When compressed, lz4_flex::compress_prepend_size includes the original size
         buf.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         buf.extend_from_slice(payload);
 
-        // ========== CRC32 (4 bytes) ==========
-        // Calculate CRC over data portion only (starting after 32-byte header)
-        // This allows decode() to verify integrity without needing the header bytes
-        let crc = crc32fast::hash(&buf[WAL_HEADER_SIZE as usize..]);
+        // CRC32 covers header + data (v3); v2 falls back to data-only on decode.
+        let crc = crc32fast::hash(&buf[..]);
         buf.extend_from_slice(&crc.to_le_bytes());
 
         buf
     }
 
-    /// Decode entry from data portion (after header has been parsed)
-    ///
-    /// Parameters:
-    /// - lsn, previous_lsn, flags: extracted from header by caller
-    /// - data: data portion + CRC (4 bytes)
-    pub fn decode(lsn: u64, previous_lsn: u64, flags: WalFlags, data: &[u8]) -> Result<Self> {
-        // Minimum size: txnID(8) + tableNameLen(2) + rowID(8) + op(1) + ts(8) + dataLen(4) + CRC(4) = 35
+    /// Verify the CRC32 of an encoded entry without parsing the fields.
+    /// Used by SWMR scanners to authenticate the header LSN before windowing.
+    /// `header_bytes` is the 32-byte header (required for v3, ignored for v2).
+    pub fn verify_crc(version: u8, header_bytes: &[u8], data: &[u8]) -> Result<()> {
+        if data.len() < 4 {
+            return Err(Error::internal(format!(
+                "data too short for CRC tail: {} bytes",
+                data.len()
+            )));
+        }
+        if version != 2 && version != 3 {
+            return Err(Error::internal(format!(
+                "unsupported WAL entry format version: {}",
+                version
+            )));
+        }
+        let crc_offset = data.len() - 4;
+        let stored_crc = u32::from_le_bytes(data[crc_offset..].try_into().unwrap());
+        let computed_crc = if version >= 3 {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(header_bytes);
+            hasher.update(&data[..crc_offset]);
+            hasher.finalize()
+        } else {
+            crc32fast::hash(&data[..crc_offset])
+        };
+        if stored_crc != computed_crc {
+            return Err(Error::internal(format!(
+                "WAL CRC mismatch (version {}): stored={:#x}, computed={:#x}",
+                version, stored_crc, computed_crc
+            )));
+        }
+        Ok(())
+    }
+
+    /// Extract `(txn_id, operation)` from the data portion without a full decode.
+    /// Caller MUST have CRC-validated `data` already; returns `None` on layout
+    /// corruption (caller should then fall back to `decode` for a precise error).
+    pub fn peek_classification(data: &[u8]) -> Option<(i64, WALOperationType)> {
+        // CRC tail; payload size = data.len() - 4.
+        if data.len() < 4 + 8 + 2 + 8 + 1 {
+            return None;
+        }
+        let payload_len = data.len() - 4;
+        let mut pos = 0;
+        let txn_id = i64::from_le_bytes(data[pos..pos + 8].try_into().ok()?);
+        pos += 8;
+        let name_len = u16::from_le_bytes(data[pos..pos + 2].try_into().ok()?) as usize;
+        pos += 2;
+        if pos + name_len + 8 + 1 > payload_len {
+            return None;
+        }
+        pos += name_len; // skip table_name
+        pos += 8; // skip row_id
+        let op_byte = data[pos];
+        let op = WALOperationType::from_u8(op_byte)?;
+        Some((txn_id, op))
+    }
+
+    /// Decode entry from data portion (after header has been parsed).
+    /// `version` selects layout + CRC scope; `header_bytes` is required for v3.
+    pub fn decode(
+        lsn: u64,
+        previous_lsn: u64,
+        flags: WalFlags,
+        version: u8,
+        data: &[u8],
+        header_bytes: &[u8],
+    ) -> Result<Self> {
+        // Minimum: txnID(8) + tableNameLen(2) + rowID(8) + op(1) + ts(8) + dataLen(4) + CRC(4) = 35
         if data.len() < 35 {
             return Err(Error::internal(format!(
                 "data too short for WAL entry: {} bytes",
                 data.len()
             )));
         }
+        if version != 2 && version != 3 {
+            return Err(Error::internal(format!(
+                "unsupported WAL entry format version: {}",
+                version
+            )));
+        }
 
-        // Verify CRC32 (last 4 bytes)
+        // CRC scope: v3 = header + data, v2 = data only.
         let crc_offset = data.len() - 4;
         let stored_crc = u32::from_le_bytes(data[crc_offset..].try_into().unwrap());
-        let computed_crc = crc32fast::hash(&data[..crc_offset]);
+        let computed_crc = if version >= 3 {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(header_bytes);
+            hasher.update(&data[..crc_offset]);
+            hasher.finalize()
+        } else {
+            crc32fast::hash(&data[..crc_offset])
+        };
 
         if stored_crc != computed_crc {
             return Err(Error::internal(format!(
-                "WAL entry checksum mismatch at LSN {}: stored={:#x}, computed={:#x}",
-                lsn, stored_crc, computed_crc
+                "WAL entry checksum mismatch at LSN {} (version {}): stored={:#x}, computed={:#x}",
+                lsn, version, stored_crc, computed_crc
             )));
         }
 
@@ -511,6 +536,20 @@ impl WALEntry {
             .ok_or_else(|| Error::internal(format!("invalid operation type: {}", data[pos])))?;
         pos += 1;
 
+        // CommitSeq (8 bytes, v3 only). v2 defaults to 0.
+        let commit_seq: i64 = if version >= 3 {
+            if pos + 8 > data.len() {
+                return Err(Error::internal(
+                    "unexpected end of data reading commit_seq (v3)",
+                ));
+            }
+            let v = i64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            v
+        } else {
+            0
+        };
+
         // Timestamp (8 bytes)
         if pos + 8 > data.len() {
             return Err(Error::internal("unexpected end of data reading timestamp"));
@@ -552,6 +591,7 @@ impl WALEntry {
             operation,
             data: entry_data,
             timestamp,
+            commit_seq,
         })
     }
 
@@ -604,25 +644,22 @@ pub struct TwoPhaseRecoveryInfo {
     pub skipped_entries: u64,
 }
 
+/// Per-reader cursor recording the byte offset and LSN just past the last
+/// in-window record this reader CRC-validated. Used by
+/// `tail_committed_entries` to skip re-validating bytes a prior scan accepted.
+/// Reuse requires the next scan's lower bound to be `>= lsn_at_offset`.
+#[derive(Clone, Debug)]
+pub struct WalScanCursor {
+    /// Absolute path of the WAL file the offset belongs to.
+    pub path: PathBuf,
+    /// Byte position just past the last in-window CRC-validated record.
+    pub offset: u64,
+    /// LSN of the last record covered by the cursor; `0` = no records yet.
+    pub lsn_at_offset: u64,
+}
+
 impl CheckpointMetadata {
-    /// Read checkpoint metadata from file (section-based v2 format)
-    ///
-    /// Header format (32 bytes):
-    /// - Magic (4 bytes) - CHECKPOINT_MAGIC
-    /// - Version (1 byte) - Format version
-    /// - Flags (1 byte) - Reserved
-    /// - Header Size (2 bytes) - Total header size
-    /// - LSN (8 bytes) - Checkpoint LSN
-    /// - Timestamp (8 bytes) - Creation timestamp
-    /// - Section Count (2 bytes) - Number of sections
-    /// - Reserved (6 bytes) - For future use
-    ///
-    /// Then section headers (8 bytes each):
-    /// - Type (2 bytes) - Section type
-    /// - Flags (2 bytes) - Section flags
-    /// - Size (4 bytes) - Section data size
-    ///
-    /// Then section data, followed by CRC32
+    /// Read checkpoint metadata from file (section-based v2 format).
     pub fn read_from_file(path: &Path) -> Result<Self> {
         let data = fs::read(path)
             .map_err(|e| Error::internal(format!("failed to read checkpoint: {}", e)))?;
@@ -651,6 +688,12 @@ impl CheckpointMetadata {
         pos += 4;
 
         let version = data[pos];
+        if version > CHECKPOINT_FORMAT_VERSION {
+            return Err(Error::internal(format!(
+                "checkpoint format version {} is newer than supported version {}",
+                version, CHECKPOINT_FORMAT_VERSION
+            )));
+        }
         pos += 1;
 
         let _flags = data[pos];
@@ -945,10 +988,15 @@ pub struct WALManager {
     current_wal_file: Mutex<String>,
     /// Current Log Sequence Number
     current_lsn: AtomicU64,
+    /// Highest WAL LSN whose bytes have been written to the file (file-write
+    /// watermark, not fsync). SWMR readers gate visibility on this.
+    flushed_lsn: AtomicU64,
     /// Previous LSN for entry chaining (enables backward traversal)
     previous_lsn: AtomicU64,
     /// Write buffer
     buffer: Mutex<Vec<u8>>,
+    /// Highest LSN currently present in `buffer`. Guarded by `buffer`'s mutex.
+    buffer_highest_lsn: AtomicU64,
     /// Flush trigger size
     flush_trigger: u64,
     /// Maximum WAL file size
@@ -977,25 +1025,33 @@ pub struct WALManager {
     current_file_position: AtomicU64,
     /// WAL file sequence number (for rotation)
     wal_sequence: AtomicU64,
-    /// Count of in-flight writes (entries taken from buffer but not yet written to disk)
-    /// Used to prevent race condition during checkpoint where LSN is read but data isn't on disk yet
+    /// In-flight writes (taken from buffer but not yet on disk). Checkpoint waits
+    /// for this to reach 0 to avoid reading an LSN whose data isn't durable yet.
     in_flight_writes: AtomicU64,
+    /// First DML LSN per active user txn (`txn_id > 0`); MIN is published to
+    /// `db.shm.oldest_active_txn_lsn` so SWMR readers can floor Phase 2 scans.
+    /// Synthetic txn_ids (DDL, RECOVERY, INVALID) are not tracked.
+    active_txn_first_lsn: parking_lot::Mutex<rustc_hash::FxHashMap<i64, u64>>,
+    /// Cached MIN of `active_txn_first_lsn`. `u64::MAX` when empty.
+    oldest_active_lsn_cache: AtomicU64,
+    /// Optional shm mirror; `fetch_min`-published on every active-set change so a
+    /// reader's pre-acquire always sees a lower-bound for the writer's oldest active.
+    shm_oldest_mirror: std::sync::OnceLock<Arc<crate::storage::mvcc::shm::ShmHandle>>,
+    /// Txn ids (incl. DDL_TXN_ID) that have appended a DDL entry but
+    /// haven't seen their commit/abort marker yet. Used to bump
+    /// `shm.catalog_epoch` to the marker LSN on commit, so the SWMR DDL
+    /// watermark only advances for *committed* DDL.
+    txns_with_ddl: parking_lot::Mutex<rustc_hash::FxHashSet<i64>>,
 }
 
 impl WALManager {
-    /// Create a new WAL manager with default config
+    /// Create a new WAL manager with default config (writable).
     pub fn new(path: impl AsRef<Path>, sync_mode: SyncMode) -> Result<Self> {
-        Self::with_config(path, sync_mode, None)
+        Self::with_config(path, sync_mode, None, false)
     }
 
-    /// Recover from any interrupted WAL truncation operations
-    ///
-    /// This is called during WAL manager initialization to handle crash scenarios:
-    /// 1. If .bak file exists without corresponding .log file, restore it
-    /// 2. If temp files exist, clean them up
-    /// 3. If both .bak and new .log exist, the truncation completed - delete .bak
-    ///
-    /// This ensures no data is lost if a crash occurs during truncation.
+    /// Recover from interrupted WAL truncation: restore from .bak when no .log
+    /// exists, clean up temp files, drop stale .bak when truncation completed.
     fn recover_interrupted_truncation(wal_dir: &Path) -> Result<()> {
         if !wal_dir.exists() {
             return Ok(());
@@ -1073,28 +1129,45 @@ impl WALManager {
         Ok(())
     }
 
-    /// Create a new WAL manager with custom config
-    ///
-    /// This allows configuring:
-    /// - `commit_batch_size`: Number of commits to batch before syncing (SyncNormal mode)
-    /// - `sync_interval_ms`: Minimum time between syncs in milliseconds (SyncNormal mode)
-    /// - `wal_flush_trigger`: Buffer size that triggers a flush
-    /// - `wal_buffer_size`: Initial buffer size
-    /// - `wal_max_size`: Maximum WAL file size before rotation
+    /// Create a new WAL manager with custom config.
     pub fn with_config(
         path: impl AsRef<Path>,
         sync_mode: SyncMode,
         config: Option<&PersistenceConfig>,
+        read_only: bool,
     ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
 
-        // Create WAL directory if it doesn't exist
-        fs::create_dir_all(&path)
-            .map_err(|e| Error::internal(format!("failed to create WAL directory: {}", e)))?;
+        // Create dir + recover interrupted truncation only on writable opens.
+        if !read_only {
+            fs::create_dir_all(&path)
+                .map_err(|e| Error::internal(format!("failed to create WAL directory: {}", e)))?;
+            Self::recover_interrupted_truncation(&path)?;
+        }
 
-        // CRITICAL: Recover from any interrupted truncation before proceeding
-        // This ensures data integrity if a crash happened during WAL truncation
-        Self::recover_interrupted_truncation(&path)?;
+        // Read-only opens use read-only file handles (no create, no append).
+        let open_existing_wal = |wal_path: &Path| -> std::io::Result<File> {
+            if read_only {
+                OpenOptions::new().read(true).open(wal_path)
+            } else {
+                OpenOptions::new().read(true).append(true).open(wal_path)
+            }
+        };
+
+        // Read-only: missing wal/ is OK (volumes-only); unreadable wal/ is fatal.
+        if read_only {
+            match fs::read_dir(&path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(Error::internal(format!(
+                        "read-only open: cannot read WAL directory '{}': {}",
+                        path.display(),
+                        e
+                    )));
+                }
+            }
+        }
 
         let mut wal_file: Option<File> = None;
         let mut initial_lsn: u64 = 0;
@@ -1108,7 +1181,7 @@ impl WALManager {
                 initial_lsn = checkpoint.lsn;
 
                 let wal_path = path.join(&checkpoint.wal_file);
-                if let Ok(file) = OpenOptions::new().read(true).append(true).open(&wal_path) {
+                if let Ok(file) = open_existing_wal(&wal_path) {
                     wal_file = Some(file);
                 }
             }
@@ -1125,6 +1198,22 @@ impl WALManager {
                         && name.ends_with(".log")
                     {
                         wal_files.push(name);
+                    }
+                }
+            }
+
+            // Read-only with present-but-unreadable WAL files: surface the OS error.
+            if read_only && !wal_files.is_empty() && wal_file.is_none() {
+                let mut sorted = wal_files.clone();
+                sorted.sort_by_key(|name| Self::extract_lsn_from_filename(name).unwrap_or(0));
+                if let Some(newest) = sorted.last() {
+                    let wal_path = path.join(newest);
+                    if let Err(e) = open_existing_wal(&wal_path) {
+                        return Err(Error::internal(format!(
+                            "read-only open: cannot read WAL file '{}': {}",
+                            wal_path.display(),
+                            e
+                        )));
                     }
                 }
             }
@@ -1147,7 +1236,7 @@ impl WALManager {
                     }
                 }
 
-                if let Ok(file) = OpenOptions::new().read(true).append(true).open(&wal_path) {
+                if let Ok(file) = open_existing_wal(&wal_path) {
                     // Find last LSN in file
                     if let Ok(last_lsn) = find_last_lsn(&path.join(newest)) {
                         if last_lsn > initial_lsn {
@@ -1159,8 +1248,8 @@ impl WALManager {
             }
         }
 
-        // Create new WAL file if none exists
-        if wal_file.is_none() {
+        // Create new WAL file if none exists (writable opens only).
+        if wal_file.is_none() && !read_only {
             let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
             wal_filename = format!("wal-{}-lsn-0.log", timestamp);
             let wal_path = path.join(&wal_filename);
@@ -1215,8 +1304,10 @@ impl WALManager {
             wal_file: Mutex::new(wal_file),
             current_wal_file: Mutex::new(wal_filename),
             current_lsn: AtomicU64::new(initial_lsn),
+            flushed_lsn: AtomicU64::new(initial_lsn),
             previous_lsn: AtomicU64::new(initial_lsn),
             buffer: Mutex::new(Vec::with_capacity(buffer_size)),
+            buffer_highest_lsn: AtomicU64::new(0),
             flush_trigger,
             max_wal_size,
             last_checkpoint: AtomicU64::new(initial_lsn),
@@ -1229,6 +1320,11 @@ impl WALManager {
             current_file_position: AtomicU64::new(initial_file_position),
             wal_sequence: AtomicU64::new(initial_sequence),
             in_flight_writes: AtomicU64::new(0),
+            active_txn_first_lsn: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
+            oldest_active_lsn_cache: AtomicU64::new(u64::MAX), // sentinel = no active user txns
+
+            shm_oldest_mirror: std::sync::OnceLock::new(),
+            txns_with_ddl: parking_lot::Mutex::new(rustc_hash::FxHashSet::default()),
         })
     }
 
@@ -1262,68 +1358,106 @@ impl WALManager {
         self.current_lsn.load(Ordering::Acquire)
     }
 
+    /// Highest WAL LSN whose bytes have been written to the WAL file
+    /// (safe to advertise to cross-process readers).
+    pub fn flushed_lsn(&self) -> u64 {
+        self.flushed_lsn.load(Ordering::Acquire)
+    }
+
     /// Append a WAL entry
     pub fn append_entry(&self, mut entry: WALEntry) -> Result<u64> {
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
         }
 
-        // Get previous LSN and assign new LSN atomically
-        let prev_lsn = self.previous_lsn.load(Ordering::Acquire);
-        entry.previous_lsn = prev_lsn;
-
-        // Check for LSN overflow before incrementing
-        // u64::MAX is ~18 quintillion, practically unreachable, but check for safety
-        let current = self.current_lsn.load(Ordering::Acquire);
-        if current == u64::MAX {
-            return Err(Error::internal(
-                "WAL LSN overflow: maximum sequence number reached. Database requires maintenance.",
-            ));
-        }
-        entry.lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Update previous_lsn for next entry's chain link
-        self.previous_lsn.store(entry.lsn, Ordering::Release);
-
-        // Encode entry with new V2 format
-        let encoded = entry.encode();
-        let encoded_len = encoded.len() as u64;
-
-        // Write to buffer
-        {
-            let mut buffer = self.buffer.lock().unwrap();
-            buffer.extend_from_slice(&encoded);
-
-            let needs_flush = buffer.len() >= self.flush_trigger as usize;
-            let force_flush = self.sync_mode == SyncMode::Full
-                || (self.sync_mode == SyncMode::Normal
-                    && (entry.operation.is_transaction_end() || entry.operation.is_ddl()));
-
-            if needs_flush || force_flush {
-                let buffer_data = std::mem::take(&mut *buffer);
-                // CRITICAL: Increment in-flight counter BEFORE releasing lock
-                // This prevents checkpoint from reading LSN before data is on disk
-                self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
-                drop(buffer); // Release buffer lock before file operations
-
-                // Use a guard pattern to ensure we decrement even on error
-                let write_result = self.write_to_file(&buffer_data);
-                self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
-                write_result?;
-
-                // Update file position tracking
-                self.current_file_position
-                    .fetch_add(buffer_data.len() as u64, Ordering::Relaxed);
-
-                if self.should_sync(entry.operation) {
-                    self.sync_locked()?;
-                }
+        // Cover the gap between LSN allocation and disk durability so
+        // create_checkpoint's wait_for_in_flight_writes can't sample a
+        // current_lsn ahead of the buffered entry. RAII guard
+        // decrements on every exit path.
+        self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
+        struct InFlightGuard<'a>(&'a AtomicU64);
+        impl<'a> Drop for InFlightGuard<'a> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
             }
         }
+        let _in_flight = InFlightGuard(&self.in_flight_writes);
 
-        // Track that we wrote encoded_len bytes (even if buffered)
-        // This is approximate but sufficient for rotation decision
-        let _ = encoded_len;
+        // Full: flush every entry. Normal: flush on commit/DDL. None: never force
+        // (SWMR visibility capped by `flushed_lsn` so buffered markers stay hidden).
+        let force_flush = self.sync_mode == SyncMode::Full
+            || (self.sync_mode == SyncMode::Normal
+                && (entry.operation.is_transaction_end() || entry.operation.is_ddl()));
+
+        // Allocate the LSN and append inside one buffer critical section so
+        // buffer contents are always LSN-ordered (tail scanners assume the WAL
+        // file is LSN-monotonic).
+        let needs_flush = {
+            let mut buffer = self.buffer.lock().unwrap();
+
+            let current = self.current_lsn.load(Ordering::Acquire);
+            if current == u64::MAX {
+                return Err(Error::internal(
+                    "WAL LSN overflow: maximum sequence number reached. Database requires maintenance.",
+                ));
+            }
+            entry.previous_lsn = self.previous_lsn.load(Ordering::Acquire);
+            entry.lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+            self.previous_lsn.store(entry.lsn, Ordering::Release);
+
+            // Track first DML LSN per active user txn (skip synthetic ids and markers).
+            if entry.txn_id > 0 && !entry.is_marker_entry() {
+                let mut map = self.active_txn_first_lsn.lock();
+                if let std::collections::hash_map::Entry::Vacant(slot) = map.entry(entry.txn_id) {
+                    slot.insert(entry.lsn);
+                    self.refresh_oldest_active_cache_locked(&map);
+                }
+            }
+
+            // DDL watermark for SWMR readers. Track DDL-bearing txns at
+            // entry append; bump catalog_epoch only when the COMMIT marker
+            // lands so an uncommitted transactional DDL doesn't poison
+            // the watermark. Abort marker just clears the flag.
+            match entry.operation {
+                op if op.is_ddl() => {
+                    self.txns_with_ddl.lock().insert(entry.txn_id);
+                }
+                WALOperationType::Commit => {
+                    let was_flagged = self.txns_with_ddl.lock().remove(&entry.txn_id);
+                    if was_flagged {
+                        if let Some(handle) = self.shm_oldest_mirror.get() {
+                            handle
+                                .header()
+                                .catalog_epoch
+                                .fetch_max(entry.lsn, Ordering::Release);
+                        }
+                    }
+                }
+                WALOperationType::Rollback => {
+                    self.txns_with_ddl.lock().remove(&entry.txn_id);
+                }
+                _ => {}
+            }
+
+            let encoded = entry.encode();
+            buffer.extend_from_slice(&encoded);
+            self.buffer_highest_lsn
+                .fetch_max(entry.lsn, Ordering::AcqRel);
+
+            buffer.len() >= self.flush_trigger as usize
+        };
+
+        if needs_flush || force_flush {
+            // Lock ordering: wal_file first, then buffer. Taking the buffer and
+            // writing it under the file lock keeps file bytes LSN-ordered, so
+            // flushed_lsn always covers a prefix.
+            let mut wal_file = self.wal_file.lock().unwrap();
+            self.flush_buffer_locked(&mut wal_file)?;
+
+            if self.should_sync(entry.operation) {
+                self.sync_file_locked(&wal_file)?;
+            }
+        }
 
         Ok(entry.lsn)
     }
@@ -1333,20 +1467,59 @@ impl WALManager {
         self.previous_lsn.load(Ordering::Acquire)
     }
 
-    /// Write a commit marker for two-phase recovery
-    pub fn write_commit_marker(&self, txn_id: i64) -> Result<u64> {
-        let entry = WALEntry::commit_marker(txn_id);
+    /// Write a commit marker. Pass 0 for synthetic commits (DDL).
+    /// Does NOT clear `active_txn_first_lsn`; cleanup is deferred to
+    /// `clear_active_txn` after the visible-commit publish, so readers don't
+    /// advance the entry floor past this txn's earlier DML.
+    pub fn write_commit_marker(&self, txn_id: i64, commit_seq: i64) -> Result<u64> {
+        let entry = WALEntry::commit_marker(txn_id, commit_seq);
         self.append_entry(entry)
     }
 
-    /// Write an abort marker for two-phase recovery
+    /// Write an abort marker. Same deferred-cleanup contract as
+    /// `write_commit_marker`.
     pub fn write_abort_marker(&self, txn_id: i64) -> Result<u64> {
         let entry = WALEntry::abort_marker(txn_id);
         self.append_entry(entry)
     }
 
-    /// Write data to WAL file
-    fn write_to_file(&self, data: &[u8]) -> Result<()> {
+    /// Clear a txn's active-DML record after the visible-commit publish has
+    /// fired. No-op for synthetic txn_ids (DDL/INVALID/RECOVERY).
+    pub fn clear_active_txn(&self, txn_id: i64) {
+        if txn_id > 0 {
+            let mut map = self.active_txn_first_lsn.lock();
+            if map.remove(&txn_id).is_some() {
+                self.refresh_oldest_active_cache_locked(&map);
+            }
+        }
+    }
+
+    /// Recompute the cached `oldest_active_lsn`. Caller must hold the map's lock.
+    /// Also `fetch_min`-mirrors into `db.shm.oldest_active_txn_lsn` when wired.
+    fn refresh_oldest_active_cache_locked(&self, map: &rustc_hash::FxHashMap<i64, u64>) {
+        let new = map.values().copied().min().unwrap_or(u64::MAX);
+        self.oldest_active_lsn_cache.store(new, Ordering::Release);
+        // fetch_min only lowers; slow-path / barrier publishes raise under seqlock.
+        if let Some(handle) = self.shm_oldest_mirror.get() {
+            handle
+                .header()
+                .oldest_active_txn_lsn
+                .fetch_min(new, Ordering::AcqRel);
+        }
+    }
+
+    /// Wire an `Arc<ShmHandle>` for the oldest-active mirror. Idempotent.
+    pub fn set_shm_oldest_mirror(&self, shm: Arc<crate::storage::mvcc::shm::ShmHandle>) {
+        let _ = self.shm_oldest_mirror.set(shm);
+    }
+
+    /// Lowest first-DML LSN across active user transactions; `u64::MAX` when none.
+    pub fn oldest_active_txn_lsn(&self) -> u64 {
+        self.oldest_active_lsn_cache.load(Ordering::Acquire)
+    }
+
+    /// Write data to the WAL file via an already-held `wal_file` guard.
+    fn write_locked(&self, wal_file: &mut Option<File>, data: &[u8], max_lsn: u64) -> Result<()> {
         if data.is_empty() {
             return Ok(());
         }
@@ -1356,19 +1529,45 @@ impl WALManager {
             return Err(Error::internal("failpoint: WAL write"));
         }
 
-        let mut wal_file = self.wal_file.lock().unwrap();
         if let Some(file) = wal_file.as_mut() {
             file.write_all(data)
                 .map_err(|e| Error::internal(format!("failed to write to WAL: {}", e)))?;
         } else {
             return Err(Error::WalFileClosed);
         }
+        self.current_file_position
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        if max_lsn > 0 {
+            self.flushed_lsn.fetch_max(max_lsn, Ordering::AcqRel);
+        }
 
         Ok(())
     }
 
-    /// Sync WAL to disk (assumes lock is held)
-    fn sync_locked(&self) -> Result<()> {
+    /// Take the buffer and write it while holding the `wal_file` lock.
+    /// Lock ordering: callers hold `wal_file` BEFORE the buffer lock (never
+    /// the reverse), so concurrent flushers reach the file in LSN order and
+    /// `flushed_lsn` always covers a prefix.
+    fn flush_buffer_locked(&self, wal_file: &mut Option<File>) -> Result<()> {
+        let (data, max_lsn) = {
+            let mut buffer = self.buffer.lock().unwrap();
+            if buffer.is_empty() {
+                return Ok(());
+            }
+            // Bump in_flight before releasing the lock so checkpoint can't read ahead of disk.
+            self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
+            let data = std::mem::take(&mut *buffer);
+            let max_lsn = self.buffer_highest_lsn.swap(0, Ordering::AcqRel);
+            (data, max_lsn)
+        };
+
+        let write_result = self.write_locked(wal_file, &data, max_lsn);
+        self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
+        write_result
+    }
+
+    /// Fsync the WAL file via an already-held `wal_file` guard.
+    fn sync_file_locked(&self, wal_file: &Option<File>) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
         }
@@ -1378,7 +1577,6 @@ impl WALManager {
             return Err(Error::internal("failpoint: WAL sync"));
         }
 
-        let wal_file = self.wal_file.lock().unwrap();
         if let Some(file) = wal_file.as_ref() {
             file.sync_all()
                 .map_err(|e| Error::internal(format!("failed to sync WAL: {}", e)))?;
@@ -1391,6 +1589,12 @@ impl WALManager {
         self.last_sync_time.store(now, Ordering::Relaxed);
 
         Ok(())
+    }
+
+    /// Sync WAL to disk (acquires the file lock).
+    fn sync_locked(&self) -> Result<()> {
+        let wal_file = self.wal_file.lock().unwrap();
+        self.sync_file_locked(&wal_file)
     }
 
     /// Check if WAL file should be rotated based on size
@@ -1416,68 +1620,56 @@ impl WALManager {
         Ok(true)
     }
 
-    /// Rotate WAL to a new file
-    ///
-    /// This:
-    /// 1. Syncs and closes the current WAL file
-    /// 2. Creates a new WAL file with incremented sequence number
-    /// 3. Updates the checkpoint metadata with the new WAL reference
+    /// Rotate WAL: create new file with incremented sequence and update checkpoint.meta.
     fn rotate_wal(&self) -> Result<()> {
-        let current_lsn = self.current_lsn.load(Ordering::Acquire);
         let new_sequence = self.wal_sequence.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Generate new filename with sequence number and LSN
         let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-        let new_filename = format!(
-            "wal_{:08}-{}-lsn-{}.log",
-            new_sequence, timestamp, current_lsn
-        );
-        let new_path = self.path.join(&new_filename);
 
-        // Create new WAL file
-        let new_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&new_path)
-            .map_err(|e| Error::internal(format!("failed to create rotated WAL file: {}", e)))?;
-
-        // Update current WAL file references
         {
-            let old_filename = {
+            let (old_filename, new_filename) = {
                 let mut wal_file = self.wal_file.lock().unwrap();
+                // Drain buffered entries into the old file, THEN sample the
+                // boundary LSN, all under the file lock: no append can slip
+                // bytes above the sampled boundary into the old file, so the
+                // "lsn-N" embedded in the new filename is a true upper bound
+                // for the old file (cleanup_old_wal_files relies on it).
+                self.flush_buffer_locked(&mut wal_file)?;
+                let current_lsn = self.current_lsn.load(Ordering::Acquire);
+
+                let new_filename = format!(
+                    "wal_{:08}-{}-lsn-{}.log",
+                    new_sequence, timestamp, current_lsn
+                );
+                let new_path = self.path.join(&new_filename);
+                let new_file = OpenOptions::new()
+                    .create(true)
+                    .read(true)
+                    .append(true)
+                    .open(&new_path)
+                    .map_err(|e| {
+                        Error::internal(format!("failed to create rotated WAL file: {}", e))
+                    })?;
+
                 let mut current_filename = self.current_wal_file.lock().unwrap();
-
-                // Get old filename for checkpoint update
                 let old_filename = current_filename.clone();
-
-                // Replace file handle
                 *wal_file = Some(new_file);
                 *current_filename = new_filename.clone();
-
-                old_filename
+                (old_filename, new_filename)
             };
 
-            // Reset file position counter
             self.current_file_position.store(0, Ordering::Release);
 
-            // Update checkpoint with new WAL file reference and previous WAL
-            // IMPORTANT: Preserve existing checkpoint LSN (which represents snapshot point)
-            // Only update the WAL file references during rotation
+            // Preserve existing checkpoint LSN (snapshot point); update WAL file refs only.
             let checkpoint_path = self.path.join("checkpoint.meta");
             let existing_lsn = match CheckpointMetadata::read_from_file(&checkpoint_path) {
                 Ok(c) => c.lsn,
-                Err(_) => {
-                    // No checkpoint.meta yet (fresh DB or first rotation).
-                    // LSN 0 means full WAL replay on recovery, which is correct.
-                    0
-                }
+                Err(_) => 0, // no checkpoint.meta yet -> full WAL replay
             };
 
             let checkpoint = CheckpointMetadata {
                 wal_file: new_filename,
                 previous_wal_file: Some(old_filename),
-                lsn: existing_lsn, // Preserve existing LSN, don't update to current_lsn
+                lsn: existing_lsn,
                 timestamp: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_nanos() as i64)
@@ -1513,11 +1705,10 @@ impl WALManager {
             return Err(Error::WalNotRunning);
         }
 
-        // First flush buffer
-        self.flush()?;
-
-        // Then sync
-        self.sync_locked()
+        // Flush then fsync under one file-lock hold.
+        let mut wal_file = self.wal_file.lock().unwrap();
+        self.flush_buffer_locked(&mut wal_file)?;
+        self.sync_file_locked(&wal_file)
     }
 
     /// Flush buffer to disk without syncing
@@ -1526,22 +1717,31 @@ impl WALManager {
             return Err(Error::WalNotRunning);
         }
 
-        let buffer_data = {
-            let mut buffer = self.buffer.lock().unwrap();
-            if buffer.is_empty() {
-                return Ok(());
-            }
-            let data = std::mem::take(&mut *buffer);
-            // CRITICAL: Increment in-flight counter BEFORE releasing lock
-            // This prevents checkpoint from reading LSN before data is on disk
-            self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
-            data
-        };
+        // Lock ordering: wal_file first, then buffer (see flush_buffer_locked).
+        let mut wal_file = self.wal_file.lock().unwrap();
+        self.flush_buffer_locked(&mut wal_file)
+    }
 
-        // Use a guard pattern to ensure we decrement even on error
-        let write_result = self.write_to_file(&buffer_data);
-        self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
-        write_result
+    /// Periodically flush `SyncMode::None` buffers so SWMR readers see commits
+    /// without paying a per-commit write. Returns true when `flushed_lsn` advanced.
+    pub fn flush_for_visibility_if_due(&self) -> Result<bool> {
+        if self.sync_mode != SyncMode::None {
+            return Ok(false);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        let last = self.last_sync_time.load(Ordering::Acquire);
+        if self.sync_interval > 0 && now.saturating_sub(last) < self.sync_interval {
+            return Ok(false);
+        }
+
+        let before = self.flushed_lsn();
+        self.flush()?;
+        let after = self.flushed_lsn();
+        self.last_sync_time.store(now, Ordering::Release);
+        Ok(after > before)
     }
 
     /// Check if we should sync based on operation type
@@ -1549,15 +1749,11 @@ impl WALManager {
         match self.sync_mode {
             SyncMode::None => false,
             SyncMode::Normal => {
-                // Always sync on DDL operations (schema changes must be durable)
                 if op.is_ddl() {
                     return true;
                 }
-                // Time-based sync: fsync at most once per second.
-                // Committed data survives in the OS buffer cache for most crashes
-                // (power failure is the exception). Checkpoint (every 60s) moves
-                // data to fsynced volume files for full durability.
-                // Max data loss on power failure: ~1 second of commits.
+                // Time-based: fsync at most once per sync_interval (default 1s).
+                // Power-failure window bounded by interval; checkpoint provides full durability.
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_nanos() as i64)
@@ -1569,20 +1765,21 @@ impl WALManager {
         }
     }
 
-    /// Two-phase WAL replay for crash recovery
-    ///
-    /// Phase 1 (Analysis): Scan all entries to identify committed/aborted transactions
-    ///                     Only stores transaction IDs, not full entries (memory efficient)
-    /// Phase 2 (REDO): Re-read WAL and apply only entries from committed transactions
-    ///
-    /// This ensures that after a crash, only committed transactions are visible.
-    /// Uncommitted transactions (those without a COMMIT_MARKER) are discarded.
-    ///
-    /// Memory optimization: Uses streaming approach with two passes over WAL files
-    /// instead of loading all entries into memory. Only txn_id HashSets are kept.
-    pub fn replay_two_phase<F>(
+    /// Two-phase WAL replay for crash recovery.
+    /// Phase 1 = analysis (build committed_txns set); Phase 2 = redo (apply DML).
+    pub fn replay_two_phase<F>(&self, from_lsn: u64, callback: F) -> Result<TwoPhaseRecoveryInfo>
+    where
+        F: FnMut(WALEntry) -> Result<()>,
+    {
+        self.replay_two_phase_capped(from_lsn, u64::MAX, callback)
+    }
+
+    /// `replay_two_phase` capped at `max_lsn`. Read-only opens pass the writer's
+    /// published `visible_commit_lsn` so unpublished markers are skipped.
+    pub fn replay_two_phase_capped<F>(
         &self,
         from_lsn: u64,
+        max_lsn: u64,
         mut callback: F,
     ) -> Result<TwoPhaseRecoveryInfo>
     where
@@ -1593,14 +1790,13 @@ impl WALManager {
 
         let mut from_lsn = from_lsn;
 
-        // Check for checkpoint — only use checkpoint.lsn when no snapshots were loaded
-        // (from_lsn == 0). When snapshots exist, from_lsn already reflects the safe
-        // replay point. Using checkpoint.lsn to override would skip WAL entries needed
-        // by tables whose snapshots are older (e.g., after a crash during snapshot rename).
+        // Use checkpoint.lsn only when from_lsn == 0 AND it's within the cap.
+        // Snapshot-loaded callers already pass a safe from_lsn; capped readers
+        // must not skip into the (max_kept_visible, cap] range.
         if from_lsn == 0 {
             let checkpoint_path = self.path.join("checkpoint.meta");
             if let Ok(checkpoint) = CheckpointMetadata::read_from_file(&checkpoint_path) {
-                if checkpoint.lsn > from_lsn {
+                if checkpoint.lsn > from_lsn && checkpoint.lsn <= max_lsn {
                     from_lsn = checkpoint.lsn;
                 }
             }
@@ -1619,9 +1815,7 @@ impl WALManager {
             }
         }
 
-        // Sort by embedded LSN for correct replay order.
-        // Lexicographic sort would misorder wal- (truncated) and wal_ (rotated)
-        // files when both coexist after a crash.
+        // Sort by embedded LSN: lexicographic would misorder wal- and wal_ filenames.
         wal_files.sort_by_key(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
@@ -1629,10 +1823,7 @@ impl WALManager {
                 .unwrap_or(0)
         });
 
-        // =====================================================
-        // Phase 1: Analysis - Identify transaction outcomes
-        // Only collect txn_ids, not full entries (memory efficient)
-        // =====================================================
+        // Phase 1: build committed/aborted txn_id sets.
         let mut committed_txns: I64Set = I64Set::new();
         let mut aborted_txns: I64Set = I64Set::new();
         let mut last_lsn = from_lsn;
@@ -1641,16 +1832,14 @@ impl WALManager {
             Self::scan_wal_for_txn_status(
                 wal_path,
                 from_lsn,
+                max_lsn,
                 &mut committed_txns,
                 &mut aborted_txns,
                 &mut last_lsn,
             )?;
         }
 
-        // =====================================================
-        // Phase 2: REDO - Re-read WAL and apply committed entries
-        // Streaming approach: read and apply one entry at a time
-        // =====================================================
+        // Phase 2: streaming redo, apply one entry at a time.
         let mut applied_count = 0u64;
         let mut skipped_count = 0u64;
 
@@ -1680,6 +1869,7 @@ impl WALManager {
                 }
 
                 // Parse header
+                let version = header_buf[4];
                 let flags = WalFlags::from_byte(header_buf[5]);
                 let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
@@ -1695,68 +1885,93 @@ impl WALManager {
                     }
                 }
 
-                // Sanity check on size
+                // Capped: stop once header LSN passes the published frontier
+                // (writer's in-flight tail is explicitly outside this snapshot).
+                let capped = max_lsn != u64::MAX;
+                if capped && lsn > max_lsn {
+                    break;
+                }
+
+                // Capped + oversized below cap = corruption inside published frontier (fatal).
                 let total_data_size = entry_size + 4;
                 if entry_size > 64 * 1024 * 1024 {
+                    if capped {
+                        return Err(Error::internal(format!(
+                            "WAL recovery (capped at LSN {}): oversized record \
+                             entry_size={} at header-LSN {}; refusing to skip in \
+                             capped read-only attach",
+                            max_lsn, entry_size, lsn
+                        )));
+                    }
                     if !Self::scan_for_magic(&mut file) {
                         break;
                     }
                     continue;
                 }
 
-                // Skip entries before from_lsn
-                if lsn < from_lsn {
-                    if file
-                        .seek(SeekFrom::Current(total_data_size as i64))
-                        .is_err()
-                    {
-                        break;
+                // CRC must validate BEFORE applying the window (v3 CRC authenticates header LSN).
+                let mut data = vec![0u8; total_data_size];
+                if file.read_exact(&mut data).is_err() {
+                    if capped {
+                        return Err(Error::internal(format!(
+                            "WAL recovery (capped at LSN {}): truncated record \
+                             at header-LSN {}; refusing to skip in capped \
+                             read-only attach",
+                            max_lsn, lsn
+                        )));
                     }
+                    break;
+                }
+                if WALEntry::verify_crc(version, &header_buf, &data).is_err() {
+                    if capped {
+                        return Err(Error::internal(format!(
+                            "WAL recovery (capped at LSN {}): CRC failed at \
+                             header-LSN {}; refusing to skip in capped \
+                             read-only attach",
+                            max_lsn, lsn
+                        )));
+                    }
+                    eprintln!(
+                        "Warning: WAL recovery Phase 2 CRC failed at header-LSN {}; \
+                         skipping",
+                        lsn
+                    );
+                    skipped_count += 1;
+                    continue;
+                }
+                if lsn < from_lsn || lsn > max_lsn {
                     continue;
                 }
 
-                // Read entry data + CRC
-                let mut data = vec![0u8; total_data_size];
-                match file.read_exact(&mut data) {
-                    Ok(()) => {}
-                    Err(_) => break,
-                }
-
-                // Decode entry
-                match WALEntry::decode(lsn, previous_lsn, flags, &data) {
+                match WALEntry::decode(lsn, previous_lsn, flags, version, &data, &header_buf) {
                     Ok(entry) => {
-                        // Skip rotation/snapshot markers (internal WAL management)
-                        if entry.is_marker_entry() {
+                        if entry.is_marker_entry() || entry.is_abort_marker() {
                             continue;
                         }
-
-                        // Skip abort markers entirely - aborted transactions don't need processing
-                        if entry.is_abort_marker() {
-                            continue;
-                        }
-
-                        // For commit markers: pass to callback so registry can be updated
-                        // This is crucial for visibility - without this, committed data is invisible
+                        // Commit markers: pass through so the registry sees them.
                         if entry.is_commit_marker() {
                             if committed_txns.contains(entry.txn_id) {
                                 callback(entry)?;
                             }
                             continue;
                         }
-
-                        // Apply only committed transactions' data entries
                         if committed_txns.contains(entry.txn_id) {
                             callback(entry)?;
                             applied_count += 1;
                         } else {
-                            // Transaction is aborted or in-doubt (no commit marker)
-                            // Treat in-doubt as aborted for safety
+                            // In-doubt treated as aborted.
                             skipped_count += 1;
                         }
                     }
                     Err(e) => {
-                        // Log decode errors (including CRC failures) during recovery
-                        // These could indicate WAL corruption or incomplete writes
+                        if capped {
+                            return Err(Error::internal(format!(
+                                "WAL recovery (capped at LSN {}): decode failed \
+                                 at LSN {}: {}; refusing to skip in capped \
+                                 read-only attach",
+                                max_lsn, lsn, e
+                            )));
+                        }
                         eprintln!(
                             "Warning: WAL entry decode failed at LSN {}: {} (entry skipped)",
                             lsn, e
@@ -1768,7 +1983,6 @@ impl WALManager {
             }
         }
 
-        // Update current LSN if we replayed entries
         if last_lsn > self.current_lsn.load(Ordering::Acquire) {
             self.current_lsn.store(last_lsn, Ordering::Release);
         }
@@ -1782,14 +1996,11 @@ impl WALManager {
         })
     }
 
-    /// Phase 1 helper: Scan a WAL file for transaction commit/abort status
-    ///
-    /// This function only extracts transaction IDs and their commit/abort markers,
-    /// without storing full entry data. This keeps memory usage minimal during
-    /// the analysis phase of two-phase recovery.
+    /// Phase 1 helper: scan a WAL file and add commit/abort txn_ids to the sets.
     fn scan_wal_for_txn_status(
         wal_path: &Path,
         from_lsn: u64,
+        max_lsn: u64,
         committed_txns: &mut I64Set,
         aborted_txns: &mut I64Set,
         last_lsn: &mut u64,
@@ -1818,10 +2029,12 @@ impl WALManager {
                 continue;
             }
 
-            // Parse header - only need flags, header_size, lsn, entry_size
+            // Parse header
+            let version = header_buf[4];
             let flags = WalFlags::from_byte(header_buf[5]);
             let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
             let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+            let previous_lsn = u64::from_le_bytes(header_buf[16..24].try_into().unwrap());
             let entry_size = u32::from_le_bytes(header_buf[24..28].try_into().unwrap()) as usize;
 
             // Skip any additional header bytes
@@ -1832,58 +2045,88 @@ impl WALManager {
                 }
             }
 
-            // Sanity check on size
+            // Capped: stop above the frontier (writer's in-flight tail).
+            let capped = max_lsn != u64::MAX;
+            if capped && lsn > max_lsn {
+                break;
+            }
+
+            // Capped + oversized below cap = fatal corruption.
             let total_data_size = entry_size + 4;
             if entry_size > 64 * 1024 * 1024 {
+                if capped {
+                    return Err(Error::internal(format!(
+                        "WAL recovery Phase 1 (capped at LSN {}): oversized \
+                         record entry_size={} at header-LSN {}; refusing to \
+                         skip in capped read-only attach",
+                        max_lsn, entry_size, lsn
+                    )));
+                }
                 if !Self::scan_for_magic(&mut file) {
                     break;
                 }
                 continue;
             }
 
-            // Skip entries before from_lsn
-            if lsn < from_lsn {
-                if file
-                    .seek(SeekFrom::Current(total_data_size as i64))
-                    .is_err()
-                {
-                    break;
+            // CRC must validate BEFORE the window check (v3 CRC authenticates header LSN).
+            let mut data = vec![0u8; total_data_size];
+            if file.read_exact(&mut data).is_err() {
+                if capped {
+                    return Err(Error::internal(format!(
+                        "WAL recovery Phase 1 (capped at LSN {}): truncated \
+                         record at header-LSN {}; refusing to skip in capped \
+                         read-only attach",
+                        max_lsn, lsn
+                    )));
                 }
+                break;
+            }
+            if WALEntry::verify_crc(version, &header_buf, &data).is_err() {
+                if capped {
+                    return Err(Error::internal(format!(
+                        "WAL recovery Phase 1 (capped at LSN {}): CRC failed \
+                         at header-LSN {} (flags={:?}); refusing to skip in \
+                         capped read-only attach",
+                        max_lsn, lsn, flags
+                    )));
+                }
+                eprintln!(
+                    "Warning: WAL recovery CRC failed at header-LSN {} (flags={:?}); \
+                     skipping",
+                    lsn, flags
+                );
+                continue;
+            }
+            if lsn < from_lsn || lsn > max_lsn {
                 continue;
             }
 
-            // For commit/abort markers, we can identify them from flags without full decode
-            // This is the fast path - only read txn_id (first 8 bytes of data)
-            if flags.contains(WalFlags::COMMIT_MARKER) || flags.contains(WalFlags::ABORT_MARKER) {
-                // Read just the txn_id (first 8 bytes of data portion)
-                let mut txn_id_buf = [0u8; 8];
-                match file.read_exact(&mut txn_id_buf) {
-                    Ok(()) => {
-                        let txn_id = i64::from_le_bytes(txn_id_buf);
-                        if flags.contains(WalFlags::COMMIT_MARKER) {
-                            committed_txns.insert(txn_id);
-                        } else {
-                            aborted_txns.insert(txn_id);
-                        }
-                        // Skip rest of entry (entry_size - 8 + CRC 4)
-                        let remaining = total_data_size.saturating_sub(8);
-                        if file.seek(SeekFrom::Current(remaining as i64)).is_err() {
-                            break;
-                        }
+            // Marker classification via CRC-protected `operation` byte.
+            match WALEntry::decode(lsn, previous_lsn, flags, version, &data, &header_buf) {
+                Ok(entry) => {
+                    if entry.is_commit_marker() {
+                        committed_txns.insert(entry.txn_id);
+                    } else if entry.is_abort_marker() {
+                        aborted_txns.insert(entry.txn_id);
                     }
-                    Err(_) => break,
                 }
-            } else {
-                // Not a commit/abort marker, skip the entire entry
-                if file
-                    .seek(SeekFrom::Current(total_data_size as i64))
-                    .is_err()
-                {
-                    break;
+                Err(e) => {
+                    if capped {
+                        return Err(Error::internal(format!(
+                            "WAL recovery Phase 1 (capped at LSN {}): decode \
+                             failed at LSN {}: {}; refusing to skip in capped \
+                             read-only attach",
+                            max_lsn, lsn, e
+                        )));
+                    }
+                    eprintln!(
+                        "Warning: WAL recovery decode failed at LSN {} (flags={:?}): {}; \
+                         skipping",
+                        lsn, flags, e
+                    );
                 }
             }
 
-            // Track last LSN
             if lsn > *last_lsn {
                 *last_lsn = lsn;
             }
@@ -1892,33 +2135,540 @@ impl WALManager {
         Ok(())
     }
 
-    /// Scan forward in the file looking for the next valid magic marker
+    /// Tail committed DML+DDL entries from the WAL between LSN bounds, pure
+    /// (no callback, no state mutation). Two-pass like `replay_two_phase`.
     ///
-    /// The magic marker is stored in little-endian format on disk, so we build
-    /// the window by shifting right and inserting new bytes at the high position.
+    /// `from_lsn` is exclusive (commit-marker window lower bound, also DDL entry
+    /// filter); `to_lsn` is inclusive. `entry_floor` is the DML scan floor,
+    /// pass the writer's `oldest_active_txn_lsn` at the prior tail (or 0 for
+    /// a full scan). `to_lsn = u64::MAX` tails every committed entry.
     ///
-    /// Uses buffered reads (8KB chunks) for efficiency instead of byte-by-byte syscalls.
+    /// `include_dml = false` collects only DDL entries (cursor still advances
+    /// so DDL detection stays current).
+    ///
+    /// Returns `Err(Error::SwmrSnapshotExpired)` when `from_lsn`/`entry_floor`
+    /// falls below the first live WAL entry, caller must reopen the handle.
+    pub fn tail_committed_entries(
+        &self,
+        from_lsn: u64,
+        entry_floor: u64,
+        to_lsn: u64,
+        include_dml: bool,
+        cursor_hint: Option<&WalScanCursor>,
+        out_cursor: Option<&mut Option<WalScanCursor>>,
+    ) -> Result<Vec<WALEntry>> {
+        // Flush so on-disk WAL reflects everything committed so far.
+        self.flush()?;
+
+        let mut wal_files: Vec<PathBuf> = Vec::new();
+        if let Ok(entries) = fs::read_dir(&self.path) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if (name.starts_with("wal-") || name.starts_with("wal_")) && name.ends_with(".log")
+                {
+                    wal_files.push(entry.path());
+                }
+            }
+        }
+        wal_files.sort_by_key(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(Self::extract_lsn_from_filename)
+                .unwrap_or(0)
+        });
+
+        // Chain-head check: fail SwmrSnapshotExpired if WAL was truncated past
+        // our needed range. When `entry_floor == 0`, treat as needing LSN >= 1
+        // so a chain head above 1 correctly trips (otherwise we'd silently miss
+        // a long txn's earlier DML below `from_lsn`).
+        if let Some(chain_head) = Self::first_live_wal_lsn(&wal_files) {
+            let phase2_floor = if entry_floor > 0 { entry_floor } else { 1 };
+            let needed = phase2_floor.min(from_lsn.saturating_add(1));
+            if needed < chain_head {
+                return Err(Error::SwmrSnapshotExpired {
+                    pinned_lsn: needed,
+                    chain_head,
+                });
+            }
+        }
+
+        // Phase 1: txns whose commit marker lands in (from_lsn, to_lsn].
+        // Skip files whose entire LSN range is below from_lsn; reuse cursor on
+        // the last (active) file to skip already-CRC-validated bytes.
+        let phase1_files = Self::wal_files_needed_for_marker_scan(&wal_files, from_lsn);
+        let mut committed_txns: I64Set = I64Set::new();
+        let mut last_path_p1: Option<PathBuf> = None;
+        let mut last_offset_p1: u64 = 0;
+        let mut last_lsn_p1: u64 = 0;
+        for wal_path in phase1_files {
+            // Cursor reuse: lsn_at_offset must be <= from_lsn (else we'd skip in-window records).
+            let (start, start_lsn) = match cursor_hint {
+                Some(c) if c.path == *wal_path && c.lsn_at_offset <= from_lsn => {
+                    (c.offset, c.lsn_at_offset)
+                }
+                _ => (0, 0),
+            };
+            let (end, end_lsn) = Self::scan_wal_for_committed_in_range(
+                wal_path,
+                from_lsn,
+                to_lsn,
+                &mut committed_txns,
+                start,
+                start_lsn,
+            )?;
+            last_path_p1 = Some(wal_path.clone());
+            last_offset_p1 = end;
+            last_lsn_p1 = end_lsn;
+        }
+        if committed_txns.is_empty() {
+            // No new commits, still publish the cursor
+            // advance so the next refresh skips the bytes we
+            // just CRC-validated.
+            if let (Some(out_c), Some(p)) = (out_cursor, last_path_p1) {
+                *out_c = Some(WalScanCursor {
+                    path: p,
+                    offset: last_offset_p1,
+                    lsn_at_offset: last_lsn_p1,
+                });
+            }
+            return Ok(Vec::new());
+        }
+
+        // Phase 2: scan DML entries with `entry_lsn <= to_lsn` whose
+        // txn_id is in `committed_txns`. The DML floor is
+        // `entry_floor`, which the caller computes from the writer's
+        // published `oldest_active_txn_lsn` at the time of the prior
+        // refresh. Anything below that watermark belongs to a
+        // transaction that committed before the prior refresh and
+        // was already applied (so we can skip the file walk for
+        // those entirely).
+        //
+        // For DDL entries (which all share the synthetic
+        // `DDL_TXN_ID = -2`), the per-entry filter `entry.lsn >
+        // from_lsn` is enforced inside the helper, DDL is
+        // auto-committed at its own LSN so this distinguishes new
+        // DDL from stale re-records.
+        //
+        // Pre-compute the smallest LSN we may need to scan, then
+        // skip whole WAL files whose range is entirely below it. The helper's `from_lsn` semantics are EXCLUSIVE
+        // (skip files whose max LSN <= from_lsn), but `entry_floor`
+        // is INCLUSIVE (we want entries with LSN >= entry_floor).
+        // Pass `entry_floor.saturating_sub(1)` to translate. For
+        // entry_floor == 0, saturating_sub gives 0 and the helper
+        // short-circuits "scan all".
+        let phase2_files =
+            Self::wal_files_needed_for_marker_scan(&wal_files, entry_floor.saturating_sub(1));
+        let mut out: Vec<WALEntry> = Vec::new();
+        let mut last_path_p2: Option<PathBuf> = None;
+        let mut last_offset_p2: u64 = 0;
+        let mut last_lsn_p2: u64 = 0;
+        for wal_path in phase2_files {
+            // Phase 2 needs records with `lsn >= entry_floor`,
+            // so cursor reuse requires the cached LSN to be
+            // STRICTLY less than `entry_floor`, equality means
+            // a record at exactly `entry_floor` is already past
+            // the cursor and would be missed. The cold-start
+            // case (cursor LSN == 0, entry_floor == 0) falls
+            // out naturally since the cursor offset is also 0.
+            let (start, start_lsn) = match cursor_hint {
+                Some(c) if c.path == *wal_path && c.lsn_at_offset < entry_floor => {
+                    (c.offset, c.lsn_at_offset)
+                }
+                _ => (0, 0),
+            };
+            let (end, end_lsn) = Self::collect_committed_dml_in_range(
+                wal_path,
+                from_lsn,
+                entry_floor,
+                to_lsn,
+                &committed_txns,
+                &mut out,
+                include_dml,
+                start,
+                start_lsn,
+            )?;
+            last_path_p2 = Some(wal_path.clone());
+            last_offset_p2 = end;
+            last_lsn_p2 = end_lsn;
+        }
+        // Publish the new cursor (MAX of phase-1/phase-2 offsets on the same file).
+        if let Some(out_c) = out_cursor {
+            *out_c = match (last_path_p2.clone(), last_path_p1) {
+                (Some(p2), Some(p1)) if p2 == p1 => {
+                    let (offset, lsn) = if last_offset_p2 >= last_offset_p1 {
+                        (last_offset_p2, last_lsn_p2)
+                    } else {
+                        (last_offset_p1, last_lsn_p1)
+                    };
+                    Some(WalScanCursor {
+                        path: p2,
+                        offset,
+                        lsn_at_offset: lsn,
+                    })
+                }
+                (Some(p), _) => Some(WalScanCursor {
+                    path: p,
+                    offset: last_offset_p2,
+                    lsn_at_offset: last_lsn_p2,
+                }),
+                (None, Some(p)) => Some(WalScanCursor {
+                    path: p,
+                    offset: last_offset_p1,
+                    lsn_at_offset: last_lsn_p1,
+                }),
+                (None, None) => None,
+            };
+        }
+        // Stable sort by LSN (input is already mostly-sorted).
+        out.sort_by_key(|e| e.lsn);
+        Ok(out)
+    }
+
+    /// Subset of WAL files possibly containing records with `lsn > from_lsn`.
+    /// Filenames embed the LAST LSN of the prior file (rotation writes
+    /// `wal_NNN-ts-lsn-{N}.log` where N is current_lsn at rotation time).
+    /// Caller must have sorted files by extracted LSN; the last file is always
+    /// included (its tail may have just-written entries with no successor).
+    fn wal_files_needed_for_marker_scan(files: &[PathBuf], from_lsn: u64) -> &[PathBuf] {
+        if files.len() <= 1 || from_lsn == 0 {
+            return files;
+        }
+        let mut skip_count = 0usize;
+        for i in 0..files.len() - 1 {
+            let next_file_lsn = files[i + 1]
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(Self::extract_lsn_from_filename)
+                .unwrap_or(0);
+            // next_file_lsn is the last LSN of files[i]; skip iff <= from_lsn.
+            if next_file_lsn <= from_lsn {
+                skip_count = i + 1;
+            } else {
+                break;
+            }
+        }
+        &files[skip_count..]
+    }
+
+    /// SWMR-tail Phase-1: add to `out` any txn_id whose commit marker has
+    /// `from_lsn < marker_lsn <= to_lsn`. Bytes before `start_offset` are
+    /// assumed CRC-validated (cursor reuse). Returns the byte offset and LSN
+    /// just past the last in-window record processed.
+    fn scan_wal_for_committed_in_range(
+        wal_path: &Path,
+        from_lsn: u64,
+        to_lsn: u64,
+        out: &mut I64Set,
+        start_offset: u64,
+        start_offset_lsn: u64,
+    ) -> Result<(u64, u64)> {
+        let mut file = match File::open(wal_path) {
+            Ok(f) => f,
+            Err(_) => return Ok((start_offset, start_offset_lsn)),
+        };
+        if start_offset > 0 && file.seek(SeekFrom::Start(start_offset)).is_err() {
+            // Seek failed (file shorter than cursor), rescan from beginning.
+            if file.seek(SeekFrom::Start(0)).is_err() {
+                return Ok((0, 0));
+            }
+        }
+        // Cursor advances ONLY for records inside (from_lsn, to_lsn] so a future
+        // scan with a higher to_lsn can re-process records beyond this cap.
+        let mut last_good_offset = start_offset;
+        let mut last_in_window_lsn = start_offset_lsn;
+        loop {
+            let mut header_buf = [0u8; 32];
+            match file.read_exact(&mut header_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(_) => break,
+            }
+            let magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+            if magic != WAL_ENTRY_MAGIC {
+                let _ = file.seek(SeekFrom::Current(-32));
+                if !Self::scan_for_magic(&mut file) {
+                    break;
+                }
+                continue;
+            }
+            let version = header_buf[4];
+            let flags = WalFlags::from_byte(header_buf[5]);
+            let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
+            let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+            let previous_lsn = u64::from_le_bytes(header_buf[16..24].try_into().unwrap());
+            let entry_size = u32::from_le_bytes(header_buf[24..28].try_into().unwrap()) as usize;
+            if header_size > 32 {
+                let extra = header_size - 32;
+                if file.seek(SeekFrom::Current(extra as i64)).is_err() {
+                    break;
+                }
+            }
+            let total_data_size = entry_size + 4;
+            // Past the cap: stop before reading/CRC-checking unpublished
+            // tail records (in-progress writes may be torn or have bad
+            // CRC and would falsely abort an otherwise-valid scan).
+            if lsn > to_lsn {
+                break;
+            }
+            // In-window oversized = corruption (fatal); out-of-window = resync.
+            let lsn_in_window = lsn > from_lsn && lsn <= to_lsn;
+            if entry_size > 64 * 1024 * 1024 {
+                if lsn_in_window {
+                    return Err(Error::internal(format!(
+                        "WAL Phase-1 oversized record at LSN {} \
+                         (entry_size={} > 64 MiB, in window ({}, {}])",
+                        lsn, entry_size, from_lsn, to_lsn
+                    )));
+                }
+                if !Self::scan_for_magic(&mut file) {
+                    break;
+                }
+                continue;
+            }
+            // CRC must validate BEFORE windowing (v3 CRC authenticates header LSN).
+            let mut data = vec![0u8; total_data_size];
+            if let Err(e) = file.read_exact(&mut data) {
+                if lsn_in_window {
+                    return Err(Error::internal(format!(
+                        "WAL Phase-1 short read at LSN {} (in window ({}, {}], \
+                         expected {} bytes): {}",
+                        lsn, from_lsn, to_lsn, total_data_size, e
+                    )));
+                }
+                break;
+            }
+            if let Err(e) = WALEntry::verify_crc(version, &header_buf, &data) {
+                return Err(Error::internal(format!(
+                    "WAL Phase-1 CRC verify failed at header-LSN {} (in window \
+                     ({}, {}]={}): {}",
+                    lsn, from_lsn, to_lsn, lsn_in_window, e
+                )));
+            }
+            // Cursor advances only for in-window records (see scan helper docs).
+            if lsn_in_window {
+                if let Ok(pos) = file.stream_position() {
+                    last_good_offset = pos;
+                    last_in_window_lsn = lsn;
+                }
+            }
+            // WAL is LSN-monotonic; break to avoid re-validating the unpublished tail.
+            if lsn > to_lsn {
+                break;
+            }
+            if !lsn_in_window {
+                continue;
+            }
+            // Cheap peek: only need (txn_id, op) to find commit markers.
+            if let Some((txn_id, op)) = WALEntry::peek_classification(&data) {
+                if matches!(op, WALOperationType::Commit) {
+                    out.insert(txn_id);
+                }
+            } else {
+                // Layout corruption, fall back to full decode for a precise error.
+                let _ = WALEntry::decode(lsn, previous_lsn, flags, version, &data, &header_buf)
+                    .map_err(|e| {
+                        Error::internal(format!(
+                            "WAL Phase-1 decode failed at LSN {} (in window \
+                             ({}, {}]): {}",
+                            lsn, from_lsn, to_lsn, e
+                        ))
+                    })?;
+            }
+        }
+        Ok((last_good_offset, last_in_window_lsn))
+    }
+
+    /// SWMR-tail Phase-2: decode each DML/DDL entry whose `txn_id` is in
+    /// `committed` AND whose `lsn` falls in `[entry_floor, to_lsn]`. Stale DDL
+    /// re-records (DDL_TXN_ID with lsn <= from_lsn) are filtered. Cursor
+    /// reuse semantics match `scan_wal_for_committed_in_range`.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_committed_dml_in_range(
+        wal_path: &Path,
+        from_lsn: u64,
+        entry_floor: u64,
+        to_lsn: u64,
+        committed: &I64Set,
+        out: &mut Vec<WALEntry>,
+        include_dml: bool,
+        start_offset: u64,
+        start_offset_lsn: u64,
+    ) -> Result<(u64, u64)> {
+        let mut file = match File::open(wal_path) {
+            Ok(f) => f,
+            Err(_) => return Ok((start_offset, start_offset_lsn)),
+        };
+        if start_offset > 0
+            && file.seek(SeekFrom::Start(start_offset)).is_err()
+            && file.seek(SeekFrom::Start(0)).is_err()
+        {
+            return Ok((0, 0));
+        }
+        // Cursor advances only for in-window records (see scan helper docs).
+        let mut last_good_offset = start_offset;
+        let mut last_in_window_lsn = start_offset_lsn;
+        loop {
+            let mut header_buf = [0u8; 32];
+            match file.read_exact(&mut header_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(_) => break,
+            }
+            let magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
+            if magic != WAL_ENTRY_MAGIC {
+                let _ = file.seek(SeekFrom::Current(-32));
+                if !Self::scan_for_magic(&mut file) {
+                    break;
+                }
+                continue;
+            }
+            let version = header_buf[4];
+            let flags = WalFlags::from_byte(header_buf[5]);
+            let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
+            let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
+            let previous_lsn = u64::from_le_bytes(header_buf[16..24].try_into().unwrap());
+            let entry_size = u32::from_le_bytes(header_buf[24..28].try_into().unwrap()) as usize;
+            if header_size > 32 {
+                let extra = header_size - 32;
+                if file.seek(SeekFrom::Current(extra as i64)).is_err() {
+                    break;
+                }
+            }
+            let total_data_size = entry_size + 4;
+            // Past the cap: stop before reading/CRC-checking unpublished
+            // tail records (in-progress writes may be torn).
+            if lsn > to_lsn {
+                break;
+            }
+            // In-window oversized = corruption (fatal); out-of-window = resync.
+            let lsn_in_window = lsn >= entry_floor && lsn <= to_lsn;
+            if entry_size > 64 * 1024 * 1024 {
+                if lsn_in_window {
+                    return Err(Error::internal(format!(
+                        "WAL Phase-2 oversized record at LSN {} \
+                         (entry_size={} > 64 MiB, in window [{}, {}])",
+                        lsn, entry_size, entry_floor, to_lsn
+                    )));
+                }
+                if !Self::scan_for_magic(&mut file) {
+                    break;
+                }
+                continue;
+            }
+            // CRC must validate BEFORE windowing (v3 CRC authenticates header LSN).
+            let mut data = vec![0u8; total_data_size];
+            if let Err(e) = file.read_exact(&mut data) {
+                if lsn_in_window {
+                    return Err(Error::internal(format!(
+                        "WAL Phase-2 short read at LSN {} (in window [{}, {}], \
+                         expected {} bytes): {}",
+                        lsn, entry_floor, to_lsn, total_data_size, e
+                    )));
+                }
+                break;
+            }
+            if let Err(e) = WALEntry::verify_crc(version, &header_buf, &data) {
+                return Err(Error::internal(format!(
+                    "WAL Phase-2 CRC verify failed at header-LSN {} (in window \
+                     [{}, {}]={}): {}",
+                    lsn, entry_floor, to_lsn, lsn_in_window, e
+                )));
+            }
+            // Cursor advances only for in-window records.
+            if lsn_in_window {
+                if let Ok(pos) = file.stream_position() {
+                    last_good_offset = pos;
+                    last_in_window_lsn = lsn;
+                }
+            }
+            // WAL is LSN-monotonic; break above to_lsn to skip the unpublished tail.
+            if lsn > to_lsn {
+                break;
+            }
+            if !lsn_in_window {
+                continue;
+            }
+            // DDL-only mode: cheap peek to skip DML/markers without full decode.
+            if !include_dml {
+                if let Some((txn_id, op)) = WALEntry::peek_classification(&data) {
+                    if !op.is_ddl() {
+                        continue;
+                    }
+                    if !committed.contains(txn_id) {
+                        continue;
+                    }
+                    // DDL_TXN_ID stale-record filter (see full-decode branch).
+                    if txn_id == crate::storage::mvcc::persistence::DDL_TXN_ID && lsn <= from_lsn {
+                        continue;
+                    }
+                    // Surviving DDL falls through so the payload (e.g. IndexMetadata) is decoded.
+                }
+            }
+            // Minimum data section is 8 bytes (txn_id); smaller = layout corruption.
+            if total_data_size < 8 {
+                return Err(Error::internal(format!(
+                    "WAL Phase-2 layout corruption at LSN {}: total_data_size={} \
+                     (less than minimum 8 bytes for txn_id), in window \
+                     [{}, {}]",
+                    lsn, total_data_size, entry_floor, to_lsn
+                )));
+            }
+            match WALEntry::decode(lsn, previous_lsn, flags, version, &data, &header_buf) {
+                Ok(entry) => {
+                    if entry.is_marker_entry() {
+                        continue;
+                    }
+                    // Marker classification via CRC-protected `operation` byte.
+                    if entry.is_commit_marker() || entry.is_abort_marker() {
+                        continue;
+                    }
+                    if !committed.contains(entry.txn_id) {
+                        continue;
+                    }
+                    // Auto-committed DDL (DDL_TXN_ID) reuses one txn_id, so use the
+                    // entry-LSN > from_lsn filter to distinguish new vs stale records.
+                    // User-txn DDL is uniquely tagged by txn_id and must NOT use this filter.
+                    if entry.operation.is_ddl()
+                        && entry.txn_id == crate::storage::mvcc::persistence::DDL_TXN_ID
+                        && entry.lsn <= from_lsn
+                    {
+                        continue;
+                    }
+                    if !include_dml && !entry.operation.is_ddl() {
+                        continue;
+                    }
+                    out.push(entry);
+                }
+                Err(e) => {
+                    return Err(Error::internal(format!(
+                        "WAL Phase-2 decode failed at LSN {} (in window \
+                         [{}, {}], entry must validate): {}",
+                        lsn, entry_floor, to_lsn, e
+                    )));
+                }
+            }
+        }
+        Ok((last_good_offset, last_in_window_lsn))
+    }
+
+    /// Scan forward for the next valid magic marker. Buffered (8KB) reads,
+    /// scans up to 1MB before giving up.
     fn scan_for_magic(file: &mut File) -> bool {
-        const BUFFER_SIZE: usize = 8192; // 8KB buffer for efficient I/O
+        const BUFFER_SIZE: usize = 8192;
         let mut buffer = [0u8; BUFFER_SIZE];
         let mut window: u32 = 0;
         let mut total_scanned: usize = 0;
-        const MAX_SCAN: usize = 1024 * 1024; // 1MB limit
+        const MAX_SCAN: usize = 1024 * 1024;
 
         loop {
-            // Read a chunk into buffer
             let bytes_read = match file.read(&mut buffer) {
-                Ok(0) => return false, // EOF
+                Ok(0) => return false,
                 Ok(n) => n,
                 Err(_) => return false,
             };
 
-            // Scan through the buffer
             for (i, &byte) in buffer[..bytes_read].iter().enumerate() {
-                // Build little-endian u32: new byte goes to high position,
-                // existing bytes shift down. After reading 4 bytes [b0,b1,b2,b3],
-                // window = (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
-                // which matches how u32::from_le_bytes works.
+                // Sliding little-endian u32 window matching u32::from_le_bytes.
                 window = (window >> 8) | ((byte as u32) << 24);
 
                 total_scanned += 1;
@@ -1927,11 +2677,7 @@ impl WALManager {
                 }
 
                 if window == WAL_ENTRY_MAGIC {
-                    // Found magic. Calculate how far back to seek:
-                    // We're at position i+1 in the current buffer read
-                    // The magic marker started 4 bytes ago
-                    // We need to seek back (bytes_read - i - 1) to end of buffer,
-                    // plus 4 for the magic marker itself, minus 1 because i is 0-indexed
+                    // Seek back to the start of the magic marker.
                     let seek_back = (bytes_read - i - 1 + 4) as i64;
                     if file.seek(SeekFrom::Current(-seek_back)).is_ok() {
                         return true;
@@ -1942,28 +2688,13 @@ impl WALManager {
         }
     }
 
-    /// Wait for any in-flight writes to complete with a timeout
-    ///
-    /// This is critical for checkpoint and truncation safety. The race condition occurs when:
-    /// 1. Thread A takes buffer data, releases buffer lock, but hasn't written to disk yet
-    /// 2. Checkpoint thread calls flush() which sees empty buffer and returns
-    /// 3. Checkpoint reads current_lsn (which includes Thread A's LSN)
-    /// 4. Checkpoint/truncation uses that LSN, potentially losing Thread A's data
-    ///
-    /// By waiting for in_flight_writes to be 0, we ensure all data is on disk
-    /// before reading the LSN for checkpoint purposes.
-    ///
-    /// Returns Ok(()) if all writes completed, Err if timeout was reached.
-    /// Default timeout is 30 seconds which should be more than enough for any
-    /// reasonable write operation. If timeout is reached, it indicates a serious
-    /// problem (hung thread, deadlock, etc.)
+    /// Wait for in-flight writes (default 30s timeout). Critical before
+    /// checkpoint/truncation reads `current_lsn` so it isn't ahead of disk.
     fn wait_for_in_flight_writes(&self) -> Result<()> {
         self.wait_for_in_flight_writes_timeout(std::time::Duration::from_secs(30))
     }
 
-    /// Wait for any in-flight writes to complete with a custom timeout
-    ///
-    /// Uses exponential backoff to avoid busy-waiting while still being responsive.
+    /// Wait for in-flight writes with a custom timeout (exponential backoff).
     fn wait_for_in_flight_writes_timeout(&self, timeout: std::time::Duration) -> Result<()> {
         use crate::common::time_compat::Instant;
 
@@ -1992,26 +2723,18 @@ impl WALManager {
         Ok(())
     }
 
-    /// Create a checkpoint and return the LSN at the checkpoint point
-    ///
-    /// Returns the LSN that represents the checkpoint point. All data up to
-    /// this LSN is guaranteed to be durably written to disk when this returns.
-    /// This LSN should be used for snapshot creation to ensure consistency.
+    /// Create a checkpoint. Returned LSN is durable on disk on success.
     pub fn create_checkpoint(&self, active_transactions: Vec<i64>) -> Result<u64> {
-        // CRITICAL: Wait for any in-flight writes before flushing
-        // This prevents the race condition where we read current_lsn before
-        // all writes at that LSN are actually on disk
+        // Wait for in-flight writes so current_lsn isn't ahead of disk.
         self.wait_for_in_flight_writes()?;
 
-        // Flush and sync
         self.flush()?;
         self.sync_locked()?;
 
-        // Wait again after flush to catch any writes that started during flush
+        // Wait again after flush to catch writes started during flush.
         self.wait_for_in_flight_writes()?;
 
-        // CRITICAL: Capture the LSN atomically after all syncs complete
-        // This LSN is the checkpoint point - all data up to this LSN is now on disk
+        // checkpoint_lsn = LSN of latest data now durable on disk.
         let checkpoint_lsn = self.current_lsn.load(Ordering::Acquire);
         let wal_file = self.current_wal_file.lock().unwrap().clone();
 
@@ -2046,25 +2769,18 @@ impl WALManager {
         Ok(checkpoint_lsn)
     }
 
-    /// Close the WAL manager
+    /// Close the WAL manager (flush + fsync + drop file handle).
     pub fn close(&self) -> Result<()> {
-        // Check if already closed
         if !self.running.load(Ordering::Acquire) {
-            return Ok(()); // Already closed
+            return Ok(());
         }
 
-        // Flush buffer to file (while still running)
         self.flush()?;
-
-        // Fsync to ensure all WAL data is durable on disk.
-        // Without this, a power failure or kill -9 after close
-        // could lose buffered WAL entries.
+        // Fsync so a power failure or kill -9 can't lose buffered WAL entries.
         self.sync_locked()?;
 
-        // Now mark as not running
         self.running.store(false, Ordering::SeqCst);
 
-        // Close file
         let mut wal_file = self.wal_file.lock().unwrap();
         *wal_file = None;
 
@@ -2077,15 +2793,7 @@ impl WALManager {
     }
 
     /// Clean up old rotated WAL files fully covered by a snapshot.
-    ///
-    /// A WAL file named `lsn-N` contains entries with LSN > N. The file's upper
-    /// bound is the NEXT file's start LSN (sorted by embedded LSN). A file is safe
-    /// to delete only when ALL its entries are <= `up_to_lsn`, which means the next
-    /// file's start LSN must be <= `up_to_lsn`.
-    ///
-    /// Without this boundary check, files containing entries that straddle
-    /// `up_to_lsn` would be deleted, causing data loss if the latest snapshot is
-    /// corrupted and recovery falls back to the second-to-last snapshot + WAL.
+    /// File[i] is deletable iff its upper bound (= file[i+1].lsn) <= up_to_lsn.
     fn cleanup_old_wal_files(wal_dir: &Path, current_wal_name: &str, up_to_lsn: u64) {
         let dir_entries = match fs::read_dir(wal_dir) {
             Ok(e) => e,
@@ -2142,6 +2850,21 @@ impl WALManager {
         }
     }
 
+    /// LSN of the first entry in the oldest WAL file. `None` when no WAL files.
+    /// Caller MUST pre-sort `wal_files` by extracted LSN.
+    fn first_live_wal_lsn(wal_files: &[PathBuf]) -> Option<u64> {
+        let oldest = wal_files.first()?;
+        let mut file = File::open(oldest).ok()?;
+        let mut header = [0u8; 16];
+        file.read_exact(&mut header).ok()?;
+        let magic = u32::from_le_bytes(header[0..4].try_into().ok()?);
+        if magic != WAL_ENTRY_MAGIC {
+            return None;
+        }
+        // Header offset 8..16 is LSN (see WALEntry::encode).
+        Some(u64::from_le_bytes(header[8..16].try_into().ok()?))
+    }
+
     /// Extract the LSN from a WAL filename containing the pattern `lsn-{N}`.
     fn extract_lsn_from_filename(name: &str) -> Option<u64> {
         let lsn_start = name.find("lsn-")?;
@@ -2165,12 +2888,8 @@ impl WALManager {
         self.current_wal_file.lock().unwrap().clone()
     }
 
-    /// Truncate the WAL file to remove entries up to the given LSN
-    ///
-    /// This is used after a successful checkpoint/snapshot to reclaim disk space.
-    /// Only entries with LSN > up_to_lsn are kept.
+    /// Truncate WAL: keep only entries with LSN > up_to_lsn.
     pub fn truncate_wal(&self, up_to_lsn: u64) -> Result<()> {
-        // Skip if not running or if up_to_lsn is zero (no valid checkpoint)
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
         }
@@ -2182,65 +2901,60 @@ impl WALManager {
             )));
         }
 
-        // CRITICAL: Wait for any in-flight writes to complete before truncation
-        // This prevents the race condition where:
-        // 1. Thread A takes buffer data, releases buffer lock, but hasn't written to disk yet
-        // 2. truncate_wal() proceeds with truncation
-        // 3. Thread A's data targets the old file and gets lost
+        // Wait for in-flight writes so they don't target the old file mid-truncate.
         self.wait_for_in_flight_writes()?;
 
-        // Lock the WAL file for the entire operation
         let mut wal_file_guard = self.wal_file.lock().unwrap();
         let mut current_wal_name = self.current_wal_file.lock().unwrap();
 
-        // Verify we're still running and have a file
         if !self.running.load(Ordering::Acquire) || wal_file_guard.is_none() {
             return Err(Error::internal(
                 "WAL manager is not running or file is closed",
             ));
         }
 
-        // Clean up old rotated WAL files covered by the snapshot.
-        // This runs before the early-return check because even if the current WAL file
-        // doesn't need truncation, previously-rotated files may be fully covered.
+        // Clean up old rotated files first (current file may not need truncating
+        // even when prior files are fully covered).
         Self::cleanup_old_wal_files(&self.path, &current_wal_name, up_to_lsn);
 
-        // Extract LSN from current WAL filename to check if truncation is needed
-        // If upToLSN <= currentFileLSN, there's nothing to truncate
+        // If current file's first LSN is already > up_to_lsn, nothing to truncate.
         if let Some(lsn_start) = current_wal_name.find("lsn-") {
             if let Some(lsn_end) = current_wal_name[lsn_start + 4..].find('.') {
                 if let Ok(current_file_lsn) =
                     current_wal_name[lsn_start + 4..lsn_start + 4 + lsn_end].parse::<u64>()
                 {
                     if up_to_lsn <= current_file_lsn {
-                        // All entries in this file are already newer than up_to_lsn
                         return Ok(());
                     }
                 }
             }
         }
 
-        // First, flush any pending data to make sure everything is on disk
+        // Flush any pending data so disk reflects everything before truncation.
         {
             let mut buffer = self.buffer.lock().unwrap();
             if !buffer.is_empty() {
                 let buffer_data = std::mem::take(&mut *buffer);
+                let max_lsn = self.buffer_highest_lsn.swap(0, Ordering::AcqRel);
                 if let Some(file) = wal_file_guard.as_mut() {
                     file.write_all(&buffer_data).map_err(|e| {
                         Error::internal(format!("failed to flush buffer during truncation: {}", e))
                     })?;
+                    self.current_file_position
+                        .fetch_add(buffer_data.len() as u64, Ordering::Relaxed);
+                    if max_lsn > 0 {
+                        self.flushed_lsn.fetch_max(max_lsn, Ordering::AcqRel);
+                    }
                 }
             }
         }
 
-        // Sync file to ensure all data is persisted
         if let Some(file) = wal_file_guard.as_ref() {
             file.sync_all().map_err(|e| {
                 Error::internal(format!("failed to sync WAL during truncation: {}", e))
             })?;
         }
 
-        // Create a new file for the truncated WAL with LSN-based naming
         let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
         let new_wal_filename = format!("wal-{}-lsn-{}.log", timestamp, up_to_lsn);
         let temp_wal_path = self.path.join(format!(
@@ -2254,49 +2968,40 @@ impl WALManager {
         let mut temp_wal_file = File::create(&temp_wal_path)
             .map_err(|e| Error::internal(format!("failed to create temporary WAL file: {}", e)))?;
 
-        // Reset the current WAL file position to beginning
         let wal_file_path = self.path.join(&*current_wal_name);
         if let Some(file) = wal_file_guard.as_mut() {
             file.seek(SeekFrom::Start(0))
                 .map_err(|e| Error::internal(format!("failed to seek WAL file: {}", e)))?;
         }
 
-        // Copy entries that are newer than up_to_lsn to the temp file
-        // 32-byte header: magic(4) + version(1) + flags(1) + header_size(2) + LSN(8) + prev_lsn(8) + entry_size(4) + reserved(4)
+        // Copy entries with LSN > up_to_lsn into the temp file.
         let mut header_buf = [0u8; 32];
         let mut entries_copied = 0u64;
-        let mut last_copied_lsn: u64 = up_to_lsn; // Track last LSN for chain continuity
-        let mut new_file_size: u64 = 0; // Track new file size for position update
+        let mut last_copied_lsn: u64 = up_to_lsn;
+        let mut new_file_size: u64 = 0;
 
         if let Some(file) = wal_file_guard.as_mut() {
             loop {
-                // Try to read entry header (32 bytes)
                 match file.read_exact(&mut header_buf) {
                     Ok(()) => {}
                     Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
                     Err(_) => break,
                 }
 
-                // Verify magic marker
                 let magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
                 if magic != WAL_ENTRY_MAGIC {
-                    // Corrupted entry, skip
                     break;
                 }
 
-                // Parse header fields
                 let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
                 let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
                 let entry_size =
                     u32::from_le_bytes(header_buf[24..28].try_into().unwrap()) as usize;
 
-                // Calculate total size after header (including any extra header bytes for future extensibility)
                 let extra_header = header_size.saturating_sub(32);
-                let total_entry_size = extra_header + entry_size + 4; // extra_header + data + CRC
+                let total_entry_size = extra_header + entry_size + 4;
 
-                // If the entry's LSN is older than or equal to up_to_lsn, skip it
                 if lsn <= up_to_lsn {
-                    // Skip to next entry
                     if file
                         .seek(SeekFrom::Current(total_entry_size as i64))
                         .is_err()
@@ -2304,12 +3009,10 @@ impl WALManager {
                         break;
                     }
                 } else {
-                    // Write the header to the temp file
                     temp_wal_file.write_all(&header_buf).map_err(|e| {
                         Error::internal(format!("failed to write header to temp file: {}", e))
                     })?;
 
-                    // Copy the rest of the entry (extra header + data + CRC)
                     let mut data = vec![0u8; total_entry_size];
                     file.read_exact(&mut data).map_err(|e| {
                         Error::internal(format!("failed to read entry data: {}", e))
@@ -2318,7 +3021,6 @@ impl WALManager {
                         Error::internal(format!("failed to write entry data to temp file: {}", e))
                     })?;
 
-                    // Track the last copied LSN and accumulate file size
                     last_copied_lsn = lsn;
                     new_file_size += 32 + total_entry_size as u64;
                     entries_copied += 1;
@@ -2326,25 +3028,16 @@ impl WALManager {
             }
         }
 
-        // If we didn't copy any entries (all entries were old), create a marker entry
-        // so the WAL file isn't empty and tracking continues correctly
-        //
-        // LSN CHAIN BREAK NOTE:
-        // The marker entry's previous_lsn points to up_to_lsn which no longer exists
-        // in the WAL (it was truncated). This is intentional and safe because:
-        // 1. Recovery uses checkpoint metadata to determine the starting point
-        // 2. The marker entry serves only to maintain LSN continuity for new entries
-        // 3. The snapshot_lsn in checkpoint metadata tracks what was persisted
-        // Use CHAIN_BREAK_MARKER (0) as previous_lsn to explicitly indicate this
+        // If nothing copied, write a chain-break marker so the file isn't empty
+        // and LSN continuity is preserved (recovery uses checkpoint.meta to find
+        // the starting point, so the broken backward chain is safe).
         if entries_copied == 0 {
-            // previous_lsn = 0 indicates a chain break point (truncation occurred)
-            // This is more explicit than pointing to a non-existent LSN
             const CHAIN_BREAK_MARKER: u64 = 0;
             let marker_entry = WALEntry {
                 lsn: up_to_lsn.saturating_add(1),
-                previous_lsn: CHAIN_BREAK_MARKER, // Explicit chain break marker
+                previous_lsn: CHAIN_BREAK_MARKER,
                 flags: WalFlags::NONE,
-                txn_id: MARKER_TXN_ID, // Special marker transaction
+                txn_id: MARKER_TXN_ID,
                 table_name: String::new(),
                 row_id: 0,
                 operation: WALOperationType::Commit,
@@ -2353,45 +3046,32 @@ impl WALManager {
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_nanos() as i64)
                     .unwrap_or(0),
+                commit_seq: 0,
             };
             let encoded = marker_entry.encode();
             temp_wal_file
                 .write_all(&encoded)
                 .map_err(|e| Error::internal(format!("failed to write marker entry: {}", e)))?;
 
-            // Track marker's LSN and size for chain continuity
             last_copied_lsn = up_to_lsn.saturating_add(1);
             new_file_size = encoded.len() as u64;
         }
 
-        // Sync the temp file to ensure data is flushed to disk
         temp_wal_file
             .sync_all()
             .map_err(|e| Error::internal(format!("failed to sync temp WAL file: {}", e)))?;
 
-        // ATOMIC WAL TRUNCATION STRATEGY:
-        // 1. Sync temp file to disk
-        // 2. Close current WAL file
-        // 3. Rename old WAL to .bak (backup)
-        // 4. Rename temp file to new WAL name
-        // 5. Open new WAL file
-        // 6. Delete .bak file (only after everything succeeded)
-        // On error at any step: restore from .bak if needed
-
-        // Close the current WAL file
+        // Atomic rename strategy: sync temp -> rename old to .bak -> rename temp ->
+        // open new -> delete .bak. On error at any step: restore from .bak.
         *wal_file_guard = None;
-
-        // Close the temp file (drop it)
         drop(temp_wal_file);
 
-        // Create paths for the operation
         let new_wal_path = self.path.join(&new_wal_filename);
         let backup_wal_path = wal_file_path.with_extension("log.bak");
 
-        // Step 1: Rename old WAL file to .bak (atomic backup)
+        // Rename old WAL -> .bak.
         if wal_file_path.exists() {
             if let Err(e) = fs::rename(&wal_file_path, &backup_wal_path) {
-                // Recovery: reopen original file at the end
                 if let Ok(file) = OpenOptions::new()
                     .read(true)
                     .append(true)
@@ -2399,7 +3079,6 @@ impl WALManager {
                 {
                     *wal_file_guard = Some(file);
                 }
-                // Cleanup temp file
                 let _ = fs::remove_file(&temp_wal_path);
                 return Err(Error::internal(format!(
                     "failed to backup old WAL file: {}",
@@ -2408,9 +3087,9 @@ impl WALManager {
             }
         }
 
-        // Step 2: Rename temp file to new WAL name
+        // Rename temp -> new WAL name.
         if let Err(e) = fs::rename(&temp_wal_path, &new_wal_path) {
-            // Recovery: restore from backup and reopen
+            // Restore from backup on failure.
             if backup_wal_path.exists() {
                 let _ = fs::rename(&backup_wal_path, &wal_file_path);
             }
@@ -2427,10 +3106,8 @@ impl WALManager {
             )));
         }
 
-        // Step 3: Update current WAL file information
         *current_wal_name = new_wal_filename;
 
-        // Step 4: Open the new WAL file
         let new_file = match OpenOptions::new()
             .read(true)
             .append(true)
@@ -2438,8 +3115,7 @@ impl WALManager {
         {
             Ok(f) => f,
             Err(e) => {
-                // Critical error: try to restore from backup
-                // This is a serious situation but we try our best
+                // Restore from backup on failure.
                 if backup_wal_path.exists() && fs::rename(&backup_wal_path, &wal_file_path).is_ok()
                 {
                     *current_wal_name = wal_file_path
@@ -2464,18 +3140,12 @@ impl WALManager {
 
         *wal_file_guard = Some(new_file);
 
-        // Step 5: Sync directory to ensure renames are durable.
-        // This is critical on filesystems like ext4 where rename durability
-        // requires directory sync. Without this, a crash after rename but
-        // before natural sync could result in the old filename persisting.
-        // Windows does not support opening directories for fsync.
+        // Sync directory: required on ext4 etc. for rename durability.
         #[cfg(not(windows))]
         if let Ok(dir_file) = File::open(&self.path) {
             let _ = dir_file.sync_all();
         }
 
-        // Step 6: Delete backup file (only after everything succeeded)
-        // If this fails, it's just a warning - not critical
         if backup_wal_path.exists() {
             if let Err(e) = fs::remove_file(&backup_wal_path) {
                 eprintln!(
@@ -2485,16 +3155,12 @@ impl WALManager {
             }
         }
 
-        // Step 7: Update WAL manager state to maintain chain continuity
-        // CRITICAL: Update previous_lsn to the last entry in the new WAL file
-        // This ensures the next append_entry() will correctly chain to the last
-        // entry we kept (or the marker entry if all were truncated).
-        // Without this, the backward chain would be broken after truncation.
+        // Update previous_lsn so the next append_entry chains correctly.
         self.previous_lsn.store(last_copied_lsn, Ordering::Release);
-
-        // Update file position to reflect the new WAL file size
         self.current_file_position
             .store(new_file_size, Ordering::Release);
+        self.flushed_lsn
+            .fetch_max(last_copied_lsn, Ordering::AcqRel);
 
         Ok(())
     }
@@ -2506,13 +3172,12 @@ impl Drop for WALManager {
     }
 }
 
-/// Find the last LSN in a WAL file (32-byte header format)
+/// Find the last LSN in a WAL file.
 fn find_last_lsn(path: &Path) -> Result<u64> {
     let mut file =
         File::open(path).map_err(|e| Error::internal(format!("failed to open WAL file: {}", e)))?;
 
     let mut last_lsn: u64 = 0;
-    // 32-byte header: magic(4) + version(1) + flags(1) + header_size(2) + LSN(8) + prev_lsn(8) + entry_size(4) + reserved(4)
     let mut header_buf = [0u8; 32];
 
     loop {
@@ -2522,13 +3187,11 @@ fn find_last_lsn(path: &Path) -> Result<u64> {
             Err(_) => break,
         }
 
-        // Verify magic marker
         let magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
         if magic != WAL_ENTRY_MAGIC {
-            break; // Corrupted or end of valid data
+            break;
         }
 
-        // Parse header fields
         let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
         let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
         let entry_size = u32::from_le_bytes(header_buf[24..28].try_into().unwrap()) as usize;
@@ -2537,7 +3200,6 @@ fn find_last_lsn(path: &Path) -> Result<u64> {
             last_lsn = lsn;
         }
 
-        // Skip any additional header bytes (for future extensibility)
         if header_size > 32 {
             let extra = header_size - 32;
             if file.seek(SeekFrom::Current(extra as i64)).is_err() {
@@ -2545,7 +3207,6 @@ fn find_last_lsn(path: &Path) -> Result<u64> {
             }
         }
 
-        // Skip to next entry (data + CRC)
         let total_entry_size = entry_size + 4;
         if file
             .seek(SeekFrom::Current(total_entry_size as i64))
@@ -2600,16 +3261,13 @@ mod tests {
             WALOperationType::Insert,
             vec![1, 2, 3, 4],
         );
-        entry.lsn = 42; // Set LSN for encoding
-        entry.previous_lsn = 41; // Set previous LSN for chaining
+        entry.lsn = 42;
+        entry.previous_lsn = 41;
         entry.flags = WalFlags::NONE;
 
         let encoded = entry.encode();
         assert!(!encoded.is_empty());
 
-        // 32-byte header format: magic(4) + version(1) + flags(1) + header_size(2) +
-        // LSN(8) + prev_lsn(8) + entry_size(4) + reserved(4) = 32 bytes
-        // Verify header
         let magic = u32::from_le_bytes(encoded[0..4].try_into().unwrap());
         assert_eq!(magic, WAL_ENTRY_MAGIC);
         let version = encoded[4];
@@ -2623,9 +3281,16 @@ mod tests {
         let previous_lsn = u64::from_le_bytes(encoded[16..24].try_into().unwrap());
         assert_eq!(previous_lsn, 41);
 
-        // Data starts at offset 32, includes CRC at end
-        let decoded =
-            WALEntry::decode(entry.lsn, entry.previous_lsn, flags, &encoded[32..]).unwrap();
+        // Data starts at offset 32; v3 decode needs header bytes for CRC.
+        let decoded = WALEntry::decode(
+            entry.lsn,
+            entry.previous_lsn,
+            flags,
+            WAL_FORMAT_VERSION,
+            &encoded[32..],
+            &encoded[..32],
+        )
+        .unwrap();
 
         assert_eq!(decoded.lsn, entry.lsn);
         assert_eq!(decoded.previous_lsn, entry.previous_lsn);
@@ -2652,13 +3317,19 @@ mod tests {
 
         let mut encoded = entry.encode();
 
-        // Corrupt the data portion (after 32-byte header)
+        // Corrupt a byte in the CRC-covered region (data portion).
         if encoded.len() > 40 {
-            encoded[40] ^= 0xFF; // Flip some bits in data portion
+            encoded[40] ^= 0xFF;
         }
 
-        // Decode should fail due to CRC mismatch
-        let result = WALEntry::decode(entry.lsn, entry.previous_lsn, entry.flags, &encoded[32..]);
+        let result = WALEntry::decode(
+            entry.lsn,
+            entry.previous_lsn,
+            entry.flags,
+            WAL_FORMAT_VERSION,
+            &encoded[32..],
+            &encoded[..32],
+        );
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -2690,6 +3361,7 @@ mod tests {
             operation: WALOperationType::Commit,
             data: Vec::new(),
             timestamp: 0,
+            commit_seq: 0,
         };
         assert!(marker.is_marker_entry());
 
@@ -2699,7 +3371,7 @@ mod tests {
 
     #[test]
     fn test_wal_entry_commit_rollback() {
-        let commit = WALEntry::commit(100);
+        let commit = WALEntry::commit(100, 0);
         assert_eq!(commit.txn_id, 100);
         assert_eq!(commit.operation, WALOperationType::Commit);
         assert!(commit.table_name.is_empty());
@@ -2742,7 +3414,7 @@ mod tests {
     #[test]
     fn test_commit_abort_markers() {
         // Test commit marker
-        let commit_marker = WALEntry::commit_marker(42);
+        let commit_marker = WALEntry::commit_marker(42, 0);
         assert_eq!(commit_marker.txn_id, 42);
         assert!(commit_marker.is_commit_marker());
         assert!(!commit_marker.is_abort_marker());
@@ -2756,7 +3428,7 @@ mod tests {
         assert!(abort_marker.flags.contains(WalFlags::ABORT_MARKER));
 
         // Test regular commit (without marker flag)
-        let regular_commit = WALEntry::commit(44);
+        let regular_commit = WALEntry::commit(44, 0);
         assert!(regular_commit.is_commit_marker()); // Still recognized via operation type
 
         // Test regular rollback (without marker flag)
@@ -2786,7 +3458,7 @@ mod tests {
         assert_eq!(wal.previous_lsn(), 2);
 
         // Commit both transactions so they show up in two-phase replay
-        wal.write_commit_marker(1).unwrap();
+        wal.write_commit_marker(1, 0).unwrap();
 
         // Verify entries have correct previous_lsn when replayed
         let mut entries = Vec::new();
@@ -2910,7 +3582,7 @@ mod tests {
         let lsn = wal.append_entry(entry).unwrap();
         assert_eq!(lsn, 1);
 
-        let entry2 = WALEntry::commit(1);
+        let entry2 = WALEntry::commit(1, 0);
         let lsn2 = wal.append_entry(entry2).unwrap();
         assert_eq!(lsn2, 2);
 
@@ -2936,7 +3608,7 @@ mod tests {
                 );
                 wal.append_entry(entry).unwrap();
                 // Commit each transaction so it shows up in two-phase replay
-                wal.write_commit_marker(i).unwrap();
+                wal.write_commit_marker(i, 0).unwrap();
             }
 
             wal.close().unwrap();
@@ -3018,6 +3690,36 @@ mod tests {
     }
 
     #[test]
+    fn test_sync_none_commit_marker_waits_for_buffer_flush() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal_none_flush_cap");
+        let wal = WALManager::new(&wal_path, SyncMode::None).unwrap();
+
+        let marker_lsn = wal.write_commit_marker(1, 7).unwrap();
+        assert_eq!(wal.current_lsn(), marker_lsn);
+        assert_eq!(
+            wal.flushed_lsn(),
+            0,
+            "SyncMode::None must not force-flush commit markers"
+        );
+
+        wal.flush().unwrap();
+        assert_eq!(wal.flushed_lsn(), marker_lsn);
+        wal.close().unwrap();
+    }
+
+    #[test]
+    fn test_sync_normal_commit_marker_still_flushes() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal_normal_flush_cap");
+        let wal = WALManager::new(&wal_path, SyncMode::Normal).unwrap();
+
+        let marker_lsn = wal.write_commit_marker(1, 7).unwrap();
+        assert_eq!(wal.flushed_lsn(), marker_lsn);
+        wal.close().unwrap();
+    }
+
+    #[test]
     fn test_wal_manager_multiple_operations() {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal");
@@ -3043,7 +3745,7 @@ mod tests {
         );
         let lsn2 = wal.append_entry(update).unwrap();
 
-        let commit = WALEntry::commit(1);
+        let commit = WALEntry::commit(1, 0);
         let lsn3 = wal.append_entry(commit).unwrap();
 
         assert_eq!(lsn1, 1);
@@ -3151,7 +3853,7 @@ mod tests {
                 );
                 wal.append_entry(entry).unwrap();
                 // Commit each transaction
-                wal.write_commit_marker(i).unwrap();
+                wal.write_commit_marker(i, 0).unwrap();
             }
 
             // Get initial WAL file size
@@ -3244,7 +3946,7 @@ mod tests {
                     vec![],
                 );
                 wal.append_entry(entry).unwrap();
-                wal.write_commit_marker(i).unwrap();
+                wal.write_commit_marker(i, 0).unwrap();
             }
 
             // Truncate all entries (up to LSN 10, which covers all 5 inserts + 5 commits)
@@ -3301,7 +4003,7 @@ mod tests {
             wal.append_entry(entry2).unwrap();
 
             // Write commit marker for transaction 1
-            wal.write_commit_marker(1).unwrap();
+            wal.write_commit_marker(1, 0).unwrap();
 
             wal.close().unwrap();
         }
@@ -3459,7 +4161,7 @@ mod tests {
                 vec![1],
             );
             wal.append_entry(entry1).unwrap();
-            wal.write_commit_marker(1).unwrap();
+            wal.write_commit_marker(1, 0).unwrap();
 
             // Transaction 2: Aborted
             let entry2 = WALEntry::new(
@@ -3491,7 +4193,7 @@ mod tests {
                 vec![4],
             );
             wal.append_entry(entry4).unwrap();
-            wal.write_commit_marker(4).unwrap();
+            wal.write_commit_marker(4, 0).unwrap();
 
             wal.close().unwrap();
         }
@@ -3541,7 +4243,7 @@ mod tests {
             ..Default::default()
         };
 
-        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config)).unwrap();
+        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config), false).unwrap();
 
         // Initial state
         assert_eq!(wal.current_sequence(), 0);
@@ -3600,7 +4302,7 @@ mod tests {
             ..Default::default()
         };
 
-        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config)).unwrap();
+        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config), false).unwrap();
 
         // Write entries before rotation
         for i in 1..=3 {
@@ -3612,7 +4314,7 @@ mod tests {
                 vec![0u8; 50],
             );
             wal.append_entry(entry).unwrap();
-            wal.write_commit_marker(i).unwrap();
+            wal.write_commit_marker(i, 0).unwrap();
         }
 
         // Count files before rotation
@@ -3647,7 +4349,7 @@ mod tests {
                 vec![0u8; 50],
             );
             wal.append_entry(entry).unwrap();
-            wal.write_commit_marker(i).unwrap();
+            wal.write_commit_marker(i, 0).unwrap();
         }
 
         // Count files after rotation (should be 2)
@@ -3665,7 +4367,7 @@ mod tests {
         wal.close().unwrap();
 
         // Reopen and replay - should get all committed entries from BOTH files
-        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config)).unwrap();
+        let wal = WALManager::with_config(&wal_path, SyncMode::Full, Some(&config), false).unwrap();
 
         let mut row_ids = Vec::new();
         let mut commit_count = 0;

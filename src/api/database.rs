@@ -12,45 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Database struct and operations
-//!
-//! Provides a modern, ergonomic Rust API for database operations.
-//!
-//! # Examples
-//!
-//! ```ignore
-//! use stoolap::{Database, params};
-//!
-//! let db = Database::open("memory://")?;
-//!
-//! // DDL - no params needed
-//! db.execute("CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)", ())?;
-//!
-//! // Insert with params - using tuple syntax
-//! db.execute("INSERT INTO users VALUES ($1, $2, $3)", (1, "Alice", 30))?;
-//!
-//! // Insert with params! macro
-//! db.execute("INSERT INTO users VALUES ($1, $2, $3)", params![2, "Bob", 25])?;
-//!
-//! // Query with iteration
-//! for row in db.query("SELECT * FROM users WHERE age > $1", (20,))? {
-//!     let row = row?;
-//!     let name: String = row.get("name")?;
-//!     println!("{}", name);
-//! }
-//!
-//! // Query single value
-//! let count: i64 = db.query_one("SELECT COUNT(*) FROM users", ())?;
-//! ```
+//! Database struct and operations.
 
 use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use crate::core::{DataType, Error, IsolationLevel, Result, Value};
 use crate::executor::context::ExecutionContextBuilder;
 use crate::executor::{CachedPlanRef, ExecutionContext, Executor};
 use crate::storage::mvcc::engine::MVCCEngine;
-use crate::storage::traits::Engine;
 use crate::storage::{Config, SyncMode};
 
 use super::params::{NamedParams, Params};
@@ -62,208 +33,547 @@ use super::transaction::Transaction;
 pub const MEMORY_SCHEME: &str = "memory";
 pub const FILE_SCHEME: &str = "file";
 
-/// Global database registry to ensure single instance per DSN
-static DATABASE_REGISTRY: std::sync::LazyLock<RwLock<FxHashMap<String, Arc<DatabaseInner>>>> =
-    std::sync::LazyLock::new(|| RwLock::new(FxHashMap::default()));
+/// Parse `"Nms"`, `"Ns"`, `"Nm"`, or `"0"` into a Duration.
+pub(crate) fn parse_refresh_interval_value(value: &str) -> Result<Duration> {
+    let trimmed = value.trim();
+    if trimmed == "0" {
+        return Ok(Duration::ZERO);
+    }
+    let (num_str, multiplier_ms): (&str, u64) = if let Some(rest) = trimmed.strip_suffix("ms") {
+        (rest, 1)
+    } else if let Some(rest) = trimmed.strip_suffix('s') {
+        (rest, 1_000)
+    } else if let Some(rest) = trimmed.strip_suffix('m') {
+        (rest, 60_000)
+    } else {
+        return Err(Error::invalid_argument(format!(
+            "invalid refresh_interval: '{}' (expected 'Nms', 'Ns', 'Nm', or '0')",
+            value
+        )));
+    };
+    let n: u64 = num_str.parse().map_err(|_| {
+        Error::invalid_argument(format!(
+            "invalid refresh_interval: '{}' (numeric portion not a non-negative integer)",
+            value
+        ))
+    })?;
+    let total_ms = n.checked_mul(multiplier_ms).ok_or_else(|| {
+        Error::invalid_argument(format!(
+            "invalid refresh_interval: '{}' overflows u64 milliseconds",
+            value
+        ))
+    })?;
+    Ok(Duration::from_millis(total_ms))
+}
 
-/// Inner database state (shared between Database instances with same DSN)
-pub(crate) struct DatabaseInner {
-    engine: Arc<MVCCEngine>,
-    executor: Mutex<Executor>,
-    dsn: String,
-    /// Whether this DatabaseInner owns the engine (created it via open()).
-    /// Cloned DatabaseInners share the engine but don't own it.
-    owns_engine: bool,
-    /// Temp directory for test-filedb feature. Deleted on drop.
+/// Per-DSN registry. Weak refs so entries self-expire when the last user handle drops.
+static DATABASE_REGISTRY: std::sync::LazyLock<
+    RwLock<FxHashMap<String, std::sync::Weak<EngineEntry>>>,
+> = std::sync::LazyLock::new(|| RwLock::new(FxHashMap::default()));
+
+/// Engine-level shared state, keyed by DSN. Arc count = live user handles.
+pub(crate) struct EngineEntry {
+    pub(crate) engine: Arc<MVCCEngine>,
+    pub(crate) dsn: String,
+    /// Shared across per-handle executors so DML invalidation reaches all readers.
+    pub(crate) semantic_cache: Arc<crate::executor::SemanticCache>,
+    /// Shared so ANALYZE updates reach all readers' plans.
+    pub(crate) query_planner: Arc<crate::executor::QueryPlanner>,
+    /// Shared compiled-plan cache so DDL on the writable handle invalidates
+    /// every in-process sibling's query cache (including `as_read_only`
+    /// views, whose `refresh()` short-circuits on writable engines).
+    pub(crate) query_cache: Arc<crate::executor::QueryCache>,
+    /// SWMR lease for read-only file:// engines. `None` for in-memory or writable.
+    pub(crate) lease: Option<crate::storage::mvcc::lease::LeaseManager>,
+    /// Read-only mmap of writer's `db.shm`. `None` falls back to v1 mtime-only presence.
+    pub(crate) shm: Option<Arc<crate::storage::mvcc::shm::ShmHandle>>,
+    /// `writer_generation` snapshot at attach; refresh detects reincarnation against it.
+    pub(crate) attach_writer_gen: u64,
+    /// `visible_commit_lsn` snapshot at attach; SwmrPendingDdl filter suppresses pre-attach DDL.
+    pub(crate) attach_visible_commit_lsn: u64,
+    /// `oldest_active_txn_lsn` sampled before visible_commit_lsn, so post-attach commits
+    /// can't move the floor above us. `u64::MAX` = no shm or no active txns at attach.
+    pub(crate) attach_oldest_active_txn_lsn: u64,
+    /// Manifest epoch read before `open_engine`; baseline for ReadOnlyDatabase refresh.
+    pub(crate) loaded_epoch: u64,
+    /// Epoch-millis of last lease touch; rate-limits the touch syscall to ~1Hz.
+    last_lease_touch_ms: std::sync::atomic::AtomicU64,
+    /// Long-lived SH lock for chmod-read-only fallback (lease registration failed on
+    /// writable mount). Blocks LOCK_EX so a privileged writer can't reclaim under us.
+    #[allow(dead_code)]
+    pub(crate) chmod_ro_lock: Option<crate::storage::mvcc::file_lock::SharedLockGuard>,
+    /// Temp directory for test-filedb feature. Deleted with the entry.
     #[cfg(feature = "test-filedb")]
     _temp_dir: Option<tempfile::TempDir>,
 }
 
-/// Type alias for Statement to use (avoids exposing DatabaseInner directly)
-pub(crate) type DatabaseInnerHandle = DatabaseInner;
+/// Probe `db_path` writability via a throwaway file. Used to classify lease failures.
+fn is_directory_writable(db_path: &std::path::Path) -> bool {
+    let pid = std::process::id();
+    let probe = db_path.join(format!(".swmr-write-probe-{}", pid));
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
 
-impl Drop for DatabaseInner {
+impl EngineEntry {
+    /// Rate-limited (~1Hz) mtime touch on the SWMR lease. No-op without a lease.
+    pub(crate) fn heartbeat_swmr_lease(&self) {
+        let Some(ref l) = self.lease else { return };
+        use std::sync::atomic::Ordering;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let last = self.last_lease_touch_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 1_000 {
+            return;
+        }
+        if l.touch().is_ok() {
+            self.last_lease_touch_ms.store(now_ms, Ordering::Relaxed);
+        }
+    }
+
+    /// Pre-acquire SWMR lease + shm + attach snapshots before engine construction.
+    /// Lease registers first (writer's GC sees us during WAL replay); shm sample
+    /// drives both engine `replay_cap_lsn` and EngineEntry's attach snapshot.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn pre_acquire_swmr_for_read_only_path(
+        path: &std::path::Path,
+    ) -> Result<(
+        Option<crate::storage::mvcc::lease::LeaseManager>,
+        Option<Arc<crate::storage::mvcc::shm::ShmHandle>>,
+        u64,                                                      // attach_writer_gen
+        u64,                                                      // attach_visible_commit_lsn
+        u64,                                                      // attach_oldest_active_txn_lsn
+        Option<crate::storage::mvcc::file_lock::SharedLockGuard>, // no-shm v1 fallback handshake guard
+        u64, // pre_acquire_pin_handle_id (caller removes via remove_handle_pin)
+    )> {
+        // Lease registration failure: accept on RO mount or chmod-RO dir, fail otherwise.
+        let lease = match crate::storage::mvcc::lease::LeaseManager::register(path) {
+            Ok(l) => Some(l),
+            Err(e) => {
+                let ro_mount = crate::storage::mvcc::file_lock::is_path_on_readonly_mount_pub(path);
+                let dir_unwritable = !ro_mount && !is_directory_writable(path);
+                if ro_mount || dir_unwritable {
+                    None
+                } else {
+                    return Err(Error::internal(format!(
+                        "SWMR attach failed at '{}': could not register reader \
+                         lease: {} (writable filesystem and directory; refusing \
+                         to skip lease registration because the writer's GC \
+                         depends on live lease presence)",
+                        path.display(),
+                        e
+                    )));
+                }
+            }
+        };
+        // Pin WAL=1 BEFORE shm sample so a concurrent checkpoint can't truncate our
+        // replay range. Use `set_handle_pin` with a fresh id to coexist with sibling
+        // contributions; RAII guard releases on early-Err so we never leak a pin of 1.
+        struct PreAcquirePinGuard<'a> {
+            lease: Option<&'a crate::storage::mvcc::lease::LeaseManager>,
+            handle_id: u64,
+            armed: bool,
+        }
+        impl Drop for PreAcquirePinGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    if let Some(l) = self.lease {
+                        l.remove_handle_pin(self.handle_id);
+                    }
+                }
+            }
+        }
+        let pre_acquire_pin_handle_id = crate::storage::mvcc::lease::next_handle_id();
+        let pin_ok = lease
+            .as_ref()
+            .map(|l| l.set_handle_pin(pre_acquire_pin_handle_id, 1).is_ok())
+            .unwrap_or(false);
+        let mut pin_guard = PreAcquirePinGuard {
+            lease: lease.as_ref(),
+            handle_id: pre_acquire_pin_handle_id,
+            armed: pin_ok,
+        };
+        let shm_path = path.join(crate::storage::mvcc::shm::SHM_FILENAME);
+
+        // Always handshake: shm file presence doesn't prove a live writer (close_engine
+        // leaves db.shm behind). Outcome classifies writer state and gates capped vs
+        // uncapped WAL replay.
+        let outcome =
+            crate::storage::mvcc::file_lock::FileLock::await_writer_startup_quiescent(path)?;
+        use crate::storage::mvcc::file_lock::HandshakeOutcome;
+        let mut handshake_guard: Option<crate::storage::mvcc::file_lock::SharedLockGuard> = None;
+        let mut startup_guard: Option<crate::storage::mvcc::file_lock::StartupLockGuard> = None;
+        let mut shm_is_stale_leftover = false;
+        match outcome {
+            HandshakeOutcome::NoWriter(g) => {
+                handshake_guard = Some(g);
+                shm_is_stale_leftover = true;
+            }
+            HandshakeOutcome::LiveWriter(sg) => {
+                startup_guard = Some(sg);
+            }
+            HandshakeOutcome::ReadOnlyMount => {}
+        }
+
+        let mut shm = if pin_ok && !shm_is_stale_leftover {
+            crate::storage::mvcc::shm::ShmHandle::open_reader(path)
+                .ok()
+                .map(Arc::new)
+        } else {
+            None
+        };
+        // Best-effort 250ms poll for the writer to publish a fresh seqlock pair.
+        // Not correctness-required (WAL→shm fetch_min mirror covers the lower bound).
+        if let Some(h) = shm.as_ref() {
+            let baseline_seq = h
+                .header()
+                .publish_seq
+                .load(std::sync::atomic::Ordering::Acquire);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            while std::time::Instant::now() < deadline {
+                let seq = h
+                    .header()
+                    .publish_seq
+                    .load(std::sync::atomic::Ordering::Acquire);
+                // Wait for an EVEN seq > baseline (in-flight publish leaves it odd).
+                if seq > baseline_seq && seq.is_multiple_of(2) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+        let mut attach_gen: u64 = 0;
+        let mut attach_oldest_active: u64 = u64::MAX;
+        let mut attach_lsn: u64 = 0;
+        // No-shm path: still probe db.shm to capture writer_generation as baseline so
+        // a future writer reincarnation is detected on refresh.
+        if shm.is_none() {
+            if let Ok(h) = crate::storage::mvcc::shm::ShmHandle::open_reader(path) {
+                let gen = h
+                    .header()
+                    .writer_generation
+                    .load(std::sync::atomic::Ordering::Acquire);
+                attach_gen = gen;
+            }
+        }
+        if let Some(h) = shm.as_ref() {
+            match h.header().sample_attach_snapshot() {
+                Some((gen, visible, oldest)) => {
+                    attach_gen = gen;
+                    attach_oldest_active = oldest;
+                    attach_lsn = visible;
+                }
+                None => {
+                    if let Some(ref l) = lease {
+                        l.remove_handle_pin(pre_acquire_pin_handle_id);
+                    }
+                    return Err(Error::internal(format!(
+                        "SWMR attach failed at '{}': writer is mid-reincarnation \
+                         (db.shm header unstable across retries); retry the open",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        // LiveWriter post-sample liveness recheck: writer may have exited mid-sample.
+        if let Some(sg) = startup_guard.take() {
+            match crate::storage::mvcc::file_lock::FileLock::recheck_writer_still_holds_lock(path)?
+            {
+                Some(db_lock_g) => {
+                    // Writer exited mid-sample. Discard shm; preserve attach_gen
+                    // (refresh check needs the leftover gen as baseline).
+                    handshake_guard = Some(db_lock_g);
+                    shm_is_stale_leftover = true;
+                    shm = None;
+                    attach_oldest_active = u64::MAX;
+                    attach_lsn = 0;
+                }
+                None => {
+                    // Writer still alive. Require shm, uncapped replay would race appends.
+                    if shm.is_none() {
+                        if let Some(ref l) = lease {
+                            l.remove_handle_pin(pre_acquire_pin_handle_id);
+                        }
+                        return Err(Error::internal(format!(
+                            "SWMR attach failed at '{}': writer is live (db.lock \
+                             still EX-held) but db.shm could not be attached \
+                             (pin_ok={}, shm_path_exists={}); refusing to fall \
+                             back to uncapped WAL replay against a live writer; \
+                             retry the open",
+                            path.display(),
+                            pin_ok,
+                            shm_path.exists()
+                        )));
+                    }
+                    drop(sg);
+                }
+            }
+        }
+
+        let shm_file_exists = shm_path.exists() && !shm_is_stale_leftover;
+        if shm_file_exists && shm.is_none() {
+            // shm exists but unattachable: accept on RO/chmod-RO (leftover), fail otherwise.
+            let ro_mount = crate::storage::mvcc::file_lock::is_path_on_readonly_mount_pub(path);
+            let dir_unwritable = !ro_mount && !is_directory_writable(path);
+            if !ro_mount && !dir_unwritable {
+                if let Some(ref l) = lease {
+                    l.remove_handle_pin(pre_acquire_pin_handle_id);
+                }
+                return Err(Error::internal(format!(
+                    "SWMR attach failed at '{}': writer's db.shm exists but \
+                     reader could not acquire shm/pin (pin_ok={}, shm_open_ok={}); \
+                     retry the open",
+                    path.display(),
+                    pin_ok,
+                    shm.is_some()
+                )));
+            }
+            // Effectively-RO path: drop the failed-pin contribution.
+            if let Some(ref l) = lease {
+                l.remove_handle_pin(pre_acquire_pin_handle_id);
+            }
+        }
+        // No-shm path: caller holds the guard across open_engine to fence new writers.
+        let returned_guard = if shm.is_none() { handshake_guard } else { None };
+        // Defuse the RAII guard so the contribution survives for the caller.
+        pin_guard.armed = false;
+        drop(pin_guard);
+        Ok((
+            lease,
+            shm,
+            attach_gen,
+            attach_lsn,
+            attach_oldest_active,
+            returned_guard,
+            pre_acquire_pin_handle_id,
+        ))
+    }
+}
+
+impl Drop for EngineEntry {
     fn drop(&mut self) {
-        // Clear all thread-local caches to release references to engine internals
-        // This prevents memory leaks from cached Arc<dyn Index> and closures
+        // Release thread-local caches that hold engine-internal Arcs/closures.
         crate::executor::clear_all_thread_local_caches();
+        let _ = self.engine.close_engine();
 
-        // Only close the engine if we own it (created via open(), not clone()).
-        // Cloned databases share the engine but don't close it on drop.
-        if self.owns_engine {
-            let _ = self.engine.close_engine();
+        // Reap our dead Weak from the registry; skip if a sibling re-inserted live.
+        if let Ok(mut registry) = DATABASE_REGISTRY.try_write() {
+            if let Some(weak) = registry.get(&self.dsn) {
+                if weak.strong_count() == 0 {
+                    registry.remove(&self.dsn);
+                }
+            }
         }
     }
 }
 
-/// Database represents a Stoolap database connection
-///
-/// This is the main entry point for using Stoolap. It wraps the storage engine
-/// and executor, providing a simple API for executing SQL queries.
-///
-/// # Thread Safety
-///
-/// Database is thread-safe and can be shared across threads via cloning.
-/// Each clone shares the same underlying storage engine.
-///
-/// # Examples
-///
-/// ```ignore
-/// use stoolap::{Database, params};
-///
-/// // Open in-memory database
-/// let db = Database::open("memory://")?;
-///
-/// // Create table
-/// db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ())?;
-///
-/// // Insert with parameters
-/// db.execute("INSERT INTO users VALUES ($1, $2)", (1, "Alice"))?;
-///
-/// // Query
-/// for row in db.query("SELECT * FROM users", ())? {
-///     let row = row?;
-///     println!("{}: {}", row.get::<i64>("id")?, row.get::<String>("name")?);
-/// }
-/// ```
+/// Per-handle state. Each handle gets its own executor so BEGIN doesn't leak across.
+pub(crate) struct DatabaseInner {
+    entry: Arc<EngineEntry>,
+    /// Shared so `read_engine`'s guard can check for an active BEGIN on this handle.
+    executor: Arc<Mutex<Executor>>,
+}
+
+pub(crate) type DatabaseInnerHandle = DatabaseInner;
+
+impl DatabaseInner {
+    /// Build a fresh writable per-handle inner sharing the entry's caches.
+    fn new_with_entry(entry: Arc<EngineEntry>) -> Self {
+        let engine = Arc::clone(&entry.engine);
+        let semantic_cache = Arc::clone(&entry.semantic_cache);
+        let query_planner = Arc::clone(&entry.query_planner);
+        let query_cache = Arc::clone(&entry.query_cache);
+        let executor = Executor::with_shared_semantic_cache(
+            engine,
+            semantic_cache,
+            query_planner,
+            query_cache,
+        );
+        Self {
+            entry,
+            executor: Arc::new(Mutex::new(executor)),
+        }
+    }
+}
+
+/// `ReadEngine` wrapper returned by `read_engine()`. Heartbeats lease and runs the
+/// per-handle refresh on every `begin_read_transaction*` call.
+pub(crate) struct SwmrReadEngineGuard {
+    pub(crate) engine: Arc<MVCCEngine>,
+    pub(crate) entry: Arc<EngineEntry>,
+    pub(crate) refresh_owner: RefreshOwner,
+}
+
+pub(crate) enum RefreshOwner {
+    ReadOnly(Arc<crate::api::read_only_database::ReadOnlyDatabaseInner>),
+    None,
+}
+
+impl SwmrReadEngineGuard {
+    #[inline]
+    fn maintain(&self) -> Result<()> {
+        self.entry.heartbeat_swmr_lease();
+        match &self.refresh_owner {
+            RefreshOwner::ReadOnly(inner) => {
+                let rod = crate::api::ReadOnlyDatabase {
+                    inner: Arc::clone(inner),
+                };
+                rod.maybe_auto_refresh()?;
+            }
+            RefreshOwner::None => {}
+        }
+        Ok(())
+    }
+}
+
+impl crate::storage::traits::ReadEngine for SwmrReadEngineGuard {
+    fn begin_read_transaction(&self) -> Result<Box<dyn crate::storage::traits::ReadTransaction>> {
+        self.maintain()?;
+        self.engine.begin_read_transaction()
+    }
+
+    fn begin_read_transaction_with_level(
+        &self,
+        level: crate::core::IsolationLevel,
+    ) -> Result<Box<dyn crate::storage::traits::ReadTransaction>> {
+        self.maintain()?;
+        self.engine.begin_read_transaction_with_level(level)
+    }
+}
+
+/// Stoolap database connection. Thread-safe; clone to share across threads
+/// (each clone gets independent transaction state but shares the engine).
 pub struct Database {
     inner: Arc<DatabaseInner>,
 }
 
 #[cfg(feature = "ffi")]
 impl Database {
-    /// Returns an Arc reference to the inner state, preventing the engine
-    /// from being closed while any keepalive handle exists.
-    ///
-    /// Used by the FFI layer to ensure cloned handles keep the original
-    /// engine-owning DatabaseInner alive.
+    /// FFI keepalive: holds inner Arc to keep the engine alive across handles.
     pub(crate) fn keepalive(&self) -> Arc<DatabaseInner> {
         Arc::clone(&self.inner)
     }
 
-    /// Returns a borrow of the inner Arc (no clone, no count change).
     pub(crate) fn inner_arc(&self) -> &Arc<DatabaseInner> {
         &self.inner
     }
+}
 
-    /// Try to remove `inner` from the global registry.
-    ///
-    /// Only removes the entry when:
-    /// 1. The registry entry points to the same `DatabaseInner` (`ptr_eq`), and
-    /// 2. `strong_count == 2`: the caller's reference + registry are the only
-    ///    remaining references. After the caller drops, only the registry holds
-    ///    a reference, so it is safe to clean up.
-    ///
-    /// This correctly handles both shared-DSN scenarios (two `stoolap_open()`
-    /// calls with the same DSN) and clone scenarios (keepalive Arcs).
+impl Database {
+    /// FFI-only registry tidying for `stoolap_close`. No-op when other handles exist.
+    #[cfg(feature = "ffi")]
     pub(crate) fn try_unregister_arc(inner: &Arc<DatabaseInner>) {
+        if Arc::strong_count(inner) > 1 {
+            return;
+        }
+        if Arc::strong_count(&inner.entry) > 1 {
+            return;
+        }
         if let Ok(mut registry) = DATABASE_REGISTRY.write() {
-            if let Some(entry) = registry.get(&inner.dsn) {
-                if Arc::ptr_eq(entry, inner) && Arc::strong_count(inner) == 2 {
-                    registry.remove(&inner.dsn);
+            if let Some(weak) = registry.get(&inner.entry.dsn) {
+                match weak.upgrade() {
+                    Some(reg_entry) if Arc::ptr_eq(&reg_entry, &inner.entry) => {
+                        registry.remove(&inner.entry.dsn);
+                    }
+                    None => {
+                        registry.remove(&inner.entry.dsn);
+                    }
+                    _ => {}
                 }
             }
+        }
+    }
+}
+
+impl Database {
+    /// New handle sharing `entry` but with its own executor (independent BEGIN state).
+    fn share_entry(entry: Arc<EngineEntry>) -> Database {
+        Database {
+            inner: Arc::new(DatabaseInner::new_with_entry(entry)),
         }
     }
 }
 
 impl Clone for Database {
-    /// Clone the database handle.
-    ///
-    /// Each cloned handle has its own executor with independent transaction state,
-    /// but shares the same underlying storage engine. This ensures proper transaction
-    /// isolation - a BEGIN on one handle won't affect reads on another handle.
+    /// Clone gets its own executor (independent transaction state); shares the engine.
     fn clone(&self) -> Self {
-        // Create a new executor with the same engine (shares data) but independent
-        // transaction state (no dirty reads across handles)
-        let engine = Arc::clone(&self.inner.engine);
-        let executor = crate::executor::Executor::new(Arc::clone(&engine));
-
-        let inner = Arc::new(DatabaseInner {
-            engine,
-            executor: Mutex::new(executor),
-            dsn: self.inner.dsn.clone(),
-            owns_engine: false,
-            #[cfg(feature = "test-filedb")]
-            _temp_dir: None, // Clones don't own the temp dir
-        });
-
-        Database { inner }
+        Database::share_entry(Arc::clone(&self.inner.entry))
     }
 }
 
-impl Drop for Database {
-    fn drop(&mut self) {
-        // Only remove from registry if:
-        // 1. The registry entry is OUR Arc (ptr_eq check) - prevents open_in_memory()
-        //    from accidentally removing a different DatabaseInner with same DSN
-        // 2. We're the last non-registry holder (strong_count == 2)
-        if let Ok(mut registry) = DATABASE_REGISTRY.write() {
-            if let Some(entry) = registry.get(&self.inner.dsn) {
-                if Arc::ptr_eq(entry, &self.inner) && Arc::strong_count(&self.inner) == 2 {
-                    registry.remove(&self.inner.dsn);
-                }
-            }
-        }
-        // Note: Thread-local cache clearing and engine closure happen in DatabaseInner::drop()
-        // when the last Arc<DatabaseInner> is dropped.
-    }
-}
+// No Drop impl: dropping `inner` drops the per-handle `Arc<EngineEntry>`; when the
+// last handle drops, `EngineEntry::drop` closes the engine and reaps the Weak.
 
 impl Database {
-    /// Open a database connection
+    /// Open a database connection.
     ///
-    /// The DSN (Data Source Name) specifies the database location:
-    /// - `memory://` - In-memory database (data lost when closed)
-    /// - `file:///path/to/db` - Persistent database at the specified path
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // In-memory database
-    /// let db = Database::open("memory://")?;
-    ///
-    /// // Persistent database
-    /// let db = Database::open("file:///tmp/mydb")?;
-    /// ```
-    ///
-    /// # Engine Reuse
+    /// DSN forms:
+    /// - `memory://`, in-memory (data lost on close).
+    /// - `file:///path/to/db`, persistent.
     ///
     /// Opening the same DSN multiple times returns the same engine instance.
-    /// This ensures consistency and prevents data corruption.
+    /// Read-only DSNs (`?read_only=true` / `?mode=ro`) must use `open_read_only`.
     pub fn open(dsn: &str) -> Result<Self> {
-        // Check if we already have an engine for this DSN
+        // Read-only DSNs go through `open_read_only` for compile-time type-level enforcement.
+        if Self::dsn_read_only_flag(dsn)? == Some(true) {
+            return Err(Error::invalid_argument(
+                "read-only DSN flag (?read_only=true / ?readonly=true / \
+                 ?mode=ro) passed to Database::open. Read-only handles \
+                 must be opened via Database::open_read_only(dsn) so the \
+                 returned ReadOnlyDatabase enforces the read-only \
+                 contract at the type level. The DSN string itself \
+                 (including the flag) can be passed unchanged to \
+                 open_read_only.",
+            ));
+        }
+
+        // Reuse a writable cached entry; reject read-only-cached entries with mode mismatch.
         {
             let registry = DATABASE_REGISTRY
                 .read()
                 .map_err(|_| Error::LockAcquisitionFailed("registry read".to_string()))?;
-            if let Some(inner) = registry.get(dsn) {
-                return Ok(Database {
-                    inner: Arc::clone(inner),
-                });
+            if let Some(weak) = registry.get(dsn) {
+                if let Some(entry) = weak.upgrade() {
+                    if entry.engine.is_read_only_mode() {
+                        return Err(Error::read_only_mode_mismatch(dsn, true, false));
+                    }
+                    return Ok(Self::share_entry(entry));
+                }
             }
         }
 
-        // Need to create a new engine - acquire write lock
         let mut registry = DATABASE_REGISTRY
             .write()
             .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
 
-        // Double-check after acquiring write lock
-        if let Some(inner) = registry.get(dsn) {
-            return Ok(Database {
-                inner: Arc::clone(inner),
-            });
+        // Re-check under write lock.
+        if let Some(weak) = registry.get(dsn) {
+            if let Some(entry) = weak.upgrade() {
+                if entry.engine.is_read_only_mode() {
+                    return Err(Error::read_only_mode_mismatch(dsn, true, false));
+                }
+                return Ok(Self::share_entry(entry));
+            }
         }
 
-        // Parse the DSN
         let (scheme, path) = Self::parse_dsn(dsn)?;
 
-        // test-filedb: track temp dir so it lives as long as the engine
         #[cfg(feature = "test-filedb")]
         let mut _temp_dir_holder: Option<tempfile::TempDir> = None;
 
-        // Create the engine based on scheme
+        // Writable-only path: no SWMR lease/shm setup.
         let engine = match scheme.as_str() {
             MEMORY_SCHEME => {
                 #[cfg(feature = "test-filedb")]
@@ -290,13 +600,10 @@ impl Database {
                 }
             }
             FILE_SCHEME => {
-                // Parse optional query parameters
                 let (_clean_path, config) = Self::parse_file_config(&path)?;
-
                 let engine = MVCCEngine::new(config);
                 engine.open_engine()?;
                 let engine = Arc::new(engine);
-                // Start background cleanup (uses config from engine)
                 engine.start_cleanup();
                 engine
             }
@@ -308,31 +615,278 @@ impl Database {
             }
         };
 
-        // Create executor (uses shared default function registry)
-        let executor = Executor::new(Arc::clone(&engine));
-
-        let inner = Arc::new(DatabaseInner {
+        let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
+        let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
+        let query_cache = Arc::new(crate::executor::QueryCache::default());
+        let entry = Arc::new(EngineEntry {
             engine,
-            executor: Mutex::new(executor),
             dsn: dsn.to_string(),
-            owns_engine: true,
+            semantic_cache,
+            query_planner,
+            query_cache,
+            lease: None,
+            shm: None,
+            attach_writer_gen: 0,
+            attach_visible_commit_lsn: 0,
+            attach_oldest_active_txn_lsn: u64::MAX,
+            loaded_epoch: 0,
+            last_lease_touch_ms: std::sync::atomic::AtomicU64::new(0),
+            chmod_ro_lock: None,
             #[cfg(feature = "test-filedb")]
             _temp_dir: _temp_dir_holder,
         });
 
-        // Store in registry
-        registry.insert(dsn.to_string(), Arc::clone(&inner));
+        registry.insert(dsn.to_string(), Arc::downgrade(&entry));
 
-        Ok(Database { inner })
+        Ok(Self::share_entry(entry))
     }
 
-    /// Open an in-memory database
-    ///
-    /// This is a convenience method that creates a new in-memory database.
-    /// Each call creates a unique instance (unlike `open("memory://")` which
-    /// would share the same instance).
+    /// Open a fresh in-memory database. Unlike `open("memory://")`, each call is unique.
     pub fn open_in_memory() -> Result<Self> {
         Self::create_in_memory_engine()
+    }
+
+    /// Open a read-only handle over an existing `file://` database. The returned
+    /// `ReadOnlyDatabase` rejects write SQL and registers a cross-process presence
+    /// lease (issue at least one query per `2 * checkpoint_interval` to keep it fresh).
+    pub fn open_read_only(dsn: &str) -> Result<crate::api::ReadOnlyDatabase> {
+        if dsn.starts_with(MEMORY_SCHEME) {
+            return Err(Error::invalid_argument(
+                "open_read_only is not supported on memory:// (a fresh \
+                 in-memory engine has no data to read); use file:// for \
+                 read-only deployments",
+            ));
+        }
+
+        // Reject DSN flag that explicitly requests writable; redundant RO flags accepted.
+        if Self::dsn_read_only_flag(dsn)? == Some(false) {
+            return Err(Error::invalid_argument(
+                "Database::open_read_only called with a DSN flag that \
+                 explicitly requests writable mode (?read_only=false / \
+                 ?readonly=false / ?mode=rw). The function name and the \
+                 DSN flag disagree, drop the flag (it's redundant on \
+                 open_read_only) or use Database::open(dsn) instead.",
+            ));
+        }
+
+        // Parse refresh flags up front so errors surface before any engine work.
+        let dsn_auto_refresh = Self::dsn_auto_refresh_flag(dsn)?;
+        let dsn_refresh_interval = Self::dsn_refresh_interval_flag(dsn)?;
+        let apply_dsn_flags =
+            |ro: crate::api::ReadOnlyDatabase| -> Result<crate::api::ReadOnlyDatabase> {
+                if let Some(enabled) = dsn_auto_refresh {
+                    ro.set_auto_refresh(enabled);
+                }
+                if let Some(d) = dsn_refresh_interval {
+                    if !d.is_zero() {
+                        ro.set_refresh_interval(Some(d))?;
+                    }
+                }
+                Ok(ro)
+            };
+
+        // Entry reuse requires shm present, frontier static, and writer_gen unchanged
+        // since attach; otherwise fall through to a fresh open with new attach snapshot.
+        let frontier_static = |entry: &Arc<EngineEntry>| -> bool {
+            match entry.shm.as_ref() {
+                Some(h) => {
+                    let observed_visible = h
+                        .header()
+                        .visible_commit_lsn
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    let observed_gen = h
+                        .header()
+                        .writer_generation
+                        .load(std::sync::atomic::Ordering::Acquire);
+                    observed_visible == entry.attach_visible_commit_lsn
+                        && observed_gen == entry.attach_writer_gen
+                }
+                None => false,
+            }
+        };
+        // Writable cached entries are always reusable (equivalent to `as_read_only`).
+        let cached_is_writable =
+            |entry: &Arc<EngineEntry>| -> bool { !entry.engine.is_read_only_mode() };
+        {
+            let registry = DATABASE_REGISTRY
+                .read()
+                .map_err(|_| Error::LockAcquisitionFailed("registry read".to_string()))?;
+            if let Some(weak) = registry.get(dsn) {
+                if let Some(entry) = weak.upgrade() {
+                    if cached_is_writable(&entry) || frontier_static(&entry) {
+                        return apply_dsn_flags(crate::api::ReadOnlyDatabase::from_entry(entry)?);
+                    }
+                }
+            }
+        }
+
+        let mut registry = DATABASE_REGISTRY
+            .write()
+            .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
+
+        if let Some(weak) = registry.get(dsn) {
+            if let Some(entry) = weak.upgrade() {
+                if cached_is_writable(&entry) || frontier_static(&entry) {
+                    return apply_dsn_flags(crate::api::ReadOnlyDatabase::from_entry(entry)?);
+                }
+            }
+        }
+
+        let (scheme, path) = Self::parse_dsn(dsn)?;
+
+        #[cfg(feature = "test-filedb")]
+        let _temp_dir_holder: Option<tempfile::TempDir> = None;
+
+        let (
+            engine,
+            lease,
+            shm,
+            attach_writer_gen,
+            attach_visible_commit_lsn,
+            loaded_epoch,
+            attach_oldest_active_txn_lsn,
+            pre_acquire_pin_handle_id,
+            chmod_ro_lock,
+        ) = match scheme.as_str() {
+            FILE_SCHEME => {
+                let (clean_path, mut config) = Self::parse_file_config(&path)?;
+                config.read_only = true;
+
+                // Refuse to materialize a fresh DB on a read-only open.
+                let path_obj = std::path::Path::new(&clean_path);
+                if !path_obj.exists() {
+                    return Err(Error::internal(format!(
+                        "cannot open '{}' read-only: path does not exist",
+                        clean_path
+                    )));
+                }
+                if !path_obj.is_dir() {
+                    return Err(Error::internal(format!(
+                        "cannot open '{}' read-only: not a directory",
+                        clean_path
+                    )));
+                }
+                // Require wal/ or volumes/ to confirm this is an existing stoolap DB.
+                let has_wal = path_obj.join("wal").exists();
+                let has_volumes = path_obj.join("volumes").exists();
+                if !has_wal && !has_volumes {
+                    return Err(Error::internal(format!(
+                        "cannot open '{}' read-only: not a stoolap database \
+                             (no wal/ or volumes/ directory)",
+                        clean_path
+                    )));
+                }
+
+                // Pre-acquire SWMR lease + shm + attach snapshots before engine open.
+                let (
+                    lease,
+                    shm,
+                    attach_writer_gen,
+                    attach_visible_commit_lsn,
+                    attach_oldest_active_txn_lsn,
+                    handshake_guard,
+                    pre_acquire_pin_handle_id,
+                ) = EngineEntry::pre_acquire_swmr_for_read_only_path(std::path::Path::new(
+                    &clean_path,
+                ))?;
+                // Snapshot manifest epoch before open_engine; from_entry seeds it as baseline.
+                let loaded_epoch = crate::storage::mvcc::manifest_epoch::read_epoch(
+                    std::path::Path::new(&clean_path),
+                )
+                .unwrap_or(0);
+                let engine = MVCCEngine::new(config);
+                if shm.is_some() {
+                    engine.set_replay_cap_lsn(attach_visible_commit_lsn);
+                }
+                // Don't leak the pre-acquire pin contribution on open failure.
+                if let Err(e) = engine.open_engine() {
+                    if let Some(ref l) = lease {
+                        l.remove_handle_pin(pre_acquire_pin_handle_id);
+                    }
+                    return Err(e);
+                }
+                let engine = Arc::new(engine);
+                // No-op for read_only configs but call for symmetry.
+                engine.start_cleanup();
+                // Pre-acquire pin stays until `from_entry` installs the per-handle pin.
+                // Persist handshake guard for chmod-RO / RO-mount lease=None paths.
+                let chmod_ro_lock = if lease.is_none() {
+                    handshake_guard
+                } else {
+                    None
+                };
+                (
+                    engine,
+                    lease,
+                    shm,
+                    attach_writer_gen,
+                    attach_visible_commit_lsn,
+                    loaded_epoch,
+                    attach_oldest_active_txn_lsn,
+                    pre_acquire_pin_handle_id,
+                    chmod_ro_lock,
+                )
+            }
+            _ => {
+                return Err(Error::parse(format!(
+                    "Unsupported scheme '{}'. Use 'memory://' or 'file://path'",
+                    scheme
+                )));
+            }
+        };
+
+        let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
+        let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
+        let query_cache = Arc::new(crate::executor::QueryCache::default());
+        // No entry-scoped pin: `from_entry` installs an advancing per-handle pin instead.
+        let entry = Arc::new(EngineEntry {
+            engine,
+            dsn: dsn.to_string(),
+            semantic_cache,
+            query_planner,
+            query_cache,
+            lease,
+            shm,
+            attach_writer_gen,
+            attach_visible_commit_lsn,
+            attach_oldest_active_txn_lsn,
+            loaded_epoch,
+            last_lease_touch_ms: std::sync::atomic::AtomicU64::new(0),
+            chmod_ro_lock,
+            #[cfg(feature = "test-filedb")]
+            _temp_dir: _temp_dir_holder,
+        });
+
+        registry.insert(dsn.to_string(), Arc::downgrade(&entry));
+
+        // Release pre-acquire pin on either path: success means
+        // from_entry installed its own per-handle pin (the new floor);
+        // failure means the in-process lease_pin_contributions entry
+        // would otherwise leak past EngineEntry::drop and constrain
+        // future readers' MIN computation.
+        let ro_db = match crate::api::ReadOnlyDatabase::from_entry(entry.clone()) {
+            Ok(db) => db,
+            Err(e) => {
+                if let Some(ref l) = entry.lease {
+                    l.remove_handle_pin(pre_acquire_pin_handle_id);
+                }
+                return Err(e);
+            }
+        };
+        if let Some(ref l) = entry.lease {
+            l.remove_handle_pin(pre_acquire_pin_handle_id);
+        }
+        apply_dsn_flags(ro_db)
+    }
+
+    /// Return a read-only view sharing this database's engine. Writes through
+    /// the view are rejected at query time. The view has its own executor:
+    /// uncommitted writes from this `Database`'s transactions are not visible.
+    pub fn as_read_only(&self) -> crate::api::ReadOnlyDatabase {
+        // Writable entries have no lease, so attach() can't fail on the
+        // epoch-file path. Any failure here is a hard internal error.
+        crate::api::ReadOnlyDatabase::from_entry(Arc::clone(&self.inner.entry))
+            .expect("as_read_only on a writable Database cannot fail")
     }
 
     #[cfg(feature = "test-filedb")]
@@ -345,15 +899,26 @@ impl Database {
         engine.open_engine()?;
         let engine = Arc::new(engine);
         engine.start_cleanup();
-        let executor = Executor::new(Arc::clone(&engine));
-        let inner = Arc::new(DatabaseInner {
+        let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
+        let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
+        let query_cache = Arc::new(crate::executor::QueryCache::default());
+        let entry = Arc::new(EngineEntry {
             engine,
-            executor: Mutex::new(executor),
             dsn: "memory://".to_string(),
-            owns_engine: true,
+            semantic_cache,
+            query_planner,
+            query_cache,
+            lease: None,
+            shm: None,
+            attach_writer_gen: 0,
+            attach_visible_commit_lsn: 0,
+            attach_oldest_active_txn_lsn: u64::MAX,
+            loaded_epoch: 0,
+            last_lease_touch_ms: std::sync::atomic::AtomicU64::new(0),
+            chmod_ro_lock: None,
             _temp_dir: Some(tmp),
         });
-        Ok(Database { inner })
+        Ok(Self::share_entry(entry))
     }
 
     #[cfg(not(feature = "test-filedb"))]
@@ -362,17 +927,113 @@ impl Database {
         engine.open_engine()?;
         let engine = Arc::new(engine);
         engine.start_cleanup();
-        let executor = Executor::new(Arc::clone(&engine));
-        let inner = Arc::new(DatabaseInner {
+        let semantic_cache = Arc::new(crate::executor::SemanticCache::default());
+        let query_planner = Arc::new(crate::executor::QueryPlanner::new(Arc::clone(&engine)));
+        let query_cache = Arc::new(crate::executor::QueryCache::default());
+        let entry = Arc::new(EngineEntry {
             engine,
-            executor: Mutex::new(executor),
             dsn: "memory://".to_string(),
-            owns_engine: true,
+            semantic_cache,
+            query_planner,
+            query_cache,
+            lease: None,
+            shm: None,
+            attach_writer_gen: 0,
+            attach_visible_commit_lsn: 0,
+            attach_oldest_active_txn_lsn: u64::MAX,
+            loaded_epoch: 0,
+            last_lease_touch_ms: std::sync::atomic::AtomicU64::new(0),
+            chmod_ro_lock: None,
         });
-        Ok(Database { inner })
+        Ok(Self::share_entry(entry))
     }
 
-    /// Parse a DSN into scheme and path
+    /// Parse `auto_refresh=on/off/...` from the DSN. `Ok(None)` if absent.
+    pub(crate) fn dsn_auto_refresh_flag(dsn: &str) -> Result<Option<bool>> {
+        let query = match dsn.find('?') {
+            Some(idx) => &dsn[idx + 1..],
+            None => return Ok(None),
+        };
+        let mut last: Option<bool> = None;
+        for param in query.split('&') {
+            let mut parts = param.splitn(2, '=');
+            let key = parts.next().unwrap_or("").to_ascii_lowercase();
+            let value = parts.next().unwrap_or("");
+            if key == "auto_refresh" {
+                last = Some(match value.to_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => true,
+                    "false" | "0" | "no" | "off" => false,
+                    _ => {
+                        return Err(Error::invalid_argument(format!(
+                            "invalid auto_refresh: '{}' (expected true/false/on/off)",
+                            value
+                        )))
+                    }
+                });
+            }
+        }
+        Ok(last)
+    }
+
+    /// Parse `refresh_interval=Nms|Ns|Nm|0` from the DSN. `0` = explicitly disabled.
+    pub(crate) fn dsn_refresh_interval_flag(dsn: &str) -> Result<Option<Duration>> {
+        let query = match dsn.find('?') {
+            Some(idx) => &dsn[idx + 1..],
+            None => return Ok(None),
+        };
+        let mut last: Option<Duration> = None;
+        for param in query.split('&') {
+            let mut parts = param.splitn(2, '=');
+            let key = parts.next().unwrap_or("").to_ascii_lowercase();
+            let value = parts.next().unwrap_or("");
+            if key == "refresh_interval" {
+                last = Some(parse_refresh_interval_value(value)?);
+            }
+        }
+        Ok(last)
+    }
+
+    fn dsn_read_only_flag(dsn: &str) -> Result<Option<bool>> {
+        let query = match dsn.find('?') {
+            Some(idx) => &dsn[idx + 1..],
+            None => return Ok(None),
+        };
+        let mut last: Option<bool> = None;
+        for param in query.split('&') {
+            let mut parts = param.splitn(2, '=');
+            let key = parts.next().unwrap_or("").to_ascii_lowercase();
+            let value = parts.next().unwrap_or("");
+            match key.as_str() {
+                "read_only" | "readonly" => {
+                    last = Some(match value.to_lowercase().as_str() {
+                        "true" | "1" | "yes" | "on" => true,
+                        "false" | "0" | "no" | "off" => false,
+                        _ => {
+                            return Err(Error::invalid_argument(format!(
+                                "invalid {}: '{}' (expected true/false)",
+                                key, value
+                            )))
+                        }
+                    });
+                }
+                "mode" => {
+                    last = Some(match value.to_lowercase().as_str() {
+                        "ro" => true,
+                        "rw" => false,
+                        _ => {
+                            return Err(Error::invalid_argument(format!(
+                                "invalid mode: '{}' (expected ro/rw)",
+                                value
+                            )))
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(last)
+    }
+
     fn parse_dsn(dsn: &str) -> Result<(String, String)> {
         let idx = dsn
             .find("://")
@@ -422,10 +1083,10 @@ impl Database {
         if let Some(query) = query {
             for param in query.split('&') {
                 let mut parts = param.splitn(2, '=');
-                let key = parts.next().unwrap_or("");
+                let key = parts.next().unwrap_or("").to_ascii_lowercase();
                 let value = parts.next().unwrap_or("");
 
-                match key {
+                match key.as_str() {
                     // Sync mode: sync=none|normal|full
                     "sync_mode" | "sync" => {
                         config.persistence.sync_mode = match value.to_lowercase().as_str() {
@@ -497,6 +1158,31 @@ impl Database {
                                     value
                                 ))
                             })?;
+                    }
+                    // Reader lease max age in seconds: lease_max_age=2400
+                    // (default 0 = engine-derived `max(120s, 2 * checkpoint_interval)`).
+                    // Non-zero overrides for callers running long scans.
+                    "lease_max_age" | "lease_max_age_secs" => {
+                        config.persistence.lease_max_age_secs =
+                            value.parse::<u32>().map_err(|_| {
+                                Error::invalid_argument(format!(
+                                    "invalid lease_max_age: '{}'",
+                                    value
+                                ))
+                            })?;
+                    }
+                    // Read-only mode: read_only=true / readonly=true / mode=ro
+                    "read_only" | "readonly" | "mode" => {
+                        config.read_only = match value.to_lowercase().as_str() {
+                            "true" | "1" | "yes" | "on" | "ro" => true,
+                            "false" | "0" | "no" | "off" | "rw" => false,
+                            _ => {
+                                return Err(Error::invalid_argument(format!(
+                                    "invalid {}: '{}' (expected true/false or ro/rw)",
+                                    key, value
+                                )));
+                            }
+                        };
                     }
                     // Sync interval in ms: sync_interval_ms=10
                     "sync_interval_ms" | "sync_interval" => {
@@ -594,40 +1280,17 @@ impl Database {
         Ok((clean_path, config))
     }
 
-    /// Execute a SQL statement
-    ///
-    /// Use this for DDL (CREATE, DROP, ALTER) and DML (INSERT, UPDATE, DELETE) statements.
-    ///
-    /// # Parameters
-    ///
-    /// Parameters can be passed using:
-    /// - Empty tuple `()` for no parameters
-    /// - Tuple syntax `(1, "Alice", 30)` for multiple parameters
-    /// - `params!` macro `params![1, "Alice", 30]`
-    ///
-    /// # Returns
-    ///
-    /// Returns the number of rows affected for DML statements, or 0 for DDL.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // DDL - no parameters
-    /// db.execute("CREATE TABLE users (id INTEGER, name TEXT)", ())?;
-    ///
-    /// // DML with tuple parameters
-    /// db.execute("INSERT INTO users VALUES ($1, $2)", (1, "Alice"))?;
-    ///
-    /// // DML with params! macro
-    /// db.execute("INSERT INTO users VALUES ($1, $2)", params![2, "Bob"])?;
-    ///
-    /// // Update with mixed types
-    /// let affected = db.execute(
-    ///     "UPDATE users SET name = $1 WHERE id = $2",
-    ///     ("Charlie", 1)
-    /// )?;
-    /// ```
+    /// Per-call SWMR maintenance: heartbeat the lease. No-op for writable engines.
+    #[inline]
+    pub(crate) fn heartbeat_and_maybe_refresh(&self) -> Result<()> {
+        self.inner.entry.heartbeat_swmr_lease();
+        Ok(())
+    }
+
+    /// Execute a DDL or DML statement. Returns rows affected (0 for DDL).
+    /// Parameters: `()`, tuple `(1, "Alice")`, or `params![...]`.
     pub fn execute<P: Params>(&self, sql: &str, params: P) -> Result<i64> {
+        self.heartbeat_and_maybe_refresh()?;
         let executor = self
             .inner
             .executor
@@ -645,36 +1308,9 @@ impl Database {
         Ok(result.rows_affected())
     }
 
-    /// Execute a query that returns rows
-    ///
-    /// # Parameters
-    ///
-    /// Parameters can be passed using:
-    /// - Empty tuple `()` for no parameters
-    /// - Tuple syntax `(value,)` for single parameter (note trailing comma)
-    /// - Tuple syntax `(1, "Alice")` for multiple parameters
-    /// - `params!` macro `params![1, "Alice"]`
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // Query all rows
-    /// for row in db.query("SELECT * FROM users", ())? {
-    ///     let row = row?;
-    ///     let id: i64 = row.get(0)?;
-    ///     let name: String = row.get("name")?;
-    /// }
-    ///
-    /// // Query with parameters
-    /// for row in db.query("SELECT * FROM users WHERE age > $1", (18,))? {
-    ///     // ...
-    /// }
-    ///
-    /// // Collect into Vec
-    /// let users: Vec<_> = db.query("SELECT * FROM users", ())?
-    ///     .collect::<Result<Vec<_>, _>>()?;
-    /// ```
+    /// Execute a query and return rows. Single-param tuples need a trailing comma: `(v,)`.
     pub fn query<P: Params>(&self, sql: &str, params: P) -> Result<Rows> {
+        self.heartbeat_and_maybe_refresh()?;
         let executor = self
             .inner
             .executor
@@ -689,20 +1325,11 @@ impl Database {
         } else {
             executor.execute_with_params(sql, param_values)?
         };
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.inner.entry)))
     }
 
-    /// Execute a query and return a single value
-    ///
-    /// This is a convenience method for queries that return a single row with a single column.
-    /// Returns an error if the query returns no rows.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let count: i64 = db.query_one("SELECT COUNT(*) FROM users", ())?;
-    /// let name: String = db.query_one("SELECT name FROM users WHERE id = $1", (1,))?;
-    /// ```
+    /// Query a single value from a single-row, single-column result.
+    /// Errors if no rows returned.
     pub fn query_one<T: FromValue, P: Params>(&self, sql: &str, params: P) -> Result<T> {
         let row = self
             .query(sql, params)?
@@ -711,16 +1338,7 @@ impl Database {
         row.get(0)
     }
 
-    /// Execute a query and return an optional single value
-    ///
-    /// Like `query_one`, but returns `None` if no rows are returned.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let name: Option<String> = db.query_opt("SELECT name FROM users WHERE id = $1", (999,))?;
-    /// assert!(name.is_none());
-    /// ```
+    /// Like `query_one` but returns `None` instead of erroring on no rows.
     pub fn query_opt<T: FromValue, P: Params>(&self, sql: &str, params: P) -> Result<Option<T>> {
         match self.query(sql, params)?.next() {
             Some(row) => Ok(Some(row?.get(0)?)),
@@ -728,23 +1346,14 @@ impl Database {
         }
     }
 
-    /// Execute a write statement with a timeout
-    ///
-    /// Like `execute`, but cancels the query if it exceeds the timeout.
-    /// Timeout is specified in milliseconds. Use 0 for no timeout.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // Execute with 5 second timeout
-    /// db.execute_with_timeout("DELETE FROM large_table WHERE old = true", (), 5000)?;
-    /// ```
+    /// Like `execute` with a timeout in ms. `0` = no timeout.
     pub fn execute_with_timeout<P: Params>(
         &self,
         sql: &str,
         params: P,
         timeout_ms: u64,
     ) -> Result<i64> {
+        self.heartbeat_and_maybe_refresh()?;
         let executor = self
             .inner
             .executor
@@ -761,25 +1370,14 @@ impl Database {
         Ok(result.rows_affected())
     }
 
-    /// Execute a query with a timeout
-    ///
-    /// Like `query`, but cancels the query if it exceeds the timeout.
-    /// Timeout is specified in milliseconds. Use 0 for no timeout.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// // Query with 10 second timeout
-    /// for row in db.query_with_timeout("SELECT * FROM large_table", (), 10000)? {
-    ///     // process row
-    /// }
-    /// ```
+    /// Like `query` with a timeout in ms. `0` = no timeout.
     pub fn query_with_timeout<P: Params>(
         &self,
         sql: &str,
         params: P,
         timeout_ms: u64,
     ) -> Result<Rows> {
+        self.heartbeat_and_maybe_refresh()?;
         let executor = self
             .inner
             .executor
@@ -793,61 +1391,29 @@ impl Database {
             .build();
 
         let result = executor.execute_with_context(sql, &ctx)?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.inner.entry)))
     }
 
-    /// Prepare a SQL statement for repeated execution
-    ///
-    /// Prepared statements are more efficient when executing the same query
-    /// multiple times with different parameters.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let stmt = db.prepare("SELECT * FROM users WHERE id = $1")?;
-    ///
-    /// // Execute multiple times with different parameters
-    /// for id in 1..=10 {
-    ///     for row in stmt.query((id,))? {
-    ///         // ...
-    ///     }
-    /// }
-    /// ```
+    /// Prepare a SQL statement for repeated execution with different params.
     pub fn prepare(&self, sql: &str) -> Result<Statement> {
         Statement::new(Arc::downgrade(&self.inner), sql.to_string(), self)
     }
 
-    /// Create a Database from an existing Arc<DatabaseInner>.
-    /// Used by Statement to upgrade weak references.
+    /// Used by Statement to upgrade weak references back to a Database handle.
     pub(crate) fn from_inner(inner: Arc<DatabaseInner>) -> Self {
         Database { inner }
     }
 
-    /// Execute a statement with named parameters
-    ///
-    /// Named parameters use the `:name` syntax in SQL queries.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use stoolap::{Database, named_params};
-    ///
-    /// let db = Database::open("memory://")?;
-    /// db.execute("CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)", ())?;
-    ///
-    /// // Insert with named params
-    /// db.execute_named(
-    ///     "INSERT INTO users VALUES (:id, :name, :age)",
-    ///     named_params!{ id: 1, name: "Alice", age: 30 }
-    /// )?;
-    ///
-    /// // Update with named params
-    /// db.execute_named(
-    ///     "UPDATE users SET name = :name WHERE id = :id",
-    ///     named_params!{ id: 1, name: "Alicia" }
-    /// )?;
-    /// ```
+    /// Borrow this handle's `EngineEntry`. Used by `Statement::query` to
+    /// pin the entry into the returned `Rows` so a concurrent
+    /// `Database::close()` defers until iteration finishes.
+    pub(crate) fn entry(&self) -> &Arc<EngineEntry> {
+        &self.inner.entry
+    }
+
+    /// Execute a statement with `:name`-style named parameters.
     pub fn execute_named(&self, sql: &str, params: NamedParams) -> Result<i64> {
+        self.heartbeat_and_maybe_refresh()?;
         let executor = self
             .inner
             .executor
@@ -858,29 +1424,9 @@ impl Database {
         Ok(result.rows_affected())
     }
 
-    /// Execute a query with named parameters
-    ///
-    /// Named parameters use the `:name` syntax in SQL queries.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use stoolap::{Database, named_params};
-    ///
-    /// let db = Database::open("memory://")?;
-    /// db.execute("CREATE TABLE users (id INTEGER, name TEXT)", ())?;
-    /// db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')", ())?;
-    ///
-    /// // Query with named params
-    /// for row in db.query_named(
-    ///     "SELECT * FROM users WHERE name = :name",
-    ///     named_params!{ name: "Alice" }
-    /// )? {
-    ///     let row = row?;
-    ///     println!("Found user: id={}", row.get::<i64>(0)?);
-    /// }
-    /// ```
+    /// Query with `:name`-style named parameters.
     pub fn query_named(&self, sql: &str, params: NamedParams) -> Result<Rows> {
+        self.heartbeat_and_maybe_refresh()?;
         let executor = self
             .inner
             .executor
@@ -888,21 +1434,10 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let result = executor.execute_with_named_params(sql, params.into_inner())?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.inner.entry)))
     }
 
-    /// Execute a query with named parameters and return a single value
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use stoolap::{Database, named_params};
-    ///
-    /// let count: i64 = db.query_one_named(
-    ///     "SELECT COUNT(*) FROM users WHERE age > :min_age",
-    ///     named_params!{ min_age: 18 }
-    /// )?;
-    /// ```
+    /// Query a single value with named parameters.
     pub fn query_one_named<T: FromValue>(&self, sql: &str, params: NamedParams) -> Result<T> {
         let mut rows = self.query_named(sql, params)?;
         match rows.next() {
@@ -912,102 +1447,24 @@ impl Database {
         }
     }
 
-    /// Execute a query and map results to structs
-    ///
-    /// This method executes a query and converts each row to a struct
-    /// that implements the `FromRow` trait.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use stoolap::{Database, FromRow, ResultRow, Result};
-    ///
-    /// struct User {
-    ///     id: i64,
-    ///     name: String,
-    /// }
-    ///
-    /// impl FromRow for User {
-    ///     fn from_row(row: &ResultRow) -> Result<Self> {
-    ///         Ok(User {
-    ///             id: row.get(0)?,
-    ///             name: row.get(1)?,
-    ///         })
-    ///     }
-    /// }
-    ///
-    /// let db = Database::open("memory://")?;
-    /// db.execute("CREATE TABLE users (id INTEGER, name TEXT)", ())?;
-    /// db.execute("INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob')", ())?;
-    ///
-    /// // Query and map to structs
-    /// let users: Vec<User> = db.query_as("SELECT id, name FROM users", ())?;
-    /// assert_eq!(users.len(), 2);
-    /// assert_eq!(users[0].name, "Alice");
-    /// ```
+    /// Query and map each row to `T` via the `FromRow` trait.
     pub fn query_as<T: FromRow, P: Params>(&self, sql: &str, params: P) -> Result<Vec<T>> {
         let rows = self.query(sql, params)?;
         rows.map(|r| r.and_then(|row| T::from_row(&row))).collect()
     }
 
-    /// Execute a query with named parameters and map results to structs
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use stoolap::{Database, FromRow, ResultRow, Result, named_params};
-    ///
-    /// struct Product {
-    ///     id: i64,
-    ///     name: String,
-    ///     price: f64,
-    /// }
-    ///
-    /// impl FromRow for Product {
-    ///     fn from_row(row: &ResultRow) -> Result<Self> {
-    ///         Ok(Product {
-    ///             id: row.get(0)?,
-    ///             name: row.get(1)?,
-    ///             price: row.get(2)?,
-    ///         })
-    ///     }
-    /// }
-    ///
-    /// let products: Vec<Product> = db.query_as_named(
-    ///     "SELECT id, name, price FROM products WHERE price > :min_price",
-    ///     named_params!{ min_price: 10.0 }
-    /// )?;
-    /// ```
+    /// Query with named parameters and map each row to `T` via `FromRow`.
     pub fn query_as_named<T: FromRow>(&self, sql: &str, params: NamedParams) -> Result<Vec<T>> {
         let rows = self.query_named(sql, params)?;
         rows.map(|r| r.and_then(|row| T::from_row(&row))).collect()
     }
 
-    /// Begin a new transaction with default isolation level
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let tx = db.begin()?;
-    /// tx.execute("INSERT INTO users VALUES ($1, $2)", (1, "Alice"))?;
-    /// tx.commit()?;
-    /// ```
+    /// Begin a transaction with the default isolation level (ReadCommitted).
     pub fn begin(&self) -> Result<Transaction> {
         self.begin_with_isolation(IsolationLevel::ReadCommitted)
     }
 
-    /// Begin a new transaction with a specific isolation level
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// use stoolap::IsolationLevel;
-    ///
-    /// let tx = db.begin_with_isolation(IsolationLevel::Snapshot)?;
-    /// // All reads in this transaction see a consistent snapshot
-    /// tx.execute("UPDATE users SET balance = balance - 100 WHERE id = $1", (1,))?;
-    /// tx.commit()?;
-    /// ```
+    /// Begin a transaction with a specific isolation level.
     pub fn begin_with_isolation(&self, isolation: IsolationLevel) -> Result<Transaction> {
         let executor = self
             .inner
@@ -1016,44 +1473,68 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
 
         let tx = executor.begin_transaction_with_isolation(isolation)?;
-        let engine = executor.engine().clone();
-        Ok(Transaction::new(tx, engine))
+        // Pass the entry so live txns count in `Arc::strong_count(&entry)` and `close()` defers.
+        let entry = Arc::clone(&self.inner.entry);
+        Ok(Transaction::new(tx, entry))
     }
 
-    /// Get the underlying storage engine
-    ///
-    /// This is primarily for advanced use cases and testing.
+    /// Get the underlying storage engine. Advanced use only.
+    /// On read-only handles, write-intent methods on the engine return `Error::ReadOnlyViolation`.
     pub fn engine(&self) -> &Arc<MVCCEngine> {
-        &self.inner.engine
+        &self.inner.entry.engine
     }
 
-    /// Close the database connection
-    ///
-    /// This removes the database from the global registry and closes the engine,
-    /// releasing the file lock immediately so another process can open the database.
-    ///
-    /// Note: The engine is also closed automatically when all Database instances
-    /// are dropped.
+    /// True if opened with `?read_only=true` / `?mode=ro`.
+    pub fn is_read_only(&self) -> bool {
+        self.inner.entry.engine.is_read_only_mode()
+    }
+
+    /// Get the engine as a read-only trait object, type-level enforcement of the
+    /// read-only contract. Works on writable Databases too.
+    pub fn read_engine(&self) -> Arc<dyn crate::storage::traits::ReadEngine> {
+        // Wrap so trait-object callers also get lease heartbeat + refresh maintenance.
+        Arc::new(SwmrReadEngineGuard {
+            engine: Arc::clone(&self.inner.entry.engine),
+            entry: Arc::clone(&self.inner.entry),
+            refresh_owner: RefreshOwner::None,
+        }) as Arc<dyn crate::storage::traits::ReadEngine>
+    }
+
+    /// Close the database. If sibling handles exist, defer until the last drops.
+    /// Engine also closes automatically when the last handle drops.
     pub fn close(&self) -> Result<()> {
-        // Remove from registry
-        let mut registry = DATABASE_REGISTRY
-            .write()
-            .map_err(|_| Error::LockAcquisitionFailed("registry write".to_string()))?;
-
-        registry.remove(&self.inner.dsn);
-
-        // Close the engine immediately to release the file lock
-        // This is idempotent - calling close_engine() multiple times is safe
-        self.inner.engine.close_engine()?;
+        // Decision under the registry write lock so a concurrent open can't
+        // upgrade the Weak between our strong-count check and removal. The
+        // lock is dropped BEFORE `close_engine()` because `close_engine`
+        // runs several checkpoint passes plus busy-loop compaction waits;
+        // holding the global registry lock for that duration would stall
+        // every unrelated-DSN open in the process. Any racing
+        // `open(same_dsn)` is blocked at the file-lock layer instead.
+        let mut registry = match DATABASE_REGISTRY.write() {
+            Ok(g) => g,
+            Err(_) => return Err(Error::LockAcquisitionFailed("registry write".to_string())),
+        };
+        if Arc::strong_count(&self.inner.entry) > 1 {
+            return Ok(());
+        }
+        if let Some(weak) = registry.get(&self.inner.entry.dsn) {
+            let same = weak
+                .upgrade()
+                .map(|reg| Arc::ptr_eq(&reg, &self.inner.entry))
+                .unwrap_or(true);
+            if same {
+                registry.remove(&self.inner.entry.dsn);
+            }
+        }
+        drop(registry);
+        self.inner.entry.engine.close_engine()?;
 
         Ok(())
     }
 
-    /// Get a cached plan for a SQL statement (parse once, execute many times).
-    ///
-    /// Returns a `CachedPlanRef` that can be stored and passed to
-    /// `execute_plan()` / `query_plan()` for zero-lookup execution.
+    /// Cache a plan for a SQL statement; pass the returned ref to `execute_plan` / `query_plan`.
     pub fn cached_plan(&self, sql: &str) -> Result<CachedPlanRef> {
+        self.heartbeat_and_maybe_refresh()?;
         let executor = self
             .inner
             .executor
@@ -1064,6 +1545,7 @@ impl Database {
 
     /// Execute a pre-cached plan with positional parameters (no parsing, no cache lookup).
     pub fn execute_plan<P: Params>(&self, plan: &CachedPlanRef, params: P) -> Result<i64> {
+        self.heartbeat_and_maybe_refresh()?;
         let executor = self
             .inner
             .executor
@@ -1081,6 +1563,7 @@ impl Database {
 
     /// Query using a pre-cached plan with positional parameters (no parsing, no cache lookup).
     pub fn query_plan<P: Params>(&self, plan: &CachedPlanRef, params: P) -> Result<Rows> {
+        self.heartbeat_and_maybe_refresh()?;
         let executor = self
             .inner
             .executor
@@ -1093,11 +1576,12 @@ impl Database {
             ExecutionContext::with_params(param_values)
         };
         let result = executor.execute_with_cached_plan(plan, &ctx)?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.inner.entry)))
     }
 
     /// Execute a pre-cached plan with named parameters (no parsing, no cache lookup).
     pub fn execute_named_plan(&self, plan: &CachedPlanRef, params: NamedParams) -> Result<i64> {
+        self.heartbeat_and_maybe_refresh()?;
         let executor = self
             .inner
             .executor
@@ -1110,6 +1594,7 @@ impl Database {
 
     /// Query using a pre-cached plan with named parameters (no parsing, no cache lookup).
     pub fn query_named_plan(&self, plan: &CachedPlanRef, params: NamedParams) -> Result<Rows> {
+        self.heartbeat_and_maybe_refresh()?;
         let executor = self
             .inner
             .executor
@@ -1117,19 +1602,34 @@ impl Database {
             .map_err(|_| Error::LockAcquisitionFailed("executor".to_string()))?;
         let ctx = ExecutionContext::with_named_params(params.into_inner());
         let result = executor.execute_with_cached_plan(plan, &ctx)?;
-        Ok(Rows::new(result))
+        Ok(Rows::with_entry(result, Arc::clone(&self.inner.entry)))
     }
 
-    /// Check if a table exists
+    /// Check if a table exists.
     pub fn table_exists(&self, name: &str) -> Result<bool> {
-        let engine = &self.inner.engine;
-        let tx = engine.begin_transaction()?;
-        Ok(tx.get_table(name).is_ok())
+        use crate::storage::traits::ReadEngine;
+        self.heartbeat_and_maybe_refresh()?;
+        let engine = &self.inner.entry.engine;
+        let tx = ReadEngine::begin_read_transaction(engine.as_ref())?;
+        Ok(tx.get_read_table(name).is_ok())
+    }
+
+    /// Rows in `name` visible to this autocommit handle. For txn-visible counts
+    /// (including uncommitted writes) use [`Transaction::table_count`].
+    pub fn table_count(&self, name: &str) -> Result<u64> {
+        use crate::storage::traits::ReadEngine;
+        let engine = &self.inner.entry.engine;
+        let tx = ReadEngine::begin_read_transaction(engine.as_ref())?;
+        let table = tx.get_read_table(name)?;
+        if let Some(c) = table.fast_row_count() {
+            return Ok(c as u64);
+        }
+        Ok(table.row_count() as u64)
     }
 
     /// Get the DSN this database was opened with
     pub fn dsn(&self) -> &str {
-        &self.inner.dsn
+        &self.inner.entry.dsn
     }
 
     /// Set the default isolation level for new transactions
@@ -1143,31 +1643,28 @@ impl Database {
         Ok(())
     }
 
-    /// Create a backup snapshot of the database
-    ///
-    /// This creates snapshot files (.bin) for each table along with
-    /// index/view definitions (ddl-{timestamp}.bin) for disaster recovery.
-    /// Normal persistence uses the checkpoint cycle (seal to volumes + WAL).
-    ///
-    /// Note: This is a no-op for in-memory databases.
+    /// Create backup .bin snapshot files for each table plus ddl-*.bin.
+    /// No-op for in-memory. `Error::ReadOnlyViolation` on read-only handles.
     pub fn create_snapshot(&self) -> Result<()> {
         use crate::storage::Engine;
-        self.inner.engine.create_snapshot()
+        if self.inner.entry.engine.is_read_only_mode() {
+            return Err(Error::read_only_violation_at("database", "create_snapshot"));
+        }
+        self.inner.entry.engine.create_snapshot()
     }
 
-    /// Restore the database from a backup snapshot.
-    ///
-    /// If no timestamp is provided, restores from the latest snapshot.
-    /// If a timestamp is provided (format: "YYYYMMDD-HHMMSS.fff"),
-    /// restores from that specific snapshot.
-    ///
-    /// This is a destructive operation that replaces all current data
-    /// with the snapshot data. Indexes and views are restored from
-    /// ddl-{timestamp}.bin or preserved from current in-memory state.
+    /// Restore from a backup snapshot. `timestamp` format: `"YYYYMMDD-HHMMSS.fff"`,
+    /// or `None` for the latest. Destructive. `Error::ReadOnlyViolation` on read-only handles.
     pub fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
         use crate::storage::Engine;
-        let result = self.inner.engine.restore_snapshot(timestamp)?;
-        // Clear all query caches since all data has changed.
+        if self.inner.entry.engine.is_read_only_mode() {
+            return Err(Error::read_only_violation_at(
+                "database",
+                "restore_snapshot",
+            ));
+        }
+        let result = self.inner.entry.engine.restore_snapshot(timestamp)?;
+        // Data wholly changed; flush all query caches.
         let executor = self
             .inner
             .executor
@@ -1181,24 +1678,11 @@ impl Database {
     }
 
     /// Get the internal executor (for Statement use)
-    pub(crate) fn executor(&self) -> &Mutex<Executor> {
+    pub(crate) fn executor(&self) -> &Arc<Mutex<Executor>> {
         &self.inner.executor
     }
 
-    /// Get semantic cache statistics
-    ///
-    /// Returns statistics about the semantic query cache including hit rates,
-    /// exact matches, and subsumption matches.
-    ///
-    /// # Examples
-    ///
-    /// ```ignore
-    /// let db = Database::open("memory://")?;
-    /// // ... execute some queries ...
-    /// let stats = db.semantic_cache_stats()?;
-    /// println!("Cache hits: {}", stats.hits);
-    /// println!("Subsumption hits: {}", stats.subsumption_hits);
-    /// ```
+    /// Semantic query cache statistics (hits, exact and subsumption matches).
     pub fn semantic_cache_stats(&self) -> Result<crate::executor::SemanticCacheStatsSnapshot> {
         let executor = self
             .inner
@@ -1208,10 +1692,7 @@ impl Database {
         Ok(executor.semantic_cache_stats())
     }
 
-    /// Clear the semantic cache
-    ///
-    /// This clears all cached query results. Useful for testing or when
-    /// you want to force queries to re-execute.
+    /// Clear all cached query results.
     pub fn clear_semantic_cache(&self) -> Result<()> {
         let executor = self
             .inner
@@ -1225,7 +1706,7 @@ impl Database {
     /// Get the oldest snapshot timestamp loaded during startup.
     /// Returns None if no snapshots were loaded.
     pub fn oldest_loaded_snapshot_timestamp(&self) -> Option<String> {
-        self.inner.engine.oldest_loaded_snapshot_timestamp()
+        self.inner.entry.engine.oldest_loaded_snapshot_timestamp()
     }
 }
 

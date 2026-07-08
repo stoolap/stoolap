@@ -46,6 +46,7 @@ Stoolap currently supports the following PRAGMA commands:
 | `sync_mode` | Read current WAL sync mode (read-only, set via DSN) | 1 |
 | `wal_flush_trigger` | Read current WAL flush trigger (read-only, set via DSN) | 32768 |
 | `volume_stats` | Show per-volume storage statistics | - |
+| `swmr_status` | Inspect single-writer/multi-reader coordination state (read-only diagnostic) | - |
 
 #### checkpoint_interval
 
@@ -229,6 +230,24 @@ PRAGMA vacuum;
 ```
 
 **Note:** This PRAGMA cannot run inside an explicit transaction.
+
+### Diagnostics
+
+#### swmr_status
+
+Returns a single row describing this engine's view of single-writer/multi-reader (SWMR) coordination state. Useful for debugging cross-process setups ("why isn't my reader seeing data?", "why isn't the writer unlinking old volumes?"). Read-only; it does not accept a value.
+
+```sql
+PRAGMA swmr_status;
+```
+
+| Column | Meaning |
+|--------|---------|
+| `manifest_epoch` | The writer's last published checkpoint epoch (0 for in-memory engines). A reader advances to this when it refreshes. |
+| `live_lease_count` | Number of live reader leases the writer's GC currently sees (file engines only). |
+| `lease_max_age_secs` | Effective lease max age the GC uses (the resolved value of the `lease_max_age` DSN flag, or the `max(120, 2 * checkpoint_interval)` default). |
+| `is_read_only` | Whether this handle is a read-only handle. |
+| `checkpoint_interval_secs` | The configured checkpoint interval. |
 
 ## Connection String Parameters
 

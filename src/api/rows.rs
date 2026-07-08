@@ -228,10 +228,20 @@ pub struct Rows {
     closed: bool,
     /// Pending error from a filter runtime failure (e.g., invalid REGEXP)
     pending_error: Option<crate::core::Error>,
+    /// Keeps the originating `EngineEntry` alive for the duration of
+    /// iteration so a concurrent `Database::close()` cannot drop the
+    /// engine out from under a streaming scanner. `None` for test /
+    /// standalone constructions that don't go through a `Database`.
+    /// `Database::close()` checks `Arc::strong_count` on the entry; a
+    /// live `Rows` increments that count and defers the actual close.
+    _entry_keepalive: Option<std::sync::Arc<crate::api::database::EngineEntry>>,
 }
 
 impl Rows {
-    /// Create a new Rows iterator from a QueryResult
+    /// Create a new Rows iterator from a QueryResult (without engine pin).
+    /// Test-only: production paths route through `with_entry` so a live
+    /// `Rows` keeps the engine alive across `Database::close()`.
+    #[cfg(test)]
     pub(crate) fn new(result: Box<dyn QueryResult>) -> Self {
         // Use columns_arc() if available (zero-copy), otherwise clone
         let columns = result
@@ -242,11 +252,41 @@ impl Rows {
             columns,
             closed: false,
             pending_error: None,
+            _entry_keepalive: None,
+        }
+    }
+
+    /// Create a new Rows iterator pinning the originating `EngineEntry`
+    /// so `Database::close()` defers until iteration finishes (or this
+    /// handle drops).
+    pub(crate) fn with_entry(
+        result: Box<dyn QueryResult>,
+        entry: std::sync::Arc<crate::api::database::EngineEntry>,
+    ) -> Self {
+        let columns = result
+            .columns_arc()
+            .unwrap_or_else(|| CompactArc::new(result.columns().to_vec()));
+        Self {
+            result,
+            columns,
+            closed: false,
+            pending_error: None,
+            _entry_keepalive: Some(entry),
         }
     }
 
     /// Get the column names
     pub fn columns(&self) -> &[String] {
+        &self.columns
+    }
+
+    /// Borrow the shared column-name `CompactArc`.
+    ///
+    /// Exposed so callers (notably the FFI layer) can use the underlying
+    /// allocation's pointer identity as a cache key: when two consecutive
+    /// queries return the same `Arc`, derived data (CStrings, schema
+    /// projections) can be reused without a per-row scan or rebuild.
+    pub fn columns_arc(&self) -> &CompactArc<Vec<String>> {
         &self.columns
     }
 

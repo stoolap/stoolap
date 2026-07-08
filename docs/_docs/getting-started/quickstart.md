@@ -312,6 +312,10 @@ stoolap -d "file:///path/to/data" -f script.sql
 # JSON output mode
 stoolap -d "file:///path/to/data" -j -e "SELECT * FROM users"
 
+# Open read-only (routes through Database::open_read_only; refuses to create a
+# fresh DB, and rejects write SQL). Can run alongside a separate writer process.
+stoolap -d "file:///path/to/data" --read-only -e "SELECT COUNT(*) FROM users"
+
 # Create backup snapshot
 stoolap -d "file:///path/to/data" --snapshot
 

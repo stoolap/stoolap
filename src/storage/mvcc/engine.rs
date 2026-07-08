@@ -12,10 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! MVCC Storage Engine
+//! MVCC Storage Engine.
 //!
-//! Provides the main MVCC storage engine implementation.
+//! Lock acquisition order (must be respected to avoid deadlock):
+//!   transactional_ddl_fence -> schemas / version_stores
+//!   seal_fence              -> segment_managers
+//!   checkpoint_mutex        -> shm_publish_lock
+//!   pending_marker_lsns     -> shm_publish_lock / WAL append
+//!   DATABASE_REGISTRY       -> pending_marker_lsns (close path)
 //!
+//! `pending_marker_lsns` is never taken while holding schemas/version_stores.
+//! See `docs/internal/locks.md` for full lock taxonomy.
 
 use crate::common::{CompactArc, I64Map, SmartString, StringMap};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -41,7 +48,7 @@ fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
     }
 }
 
-use super::file_lock::FileLock;
+use super::file_lock::{FileLock, StartupLockGuard};
 
 use crate::core::{DataType, Error, ForeignKeyConstraint, IsolationLevel, Result, Schema, Value};
 use crate::storage::config::Config;
@@ -49,11 +56,13 @@ use crate::storage::mvcc::wal_manager::WALOperationType;
 #[cfg(test)]
 use crate::storage::mvcc::VisibilityChecker;
 use crate::storage::mvcc::{
-    MVCCTable, MvccTransaction, PersistenceManager, PkIndex, RowVersion, SealFenceGuard,
-    TransactionEngineOperations, TransactionRegistry, TransactionVersionStore, VersionStore,
-    INVALID_TRANSACTION_ID,
+    DeferredDdlOp, DropSnapshot, MVCCTable, MvccTransaction, PersistenceManager, PkIndex,
+    RowVersion, SealFenceGuard, TransactionEngineOperations, TransactionRegistry,
+    TransactionVersionStore, VersionStore, INVALID_TRANSACTION_ID,
 };
-use crate::storage::traits::{Engine, Index, Table, Transaction};
+use crate::storage::traits::{
+    Engine, Index, ReadEngine, ReadTable, ReadTransaction, WriteTable, WriteTransaction,
+};
 
 /// Type alias for a single table entry in the transaction version store
 type TxnTableEntry = (SmartString, Arc<RwLock<TransactionVersionStore>>);
@@ -422,6 +431,10 @@ pub struct MVCCEngine {
     registry: Arc<TransactionRegistry>,
     /// Whether the engine is open
     open: AtomicBool,
+    /// Catastrophic-failure latch. Set on unrecoverable WAL marker error after
+    /// VersionStores have been written. Once set, every durability path refuses;
+    /// only process restart + WAL recovery (which discards the markerless txn) recovers.
+    failed: Arc<AtomicBool>,
     /// Cache of transaction version stores per (txn_id, table_name) for proper commit/rollback
     /// (Arc-wrapped for safe sharing with transactions)
     txn_version_stores: Arc<RwLock<TxnVersionStoreMap>>,
@@ -434,9 +447,9 @@ pub struct MVCCEngine {
     loading_from_disk: Arc<AtomicBool>,
     /// File lock to prevent multiple processes from accessing the same database
     file_lock: Mutex<Option<FileLock>>,
-    /// Schema epoch counter - increments on any CREATE/ALTER/DROP TABLE
-    /// Used for fast cache invalidation without HashMap lookup
-    schema_epoch: AtomicU64,
+    /// Schema epoch counter; bumped on CREATE/ALTER/DROP/rename. Drives cache
+    /// invalidation. Arc-shared so EngineOperations bumps the same counter.
+    schema_epoch: Arc<AtomicU64>,
     /// Handle for the background cleanup thread (None if not started)
     cleanup_handle: Mutex<Option<CleanupHandle>>,
     /// Cached reverse FK mapping: parent_table → Vec<(child_table, FK constraint)>
@@ -460,14 +473,54 @@ pub struct MVCCEngine {
     /// (exclusive, brief ~100ms) to create a quiet moment where all_hot_empty can
     /// be true. This enables WAL truncation under continuous writes.
     seal_fence: Arc<parking_lot::RwLock<()>>,
+    /// Transactional-DDL fence. Open txn with DDL holds SH; checkpoint's
+    /// rerecord_ddl_to_wal takes EX so it snapshots catalog only when no
+    /// uncommitted DDL is in flight.
+    transactional_ddl_fence: Arc<parking_lot::RwLock<()>>,
+    /// Tables whose post-commit volume cleanup failed; while non-empty
+    /// compute_wal_truncate_floor refuses truncation so DropTable record stays.
+    /// Shared with EngineOperations.
+    pending_drop_cleanups: Arc<parking_lot::Mutex<rustc_hash::FxHashSet<String>>>,
+    /// Set on non-NotFound enumeration error in sweep_orphan_table_dirs; refuses
+    /// WAL truncation until a discovery pass succeeds end-to-end.
+    orphan_discovery_failed: Arc<AtomicBool>,
+    /// Cached lease max-age (nanos). Arc-shared so EngineOperations uses the same
+    /// window as the engine (shorter would reap leases the engine considers live).
+    lease_max_age_nanos: Arc<AtomicU64>,
+    /// EX db.startup.lock stash for post-destructive-boundary RESTORE failure.
+    /// Held until process exit; cross-process readers block on its SH side.
+    failed_restore_attach_gate: Mutex<Option<StartupLockGuard>>,
     /// True while a background compaction thread is running.
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
     compaction_running: Arc<AtomicBool>,
-    /// Global epoch counter for volume eviction. Incremented each checkpoint
-    /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
-    #[cfg(not(target_arch = "wasm32"))]
-    eviction_epoch: AtomicU64,
+    /// Serializes epoch-file read-modify-write (bump_epoch) and the orphan
+    /// sweep's stamp read. In-process only: SWMR has a single writer process,
+    /// so no cross-process locking is needed.
+    epoch_bump_lock: parking_lot::Mutex<()>,
+    /// Persistence init failure on read-only open (Some -> open_engine fails hard).
+    persistence_init_error: Mutex<Option<Error>>,
+    /// Cross-process db.shm. Some only on writable disk-backed Unix opens.
+    shm: Mutex<Option<Arc<crate::storage::mvcc::shm::ShmHandle>>>,
+    /// WAL commit-marker LSNs written but not yet complete_commit-d.
+    /// safe_visible = min(pending) - 1 if non-empty else max_written_marker_lsn.
+    pending_marker_lsns: Arc<parking_lot::Mutex<std::collections::BTreeSet<u64>>>,
+    /// Highest LSN ever returned by record_commit. Upper bound of safe_visible
+    /// once pending_marker_lsns drains.
+    max_written_marker_lsn: Arc<std::sync::atomic::AtomicU64>,
+    /// Completed-but-not-yet-published txns keyed by marker LSN. SyncMode::None can
+    /// buffer markers; their first-DML LSN must stay in the WAL active map until
+    /// a later flush lets shm publish past the marker.
+    completed_marker_txns: Arc<parking_lot::Mutex<std::collections::BTreeMap<u64, i64>>>,
+    /// Read-only WAL replay cap (LSN snapshot from before open_engine). u64::MAX = uncapped.
+    replay_cap_lsn: std::sync::atomic::AtomicU64,
+    /// Serializes every shm visibility publish (seqlock odd->stores->even must be
+    /// atomic w.r.t. other writers). Arc-shared with EngineOperations.
+    shm_publish_lock: Arc<parking_lot::Mutex<()>>,
+    /// Cached "any cross-process reader holds a live lease". When false, commit publish
+    /// skips the seqlock dance. Default true (conservative); refresh_lease_present_cache
+    /// barrier-publishes on the false->true transition.
+    lease_present: Arc<AtomicBool>,
 }
 
 /// RAII guard that clears an AtomicBool on drop. Used to release the
@@ -488,18 +541,100 @@ fn parse_volume_id(path: &std::path::Path) -> Option<u64> {
         .and_then(|hex| u64::from_str_radix(hex, 16).ok())
 }
 
+/// Lower-cased names of tables with `<db>/volumes/<name>/manifest.bin` on disk.
+fn scan_table_dirs(db_path: &std::path::Path) -> rustc_hash::FxHashSet<String> {
+    let mut out = rustc_hash::FxHashSet::default();
+    let vol_dir = db_path.join("volumes");
+    let entries = match std::fs::read_dir(&vol_dir) {
+        Ok(e) => e,
+        Err(_) => return out,
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let manifest_path = entry.path().join("manifest.bin");
+        if !manifest_path.exists() {
+            continue;
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            out.insert(name.to_lowercase());
+        }
+    }
+    out
+}
+
+fn cap_visible_lsn_by_flushed(
+    persistence: &Arc<Option<PersistenceManager>>,
+    safe_visible: u64,
+) -> u64 {
+    if safe_visible == 0 {
+        return 0;
+    }
+    persistence
+        .as_ref()
+        .as_ref()
+        .and_then(|pm| pm.wal())
+        .map(|wal| safe_visible.min(wal.flushed_lsn()))
+        .unwrap_or(safe_visible)
+}
+
+fn clear_published_completed_txns(
+    completed_marker_txns: &parking_lot::Mutex<std::collections::BTreeMap<u64, i64>>,
+    persistence: &Arc<Option<PersistenceManager>>,
+    published_lsn: u64,
+) -> bool {
+    if published_lsn == 0 {
+        return false;
+    }
+    let mut txn_ids = Vec::new();
+    {
+        let mut completed = completed_marker_txns.lock();
+        while let Some((&marker_lsn, &txn_id)) = completed.iter().next() {
+            if marker_lsn > published_lsn {
+                break;
+            }
+            completed.remove(&marker_lsn);
+            txn_ids.push(txn_id);
+        }
+    }
+    if txn_ids.is_empty() {
+        return false;
+    }
+    if let Some(wal) = persistence.as_ref().as_ref().and_then(|pm| pm.wal()) {
+        for txn_id in txn_ids {
+            wal.clear_active_txn(txn_id);
+        }
+        true
+    } else {
+        false
+    }
+}
+
 impl MVCCEngine {
-    /// Creates a new MVCC engine with the given configuration
+    /// Creates a new MVCC engine. Persistence init failure is fatal for read-only
+    /// opens (silent degradation would surface as "table not found"); writable opens
+    /// warn and fall back to in-memory.
     pub fn new(config: Config) -> Self {
         let path = config.path.clone().unwrap_or_default();
+        let read_only = config.read_only;
 
         // Initialize persistence manager if path is provided and persistence is enabled
+        let mut persistence_init_error: Option<Error> = None;
         let persistence = if !path.is_empty() && config.persistence.enabled {
-            match PersistenceManager::new(Some(Path::new(&path)), &config.persistence) {
+            match PersistenceManager::new(Some(Path::new(&path)), &config.persistence, read_only) {
                 Ok(pm) => Some(pm),
                 Err(e) => {
-                    eprintln!("Warning: Failed to initialize persistence: {}", e);
-                    None
+                    if read_only {
+                        // Hold the error; surface it from open_engine so
+                        // the caller sees a Result<()> failure rather than
+                        // a silently-empty engine.
+                        persistence_init_error = Some(e);
+                        None
+                    } else {
+                        eprintln!("Warning: Failed to initialize persistence: {}", e);
+                        None
+                    }
                 }
             }
         } else {
@@ -517,12 +652,13 @@ impl MVCCEngine {
             version_stores: Arc::new(RwLock::new(FxHashMap::default())),
             registry: Arc::new(TransactionRegistry::new()),
             open: AtomicBool::new(false),
+            failed: Arc::new(AtomicBool::new(false)),
             txn_version_stores: Arc::new(RwLock::new(I64Map::new())),
             views: RwLock::new(FxHashMap::default()),
             persistence: Arc::new(persistence),
             loading_from_disk: Arc::new(AtomicBool::new(false)),
             file_lock: Mutex::new(None),
-            schema_epoch: AtomicU64::new(0),
+            schema_epoch: Arc::new(AtomicU64::new(0)),
             cleanup_handle: Mutex::new(None),
             fk_reverse_cache: RwLock::new((u64::MAX, StringMap::default())),
             snapshot_timestamps: RwLock::new(FxHashMap::default()),
@@ -530,9 +666,33 @@ impl MVCCEngine {
             force_seal_all: AtomicBool::new(false),
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
+            transactional_ddl_fence: Arc::new(parking_lot::RwLock::new(())),
+            lease_max_age_nanos: Arc::new(AtomicU64::new(0)),
+            failed_restore_attach_gate: Mutex::new(None),
+            pending_drop_cleanups: Arc::new(parking_lot::Mutex::new(
+                rustc_hash::FxHashSet::default(),
+            )),
+            orphan_discovery_failed: Arc::new(AtomicBool::new(false)),
             compaction_running: Arc::new(AtomicBool::new(false)),
-            #[cfg(not(target_arch = "wasm32"))]
-            eviction_epoch: AtomicU64::new(0),
+            epoch_bump_lock: parking_lot::Mutex::new(()),
+            persistence_init_error: Mutex::new(persistence_init_error),
+            shm: Mutex::new(None),
+            pending_marker_lsns: Arc::new(parking_lot::Mutex::new(
+                std::collections::BTreeSet::new(),
+            )),
+            max_written_marker_lsn: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            completed_marker_txns: Arc::new(parking_lot::Mutex::new(
+                std::collections::BTreeMap::new(),
+            )),
+            shm_publish_lock: Arc::new(parking_lot::Mutex::new(())),
+            // Default true (conservative): pay the publish cost
+            // until the cleanup loop's first lease scan proves
+            // no reader is present.
+            lease_present: Arc::new(AtomicBool::new(true)),
+            // u64::MAX = uncapped (writer recovery). Database::open
+            // overrides this for read-only file:// opens before
+            // calling open_engine.
+            replay_cap_lsn: std::sync::atomic::AtomicU64::new(u64::MAX),
         }
     }
 
@@ -548,11 +708,79 @@ impl MVCCEngine {
             return Ok(()); // Already open
         }
 
-        // Acquire file lock for disk-based databases to prevent concurrent access
+        // Publish the effective lease window so any
+        // `EngineOperations` instance built from this engine
+        // (transactional DDL DROP path) shares the SAME
+        // window the engine uses for `defer_for_live_readers`
+        // / `min_pinned_reader_lsn`. Without this priming the
+        // first transactional DROP could see a 0-nanos value
+        // and fall back to the 120s floor while the engine's
+        // own checks use a different window.
+        let _ = self.effective_lease_max_age();
+
+        // Surface a deferred persistence-init failure recorded by `new()`.
+        // For read-only opens, persistence init failure is fatal: silent
+        // fallback to an in-memory engine would let the caller see a
+        // "successful" open against a completely empty engine and only
+        // discover the missing data later via `table not found`.
+        if let Some(err) = self.persistence_init_error.lock().unwrap().take() {
+            // Reset the open flag since we're failing.
+            self.open.store(false, Ordering::Release);
+            return Err(err);
+        }
+
+        // File lock: read-only takes SH (multiple readers + a writer); writers take EX.
+        // Writer also takes db.startup.lock EX before db.lock so readers that find db.lock
+        // EX-locked cannot trust a stale db.shm READY from a prior writer incarnation.
+        #[cfg(unix)]
+        let mut _startup_gate: Option<crate::storage::mvcc::file_lock::StartupLockGuard> = None;
         if self.path != "memory://" {
-            let lock = FileLock::acquire(&self.path)?;
+            let read_only = self.config.read().unwrap().read_only;
+            #[cfg(unix)]
+            if !read_only {
+                _startup_gate =
+                    FileLock::acquire_startup_exclusive(std::path::Path::new(&self.path))?;
+            }
+            let lock = if read_only {
+                FileLock::acquire_shared(&self.path)?
+            } else {
+                FileLock::acquire(&self.path)?
+            };
             let mut file_lock = self.file_lock.lock().unwrap();
             *file_lock = Some(lock);
+            drop(file_lock);
+
+            // SWMR v2: writable Unix opens publish db.shm. Required (not optional):
+            // readers detect "writer up" via shm presence; missing shm would let them
+            // fall back to uncapped WAL replay and observe unpublished commits.
+            #[cfg(unix)]
+            if !read_only {
+                use crate::storage::mvcc::shm::ShmHandle;
+                let handle =
+                    ShmHandle::create_writer(std::path::Path::new(&self.path)).map_err(|e| {
+                        Error::internal(format!(
+                            "failed to create db.shm at '{}': {} \
+                             (shm is required for writable SWMR opens; \
+                             a missing shm would let read-only attaches \
+                             silently fall back to uncapped WAL replay)",
+                            self.path, e
+                        ))
+                    })?;
+                // writer_generation bumped inside create_writer; prior reader snapshots
+                // unequal, surfacing SwmrWriterReincarnated on their next refresh.
+                let mut shm = self.shm.lock().unwrap();
+                let arc = Arc::new(handle);
+                *shm = Some(Arc::clone(&arc));
+                drop(shm);
+                // WAL -> shm mirror: every active-set change fetch_min-mirrors into
+                // shm.oldest_active_txn_lsn so fresh readers see consistent state during
+                // a lease_present=false window even before the cleanup loop publishes.
+                if let Some(ref pm) = *self.persistence {
+                    if let Some(wal) = pm.wal() {
+                        wal.set_shm_oldest_mirror(arc);
+                    }
+                }
+            }
         }
 
         // Start accepting transactions
@@ -603,7 +831,7 @@ impl MVCCEngine {
                     // New path: load manifests + volumes BEFORE WAL replay.
                     // Volumes must be loaded so is_row_id_in_volume() can check
                     // row_ids for idempotent INSERT during replay.
-                    let lsn = self.load_manifests_from_volumes();
+                    let lsn = self.load_manifests_from_volumes()?;
                     self.load_standalone_volumes_no_schema_check();
                     lsn
                 } else if has_legacy_snapshots {
@@ -615,8 +843,11 @@ impl MVCCEngine {
                     0
                 };
 
-                // Clean up stale .dv files from previous versions
-                self.cleanup_stale_dv_files();
+                // Clean up stale .dv files from previous versions.
+                // Writer-only: a read-only open must not mutate the db dir.
+                if !self.is_read_only_mode() {
+                    self.cleanup_stale_dv_files();
+                }
 
                 // Replay WAL entries after the checkpoint/snapshot LSN
                 self.replay_wal(replay_from_lsn)?;
@@ -643,9 +874,20 @@ impl MVCCEngine {
                 // generated row_id doesn't collide with cold rows.
                 self.sync_auto_increment_from_segments();
 
+                // WAL replay inserts schemas directly without bumping epoch; sync to
+                // the highest schema_version observed so drift check fires only for
+                // post-open writer DDL.
+                self.sync_schema_epoch_from_segments();
+
+                // Read-only must skip seal/migration (writes new volumes/manifests).
+                // Hot rows from WAL replay stay in memory; queries pay O(hot_size) until next
+                // writer checkpoints, which is the correct trade-off
+                // for a reader.
+                let read_only = self.is_read_only_mode();
+
                 // Migration: if we loaded from legacy snapshots, seal all data
                 // into volumes and remove the old snapshots/ directory.
-                if has_legacy_snapshots {
+                if has_legacy_snapshots && !read_only {
                     // Clear loading flag temporarily so checkpoint can write WAL
                     self.loading_from_disk.store(false, Ordering::Release);
 
@@ -680,13 +922,9 @@ impl MVCCEngine {
                     self.loading_from_disk.store(true, Ordering::Release);
                 }
 
-                // After recovery, seal hot rows immediately before accepting
-                // queries. Without this, a dirty shutdown that loads 1M+ rows
-                // into hot via WAL replay makes ALL queries O(hot_size) until
-                // the first background checkpoint fires (up to 60s later).
-                // Sealing here drains the hot buffer while no concurrent reads
-                // exist, so there's no seal_overlap performance impact.
-                {
+                // Drain post-recovery hot rows so first queries aren't O(hot_size).
+                // Skipped on read-only (writes new volumes/manifests).
+                if !read_only {
                     self.loading_from_disk.store(false, Ordering::Release);
                     let has_hot_rows = {
                         let stores = self.version_stores.read().unwrap();
@@ -699,11 +937,8 @@ impl MVCCEngine {
                         }
                         self.force_seal_all.store(false, Ordering::Release);
 
-                        // Persist manifests so sealed volumes survive another
-                        // crash. Don't advance checkpoint_lsn or truncate WAL
-                        // here — the WAL may be corrupt (that's why recovery
-                        // ran). The first clean checkpoint (background thread
-                        // or close_engine) will advance and truncate safely.
+                        // Persist manifests so sealed volumes survive another crash.
+                        // Don't advance checkpoint_lsn or truncate (WAL may be corrupt).
                         {
                             let mgr_arcs: Vec<_> = {
                                 let mgrs = self.segment_managers.read().unwrap();
@@ -719,11 +954,77 @@ impl MVCCEngine {
 
                 // Clear the loading flag
                 self.loading_from_disk.store(false, Ordering::Release);
+
+                // Always bump manifest epoch on writer recovery so attaching readers
+                // trigger reload_manifests (DDL-only crashes leave the epoch file untouched).
+                if !read_only && !self.path.is_empty() {
+                    if let Err(e) = self.bump_manifest_epoch() {
+                        eprintln!("Warning: post-recovery manifest epoch bump failed: {}", e);
+                    }
+                }
             }
+        }
+
+        // Publish recovered WAL frontier into shm BEFORE init_done. Without this a
+        // post-recovery attach would cap replay at 0 and miss recovered transactions.
+        #[cfg(unix)]
+        {
+            let recovered_frontier = self
+                .persistence
+                .as_ref()
+                .as_ref()
+                .map(|pm| pm.current_lsn())
+                .unwrap_or(0);
+            let shm_guard = self.shm.lock().unwrap();
+            if let Some(ref handle) = *shm_guard {
+                if recovered_frontier > 0 {
+                    // Serialize against any concurrent publish
+                    // (none expected during recovery, but the
+                    // contract is "every shm publish goes through
+                    // the lock").
+                    let _publish_guard = self.shm_publish_lock.lock();
+                    // Publish oldest=u64::MAX with visible=recovered under same seqlock.
+                    // Default 0 would pin readers at WAL LSN 1 forever.
+                    handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+                    handle
+                        .header()
+                        .oldest_active_txn_lsn
+                        .store(u64::MAX, Ordering::Release);
+                    handle
+                        .header()
+                        .visible_commit_lsn
+                        .fetch_max(recovered_frontier, Ordering::AcqRel);
+                    handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+                }
+                handle.mark_ready();
+            }
+        }
+
+        // Release the startup gate. From this point on, readers
+        // probing `db.shm` are allowed to classify a READY shm as
+        // "live writer authoritative", see the matching reader
+        // half in `await_writer_startup_quiescent`. Held above the
+        // mark_ready boundary so a reader that gets through the
+        // gate and finds db.lock still EX-locked has a guarantee
+        // that init_done has been freshly stamped by THIS writer.
+        #[cfg(unix)]
+        {
+            let _ = _startup_gate.take();
         }
 
         // Note: Cleanup is started separately via start_cleanup() after Arc wrapping
         // because start_periodic_cleanup requires Arc<Self>
+
+        // Sweep any leftover `<volumes>/<dirname>/`
+        // directories from prior runs where the writer
+        // dropped a table while readers were live (and the
+        // defer-on-live-readers path skipped the unlink) or
+        // crashed mid-DROP. Inside `open_engine` we hold the
+        // file lock, at most one writer process can be
+        // running, but live RO readers may exist; the sweep
+        // itself gates on `defer_for_live_readers` and skips
+        // when any are.
+        self.sweep_orphan_table_dirs();
 
         Ok(())
     }
@@ -740,6 +1041,19 @@ impl MVCCEngine {
         if !config.cleanup.enabled {
             return;
         }
+        // `cleanup_interval = 0` is meaningless for an "interval
+        // between runs" value, but DSN parsing accepts it. Treat it
+        // as cleanup-disabled (same semantics as
+        // `cleanup.enabled = false`) instead of letting the loop spin
+        // with `loop_interval = 0`, which would skip the inner sleep
+        // and hammer eviction (read-only) or the cleanup sweeps
+        // (writer) in a tight loop. The read-only path is especially
+        // bad because the tight loop also fetch_add's
+        // `GLOBAL_EVICTION_EPOCH` on every iteration.
+        if config.cleanup.interval_secs == 0 {
+            return;
+        }
+        // Read-only also runs cleanup (eviction-only branch); needed for warm-tier demotion.
 
         let interval = std::time::Duration::from_secs(config.cleanup.interval_secs);
         let deleted_row_retention =
@@ -769,13 +1083,23 @@ impl MVCCEngine {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_flag_clone = Arc::clone(&stop_flag);
         let engine = Arc::clone(self);
+        // Snapshot read-only mode for the loop. Read-only is fixed
+        // for the engine's lifetime, so we never need to re-check it
+        // per tick. Writer-only operations (lease scans, WAL
+        // visibility flush, checkpoint, compaction, retention
+        // sweeps) are skipped on read-only; eviction still runs.
+        let read_only = engine.is_read_only_mode();
 
         let handle = thread::spawn(move || {
             let mut time_since_cleanup = std::time::Duration::ZERO;
 
             while !stop_flag_clone.load(Ordering::Acquire) {
-                // Read config once per outer iteration (not per 100ms tick)
-                let current_checkpoint_interval = {
+                // Read config once per outer iteration (not per 100ms tick).
+                // Checkpoint cadence drives the writer's loop interval;
+                // read-only handles use the configured cleanup interval as-is.
+                let current_checkpoint_interval = if read_only {
+                    std::time::Duration::ZERO
+                } else {
                     let cfg = engine.config.read().unwrap();
                     if cfg.persistence.checkpoint_interval > 0 {
                         std::time::Duration::from_secs(cfg.persistence.checkpoint_interval as u64)
@@ -794,6 +1118,19 @@ impl MVCCEngine {
                 while elapsed < loop_interval && !stop_flag_clone.load(Ordering::Acquire) {
                     thread::sleep(check_interval);
                     elapsed += check_interval;
+                    if !read_only {
+                        // Writer side: refresh lease-presence cache on
+                        // every 100ms inner tick so a freshly-attached
+                        // reader sees the writer's barrier publish
+                        // within a bounded window. SyncMode::None no
+                        // longer flushes every commit marker, so we
+                        // periodically write the WAL buffer and
+                        // republish the flushed frontier here too.
+                        if engine.flush_wal_for_visibility_if_due() {
+                            engine.barrier_publish_full_state();
+                        }
+                        engine.refresh_lease_present_cache();
+                    }
                 }
 
                 if stop_flag_clone.load(Ordering::Acquire) {
@@ -804,12 +1141,16 @@ impl MVCCEngine {
                 time_since_cleanup += loop_interval;
                 if time_since_cleanup >= interval {
                     time_since_cleanup = std::time::Duration::ZERO;
-                    let _txn_count = engine.cleanup_old_transactions(txn_retention);
-                    let _row_count = engine.cleanup_deleted_rows(deleted_row_retention);
-                    let _prev_version_count = engine.cleanup_old_previous_versions();
+                    if !read_only {
+                        let _txn_count = engine.cleanup_old_transactions(txn_retention);
+                        let _row_count = engine.cleanup_deleted_rows(deleted_row_retention);
+                        let _prev_version_count = engine.cleanup_old_previous_versions();
+                    }
                 }
 
-                // Auto-checkpoint using the cached interval
+                // Auto-checkpoint using the cached interval. Writer
+                // only: read-only zeroed `current_checkpoint_interval`
+                // above, so this whole block is skipped.
                 if !current_checkpoint_interval.is_zero() {
                     if let Some(ref pm) = *engine.persistence {
                         let last = pm.last_checkpoint_time();
@@ -838,6 +1179,17 @@ impl MVCCEngine {
                             }
                         }
                     }
+                } else if read_only {
+                    // Read-only handles never run compaction, so the
+                    // writer's "eviction runs inside spawn_compaction"
+                    // hook never fires. Drive eviction directly here on
+                    // the cleanup cadence so warm volumes age out to
+                    // cold instead of pinning every loaded volume's
+                    // decompressed columns in RAM forever. Eviction is
+                    // pure RAM management (drops decompressed/
+                    // compressed columns; metadata stays via Arc) and
+                    // does not touch disk, so it is safe for read-only.
+                    engine.evict_idle_volumes();
                 }
             }
         });
@@ -874,6 +1226,7 @@ impl MVCCEngine {
         if !snapshot_dir.exists() {
             return Ok(0); // No snapshots directory
         }
+        let read_only = self.is_read_only_mode();
 
         // Read the snapshot LSN from metadata (supports both binary and JSON formats)
         let metadata_lsn = read_snapshot_lsn(&snapshot_dir);
@@ -911,7 +1264,12 @@ impl MVCCEngine {
                 let file_size = std::fs::metadata(snapshot_path)
                     .map(|m| m.len())
                     .unwrap_or(0);
-                let use_volume = has_vol || file_size > 16 * 1024 * 1024;
+                // Read-only opens take the in-memory load path: the
+                // volume-promotion path writes tmp+rename and markers
+                // under volumes/. For very large snapshots this means
+                // higher RAM, but RO callers chose to attach a legacy
+                // snapshot DB without first migrating it.
+                let use_volume = !read_only && (has_vol || file_size > 16 * 1024 * 1024);
 
                 let load_result = if use_volume {
                     self.load_table_snapshot_as_volume(&table_name, snapshot_path)
@@ -955,6 +1313,23 @@ impl MVCCEngine {
         // replay_two_phase to skip entries that need to be replayed.
         if !any_snapshot_loaded {
             let checkpoint_path = pm.path().join("wal").join("checkpoint.meta");
+            if read_only {
+                // Reader must not unlink writer-owned state. A published
+                // floor whose snapshot didn't load means replay would skip
+                // entries we have no data for; fail instead.
+                let published_floor =
+                    crate::storage::mvcc::wal_manager::CheckpointMetadata::read_from_file(
+                        &checkpoint_path,
+                    )
+                    .map(|c| c.lsn)
+                    .unwrap_or(0);
+                if published_floor == 0 {
+                    return Ok(0);
+                }
+                return Err(Error::SwmrPartialReload(
+                    "legacy snapshots unreadable despite a published checkpoint floor".to_string(),
+                ));
+            }
             let _ = std::fs::remove_file(checkpoint_path);
             return Ok(0);
         }
@@ -1049,14 +1424,8 @@ impl MVCCEngine {
         Ok(source_lsn)
     }
 
-    /// Load a table's snapshot as a frozen volume instead of into the arena.
-    ///
-    /// Fast-startup path:
-    /// 1. Check for a pre-built `.vol` file next to the snapshot — load directly
-    /// 2. If no `.vol` file, convert from snapshot and save the `.vol` for next time
-    ///
-    /// The VersionStore is created empty (only WAL-replayed rows go into the arena).
-    /// Returns the source_lsn from the snapshot header.
+    /// Load snapshot as frozen volume. Loads pre-built .vol if present, else converts
+    /// and saves for next startup. Returns source_lsn from snapshot header.
     fn load_table_snapshot_as_volume(
         &self,
         _table_name: &str,
@@ -1159,6 +1528,15 @@ impl MVCCEngine {
                         std::fs::rename(&tmp_path, &vol_path).map_err(|e| {
                             crate::core::Error::internal(format!("failed to rename volume: {}", e))
                         })?;
+                        // Dir fsync so the rename survives a crash; without it the
+                        // tmp could disappear and vol_path stay absent, leaving a
+                        // promoted standalone with no source to reload.
+                        #[cfg(not(windows))]
+                        if let Some(parent) = vol_path.parent() {
+                            if let Ok(dir) = std::fs::File::open(parent) {
+                                let _ = dir.sync_all();
+                            }
+                        }
                         Ok(())
                     })() {
                         eprintln!(
@@ -1201,19 +1579,8 @@ impl MVCCEngine {
         Ok(source_lsn)
     }
 
-    /// Copy a snapshot-adjacent .vol file into the standalone volumes directory.
-    ///
-    /// This makes the cold data durable across snapshot rotations: once a newer
-    /// snapshot is created and old snapshots are cleaned up, the .vol that was
-    /// written next to the old snapshot would be orphaned. By copying it into
-    /// `volumes/<table>/`, `load_standalone_volumes` can find it on every future
-    /// restart regardless of which snapshot is current.
-    ///
-    /// The copy is skipped if the standalone directory already contains any .vol
-    /// files for this table, to avoid duplicating data on every restart.
-    /// Promotes a snapshot .vol to standalone volumes/. Returns the volume_id
-    /// used for the standalone file so the caller can register the segment with
-    /// the same ID (preventing double-load by load_standalone_volumes).
+    /// Promote snapshot-adjacent .vol to standalone volumes/. Returns volume_id
+    /// (caller registers with same ID; prevents double-load).
     fn promote_snapshot_vol_to_standalone(
         &self,
         table_name: &str,
@@ -1284,15 +1651,29 @@ impl MVCCEngine {
             let _ = std::fs::remove_file(&tmp_path);
             return None;
         }
+        // Dir fsync so the rename survives a crash; otherwise the entry
+        // can vanish post-reboot and the marker (written next) points at
+        // a missing standalone, triggering re-promotion + duplicate ID.
+        #[cfg(not(windows))]
+        if let Ok(dir) = std::fs::File::open(&table_vol_dir) {
+            let _ = dir.sync_all();
+        }
 
         // Write marker with the volume_id so subsequent opens register
         // with the same segment_id as the standalone copy.
-        // Fsync the marker to prevent re-promotion (and duplicate volumes) after crash.
+        // Fsync the marker AND its directory to prevent re-promotion (and
+        // duplicate volumes) after crash.
         if std::fs::write(&marker_path, volume_id.to_string()).is_ok() {
             let _ = std::fs::OpenOptions::new()
                 .write(true)
                 .open(&marker_path)
                 .and_then(|f| f.sync_all());
+            #[cfg(not(windows))]
+            if let Some(parent) = marker_path.parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
         }
         Some(volume_id)
     }
@@ -1310,9 +1691,15 @@ impl MVCCEngine {
             _ => return Ok(()),
         };
 
-        // Use two-phase recovery for crash consistency
-        // This ensures uncommitted transactions are NOT applied after a crash
-        let result = pm.replay_two_phase(from_lsn, |entry| self.apply_wal_entry(entry));
+        // Read-only opens cap replay at writer's visible_commit_lsn (set by
+        // Database::open before open_engine). Same snapshot as EngineEntry's
+        // attach_visible_commit_lsn so replay-cap and SwmrPendingDdl agree.
+        // Writers don't cap (prior-incarnation value is stale).
+        use std::sync::atomic::Ordering;
+        let max_lsn = self.replay_cap_lsn.load(Ordering::Acquire);
+
+        let result =
+            pm.replay_two_phase_capped(from_lsn, max_lsn, |entry| self.apply_wal_entry(entry));
 
         match result {
             Ok(info) => {
@@ -1345,16 +1732,8 @@ impl MVCCEngine {
         }
     }
 
-    /// Populate HNSW indexes from cold segment data.
-    ///
-    /// After WAL replay + populate_all_indexes(), HNSW indexes only contain hot rows.
-    /// Cold segment rows must also be added because vector similarity search cannot
-    /// fall back to zone maps like B-tree/Hash indexes can.
-    ///
-    /// Uses newest-first volume ordering with row_id dedup so that when the same
-    /// row_id exists in multiple overlapping volumes, only the newest version is
-    /// added to the HNSW graph. Also skips row_ids that are in the hot buffer
-    /// (already indexed by populate_all_indexes).
+    /// HNSW needs cold segment rows too (no zone-map fallback for vector search).
+    /// Newest-first dedup; skips hot rows already indexed by populate_all_indexes.
     fn populate_hnsw_from_segments(&self) {
         let stores = self.version_stores.read().unwrap();
         let mgrs = self.segment_managers.read().unwrap();
@@ -1385,9 +1764,11 @@ impl MVCCEngine {
                     continue;
                 }
 
-                let tombstones = mgr.tombstone_set_arc();
-                // Use newest-first ordering so overlapping row_ids resolve to newest version
-                let volumes = mgr.get_volumes_newest_first();
+                // Atomic capture of cold state. Newest-first ordering
+                // makes overlapping row_ids resolve to the newest
+                // version. Separate calls would race a concurrent
+                // read-only refresh's `reload_from_disk`.
+                let (volumes, tombstones) = mgr.volumes_and_tombstones_newest_first();
 
                 // Seed seen set with hot row_ids (already indexed by populate_all_indexes)
                 let mut seen: rustc_hash::FxHashSet<i64> = store
@@ -1657,34 +2038,17 @@ impl MVCCEngine {
                     let in_volume = mgr.is_row_id_in_volume(entry.row_id);
 
                     if in_volume {
-                        // Row exists in a cold volume. Two cases:
-                        // 1. Sealed INSERT: original data, already in volume → skip
-                        // 2. Post-seal UPDATE: new data supersedes cold → apply + tombstone
-                        //
-                        // Distinguish by checking if the row_id is already tombstoned.
-                        // If tombstoned, a previous WAL entry already marked it as
-                        // superseded (UPDATE or DELETE), so this entry is a later
-                        // version that should be applied. If not tombstoned, this is
-                        // the first (original sealed) INSERT → skip.
-                        //
-                        // ORDERING INVARIANT: commit_all_tables writes tombstone
-                        // DELETE entries BEFORE the corresponding INSERT entries.
-                        // This guarantees `already_tombstoned` is true for post-seal
-                        // UPDATEs (which are recorded as Insert in the WAL).
-                        // The `WALOperationType::Update` arm is a safety net for
-                        // any future code path that records with the Update op type.
+                        // Row in cold volume: sealed INSERT (skip) vs post-seal UPDATE
+                        // (apply to hot). Distinguished by tombstone presence.
+                        // Invariant: commit_all_tables writes tombstone Delete BEFORE
+                        // post-seal Insert, so already_tombstoned discriminates.
                         let already_tombstoned = mgr.is_tombstoned(entry.row_id);
 
                         if already_tombstoned || entry.operation == WALOperationType::Update {
-                            // Post-seal change: apply to hot. The hot version
-                            // shadows the cold version via skip set (hot_row_ids
-                            // in the cumulative skip set at scan time). No tombstone
-                            // needed here — the hot version IS the dedup mechanism.
                             if let Ok(store) = self.get_version_store(&table_name) {
                                 store.apply_recovered_version(entry.row_id, row_version);
                             }
                         }
-                        // else: sealed INSERT, volume has authoritative data → skip
                     } else {
                         // Row not in any volume: standard hot insert
                         if let Ok(store) = self.get_version_store(&table_name) {
@@ -1706,7 +2070,10 @@ impl MVCCEngine {
                     // Recovery tombstones get commit_seq=0, which is always visible
                     // to all new snapshots (any begin_seq > 0). This is correct:
                     // these tombstones were committed before the restart.
-                    mgr.add_tombstones(&[entry.row_id], 0);
+                    // visible_at_lsn=0 marks "always visible" cross-process,
+                    // recovery-rebuilt tombstones predate any current
+                    // capped attach.
+                    mgr.add_tombstones(&[entry.row_id], 0, 0);
                 }
             }
             WALOperationType::Commit => {
@@ -1756,15 +2123,28 @@ impl MVCCEngine {
                         mgr.clear();
                     }
                 }
-                // Delete standalone volume files from disk
+                // Defer-when-readers-live unlink (live readers may lazy-load these
+                // volumes; sweep_orphan_table_dirs reaps later).
                 if let Some(ref pm) = *self.persistence {
                     if pm.is_enabled() {
                         let vol_dir = pm.path().join("volumes");
-                        let _ =
-                            crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_name);
+                        let defer = self.defer_for_live_readers();
+                        // Propagate failure: leftover manifest would resurface table on reopen.
+                        crate::storage::volume::io::delete_table_volumes_when_safe(
+                            &vol_dir,
+                            &table_name,
+                            defer,
+                        )?;
                     }
                 }
             }
+        }
+
+        // Bump schema_epoch on DDL replay (without this, first checkpoint after CREATE
+        // would surface SchemaChanged because manifest.schema_version > reader.epoch).
+        if entry.operation.is_ddl() {
+            self.schema_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
         }
 
         Ok(())
@@ -2045,8 +2425,11 @@ impl MVCCEngine {
         // Run a final checkpoint to seal ALL remaining hot rows into volumes.
         // Use force_seal=true to bypass thresholds — on close, we want all data
         // in volumes so startup is fast and doesn't depend on WAL replay.
-        // Skipped when checkpoint_on_close is false (crash simulation in tests).
-        let checkpoint_on_close = self.config.read().unwrap().persistence.checkpoint_on_close;
+        // Skipped when checkpoint_on_close is false (crash simulation in tests),
+        // and ALWAYS skipped on read-only engines (no DML to seal, no WAL to
+        // truncate, and the shared file lock doesn't permit writes anyway).
+        let checkpoint_on_close = self.config.read().unwrap().persistence.checkpoint_on_close
+            && !self.is_read_only_mode();
         if checkpoint_on_close {
             if let Some(ref pm) = *self.persistence {
                 if pm.is_enabled() {
@@ -2106,12 +2489,80 @@ impl MVCCEngine {
             *file_lock = None;
         }
 
+        // Release the cross-process shm mapping. Drop unmaps; the file
+        // stays on disk so the next writable open replaces it via
+        // `create_writer` (truncate + re-init). Reader processes that
+        // were attached observe the file truncation by their next
+        // refresh seeing a different writer_generation when the new
+        // writer reopens.
+        {
+            let mut shm = self.shm.lock().unwrap();
+            *shm = None;
+        }
+
         Ok(())
     }
 
     /// Returns whether the engine is open
     pub fn is_open(&self) -> bool {
         self.open.load(Ordering::Acquire)
+    }
+
+    /// True iff the engine is in the catastrophic-failure state (a
+    /// post-`commit_all_tables` WAL marker write hit an
+    /// unrecoverable error and parent VersionStores already hold
+    /// markerless data). All durability paths consult this and
+    /// refuse to run. The latch itself is set via the
+    /// `EngineOperations::mark_engine_failed` trait method from the
+    /// transaction commit path.
+    pub fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire)
+    }
+
+    /// Stash EX db.startup.lock guard into the engine (held until process exit).
+    /// Used by post-destructive-boundary RESTORE failures so partial state isn't readable.
+    pub(crate) fn latch_attach_gate_on_failure(&self, gate: Option<StartupLockGuard>) {
+        if let Ok(mut slot) = self.failed_restore_attach_gate.lock() {
+            *slot = gate;
+        }
+    }
+
+    /// Trip catastrophic-failure latch (idempotent Release store). Forces every
+    /// subsequent durability path to refuse; process restart + recovery converges.
+    pub fn enter_catastrophic_failure(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    /// Set WAL replay cap. u64::MAX = uncapped (writer recovery).
+    pub fn set_replay_cap_lsn(&self, cap: u64) {
+        use std::sync::atomic::Ordering;
+        self.replay_cap_lsn.store(cap, Ordering::Release);
+    }
+
+    pub fn is_read_only_mode(&self) -> bool {
+        self.config.read().unwrap().read_only
+    }
+
+    /// Defense-in-depth gate: rejects write-intent methods on read-only or failed
+    /// engines. #[track_caller] embeds call-site file:line in the error.
+    #[track_caller]
+    fn ensure_writable(&self) -> Result<()> {
+        if self.is_read_only_mode() {
+            let loc = std::panic::Location::caller();
+            return Err(Error::read_only_violation_at(
+                "engine",
+                &format!("{}:{}", loc.file(), loc.line()),
+            ));
+        }
+        if self.is_failed() {
+            return Err(Error::internal(
+                "write refused: engine is in the catastrophic-failure state \
+                 (a prior commit's WAL marker write failed after some tables \
+                 were already committed). Restart the process; recovery will \
+                 discard the markerless transaction.",
+            ));
+        }
+        Ok(())
     }
 
     /// Per-table, per-volume statistics for PRAGMA VOLUME_STATS.
@@ -2145,6 +2596,390 @@ impl MVCCEngine {
         &self.path
     }
 
+    /// Reload per-table manifests from disk for SWMR readers.
+    /// On schema drift returns SchemaChanged (first table wins; partial reload would
+    /// give cross-table inconsistency). Detects added/removed tables by comparing
+    /// on-disk dirs against catalog. Returns Ok(false) if writer checkpoint is mid-flight
+    /// (mismatched checkpoint_lsn across tables); caller should retry.
+    pub(crate) fn reload_manifests(&self) -> Result<bool> {
+        if self.path.is_empty() {
+            return Ok(true);
+        }
+
+        // DDL detection: compare on-disk dirs vs catalog (schemas), not segment_managers
+        // (managers are lazy; a WAL-replayed CREATE has no manager yet).
+        // For removed side, use segment_managers (no on-disk dir = real DROP).
+        let known_catalog: rustc_hash::FxHashSet<String> = {
+            let schemas = self.schemas.read().unwrap();
+            schemas.keys().cloned().collect()
+        };
+        let known_managers: rustc_hash::FxHashSet<String> = {
+            let mgrs = self.segment_managers.read().unwrap();
+            mgrs.keys().cloned().collect()
+        };
+        let on_disk_tables = scan_table_dirs(std::path::Path::new(&self.path));
+        let added: Vec<String> = on_disk_tables
+            .iter()
+            .filter(|t| !known_catalog.contains(*t))
+            .cloned()
+            .collect();
+        let removed: Vec<String> = known_managers
+            .iter()
+            .filter(|t| !on_disk_tables.contains(*t))
+            .cloned()
+            .collect();
+        if !added.is_empty() || !removed.is_empty() {
+            let mut parts = Vec::new();
+            if !added.is_empty() {
+                let mut a = added.clone();
+                a.sort();
+                parts.push(format!("tables added on disk: [{}]", a.join(", ")));
+            }
+            if !removed.is_empty() {
+                let mut r = removed.clone();
+                r.sort();
+                parts.push(format!("tables dropped on disk: [{}]", r.join(", ")));
+            }
+            return Err(Error::SchemaChanged(format!(
+                "{}; reopen the Database / ReadOnlyDatabase to pick up the new schema",
+                parts.join("; ")
+            )));
+        }
+
+        // ---- Per-table reconcile (with schema-drift gating per-segment) ----
+        let max_known_schema = self.schema_epoch.load(std::sync::atomic::Ordering::Acquire);
+        // For every table that's BOTH in the known catalog AND has
+        // an on-disk volumes dir, ensure a SegmentManager exists.
+        // A table replayed from WAL DDL but never inserted on the
+        // reader yet has no manager, so a writer's first checkpoint
+        // would otherwise leave its new manifest unloaded, the
+        // reader would still see count 0 after refresh. `get_or_
+        // create_segment_manager` is idempotent, so existing
+        // managers are returned unchanged.
+        let mgr_arcs: Vec<Arc<crate::storage::volume::manifest::SegmentManager>> = on_disk_tables
+            .iter()
+            .filter(|t| known_catalog.contains(*t))
+            .map(|t| self.get_or_create_segment_manager(t))
+            .collect();
+
+        // Stage every table's manifest exactly once, then validate the
+        // staged set before mutating any segment manager. This closes two
+        // races:
+        // - schema drift in a later table after an earlier table already
+        //   swapped, and
+        // - a writer checkpoint advancing one table between a preflight read
+        //   and the actual per-table reload.
+        let mut staged_manifests = Vec::with_capacity(mgr_arcs.len());
+        let mut checkpoint_min = u64::MAX;
+        let mut checkpoint_max = 0u64;
+        for mgr in mgr_arcs {
+            let Some(manifest) = mgr.read_manifest_from_disk()? else {
+                continue;
+            };
+            mgr.validate_manifest_for_reload(&manifest, max_known_schema)?;
+            let lsn = manifest.checkpoint_lsn;
+            checkpoint_min = checkpoint_min.min(lsn);
+            checkpoint_max = checkpoint_max.max(lsn);
+            staged_manifests.push((mgr, manifest));
+        }
+
+        // Reject mid-flight cross-table checkpoint (manifests persisted one-by-one
+        // before the global epoch bump). Next refresh retries.
+        if checkpoint_min != u64::MAX && checkpoint_min != checkpoint_max {
+            return Ok(false);
+        }
+
+        // Propagate reload errors so the cached epoch stays unchanged and the next
+        // refresh retries (log-and-continue would leave the table missing).
+        let mut failures: Vec<(String, Error)> = Vec::new();
+        for (mgr, manifest) in staged_manifests {
+            if let Err(e) = mgr.reload_from_manifest(manifest, max_known_schema) {
+                eprintln!(
+                    "Warning: Failed to reload manifest for {}: {}",
+                    mgr.table_name(),
+                    e
+                );
+                failures.push((mgr.table_name().to_string(), e));
+            }
+        }
+        if !failures.is_empty() {
+            // SwmrPartialReload signals the snapshot is mixed; caller must reopen.
+            let mut detail = String::new();
+            for (i, (table, err)) in failures.iter().enumerate() {
+                if i > 0 {
+                    detail.push_str("; ");
+                }
+                detail.push_str(&format!("{}: {}", table, err));
+            }
+            return Err(Error::SwmrPartialReload(detail));
+        }
+        Ok(true)
+    }
+
+    /// Shared accessor for `transactional_ddl_fence`. Auto-commit DDL paths in the
+    /// executor hold `.read()` across multi-engine-call mutations.
+    pub(crate) fn ddl_fence(&self) -> &Arc<parking_lot::RwLock<()>> {
+        &self.transactional_ddl_fence
+    }
+
+    pub(crate) fn defer_for_live_readers(&self) -> bool {
+        // Memory engines have no readers/ dir. Short-circuit on the sentinel; on Windows
+        // Path::new("memory://").join("readers") is malformed and live_leases returns Err,
+        // which fail-closed would interpret as "defer".
+        if self.path.is_empty() || self.path == "memory://" {
+            return false;
+        }
+        let max_age = self.effective_lease_max_age();
+        let dir = std::path::Path::new(&self.path).join(crate::storage::mvcc::lease::READERS_DIR);
+        // Reap stale first so live_leases sees the post-reap state.
+        let _ = crate::storage::mvcc::lease::reap_stale_leases(&dir, max_age);
+        // Fail-closed on Err: transient FS errors must not unlink volumes a reader may
+        // be about to lazy-load.
+        match crate::storage::mvcc::lease::live_leases(&dir, max_age) {
+            Ok(v) => !v.is_empty(),
+            Err(_) => true,
+        }
+    }
+
+    /// Refresh `lease_present` cache and barrier-publish on false->true transition.
+    /// Called from the cleanup loop. The flag drives the commit publish fast path.
+    pub(crate) fn refresh_lease_present_cache(&self) {
+        if self.path.is_empty() {
+            return;
+        }
+        let observed = self.defer_for_live_readers();
+        let prior = self.lease_present.swap(observed, Ordering::AcqRel);
+        if !prior && observed {
+            // Fast-path commits left oldest_active_txn_lsn untouched (possibly stale-low).
+            // barrier publish always re-syncs both fields under the seqlock.
+            self.barrier_publish_full_state();
+        }
+    }
+
+    fn flush_wal_for_visibility_if_due(&self) -> bool {
+        let Some(pm) = self.persistence.as_ref().as_ref() else {
+            return false;
+        };
+        let Some(wal) = pm.wal() else {
+            return false;
+        };
+        match wal.flush_for_visibility_if_due() {
+            Ok(advanced) => advanced,
+            Err(e) => {
+                eprintln!("Warning: periodic WAL visibility flush failed: {}", e);
+                false
+            }
+        }
+    }
+
+    /// Always-on seqlock publish (re-syncs shm after no-readers window where fast-path
+    /// commits left oldest_active_txn_lsn stale). Called from refresh_lease_present_cache
+    /// on the false->true transition.
+    fn barrier_publish_full_state(&self) {
+        let safe_visible = {
+            let pending = self.pending_marker_lsns.lock();
+            if let Some(&min_pending) = pending.iter().next() {
+                min_pending.saturating_sub(1)
+            } else {
+                self.max_written_marker_lsn.load(Ordering::Acquire)
+            }
+        };
+        let publish_lsn = cap_visible_lsn_by_flushed(&self.persistence, safe_visible);
+        let shm = self.shm.lock().unwrap();
+        let Some(handle) = shm.as_ref() else { return };
+        let _publish_guard = self.shm_publish_lock.lock();
+        // Always run seqlock pair; storing oldest unconditionally is the whole point.
+        handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+        if let Some(pm) = self.persistence.as_ref().as_ref() {
+            if let Some(wal) = pm.wal() {
+                let oldest = wal.oldest_active_txn_lsn();
+                handle
+                    .header()
+                    .oldest_active_txn_lsn
+                    .store(oldest, Ordering::Release);
+            }
+        }
+        if publish_lsn > 0 {
+            handle
+                .header()
+                .visible_commit_lsn
+                .fetch_max(publish_lsn, Ordering::AcqRel);
+        }
+        handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+        let visible_after = handle.header().visible_commit_lsn.load(Ordering::Acquire);
+        if clear_published_completed_txns(
+            &self.completed_marker_txns,
+            &self.persistence,
+            visible_after,
+        ) {
+            if let Some(pm) = self.persistence.as_ref().as_ref() {
+                if let Some(wal) = pm.wal() {
+                    handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+                    handle
+                        .header()
+                        .oldest_active_txn_lsn
+                        .store(wal.oldest_active_txn_lsn(), Ordering::Release);
+                    handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+        }
+    }
+
+    /// Borrow the engine's WALManager. None for memory / persistence-disabled engines.
+    pub fn wal(&self) -> Option<&crate::storage::mvcc::wal_manager::WALManager> {
+        self.persistence.as_ref().as_ref().and_then(|pm| pm.wal())
+    }
+
+    /// Lower-cased names of all known tables and views. Used by
+    /// ReadOnlyDatabase::maybe_rebuild_overlay to suppress DDL re-records for
+    /// already-known objects (table_checkpoint_lsns alone misses empty tables and views).
+    pub fn known_catalog_objects(&self) -> rustc_hash::FxHashSet<String> {
+        let mut out = rustc_hash::FxHashSet::default();
+        {
+            let schemas = self.schemas.read().unwrap();
+            for name in schemas.keys() {
+                out.insert(name.clone());
+            }
+        }
+        {
+            let views = self.views.read().unwrap();
+            for name in views.keys() {
+                out.insert(name.clone());
+            }
+        }
+        out
+    }
+
+    /// Snapshot of all known index names across every loaded version
+    /// store. Used by `ReadOnlyDatabase::refresh` to suppress
+    /// CreateIndex re-records for indexes the reader already knows
+    /// about, while still surfacing brand-new indexes as
+    /// `SwmrPendingDdl`. Names are stored case-sensitively (matching
+    /// `IndexMetadata::name`).
+    pub fn known_index_names(&self) -> rustc_hash::FxHashSet<String> {
+        let mut out = rustc_hash::FxHashSet::default();
+        let stores = self.version_stores.read().unwrap();
+        for store in stores.values() {
+            for idx in store.get_all_indexes() {
+                out.insert(idx.name().to_string());
+            }
+        }
+        out
+    }
+
+    /// Per-table checkpoint_lsn snapshot (lower-case keys). Drives per-table cache
+    /// invalidation in ReadOnlyDatabase::refresh.
+    pub fn table_checkpoint_lsns(&self) -> rustc_hash::FxHashMap<String, u64> {
+        let mgrs = self.segment_managers.read().unwrap();
+        let mut out =
+            rustc_hash::FxHashMap::with_capacity_and_hasher(mgrs.len(), Default::default());
+        for (name, mgr) in mgrs.iter() {
+            out.insert(name.clone(), mgr.manifest().checkpoint_lsn);
+        }
+        out
+    }
+
+    /// Min pinned_lsn across live reader leases. None = no constraint. Fail-closed:
+    /// FS error returns Some(1) so compute_wal_truncate_floor refuses truncation.
+    pub(crate) fn min_pinned_reader_lsn(&self) -> Option<u64> {
+        if self.path.is_empty() {
+            return None;
+        }
+        let max_age = self.effective_lease_max_age();
+        let dir = std::path::Path::new(&self.path).join(crate::storage::mvcc::lease::READERS_DIR);
+        match crate::storage::mvcc::lease::min_pinned_lsn(&dir, max_age) {
+            Ok(v) => v,
+            Err(_) => Some(1),
+        }
+    }
+
+    /// Min `manifest_epoch` across live reader handles. Used by the
+    /// retire-sidecar reaper to gate volume unlinks. `None` = no live
+    /// reader leases (free to reap). `Some(0)` = at least one live
+    /// PID has no epoch file (legacy reader / attach window) → defer.
+    /// On scan error, fail closed: `Some(0)`.
+    pub(crate) fn min_reader_handle_epoch(&self) -> Option<u64> {
+        if self.path.is_empty() {
+            return None;
+        }
+        let max_age = self.effective_lease_max_age();
+        let dir = std::path::Path::new(&self.path).join(crate::storage::mvcc::lease::READERS_DIR);
+        match crate::storage::mvcc::lease::min_reader_handle_epoch(&dir, max_age) {
+            Ok(v) => v,
+            Err(_) => Some(0),
+        }
+    }
+
+    /// Lease max-age. User-configured value if set; otherwise 2x checkpoint_interval
+    /// with a 120s floor (aggressive cadences must not reap GC-paused readers).
+    fn effective_lease_max_age(&self) -> std::time::Duration {
+        let cfg = self.config.read().unwrap();
+        let max_age = if cfg.persistence.lease_max_age_secs > 0 {
+            std::time::Duration::from_secs(cfg.persistence.lease_max_age_secs as u64)
+        } else {
+            let interval = cfg.persistence.checkpoint_interval;
+            std::time::Duration::from_secs(((interval * 2) as u64).max(120))
+        };
+        drop(cfg);
+        // Cache the value so EngineOperations and any other
+        // shared-Arc consumer picks up the same window
+        // without rereading config (and without us paying
+        // the config-lock cost in the hot WAL-truncate path).
+        self.lease_max_age_nanos
+            .store(max_age.as_nanos() as u64, Ordering::Release);
+        max_age
+    }
+
+    /// WAL truncate floor: capped at min_pinned_lsn-1 (SWMR readers) and
+    /// visible_commit_lsn (preserve chain_head <= visible invariant).
+    /// None = refuse truncation entirely.
+    fn compute_wal_truncate_floor(&self, checkpoint_lsn: u64) -> Option<u64> {
+        // Refuse if pending_drop_cleanups non-empty: leftover manifest.bin would
+        // resurface dropped table on next open if DropTable record gets truncated.
+        if !self.pending_drop_cleanups.lock().is_empty() {
+            return None;
+        }
+        if self.orphan_discovery_failed.load(Ordering::Acquire) {
+            return None;
+        }
+        let visible_clamp = self.published_visible_commit_lsn();
+        let bounded_checkpoint = if visible_clamp > 0 {
+            checkpoint_lsn.min(visible_clamp)
+        } else {
+            checkpoint_lsn
+        };
+        match self.min_pinned_reader_lsn() {
+            None => Some(bounded_checkpoint),
+            Some(0) => Some(bounded_checkpoint), // 0 means no pin, ignore
+            Some(1) => None,                     // can't safely truncate: every entry needed
+            Some(pinned) => Some(bounded_checkpoint.min(pinned - 1)),
+        }
+    }
+
+    /// Sample published visible_commit_lsn from db.shm. 0 = no shm attached.
+    fn published_visible_commit_lsn(&self) -> u64 {
+        let shm = self.shm.lock().unwrap();
+        match shm.as_ref() {
+            Some(handle) => handle
+                .header()
+                .visible_commit_lsn
+                .load(std::sync::atomic::Ordering::Acquire),
+            None => 0,
+        }
+    }
+
+    /// Publish min_pinned_lsn to db.shm for PRAGMA SWMR_STATUS. 0 = no pinning.
+    fn publish_min_pinned_lsn(&self) {
+        let value = self.min_pinned_reader_lsn().unwrap_or(0);
+        let shm = self.shm.lock().unwrap();
+        if let Some(handle) = shm.as_ref() {
+            handle
+                .header()
+                .min_pinned_lsn
+                .store(value, Ordering::Release);
+        }
+    }
+
     /// Returns a copy of the configuration
     pub fn config(&self) -> Config {
         self.config.read().unwrap().clone()
@@ -2152,6 +2987,7 @@ impl MVCCEngine {
 
     /// Updates the engine configuration
     pub fn update_engine_config(&self, config: Config) -> Result<()> {
+        self.ensure_writable()?;
         let current = self.config.read().unwrap();
         if config.path != current.path {
             return Err(Error::internal("cannot change database path after opening"));
@@ -2423,21 +3259,111 @@ impl MVCCEngine {
         self.loading_from_disk.load(Ordering::Acquire)
     }
 
-    /// Record a DDL operation to WAL
+    /// Record a DDL operation to WAL and publish the marker LSN to
+    /// `db.shm` so reader processes' WAL-tail can observe the new
+    /// DDL via the same `visible_commit_lsn` watermark they already
+    /// poll.
     fn record_ddl(&self, table_name: &str, op: WALOperationType, schema_data: &[u8]) -> Result<()> {
         if self.should_skip_wal() {
             return Ok(());
         }
+        // Defense in depth: ensure_writable() guards public DDL
+        // helpers, but record_ddl is reached from internal callers
+        // (rerecord_ddl_to_wal in the checkpoint cycle, the
+        // record_create_index / alter / truncate helpers) and from
+        // already-open transactions that bypassed the begin-time
+        // check. Refuse here so no DDL LSN is ever published after
+        // the catastrophic-failure latch, recovery will discard
+        // the markerless transaction, and any DDL that landed after
+        // it would diverge live state from on-disk state.
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "record_ddl refused: engine is in the catastrophic-failure \
+                 state from a prior commit's marker write failure. Restart \
+                 the process; recovery will discard markerless transactions.",
+            ));
+        }
         if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
-                pm.record_ddl_operation(table_name, op, schema_data)?;
+                // Hold pending_marker_lsns across BOTH DDL entry append AND its commit
+                // marker append; otherwise a concurrent commit could publish a
+                // visible_commit_lsn between them and a SWMR reader would skip the DDL.
+                // Release before publish_visible_commit_lsn_local (re-acquires same lock).
+                let lsn = {
+                    let _gate = self.pending_marker_lsns.lock();
+                    pm.record_ddl_operation(table_name, op, schema_data)?
+                };
+                self.publish_visible_commit_lsn_local(lsn);
             }
         }
         Ok(())
     }
 
+    /// DDL-side equivalent of EngineOperations::publish_visible_commit_lsn.
+    /// CRITICAL: store oldest_active BEFORE visible_commit_lsn (Release-Acquire
+    /// pairing) so readers don't observe new visible with stale high watermark.
+    fn publish_visible_commit_lsn_local(&self, lsn: u64) {
+        if lsn == 0 {
+            return;
+        }
+        // DDL auto-commits inline, so doesn't add to pending_marker_lsns; just bumps
+        // max_written_marker_lsn. Hold pending across bump+compute so concurrent
+        // commits can't interleave.
+        let safe_visible = {
+            let pending = self.pending_marker_lsns.lock();
+            self.max_written_marker_lsn.fetch_max(lsn, Ordering::AcqRel);
+            if let Some(&min_pending) = pending.iter().next() {
+                min_pending.saturating_sub(1)
+            } else {
+                self.max_written_marker_lsn.load(Ordering::Acquire)
+            }
+        };
+        if safe_visible == 0 {
+            return;
+        }
+        let publish_lsn = cap_visible_lsn_by_flushed(&self.persistence, safe_visible);
+        if publish_lsn == 0 {
+            return;
+        }
+        let shm = self.shm.lock().unwrap();
+        if let Some(handle) = shm.as_ref() {
+            // shm_publish_lock serializes the seqlock pair (odd -> stores -> even).
+            let _publish_guard = self.shm_publish_lock.lock();
+            // Skip when no progress: an unconditional oldest store could overwrite
+            // the floor with a higher value, letting readers skip in-flight DML.
+            if publish_lsn <= handle.header().visible_commit_lsn.load(Ordering::Acquire) {
+                return;
+            }
+            // Seqlock publish: bump to ODD BEFORE the field
+            // stores so a concurrent reader sample observes
+            // "publish in progress" and retries. Then store both
+            // fields. Then bump to EVEN AFTER both stores, the
+            // pair is now coherent for reader sampling. See
+            // `ShmHeader::publish_seq` doc for why "bump-after-
+            // only" admits a torn read.
+            handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+            // Store watermark FIRST.
+            if let Some(pm) = self.persistence.as_ref().as_ref() {
+                if let Some(wal) = pm.wal() {
+                    handle
+                        .header()
+                        .oldest_active_txn_lsn
+                        .store(wal.oldest_active_txn_lsn(), Ordering::Release);
+                }
+            }
+            // Then visible_commit_lsn, readers Acquire-loading
+            // this also see the watermark store above.
+            handle
+                .header()
+                .visible_commit_lsn
+                .fetch_max(publish_lsn, Ordering::AcqRel);
+            // Bump to EVEN: publish complete, pair is coherent.
+            handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     /// Serialize a schema to binary format for WAL
-    pub fn serialize_schema(schema: &Schema) -> Vec<u8> {
+    pub(crate) fn serialize_schema(schema: &Schema) -> Vec<u8> {
         let mut buf = Vec::new();
 
         // Table name
@@ -2522,24 +3448,14 @@ impl MVCCEngine {
         buf
     }
 
-    /// Returns all table names (lowercase) currently in the engine
-    pub fn get_all_table_names(&self) -> Vec<String> {
-        self.schemas.read().unwrap().keys().cloned().collect()
-    }
-
-    /// Returns all schemas currently in the engine (CompactArc ref-count bump only)
-    pub fn get_all_schemas(&self) -> Vec<crate::common::CompactArc<Schema>> {
-        self.schemas.read().unwrap().values().cloned().collect()
-    }
-
     /// Get a table handle for an existing transaction by txn_id.
     /// This allows FK enforcement to participate in the caller's transaction,
     /// ensuring CASCADE effects are atomic and uncommitted rows are visible.
-    pub fn get_table_for_txn(
+    pub(crate) fn get_table_for_txn(
         &self,
         txn_id: i64,
         table_name: &str,
-    ) -> Result<Box<dyn crate::storage::traits::Table>> {
+    ) -> Result<Box<dyn crate::storage::traits::WriteTable>> {
         EngineOperations::new(self).get_table_for_transaction(txn_id, table_name)
     }
 
@@ -2547,7 +3463,7 @@ impl MVCCEngine {
     /// Uses a cached reverse mapping that is rebuilt only when schema_epoch changes.
     /// Returns Arc-wrapped Vec for zero-copy sharing (ref-count bump only).
     /// Zero cost for databases without FK constraints.
-    pub fn find_referencing_fks(
+    pub(crate) fn find_referencing_fks(
         &self,
         parent_table: &str,
     ) -> Arc<Vec<(String, ForeignKeyConstraint)>> {
@@ -2603,9 +3519,16 @@ impl MVCCEngine {
 
     /// Creates a new table
     pub fn create_table(&self, schema: Schema) -> Result<Schema> {
+        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
+
+        // SH transactional_ddl_fence: blocks concurrent checkpoint from snapshotting
+        // the transient catalog (in-memory inserts done before record_ddl).
+        // read_recursive: reachable via CTAS while the txn already holds the
+        // fence SH; plain read() would deadlock behind a parked checkpoint EX.
+        let _ddl_fence_guard = self.transactional_ddl_fence.read_recursive();
 
         let table_name = schema.table_name_lower.clone();
 
@@ -2625,26 +3548,51 @@ impl MVCCEngine {
         // Prepare WAL data before locks (avoids holding lock during serialization)
         let schema_data = Self::serialize_schema(&schema);
 
-        // Atomically check-and-insert under write lock to prevent TOCTOU race
+        // Atomic check-and-insert under schemas write lock (same schemas->pending
+        // lock order DROP follows) prevents TOCTOU with a concurrent DROP.
         let return_schema = schema.clone();
         {
             let mut schemas = self.schemas.write().unwrap();
             if schemas.contains_key(&table_name) {
                 return Err(Error::TableAlreadyExists(table_name.to_string()));
             }
+            // Pending DROP must not allow same-name CREATE to inherit the leftover manifest.
+            if self.pending_drop_cleanups.lock().contains(&table_name) {
+                return Err(Error::internal(format!(
+                    "CREATE TABLE refused: a prior DROP/TRUNCATE for '{}' is still \
+                     pending physical cleanup (live cross-process readers, or a \
+                     cleanup I/O failure). Wait for the orphan sweep to drain \
+                     before recreating the table.",
+                    table_name
+                )));
+            }
             schemas.insert(table_name.clone(), CompactArc::new(schema));
         }
         {
             let mut stores = self.version_stores.write().unwrap();
-            stores.insert(table_name, version_store);
+            stores.insert(table_name.clone(), version_store);
         }
 
-        // Record DDL to WAL only after successful insertion
-        self.record_ddl(
+        // Roll back in-memory insert on WAL failure (otherwise table appears in this
+        // process but vanishes on restart).
+        if let Err(e) = self.record_ddl(
             &return_schema.table_name,
             WALOperationType::CreateTable,
             &schema_data,
-        )?;
+        ) {
+            let mut stores = self.version_stores.write().unwrap();
+            if let Some(store) = stores.remove(&table_name) {
+                store.close();
+            }
+            drop(stores);
+            let mut schemas = self.schemas.write().unwrap();
+            schemas.remove(&table_name);
+            drop(schemas);
+            // Bump epoch on revert too: a concurrent reader may have cached against
+            // the transient table; that stale cache must not survive revert.
+            self.schema_epoch.fetch_add(1, Ordering::Release);
+            return Err(e);
+        }
 
         // Increment schema epoch for cache invalidation
         self.schema_epoch.fetch_add(1, Ordering::Release);
@@ -2654,40 +3602,108 @@ impl MVCCEngine {
 
     /// Drops a table
     pub fn drop_table_internal(&self, name: &str) -> Result<()> {
+        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
 
+        // SH transactional_ddl_fence: prevents checkpoint from interleaving with this
+        // DROP's schemas-remove + record_ddl (would leave catalog without DropTable record).
+        // read_recursive: an api::Transaction on this thread may hold the fence SH.
+        let _ddl_fence_guard = self.transactional_ddl_fence.read_recursive();
+
         let table_name = name.to_lowercase();
 
-        // Atomically remove schema AND strip FK references under single write lock.
-        // This prevents a race where find_referencing_fks reads stale state between
-        // schema removal and FK stripping.
+        // Snapshot pre-drop state for revert on WAL failure (otherwise DROP "succeeds"
+        // in-memory but reappears on restart).
+        let pre_schema_for_revert: Option<CompactArc<Schema>>;
+        let mut pre_child_schemas: Vec<(String, CompactArc<Schema>)> = Vec::new();
+        // Atomic schemas-remove + FK strip + pending_drop_cleanups insert under one
+        // schemas write lock. Lock order: schemas FIRST, pending SECOND.
         {
             let mut schemas = self.schemas.write().unwrap();
             if !schemas.contains_key(&table_name) {
                 return Err(Error::TableNotFound(table_name.to_string()));
             }
+            pre_schema_for_revert = schemas.get(&table_name).cloned();
+            // Snapshot child schemas that reference us (for revert).
+            for (name, sch) in schemas.iter() {
+                if sch
+                    .foreign_keys
+                    .iter()
+                    .any(|fk| fk.referenced_table == table_name)
+                {
+                    pre_child_schemas.push((name.clone(), sch.clone()));
+                }
+            }
+            // Mark dropping BEFORE removing schema (concurrent CREATE sees pending entry).
+            self.pending_drop_cleanups.lock().insert(table_name.clone());
             schemas.remove(&table_name);
 
-            // Strip FK constraints from child tables that referenced the dropped table.
-            // Done under the same schemas write lock for atomicity.
             let version_stores = self.version_stores.read().unwrap();
             strip_fk_references(&mut schemas, &version_stores, &table_name);
         }
 
-        // Close and remove version store
-        {
+        let removed_store: Option<Arc<VersionStore>> = {
             let mut stores = self.version_stores.write().unwrap();
-            if let Some(store) = stores.remove(&table_name) {
-                store.close();
-            }
-        }
+            stores.remove(&table_name)
+        };
+        // Defer store.close() until WAL succeeds (revert needs it serving reads).
 
         // WAL FIRST: record the drop before deleting segment files.
         // If crash happens after WAL but before file deletion, WAL replay
         // will re-execute the drop. Orphan files are harmless.
-        self.record_ddl(name, WALOperationType::DropTable, &[])?;
+        if let Err(e) = self.record_ddl(name, WALOperationType::DropTable, &[]) {
+            // Revert in-memory state in reverse order of removal.
+            if let Some(store) = removed_store {
+                let mut stores = self.version_stores.write().unwrap();
+                stores.insert(table_name.clone(), store);
+            }
+            let mut schemas = self.schemas.write().unwrap();
+            if let Some(prior) = pre_schema_for_revert {
+                schemas.insert(table_name.clone(), prior);
+            }
+            // Clear the "drop in progress" mark we
+            // optimistically deposited above. The DROP
+            // never reached durability, so a same-name
+            // CREATE TABLE that arrives after this revert
+            // must be allowed to proceed.
+            self.pending_drop_cleanups.lock().remove(&table_name);
+            // Restore each child schema in BOTH the schemas
+            // catalog and the child's VersionStore. Without
+            // restoring the VS schema, later table handles
+            // observe a schema that no longer matches the
+            // restored catalog (the FK constraint is back in
+            // `schemas` but the VS still has it stripped),
+            // causing FK enforcement and serialization to
+            // disagree. Acquire version_stores read once
+            // outside the loop to keep lock ordering stable.
+            let stores_for_revert = self.version_stores.read().unwrap();
+            for (cname, csch) in pre_child_schemas {
+                if let Some(vs) = stores_for_revert.get(cname.as_str()) {
+                    *vs.schema_mut() = csch.clone();
+                }
+                schemas.insert(cname, csch);
+            }
+            drop(stores_for_revert);
+            drop(schemas);
+            // Bump schema_epoch on the failure-revert path.
+            // The catalog spent the WAL-write window in its
+            // dropped state (parent removed, child FKs
+            // stripped), so a concurrent reader may have
+            // rebuilt `fk_reverse_cache` against THAT view
+            // and stamped it with the still-current epoch.
+            // Without this bump that stale cache survives
+            // the revert and reports the parent as having no
+            // referencing FKs.
+            self.schema_epoch.fetch_add(1, Ordering::Release);
+            return Err(e);
+        }
+
+        // WAL succeeded, close the now-orphaned VersionStore.
+        if let Some(store) = removed_store {
+            store.close();
+        }
 
         // Clear in-memory segment state
         {
@@ -2697,22 +3713,40 @@ impl MVCCEngine {
             }
             mgrs.remove(&table_name);
         }
-        // Delete volume files from disk
+        // Defer volume cleanup when readers may hold stale manifest pointers.
+        // pending_drop_cleanups blocks WAL truncation past DropTable record until
+        // sweep_orphan_table_dirs confirms the directory is gone.
+        // Bump schema_epoch BEFORE fallible cleanup: catalog is already durable, caches
+        // stamped under the old epoch are stale regardless of unlink success.
+        self.schema_epoch.fetch_add(1, Ordering::Release);
+
         if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
                 let vol_dir = pm.path().join("volumes");
-                let _ = crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_name);
+                let defer = self.defer_for_live_readers();
+                if let Err(e) = crate::storage::volume::io::delete_table_volumes_when_safe(
+                    &vol_dir,
+                    &table_name,
+                    defer,
+                ) {
+                    self.pending_drop_cleanups.lock().insert(table_name.clone());
+                    return Err(e);
+                }
+                if !defer {
+                    self.pending_drop_cleanups.lock().remove(&table_name);
+                }
+            } else {
+                self.pending_drop_cleanups.lock().remove(&table_name);
             }
+        } else {
+            self.pending_drop_cleanups.lock().remove(&table_name);
         }
-
-        // Increment schema epoch for cache invalidation
-        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
 
     /// Gets a version store for a table
-    pub fn get_version_store(&self, name: &str) -> Result<Arc<VersionStore>> {
+    pub(crate) fn get_version_store(&self, name: &str) -> Result<Arc<VersionStore>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2734,6 +3768,7 @@ impl MVCCEngine {
         data_type: DataType,
         nullable: bool,
     ) -> Result<()> {
+        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2799,6 +3834,7 @@ impl MVCCEngine {
         default_expr: Option<String>,
         vector_dimensions: u16,
     ) -> Result<()> {
+        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2853,12 +3889,17 @@ impl MVCCEngine {
         // Increment schema epoch for cache invalidation
         self.schema_epoch.fetch_add(1, Ordering::Release);
 
+        // Stamp the table's segment manager so a no-shm
+        // reader's drift check sees this ADD COLUMN even when
+        // no new segment is produced. See `propagate_schema_bump`.
+        self.propagate_schema_bump(table_name);
+
         Ok(())
     }
 
     /// Refresh the engine's schema cache for a table from the version store
     /// This is used after DDL operations that modify the table's schema directly
-    pub fn refresh_schema_cache(&self, table_name: &str) -> Result<()> {
+    pub(crate) fn refresh_schema_cache(&self, table_name: &str) -> Result<()> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2959,14 +4000,17 @@ impl MVCCEngine {
 
     /// Register a frozen volume with a specific segment ID.
     /// Used during startup to restore stable IDs from volume filenames,
-    /// ensuring .dv files match their segments across restarts.
+    /// ensuring .dv files match their segments across restarts. Recovery
+    /// callers leave `visible_at_lsn` at 0 (= "visible to all readers"):
+    /// the segment existed before this engine opened, so any reader
+    /// attaching now should see it.
     fn register_volume_with_id(
         &self,
         table_name: &str,
         volume: Arc<crate::storage::volume::writer::FrozenVolume>,
         seg_id: u64,
     ) {
-        self.register_volume_with_id_and_seal_seq(table_name, volume, seg_id, 0);
+        self.register_volume_with_id_and_seal_seq(table_name, volume, seg_id, 0, 0);
     }
 
     fn register_volume_with_id_and_seal_seq(
@@ -2975,6 +4019,7 @@ impl MVCCEngine {
         volume: Arc<crate::storage::volume::writer::FrozenVolume>,
         seg_id: u64,
         seal_seq: u64,
+        visible_at_lsn: u64,
     ) {
         use crate::storage::volume::manifest::SegmentMeta;
         let mgr = self.get_or_create_segment_manager(table_name);
@@ -2995,87 +4040,175 @@ impl MVCCEngine {
                 creation_lsn: 0,
                 seal_seq,
                 schema_version: self.schema_epoch.load(Ordering::Acquire),
+                // visible_at_lsn=0 means visible-to-all (recovery); seal/compact pass
+                // current WAL LSN so capped readers don't see post-attach segments.
+                visible_at_lsn,
             },
             None,
         );
     }
 
-    /// Load manifests from the volumes/ directory for checkpoint-to-volume recovery.
-    ///
-    /// This is called during startup when no snapshot files exist but volumes/ has
-    /// manifest.bin files from a previous checkpoint cycle. Loads manifest metadata
-    /// (segment list, tombstones, checkpoint_lsn) into segment managers so that:
-    /// - WAL replay can check `is_row_id_in_volume_range()` for tombstone creation
-    /// - The minimum checkpoint_lsn determines where WAL replay starts
-    ///
-    /// Returns the minimum checkpoint_lsn across all loaded manifests (0 if none found).
-    /// Actual .vol files are loaded later by `load_standalone_volumes()` after WAL replay
-    /// creates the required schemas and version stores.
-    fn load_manifests_from_volumes(&self) -> u64 {
+    /// Load manifests for checkpoint-to-volume recovery. Returns min checkpoint_lsn
+    /// (0 if none). Actual .vol files are loaded by load_standalone_volumes after replay.
+    /// Errors only on read-only opens that can't reach a consistent manifest view.
+    fn load_manifests_from_volumes(&self) -> Result<u64> {
         let pm = match self.persistence.as_ref() {
             Some(pm) if pm.is_enabled() => pm,
-            _ => return 0,
+            _ => return Ok(0),
         };
 
         let vol_dir = pm.path().join("volumes");
         if !vol_dir.exists() {
-            return 0;
+            return Ok(0);
         }
 
-        let entries = match std::fs::read_dir(&vol_dir) {
-            Ok(e) => e,
-            Err(_) => return 0,
-        };
+        let read_only_open = self.is_read_only_mode();
+        let max_attempts = if read_only_open { 200 } else { 1 };
 
-        let mut min_checkpoint_lsn: u64 = u64::MAX;
-        let mut any_loaded = false;
+        for attempt in 0..max_attempts {
+            let entries = match std::fs::read_dir(&vol_dir) {
+                Ok(e) => e,
+                Err(_) => return Ok(0),
+            };
 
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                continue;
-            }
+            let mut min_checkpoint_lsn: u64 = u64::MAX;
+            let mut observed_checkpoint_min: u64 = u64::MAX;
+            let mut observed_checkpoint_max: u64 = 0;
+            let mut any_loaded = false;
+            let mut staged: Vec<(
+                String,
+                Arc<crate::storage::volume::manifest::SegmentManager>,
+            )> = Vec::new();
 
-            let table_name = entry.file_name().to_string_lossy().to_lowercase();
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                    continue;
+                }
 
-            // Try to load manifest from this table directory
-            match crate::storage::volume::manifest::SegmentManager::load_from_disk(
-                &table_name,
-                &vol_dir,
-            ) {
-                Ok(Some(mgr)) => {
-                    let lsn = mgr.manifest().checkpoint_lsn;
-                    if lsn > 0 && lsn < min_checkpoint_lsn {
-                        min_checkpoint_lsn = lsn;
+                let table_name = entry.file_name().to_string_lossy().to_lowercase();
+
+                // Try to load manifest from this table directory.
+                match crate::storage::volume::manifest::SegmentManager::load_from_disk(
+                    &table_name,
+                    &vol_dir,
+                ) {
+                    Ok(Some(mgr)) => {
+                        let manifest_lsn = mgr.manifest().checkpoint_lsn;
+                        observed_checkpoint_min = observed_checkpoint_min.min(manifest_lsn);
+                        observed_checkpoint_max = observed_checkpoint_max.max(manifest_lsn);
+
+                        // Capped read-only: hide post-attach segments (shm sample races
+                        // writer checkpoint; cold rows mustn't outpace replay cap).
+                        let cap = self
+                            .replay_cap_lsn
+                            .load(std::sync::atomic::Ordering::Acquire);
+                        if cap != u64::MAX {
+                            mgr.retain_segments_visible_at_or_below(cap);
+                        }
+                        // Effective replay floor: uncapped uses checkpoint_lsn directly.
+                        // Capped read-only with checkpoint > cap must use MAX visible_at_lsn
+                        // of kept segments (otherwise replay_two_phase_capped(floor, cap)
+                        // becomes empty and drops rows in (max_kept, cap]).
+                        if cap != u64::MAX && manifest_lsn > cap {
+                            // kept_max==0 means every segment was filtered; need full WAL
+                            // replay from 0 (dominates any positive floor from other tables).
+                            let kept_max = mgr
+                                .manifest()
+                                .segments
+                                .iter()
+                                .map(|s| s.visible_at_lsn)
+                                .max()
+                                .unwrap_or(0);
+                            if kept_max == 0 {
+                                min_checkpoint_lsn = 0;
+                            } else if kept_max < min_checkpoint_lsn {
+                                min_checkpoint_lsn = kept_max;
+                            }
+                        } else if manifest_lsn > 0 && manifest_lsn < min_checkpoint_lsn {
+                            // Uncapped / writable open: keep the
+                            // historical "skip 0" semantic to avoid
+                            // regressing writable recovery, a
+                            // manifest at `checkpoint_lsn = 0` here
+                            // means "no prior checkpoint info" rather
+                            // than "must replay from 0".
+                            min_checkpoint_lsn = manifest_lsn;
+                        }
+                        any_loaded = true;
+                        staged.push((table_name, Arc::new(mgr)));
                     }
-                    any_loaded = true;
-
-                    // Store the segment manager so WAL replay can use
-                    // is_row_id_in_volume_range() for tombstone creation.
-                    let mut mgrs = self.segment_managers.write().unwrap();
-                    mgrs.insert(table_name, Arc::new(mgr));
-                }
-                Ok(None) => {
-                    // No manifest.bin in this directory, skip
-                }
-                Err(e) => {
-                    eprintln!("Warning: Failed to load manifest for {}: {}", table_name, e);
+                    Ok(None) => {
+                        // No manifest.bin in this directory, skip.
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: Failed to load manifest for {}: {}", table_name, e);
+                    }
                 }
             }
+
+            if !any_loaded {
+                let checkpoint_path = pm.path().join("wal").join("checkpoint.meta");
+                if !read_only_open {
+                    // No manifests: drop checkpoint.meta to force full WAL replay.
+                    let _ = std::fs::remove_file(checkpoint_path);
+                    return Ok(0);
+                }
+                // Read-only must never unlink writer-owned state. A
+                // checkpoint.meta floor of 0 (absent, unreadable, or written
+                // by WAL rotation before any checkpoint) publishes no replay
+                // floor, so replay from 0 sees everything. A floor > 0 means
+                // a checkpoint published manifests we can't read yet (writer
+                // mid-first-checkpoint), so replay would skip entries whose
+                // data lives in volumes we can't load: retry until the
+                // manifests land, then fail rather than serve a torn view.
+                let published_floor =
+                    crate::storage::mvcc::wal_manager::CheckpointMetadata::read_from_file(
+                        &checkpoint_path,
+                    )
+                    .map(|c| c.lsn)
+                    .unwrap_or(0);
+                if published_floor == 0 {
+                    return Ok(0);
+                }
+                if attempt + 1 < max_attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                return Err(Error::SwmrPartialReload(
+                    "no readable table manifests despite an existing checkpoint.meta".to_string(),
+                ));
+            }
+
+            if read_only_open
+                && observed_checkpoint_min != u64::MAX
+                && observed_checkpoint_min != observed_checkpoint_max
+            {
+                if attempt + 1 < max_attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    continue;
+                }
+                // Mid-checkpoint window never closed. Fail instead of
+                // proceeding with a torn view (and never touch the writer's
+                // checkpoint.meta from a reader).
+                return Err(Error::SwmrPartialReload(format!(
+                    "mixed checkpoint_lsn range {}..{} across table manifests",
+                    observed_checkpoint_min, observed_checkpoint_max
+                )));
+            }
+
+            // Store managers so WAL replay can use is_row_id_in_volume_range for tombstones.
+            let mut mgrs = self.segment_managers.write().unwrap();
+            for (table_name, mgr) in staged {
+                mgrs.insert(table_name, mgr);
+            }
+
+            return Ok(if min_checkpoint_lsn == u64::MAX {
+                0
+            } else {
+                min_checkpoint_lsn
+            });
         }
 
-        if !any_loaded {
-            // No manifests found, remove checkpoint.meta if present
-            // to ensure full WAL replay
-            let checkpoint_path = pm.path().join("wal").join("checkpoint.meta");
-            let _ = std::fs::remove_file(checkpoint_path);
-            return 0;
-        }
-
-        if min_checkpoint_lsn == u64::MAX {
-            0
-        } else {
-            min_checkpoint_lsn
-        }
+        Ok(0)
     }
 
     /// Load standalone volumes from the volumes/ directory.
@@ -3200,6 +4333,25 @@ impl MVCCEngine {
             Err(_) => return,
         };
 
+        // Read-only opens must not unlink any .vol file: orphans may
+        // belong to a sibling writer's in-flight checkpoint, and a
+        // capped read-only attach legitimately filters out segments
+        // the writer published after our attach LSN (their .vol
+        // files are NOT orphans from the writer's perspective).
+        let read_only = self.is_read_only_mode();
+        // Writable startup ALSO defers orphan-volume unlinks
+        // when live read-only processes are still attached.
+        // The live DROP / TRUNCATE / compaction paths leave
+        // unreferenced .vol files on disk specifically so a
+        // reader's stale manifest can keep lazy-loading via
+        // `SegmentManager::ensure_volume`. Unconditionally
+        // unlinking here on writer restart would unlink the
+        // exact files the surviving reader needs (the
+        // writer's new manifest doesn't reference them, but
+        // the reader's pre-restart manifest does). Same
+        // fail-closed gating as the live cleanup paths.
+        let defer = self.defer_for_live_readers();
+
         for entry in entries.flatten() {
             if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
                 continue;
@@ -3221,14 +4373,18 @@ impl MVCCEngine {
                 // Orphan .vol files (from compaction or crash) are cleaned up
                 // without being deserialized.
                 if stable_id == 0 {
-                    let _ = std::fs::remove_file(&path);
+                    if !read_only && !defer {
+                        let _ = std::fs::remove_file(&path);
+                    }
                     continue;
                 }
                 if mgr.has_segment(stable_id) {
                     continue;
                 }
                 if !mgr.manifest_has_segment(stable_id) {
-                    let _ = std::fs::remove_file(&path);
+                    if !read_only && !defer {
+                        let _ = std::fs::remove_file(&path);
+                    }
                     continue;
                 }
 
@@ -3263,8 +4419,32 @@ impl MVCCEngine {
         }
     }
 
-    /// Sync auto-increment counters from segment data.
-    ///
+    /// After WAL replay, raise `schema_epoch` to the highest segment
+    /// `schema_version` across loaded manifests. Replay inserts schemas
+    /// directly without bumping the epoch; without this baseline the
+    /// SWMR drift check would flag already-replayed writer DDL.
+    fn sync_schema_epoch_from_segments(&self) {
+        let mgrs = self.segment_managers.read().unwrap();
+        if mgrs.is_empty() {
+            return;
+        }
+        let max_seen: u64 = mgrs
+            .values()
+            .flat_map(|mgr| {
+                mgr.manifest()
+                    .segments
+                    .iter()
+                    .map(|s| s.schema_version)
+                    .collect::<Vec<u64>>()
+            })
+            .max()
+            .unwrap_or(0);
+        // fetch_max so we never go BACKWARDS (an existing engine that
+        // already did DDL events past max_seen keeps its higher value).
+        self.schema_epoch
+            .fetch_max(max_seen, std::sync::atomic::Ordering::Release);
+    }
+
     /// After WAL replay, ensure auto-increment counters account for
     /// the max row_id in segments (which may be higher than hot buffer).
     /// Normal secondary indexes are NOT populated from cold data.
@@ -3313,6 +4493,7 @@ impl MVCCEngine {
 
     /// Drops a column from a table
     pub fn drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
+        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3370,6 +4551,7 @@ impl MVCCEngine {
 
     /// Renames a column in a table
     pub fn rename_column(&self, table_name: &str, old_name: &str, new_name: &str) -> Result<()> {
+        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3431,12 +4613,13 @@ impl MVCCEngine {
     }
 
     /// Record a column drop so old cold volumes don't leak stale data.
-    pub fn propagate_column_drop(&self, table_name: &str, col_name: &str) {
+    pub(crate) fn propagate_column_drop(&self, table_name: &str, col_name: &str) {
         let table_name_lower = table_name.to_lowercase();
         let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
         let current_epoch = self.schema_epoch.load(Ordering::Acquire);
         if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
             mgr.record_column_drop(col_name, current_epoch);
+            mgr.record_table_schema_version(current_epoch);
             if let Some(ref s) = schema {
                 mgr.invalidate_mappings(s);
             }
@@ -3445,14 +4628,31 @@ impl MVCCEngine {
 
     /// Record a column rename and propagate alias to all cold volumes.
     /// Persists in the manifest so aliases survive restart.
-    pub fn propagate_column_alias(&self, table_name: &str, new_name: &str, old_name: &str) {
+    pub(crate) fn propagate_column_alias(&self, table_name: &str, new_name: &str, old_name: &str) {
         let table_name_lower = table_name.to_lowercase();
         let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
+        let current_epoch = self.schema_epoch.load(Ordering::Acquire);
         if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
             mgr.record_column_rename(old_name, new_name);
+            mgr.record_table_schema_version(current_epoch);
             if let Some(ref s) = schema {
                 mgr.invalidate_mappings(s);
             }
+        }
+    }
+
+    /// Stamp the table's segment manager with the current
+    /// `schema_epoch`. Called by ADD/MODIFY COLUMN paths that
+    /// don't otherwise touch the segment manager. Without this,
+    /// a no-shm reader's `peek_schema_drift` would not detect
+    /// these DDLs (they don't produce a new segment, don't
+    /// touch dropped_columns/column_renames, and don't reach
+    /// `propagate_column_drop`/`propagate_column_alias`).
+    pub(crate) fn propagate_schema_bump(&self, table_name: &str) {
+        let table_name_lower = table_name.to_lowercase();
+        let current_epoch = self.schema_epoch.load(Ordering::Acquire);
+        if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
+            mgr.record_table_schema_version(current_epoch);
         }
     }
 
@@ -3464,6 +4664,7 @@ impl MVCCEngine {
         data_type: DataType,
         nullable: bool,
     ) -> Result<()> {
+        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3511,12 +4712,17 @@ impl MVCCEngine {
         // Increment schema epoch for cache invalidation
         self.schema_epoch.fetch_add(1, Ordering::Release);
 
+        // Stamp the table's segment manager so a no-shm
+        // reader's drift check sees this MODIFY COLUMN even when
+        // no new segment is produced.
+        self.propagate_schema_bump(table_name);
+
         Ok(())
     }
 
     /// Modifies a column's type, nullable, and vector dimensions
     /// Used by WAL replay to restore ALTER TABLE MODIFY COLUMN with full dimension info
-    pub fn modify_column_with_dimensions(
+    pub(crate) fn modify_column_with_dimensions(
         &self,
         table_name: &str,
         column_name: &str,
@@ -3572,11 +4778,151 @@ impl MVCCEngine {
         // Increment schema epoch for cache invalidation
         self.schema_epoch.fetch_add(1, Ordering::Release);
 
+        // Stamp the table's segment manager so a no-shm
+        // reader's drift check sees this MODIFY COLUMN even when
+        // no new segment is produced.
+        self.propagate_schema_bump(table_name);
+
         Ok(())
     }
 
-    /// Renames a table
+    /// Restore table's schema verbatim from pre-mutation snapshot. Bypasses failed
+    /// latch (latch was set by the failure we're reverting from). Used by ALTER
+    /// column-revert paths to preserve every field exactly.
+    pub(crate) fn restore_table_schema(&self, table_name: &str, pre_schema: Schema) -> Result<()> {
+        let table_name_lower = table_name.to_lowercase();
+        {
+            let stores = self.version_stores.read().unwrap();
+            let store = stores
+                .get(&table_name_lower)
+                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
+            let mut vs_schema_guard = store.schema_mut();
+            *vs_schema_guard = crate::common::CompactArc::new(pre_schema);
+        }
+        // refresh_schema_cache bumps schema_epoch.
+        self.refresh_schema_cache(&table_name_lower)
+    }
+
+    /// Revert a rename when record_alter_table_rename failed mid-flight. Bypasses
+    /// gates; ONLY for ALTER TABLE RENAME revert path.
+    pub(crate) fn rename_table_revert(&self, current_name: &str, target_name: &str) -> Result<()> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+
+        let old_name_lower = current_name.to_lowercase();
+        let new_name_lower = target_name.to_lowercase();
+        self.do_rename_table_unchecked(&old_name_lower, &new_name_lower, target_name)
+    }
+
+    /// Shared rename body: in-memory + on-disk dir rename with revert-on-failure.
+    fn do_rename_table_unchecked(
+        &self,
+        old_name_lower: &str,
+        new_name_lower: &str,
+        new_name_display: &str,
+    ) -> Result<()> {
+        // Atomically check-and-rename under write lock to prevent TOCTOU race
+        {
+            let mut schemas = self.schemas.write().unwrap();
+            if !schemas.contains_key(old_name_lower) {
+                return Err(Error::TableNotFound(old_name_lower.to_string()));
+            }
+            if schemas.contains_key(new_name_lower) {
+                return Err(Error::TableAlreadyExists(new_name_lower.to_string()));
+            }
+            if let Some(mut schema_arc) = schemas.remove(old_name_lower) {
+                let schema = CompactArc::make_mut(&mut schema_arc);
+                schema.table_name = new_name_display.to_string();
+                schema.table_name_lower = new_name_lower.to_string();
+                schemas.insert(new_name_lower.to_string(), schema_arc);
+            }
+        }
+
+        // Update version_stores map
+        {
+            let mut stores = self.version_stores.write().unwrap();
+            if let Some(store) = stores.remove(old_name_lower) {
+                {
+                    let mut vs_schema_guard = store.schema_mut();
+                    let schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                    schema.table_name = new_name_display.to_string();
+                    schema.table_name_lower = new_name_lower.to_string();
+                }
+                stores.insert(new_name_lower.to_string(), store);
+            }
+        }
+
+        // Move segment manager to new name and update its manifest table_name
+        {
+            let mut mgrs = self.segment_managers.write().unwrap();
+            if let Some(mgr) = mgrs.remove(old_name_lower) {
+                mgr.manifest_mut().table_name = crate::common::SmartString::from(new_name_lower);
+                mgrs.insert(new_name_lower.to_string(), mgr);
+            }
+        }
+        // Rename on-disk volume directory so it survives restart
+        if let Some(ref pm) = *self.persistence {
+            if pm.is_enabled() {
+                let vol_dir = pm.path().join("volumes");
+                let old_dir = vol_dir.join(old_name_lower);
+                let new_dir = vol_dir.join(new_name_lower);
+                if old_dir.exists() {
+                    if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                        // Revert in-memory renames on disk failure
+                        let mut mgrs = self.segment_managers.write().unwrap();
+                        if let Some(mgr) = mgrs.remove(new_name_lower) {
+                            mgr.manifest_mut().table_name =
+                                crate::common::SmartString::from(old_name_lower);
+                            mgrs.insert(old_name_lower.to_string(), mgr);
+                        }
+                        drop(mgrs);
+                        let mut stores = self.version_stores.write().unwrap();
+                        if let Some(store) = stores.remove(new_name_lower) {
+                            {
+                                let mut vs_schema_guard = store.schema_mut();
+                                let schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                                schema.table_name = old_name_lower.to_string();
+                                schema.table_name_lower = old_name_lower.to_string();
+                            }
+                            stores.insert(old_name_lower.to_string(), store);
+                        }
+                        drop(stores);
+                        let mut schemas = self.schemas.write().unwrap();
+                        if let Some(mut schema_arc) = schemas.remove(new_name_lower) {
+                            let schema = CompactArc::make_mut(&mut schema_arc);
+                            schema.table_name = old_name_lower.to_string();
+                            schema.table_name_lower = old_name_lower.to_string();
+                            schemas.insert(old_name_lower.to_string(), schema_arc);
+                        }
+                        return Err(Error::internal(format!(
+                            "failed to rename volume directory: {}",
+                            e
+                        )));
+                    }
+                }
+                // Move legacy snapshots/<old>/tombstones.dat to
+                // snapshots/<new>/tombstones.dat. The original
+                // pub `rename_table` does this; the unchecked
+                // helper must match so a revert doesn't leave
+                // tombstones under the failed name. Best-effort,
+                // missing source is fine (no legacy tombstones).
+                let snap_dir = pm.path().join("snapshots");
+                let old_ts = snap_dir.join(old_name_lower).join("tombstones.dat");
+                let new_ts_dir = snap_dir.join(new_name_lower);
+                let new_ts = new_ts_dir.join("tombstones.dat");
+                if old_ts.exists() {
+                    let _ = std::fs::create_dir_all(&new_ts_dir);
+                    let _ = std::fs::rename(&old_ts, &new_ts);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
+        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3724,9 +5070,21 @@ impl MVCCEngine {
     pub fn create_view(&self, name: &str, query: String, if_not_exists: bool) -> Result<()> {
         use crate::storage::mvcc::wal_manager::WALOperationType;
 
+        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
+
+        // Hold SH on `transactional_ddl_fence` across the
+        // mutation-to-WAL window, same rationale as
+        // `create_table`. Without this guard a checkpoint
+        // that landed mid-window could snapshot the
+        // transient view in `rerecord_ddl_to_wal` and emit a
+        // CreateView re-record that survives recovery even
+        // if the original `record_ddl` later fails and the
+        // rollback removes the view from memory.
+        // read_recursive: the txn may already hold the fence SH.
+        let _ddl_fence_guard = self.transactional_ddl_fence.read_recursive();
 
         let name_lower = name.to_lowercase();
 
@@ -3759,9 +5117,17 @@ impl MVCCEngine {
         // Release the lock before recording to WAL
         drop(views);
 
-        // Record to WAL for persistence
+        // Record to WAL for persistence. Roll back the
+        // in-memory insert if `record_ddl` fails (catastrophic-
+        // failure latch tripped or WAL I/O failed). Without
+        // rollback the view stays visible in this process while
+        // restart's WAL recovery would not replay it, a CREATE
+        // VIEW that succeeded then "vanishes" on next restart.
         let data = view_def.serialize();
-        self.record_ddl(&name_lower, WALOperationType::CreateView, &data)?;
+        if let Err(e) = self.record_ddl(&name_lower, WALOperationType::CreateView, &data) {
+            self.views.write().unwrap().remove(&name_lower);
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -3770,25 +5136,37 @@ impl MVCCEngine {
     pub fn drop_view(&self, name: &str, if_exists: bool) -> Result<()> {
         use crate::storage::mvcc::wal_manager::WALOperationType;
 
+        self.ensure_writable()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
 
+        // SH transactional_ddl_fence (same as drop_table_internal).
+        // read_recursive: the txn may already hold the fence SH.
+        let _ddl_fence_guard = self.transactional_ddl_fence.read_recursive();
+
         let name_lower = name.to_lowercase();
         let mut views = self.views.write().unwrap();
 
-        if views.remove(&name_lower).is_none() {
-            if if_exists {
-                return Ok(());
+        // Snapshot for revert on WAL failure (otherwise drop "succeeds" then reappears).
+        let removed_view = match views.remove(&name_lower) {
+            Some(v) => v,
+            None => {
+                if if_exists {
+                    return Ok(());
+                }
+                return Err(Error::ViewNotFound(name.to_string()));
             }
-            return Err(Error::ViewNotFound(name.to_string()));
-        }
+        };
 
         // Release the lock before recording to WAL
         drop(views);
 
         // Record to WAL for persistence (just the view name)
-        self.record_ddl(&name_lower, WALOperationType::DropView, name.as_bytes())?;
+        if let Err(e) = self.record_ddl(&name_lower, WALOperationType::DropView, name.as_bytes()) {
+            self.views.write().unwrap().insert(name_lower, removed_view);
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -3855,6 +5233,19 @@ impl MVCCEngine {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
+        // See `seal_hot_buffers`: backup walks parent VersionStores
+        // via `for_each_committed_version_with_cutoff` and would
+        // export markerless committed rows into the snapshot .bin
+        // files. A later restore would resurrect a commit the WAL
+        // never has a marker for.
+        if self.is_failed() {
+            return Err(Error::internal(
+                "backup snapshot refused: engine is in the catastrophic-failure \
+                 state (a prior commit's WAL marker write failed after some tables \
+                 were already committed). Restart the process; recovery will \
+                 converge by discarding the markerless transaction.",
+            ));
+        }
 
         let pm = match self.persistence.as_ref() {
             Some(pm) if pm.is_enabled() => pm,
@@ -3911,6 +5302,17 @@ impl MVCCEngine {
             }
         }
 
+        // Re-check failed: the wait can sit blocked while a failing commit drains
+        // markerless rows AND calls complete_commit, putting its commit_seq within
+        // safe_snapshot_cutoff before mark_engine_failed fires.
+        if self.is_failed() {
+            return Err(Error::internal(
+                "backup snapshot refused: engine entered the catastrophic-failure \
+                 state during the in-flight-commit wait. Restart the process; \
+                 recovery will discard the markerless transaction.",
+            ));
+        }
+
         // No in-flight commits at this point. Capture tombstones FIRST, then
         // cutoff. The commit path ordering is: start_commit (alloc seq) →
         // commit_all_tables (apply tombstones). So any tombstone in the shared
@@ -3924,11 +5326,50 @@ impl MVCCEngine {
         let frozen_tombstones: ahash::AHashMap<String, Arc<FxHashMap<i64, u64>>> = {
             let mgrs = self.segment_managers.read().unwrap();
             mgrs.iter()
-                .map(|(name, mgr)| (name.clone(), mgr.tombstone_set_arc()))
+                .map(|(name, mgr)| {
+                    // Strip ephemeral (u64::MAX) tombstones from the
+                    // backup snapshot's skip-set. These are failed-
+                    // marker tombstones (record_commit IO failure
+                    // after partial commit) that exist only in-memory,
+                    // backing them up to a snapshot .bin file would
+                    // let a later restore physically drop cold rows
+                    // for a markerless commit.
+                    let live = mgr.tombstone_set_arc();
+                    let manifest = mgr.manifest();
+                    let ephemeral: rustc_hash::FxHashSet<i64> = manifest
+                        .tombstones
+                        .iter()
+                        .filter(|(_, _, vis)| *vis == u64::MAX)
+                        .map(|(rid, _, _)| *rid)
+                        .collect();
+                    let value = if ephemeral.is_empty() {
+                        live
+                    } else {
+                        let filtered: FxHashMap<i64, u64> = live
+                            .iter()
+                            .filter(|(rid, _)| !ephemeral.contains(rid))
+                            .map(|(&k, &v)| (k, v))
+                            .collect();
+                        Arc::new(filtered)
+                    };
+                    (name.clone(), value)
+                })
                 .collect()
         };
 
         let snapshot_commit_seq = self.registry.current_commit_sequence();
+
+        // Re-check failed AFTER cutoff sample: a commit can slip past the wait,
+        // markerless-fail, complete_commit at <= snapshot_commit_seq, then export
+        // markerless rows into the snapshot.
+        if self.is_failed() {
+            return Err(Error::internal(
+                "backup snapshot refused: engine entered the catastrophic-failure \
+                 state after the in-flight-commit wait, before snapshot capture. \
+                 Restart the process; recovery will discard the markerless \
+                 transaction.",
+            ));
+        }
 
         let schemas = self.schemas.read().unwrap();
         let stores = self.version_stores.read().unwrap();
@@ -4107,6 +5548,18 @@ impl MVCCEngine {
             pending_snapshots.push((temp_path, final_path, table_name.clone()));
         }
 
+        // Final latch recheck before any rename. Phase 1 wrote
+        // temp files; if a commit started after the cutoff sample
+        // and hit the marker-failure path between then and now,
+        // its parent-store rows landed in those temp files via
+        // for_each_committed_version_with_cutoff (its commit_seq
+        // was already in the cutoff at sample time). Renaming
+        // would make markerless data restorable. Refuse and let
+        // Phase 3 cleanup remove the temp files.
+        if self.is_failed() {
+            all_succeeded = false;
+        }
+
         // Phase 2: Atomic rename of all temp files
         let mut renamed_successfully: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
 
@@ -4230,11 +5683,6 @@ impl MVCCEngine {
                 }
                 Ok(())
             })();
-            if let Err(e) = ddl_result {
-                eprintln!("Warning: Failed to write DDL metadata: {}", e);
-                let _ = std::fs::remove_file(&ddl_tmp);
-            }
-
             // Write per-batch manifest listing all tables in this snapshot.
             // Used by CLI restore to select a complete, coherent snapshot set
             // instead of guessing from individual table directories.
@@ -4250,23 +5698,67 @@ impl MVCCEngine {
                 table_list
                     .iter()
                     .map(|t| {
-                        // Escape JSON-special characters in table names
                         let escaped = t.replace('\\', "\\\\").replace('"', "\\\"");
                         format!("\"{}\"", escaped)
                     })
                     .collect::<Vec<_>>()
                     .join(",")
             );
-            let manifest_result = (|| -> std::io::Result<()> {
-                let f = std::fs::File::create(&manifest_tmp)?;
-                std::io::Write::write_all(&mut &f, manifest_json.as_bytes())?;
-                f.sync_all()?;
-                std::fs::rename(&manifest_tmp, &manifest_path)?;
+            let manifest_result = if ddl_result.is_ok() {
+                (|| -> std::io::Result<()> {
+                    let f = std::fs::File::create(&manifest_tmp)?;
+                    std::io::Write::write_all(&mut &f, manifest_json.as_bytes())?;
+                    f.sync_all()?;
+                    std::fs::rename(&manifest_tmp, &manifest_path)?;
+                    #[cfg(not(windows))]
+                    if let Ok(dir) = std::fs::File::open(&snapshot_dir) {
+                        let _ = dir.sync_all();
+                    }
+                    Ok(())
+                })()
+            } else {
                 Ok(())
-            })();
-            if let Err(e) = manifest_result {
-                eprintln!("Warning: Failed to write snapshot manifest: {}", e);
-                let _ = std::fs::remove_file(&manifest_tmp);
+            };
+
+            // DDL + manifest are atomic batch members. Either failure rolls back
+            // (avoid manifest referencing missing ddl, or pruning live .bin files).
+            if ddl_result.is_err() || manifest_result.is_err() {
+                if let Err(e) = ddl_result {
+                    eprintln!("Failed to write DDL metadata for snapshot: {}", e);
+                }
+                if let Err(e) = manifest_result {
+                    eprintln!("Failed to write snapshot manifest: {}", e);
+                }
+                // Best-effort rollback; log per-file failures so users can correlate orphans.
+                let to_remove = [
+                    ("ddl tmp", ddl_tmp.clone()),
+                    ("ddl final", ddl_path.clone()),
+                    ("manifest tmp", manifest_tmp.clone()),
+                    ("manifest final", manifest_path.clone()),
+                ];
+                for (label, path) in &to_remove {
+                    if let Err(e) = std::fs::remove_file(path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            eprintln!(
+                                "Snapshot rollback: could not remove {} {:?}: {} (orphan may persist until Phase 6 prune).",
+                                label, path, e
+                            );
+                        }
+                    }
+                }
+                for (_, final_path, table_name) in &pending_snapshots {
+                    if let Err(e) = std::fs::remove_file(final_path) {
+                        if e.kind() != std::io::ErrorKind::NotFound {
+                            eprintln!(
+                                "Snapshot rollback: could not remove per-table snapshot for {} at {:?}: {} (orphan .bin may persist until cleanup_old_snapshots prunes).",
+                                table_name, final_path, e
+                            );
+                        }
+                    }
+                }
+                return Err(Error::internal(
+                    "snapshot creation failed: DDL or manifest write failed; new batch rolled back, older snapshots preserved",
+                ));
             }
         }
 
@@ -4356,10 +5848,28 @@ impl MVCCEngine {
     /// This is a destructive operation: all current data (hot buffer + volumes) is
     /// Restore indexes and views from a ddl.bin file saved by PRAGMA SNAPSHOT.
     /// Format: "SDDL" (4) + version (1) + index_count (u32) + entries + view_count (u32) + entries
-    fn restore_ddl_from_bin(&self, data: &[u8]) {
+    fn restore_ddl_from_bin(&self, data: &[u8]) -> Result<()> {
+        // Returns Err on ANY corruption (bad magic, CRC mismatch,
+        // truncation, decode failure, per-entry create failure).
+        // RESTORE depends on this output for correctness:
+        // UNIQUE / FK enforcement is driven from the restored
+        // indexes, silently skipping a corrupted entry would
+        // make RESTORE report success while leaving the
+        // database with missing constraints. Recovery cannot
+        // recover from this without operator intervention.
+
         // Minimum: magic(4) + version(1) + crc(4)
-        if data.len() < 9 || &data[0..4] != b"SDDL" {
-            return;
+        if data.len() < 9 {
+            return Err(Error::internal(format!(
+                "ddl.bin too short ({} bytes; minimum 9 for header + CRC)",
+                data.len()
+            )));
+        }
+        if &data[0..4] != b"SDDL" {
+            return Err(Error::internal(format!(
+                "ddl.bin bad magic (expected 'SDDL', got {:?})",
+                &data[0..4.min(data.len())]
+            )));
         }
 
         // Verify CRC32: last 4 bytes are checksum of everything before
@@ -4367,62 +5877,91 @@ impl MVCCEngine {
         let stored_crc = u32::from_le_bytes(data[data.len() - 4..].try_into().unwrap());
         let computed_crc = crc32fast::hash(payload);
         if stored_crc != computed_crc {
-            eprintln!("Warning: ddl.bin CRC mismatch, skipping DDL restore");
-            return;
+            return Err(Error::internal(format!(
+                "ddl.bin CRC mismatch (stored=0x{:08x}, computed=0x{:08x})",
+                stored_crc, computed_crc
+            )));
         }
 
         let mut pos = 5; // skip magic + version
 
         // Read indexes
         if pos + 4 > data.len() {
-            return;
+            return Err(Error::internal(
+                "ddl.bin truncated before index_count".to_string(),
+            ));
         }
         let index_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
         let stores = self.version_stores.read().unwrap();
-        for _ in 0..index_count {
+        for i in 0..index_count {
             if pos + 4 > data.len() {
-                break;
+                return Err(Error::internal(format!(
+                    "ddl.bin truncated before index {} length prefix",
+                    i
+                )));
             }
             let entry_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             if pos + entry_len > data.len() {
-                break;
+                return Err(Error::internal(format!(
+                    "ddl.bin truncated inside index {} payload (need {} bytes, \
+                     have {})",
+                    i,
+                    entry_len,
+                    data.len() - pos
+                )));
             }
             let entry_data = &data[pos..pos + entry_len];
             pos += entry_len;
 
-            if let Ok(meta) = super::persistence::IndexMetadata::deserialize(entry_data) {
-                let table_lower = meta.table_name.to_lowercase();
-                if let Some(store) = stores.get(&table_lower) {
-                    if let Err(e) = store.create_index_from_metadata_with_graph(&meta, false, None)
-                    {
-                        eprintln!(
-                            "Warning: Failed to recreate index '{}' on '{}': {}",
+            let meta = super::persistence::IndexMetadata::deserialize(entry_data).map_err(|e| {
+                Error::internal(format!("ddl.bin index {} decode failed: {}", i, e))
+            })?;
+            let table_lower = meta.table_name.to_lowercase();
+            if let Some(store) = stores.get(&table_lower) {
+                store
+                    .create_index_from_metadata_with_graph(&meta, false, None)
+                    .map_err(|e| {
+                        Error::internal(format!(
+                            "ddl.bin: failed to recreate index '{}' on '{}': {}",
                             meta.name, meta.table_name, e
-                        );
-                    }
-                }
+                        ))
+                    })?;
+            } else {
+                return Err(Error::internal(format!(
+                    "ddl.bin index '{}' references unknown table '{}' (snapshot \
+                     load may have skipped it)",
+                    meta.name, meta.table_name
+                )));
             }
         }
         drop(stores);
 
         // Read views
         if pos + 4 > data.len() {
-            return;
+            return Err(Error::internal(
+                "ddl.bin truncated before view_count".to_string(),
+            ));
         }
         let view_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
 
-        for _ in 0..view_count {
+        for i in 0..view_count {
             if pos + 4 > data.len() {
-                break;
+                return Err(Error::internal(format!(
+                    "ddl.bin truncated before view {} length prefix",
+                    i
+                )));
             }
             let entry_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
             if pos + entry_len > data.len() {
-                break;
+                return Err(Error::internal(format!(
+                    "ddl.bin truncated inside view {} payload",
+                    i
+                )));
             }
             let entry_data = &data[pos..pos + entry_len];
             pos += entry_len;
@@ -4430,24 +5969,36 @@ impl MVCCEngine {
             // ViewDefinition format: name_len(u16) + name + query_len(u32) + query
             let mut vpos = 0;
             if vpos + 2 > entry_data.len() {
-                continue;
+                return Err(Error::internal(format!(
+                    "ddl.bin view {} truncated before name length",
+                    i
+                )));
             }
             let name_len =
                 u16::from_le_bytes(entry_data[vpos..vpos + 2].try_into().unwrap()) as usize;
             vpos += 2;
             if vpos + name_len > entry_data.len() {
-                continue;
+                return Err(Error::internal(format!(
+                    "ddl.bin view {} truncated inside name",
+                    i
+                )));
             }
             let view_name = String::from_utf8_lossy(&entry_data[vpos..vpos + name_len]).to_string();
             vpos += name_len;
             if vpos + 4 > entry_data.len() {
-                continue;
+                return Err(Error::internal(format!(
+                    "ddl.bin view '{}' truncated before query length",
+                    view_name
+                )));
             }
             let query_len =
                 u32::from_le_bytes(entry_data[vpos..vpos + 4].try_into().unwrap()) as usize;
             vpos += 4;
             if vpos + query_len > entry_data.len() {
-                continue;
+                return Err(Error::internal(format!(
+                    "ddl.bin view '{}' truncated inside query payload",
+                    view_name
+                )));
             }
             let query = String::from_utf8_lossy(&entry_data[vpos..vpos + query_len]).to_string();
 
@@ -4457,6 +6008,7 @@ impl MVCCEngine {
                 .unwrap()
                 .insert(view_name.to_lowercase(), view_def);
         }
+        Ok(())
     }
 
     /// Restore the database from a backup snapshot, replacing all current data.
@@ -4477,6 +6029,36 @@ impl MVCCEngine {
         let snapshot_dir = pm.path().join("snapshots");
         if !snapshot_dir.exists() {
             return Err(Error::internal("No snapshots directory found"));
+        }
+
+        // Re-take db.startup.lock EX to block reader attaches for the duration of restore.
+        // Held to success path; on early-Err Drop releases (readers see pre-restore state).
+        let restore_attach_gate =
+            match crate::storage::mvcc::file_lock::FileLock::acquire_startup_exclusive(
+                std::path::Path::new(&self.path),
+            ) {
+                Ok(g) => g,
+                Err(e) => {
+                    return Err(Error::internal(format!(
+                        "PRAGMA RESTORE refused: failed to acquire startup gate \
+                     (another process may be attaching as read-only right now): {}",
+                        e
+                    )));
+                }
+            };
+        // RAII: panic/Err path releases gate via Drop. latch_attach_gate_on_failure
+        // moves it into MVCCEngine for post-destructive-boundary failure paths.
+        let mut restore_attach_gate = restore_attach_gate;
+        // Refuse if live readers attached: the destructive phase remove_dir_all's every
+        // <volumes>/<table>/ dir, and restore needs a clean tree (no safe defer).
+        // Runs AFTER startup-gate so concurrent attachers are blocked or visible via lease.
+        // Runs BEFORE stop_accepting_transactions so early Err needs no matching start.
+        if self.defer_for_live_readers() {
+            return Err(Error::internal(
+                "PRAGMA RESTORE refused: one or more cross-process read-only \
+                 handles are attached. Detach all readers (or wait for their \
+                 leases to expire) before retrying.",
+            ));
         }
 
         // Claim the compaction slot so no background compaction can start
@@ -4522,65 +6104,197 @@ impl MVCCEngine {
             }
         };
 
-        // When no timestamp is given, find the latest manifest-*.json to get the
-        // coherent table list from that snapshot batch. This prevents resurrecting
-        // tables that were dropped between snapshots.
-        let effective_tables: Option<Vec<String>> = if timestamp.is_none() {
-            let mut manifests: Vec<std::path::PathBuf> = std::fs::read_dir(&snapshot_dir)
-                .ok()
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|e| {
-                    let p = e.path();
+        // Resolve the authoritative manifest for this restore (if any).
+        // - explicit timestamp: look for the matching `manifest-{ts}.json`.
+        // - latest restore: take the newest `manifest-*.json`.
+        //
+        // When a manifest exists it pins BOTH the table list AND the
+        // exact `snapshot-{ts}.bin` filename to load for each listed
+        // table (see the loop below). This prevents:
+        //   - resurrecting tables dropped between snapshots,
+        //   - mixing unmanifested orphan snapshot files (left behind
+        //     when `create_snapshot`'s manifest write failed after the
+        //     per-table writes) with the manifested batch.
+        //
+        // No-manifest is the legacy-backup fallback: per-table dir scan.
+        let manifest_path: Option<std::path::PathBuf> = match timestamp {
+            Some(ts) => {
+                let p = snapshot_dir.join(format!("manifest-{}.json", ts));
+                if p.exists() {
+                    Some(p)
+                } else {
+                    None
+                }
+            }
+            None => {
+                // Fail closed on enumeration errors. Falling back to
+                // None would let the caller scan every surviving
+                // snapshot table directory, including ones
+                // intentionally preserved for tables dropped after
+                // older backups. We are still before the destructive
+                // boundary, so a plain Err return after resuming the
+                // registry is safe.
+                let entries = std::fs::read_dir(&snapshot_dir).map_err(|e| {
+                    self.registry.start_accepting_transactions();
+                    Error::internal(format!(
+                        "PRAGMA RESTORE: cannot enumerate snapshots directory {:?}: {}, \
+                         refusing to fall back to all-directories scan (would resurrect \
+                         tables that were dropped after older backups).",
+                        snapshot_dir, e
+                    ))
+                })?;
+                let mut manifests: Vec<std::path::PathBuf> = Vec::new();
+                for entry in entries {
+                    let entry = entry.map_err(|e| {
+                        self.registry.start_accepting_transactions();
+                        Error::internal(format!(
+                            "PRAGMA RESTORE: cannot read entry in snapshots directory {:?}: {}, \
+                             refusing to fall back to all-directories scan.",
+                            snapshot_dir, e
+                        ))
+                    })?;
+                    let p = entry.path();
                     if p.extension().and_then(|e| e.to_str()) == Some("json")
                         && p.file_name()
                             .and_then(|n| n.to_str())
                             .is_some_and(|n| n.starts_with("manifest-"))
                     {
-                        Some(p)
-                    } else {
-                        None
+                        manifests.push(p);
                     }
-                })
-                .collect();
-            manifests.sort();
-            if let Some(latest) = manifests.last() {
-                if let Ok(data) = std::fs::read_to_string(latest) {
-                    // manifest-*.json is {"timestamp":"...","tables":["t1","t2"]}
-                    let parsed: serde_json::Value = serde_json::from_str(&data).unwrap_or_default();
-                    let tables: Vec<String> = parsed
-                        .get("tables")
-                        .and_then(|v| v.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if !tables.is_empty() {
-                        Some(tables)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
                 }
-            } else {
-                None
+                manifests.sort();
+                manifests.pop()
             }
+        };
+
+        let effective_manifest: Option<(String, Vec<String>)> = if let Some(latest) = manifest_path
+        {
+            // manifest-*.json is {"timestamp":"...","tables":[...]}. Read/parse failure
+            // is fatal: dir-scan fallback would resurrect dropped tables.
+            let data = std::fs::read_to_string(&latest).map_err(|e| {
+                self.registry.start_accepting_transactions();
+                Error::internal(format!(
+                    "PRAGMA RESTORE: snapshot manifest {:?} exists but \
+                         could not be read: {}, refusing to fall back to \
+                         all-directories scan (would resurrect tables that \
+                         were dropped after older backups).",
+                    latest, e
+                ))
+            })?;
+            let parsed: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
+                self.registry.start_accepting_transactions();
+                Error::internal(format!(
+                    "PRAGMA RESTORE: snapshot manifest {:?} could not \
+                         be parsed: {}, refusing to fall back to all-\
+                         directories scan.",
+                    latest, e
+                ))
+            })?;
+            // Strict parse: non-string entry is fatal (would silently shrink table set).
+            // Empty tables:[] is allowed (views-only / DDL-only snapshot).
+            let tables_array =
+                parsed
+                    .get("tables")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| {
+                        self.registry.start_accepting_transactions();
+                        Error::internal(format!(
+                            "PRAGMA RESTORE: snapshot manifest {:?} missing or non-array \
+                             `tables` field, refusing to fall back to all-directories scan \
+                             (would resurrect dropped tables).",
+                            latest
+                        ))
+                    })?;
+            let mut tables: Vec<String> = Vec::with_capacity(tables_array.len());
+            for (i, v) in tables_array.iter().enumerate() {
+                match v.as_str() {
+                    Some(s) => tables.push(s.to_string()),
+                    None => {
+                        self.registry.start_accepting_transactions();
+                        return Err(Error::internal(format!(
+                            "PRAGMA RESTORE: snapshot manifest {:?} has non-string \
+                                 entry at `tables[{}]` ({}), refusing to restore from a \
+                                 corrupt manifest (would silently omit a table).",
+                            latest, i, v
+                        )));
+                    }
+                }
+            }
+            // Filename is authoritative: it locates snapshot-{ts}.bin / ddl-{ts}.bin.
+            // JSON timestamp field, if present, MUST match (disagreement = corrupt).
+            let ts_from_filename = latest
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_prefix("manifest-"))
+                .and_then(|n| n.strip_suffix(".json"))
+                .map(String::from);
+            let ts_from_field = parsed
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            if let (Some(ref filename_ts), Some(ref field_ts)) =
+                (ts_from_filename.as_ref(), ts_from_field.as_ref())
+            {
+                if filename_ts != field_ts {
+                    self.registry.start_accepting_transactions();
+                    return Err(Error::internal(format!(
+                        "PRAGMA RESTORE: snapshot manifest {:?} has \
+                         `timestamp` field '{}' that disagrees with the \
+                         filename suffix '{}', refusing to restore from \
+                         corrupt metadata (would load the wrong batch).",
+                        latest, field_ts, filename_ts
+                    )));
+                }
+            }
+            let manifest_ts = ts_from_filename.or(ts_from_field).ok_or_else(|| {
+                self.registry.start_accepting_transactions();
+                Error::internal(format!(
+                    "PRAGMA RESTORE: snapshot manifest {:?} has no \
+                         resolvable timestamp (neither `timestamp` field nor \
+                         `manifest-{{ts}}.json` filename), refusing to fall \
+                         back to newest-per-table scan (could mix data from \
+                         different backup batches).",
+                    latest
+                ))
+            })?;
+            Some((manifest_ts, tables))
         } else {
             None
         };
 
-        for entry in table_dirs.flatten() {
-            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+        for entry in table_dirs {
+            // Per-entry Err is fatal: legacy backups have no manifest, so this dir
+            // scan IS the table list; dropping a failed entry would silently restore
+            // an incomplete table set and report success.
+            // Pre-destructive boundary: resume registry, plain
+            // Err.
+            let entry = entry.map_err(|e| {
+                self.registry.start_accepting_transactions();
+                Error::internal(format!(
+                    "PRAGMA RESTORE: cannot read entry in snapshots directory {:?}: {}, \
+                     refusing to proceed (would silently omit a table from a legacy backup).",
+                    snapshot_dir, e
+                ))
+            })?;
+            // file_type() failure is also fatal, we cannot
+            // tell if this entry is a table dir whose contents
+            // we'd otherwise process.
+            let ft = entry.file_type().map_err(|e| {
+                self.registry.start_accepting_transactions();
+                Error::internal(format!(
+                    "PRAGMA RESTORE: cannot stat snapshot dir entry {:?}: {}, \
+                     refusing to proceed (could silently omit a table).",
+                    entry.path(),
+                    e
+                ))
+            })?;
+            if !ft.is_dir() {
                 continue;
             }
             let table_name = entry.file_name().to_string_lossy().to_string();
 
             // Skip tables not in the manifest (prevents resurrecting dropped tables)
-            if let Some(ref tables) = effective_tables {
+            if let Some((_, ref tables)) = effective_manifest {
                 if !tables.iter().any(|t| t.eq_ignore_ascii_case(&table_name)) {
                     continue;
                 }
@@ -4588,7 +6302,25 @@ impl MVCCEngine {
 
             let paths = Self::find_snapshots_newest_first(&entry.path());
 
-            if let Some(ts) = timestamp {
+            // Pick which snapshot file to load:
+            //   - explicit timestamp arg → exact `snapshot-{ts}.bin`
+            //   - latest restore with manifest → exact
+            //     `snapshot-{manifest_ts}.bin` (same
+            //     timestamp the manifest was written with),
+            //     so unmanifested orphan files left behind
+            //     by a snapshot batch whose later
+            //     `manifest-*.json` write failed are
+            //     IGNORED instead of being mixed into the
+            //     restore.
+            //   - latest restore with no manifest (legacy
+            //     backup) → newest file per table.
+            let target_ts: Option<&str> = if let Some(ts) = timestamp {
+                Some(ts)
+            } else {
+                effective_manifest.as_ref().map(|(ts, _)| ts.as_str())
+            };
+
+            if let Some(ts) = target_ts {
                 let target = format!("snapshot-{}.bin", ts);
                 if let Some(path) = paths
                     .iter()
@@ -4602,8 +6334,38 @@ impl MVCCEngine {
         }
 
         if snapshot_files.is_empty() {
-            self.registry.start_accepting_transactions();
-            return Err(Error::internal("No matching snapshots found"));
+            // tables:[] is a valid empty point-in-time state (views/DDL-only).
+            let manifest_allows_empty = effective_manifest
+                .as_ref()
+                .is_some_and(|(_, tables)| tables.is_empty());
+            if !manifest_allows_empty {
+                self.registry.start_accepting_transactions();
+                return Err(Error::internal("No matching snapshots found"));
+            }
+        }
+
+        // Manifest pinned a list: require exact snapshot-{ts}.bin for every table
+        // (older file would silently make a partial point-in-time restore).
+        if let Some((ref manifest_ts, ref tables)) = effective_manifest {
+            let target = format!("snapshot-{}.bin", manifest_ts);
+            for t in tables {
+                let t_lower = t.to_ascii_lowercase();
+                let have = snapshot_files.iter().any(|(name, path)| {
+                    name.eq_ignore_ascii_case(&t_lower)
+                        && path.file_name().and_then(|n| n.to_str()) == Some(target.as_str())
+                });
+                if !have {
+                    self.registry.start_accepting_transactions();
+                    return Err(Error::internal(format!(
+                        "PRAGMA RESTORE: snapshot manifest pinned timestamp \
+                         '{}' but table '{}' has no '{}' on disk, refusing \
+                         to mix an older snapshot of this table with the \
+                         rest of the batch (would be a partial point-in-time \
+                         restore).",
+                        manifest_ts, t, target
+                    )));
+                }
+            }
         }
 
         // Pre-validate: open all readers AND companion .vol files to catch corruption
@@ -4632,15 +6394,17 @@ impl MVCCEngine {
 
         // === Load DDL metadata (indexes + views) ===
         // Use per-timestamp DDL file (ddl-{ts}.bin) matching the snapshot data.
-        // For timestamped restore: use exact match. For latest restore: extract the
-        // oldest timestamp from the selected snapshot files (conservative — ensures
-        // DDL is never newer than any table data being restored).
+        // Preference order:
+        //   1. Manifest-pinned timestamp (matches the batch the manifest published).
+        //   2. Explicit `timestamp` arg (legacy timestamped restore with no manifest).
+        //   3. Oldest timestamp across the selected snapshot files (latest restore
+        //      with no manifest, conservative, never newer than any restored data).
         let ddl_data = {
-            let effective_ts = if timestamp.is_some() {
-                timestamp.map(|s| s.to_string())
+            let effective_ts = if let Some((ref manifest_ts, _)) = effective_manifest {
+                Some(manifest_ts.clone())
+            } else if let Some(ts) = timestamp {
+                Some(ts.to_string())
             } else {
-                // Extract oldest timestamp from selected snapshot filenames.
-                // Format: "snapshot-YYYYMMDD-HHMMSS.fff.bin"
                 snapshot_files
                     .iter()
                     .filter_map(|(_, path)| {
@@ -4657,7 +6421,19 @@ impl MVCCEngine {
                 None => snapshot_dir.join("ddl.bin"),
             };
             if ddl_path.exists() {
-                std::fs::read(&ddl_path).ok()
+                // Read failure is fatal: in-memory fallback would silently restore
+                // wrong constraints. Pre-destructive-boundary, so plain Err is safe.
+                Some(std::fs::read(&ddl_path).map_err(|e| {
+                    // Resume registry: nothing changed on disk yet.
+                    self.registry.start_accepting_transactions();
+                    Error::internal(format!(
+                        "PRAGMA RESTORE: ddl metadata file {:?} exists but \
+                         could not be read: {}, refusing to fall back to \
+                         current in-memory indexes / views (would restore \
+                         wrong constraints).",
+                        ddl_path, e
+                    ))
+                })?)
             } else if timestamp.is_some() {
                 // Timestamped restore with missing DDL: fail rather than silently
                 // using current indexes/views which may not match the snapshot data.
@@ -4665,6 +6441,17 @@ impl MVCCEngine {
                 return Err(Error::internal(format!(
                     "DDL metadata file not found for timestamp '{}'. Cannot restore indexes/views accurately.",
                     timestamp.unwrap()
+                )));
+            } else if effective_manifest.is_some() {
+                // Manifest pins a timestamp but ddl-{ts}.bin is missing: refuse rather
+                // than fall through to in-memory indexes (would restore wrong constraints).
+                self.registry.start_accepting_transactions();
+                return Err(Error::internal(format!(
+                    "PRAGMA RESTORE: snapshot manifest pinned timestamp but \
+                     DDL metadata {:?} is missing, refusing to fall back to \
+                     current in-memory indexes / views (would restore wrong \
+                     constraints).",
+                    ddl_path
                 )));
             } else {
                 None
@@ -4735,24 +6522,62 @@ impl MVCCEngine {
             mgrs.clear();
         }
 
-        // Delete all volume directories on disk
+        // Delete all volume dirs BEFORE WAL truncate: a stale manifest would have no
+        // DropTable record after WAL reset, so the table would resurface on next recovery.
+        // Any failure latches catastrophic-failure (catalog already partially destroyed).
         let vol_dir = pm.path().join("volumes");
-        if vol_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&vol_dir) {
-                for entry in entries.flatten() {
+        let cleanup_result: Result<()> = (|| {
+            if vol_dir.exists() {
+                let entries = std::fs::read_dir(&vol_dir).map_err(|e| {
+                    Error::internal(format!(
+                        "PRAGMA RESTORE: failed to enumerate volume directories \
+                         at {:?}: {}",
+                        vol_dir, e
+                    ))
+                })?;
+                for entry in entries {
+                    let entry = entry.map_err(|e| {
+                        Error::internal(format!(
+                            "PRAGMA RESTORE: failed to read volumes directory entry: {}",
+                            e
+                        ))
+                    })?;
                     if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
-                        let _ = std::fs::remove_dir_all(entry.path());
+                        let path = entry.path();
+                        std::fs::remove_dir_all(&path).map_err(|e| {
+                            Error::internal(format!(
+                                "PRAGMA RESTORE: failed to remove volume directory \
+                                 {:?} (refusing to truncate WAL while a stale \
+                                 table manifest survives on disk): {}",
+                                path, e
+                            ))
+                        })?;
                     }
                 }
             }
+            Ok(())
+        })();
+        if let Err(e) = cleanup_result {
+            self.enter_catastrophic_failure();
+            self.latch_attach_gate_on_failure(restore_attach_gate.take());
+            return Err(e);
         }
 
-        // Reset WAL: old entries contain post-snapshot DML that would
-        // overwrite restored data if replayed on next open.
-        // Truncate with LSN=1 to create a fresh WAL starting from the beginning.
-        // The post-restore checkpoint will re-record DDL with correct LSNs.
+        // Destructive boundary wiped all manifests; clear pending_drop_cleanups so
+        // restored tables don't inherit a stale WAL-truncation gate.
+        self.pending_drop_cleanups.lock().clear();
+
+        // Reset WAL: old entries would overwrite restored data on next replay.
+        // Failure here latches catastrophic-failure (volume dirs already gone, half-restored).
         if let Err(e) = pm.truncate_wal(1) {
-            eprintln!("Warning: WAL reset during restore: {}", e);
+            self.enter_catastrophic_failure();
+            self.latch_attach_gate_on_failure(restore_attach_gate.take());
+            return Err(Error::internal(format!(
+                "PRAGMA RESTORE: WAL reset failed after volume directories were \
+                 cleared: {}, engine latched into catastrophic-failure state. \
+                 Restart the process and retry the restore.",
+                e
+            )));
         }
 
         // Clear all in-memory state
@@ -4800,7 +6625,15 @@ impl MVCCEngine {
                 }
                 Err(e) => {
                     // Partial restore failure: some tables loaded, others not.
-                    // Persist what we have so a crash doesn't lose everything.
+                    // The old volume tree is gone and the WAL was reset to LSN=1,
+                    // so neither the original database nor the full requested
+                    // snapshot can be reconstructed by recovery from this state.
+                    // Persist what we have so a crash doesn't lose everything,
+                    // then LATCH the engine, letting `start_accepting_transactions`
+                    // run here would let new auto-commit DDL / DML append WAL
+                    // on top of a partial restore that recovery can't reason
+                    // about. Same fail-closed policy as the later DDL re-record
+                    // and forced-checkpoint failure branches.
                     if total_tables > 0 {
                         eprintln!(
                             "Warning: partial restore ({} tables loaded), persisting before error return",
@@ -4813,9 +6646,12 @@ impl MVCCEngine {
                     } else {
                         drop(_checkpoint_guard);
                     }
-                    self.registry.start_accepting_transactions();
+                    self.enter_catastrophic_failure();
+                    self.latch_attach_gate_on_failure(restore_attach_gate.take());
                     return Err(Error::internal(format!(
-                        "Failed to restore table {}: {}",
+                        "PRAGMA RESTORE: failed to restore table '{}': {}, engine \
+                         latched into catastrophic-failure state. Restart the \
+                         process and retry the restore against the snapshot.",
                         table_name, e
                     )));
                 }
@@ -4825,8 +6661,28 @@ impl MVCCEngine {
         // === Post-restore ===
 
         // Recreate indexes and views from ddl.bin or fallback saved state.
+        // Treat ddl.bin corruption as fatal: UNIQUE / FK
+        // enforcement is driven from the restored indexes,
+        // so silently skipping a corrupted entry would make
+        // RESTORE report success against a database that
+        // can't enforce its constraints. Latch the engine,
+        // the destructive boundary is past, so reopening
+        // writes against a partial DDL load could append WAL
+        // mutating tables whose indexes are missing.
         if let Some(ref data) = ddl_data {
-            self.restore_ddl_from_bin(data);
+            if let Err(e) = self.restore_ddl_from_bin(data) {
+                self.enter_catastrophic_failure();
+                self.latch_attach_gate_on_failure(restore_attach_gate.take());
+                return Err(Error::internal(format!(
+                    "PRAGMA RESTORE: ddl.bin validation/restore failed: {}, \
+                     engine latched into catastrophic-failure state. The \
+                     restored snapshot is missing one or more indexes / views, \
+                     so UNIQUE / FK enforcement would be silently broken. \
+                     Restart the process and retry the restore against a \
+                     valid snapshot.",
+                    e
+                )));
+            }
         } else {
             // Fallback: recreate indexes from in-memory saved state
             let stores = self.version_stores.read().unwrap();
@@ -4866,12 +6722,18 @@ impl MVCCEngine {
         self.schema_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
 
-        // Re-record DDL to WAL so table schemas survive WAL truncation
+        // Re-record DDL post WAL-truncate. Failure is fatal: half-recorded restore
+        // can't recover. Latch failure; do NOT start_accepting_transactions.
         if let Err(e) = self.rerecord_ddl_to_wal() {
-            eprintln!(
-                "Warning: Failed to re-record DDL to WAL after restore: {}",
+            self.enter_catastrophic_failure();
+            self.latch_attach_gate_on_failure(restore_attach_gate.take());
+            return Err(Error::internal(format!(
+                "PRAGMA RESTORE: failed to re-record DDL to WAL after the WAL \
+                 reset: {}, engine latched into catastrophic-failure state. \
+                 Restart the process; recovery converges from the on-disk \
+                 manifests + whatever DDL entries landed before the failure.",
                 e
-            );
+            )));
         }
 
         // Drop the checkpoint guard BEFORE calling checkpoint_cycle_inner
@@ -4887,13 +6749,19 @@ impl MVCCEngine {
         // transactions. WAL was truncated, so data is only in memory until this
         // checkpoint. If this fails, the restored data is non-durable — return
         // an error so the caller knows the restore did not complete safely.
-        self.checkpoint_cycle_inner(true).map_err(|e| {
-            // Resume transactions so the database is usable even if non-durable
-            self.registry.start_accepting_transactions();
-            Error::Internal {
-                message: format!("Restore data not persisted (crash may lose it): {}", e),
-            }
-        })?;
+        if let Err(e) = self.checkpoint_cycle_inner(true) {
+            // Latch failure: restored rows only in memory; WAL was truncated.
+            self.enter_catastrophic_failure();
+            self.latch_attach_gate_on_failure(restore_attach_gate.take());
+            return Err(Error::Internal {
+                message: format!(
+                    "PRAGMA RESTORE: forced checkpoint failed; restored data is \
+                     non-durable: {}, engine latched into catastrophic-failure \
+                     state. Restart the process to converge.",
+                    e
+                ),
+            });
+        }
         self.compact_after_checkpoint_forced();
 
         // Resume accepting transactions only after data is persisted
@@ -4905,32 +6773,175 @@ impl MVCCEngine {
         ))
     }
 
-    /// Checkpoint-to-volume cycle: replaces the old snapshot-based persistence.
-    ///
-    /// Instead of serializing the entire hot buffer to a snapshot .bin file,
-    /// this cycle seals committed hot rows into frozen volumes, re-records all DDL
-    /// to WAL (so recovery can recreate schemas after WAL truncation), persists
-    /// manifests, and optionally truncates the WAL.
-    ///
-    /// Recovery loads manifests + volumes from disk, replays WAL from 0 (skipping
-    /// INSERT entries for rows already in volumes), and rebuilds hot state.
-    ///
-    /// WAL truncation is only safe when ALL committed hot rows have been sealed.
-    /// Otherwise, unsealed rows' INSERT entries must survive in the WAL.
+    /// Seal hot rows into volumes, re-record DDL, persist manifests, optionally truncate WAL.
+    /// Recovery loads manifests/volumes then replays WAL (skipping already-sealed rows).
     fn checkpoint_cycle(&self) -> Result<()> {
         self.checkpoint_cycle_inner(false)?;
-        // Run compaction synchronously so direct callers (Rust API,
-        // trait users) get the full seal + compact behavior.
-        // The background thread bypasses this by calling
-        // checkpoint_cycle_inner + spawn_compaction directly.
+        // Run compaction synchronously so direct callers (Rust API, trait users) get
+        // the full seal+compact behavior. Both paths drive sweep_orphan_table_dirs,
+        // covering explicit AND background cycles.
         self.compact_after_checkpoint_forced();
         Ok(())
+    }
+
+    /// Reap orphans in two passes (gated on !defer_for_live_readers):
+    /// 1. Whole-table orphans: dirs not in current catalog (DROP defer / crash).
+    /// 2. Per-file orphans: vol_<id>.vol not in active table's manifest (TRUNCATE/compact defer).
+    fn sweep_orphan_table_dirs(&self) {
+        let pm = match self.persistence.as_ref() {
+            Some(pm) if pm.is_enabled() => pm,
+            _ => return,
+        };
+        // Build active-tables (schemas U segment_managers) + per-table in-mem segment IDs
+        // under read locks before touching the filesystem.
+        let mut active: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
+        {
+            let schemas = self.schemas.read().unwrap();
+            for name in schemas.keys() {
+                active.insert(name.clone());
+            }
+        }
+        let mut per_table_in_memory: Vec<(String, rustc_hash::FxHashSet<u64>)> = Vec::new();
+        {
+            let mgrs = self.segment_managers.read().unwrap();
+            for (name, mgr) in mgrs.iter() {
+                active.insert(name.clone());
+                let segs = mgr.segments_raw();
+                let ids: rustc_hash::FxHashSet<u64> = segs.keys().copied().collect();
+                per_table_in_memory.push((name.clone(), ids));
+            }
+        }
+        let vol_dir = pm.path().join("volumes");
+
+        // Always seed pending_drop_cleanups with on-disk orphan dirs (even when readers
+        // are live and we skip unlink), so compute_wal_truncate_floor refuses truncation
+        // while leftover manifests are discoverable. NotFound = empty result; any other
+        // error sets orphan_discovery_failed (refuse truncation until next cycle).
+        let read_result = std::fs::read_dir(&vol_dir);
+        match read_result {
+            Ok(entries) => {
+                let mut pending = self.pending_drop_cleanups.lock();
+                let mut entry_error = false;
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => {
+                            entry_error = true;
+                            break;
+                        }
+                    };
+                    // file_type() failure is fatal: silently skipping a leftover dir
+                    // with manifest.bin would let a later checkpoint truncate past DropTable.
+                    let ft = match entry.file_type() {
+                        Ok(ft) => ft,
+                        Err(_) => {
+                            entry_error = true;
+                            break;
+                        }
+                    };
+                    if !ft.is_dir() {
+                        continue;
+                    }
+                    if let Some(name) = entry.file_name().to_str() {
+                        let lower = name.to_lowercase();
+                        if !active.contains(&lower) {
+                            pending.insert(lower);
+                        }
+                    }
+                }
+                drop(pending);
+                if entry_error {
+                    self.orphan_discovery_failed.store(true, Ordering::Release);
+                } else {
+                    self.orphan_discovery_failed.store(false, Ordering::Release);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.orphan_discovery_failed.store(false, Ordering::Release);
+            }
+            Err(_) => {
+                self.orphan_discovery_failed.store(true, Ordering::Release);
+            }
+        }
+
+        // Stamp = on_disk + 1 so a failed bump_epoch can't false-certify
+        // the reap (reader can't reach on_disk + 1 without a future bump).
+        // Read under epoch_bump_lock so the stamp is never computed against
+        // a value an in-flight bump is about to overwrite.
+        let stamp_epoch = {
+            let _epoch_guard = self.epoch_bump_lock.lock();
+            let on_disk =
+                crate::storage::mvcc::manifest_epoch::read_epoch(std::path::Path::new(&self.path))
+                    .unwrap_or(0);
+            on_disk.saturating_add(1)
+        };
+        let min_reader_epoch = self.min_reader_handle_epoch();
+        for (table, in_mem_ids) in &per_table_in_memory {
+            let manifest_path = vol_dir.join(table).join("manifest.bin");
+            let mf = match crate::storage::volume::manifest::TableManifest::read_from_disk(
+                &manifest_path,
+            ) {
+                Ok(mf) => mf,
+                Err(_) => continue,
+            };
+            let mut keep = in_mem_ids.clone();
+            for seg in &mf.segments {
+                keep.insert(seg.segment_id);
+            }
+            crate::storage::volume::io::reap_orphan_volumes_with_sidecars(
+                &vol_dir,
+                table,
+                &keep,
+                stamp_epoch,
+                min_reader_epoch,
+            );
+        }
+
+        // Whole-table sweep (DROP defer / crash leftovers): keeps the
+        // simpler defer_for_live_readers gate, these orphans are
+        // whole tables, not individual segments, and DROP recovery is
+        // rare enough that the all-or-nothing behavior is acceptable.
+        if self.defer_for_live_readers() {
+            return;
+        }
+        let report = crate::storage::volume::io::sweep_orphan_table_dirs(&vol_dir, &active);
+        if report.read_dir_failed || report.entry_errors > 0 || report.remove_failures > 0 {
+            self.orphan_discovery_failed.store(true, Ordering::Release);
+        }
+        {
+            let mut pending = self.pending_drop_cleanups.lock();
+            let mut stat_failed = false;
+            pending.retain(|name| match vol_dir.join(name).try_exists() {
+                Ok(true) => true,
+                Ok(false) => false,
+                Err(_) => {
+                    stat_failed = true;
+                    true
+                }
+            });
+            if stat_failed {
+                self.orphan_discovery_failed.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Bump the on-disk manifest epoch under `epoch_bump_lock`. Every bump
+    /// site must route through here: the read+write in `bump_epoch` is not
+    /// atomic, and an unserialized interleave (e.g. a stalled compaction
+    /// bump vs a checkpoint bump) can regress the epoch.
+    fn bump_manifest_epoch(&self) -> Result<u64> {
+        let _guard = self.epoch_bump_lock.lock();
+        crate::storage::mvcc::manifest_epoch::bump_epoch(std::path::Path::new(&self.path))
     }
 
     /// Inner checkpoint implementation. When `force` is true, seals ALL hot rows
     /// regardless of threshold (used by PRAGMA CHECKPOINT and close_engine).
     /// When false, respects the normal seal thresholds (used by background thread).
     fn checkpoint_cycle_inner(&self, force: bool) -> Result<()> {
+        // Refuse cycle when failed: re-record/persist/truncate are durable state.
+        if self.is_failed() {
+            return Ok(());
+        }
         if let Some(ref pm) = *self.persistence {
             if !pm.is_enabled() {
                 return Ok(());
@@ -4987,6 +6998,18 @@ impl MVCCEngine {
             .try_write_for(std::time::Duration::from_secs(15))
         {
             Some(_fence) => {
+                // Recheck the latch AFTER the seal/fence wait. The
+                // entry-time check passed; the wait above (seal_hot_buffers
+                // + acquiring the seal_fence write lock) can block while
+                // a marker-failure commit completes its drain, latches
+                // the engine, and drops its own seal_fence read guard,
+                // handing us the write lock. Without this recheck
+                // we'd call create_checkpoint, persist manifests, bump
+                // the manifest epoch, and truncate WAL after the
+                // catastrophic-failure latch was set.
+                if self.is_failed() {
+                    return Ok(());
+                }
                 // Fence acquired — no new commits can start. In-flight commits
                 // finished (they held the read lock, which is now released).
                 // Just check if bulk seal (steps 1-2) drained everything.
@@ -5052,6 +7075,19 @@ impl MVCCEngine {
             }
         }
 
+        // Step 4b: Bump the cross-process manifest epoch. Reader processes
+        // poll `<db>/volumes/epoch` to detect new checkpoints and reload
+        // their cached manifests on advance. We only bump when ALL
+        // manifests are durable so a reader that observes epoch=N is
+        // guaranteed every per-table manifest.bin is at the post-checkpoint
+        // state. Skip on memory engines (no path) and when the fence
+        // didn't acquire (checkpoint_lsn==0).
+        if checkpoint_lsn > 0 && all_manifests_persisted && !self.path.is_empty() {
+            if let Err(e) = self.bump_manifest_epoch() {
+                eprintln!("Warning: Failed to bump manifest epoch: {}", e);
+            }
+        }
+
         // Step 5: Truncate WAL BEFORE compaction.
         // WAL truncation only depends on seal + manifest persist, not compaction.
         // Running compaction first (30+ seconds) delays truncation and extends
@@ -5059,48 +7095,60 @@ impl MVCCEngine {
         // checkpoint_lsn > 0 already guarantees all_hot_empty was true inside
         // the fence. Don't re-check the outer all_hot_empty (stale, checked
         // before fence when continuous inserts make it always false).
+        //
+        // Floor the truncate at `min_pinned_lsn - 1` so a reader
+        // tailing the WAL never finds the entries it needs gone.
+        // `min_pinned_lsn` returns None when no SWMR reader is
+        // attached, so the typical case is just
+        // `truncate_wal(checkpoint_lsn)`.
         if checkpoint_lsn > 0 && all_manifests_persisted {
             if let Some(ref pm) = *self.persistence {
-                if let Err(e) = pm.truncate_wal(checkpoint_lsn) {
-                    eprintln!("Warning: Failed to truncate WAL: {}", e);
+                let truncate_floor = self.compute_wal_truncate_floor(checkpoint_lsn);
+                if let Some(floor) = truncate_floor {
+                    if let Err(e) = pm.truncate_wal(floor) {
+                        eprintln!("Warning: Failed to truncate WAL: {}", e);
+                    }
                 }
+                // Whether or not we actually truncated, publish the
+                // current min_pinned_lsn to db.shm so monitoring (PRAGMA
+                // SWMR_STATUS) reflects reality.
+                self.publish_min_pinned_lsn();
             }
         }
 
         Ok(())
     }
 
-    /// Run compaction synchronously under the compaction_running flag.
-    /// The flag prevents concurrent compaction from background and forced
-    /// callers. Clears the flag on exit (including panics via drop guard).
+    /// Sync compaction under compaction_running flag (cleared via drop guard).
+    /// Drives sweep_orphan_table_dirs after so background checkpoints reap leftovers.
     fn run_compaction_guarded(&self) {
         let _guard = AtomicBoolGuard(&self.compaction_running);
         if let Err(e) = self.compact_volumes() {
             eprintln!("Warning: compact_volumes failed: {}", e);
         }
+        self.sweep_orphan_table_dirs();
     }
 
     /// Evict idle volume data to save memory. Volumes not accessed since the
     /// last epoch transition: hot → warm (drop decompressed) → cold (drop compressed).
     #[cfg(not(target_arch = "wasm32"))]
     fn evict_idle_volumes(&self) {
-        let epoch = self.eviction_epoch.fetch_add(1, Ordering::Relaxed) + 1;
-        // Publish to global so scanners stamp volumes with the correct epoch.
-        // Use fetch_max so multiple engines only move the global forward.
-        crate::storage::volume::writer::GLOBAL_EVICTION_EPOCH.fetch_max(epoch, Ordering::Relaxed);
+        // Use GLOBAL_EVICTION_EPOCH (volumes are stamped with the global on load).
+        // A per-engine counter would let other engines' loads carry stamps ahead of
+        // ours, delaying demotion and pinning RAM.
+        let epoch = crate::storage::volume::writer::GLOBAL_EVICTION_EPOCH
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
         let mgrs = self.segment_managers.read().unwrap();
         for mgr in mgrs.values() {
             mgr.evict_idle_volumes(epoch);
         }
     }
 
-    /// Spawn compaction on a background thread. If compaction is already
-    /// running, this is a no-op (the next checkpoint cycle will retry).
-    /// Called from the background cleanup thread which owns Arc<Self>.
+    /// Spawn compaction on background thread. No-op if already running.
     #[cfg(not(target_arch = "wasm32"))]
     fn spawn_compaction(self: &Arc<Self>) {
-        // Try to claim the compaction slot. If already running, skip
-        // compaction but still run eviction on this thread.
+        // Skip compaction if slot held; still run eviction on this thread.
         if self
             .compaction_running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -5116,13 +7164,9 @@ impl MVCCEngine {
         });
     }
 
-    /// Run compaction synchronously, waiting for any in-flight background
-    /// compaction to finish first. Used by PRAGMA CHECKPOINT, close_engine,
-    /// restore, and v0.3.7 migration.
+    /// Sync compaction; waits for in-flight background compaction.
     fn compact_after_checkpoint_forced(&self) {
-        // Claim the compaction slot, waiting for any background compaction.
-        // CAS loop: if background thread holds the flag, spin until it clears.
-        // Once we claim it, no background thread can start a new compaction.
+        // CAS loop: spin until background compaction clears the flag.
         while self
             .compaction_running
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -5133,15 +7177,13 @@ impl MVCCEngine {
         self.run_compaction_guarded();
     }
 
-    /// Re-record all DDL entries to WAL after checkpoint.
-    ///
-    /// After WAL truncation, any CreateTable/CreateIndex/CreateView entries before
-    /// the checkpoint LSN are lost. Re-recording them places fresh entries at
-    /// the WAL head so they survive truncation and are replayed on recovery.
-    ///
-    /// Order matters: CreateTable must come before CreateIndex for the same table,
-    /// because index replay needs the version store to exist.
+    /// Re-record DDL after checkpoint so it survives WAL truncation.
+    /// Order: CreateTable before CreateIndex (index replay needs the version store).
     fn rerecord_ddl_to_wal(&self) -> Result<()> {
+        // EX transactional_ddl_fence: only snapshot COMMITTED catalog state. Open
+        // CREATE/DROP holds SH; we block until they resolve.
+        let _ddl_fence = self.transactional_ddl_fence.write();
+
         // Collect CreateTable entries and table names in a single schemas lock
         let (table_entries, table_names_for_indexes): (Vec<(String, Vec<u8>)>, Vec<String>) = {
             let schemas = self.schemas.read().unwrap();
@@ -5194,7 +7236,9 @@ impl MVCCEngine {
                 .collect()
         };
 
-        // Write CreateTable entries first (schemas must exist before indexes)
+        // Use publishing record_ddl path: invariant chain_head <= visible_commit_lsn.
+        // Reader-side known_catalog_objects filter suppresses spurious SwmrPendingDdl.
+        // Write CreateTable first (schemas must exist before indexes).
         for (table_name, data) in &table_entries {
             self.record_ddl(table_name, WALOperationType::CreateTable, data)?;
         }
@@ -5211,6 +7255,11 @@ impl MVCCEngine {
     }
 
     fn compact_volumes(&self) -> Result<()> {
+        // Refuse if failed: compaction would let markerless rows survive into
+        // rewritten segments.
+        if self.is_failed() {
+            return Ok(());
+        }
         let pm = match self.persistence.as_ref() {
             Some(pm) if pm.is_enabled() => pm,
             _ => return Ok(()),
@@ -5265,6 +7314,18 @@ impl MVCCEngine {
         }
 
         for table_name in &tables_to_compact {
+            // Recheck the catastrophic-failure latch per-table.
+            // Candidate selection above only checked the latch at
+            // function entry; a failing commit can complete its
+            // in-memory drain and latch the engine while we're
+            // iterating. Compaction reads tombstones and rewrites
+            // segments, so proceeding could materialize markerless-
+            // commit deletes (or merge in markerless-commit data via
+            // hot-row visibility carryover paths) into a replacement
+            // segment that survives recovery.
+            if self.is_failed() {
+                return Ok(());
+            }
             let schema = {
                 let schemas = self.schemas.read().unwrap();
                 match schemas.get(table_name) {
@@ -5281,14 +7342,11 @@ impl MVCCEngine {
             let compact_seal_seq_limit =
                 self.registry.get_min_snapshot_begin_seq().map(|s| s as u64);
 
-            // Targeted compaction: only rewrite volumes that need work.
-            // At-target volumes are left untouched to minimize disk I/O.
-            //
-            // Categories:
-            // - Sub-target (< target_volume_rows): small volumes to merge together
-            // - Oversized (> target * 3/2): large volumes to split
-            // - At-target: properly sized, never rewrite
-            let (old_ids, volumes, tombstones) = {
+            // Categories: sub-target (merge), oversized (split), at-target (skip).
+            // SWMR: with live readers, restrict to segments visible_at_lsn <= min_pin
+            // (output is stamped MAX(inputs); mixing across a reader's cap exposes new rows).
+            let visibility_cap = self.min_pinned_reader_lsn().unwrap_or(u64::MAX);
+            let (old_ids, volumes, tombstones, old_visible_at_lsn_max, tombstone_visible_at) = {
                 // Use segments_raw for planning — only metadata (row_ids,
                 // row_count) is needed. Avoids reloading ALL cold volumes
                 // for tables where only sub-target volumes need compaction.
@@ -5308,6 +7366,16 @@ impl MVCCEngine {
                         if seg.seal_seq > 0 && seg.seal_seq > limit {
                             continue;
                         }
+                    }
+                    // Cross-process SWMR: skip segments whose
+                    // visibility frontier is above the lowest live
+                    // reader's pin. Including them would force MAX
+                    // of inputs to exceed `visibility_cap`, which
+                    // would put a live reader strictly between the
+                    // merged inputs and let the compacted segment
+                    // expose rows the reader never had visibility to.
+                    if seg.visible_at_lsn > visibility_cap {
+                        continue;
                     }
                     if seg.row_count < target_volume_rows {
                         // Sub-target: merge together to reach target size
@@ -5362,6 +7430,13 @@ impl MVCCEngine {
                     .iter()
                     .map(|&i| manifest.segments[i].segment_id)
                     .collect();
+                // Output visible_at_lsn = MAX(inputs). MIN would expose rows from
+                // higher-cap inputs to readers between MIN and MAX.
+                let old_visible_at_lsn_max: u64 = merge_indices
+                    .iter()
+                    .map(|&i| manifest.segments[i].visible_at_lsn)
+                    .max()
+                    .unwrap_or(0);
                 let mut vols: Vec<(u64, Arc<crate::storage::volume::writer::FrozenVolume>)> =
                     merge_indices
                         .iter()
@@ -5386,7 +7461,14 @@ impl MVCCEngine {
                 // Sort by segment_id descending (newest first) for correct dedup.
                 vols.sort_by_key(|entry| std::cmp::Reverse(entry.0));
                 let ts = mgr.tombstone_set_arc();
-                (old_ids, Arc::new(vols), ts)
+                // V8+ visible_at_lsn; V7 synthesizes 0 (always visible). Used to skip
+                // tombstones newer than the lowest live reader's pin.
+                let ts_vis: rustc_hash::FxHashMap<i64, u64> = manifest
+                    .tombstones
+                    .iter()
+                    .map(|&(rid, _, vis)| (rid, vis))
+                    .collect();
+                (old_ids, Arc::new(vols), ts, old_visible_at_lsn_max, ts_vis)
             };
 
             // Streaming compaction: iterate volumes newest-first, dedup by row_id,
@@ -5396,35 +7478,42 @@ impl MVCCEngine {
             let mut seen = FxHashSet::default();
             let mut live_refs: Vec<(i64, usize, usize)> = Vec::new(); // (row_id, vol_idx, row_idx)
 
-            // When snapshots are active, build a filtered tombstone set containing
-            // only tombstones that were actually applied (commit_seq < limit).
-            // Post-snapshot tombstones are preserved so snapshot reads stay correct.
-            let applied_tombstones: Arc<FxHashMap<i64, u64>> =
-                if let Some(limit) = compact_seal_seq_limit {
-                    let filtered: FxHashMap<i64, u64> = tombstones
-                        .iter()
-                        .filter(|(_, &seq)| seq < limit)
-                        .map(|(&rid, &seq)| (rid, seq))
-                        .collect();
-                    Arc::new(filtered)
-                } else {
-                    Arc::clone(&tombstones)
-                };
+            // Snapshot-active: keep only applied tombstones (commit_seq < limit).
+            // SWMR: also filter visible_at_lsn > visibility_cap so compaction can't
+            // remove rows still visible to capped readers. V7 (vis=0) passes trivially.
+            let applied_tombstones: Arc<FxHashMap<i64, u64>> = {
+                let filtered: FxHashMap<i64, u64> = tombstones
+                    .iter()
+                    .filter(|(_, &seq)| {
+                        compact_seal_seq_limit
+                            .map(|limit| seq < limit)
+                            .unwrap_or(true)
+                    })
+                    .filter(|(rid, _)| {
+                        let vis = tombstone_visible_at.get(rid).copied().unwrap_or(0);
+                        // u64::MAX = partial-commit-failure sentinel; never materialize.
+                        vis != u64::MAX && vis <= visibility_cap
+                    })
+                    .map(|(&rid, &seq)| (rid, seq))
+                    .collect();
+                Arc::new(filtered)
+            };
 
             for (vol_idx, (_seg_id, vol)) in volumes.iter().enumerate() {
                 for i in 0..vol.meta.row_count {
                     let row_id = vol.meta.row_ids[i];
-                    // Apply tombstone only if it was committed before the earliest
-                    // snapshot (safe to physically remove). Tombstones created after
-                    // are preserved — the row stays in the merged volume so snapshots
-                    // can still see it via versioned tombstone filtering.
-                    let is_tombstoned = if let Some(limit) = compact_seal_seq_limit {
-                        tombstones
-                            .get(&row_id)
-                            .is_some_and(|&commit_seq| commit_seq < limit)
-                    } else {
-                        tombstones.contains_key(&row_id)
-                    };
+                    // Apply tombstone only if (a) commit_seq < earliest snapshot AND
+                    // (b) visible_at_lsn <= every live reader's cap.
+                    let snapshot_safe = compact_seal_seq_limit
+                        .map(|limit| {
+                            tombstones
+                                .get(&row_id)
+                                .is_some_and(|&commit_seq| commit_seq < limit)
+                        })
+                        .unwrap_or_else(|| tombstones.contains_key(&row_id));
+                    let row_vis = tombstone_visible_at.get(&row_id).copied().unwrap_or(0);
+                    let visible_to_all_readers = row_vis != u64::MAX && row_vis <= visibility_cap;
+                    let is_tombstoned = snapshot_safe && visible_to_all_readers;
                     if is_tombstoned && !seen.contains(&row_id) {
                         continue;
                     }
@@ -5457,22 +7546,9 @@ impl MVCCEngine {
                     continue;
                 }
 
-                let vol_dir = pm.path().join("volumes");
-                let vol_table_dir = vol_dir.join(table_name);
-                let old_filenames: FxHashSet<String> = old_ids
-                    .iter()
-                    .map(|id| format!("vol_{:016x}.vol", id))
-                    .collect();
-                if let Ok(entries) = std::fs::read_dir(&vol_table_dir) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                            if old_filenames.contains(fname) {
-                                let _ = std::fs::remove_file(&path);
-                            }
-                        }
-                    }
-                }
+                // Old segments orphaned by the manifest persist above;
+                // sweep_orphan_table_dirs handles unlink via the retire-
+                // sidecar protocol.
                 continue;
             }
 
@@ -5502,6 +7578,18 @@ impl MVCCEngine {
                 crate::storage::volume::manifest::SegmentMeta,
             )> = Vec::new();
             let mut write_failed = false;
+
+            // visible_at_lsn for compacted output: inherit the MIN
+            // across the merged segments, NOT the writer's current
+            // WAL LSN. The compacted rows were already visible at
+            // each merged segment's `visible_at_lsn`, so the
+            // compaction must not raise that floor, otherwise a
+            // capped reader at P (where old_min <= P < current_lsn)
+            // would drop the new segment even though the same rows
+            // were visible to it through the merged-out segments.
+            // After the old WAL range is truncated, the reader
+            // could not reconstruct them.
+            let visible_lsn = old_visible_at_lsn_max;
 
             for chunk in live_refs.chunks(chunk_size) {
                 let mut builder = crate::storage::volume::writer::VolumeBuilder::with_capacity(
@@ -5554,6 +7642,7 @@ impl MVCCEngine {
                                 creation_lsn: 0,
                                 seal_seq: 0,
                                 schema_version: self.schema_epoch.load(Ordering::Acquire),
+                                visible_at_lsn: visible_lsn,
                             },
                         ));
                     }
@@ -5600,49 +7689,28 @@ impl MVCCEngine {
                 continue;
             }
 
-            // Now safe to delete old volume files + stale .dv files.
-            let vol_table_dir = vol_dir.join(table_name);
-            let old_filenames: FxHashSet<String> = old_ids
-                .iter()
-                .map(|id| format!("vol_{:016x}.vol", id))
-                .collect();
-            if let Ok(entries) = std::fs::read_dir(&vol_table_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    let ext = path.extension().and_then(|e| e.to_str());
-                    if ext == Some("dv") {
-                        let _ = std::fs::remove_file(&path);
-                    } else if ext == Some("vol") {
-                        if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
-                            if old_filenames.contains(fname) {
-                                let _ = std::fs::remove_file(&path);
-                            }
-                        }
-                    }
-                }
+            // Old segments orphaned. Reaper handles unlinks.
+        }
+
+        // Bump shm.manifest_epoch so readers reload manifests and stop
+        // referencing orphaned old segment IDs. The reaper handles
+        // file unlinks via the on-disk retire-sidecar protocol.
+        if !self.path.is_empty() {
+            if let Err(e) = self.bump_manifest_epoch() {
+                eprintln!("Warning: post-compaction manifest epoch bump failed: {}", e);
             }
         }
 
         Ok(())
     }
 
-    /// Seal hot buffer rows into frozen volumes and reclaim memory.
-    ///
-    /// Called automatically in the background. For each table with enough
-    /// VISIBLE rows in the hot buffer, extracts them, writes a frozen volume
-    /// to disk, then marks the sealed rows as deleted in the VersionStore.
-    ///
-    /// Uses actual visible row count (not committed_row_count which includes
-    /// deleted rows and is never decremented).
-    ///
-    /// This is safe for concurrent queries because:
-    /// - mark_deleted creates a new version (doesn't modify existing data)
-    /// - In-flight scans that already read the row see the pre-delete version
-    /// - New scans see the delete and skip the row (read from volume instead)
-    ///
-    /// Threshold: 100K rows (first seal) or 10K rows (subsequent seals).
-    /// Output is split into target_volume_rows-sized volumes.
+    /// Seal hot rows into volumes. Threshold: 100K (first seal) or 10K (subsequent).
+    /// Output split at target_volume_rows boundary.
     fn seal_hot_buffers(&self) -> Result<()> {
+        // Refuse if failed: would seal markerless rows into durable volumes.
+        if self.is_failed() {
+            return Ok(());
+        }
         const SEAL_ROW_THRESHOLD: usize = 100_000;
         const SEAL_INCREMENTAL_THRESHOLD: usize = 10_000;
         let seal_row_threshold = SEAL_ROW_THRESHOLD;
@@ -5740,6 +7808,24 @@ impl MVCCEngine {
         const REMOVE_BATCH_SIZE: usize = 50_000;
 
         for (table_name, schema, store, has_segments) in table_names {
+            // Per-table failed recheck: candidate selection takes locks; a failing
+            // commit can latch the engine while we hold them.
+            if self.is_failed() {
+                return Ok(());
+            }
+            // Skip if any commit marker is pending: extract_for_seal could include
+            // rows whose marker exceeds the safe-visible frontier. max_written here
+            // is the visible_lsn we'll stamp the segment with.
+            let (pre_pending_empty, visible_lsn_at_extract) = {
+                let pending = self.pending_marker_lsns.lock();
+                let empty = pending.is_empty();
+                let mw = self.max_written_marker_lsn.load(Ordering::Acquire);
+                (empty, mw)
+            };
+            if !pre_pending_empty {
+                continue;
+            }
+
             // Extract rows AND a CowBTree snapshot (O(1) Arc clone).
             // The snapshot records each row's txn_id at extraction time.
             // remove_sealed_rows compares against it to detect concurrent
@@ -5754,6 +7840,18 @@ impl MVCCEngine {
                 let read_txn_id = INVALID_TRANSACTION_ID + 1;
                 store.extract_for_seal(read_txn_id)
             };
+
+            // Post-extract recheck: any change in pending or max_written means a
+            // commit landed during extract; skip and retry next cycle.
+            let (post_pending_empty, post_max_written) = {
+                let pending = self.pending_marker_lsns.lock();
+                let empty = pending.is_empty();
+                let mw = self.max_written_marker_lsn.load(Ordering::Acquire);
+                (empty, mw)
+            };
+            if !post_pending_empty || post_max_written != visible_lsn_at_extract {
+                continue;
+            }
             // On close (force_seal_all), seal ALL rows regardless of threshold.
             if !self.force_seal_all.load(Ordering::Acquire) {
                 let threshold = if has_segments {
@@ -5769,12 +7867,16 @@ impl MVCCEngine {
                 continue;
             }
 
+            // Recheck failed latch after extraction: a markerless commit between the
+            // pre-check and now would seal markerless rows into a volume that survives
+            // restart. Drop the extracted rows (they're still in the VersionStore).
+            if self.is_failed() {
+                return Ok(());
+            }
+
             let total_rows = all_rows.len();
 
-            // Normalize rows to current schema before sealing.
-            // After ALTER TABLE ADD COLUMN ... DEFAULT ..., old rows have
-            // fewer columns. Without normalization, the default is lost
-            // permanently in the cold segment (stored as NULL).
+            // Normalize: ADD COLUMN DEFAULT must be materialized in cold or default is lost.
             let schema_cols = schema.columns.len();
             for (_row_id, row) in &mut all_rows {
                 if row.len() < schema_cols {
@@ -5839,12 +7941,17 @@ impl MVCCEngine {
                         let current_seal_seq = per_table_cutoff
                             .map(|s| s as u64)
                             .unwrap_or_else(|| self.registry.get_current_sequence() as u64);
+                        // Use safe-visible LSN captured at extract time. Re-sampling
+                        // here could race a post-extract commit and stamp visibility
+                        // higher than the segment's actual contents.
+                        let visible_lsn = visible_lsn_at_extract;
                         for (volume, _path, volume_id) in &sealed_volumes {
                             self.register_volume_with_id_and_seal_seq(
                                 &table_name,
                                 Arc::clone(volume),
                                 *volume_id,
                                 current_seal_seq,
+                                visible_lsn,
                             );
                         }
 
@@ -5861,7 +7968,12 @@ impl MVCCEngine {
 
                         if !all_skipped_inner.is_empty() {
                             let seal_seq = self.registry.get_current_sequence() as u64;
-                            mgr.add_tombstones(&all_skipped_inner, seal_seq);
+                            // Reuse visible_lsn_at_extract; re-sampling races same as segment stamp.
+                            mgr.add_tombstones(
+                                &all_skipped_inner,
+                                seal_seq,
+                                visible_lsn_at_extract,
+                            );
                         }
 
                         if let Some(&(max_id, _)) = all_rows.last() {
@@ -5913,22 +8025,52 @@ impl MVCCEngine {
     }
 }
 
-impl Engine for MVCCEngine {
-    fn open(&mut self) -> Result<()> {
-        MVCCEngine::open_engine(self)
+impl ReadEngine for MVCCEngine {
+    fn begin_read_transaction(&self) -> Result<Box<dyn ReadTransaction>> {
+        // Use internal writable entry (bypasses read-only gate); cast via supertrait.
+        let tx: Box<dyn WriteTransaction> = self.begin_writable_transaction_internal()?;
+        Ok(tx)
     }
 
-    fn close(&mut self) -> Result<()> {
-        MVCCEngine::close_engine(self)
+    fn begin_read_transaction_with_level(
+        &self,
+        level: IsolationLevel,
+    ) -> Result<Box<dyn ReadTransaction>> {
+        let tx: Box<dyn WriteTransaction> =
+            self.begin_writable_transaction_with_level_internal(level)?;
+        Ok(tx)
+    }
+}
+
+impl MVCCEngine {
+    /// Internal write entry: bypasses read-only gate. Trusted callers only
+    /// (DML/DDL/executor that has already checked Executor::read_only).
+    pub(crate) fn begin_writable_transaction_internal(&self) -> Result<Box<dyn WriteTransaction>> {
+        self.begin_writable_transaction_with_level_internal(self.get_isolation_level())
     }
 
-    fn begin_transaction(&self) -> Result<Box<dyn Transaction>> {
-        self.begin_transaction_with_level(self.get_isolation_level())
-    }
-
-    fn begin_transaction_with_level(&self, level: IsolationLevel) -> Result<Box<dyn Transaction>> {
+    /// `begin_writable_transaction_internal` with an explicit isolation level.
+    pub(crate) fn begin_writable_transaction_with_level_internal(
+        &self,
+        level: IsolationLevel,
+    ) -> Result<Box<dyn WriteTransaction>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
+        }
+        // Refuse new write transactions once the engine is in the
+        // catastrophic-failure state. A prior commit already drained
+        // markerless data into parent VersionStores and we can't
+        // undo it; admitting another writer would let it read or
+        // overwrite that markerless state and then publish its own
+        // WAL marker, making the markerless data interleave with
+        // legitimate durable state. The user must restart.
+        if self.is_failed() {
+            return Err(Error::internal(
+                "engine is in the catastrophic-failure state (a prior commit's \
+                 WAL marker write failed after some tables were already \
+                 committed); no new write transactions can be started. Restart \
+                 the process; recovery will discard the markerless transaction.",
+            ));
         }
 
         // Begin transaction in registry
@@ -5952,6 +8094,37 @@ impl Engine for MVCCEngine {
         txn.set_engine_operations(engine_ops);
 
         Ok(Box::new(txn))
+    }
+}
+
+impl Engine for MVCCEngine {
+    fn open(&mut self) -> Result<()> {
+        MVCCEngine::open_engine(self)
+    }
+
+    fn close(&mut self) -> Result<()> {
+        MVCCEngine::close_engine(self)
+    }
+
+    fn begin_transaction(&self) -> Result<Box<dyn WriteTransaction>> {
+        self.begin_transaction_with_level(self.get_isolation_level())
+    }
+
+    fn begin_transaction_with_level(
+        &self,
+        level: IsolationLevel,
+    ) -> Result<Box<dyn WriteTransaction>> {
+        // Read-only gate at the public Engine trait surface. Without this,
+        // `Database::engine().begin_transaction()` on a `?read_only=true`
+        // handle would still return a writable transaction (the engine
+        // would happily mint one), bypassing every other gate. Trusted
+        // internal callers go through
+        // `begin_writable_transaction_with_level_internal` and are not
+        // affected.
+        if self.is_read_only_mode() {
+            return Err(Error::read_only_violation_at("engine", "begin_transaction"));
+        }
+        self.begin_writable_transaction_with_level_internal(level)
     }
 
     fn path(&self) -> Option<&str> {
@@ -6070,20 +8243,33 @@ impl Engine for MVCCEngine {
     }
 
     fn checkpoint_cycle(&self) -> Result<()> {
+        self.ensure_writable()?;
         MVCCEngine::checkpoint_cycle(self)
     }
 
     fn force_checkpoint_cycle(&self) -> Result<()> {
+        self.ensure_writable()?;
         MVCCEngine::checkpoint_cycle_inner(self, true)?;
         self.compact_after_checkpoint_forced();
         Ok(())
     }
 
     fn create_snapshot(&self) -> Result<()> {
+        // Snapshot writes new files to disk. A read-only engine refuses
+        // even though the I/O layer would also fail with EROFS / EACCES,
+        // a clear `ReadOnlyViolation` here beats a confusing late error
+        // and is consistent with how the SQL `PRAGMA SNAPSHOT` is gated
+        // by the parser write-reason classifier.
+        self.ensure_writable()?;
         MVCCEngine::create_backup_snapshot(self)
     }
 
     fn restore_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
+        // Restore is destructive: it replaces engine state in-place from
+        // a backup. Refusing on read-only engines is mandatory, not
+        // defense-in-depth, the on-disk replacement bypasses anything
+        // the read-only file-lock contract was supposed to guarantee.
+        self.ensure_writable()?;
         MVCCEngine::restore_from_snapshot(self, timestamp)
     }
 
@@ -6199,10 +8385,14 @@ impl Engine for MVCCEngine {
             data.extend_from_slice(&0u16.to_le_bytes());
         }
 
-        // If this column was previously dropped, clear it from dropped_columns.
-        // Recompute cold mappings with the post-add schema.
-        // dropped_columns stays permanent — old volumes have stale data under
-        // the dropped name, new volumes get the re-added column at a new position.
+        // WAL FIRST so failed-latch in record_ddl rejects before mutating segment state.
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)?;
+
+        // Bump per-table manifest epoch so no-shm readers' drift check sees the ADD
+        // COLUMN even if next checkpoint produces no new segment.
+        self.propagate_schema_bump(table_name);
+
+        // Recompute cold mappings with post-add schema. dropped_columns is permanent.
         {
             let schema = self.schemas.read().unwrap().get(table_name).cloned();
             let mgrs = self.segment_managers.read().unwrap();
@@ -6213,7 +8403,7 @@ impl Engine for MVCCEngine {
             }
         }
 
-        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
+        Ok(())
     }
 
     fn record_alter_table_drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
@@ -6300,7 +8490,14 @@ impl Engine for MVCCEngine {
         // Nullable
         data.push(if nullable { 1 } else { 0 });
 
-        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)?;
+        // Stamp the table-level manifest epoch so a no-shm reader's
+        // drift check sees this MODIFY COLUMN even when the next
+        // checkpoint produces no new segment. See the matching
+        // block in `record_alter_table_add_column` for the full
+        // rationale, same SQL ALTER path bypass.
+        self.propagate_schema_bump(table_name);
+        Ok(())
     }
 
     fn record_alter_table_rename(&self, old_table_name: &str, new_table_name: &str) -> Result<()> {
@@ -6324,6 +8521,13 @@ impl Engine for MVCCEngine {
     }
 
     fn record_truncate_table(&self, table_name: &str) -> Result<()> {
+        // The `transactional_ddl_fence` is held by the
+        // CALLER (`Executor::execute_truncate`), spanning
+        // both `table.truncate()` AND this WAL write. We do
+        // NOT re-acquire SH here, parking_lot's RwLock can
+        // deadlock on reentrant SH if a checkpoint EX is
+        // waiting for the outer guard to drop.
+
         let table_lower = table_name.to_lowercase();
 
         // WAL FIRST: record the truncate before deleting segment files.
@@ -6341,11 +8545,18 @@ impl Engine for MVCCEngine {
             }
         }
 
-        // Delete volume files from disk (standalone volumes + legacy tombstones)
+        // Defer-when-readers-live unlink. Note: TRUNCATE leaves the table in catalog,
+        // so orphan-sweep won't pick it up; deferred files persist until DROP/crash.
         if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
                 let vol_dir = pm.path().join("volumes");
-                let _ = crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_lower);
+                let defer = self.defer_for_live_readers();
+                // Propagate failure: leftover manifest could resurface table.
+                crate::storage::volume::io::delete_table_volumes_when_safe(
+                    &vol_dir,
+                    &table_lower,
+                    defer,
+                )?;
                 let snapshot_dir = pm.path().join("snapshots");
                 let ts_path = snapshot_dir.join(&table_lower).join("tombstones.dat");
                 let _ = std::fs::remove_file(ts_path);
@@ -6446,9 +8657,14 @@ impl Engine for MVCCEngine {
 // =============================================================================
 
 impl MVCCEngine {
-    /// Cleanup old transactions that have been idle for too long
+    /// Cleanup old transactions that have been idle for too long.
+    ///
+    /// Silent no-op on a read-only engine (returns 0). Read-only engines
+    /// have no committed-transaction churn to clean and must not mutate
+    /// the registry. The same `is_read_only_mode` short-circuit applies
+    /// to every `cleanup_*` family method below.
     pub fn cleanup_old_transactions(&self, max_age: std::time::Duration) -> i32 {
-        if !self.is_open() {
+        if !self.is_open() || self.is_read_only_mode() {
             return 0;
         }
         self.registry.cleanup_old_transactions(max_age)
@@ -6456,7 +8672,7 @@ impl MVCCEngine {
 
     /// Cleanup deleted rows older than retention period from all tables
     pub fn cleanup_deleted_rows(&self, max_age: std::time::Duration) -> i32 {
-        if !self.is_open() {
+        if !self.is_open() || self.is_read_only_mode() {
             return 0;
         }
 
@@ -6472,7 +8688,7 @@ impl MVCCEngine {
 
     /// Cleanup old previous versions that are no longer needed from all tables
     pub fn cleanup_old_previous_versions(&self) -> i32 {
-        if !self.is_open() {
+        if !self.is_open() || self.is_read_only_mode() {
             return 0;
         }
 
@@ -6487,7 +8703,8 @@ impl MVCCEngine {
     }
 
     /// No-op: in the new tombstone design, cold deletes are not tracked
-    /// per-transaction. Kept for API compatibility.
+    /// per-transaction. Kept for API compatibility. Always a no-op,
+    /// regardless of read-only mode.
     pub fn cleanup_abandoned_cold_deletes(&self) {
         // Intentionally empty.
     }
@@ -6509,6 +8726,7 @@ impl MVCCEngine {
         table_name: Option<&str>,
         retention: std::time::Duration,
     ) -> crate::core::Result<(i32, i32, i32)> {
+        self.ensure_writable()?;
         if !self.is_open() {
             return Ok((0, 0, 0));
         }
@@ -6542,6 +8760,11 @@ impl MVCCEngine {
     /// Start periodic cleanup of old transactions and deleted rows
     ///
     /// Returns a handle that can be used to stop the cleanup thread.
+    /// On a read-only engine this is a silent no-op: the returned handle
+    /// has no underlying thread, matching the behaviour of `start_cleanup`
+    /// which also skips the background loop on read-only opens. Callers
+    /// can drop or `stop()` the handle the same way; nothing else
+    /// changes from their perspective.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn start_periodic_cleanup(
         self: &Arc<Self>,
@@ -6552,6 +8775,14 @@ impl MVCCEngine {
         use std::thread;
 
         let stop_flag = Arc::new(AtomicBool::new(false));
+
+        if self.is_read_only_mode() {
+            return CleanupHandle {
+                stop_flag,
+                thread: None,
+            };
+        }
+
         let stop_flag_clone = Arc::clone(&stop_flag);
         let engine = Arc::clone(self);
 
@@ -6629,12 +8860,40 @@ struct EngineOperations {
         Arc<RwLock<FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>>>,
     /// Seal fence for WAL truncation safety
     seal_fence: Arc<parking_lot::RwLock<()>>,
+    /// Cloned transactional_ddl_fence. SH held while txn has in-flight DDL.
+    transactional_ddl_fence: Arc<parking_lot::RwLock<()>>,
+    /// Cloned schema_epoch so transactional DDL bumps the same counter as direct DDL.
+    schema_epoch: Arc<AtomicU64>,
+    /// Cloned engine root path for finalize_committed_drops's defer-when-readers-live check.
+    engine_path: String,
+    /// Cloned lease max-age (Arc-shared so future PRAGMA reload propagates to both).
+    lease_max_age_nanos: Arc<AtomicU64>,
+    /// Shared pending_drop_cleanups (transactional DROP path participates).
+    pending_drop_cleanups: Arc<parking_lot::Mutex<rustc_hash::FxHashSet<String>>>,
+    /// Engine shm handle snapshot at txn-begin (Arc keeps mapping alive even if
+    /// engine slot swaps). None = no cross-process publish.
+    shm: Option<Arc<crate::storage::mvcc::shm::ShmHandle>>,
+    /// Shared pending_marker_lsns (commit publish path).
+    pending_marker_lsns: Arc<parking_lot::Mutex<std::collections::BTreeSet<u64>>>,
+    /// Shared shm_publish_lock (serialize seqlock publishes).
+    shm_publish_lock: Arc<parking_lot::Mutex<()>>,
+    /// Shared lease_present cache (commit publish fast path).
+    lease_present: Arc<AtomicBool>,
+    /// Shared max_written_marker_lsn (safe-visible upper bound when pending drains).
+    max_written_marker_lsn: Arc<std::sync::atomic::AtomicU64>,
+    completed_marker_txns: Arc<parking_lot::Mutex<std::collections::BTreeMap<u64, i64>>>,
+    /// Shared catastrophic-failure latch.
+    failed: Arc<AtomicBool>,
+    /// Engine read-only snapshot at construction (immutable for engine lifetime).
+    read_only: bool,
 }
 
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
 
 impl EngineOperations {
     fn new(engine: &MVCCEngine) -> Self {
+        let shm = engine.shm.lock().unwrap().as_ref().map(Arc::clone);
+        let read_only = engine.is_read_only_mode();
         Self {
             schemas: Arc::clone(&engine.schemas),
             version_stores: Arc::clone(&engine.version_stores),
@@ -6644,6 +8903,19 @@ impl EngineOperations {
             loading_from_disk: Arc::clone(&engine.loading_from_disk),
             segment_managers: Arc::clone(&engine.segment_managers),
             seal_fence: Arc::clone(&engine.seal_fence),
+            transactional_ddl_fence: Arc::clone(&engine.transactional_ddl_fence),
+            schema_epoch: Arc::clone(&engine.schema_epoch),
+            engine_path: engine.path.clone(),
+            lease_max_age_nanos: Arc::clone(&engine.lease_max_age_nanos),
+            pending_drop_cleanups: Arc::clone(&engine.pending_drop_cleanups),
+            shm,
+            pending_marker_lsns: Arc::clone(&engine.pending_marker_lsns),
+            max_written_marker_lsn: Arc::clone(&engine.max_written_marker_lsn),
+            completed_marker_txns: Arc::clone(&engine.completed_marker_txns),
+            shm_publish_lock: Arc::clone(&engine.shm_publish_lock),
+            lease_present: Arc::clone(&engine.lease_present),
+            failed: Arc::clone(&engine.failed),
+            read_only,
         }
     }
 
@@ -6883,8 +9155,37 @@ impl EngineOperations {
     }
 }
 
+impl EngineOperations {
+    /// Mirror of `MVCCEngine::defer_for_live_readers` for the
+    /// transactional-DDL DROP path. Uses the shared `lease_max_age_nanos`
+    /// (120s engine floor if unset). Same fail-closed semantics: an FS
+    /// error reading reader leases returns `true`.
+    fn defer_for_live_readers(&self) -> bool {
+        if self.engine_path.is_empty() {
+            return false;
+        }
+        let nanos = self.lease_max_age_nanos.load(Ordering::Acquire);
+        let max_age = if nanos > 0 {
+            std::time::Duration::from_nanos(nanos)
+        } else {
+            std::time::Duration::from_secs(120)
+        };
+        let dir =
+            std::path::Path::new(&self.engine_path).join(crate::storage::mvcc::lease::READERS_DIR);
+        let _ = crate::storage::mvcc::lease::reap_stale_leases(&dir, max_age);
+        match crate::storage::mvcc::lease::live_leases(&dir, max_age) {
+            Ok(v) => !v.is_empty(),
+            Err(_) => true,
+        }
+    }
+}
+
 impl TransactionEngineOperations for EngineOperations {
-    fn get_table_for_transaction(&self, txn_id: i64, table_name: &str) -> Result<Box<dyn Table>> {
+    fn get_table_for_transaction(
+        &self,
+        txn_id: i64,
+        table_name: &str,
+    ) -> Result<Box<dyn WriteTable>> {
         // Use Cow to avoid allocation when table_name is already lowercase (common case)
         let table_name_lower = to_lowercase_cow(table_name);
 
@@ -6958,16 +9259,41 @@ impl TransactionEngineOperations for EngineOperations {
                         ),
                     ));
                 }
-                return Ok(Box::new(
-                    crate::storage::volume::table::SegmentedTable::new(Box::new(table), mgr),
-                ));
+                // Read-only engines need the SWMR-aware row_count
+                // path; writers stay on the O(1) formula. See the
+                // `read_only` field doc on SegmentedTable.
+                return Ok(Box::new(if self.read_only {
+                    crate::storage::volume::table::SegmentedTable::new_read_only(
+                        Box::new(table),
+                        mgr,
+                    )
+                } else {
+                    crate::storage::volume::table::SegmentedTable::new(Box::new(table), mgr)
+                }));
             }
         }
 
         Ok(Box::new(table))
     }
 
-    fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn Table>> {
+    fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn WriteTable>> {
+        // Refuse if the engine is in the catastrophic-failure state.
+        // Same shape as the drop_table / rename_table guards: this
+        // trait method is reachable from inside an open transaction
+        // (`MvccTransaction::create_table`) where `check_active()`
+        // is the only gate. Without this guard, transactional
+        // CREATE could insert the schema + VersionStore, a later
+        // record_commit would then hit the failed latch and return
+        // Err, but the new table would remain live in memory and
+        // `rollback_ddl` couldn't remove it (drop_table now refuses
+        // under the latch).
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "create_table refused: engine is in the catastrophic-failure \
+                 state from a prior commit's marker write failure. Restart \
+                 the process; recovery will discard the markerless transaction.",
+            ));
+        }
         let table_name = name.to_lowercase();
 
         // Create version store for this table (before acquiring locks)
@@ -6980,11 +9306,20 @@ impl TransactionEngineOperations for EngineOperations {
         // Register PkIndex if table has a primary key
         register_pk_index(&schema, &version_store);
 
-        // Atomically check-and-insert under write lock to prevent TOCTOU race
+        // Atomic check-and-insert; same schemas->pending lock order as DROP.
         {
             let mut schemas = self.schemas().write().unwrap();
             if schemas.contains_key(&table_name) {
                 return Err(Error::TableAlreadyExists(table_name.to_string()));
+            }
+            if self.pending_drop_cleanups.lock().contains(&table_name) {
+                return Err(Error::internal(format!(
+                    "CREATE TABLE refused: a prior DROP/TRUNCATE for '{}' is still \
+                     pending physical cleanup (live cross-process readers, or a \
+                     cleanup I/O failure). Wait for the orphan sweep to drain \
+                     before recreating the table.",
+                    table_name
+                )));
             }
             schemas.insert(table_name.clone(), CompactArc::new(schema));
         }
@@ -6992,6 +9327,10 @@ impl TransactionEngineOperations for EngineOperations {
             let mut stores = self.version_stores().write().unwrap();
             stores.insert(table_name, Arc::clone(&version_store));
         }
+
+        // Bump epoch AFTER mutation so concurrent readers seeing the higher epoch also
+        // see the inserted entries.
+        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         // Create transaction version store with txn_id 0 (will be set by caller)
         let txn_versions = TransactionVersionStore::new(Arc::clone(&version_store), 0);
@@ -7002,53 +9341,92 @@ impl TransactionEngineOperations for EngineOperations {
         Ok(Box::new(table))
     }
 
-    fn drop_table(&self, name: &str) -> Result<()> {
+    fn drop_table(&self, name: &str) -> Result<DropSnapshot> {
+        // Refuse if failed (reachable from inside open txn; begin-time gate doesn't apply).
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "drop_table refused: engine is in the catastrophic-failure \
+                 state from a prior commit's marker write failure. Restart \
+                 the process; recovery will discard the markerless transaction.",
+            ));
+        }
         let table_name_lower = name.to_lowercase();
 
-        // Remove schema and clean up FK references in child tables
+        // Snapshot parent + FK-referencing children before strip; returned for txn rollback.
+        let parent_schema: Schema;
+        let mut child_schemas: Vec<(String, Schema)> = Vec::new();
         {
             let mut schemas = self.schemas().write().unwrap();
-            if schemas.remove(&table_name_lower).is_none() {
+            if !schemas.contains_key(&table_name_lower) {
                 return Err(Error::TableNotFound(table_name_lower.to_string()));
             }
+            // Clone the parent schema before removal.
+            parent_schema = schemas
+                .get(&table_name_lower)
+                .map(|s| (**s).clone())
+                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
+            // Capture every child whose FK constraints would be
+            // stripped by `strip_fk_references`.
+            for (cname, csch) in schemas.iter() {
+                if csch
+                    .foreign_keys
+                    .iter()
+                    .any(|fk| fk.referenced_table == table_name_lower)
+                {
+                    child_schemas.push((cname.clone(), (**csch).clone()));
+                }
+            }
+            // Mark dropping under same schemas write lock (closes CREATE-after-DROP race).
+            self.pending_drop_cleanups
+                .lock()
+                .insert(table_name_lower.clone());
+            schemas.remove(&table_name_lower);
             let version_stores = self.version_stores().read().unwrap();
             strip_fk_references(&mut schemas, &version_stores, &table_name_lower);
         }
-        // Close and remove version store
-        {
+
+        // Capture secondary indexes so rollback can recreate them on the fresh
+        // VersionStore. PK indexes are auto-derived by register_pk_index.
+        let removed_store: Option<Arc<VersionStore>> = {
             let mut stores = self.version_stores().write().unwrap();
-            if let Some(store) = stores.remove(&table_name_lower) {
-                store.close();
-            }
-        }
-
-        // Record DDL to WAL so the drop survives crash recovery
-        if !self.should_skip_wal() {
-            if let Some(ref pm) = *self.persistence() {
-                if pm.is_enabled() {
-                    let _ = pm.record_ddl_operation(name, WALOperationType::DropTable, &[]);
+            stores.remove(&table_name_lower)
+        };
+        let mut captured_indexes: Vec<Vec<u8>> = Vec::new();
+        if let Some(ref store) = removed_store {
+            let _ = store.for_each_index(|index| {
+                if index.index_type() == crate::core::IndexType::PrimaryKey {
+                    return Ok(());
                 }
-            }
+                let meta = super::persistence::IndexMetadata {
+                    name: index.name().to_string(),
+                    table_name: table_name_lower.clone(),
+                    column_names: index.column_names().to_vec(),
+                    column_ids: index.column_ids().to_vec(),
+                    data_types: index.data_types().to_vec(),
+                    is_unique: index.is_unique(),
+                    index_type: index.index_type(),
+                    hnsw_m: index.hnsw_m(),
+                    hnsw_ef_construction: index.hnsw_ef_construction(),
+                    hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
+                    hnsw_distance_metric: index.hnsw_distance_metric(),
+                };
+                captured_indexes.push(meta.serialize());
+                Ok(())
+            });
+        }
+        if let Some(store) = removed_store {
+            store.close();
         }
 
-        // Clear in-memory segment state (prevents phantom rows on re-create)
-        {
-            let mut mgrs = self.segment_managers.write().unwrap();
-            if let Some(mgr) = mgrs.get(&table_name_lower) {
-                mgr.clear();
-            }
-            mgrs.remove(&table_name_lower);
-        }
+        // Segment-manager clear and volume-file delete happen post-commit in
+        // finalize_committed_drops (rollback retains files; commit reaps after marker).
+        self.schema_epoch.fetch_add(1, Ordering::Release);
 
-        // Delete volume files from disk
-        if let Some(ref pm) = *self.persistence() {
-            if pm.is_enabled() {
-                let vol_dir = pm.path().join("volumes");
-                let _ = crate::storage::volume::io::delete_all_volumes(&vol_dir, &table_name_lower);
-            }
-        }
-
-        Ok(())
+        Ok(DropSnapshot {
+            parent_schema,
+            child_schemas,
+            indexes: captured_indexes,
+        })
     }
 
     fn list_tables(&self) -> Result<Vec<String>> {
@@ -7057,6 +9435,15 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
+        // Refuse if failed: this is reachable from inside an open transaction where
+        // begin-time latch checks don't apply.
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "rename_table refused: engine is in the catastrophic-failure \
+                 state from a prior commit's marker write failure. Restart \
+                 the process; recovery will discard the markerless transaction.",
+            ));
+        }
         let old_name_lower = old_name.to_lowercase();
         let new_name_lower = new_name.to_lowercase();
 
@@ -7155,10 +9542,16 @@ impl TransactionEngineOperations for EngineOperations {
             }
         }
 
+        // Bump schema_epoch, same rationale as in
+        // `create_table` / `drop_table`. A rename invalidates
+        // any cached lookup keyed by the old or new name and
+        // any compiled DML targeting either entry.
+        self.schema_epoch.fetch_add(1, Ordering::Release);
+
         Ok(())
     }
 
-    fn commit_table(&self, txn_id: i64, table: &dyn Table) -> Result<()> {
+    fn commit_table(&self, txn_id: i64, table: &dyn WriteTable) -> Result<()> {
         // Skip WAL writes during recovery replay
         if self.should_skip_wal() {
             return Ok(());
@@ -7197,26 +9590,487 @@ impl TransactionEngineOperations for EngineOperations {
         Ok(())
     }
 
-    fn rollback_table(&self, _txn_id: i64, table: &dyn Table) {
+    fn rollback_table(&self, _txn_id: i64, table: &dyn WriteTable) {
         // The Table trait now has a rollback method.
         // This callback is for any engine-level rollback actions.
         let _ = table;
     }
 
-    fn record_commit(&self, txn_id: i64) -> Result<()> {
+    fn record_commit(&self, txn_id: i64, commit_seq: i64) -> Result<u64> {
         // Skip WAL writes during recovery replay
+        if self.should_skip_wal() {
+            return Ok(0);
+        }
+        // Defense in depth: in-flight commits started pre-latch must not publish
+        // post-latch (would coexist with markerless rows on restart).
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "record_commit refused: engine is in the catastrophic-failure \
+                 state from a prior commit's marker write failure. Restart the \
+                 process; recovery will discard markerless transactions.",
+            ));
+        }
+
+        // commit_seq from start_commit; SWMR v2 readers use it for tombstone tagging.
+        // Returns marker LSN (0 if persistence disabled).
+        if let Some(ref pm) = self.persistence() {
+            if pm.is_enabled() {
+                // Hold pending_marker_lsns across marker write + insert: a concurrent
+                // publish in the gap would compute safe=max_written and advertise past
+                // our marker before our complete_commit fires.
+                use std::sync::atomic::Ordering;
+                let mut pending = self.pending_marker_lsns.lock();
+                let lsn = pm.record_commit(txn_id, commit_seq)?;
+                if lsn > 0 {
+                    pending.insert(lsn);
+                    self.max_written_marker_lsn.fetch_max(lsn, Ordering::AcqRel);
+                }
+                drop(pending);
+                return Ok(lsn);
+            }
+        }
+        Ok(0)
+    }
+
+    fn publish_visible_commit_lsn(&self, txn_id: i64, lsn: u64) {
+        if lsn == 0 {
+            return;
+        }
+        // safe_visible = (min(pending) - 1) if pending non-empty else max_written.
+        // Remove our own LSN first; never advertise past any pending marker.
+        let safe_visible = {
+            let mut pending = self.pending_marker_lsns.lock();
+            pending.remove(&lsn);
+            if let Some(&min_pending) = pending.iter().next() {
+                min_pending.saturating_sub(1)
+            } else {
+                use std::sync::atomic::Ordering;
+                self.max_written_marker_lsn.load(Ordering::Acquire)
+            }
+        };
+        if txn_id > 0 {
+            self.completed_marker_txns.lock().insert(lsn, txn_id);
+        }
+        if safe_visible == 0 {
+            return;
+        }
+        let publish_lsn = cap_visible_lsn_by_flushed(&self.persistence, safe_visible);
+        if let Some(handle) = self.shm.as_ref() {
+            // Watermark must be read BEFORE clear_active_txn so it includes this txn's DML LSN.
+            // After publish, a watermark-only re-publish ensures oldest_active advances past
+            // this completed txn instead of pinning forever.
+            // Lease-presence fast path: no live cross-process reader -> skip seqlock dance and
+            // fetch_max visible_commit_lsn directly (Release-Acquire is sufficient for single
+            // AtomicU64). Default lease_present=true (conservative).
+            let do_full_publish = self.lease_present.load(Ordering::Acquire);
+            if !do_full_publish {
+                // Fast path: only advance visible_commit_lsn (truncate clamp). Don't touch
+                // oldest_active_txn_lsn; the false->true transition triggers a barrier publish.
+                if publish_lsn > 0 {
+                    handle
+                        .header()
+                        .visible_commit_lsn
+                        .fetch_max(publish_lsn, Ordering::AcqRel);
+                }
+                let visible_after = handle.header().visible_commit_lsn.load(Ordering::Acquire);
+                clear_published_completed_txns(
+                    &self.completed_marker_txns,
+                    &self.persistence,
+                    visible_after,
+                );
+                return;
+            }
+
+            // Slow path (readers present): full seqlock publish.
+            let _publish_guard = self.shm_publish_lock.lock();
+            // Skip the visible publish if no advance (would overwrite oldest with
+            // higher value paired to existing visible). Outer fn must continue:
+            // clear_active_txn + watermark republish below must run.
+            if publish_lsn > handle.header().visible_commit_lsn.load(Ordering::Acquire) {
+                // Seqlock: bump-odd, store fields, bump-even.
+                handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+                if let Some(pm) = self.persistence.as_ref().as_ref() {
+                    if let Some(wal) = pm.wal() {
+                        let oldest = wal.oldest_active_txn_lsn();
+                        handle
+                            .header()
+                            .oldest_active_txn_lsn
+                            .store(oldest, Ordering::Release);
+                    }
+                }
+                handle
+                    .header()
+                    .visible_commit_lsn
+                    .fetch_max(publish_lsn, Ordering::AcqRel);
+                handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+            }
+
+            // Clear completed txns covered by visible, then re-publish recomputed
+            // watermark (oldest may advance; visible doesn't change). Same publish_guard
+            // keeps the seqlock pair atomic.
+            let visible_after = handle.header().visible_commit_lsn.load(Ordering::Acquire);
+            let cleared = clear_published_completed_txns(
+                &self.completed_marker_txns,
+                &self.persistence,
+                visible_after,
+            );
+            if cleared {
+                if let Some(pm) = self.persistence.as_ref().as_ref() {
+                    if let Some(wal) = pm.wal() {
+                        let fresh_oldest = wal.oldest_active_txn_lsn();
+                        let current_oldest = handle
+                            .header()
+                            .oldest_active_txn_lsn
+                            .load(Ordering::Acquire);
+                        if fresh_oldest != current_oldest {
+                            handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+                            handle
+                                .header()
+                                .oldest_active_txn_lsn
+                                .store(fresh_oldest, Ordering::Release);
+                            handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                }
+            }
+        } else {
+            // No shm: still need to clear the WAL state so
+            // future publishes (if shm appears) reflect the
+            // cleared txn.
+            self.completed_marker_txns.lock().remove(&lsn);
+            if let Some(pm) = self.persistence.as_ref().as_ref() {
+                if let Some(wal) = pm.wal() {
+                    wal.clear_active_txn(txn_id);
+                }
+            }
+        }
+    }
+
+    fn flush_transactional_ddl(&self, txn_id: i64, ops: &[DeferredDdlOp]) -> Result<()> {
+        // Durable WAL entry per op under txn_id (no marker). Visibility gated by
+        // the user txn's commit marker; crashed-orphan entries are skipped on recovery.
         if self.should_skip_wal() {
             return Ok(());
         }
-
-        // Record commit in WAL — propagate errors since missing commit records
-        // means crash recovery won't replay this transaction's changes
-        if let Some(ref pm) = self.persistence() {
-            if pm.is_enabled() {
-                pm.record_commit(txn_id)?;
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "flush_transactional_ddl refused: engine is in the \
+                 catastrophic-failure state from a prior commit's marker write \
+                 failure. Restart the process; recovery will discard the \
+                 markerless transaction.",
+            ));
+        }
+        let pm_guard = self.persistence();
+        let pm = match pm_guard.as_ref() {
+            Some(pm) if pm.is_enabled() => pm,
+            _ => return Ok(()),
+        };
+        for op in ops {
+            // Re-check failed before each write (concurrent flip could slip DDL past the gate).
+            if self.failed.load(Ordering::Acquire) {
+                return Err(Error::internal(
+                    "flush_transactional_ddl refused mid-batch: engine entered \
+                     the catastrophic-failure state.",
+                ));
+            }
+            match op {
+                DeferredDdlOp::Create { name, schema_data } => {
+                    pm.record_transactional_ddl(
+                        txn_id,
+                        name,
+                        WALOperationType::CreateTable,
+                        schema_data,
+                    )?;
+                }
+                DeferredDdlOp::Drop { name } => {
+                    pm.record_transactional_ddl(txn_id, name, WALOperationType::DropTable, &[])?;
+                }
+                DeferredDdlOp::CreateIndex {
+                    table_name,
+                    metadata,
+                } => {
+                    pm.record_transactional_ddl(
+                        txn_id,
+                        table_name,
+                        WALOperationType::CreateIndex,
+                        metadata,
+                    )?;
+                }
             }
         }
         Ok(())
+    }
+
+    fn finalize_committed_drops(&self, names: &[String]) {
+        // Post-commit physical reap. Called only AFTER the
+        // user's commit marker is durable + visible, so a
+        // crash between marker durability and these
+        // operations leaves orphan files / segment state that
+        // the next checkpoint or compaction can clean up.
+        let defer = self.defer_for_live_readers();
+        for name in names {
+            let table_name_lower = name.to_lowercase();
+            // Clear in-memory segment state first (prevents
+            // phantom rows on a re-create using the same
+            // name).
+            {
+                let mut mgrs = self.segment_managers.write().unwrap();
+                if let Some(mgr) = mgrs.get(&table_name_lower) {
+                    mgr.clear();
+                }
+                mgrs.remove(&table_name_lower);
+            }
+            // Defer volume cleanup if cross-process readers may hold stale manifest pointers.
+            // pending_drop_cleanups blocks WAL truncation past the DropTable record until
+            // sweep_orphan_table_dirs successfully removes the leftover manifest.
+            if let Some(ref pm) = *self.persistence() {
+                if pm.is_enabled() {
+                    let vol_dir = pm.path().join("volumes");
+                    // drop_table already inserted into pending_drop_cleanups; clear only on
+                    // non-deferred success.
+                    match crate::storage::volume::io::delete_table_volumes_when_safe(
+                        &vol_dir,
+                        &table_name_lower,
+                        defer,
+                    ) {
+                        Ok(()) => {
+                            if !defer {
+                                self.pending_drop_cleanups.lock().remove(&table_name_lower);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: post-commit volume cleanup failed for '{}': {} \
+                                 (deferring WAL truncation until cleanup succeeds)",
+                                table_name_lower, e
+                            );
+                        }
+                    }
+                } else {
+                    self.pending_drop_cleanups.lock().remove(&table_name_lower);
+                }
+            } else {
+                self.pending_drop_cleanups.lock().remove(&table_name_lower);
+            }
+        }
+    }
+
+    fn build_index_metadata(
+        &self,
+        table_name: &str,
+        index_name: &str,
+        column_names: &[String],
+        is_unique: bool,
+        index_type: crate::core::IndexType,
+        hnsw_m: Option<u16>,
+        hnsw_ef_construction: Option<u16>,
+        hnsw_ef_search: Option<u16>,
+        hnsw_distance_metric: Option<u8>,
+    ) -> Result<Vec<u8>> {
+        // Returns serialized payload for ddl_log so the txn flushes at commit time
+        // (WAL ordering: CreateTable -> CreateIndex -> commit marker).
+        let table_name_lower = table_name.to_lowercase();
+        let schema = {
+            let schemas = self.schemas().read().unwrap();
+            schemas
+                .get(&table_name_lower)
+                .cloned()
+                .ok_or_else(|| Error::TableNotFound(table_name_lower.clone()))?
+        };
+        let col_index_map = schema.column_index_map();
+        let mut column_ids = Vec::with_capacity(column_names.len());
+        let mut data_types = Vec::with_capacity(column_names.len());
+        for col_name in column_names {
+            let col_name_lower = col_name.to_lowercase();
+            if let Some(&idx) = col_index_map.get(&col_name_lower) {
+                column_ids.push(idx as i32);
+                data_types.push(schema.columns[idx].data_type);
+            } else {
+                // Stale column reference: empty payload signals "no flush needed".
+                return Ok(Vec::new());
+            }
+        }
+        let index_meta = super::persistence::IndexMetadata {
+            name: index_name.to_string(),
+            table_name: table_name.to_string(),
+            column_names: column_names.to_vec(),
+            column_ids,
+            data_types,
+            is_unique,
+            index_type,
+            hnsw_m,
+            hnsw_ef_construction,
+            hnsw_ef_search,
+            hnsw_distance_metric,
+        };
+        Ok(index_meta.serialize())
+    }
+
+    fn restore_table_indexes(&self, table_name: &str, indexes: &[Vec<u8>]) -> Result<()> {
+        if indexes.is_empty() {
+            return Ok(());
+        }
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "restore_table_indexes refused: engine is in the \
+                 catastrophic-failure state.",
+            ));
+        }
+        let table_name_lower = table_name.to_lowercase();
+        let store = {
+            let stores = self.version_stores().read().unwrap();
+            stores
+                .get(&table_name_lower)
+                .cloned()
+                .ok_or_else(|| Error::TableNotFound(table_name_lower.clone()))?
+        };
+        // Segment manager survives transactional drop (finalized post-commit).
+        // On rollback HNSW must include cold rows (no segment-scan fallback for vector search).
+        let segment_mgr = {
+            let mgrs = self.segment_managers.read().unwrap();
+            mgrs.get(&table_name_lower).cloned()
+        };
+        for serialized in indexes {
+            let meta = crate::storage::mvcc::persistence::IndexMetadata::deserialize(serialized)?;
+            // Step 1: recreate the index structure +
+            // populate from the (currently empty) hot store.
+            store.create_index_from_metadata(&meta, false)?;
+            // Step 2: HNSW-only, populate from cold
+            // segments. Other index types (BTree, Hash,
+            // Bitmap, MultiColumn) intentionally cover only
+            // hot rows; cold scans use zone maps + dictionary
+            // pre-filters, so leaving cold rows out of the
+            // in-memory index is correct. HNSW has no such
+            // fallback path, so without this step a restored
+            // HNSW index would miss every sealed vector and
+            // unique-vector checks would ignore cold
+            // duplicates.
+            if meta.index_type == crate::core::IndexType::Hnsw {
+                if let Some(ref mgr) = segment_mgr {
+                    if mgr.has_segments() {
+                        let cols: Vec<&str> =
+                            meta.column_names.iter().map(|s| s.as_str()).collect();
+                        if let Err(e) =
+                            crate::storage::volume::table::populate_index_from_cold_segments(
+                                &store,
+                                mgr.as_ref(),
+                                &meta.name,
+                                &cols,
+                            )
+                        {
+                            // Roll back the partially-built
+                            // index so a retry sees a clean
+                            // state. Mirrors the rollback in
+                            // `SegmentedTable::create_index_with_type`.
+                            let _ = store.remove_index(&meta.name);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        }
+        // Bump schema_epoch, restoring secondary indexes
+        // changes the index set on the table, so cached
+        // compiled DML / planner choices keyed on the prior
+        // (no-index) state must rederive.
+        self.schema_epoch.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn release_pending_drop_cleanup(&self, name: &str) {
+        // The DROP that placed the entry never reached
+        // durability (rollback) and the inverse
+        // `create_table` is about to run; clearing here
+        // lets that create_table acquire the schemas write
+        // lock without tripping the same-name DROP-in-
+        // progress guard. No-op when not present.
+        self.pending_drop_cleanups.lock().remove(name);
+    }
+
+    fn restore_child_fk_schemas(&self, schemas: &[(String, Schema)]) -> Result<()> {
+        if schemas.is_empty() {
+            return Ok(());
+        }
+        if self.failed.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "restore_child_fk_schemas refused: engine is in the \
+                 catastrophic-failure state.",
+            ));
+        }
+        // Acquire schemas write + version_stores read in the
+        // same scope so the catalog and per-VS schema updates
+        // are consistent. Lock-ordering rule: schemas FIRST,
+        // then version_stores (matches `MVCCEngine::drop_table_internal`'s
+        // revert path).
+        {
+            let mut catalog = self.schemas().write().unwrap();
+            let stores = self.version_stores().read().unwrap();
+            for (cname, csch) in schemas {
+                if let Some(vs) = stores.get(cname.as_str()) {
+                    *vs.schema_mut() = CompactArc::new(csch.clone());
+                }
+                catalog.insert(cname.clone(), CompactArc::new(csch.clone()));
+            }
+        }
+        // Bump schema_epoch so any cached
+        // `find_referencing_fks(parent)` result that was
+        // computed against the FK-stripped catalog is
+        // invalidated and recomputes against the restored
+        // child constraints.
+        self.schema_epoch.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn release_pending_ddl_marker(&self, lsn: u64) {
+        // Mirrors the pending-drain shape of
+        // `publish_visible_commit_lsn` but without the txn-side
+        // bookkeeping (no `clear_active_txn`; DDL doesn't have
+        // an active_txn record, only a marker LSN parked in
+        // pending). `lsn = 0` means no marker was actually
+        // pinned (in-memory engine, persistence disabled, or
+        // `should_skip_wal()` true), nothing to do.
+        if lsn == 0 {
+            return;
+        }
+        let safe_visible = {
+            let mut pending = self.pending_marker_lsns.lock();
+            pending.remove(&lsn);
+            if let Some(&min_pending) = pending.iter().next() {
+                min_pending.saturating_sub(1)
+            } else {
+                self.max_written_marker_lsn.load(Ordering::Acquire)
+            }
+        };
+        if safe_visible == 0 {
+            return;
+        }
+        let publish_lsn = cap_visible_lsn_by_flushed(&self.persistence, safe_visible);
+        if publish_lsn == 0 {
+            return;
+        }
+        if let Some(handle) = self.shm.as_ref() {
+            // Same shm publish dance as
+            // `publish_visible_commit_lsn`, see that method
+            // for the seqlock + watermark ordering rationale.
+            let _publish_guard = self.shm_publish_lock.lock();
+            if publish_lsn > handle.header().visible_commit_lsn.load(Ordering::Acquire) {
+                handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+                if let Some(pm) = self.persistence.as_ref().as_ref() {
+                    if let Some(wal) = pm.wal() {
+                        let oldest = wal.oldest_active_txn_lsn();
+                        handle
+                            .header()
+                            .oldest_active_txn_lsn
+                            .store(oldest, Ordering::Release);
+                    }
+                }
+                handle
+                    .header()
+                    .visible_commit_lsn
+                    .fetch_max(publish_lsn, Ordering::AcqRel);
+                handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+            }
+        }
     }
 
     fn record_rollback(&self, txn_id: i64) -> Result<()> {
@@ -7231,12 +10085,34 @@ impl TransactionEngineOperations for EngineOperations {
                 if let Err(e) = pm.record_rollback(txn_id) {
                     eprintln!("Warning: Failed to record rollback in WAL: {}", e);
                 }
+                // Clear active_txn_first_lsn now (rollback has no commit publish).
+                // Republish oldest_active under seqlock so readers advance past this
+                // rolled-back txn's first DML LSN (otherwise WAL stays pinned at it).
+                if let Some(wal) = pm.wal() {
+                    wal.clear_active_txn(txn_id);
+                    if let Some(handle) = self.shm.as_ref() {
+                        let _publish_guard = self.shm_publish_lock.lock();
+                        let fresh_oldest = wal.oldest_active_txn_lsn();
+                        let current_oldest = handle
+                            .header()
+                            .oldest_active_txn_lsn
+                            .load(Ordering::Acquire);
+                        if fresh_oldest != current_oldest {
+                            handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+                            handle
+                                .header()
+                                .oldest_active_txn_lsn
+                                .store(fresh_oldest, Ordering::Release);
+                            handle.header().publish_seq.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                }
             }
         }
         Ok(())
     }
 
-    fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn Table>>> {
+    fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn WriteTable>>> {
         let mut tables = Vec::new();
 
         // O(1) lookup for this transaction's tables (hot changes)
@@ -7260,7 +10136,7 @@ impl TransactionEngineOperations for EngineOperations {
                             Arc::clone(txn_store),
                         );
 
-                        tables.push(Box::new(table) as Box<dyn Table>);
+                        tables.push(Box::new(table) as Box<dyn WriteTable>);
                     }
                 }
             }
@@ -7270,34 +10146,24 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn has_pending_dml_changes(&self, txn_id: i64) -> bool {
-        // Check hot-side DML changes
         let cache = self.txn_version_stores().read().unwrap();
         let txn_tables = match cache.get(txn_id) {
             Some(tables) if !tables.is_empty() => tables,
-            _ => {
-                // No txn_version_store entry means this txn never accessed any table
-                // for DML, so no pending tombstones can exist either.
-                return false;
-            }
+            _ => return false,
         };
 
-        // Phase 1: Check hot mutations. Return immediately if any found.
-        // Do NOT collect table names here — avoids SmartString clones
-        // on the common early-return path.
+        // Hot mutations: early-return without collecting table names (saves clones).
         for (_, txn_store) in txn_tables.iter() {
             if txn_store.read().unwrap().has_local_changes() {
                 return true;
             }
         }
 
-        // Phase 2: No hot changes found. Now collect table names for cold check.
         let touched_tables: smallvec::SmallVec<[crate::common::SmartString; 4]> =
             txn_tables.iter().map(|(name, _)| name.clone()).collect();
         drop(cache);
 
-        // Check cold-side pending tombstones only for tables this txn touched.
-        // Cold DELETE/UPDATE on non-int-pk tables may create tombstones without
-        // hot mutations, but they always go through get_table_for_transaction first.
+        // Cold-side pending tombstones (cold DELETE/UPDATE on non-int-pk tables).
         let mgrs = self.segment_managers.read().unwrap();
         for table_name in &touched_tables {
             if let Some(mgr) = mgrs.get(table_name.as_str()) {
@@ -7309,7 +10175,7 @@ impl TransactionEngineOperations for EngineOperations {
         false
     }
 
-    fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>) {
+    fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>, Vec<String>) {
         // Get the commit_seq for this transaction. start_commit() was called before us,
         // so the commit_seq is in the registry. Used for versioned tombstones: snapshot
         // isolation transactions only see tombstones with commit_seq <= their begin_seq.
@@ -7323,11 +10189,13 @@ impl TransactionEngineOperations for EngineOperations {
             Arc<RwLock<TransactionVersionStore>>,
             Arc<VersionStore>,
         )>;
+        let touched_table_names: SmallVec<[crate::common::SmartString; 4]>;
         {
             let cache = self.txn_version_stores().read().unwrap();
-            tables_to_commit = if let Some(txn_tables) = cache.get(txn_id) {
+            if let Some(txn_tables) = cache.get(txn_id) {
+                touched_table_names = txn_tables.iter().map(|(name, _)| name.clone()).collect();
                 let stores = self.version_stores().read().unwrap();
-                txn_tables
+                tables_to_commit = txn_tables
                     .iter()
                     .filter(|(_, txn_store)| {
                         let store = txn_store.read().unwrap();
@@ -7339,15 +10207,17 @@ impl TransactionEngineOperations for EngineOperations {
                             .cloned()
                             .map(|vs| (table_name.clone(), Arc::clone(txn_store), vs))
                     })
-                    .collect()
+                    .collect();
             } else {
-                Vec::new()
-            };
+                touched_table_names = SmallVec::new();
+                tables_to_commit = Vec::new();
+            }
             // cache (read lock) and stores (read lock) dropped here
         }
 
         let mut commit_error: Option<crate::core::Error> = None;
         let mut any_committed = false;
+        let mut pending_tombstone_tables = Vec::new();
         let mut tombstones_wal_recorded: rustc_hash::FxHashSet<String> =
             rustc_hash::FxHashSet::default();
 
@@ -7358,15 +10228,20 @@ impl TransactionEngineOperations for EngineOperations {
                 .as_ref()
                 .is_some_and(|pm| pm.is_enabled());
 
-        // Collect Arc clones of segment managers, then drop the read lock
-        // before WAL I/O to avoid blocking seal/compaction writes.
+        // Collect Arc clones for the managers this transaction touched, then
+        // drop the read lock before WAL I/O. This keeps commit O(touched
+        // tables) instead of O(all segment managers) for ordinary writes.
         let commit_mgrs: ahash::AHashMap<
             String,
             Arc<crate::storage::volume::manifest::SegmentManager>,
         > = {
             let mgrs = self.segment_managers.read().unwrap();
-            mgrs.iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+            touched_table_names
+                .iter()
+                .filter_map(|table_name| {
+                    mgrs.get(table_name.as_str())
+                        .map(|mgr| (table_name.to_string(), Arc::clone(mgr)))
+                })
                 .collect()
         };
 
@@ -7486,7 +10361,7 @@ impl TransactionEngineOperations for EngineOperations {
 
         drop(tables_to_commit);
 
-        // Commit or rollback pending tombstones on all segment managers.
+        // Commit or rollback pending tombstones on touched segment managers.
         // For tables with hot changes, tombstone WAL entries were already
         // recorded in the per-table loop above. For cold-only changes
         // (no hot), record tombstones here.
@@ -7503,10 +10378,15 @@ impl TransactionEngineOperations for EngineOperations {
                     .as_ref()
                     .is_some_and(|pm| pm.is_enabled());
 
-            // Reuse the commit_mgrs read lock acquired before the commit loop
+            // Tombstones stay pending; stamp_pending_tombstones (post-record_commit)
+            // commits them with visible_at_lsn=marker_lsn. Stamping with current_lsn
+            // here would race a concurrent publish and hide rows at a sampled cap.
             for (table_name, mgr) in commit_mgrs.iter() {
-                if commit_error.is_none() {
-                    // Record cold-only tombstones to WAL (tables not already handled above)
+                let had_pending_tombstones = mgr.has_pending_tombstones(txn_id);
+                // Keep pending iff no error AND cold-tombstone WAL write succeeded.
+                // Exception: prior error but already-committed hot changes -> keep
+                // (rolling back leaves stale cold rows behind new hot versions).
+                let keep_pending = if commit_error.is_none() {
                     if should_record_wal && !tombstones_wal_recorded.contains(table_name.as_str()) {
                         let pending = mgr.get_pending_tombstones(txn_id);
                         if !pending.is_empty() {
@@ -7532,27 +10412,51 @@ impl TransactionEngineOperations for EngineOperations {
                             }
                         }
                     }
-                    if commit_error.is_some() {
-                        mgr.rollback_pending_tombstones(txn_id);
-                    } else {
-                        mgr.commit_pending_tombstones(txn_id, commit_seq);
-                    }
-                } else if tombstones_wal_recorded.contains(table_name.as_str()) {
-                    mgr.commit_pending_tombstones(txn_id, commit_seq);
+                    commit_error.is_none()
                 } else {
+                    tombstones_wal_recorded.contains(table_name.as_str())
+                };
+                if !keep_pending {
                     mgr.rollback_pending_tombstones(txn_id);
+                } else if had_pending_tombstones {
+                    pending_tombstone_tables.push(table_name.clone());
                 }
                 mgr.clear_txn_seal_generation(txn_id);
             }
+            let _ = commit_seq;
         }
 
-        (any_committed, commit_error)
+        (any_committed, commit_error, pending_tombstone_tables)
+    }
+
+    fn mark_engine_failed(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    fn stamp_pending_tombstones(
+        &self,
+        txn_id: i64,
+        commit_seq: u64,
+        marker_lsn: u64,
+        tables: &[String],
+    ) {
+        // Caller passes commit_seq directly: the partial-commit path runs
+        // complete_commit (which removes the registry entry) BEFORE this stamping,
+        // so a re-read would return 0 and downgrade tombstones to all-snapshots-visible.
+        // Stamp only tables commit_all_tables proved still have pending tombstones.
+        // INSERT/UPDATE commits from doing a second all-table scan.
+        let mgrs = self.segment_managers.read().unwrap();
+        for table_name in tables {
+            if let Some(mgr) = mgrs.get(table_name.as_str()) {
+                mgr.commit_pending_tombstones(txn_id, commit_seq, marker_lsn);
+            }
+        }
     }
 
     fn rollback_all_tables(&self, txn_id: i64) {
         // Collect touched table names BEFORE removing the cache entry,
-        // so we only rollback tombstones on tables this txn actually used
-        // instead of iterating every segment manager (O(tables) → O(touched)).
+        // so the common active-rollback path only iterates tables this
+        // txn actually used (O(touched) instead of O(tables)).
         let mut cache = self.txn_version_stores().write().unwrap();
         let touched: smallvec::SmallVec<[crate::common::SmartString; 4]> = cache
             .get(txn_id)
@@ -7561,10 +10465,26 @@ impl TransactionEngineOperations for EngineOperations {
         cache.remove(txn_id);
         drop(cache);
 
-        // Rollback pending tombstones and clean up seal generation records
-        // only on tables this transaction touched.
-        if !touched.is_empty() {
-            let mgrs = self.segment_managers.read().unwrap();
+        let mgrs = self.segment_managers.read().unwrap();
+        if touched.is_empty() {
+            // Cache was already drained, typically by `commit_all_tables`
+            // which removes the txn entry before returning. The
+            // partial-commit failure path in `MvccTransaction::commit`
+            // calls us here to clear leftover pending tombstones for
+            // tables that successfully committed (their tombstones were
+            // kept pending by `commit_all_tables` so a subsequent
+            // `stamp_pending_tombstones` could finalize them with the
+            // marker LSN, but record_commit failed, so they need to
+            // go away). We can't recover the touched list, so iterate
+            // every manager. `rollback_pending_tombstones` is an O(1)
+            // HashMap lookup keyed by `txn_id` and a no-op when nothing
+            // is pending for the txn, so the cost is one lookup per
+            // table.
+            for mgr in mgrs.values() {
+                mgr.rollback_pending_tombstones(txn_id);
+                mgr.clear_txn_seal_generation(txn_id);
+            }
+        } else {
             for name in &touched {
                 if let Some(mgr) = mgrs.get(name.as_str()) {
                     mgr.rollback_pending_tombstones(txn_id);
@@ -7576,6 +10496,16 @@ impl TransactionEngineOperations for EngineOperations {
 
     fn acquire_seal_fence(&self) -> Option<SealFenceGuard> {
         Some(SealFenceGuard::new(Arc::clone(&self.seal_fence)))
+    }
+
+    fn acquire_transactional_ddl_fence(
+        &self,
+    ) -> Option<crate::storage::mvcc::transaction::TransactionalDdlFenceGuard> {
+        Some(
+            crate::storage::mvcc::transaction::TransactionalDdlFenceGuard::new(Arc::clone(
+                &self.transactional_ddl_fence,
+            )),
+        )
     }
 }
 
@@ -7589,6 +10519,76 @@ mod tests {
         let engine = MVCCEngine::in_memory();
         assert!(!engine.is_open());
         assert_eq!(engine.get_path(), "memory://");
+    }
+
+    #[test]
+    fn defer_for_live_readers_true_when_lease_present() {
+        // GC consults <db>/readers/ before unlinking compacted volumes.
+        use std::time::{Duration, SystemTime};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("defer.db");
+        let path_str = path.display().to_string();
+
+        let engine = MVCCEngine::new(crate::storage::Config::with_path(path_str));
+        engine.open_engine().unwrap();
+
+        let readers_dir = path.join("readers");
+        let lease = readers_dir.join("12345.lease");
+
+        // No lease yet → no deferral.
+        assert!(
+            !engine.defer_for_live_readers(),
+            "no readers/ dir → must not defer"
+        );
+
+        // Create a fresh lease file. Real RO opens use LeaseManager;
+        // here we just need the file present with a recent mtime.
+        std::fs::create_dir_all(&readers_dir).unwrap();
+        std::fs::File::create(&lease).unwrap();
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lease)
+            .unwrap();
+        f.set_modified(SystemTime::now()).unwrap();
+        drop(f);
+        assert!(
+            engine.defer_for_live_readers(),
+            "live lease must trigger deferral"
+        );
+
+        // Backdate the lease. Default max_age is `max(120s, 2 *
+        // checkpoint_interval)`; 1h is unambiguously stale.
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lease)
+            .unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(3600))
+            .unwrap();
+        drop(f);
+
+        assert!(
+            !engine.defer_for_live_readers(),
+            "stale lease must NOT trigger deferral (and must be reaped)"
+        );
+        assert!(
+            !lease.exists(),
+            "stale lease must be reaped by defer_for_live_readers"
+        );
+
+        engine.close_engine().unwrap();
+    }
+
+    #[test]
+    fn defer_for_live_readers_false_on_memory_engine() {
+        // memory:// engines have no path; defer helper short-circuits to false.
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+        assert!(
+            !engine.defer_for_live_readers(),
+            "memory engine must never defer (no readers/ dir possible)"
+        );
+        engine.close_engine().unwrap();
     }
 
     #[test]

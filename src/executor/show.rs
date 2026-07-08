@@ -41,7 +41,8 @@ impl Executor {
         _stmt: &ShowTablesStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let tx = self.engine.begin_transaction()?;
+        use crate::storage::traits::ReadEngine;
+        let tx = ReadEngine::begin_read_transaction(self.engine.as_ref())?;
         let tables = tx.list_tables()?;
 
         let columns = vec!["table_name".to_string()];
@@ -83,8 +84,9 @@ impl Executor {
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         let table_name = &stmt.table_name.value;
-        let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(table_name)?;
+        use crate::storage::traits::ReadEngine;
+        let tx = ReadEngine::begin_read_transaction(self.engine.as_ref())?;
+        let table = tx.get_read_table(table_name)?;
         let schema = table.schema();
 
         // Get unique column names from indexes
@@ -207,8 +209,9 @@ impl Executor {
         let table_name = &stmt.table_name.value;
 
         // Get a table reference to access indexes
-        let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(table_name)?;
+        use crate::storage::traits::ReadEngine;
+        let tx = ReadEngine::begin_read_transaction(self.engine.as_ref())?;
+        let table = tx.get_read_table(table_name)?;
 
         // Get index info from version store through the table
         let index_names = {
@@ -284,8 +287,9 @@ impl Executor {
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         let table_name = &stmt.table_name.value;
-        let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(table_name)?;
+        use crate::storage::traits::ReadEngine;
+        let tx = ReadEngine::begin_read_transaction(self.engine.as_ref())?;
+        let table = tx.get_read_table(table_name)?;
         let schema = table.schema();
 
         // Column headers: Field, Type, Null, Key, Default, Extra
