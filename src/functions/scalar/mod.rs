@@ -48,16 +48,19 @@ mod hash;
 mod math;
 #[cfg(feature = "semantic")]
 pub mod semantic;
+pub mod spatial;
 mod string;
 mod utility;
 pub mod vector;
 
 pub use conversion::{CastFunction, CollateFunction};
 pub use datetime::{
-    CurrentDateFunction, CurrentTimeFunction, CurrentTimestampFunction, DateAddFunction,
-    DateDiffAliasFunction, DateDiffFunction, DateSubFunction, DateTruncFunction, DayFunction,
-    ExtractFunction, HourFunction, MinuteFunction, MonthFunction, SecondFunction,
-    TimeTruncFunction, ToCharFunction, VersionFunction, YearFunction,
+    AgeFunction, ClockTimestampFunction, ConvertTzFunction, CurrentDateFunction,
+    CurrentTimeFunction, CurrentTimestampFunction, DateAddFunction, DateDiffAliasFunction,
+    DateDiffFunction, DateSubFunction, DateTruncFunction, DayFunction, ExtractFunction,
+    HourFunction, LastDayFunction, MakeDateFunction, MakeTimeFunction, MakeTimestampFunction,
+    MinuteFunction, MonthFunction, SecondFunction, StatementTimestampFunction, TimeTruncFunction,
+    TimeofdayFunction, ToCharFunction, VersionFunction, YearFunction,
 };
 pub use hash::{
     Crc32Function, Md5Function, Sha1Function, Sha256Function, Sha384Function, Sha512Function,
@@ -68,19 +71,40 @@ pub use math::{
     PowerFunction, RandomFunction, RoundFunction, SignFunction, SinFunction, SqrtFunction,
     TanFunction, TruncFunction, TruncateFunction,
 };
+pub use spatial::{
+    StAreaFunction, StAsTextFunction, StCentroidFunction, StContainsFunction, StDWithinFunction,
+    StDistanceFunction, StDistanceSphereFunction, StEnvelopeFunction, StGeomFromTextFunction,
+    StIntersectsFunction, StLengthFunction, StMakePointFunction, StNumPointsFunction,
+    StPerimeterFunction, StPointFunction, StSetSridFunction, StSridFunction, StXFunction,
+    StYFunction,
+};
 pub use string::{
     CharFunction, CharLengthFunction, ConcatFunction, ConcatWsFunction, ContainsFunction,
-    EndsWithFunction, InstrFunction, LeftFunction, LengthFunction, LocateFunction, LowerFunction,
-    LpadFunction, LtrimFunction, PositionFunction, RepeatFunction, ReplaceFunction,
-    ReverseFunction, RightFunction, RpadFunction, RtrimFunction, SplitPartFunction,
-    StartsWithFunction, StrposFunction, SubstrFunction, SubstringFunction, TrimFunction,
-    UpperFunction,
+    EltFunction, EndsWithFunction, FieldFunction, FindInSetFunction, HexFunction, InstrFunction,
+    LeftFunction, LengthFunction, LocateFunction, LowerFunction, LpadFunction, LtrimFunction,
+    PositionFunction, QuoteFunction, RegexpLikeFunction, RegexpReplaceFunction,
+    RegexpSubstrFunction, RepeatFunction, ReplaceFunction, ReverseFunction, RightFunction,
+    RpadFunction, RtrimFunction, SoundexFunction, SplitPartFunction, StartsWithFunction,
+    StrposFunction, SubstrFunction, SubstringFunction, SubstringIndexFunction, TrimFunction,
+    UnhexFunction, UpperFunction,
 };
 pub use utility::{
-    CoalesceFunction, GreatestFunction, IfNullFunction, IifFunction, JsonArrayFunction,
-    JsonArrayLengthFunction, JsonExtractFunction, JsonKeysFunction, JsonObjectFunction,
-    JsonTypeFunction, JsonTypeOfFunction, JsonValidFunction, LeastFunction, NowFunction,
-    NullIfFunction, SleepFunction, TypeOfFunction,
+    ArrayContainsFunction, ArrayLengthFunction, CoalesceFunction, GenRandomUuidFunction,
+    GreatestFunction, IfNullFunction, IifFunction, Inet6AtonFunction, Inet6NtoaFunction,
+    InetAtonFunction, InetNtoaFunction, IsIpv4Function, IsIpv6Function, IsValidJsonFunction,
+    JsonArrayFunction, JsonArrayLengthFunction, JsonContainsFunction, JsonContainsPathFunction,
+    JsonExtractFunction, JsonInsertFunction, JsonKeysFunction, JsonObjectFunction,
+    JsonQuoteFunction, JsonRemoveFunction, JsonReplaceFunction, JsonSetFunction, JsonTypeFunction,
+    JsonTypeOfFunction, JsonUnquoteFunction, JsonValidFunction, LeastFunction, NowFunction,
+    NullIfFunction, SleepFunction, TypeOfFunction, UuidFunction,
+};
+pub use vector::{
+    ChebyshevDistanceFunction, CosineDistanceFunction, CosineSimilarityFunction,
+    HammingDistanceFunction, InnerProductFunction, L2DistanceFunction, ManhattanDistanceFunction,
+    VecAddFunction, VecConcatFunction, VecDimsFunction, VecDistanceCosineFunction,
+    VecDistanceIpFunction, VecDistanceL2Function, VecMulFunction, VecNormFunction,
+    VecNormalizeFunction, VecSliceFunction, VecSubFunction, VecToTextFunction,
+    VectorNormFunction,
 };
 
 use crate::core::{DataType, Value};

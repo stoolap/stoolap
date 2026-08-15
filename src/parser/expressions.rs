@@ -310,7 +310,7 @@ impl Parser {
                 }
             }
             // Keywords that can also be function names when followed by (
-            "LEFT" | "RIGHT" | "CHAR" | "FIRST" | "LAST" | "TRUNCATE" => {
+            "LEFT" | "RIGHT" | "CHAR" | "FIRST" | "LAST" | "TRUNCATE" | "VALUES" => {
                 if self.peek_token_is_punctuator("(") {
                     // Treat as function call
                     let ident = Expression::Identifier(Identifier::new(

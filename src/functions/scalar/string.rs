@@ -21,7 +21,7 @@ use crate::functions::{
 };
 use crate::validate_arg_count;
 
-use super::{value_to_i64, value_to_string};
+use super::{value_as_str, value_to_i64, value_to_string};
 
 // ============================================================================
 // UPPER
@@ -1674,5 +1674,660 @@ impl ScalarFunction for ContainsFunction {
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
         Box::new(ContainsFunction)
+    }
+}
+
+// ============================================================================
+// SUBSTRING_INDEX
+// ============================================================================
+
+/// SUBSTRING_INDEX(str, delim, count) — returns substring before count occurrences of delim
+#[derive(Default)]
+pub struct SubstringIndexFunction;
+
+impl ScalarFunction for SubstringIndexFunction {
+    fn name(&self) -> &str {
+        "SUBSTRING_INDEX"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "SUBSTRING_INDEX",
+            FunctionType::Scalar,
+            "Returns the substring from string str before count occurrences of delimiter delim",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![
+                    FunctionDataType::String,
+                    FunctionDataType::String,
+                    FunctionDataType::Integer,
+                ],
+                3,
+                3,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(SubstringIndexFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "SUBSTRING_INDEX", 3);
+
+        if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let s = value_to_string(&args[0]);
+        let delim = value_to_string(&args[1]);
+        let count = value_to_i64(&args[2]).ok_or_else(|| {
+            Error::invalid_argument("SUBSTRING_INDEX count must be an integer")
+        })?;
+
+        if count == 0 || delim.is_empty() {
+            return Ok(Value::text(""));
+        }
+
+        if count > 0 {
+            let mut matches = 0;
+            for (idx, _) in s.match_indices(delim.as_str()) {
+                matches += 1;
+                if matches == count {
+                    return Ok(Value::Text(SmartString::from_string(s[..idx].to_string())));
+                }
+            }
+            // Fewer delimiters than count -> return whole string
+            Ok(Value::Text(SmartString::from_string(s)))
+        } else {
+            let target = count.unsigned_abs() as usize;
+            let occurrences: Vec<usize> = s.match_indices(delim.as_str()).map(|(i, _)| i).collect();
+            if occurrences.len() < target {
+                // Fewer delimiters than |count| -> return whole string
+                Ok(Value::Text(SmartString::from_string(s)))
+            } else {
+                let match_idx = occurrences[occurrences.len() - target];
+                let start = match_idx + delim.len();
+                Ok(Value::Text(SmartString::from_string(s[start..].to_string())))
+            }
+        }
+    }
+}
+
+// ============================================================================
+// REGEXP_LIKE
+// ============================================================================
+
+/// REGEXP_LIKE(str, pattern) — returns true if string matches regular expression
+#[derive(Default)]
+pub struct RegexpLikeFunction;
+
+impl ScalarFunction for RegexpLikeFunction {
+    fn name(&self) -> &str {
+        "REGEXP_LIKE"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "REGEXP_LIKE",
+            FunctionType::Scalar,
+            "Returns true if string matches the specified regular expression",
+            FunctionSignature::new(
+                FunctionDataType::Boolean,
+                vec![FunctionDataType::String, FunctionDataType::String],
+                2,
+                2,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(RegexpLikeFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "REGEXP_LIKE", 2);
+
+        if args[0].is_null() || args[1].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let s = value_to_string(&args[0]);
+        let pattern = value_to_string(&args[1]);
+
+        let re = regex::Regex::new(&pattern).map_err(|e| {
+            Error::invalid_argument(format!("REGEXP_LIKE invalid regex pattern: {}", e))
+        })?;
+
+        Ok(Value::Boolean(re.is_match(&s)))
+    }
+}
+
+// ============================================================================
+// REGEXP_REPLACE
+// ============================================================================
+
+/// REGEXP_REPLACE(str, pattern, replacement) — replaces matches of regular expression
+#[derive(Default)]
+pub struct RegexpReplaceFunction;
+
+impl ScalarFunction for RegexpReplaceFunction {
+    fn name(&self) -> &str {
+        "REGEXP_REPLACE"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "REGEXP_REPLACE",
+            FunctionType::Scalar,
+            "Replaces occurrences of a regular expression with a replacement string",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![
+                    FunctionDataType::String,
+                    FunctionDataType::String,
+                    FunctionDataType::String,
+                ],
+                3,
+                3,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(RegexpReplaceFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "REGEXP_REPLACE", 3);
+
+        if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let s = value_to_string(&args[0]);
+        let pattern = value_to_string(&args[1]);
+        let repl = value_to_string(&args[2]);
+
+        let re = regex::Regex::new(&pattern).map_err(|e| {
+            Error::invalid_argument(format!("REGEXP_REPLACE invalid regex pattern: {}", e))
+        })?;
+
+        let result = re.replace_all(&s, repl.as_str()).to_string();
+        Ok(Value::Text(SmartString::from_string(result)))
+    }
+}
+
+// ============================================================================
+// REGEXP_SUBSTR
+// ============================================================================
+
+/// REGEXP_SUBSTR(str, pattern) — extracts the first substring matching regular expression
+#[derive(Default)]
+pub struct RegexpSubstrFunction;
+
+impl ScalarFunction for RegexpSubstrFunction {
+    fn name(&self) -> &str {
+        "REGEXP_SUBSTR"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "REGEXP_SUBSTR",
+            FunctionType::Scalar,
+            "Extracts substring matching regular expression",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![FunctionDataType::String, FunctionDataType::String],
+                2,
+                2,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(RegexpSubstrFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "REGEXP_SUBSTR", 2);
+
+        if args[0].is_null() || args[1].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let s = value_to_string(&args[0]);
+        let pattern = value_to_string(&args[1]);
+
+        let re = regex::Regex::new(&pattern).map_err(|e| {
+            Error::invalid_argument(format!("REGEXP_SUBSTR invalid regex pattern: {}", e))
+        })?;
+
+        if let Some(mat) = re.find(&s) {
+            Ok(Value::Text(SmartString::from_string(mat.as_str().to_string())))
+        } else {
+            Ok(Value::null_unknown())
+        }
+    }
+}
+
+// ============================================================================
+// HEX / UNHEX
+// ============================================================================
+
+/// HEX(val) — converts string or integer to hexadecimal representation
+#[derive(Default)]
+pub struct HexFunction;
+
+#[inline]
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX_CHARS: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX_CHARS[(b >> 4) as usize] as char);
+        out.push(HEX_CHARS[(b & 0x0F) as usize] as char);
+    }
+    out
+}
+
+impl ScalarFunction for HexFunction {
+    fn name(&self) -> &str {
+        "HEX"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "HEX",
+            FunctionType::Scalar,
+            "Converts string or integer to hexadecimal representation",
+            FunctionSignature::new(FunctionDataType::String, vec![FunctionDataType::Any], 1, 1),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(HexFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "HEX", 1);
+
+        match &args[0] {
+            Value::Null(_) => Ok(Value::null_unknown()),
+            Value::Integer(i) => Ok(Value::Text(SmartString::from_string(format!("{:X}", i)))),
+            Value::Text(s) => Ok(Value::Text(SmartString::from_string(bytes_to_hex(s.as_bytes())))),
+            Value::Extension(data) => Ok(Value::Text(SmartString::from_string(bytes_to_hex(data)))),
+            other => {
+                let s = other.to_string();
+                Ok(Value::Text(SmartString::from_string(bytes_to_hex(s.as_bytes()))))
+            }
+        }
+    }
+}
+
+/// UNHEX(str) — decodes hexadecimal string to string
+#[derive(Default)]
+pub struct UnhexFunction;
+
+impl ScalarFunction for UnhexFunction {
+    fn name(&self) -> &str {
+        "UNHEX"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "UNHEX",
+            FunctionType::Scalar,
+            "Decodes hexadecimal string to string or bytes",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![FunctionDataType::String],
+                1,
+                1,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(UnhexFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "UNHEX", 1);
+
+        if args[0].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let s = value_to_string(&args[0]);
+        let hex_str = s.trim();
+        if !hex_str.len().is_multiple_of(2) {
+            return Ok(Value::null_unknown());
+        }
+
+        let mut bytes = Vec::with_capacity(hex_str.len() / 2);
+        for i in (0..hex_str.len()).step_by(2) {
+            let byte_str = &hex_str[i..i + 2];
+            match u8::from_str_radix(byte_str, 16) {
+                Ok(b) => bytes.push(b),
+                Err(_) => return Ok(Value::null_unknown()),
+            }
+        }
+
+        match String::from_utf8(bytes.clone()) {
+            Ok(utf8_str) => Ok(Value::Text(SmartString::from_string(utf8_str))),
+            Err(_) => {
+                // Return as extension byte blob if not valid UTF-8
+                let mut ext = Vec::with_capacity(bytes.len() + 1);
+                ext.push(0); // blob tag
+                ext.extend(bytes);
+                Ok(Value::Extension(crate::common::CompactArc::from(ext)))
+            }
+        }
+    }
+}
+
+// ============================================================================
+// FIELD / FIND_IN_SET / ELT / SOUNDEX / QUOTE
+// ============================================================================
+
+/// FIELD(target, val1, val2, ...) — returns the 1-based index of target in argument list, or 0
+#[derive(Default)]
+pub struct FieldFunction;
+
+impl ScalarFunction for FieldFunction {
+    fn name(&self) -> &str {
+        "FIELD"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "FIELD",
+            FunctionType::Scalar,
+            "Returns the index (position) of the first argument in the subsequent arguments, or 0",
+            FunctionSignature::new(
+                FunctionDataType::Integer,
+                vec![FunctionDataType::Any, FunctionDataType::Any],
+                2,
+                usize::MAX,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(FieldFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 {
+            return Err(Error::invalid_argument(
+                "FIELD requires at least 2 arguments",
+            ));
+        }
+
+        let target = &args[0];
+        if target.is_null() {
+            return Ok(Value::Integer(0));
+        }
+
+        for (idx, candidate) in args[1..].iter().enumerate() {
+            if target == candidate {
+                return Ok(Value::Integer((idx + 1) as i64));
+            }
+        }
+
+        Ok(Value::Integer(0))
+    }
+}
+
+/// FIND_IN_SET(str, strlist) — returns 1-based index of str in comma-separated strlist, or 0
+#[derive(Default)]
+pub struct FindInSetFunction;
+
+impl ScalarFunction for FindInSetFunction {
+    fn name(&self) -> &str {
+        "FIND_IN_SET"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "FIND_IN_SET",
+            FunctionType::Scalar,
+            "Returns the 1-based index of a string within a comma-separated string list",
+            FunctionSignature::new(
+                FunctionDataType::Integer,
+                vec![FunctionDataType::String, FunctionDataType::String],
+                2,
+                2,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(FindInSetFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "FIND_IN_SET", 2);
+
+        if args[0].is_null() || args[1].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let (target_owned, list_owned);
+        let target = if let Some(s) = value_as_str(&args[0]) {
+            s
+        } else {
+            target_owned = value_to_string(&args[0]);
+            target_owned.as_str()
+        };
+
+        let list = if let Some(s) = value_as_str(&args[1]) {
+            s
+        } else {
+            list_owned = value_to_string(&args[1]);
+            list_owned.as_str()
+        };
+
+        if target.contains(',') {
+            return Ok(Value::Integer(0));
+        }
+
+        for (idx, item) in list.split(',').enumerate() {
+            if item == target {
+                return Ok(Value::Integer((idx + 1) as i64));
+            }
+        }
+
+        Ok(Value::Integer(0))
+    }
+}
+
+/// ELT(n, str1, str2, ...) — returns the n-th string argument (1-based), or NULL
+#[derive(Default)]
+pub struct EltFunction;
+
+impl ScalarFunction for EltFunction {
+    fn name(&self) -> &str {
+        "ELT"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "ELT",
+            FunctionType::Scalar,
+            "Returns the string at index N (1-based) from a list of strings",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![FunctionDataType::Integer, FunctionDataType::Any],
+                2,
+                usize::MAX,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(EltFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 {
+            return Err(Error::invalid_argument("ELT requires at least 2 arguments"));
+        }
+
+        if args[0].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let n = value_to_i64(&args[0])
+            .ok_or_else(|| Error::invalid_argument("ELT index N must be an integer"))?;
+
+        if n <= 0 || (n as usize) > args.len() - 1 {
+            return Ok(Value::null_unknown());
+        }
+
+        Ok(args[n as usize].clone())
+    }
+}
+
+/// SOUNDEX(str) — computes the standard Soundex phonetic key for a string
+#[derive(Default)]
+pub struct SoundexFunction;
+
+impl ScalarFunction for SoundexFunction {
+    fn name(&self) -> &str {
+        "SOUNDEX"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "SOUNDEX",
+            FunctionType::Scalar,
+            "Returns the Soundex phonetic code for a string",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![FunctionDataType::String],
+                1,
+                1,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(SoundexFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "SOUNDEX", 1);
+
+        if args[0].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let s_owned;
+        let s = if let Some(t) = value_as_str(&args[0]) {
+            t
+        } else {
+            s_owned = value_to_string(&args[0]);
+            s_owned.as_str()
+        };
+
+        let chars: Vec<char> = s.chars().filter(|c| c.is_alphabetic()).collect();
+        if chars.is_empty() {
+            return Ok(Value::text("0000"));
+        }
+
+        let first = chars[0].to_ascii_uppercase();
+        let mut code = String::with_capacity(4);
+        code.push(first);
+
+        let soundex_digit = |c: char| -> char {
+            match c.to_ascii_uppercase() {
+                'B' | 'F' | 'P' | 'V' => '1',
+                'C' | 'G' | 'J' | 'K' | 'Q' | 'S' | 'X' | 'Z' => '2',
+                'D' | 'T' => '3',
+                'L' => '4',
+                'M' | 'N' => '5',
+                'R' => '6',
+                _ => '0',
+            }
+        };
+
+        let mut prev_digit = soundex_digit(chars[0]);
+
+        for &c in &chars[1..] {
+            let digit = soundex_digit(c);
+            if digit != '0' && digit != prev_digit {
+                code.push(digit);
+                if code.len() == 4 {
+                    break;
+                }
+            }
+            prev_digit = digit;
+        }
+
+        while code.len() < 4 {
+            code.push('0');
+        }
+
+        Ok(Value::text(code))
+    }
+}
+
+/// QUOTE(str) — quotes a string with single quotes and escapes internal quotes
+#[derive(Default)]
+pub struct QuoteFunction;
+
+impl ScalarFunction for QuoteFunction {
+    fn name(&self) -> &str {
+        "QUOTE"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "QUOTE",
+            FunctionType::Scalar,
+            "Quotes a string with single quotes and escapes single quotes inside",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![FunctionDataType::Any],
+                1,
+                1,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(QuoteFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "QUOTE", 1);
+
+        if args[0].is_null() {
+            return Ok(Value::text("NULL"));
+        }
+
+        let s_owned;
+        let s = if let Some(t) = value_as_str(&args[0]) {
+            t
+        } else {
+            s_owned = value_to_string(&args[0]);
+            s_owned.as_str()
+        };
+
+        if !s.contains('\'') {
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push('\'');
+            out.push_str(s);
+            out.push('\'');
+            return Ok(Value::text(out));
+        }
+
+        let escaped = s.replace('\'', "\\'");
+        let mut out = String::with_capacity(escaped.len() + 2);
+        out.push('\'');
+        out.push_str(&escaped);
+        out.push('\'');
+        Ok(Value::text(out))
     }
 }

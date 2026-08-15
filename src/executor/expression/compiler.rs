@@ -1439,6 +1439,23 @@ impl<'a> ExprCompiler<'a> {
 
         // Special handling for certain functions
         match func_name.as_str() {
+            "VALUES" => {
+                // MySQL-style VALUES(column) in ON DUPLICATE KEY UPDATE.
+                // Resolves against the second row source (excluded.<column>).
+                if func.arguments.len() == 1 {
+                    if let Expression::Identifier(ref ident) = func.arguments[0] {
+                        let excluded_name = format!("excluded.{}", ident.value);
+                        if let Some(source) = self.ctx.resolve_column(&excluded_name) {
+                            match source {
+                                ColumnSource::Row1(idx) => builder.emit(Op::LoadColumn(idx)),
+                                ColumnSource::Row2(idx) => builder.emit(Op::LoadColumn2(idx)),
+                            }
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
             "CURRENT_TRANSACTION_ID" => {
                 // Context-dependent function - loads from ExecuteContext
                 builder.emit(Op::LoadTransactionId);

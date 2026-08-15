@@ -14,7 +14,7 @@
 
 //! Date/Time scalar functions
 
-use chrono::{DateTime, Datelike, Duration, TimeZone, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, TimeZone, Timelike, Utc};
 
 use crate::common::SmartString;
 use crate::core::{parse_timestamp, Error, Result, Value};
@@ -1329,6 +1329,150 @@ impl ScalarFunction for ToCharFunction {
     }
 }
 
+// ============================================================================
+// CONVERT_TZ
+// ============================================================================
+
+/// CONVERT_TZ function - converts a timestamp from one time zone to another
+///
+/// # Arguments
+/// - dt: The timestamp or datetime string to convert
+/// - from_tz: The source time zone offset (e.g. '+00:00', 'UTC', '-05:00', '+05:30')
+/// - to_tz: The target time zone offset (e.g. '+05:30', 'UTC', '-08:00')
+///
+/// # Examples
+/// ```sql
+/// CONVERT_TZ('2024-01-01 12:00:00', '+00:00', '+05:30') -- Returns '2024-01-01 17:30:00'
+/// CONVERT_TZ('2024-01-01 12:00:00', 'UTC', '-08:00')    -- Returns '2024-01-01 04:00:00'
+/// ```
+#[derive(Default)]
+pub struct ConvertTzFunction;
+
+impl ScalarFunction for ConvertTzFunction {
+    fn name(&self) -> &str {
+        "CONVERT_TZ"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "CONVERT_TZ",
+            FunctionType::Scalar,
+            "Converts a timestamp from one time zone to another",
+            FunctionSignature::new(
+                FunctionDataType::Timestamp,
+                vec![
+                    FunctionDataType::Any,
+                    FunctionDataType::String,
+                    FunctionDataType::String,
+                ],
+                3,
+                3,
+            ),
+        )
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "CONVERT_TZ", 3);
+
+        if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let from_tz = match &args[1] {
+            Value::Text(s) => s.as_str(),
+            _ => {
+                return Err(Error::invalid_argument(
+                    "CONVERT_TZ from_tz argument must be a string",
+                ))
+            }
+        };
+
+        let to_tz = match &args[2] {
+            Value::Text(s) => s.as_str(),
+            _ => {
+                return Err(Error::invalid_argument(
+                    "CONVERT_TZ to_tz argument must be a string",
+                ))
+            }
+        };
+
+        let from_offset = parse_tz_offset_minutes(from_tz)?;
+        let to_offset = parse_tz_offset_minutes(to_tz)?;
+
+        let ts = match &args[0] {
+            Value::Timestamp(t) => *t,
+            Value::Text(s) => parse_timestamp(s).map_err(|_| {
+                Error::invalid_argument(format!("CONVERT_TZ could not parse timestamp: {}", s))
+            })?,
+            _ => {
+                return Err(Error::invalid_argument(
+                    "CONVERT_TZ first argument must be a timestamp or string",
+                ))
+            }
+        };
+
+        let diff_minutes = (to_offset - from_offset) as i64;
+        let converted_ts = ts + Duration::minutes(diff_minutes);
+
+        Ok(Value::Timestamp(converted_ts))
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(ConvertTzFunction)
+    }
+}
+
+/// Parse timezone offset string into minutes from UTC
+fn parse_tz_offset_minutes(tz_str: &str) -> Result<i32> {
+    let s = tz_str.trim();
+    if s.eq_ignore_ascii_case("utc") || s.eq_ignore_ascii_case("gmt") || s == "Z" || s == "z" {
+        return Ok(0);
+    }
+
+    let is_negative = s.starts_with('-');
+    let is_positive = s.starts_with('+');
+    let s_clean = if is_negative || is_positive {
+        &s[1..]
+    } else {
+        s
+    };
+
+    let sign = if is_negative { -1 } else { 1 };
+
+    let (hours, minutes) = if let Some(colon_pos) = s_clean.find(':') {
+        let h: i32 = s_clean[..colon_pos]
+            .parse()
+            .map_err(|_| Error::invalid_argument(format!("invalid timezone offset: {}", tz_str)))?;
+        let m: i32 = s_clean[colon_pos + 1..]
+            .parse()
+            .map_err(|_| Error::invalid_argument(format!("invalid timezone offset: {}", tz_str)))?;
+        (h, m)
+    } else {
+        let val: i32 = s_clean
+            .parse()
+            .map_err(|_| Error::invalid_argument(format!("invalid timezone offset: {}", tz_str)))?;
+        if s_clean.len() <= 2 {
+            (val, 0)
+        } else if s_clean.len() == 4 {
+            (val / 100, val % 100)
+        } else {
+            return Err(Error::invalid_argument(format!(
+                "invalid timezone offset: {}",
+                tz_str
+            )));
+        }
+    };
+
+    if hours > 14 || minutes > 59 {
+        return Err(Error::invalid_argument(format!(
+            "timezone offset out of range: {}",
+            tz_str
+        )));
+    }
+
+    Ok(sign * (hours * 60 + minutes))
+}
+
 /// Format a timestamp according to a format pattern
 fn format_timestamp(ts: DateTime<Utc>, format: &str) -> String {
     let mut result = format.to_string();
@@ -1508,6 +1652,449 @@ fn capitalize_first(s: &str) -> String {
             .to_uppercase()
             .chain(chars.flat_map(|c| c.to_lowercase()))
             .collect(),
+    }
+}
+
+// ============================================================================
+// MAKE_DATE / MAKE_TIME / MAKE_TIMESTAMP / AGE
+// ============================================================================
+
+/// MAKE_DATE(year, month, day) — creates a date timestamp from year, month, and day
+#[derive(Default)]
+pub struct MakeDateFunction;
+
+impl ScalarFunction for MakeDateFunction {
+    fn name(&self) -> &str {
+        "MAKE_DATE"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "MAKE_DATE",
+            FunctionType::Scalar,
+            "Creates a date from year, month, and day integers",
+            FunctionSignature::new(
+                FunctionDataType::Timestamp,
+                vec![
+                    FunctionDataType::Integer,
+                    FunctionDataType::Integer,
+                    FunctionDataType::Integer,
+                ],
+                3,
+                3,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(MakeDateFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "MAKE_DATE", 3);
+        if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let year = match &args[0] {
+            Value::Integer(y) => *y as i32,
+            _ => return Err(Error::invalid_argument("MAKE_DATE year must be an integer")),
+        };
+        let month = match &args[1] {
+            Value::Integer(m) => *m as u32,
+            _ => return Err(Error::invalid_argument("MAKE_DATE month must be an integer")),
+        };
+        let day = match &args[2] {
+            Value::Integer(d) => *d as u32,
+            _ => return Err(Error::invalid_argument("MAKE_DATE day must be an integer")),
+        };
+
+        if let Some(naive_date) = chrono::NaiveDate::from_ymd_opt(year, month, day) {
+            let naive_dt = naive_date.and_hms_opt(0, 0, 0).unwrap_or_default();
+            Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(
+                naive_dt,
+                chrono::Utc,
+            )))
+        } else {
+            Err(Error::invalid_argument(format!(
+                "MAKE_DATE invalid date parameters: {}-{}-{}",
+                year, month, day
+            )))
+        }
+    }
+}
+
+/// MAKE_TIME(hour, minute, second) — creates a time string 'HH:MM:SS'
+#[derive(Default)]
+pub struct MakeTimeFunction;
+
+impl ScalarFunction for MakeTimeFunction {
+    fn name(&self) -> &str {
+        "MAKE_TIME"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "MAKE_TIME",
+            FunctionType::Scalar,
+            "Creates a time string from hour, minute, and second numbers",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![
+                    FunctionDataType::Integer,
+                    FunctionDataType::Integer,
+                    FunctionDataType::Any,
+                ],
+                3,
+                3,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(MakeTimeFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "MAKE_TIME", 3);
+        if args[0].is_null() || args[1].is_null() || args[2].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let hour = match &args[0] {
+            Value::Integer(h) => *h,
+            _ => return Err(Error::invalid_argument("MAKE_TIME hour must be an integer")),
+        };
+        let minute = match &args[1] {
+            Value::Integer(m) => *m,
+            _ => return Err(Error::invalid_argument("MAKE_TIME minute must be an integer")),
+        };
+        let second = match &args[2] {
+            Value::Integer(s) => *s as f64,
+            Value::Float(s) => *s,
+            _ => return Err(Error::invalid_argument("MAKE_TIME second must be a number")),
+        };
+
+        if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || !(0.0..60.0).contains(&second) {
+            return Err(Error::invalid_argument(format!(
+                "MAKE_TIME invalid time: {}:{}:{}",
+                hour, minute, second
+            )));
+        }
+
+        let sec_int = second.floor() as u32;
+        let frac = second - second.floor();
+        if frac > 1e-6 {
+            Ok(Value::text(format!("{:02}:{:02}:{:06.3}", hour, minute, second)))
+        } else {
+            Ok(Value::text(format!("{:02}:{:02}:{:02}", hour, minute, sec_int)))
+        }
+    }
+}
+
+/// MAKE_TIMESTAMP(year, month, day, hour, minute, second) — creates a timestamp
+#[derive(Default)]
+pub struct MakeTimestampFunction;
+
+impl ScalarFunction for MakeTimestampFunction {
+    fn name(&self) -> &str {
+        "MAKE_TIMESTAMP"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "MAKE_TIMESTAMP",
+            FunctionType::Scalar,
+            "Creates a timestamp from year, month, day, hour, minute, and second numbers",
+            FunctionSignature::new(
+                FunctionDataType::Timestamp,
+                vec![
+                    FunctionDataType::Integer,
+                    FunctionDataType::Integer,
+                    FunctionDataType::Integer,
+                    FunctionDataType::Integer,
+                    FunctionDataType::Integer,
+                    FunctionDataType::Any,
+                ],
+                6,
+                6,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(MakeTimestampFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "MAKE_TIMESTAMP", 6);
+        if args.iter().any(|a| a.is_null()) {
+            return Ok(Value::null_unknown());
+        }
+
+        let year = match &args[0] {
+            Value::Integer(y) => *y as i32,
+            _ => return Err(Error::invalid_argument("MAKE_TIMESTAMP year must be an integer")),
+        };
+        let month = match &args[1] {
+            Value::Integer(m) => *m as u32,
+            _ => return Err(Error::invalid_argument("MAKE_TIMESTAMP month must be an integer")),
+        };
+        let day = match &args[2] {
+            Value::Integer(d) => *d as u32,
+            _ => return Err(Error::invalid_argument("MAKE_TIMESTAMP day must be an integer")),
+        };
+        let hour = match &args[3] {
+            Value::Integer(h) => *h as u32,
+            _ => return Err(Error::invalid_argument("MAKE_TIMESTAMP hour must be an integer")),
+        };
+        let minute = match &args[4] {
+            Value::Integer(m) => *m as u32,
+            _ => return Err(Error::invalid_argument("MAKE_TIMESTAMP minute must be an integer")),
+        };
+        let second = match &args[5] {
+            Value::Integer(s) => *s as f64,
+            Value::Float(s) => *s,
+            _ => return Err(Error::invalid_argument("MAKE_TIMESTAMP second must be a number")),
+        };
+
+        let sec_int = second.floor() as u32;
+        let nsec = ((second - second.floor()) * 1_000_000_000.0) as u32;
+
+        let naive_date = chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| {
+            Error::invalid_argument(format!("MAKE_TIMESTAMP invalid date: {}-{}-{}", year, month, day))
+        })?;
+        let naive_time = chrono::NaiveTime::from_hms_nano_opt(hour, minute, sec_int, nsec).ok_or_else(|| {
+            Error::invalid_argument(format!("MAKE_TIMESTAMP invalid time: {}:{}:{}", hour, minute, second))
+        })?;
+        let naive_dt = chrono::NaiveDateTime::new(naive_date, naive_time);
+
+        Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(
+            naive_dt,
+            chrono::Utc,
+        )))
+    }
+}
+
+/// AGE(timestamp1, [timestamp2]) — calculates age interval between two timestamps (or timestamp and now)
+#[derive(Default)]
+pub struct AgeFunction;
+
+impl ScalarFunction for AgeFunction {
+    fn name(&self) -> &str {
+        "AGE"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "AGE",
+            FunctionType::Scalar,
+            "Calculates the difference between two timestamps (or timestamp and current date)",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![FunctionDataType::Any],
+                1,
+                2,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(AgeFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "AGE", 1, 2);
+        if args.iter().any(|a| a.is_null()) {
+            return Ok(Value::null_unknown());
+        }
+
+        let t1 = match &args[0] {
+            Value::Timestamp(t) => *t,
+            Value::Text(s) => parse_timestamp(s).map_err(|_| {
+                Error::invalid_argument(format!("AGE could not parse first timestamp: {}", s))
+            })?,
+            _ => return Err(Error::invalid_argument("AGE first argument must be a timestamp or string")),
+        };
+
+        let t2 = if args.len() == 2 {
+            match &args[1] {
+                Value::Timestamp(t) => *t,
+                Value::Text(s) => parse_timestamp(s).map_err(|_| {
+                    Error::invalid_argument(format!("AGE could not parse second timestamp: {}", s))
+                })?,
+                _ => return Err(Error::invalid_argument("AGE second argument must be a timestamp or string")),
+            }
+        } else {
+            chrono::Utc::now()
+        };
+
+        let duration = t1.signed_duration_since(t2);
+        let total_days = duration.num_days();
+        let years = total_days / 365;
+        let rem_days_after_years = total_days % 365;
+        let months = rem_days_after_years / 30;
+        let days = rem_days_after_years % 30;
+
+        let mut parts = Vec::new();
+        if years != 0 {
+            parts.push(format!("{} year{}", years.abs(), if years.abs() == 1 { "" } else { "s" }));
+        }
+        if months != 0 {
+            parts.push(format!("{} mon{}", months.abs(), if months.abs() == 1 { "" } else { "s" }));
+        }
+        if days != 0 || parts.is_empty() {
+            parts.push(format!("{} day{}", days.abs(), if days.abs() == 1 { "" } else { "s" }));
+        }
+
+        let sign = if total_days < 0 { "-" } else { "" };
+        Ok(Value::text(format!("{}{}", sign, parts.join(" "))))
+    }
+}
+
+// ============================================================================
+// TIMEOFDAY / CLOCK_TIMESTAMP / STATEMENT_TIMESTAMP / LAST_DAY
+// ============================================================================
+
+/// TIMEOFDAY() — returns current date and time formatted as a string with day of week
+#[derive(Default)]
+pub struct TimeofdayFunction;
+
+impl ScalarFunction for TimeofdayFunction {
+    fn name(&self) -> &str {
+        "TIMEOFDAY"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "TIMEOFDAY",
+            FunctionType::Scalar,
+            "Returns current date and time as a string formatted according to PostgreSQL standard",
+            FunctionSignature::new(FunctionDataType::String, vec![], 0, 0),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(TimeofdayFunction)
+    }
+
+    fn evaluate(&self, _args: &[Value]) -> Result<Value> {
+        let now = Utc::now();
+        Ok(Value::text(now.format("%a %b %d %H:%M:%S.%6f %Y %Z").to_string()))
+    }
+}
+
+/// CLOCK_TIMESTAMP() — returns current wall clock timestamp
+#[derive(Default)]
+pub struct ClockTimestampFunction;
+
+impl ScalarFunction for ClockTimestampFunction {
+    fn name(&self) -> &str {
+        "CLOCK_TIMESTAMP"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "CLOCK_TIMESTAMP",
+            FunctionType::Scalar,
+            "Returns the current timestamp (changes during statement execution)",
+            FunctionSignature::new(FunctionDataType::Timestamp, vec![], 0, 0),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(ClockTimestampFunction)
+    }
+
+    fn evaluate(&self, _args: &[Value]) -> Result<Value> {
+        Ok(Value::Timestamp(Utc::now()))
+    }
+}
+
+/// STATEMENT_TIMESTAMP() — returns current statement start timestamp
+#[derive(Default)]
+pub struct StatementTimestampFunction;
+
+impl ScalarFunction for StatementTimestampFunction {
+    fn name(&self) -> &str {
+        "STATEMENT_TIMESTAMP"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "STATEMENT_TIMESTAMP",
+            FunctionType::Scalar,
+            "Returns the current statement start timestamp",
+            FunctionSignature::new(FunctionDataType::Timestamp, vec![], 0, 0),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(StatementTimestampFunction)
+    }
+
+    fn evaluate(&self, _args: &[Value]) -> Result<Value> {
+        Ok(Value::Timestamp(Utc::now()))
+    }
+}
+
+/// LAST_DAY(date) — returns the last day of the month for the given date
+#[derive(Default)]
+pub struct LastDayFunction;
+
+impl ScalarFunction for LastDayFunction {
+    fn name(&self) -> &str {
+        "LAST_DAY"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        FunctionInfo::new(
+            "LAST_DAY",
+            FunctionType::Scalar,
+            "Returns the last day of the month for the given date/timestamp",
+            FunctionSignature::new(
+                FunctionDataType::Timestamp,
+                vec![FunctionDataType::Any],
+                1,
+                1,
+            ),
+        )
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(LastDayFunction)
+    }
+
+    fn evaluate(&self, args: &[Value]) -> Result<Value> {
+        validate_arg_count!(args, "LAST_DAY", 1);
+        if args[0].is_null() {
+            return Ok(Value::null_unknown());
+        }
+
+        let dt = match &args[0] {
+            Value::Timestamp(t) => *t,
+            Value::Text(s) => parse_timestamp(s.as_str())?,
+            _ => return Err(Error::invalid_argument("LAST_DAY requires a DATE, TIMESTAMP, or text date")),
+        };
+
+        let y = dt.year();
+        let m = dt.month();
+
+        // Find next month 1st day then subtract 1 day
+        let next_year = if m == 12 { y + 1 } else { y };
+        let next_month = if m == 12 { 1 } else { m + 1 };
+
+        let first_of_next = NaiveDate::from_ymd_opt(next_year, next_month, 1)
+            .ok_or_else(|| Error::invalid_argument("Date calculation overflow"))?;
+        let last_day = first_of_next
+            .pred_opt()
+            .ok_or_else(|| Error::invalid_argument("Date calculation overflow"))?;
+
+        let last_day_dt = last_day.and_hms_opt(0, 0, 0)
+            .ok_or_else(|| Error::invalid_argument("Date calculation overflow"))?
+            .and_utc();
+
+        Ok(Value::Timestamp(last_day_dt))
     }
 }
 
@@ -1744,5 +2331,55 @@ mod tests {
     fn test_version_no_args() {
         let f = VersionFunction;
         assert!(f.evaluate(&[Value::Integer(1)]).is_err());
+    }
+
+    #[test]
+    fn test_convert_tz() {
+        let f = ConvertTzFunction;
+        let ts = Utc.with_ymd_and_hms(2024, 1, 1, 12, 0, 0).unwrap();
+
+        // UTC to IST (+05:30) -> 17:30
+        let res = f
+            .evaluate(&[
+                Value::Timestamp(ts),
+                Value::text("UTC"),
+                Value::text("+05:30"),
+            ])
+            .unwrap();
+        if let Value::Timestamp(t) = res {
+            assert_eq!(t.hour(), 17);
+            assert_eq!(t.minute(), 30);
+        } else {
+            panic!("Expected timestamp");
+        }
+
+        // UTC to PST (-08:00) -> 04:00
+        let res = f
+            .evaluate(&[
+                Value::Timestamp(ts),
+                Value::text("+00:00"),
+                Value::text("-08:00"),
+            ])
+            .unwrap();
+        if let Value::Timestamp(t) = res {
+            assert_eq!(t.hour(), 4);
+            assert_eq!(t.minute(), 0);
+        } else {
+            panic!("Expected timestamp");
+        }
+
+        // String timestamp parsing
+        let res = f
+            .evaluate(&[
+                Value::text("2024-01-01 12:00:00"),
+                Value::text("Z"),
+                Value::text("+02:00"),
+            ])
+            .unwrap();
+        if let Value::Timestamp(t) = res {
+            assert_eq!(t.hour(), 14);
+        } else {
+            panic!("Expected timestamp");
+        }
     }
 }
