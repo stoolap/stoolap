@@ -516,13 +516,13 @@ impl Transaction for MvccTransaction {
         }
 
         // Rollback all tables - discard local changes
-        for (_, table) in self.tables.iter_mut() {
+        for table in self.tables.values_mut() {
             table.rollback();
         }
 
         // Notify engine of rollback (per-table callbacks)
         if let Some(ops) = &self.engine_operations {
-            for (_, table) in self.tables.iter() {
+            for table in self.tables.values() {
                 ops.rollback_table(self.id, table.as_ref());
             }
             // Clean up txn_version_stores entry to prevent memory leak

@@ -1062,15 +1062,14 @@ impl Executor {
                     let name = fc.function.to_uppercase();
                     let col = Self::extract_vec_col_name(&fc.arguments[0])?;
                     (name.to_string(), col)
-                } else if let Some(infix) = Self::find_vec_distance_infix_alias_for_explain(
-                    &id.value_lower,
-                    &select.columns,
-                ) {
+                } else {
+                    let infix = Self::find_vec_distance_infix_alias_for_explain(
+                        &id.value_lower,
+                        &select.columns,
+                    )?;
                     // <=> operator is equivalent to VEC_DISTANCE_L2
                     let col = Self::extract_vec_col_name(&infix.left)?;
                     ("VEC_DISTANCE_L2".to_string(), col)
-                } else {
-                    return None;
                 }
             }
             Expression::Infix(infix) if infix.op_type == InfixOperator::VectorDistance => {
