@@ -68,7 +68,7 @@ file:///path/to/data?sync_mode=normal&checkpoint_interval=60
 
 | Option | Values | Default | Description |
 |--------|--------|---------|-------------|
-| `sync` / `sync_mode` | none/off, normal, full (or 0, 1, 2) | normal | WAL synchronization mode. none/off=no fsync (data durable at checkpoint), normal=fsync every 1s, full=fsync every write |
+| `sync` / `sync_mode` | none/off, normal, full (or 0, 1, 2) | normal | WAL synchronization mode. none/off=no fsync (data durable at checkpoint), normal=fsync every 1s, full=fsync at every commit and DDL |
 | `checkpoint_interval` | Integer (seconds) | 60 | Time between automatic checkpoint cycles |
 | `compact_threshold` | Integer (min 2) | 4 | Sub-target volumes per table before merging |
 | `keep_snapshots` | Integer | 3 | Backup snapshots to retain per table |
@@ -111,7 +111,7 @@ file:///data/mydb?cleanup=off
 |------|-------|-------------|
 | none | 0 | No fsync. Data is durable only after checkpoint writes volumes to disk. |
 | normal | 1 | Fsync every 1 second (configurable via `sync_interval_ms`). DDL fsyncs immediately. Comparable to SQLite WAL + synchronous=NORMAL. |
-| full | 2 | Fsync on every write operation. Maximum durability. |
+| full | 2 | Fsync at every commit and DDL. Maximum durability: every acknowledged commit survives power loss. |
 
 ## Usage Examples
 

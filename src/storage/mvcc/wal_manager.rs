@@ -1289,36 +1289,22 @@ impl WALManager {
         let encoded = entry.encode();
         let encoded_len = encoded.len() as u64;
 
-        // Write to buffer
-        {
+        // Write to buffer. Flush at commit/DDL boundaries in both durable
+        // modes: mid-txn DML needs no independent flush or fsync, the
+        // commit-marker flush carries all buffered entries, and recovery
+        // discards uncommitted transactions either way.
+        let do_flush = {
             let mut buffer = self.buffer.lock().unwrap();
             buffer.extend_from_slice(&encoded);
 
             let needs_flush = buffer.len() >= self.flush_trigger as usize;
-            let force_flush = self.sync_mode == SyncMode::Full
-                || (self.sync_mode == SyncMode::Normal
-                    && (entry.operation.is_transaction_end() || entry.operation.is_ddl()));
+            let force_flush = self.sync_mode != SyncMode::None
+                && (entry.operation.is_transaction_end() || entry.operation.is_ddl());
+            needs_flush || force_flush
+        };
 
-            if needs_flush || force_flush {
-                let buffer_data = std::mem::take(&mut *buffer);
-                // CRITICAL: Increment in-flight counter BEFORE releasing lock
-                // This prevents checkpoint from reading LSN before data is on disk
-                self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
-                drop(buffer); // Release buffer lock before file operations
-
-                // Use a guard pattern to ensure we decrement even on error
-                let write_result = self.write_to_file(&buffer_data);
-                self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
-                write_result?;
-
-                // Update file position tracking
-                self.current_file_position
-                    .fetch_add(buffer_data.len() as u64, Ordering::Relaxed);
-
-                if self.should_sync(entry.operation) {
-                    self.sync_locked()?;
-                }
-            }
+        if do_flush {
+            self.flush_and_maybe_sync(self.should_sync(entry.operation))?;
         }
 
         // Track that we wrote encoded_len bytes (even if buffered)
@@ -1326,6 +1312,48 @@ impl WALManager {
         let _ = encoded_len;
 
         Ok(entry.lsn)
+    }
+
+    /// Drain the buffer to the file and optionally fsync, all under the
+    /// `wal_file` lock (same `wal_file` -> `buffer` order as `truncate_wal`).
+    /// Serializing drains here is what makes a commit sync cover every
+    /// byte appended before it: no other thread can be holding drained-but-
+    /// unwritten bytes. On write failure the buffer is left untouched, so
+    /// nothing is lost and the next flush retries.
+    fn flush_and_maybe_sync(&self, sync: bool) -> Result<()> {
+        let mut wal_file = self.wal_file.lock().unwrap();
+        {
+            let mut buffer = self.buffer.lock().unwrap();
+            if !buffer.is_empty() {
+                #[cfg(any(test, feature = "test-failpoints"))]
+                if crate::test_failpoints::WAL_WRITE_FAIL.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(Error::internal("failpoint: WAL write"));
+                }
+
+                // Signal checkpoint coordination for the duration of the write.
+                self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
+                let write_result = match wal_file.as_mut() {
+                    Some(file) => file
+                        .write_all(&buffer)
+                        .map_err(|e| Error::internal(format!("failed to write to WAL: {}", e))),
+                    None => Err(Error::WalFileClosed),
+                };
+                self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
+                write_result?;
+
+                self.current_file_position
+                    .fetch_add(buffer.len() as u64, Ordering::Relaxed);
+                // clear() keeps the allocation, so the buffer capacity
+                // survives across flush cycles.
+                buffer.clear();
+            }
+        }
+
+        if sync {
+            self.sync_with_file(&wal_file)?;
+        }
+        Ok(())
     }
 
     /// Get previous LSN (last written entry's LSN)
@@ -1345,30 +1373,14 @@ impl WALManager {
         self.append_entry(entry)
     }
 
-    /// Write data to WAL file
-    fn write_to_file(&self, data: &[u8]) -> Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        #[cfg(any(test, feature = "test-failpoints"))]
-        if crate::test_failpoints::WAL_WRITE_FAIL.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(Error::internal("failpoint: WAL write"));
-        }
-
-        let mut wal_file = self.wal_file.lock().unwrap();
-        if let Some(file) = wal_file.as_mut() {
-            file.write_all(data)
-                .map_err(|e| Error::internal(format!("failed to write to WAL: {}", e)))?;
-        } else {
-            return Err(Error::WalFileClosed);
-        }
-
-        Ok(())
+    /// Sync WAL to disk (acquires the wal_file lock).
+    fn sync_locked(&self) -> Result<()> {
+        let wal_file = self.wal_file.lock().unwrap();
+        self.sync_with_file(&wal_file)
     }
 
-    /// Sync WAL to disk (assumes lock is held)
-    fn sync_locked(&self) -> Result<()> {
+    /// Fsync via an already-held `wal_file` guard.
+    fn sync_with_file(&self, wal_file: &Option<File>) -> Result<()> {
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
         }
@@ -1378,7 +1390,6 @@ impl WALManager {
             return Err(Error::internal("failpoint: WAL sync"));
         }
 
-        let wal_file = self.wal_file.lock().unwrap();
         if let Some(file) = wal_file.as_ref() {
             file.sync_all()
                 .map_err(|e| Error::internal(format!("failed to sync WAL: {}", e)))?;
@@ -1526,22 +1537,7 @@ impl WALManager {
             return Err(Error::WalNotRunning);
         }
 
-        let buffer_data = {
-            let mut buffer = self.buffer.lock().unwrap();
-            if buffer.is_empty() {
-                return Ok(());
-            }
-            let data = std::mem::take(&mut *buffer);
-            // CRITICAL: Increment in-flight counter BEFORE releasing lock
-            // This prevents checkpoint from reading LSN before data is on disk
-            self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
-            data
-        };
-
-        // Use a guard pattern to ensure we decrement even on error
-        let write_result = self.write_to_file(&buffer_data);
-        self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
-        write_result
+        self.flush_and_maybe_sync(false)
     }
 
     /// Check if we should sync based on operation type
@@ -1565,7 +1561,10 @@ impl WALManager {
                 let last = self.last_sync_time.load(Ordering::Relaxed);
                 now - last >= self.sync_interval
             }
-            SyncMode::Full => true,
+            // Sync at transaction end and DDL. Per-entry fsync added no
+            // durability (uncommitted entries are discarded at recovery)
+            // and cost one fsync per row on multi-row transactions.
+            SyncMode::Full => op.is_transaction_end() || op.is_ddl(),
         }
     }
 
@@ -3012,7 +3011,11 @@ mod tests {
             let wal_path = dir.path().join("wal_full");
             let wal = WALManager::new(&wal_path, SyncMode::Full).unwrap();
             assert!(wal.should_sync(WALOperationType::Commit));
-            assert!(wal.should_sync(WALOperationType::Insert));
+            assert!(wal.should_sync(WALOperationType::Rollback));
+            assert!(wal.should_sync(WALOperationType::CreateTable));
+            // DML entries must NOT fsync individually: durability is
+            // established by the commit-marker sync.
+            assert!(!wal.should_sync(WALOperationType::Insert));
             wal.close().unwrap();
         }
     }
