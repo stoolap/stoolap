@@ -4738,7 +4738,7 @@ impl MVCCEngine {
         // Clear segment managers and delete volume files on disk
         {
             let mut mgrs = self.segment_managers.write().unwrap();
-            for (_, mgr) in mgrs.iter() {
+            for mgr in mgrs.values() {
                 mgr.clear();
             }
             mgrs.clear();
