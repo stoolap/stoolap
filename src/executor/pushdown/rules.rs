@@ -814,10 +814,8 @@ impl FunctionRule {
         // Convert function arguments to FunctionArg
         let mut args = Vec::with_capacity(func_call.arguments.len());
         for arg in &func_call.arguments {
-            match self.convert_func_arg(arg, ctx) {
-                Some(fa) => args.push(fa),
-                None => return None, // Can't convert argument, bail out
-            }
+            // Bail out when an argument can't be converted.
+            args.push(self.convert_func_arg(arg, ctx)?);
         }
 
         // Get the comparison value

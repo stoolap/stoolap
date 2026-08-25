@@ -63,9 +63,7 @@ pub unsafe extern "C" fn stoolap_rows_next(rows: *mut StoolapRows) -> i32 {
 
         // Clear text cache from previous row (only if anything was cached)
         if handle.text_cache_dirty {
-            for slot in &mut handle.text_cache {
-                *slot = None;
-            }
+            handle.text_cache.fill(None);
             handle.text_cache_dirty = false;
         }
 
