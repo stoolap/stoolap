@@ -171,6 +171,13 @@ impl MergeJoinOperator {
         Ordering::Equal
     }
 
+    /// True if any join-key column of `row` is NULL.
+    fn row_has_null_key(row: &Row, key_indices: &[usize]) -> bool {
+        key_indices
+            .iter()
+            .any(|&i| row.get(i).map(|v| v.is_null()).unwrap_or(true))
+    }
+
     /// Compare two rows from the same side on their keys.
     fn compare_same_side(&self, row1: &Row, row2: &Row, key_indices: &[usize]) -> Ordering {
         for &idx in key_indices {
@@ -362,6 +369,20 @@ impl Operator for MergeJoinOperator {
                     self.right_idx += 1;
                 }
                 Ordering::Equal => {
+                    // NULL keys compare Equal for ordering only; SQL equi-join
+                    // semantics say NULL = NULL is not a match. Treat the left
+                    // row as unmatched (right side stays unmarked, so OUTER
+                    // emission still picks it up later).
+                    if Self::row_has_null_key(left_row, &self.left_key_indices) {
+                        self.left_idx += 1;
+                        if is_left_outer {
+                            let null_right = self.null_right_row();
+                            let combined = self.combine(left_row, &null_right);
+                            return Ok(Some(RowRef::Owned(combined)));
+                        }
+                        continue;
+                    }
+
                     // Found match - find extent of matching groups
                     let left_start = self.left_idx;
                     let right_start = self.right_idx;
@@ -466,6 +487,65 @@ mod tests {
         }
         op.close()?;
         Ok(results)
+    }
+
+    fn make_operator_with_null_key(
+        data: Vec<(Option<i64>, i64)>,
+        cols: Vec<&str>,
+    ) -> Box<dyn Operator> {
+        let rows = data
+            .into_iter()
+            .map(|(k, v)| {
+                let key = k.map(Value::integer).unwrap_or(NULL_VALUE);
+                Row::from_values(vec![key, Value::integer(v)])
+            })
+            .collect();
+        let schema = cols.into_iter().map(ColumnInfo::new).collect();
+        Box::new(MaterializedOperator::new(rows, schema))
+    }
+
+    #[test]
+    fn test_null_keys_do_not_match_inner() {
+        // NULL = NULL must not join; inputs sorted with NULLs last.
+        let left =
+            make_operator_with_null_key(vec![(Some(1), 10), (None, 20)], vec!["id", "value"]);
+        let right =
+            make_operator_with_null_key(vec![(Some(1), 100), (None, 200)], vec!["id", "data"]);
+        let mut join = MergeJoinOperator::new(left, right, JoinType::Inner, vec![0], vec![0]);
+        let results = collect_results(&mut join).unwrap();
+        assert_eq!(results.len(), 1, "only id=1 matches; NULL keys must not");
+        assert_eq!(results[0].get(0), Some(&Value::integer(1)));
+    }
+
+    #[test]
+    fn test_null_keys_left_outer_emits_null_row() {
+        let left =
+            make_operator_with_null_key(vec![(Some(1), 10), (None, 20)], vec!["id", "value"]);
+        let right =
+            make_operator_with_null_key(vec![(Some(1), 100), (None, 200)], vec!["id", "data"]);
+        let mut join = MergeJoinOperator::new(left, right, JoinType::Left, vec![0], vec![0]);
+        let results = collect_results(&mut join).unwrap();
+        assert_eq!(results.len(), 2, "id=1 match plus NULL-key left row");
+        let null_key_row = results
+            .iter()
+            .find(|r| r.get(1) == Some(&Value::integer(20)))
+            .expect("NULL-key left row present");
+        assert!(
+            null_key_row.get(2).unwrap().is_null() && null_key_row.get(3).unwrap().is_null(),
+            "NULL-key left row must carry NULL right side"
+        );
+    }
+
+    #[test]
+    fn test_null_keys_full_outer_keeps_both_sides() {
+        let left =
+            make_operator_with_null_key(vec![(Some(1), 10), (None, 20)], vec!["id", "value"]);
+        let right =
+            make_operator_with_null_key(vec![(Some(1), 100), (None, 200)], vec!["id", "data"]);
+        let mut join = MergeJoinOperator::new(left, right, JoinType::Full, vec![0], vec![0]);
+        let results = collect_results(&mut join).unwrap();
+        // id=1 match + unmatched NULL-key left + unmatched NULL-key right
+        assert_eq!(results.len(), 3);
     }
 
     #[test]

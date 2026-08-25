@@ -977,14 +977,24 @@ fn check_range_subsumption(cached: &Expression, new: &Expression) -> Option<Subs
     // Check operator relationship
     match (&cached_infix.op_type, &new_infix.op_type) {
         // Greater than: new > cached means new is stricter
-        (InfixOperator::GreaterThan, InfixOperator::GreaterThan)
-        | (InfixOperator::GreaterThan, InfixOperator::GreaterEqual) => {
+        (InfixOperator::GreaterThan, InfixOperator::GreaterThan) => {
             if new_val > cached_val {
                 Some(SubsumptionResult::Subsumed {
                     filter: Box::new(new.clone()),
                 })
             } else if (new_val - cached_val).abs() < f64::EPSILON {
                 Some(SubsumptionResult::Identical)
+            } else {
+                None
+            }
+        }
+        // Equal values are NOT identical here: new `>= v` includes v,
+        // cached `> v` does not.
+        (InfixOperator::GreaterThan, InfixOperator::GreaterEqual) => {
+            if new_val > cached_val {
+                Some(SubsumptionResult::Subsumed {
+                    filter: Box::new(new.clone()),
+                })
             } else {
                 None
             }
@@ -1009,14 +1019,24 @@ fn check_range_subsumption(cached: &Expression, new: &Expression) -> Option<Subs
         }
 
         // Less than: new < cached means new is stricter
-        (InfixOperator::LessThan, InfixOperator::LessThan)
-        | (InfixOperator::LessThan, InfixOperator::LessEqual) => {
+        (InfixOperator::LessThan, InfixOperator::LessThan) => {
             if new_val < cached_val {
                 Some(SubsumptionResult::Subsumed {
                     filter: Box::new(new.clone()),
                 })
             } else if (new_val - cached_val).abs() < f64::EPSILON {
                 Some(SubsumptionResult::Identical)
+            } else {
+                None
+            }
+        }
+        // Equal values are NOT identical here: new `<= v` includes v,
+        // cached `< v` does not.
+        (InfixOperator::LessThan, InfixOperator::LessEqual) => {
+            if new_val < cached_val {
+                Some(SubsumptionResult::Subsumed {
+                    filter: Box::new(new.clone()),
+                })
             } else {
                 None
             }
@@ -1164,27 +1184,18 @@ impl PartialEq for NumericValue {
 
 /// Extract values from an IN expression's right side
 fn extract_in_values(expr: &Expression) -> Option<Vec<NumericValue>> {
+    // Any non-numeric element bails the whole extraction: dropping elements
+    // would make different string IN lists compare as identical empty sets.
+    fn numeric_lit(e: &Expression) -> Option<NumericValue> {
+        match e {
+            Expression::IntegerLiteral(lit) => Some(NumericValue::Integer(lit.value)),
+            Expression::FloatLiteral(lit) => Some(NumericValue::Float(lit.value)),
+            _ => None,
+        }
+    }
     match expr {
-        Expression::List(list) => Some(
-            list.elements
-                .iter()
-                .filter_map(|e| match e {
-                    Expression::IntegerLiteral(lit) => Some(NumericValue::Integer(lit.value)),
-                    Expression::FloatLiteral(lit) => Some(NumericValue::Float(lit.value)),
-                    _ => None,
-                })
-                .collect(),
-        ),
-        Expression::ExpressionList(list) => Some(
-            list.expressions
-                .iter()
-                .filter_map(|e| match e {
-                    Expression::IntegerLiteral(lit) => Some(NumericValue::Integer(lit.value)),
-                    Expression::FloatLiteral(lit) => Some(NumericValue::Float(lit.value)),
-                    _ => None,
-                })
-                .collect(),
-        ),
+        Expression::List(list) => list.elements.iter().map(numeric_lit).collect(),
+        Expression::ExpressionList(list) => list.expressions.iter().map(numeric_lit).collect(),
         _ => None,
     }
 }
@@ -1267,6 +1278,69 @@ mod tests {
             }))),
             not: false,
         })
+    }
+
+    fn make_cmp(col: &str, op: &str, val: i64) -> Expression {
+        Expression::Infix(InfixExpression::new(
+            make_token(),
+            Box::new(make_identifier(col)),
+            op.to_string(),
+            Box::new(make_int_literal(val)),
+        ))
+    }
+
+    fn make_string_in(col: &str, values: Vec<&str>) -> Expression {
+        Expression::In(InExpression {
+            token: make_token(),
+            left: Box::new(make_identifier(col)),
+            right: Box::new(Expression::List(Box::new(ListExpression {
+                token: make_token(),
+                elements: values
+                    .into_iter()
+                    .map(|s| {
+                        Expression::StringLiteral(crate::parser::ast::StringLiteral {
+                            token: make_token(),
+                            value: s.into(),
+                            type_hint: None,
+                        })
+                    })
+                    .collect(),
+            }))),
+            not: false,
+        })
+    }
+
+    #[test]
+    fn test_boundary_gt_vs_ge_not_identical() {
+        // cached a > 100 lacks the row a = 100 that new a >= 100 needs
+        let cached = make_cmp("a", ">", 100);
+        let new = make_cmp("a", ">=", 100);
+        match check_subsumption(Some(&cached), Some(&new)) {
+            SubsumptionResult::NoSubsumption => {}
+            other => panic!("cached a>100 must not answer a>=100, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_boundary_lt_vs_le_not_identical() {
+        let cached = make_cmp("a", "<", 100);
+        let new = make_cmp("a", "<=", 100);
+        match check_subsumption(Some(&cached), Some(&new)) {
+            SubsumptionResult::NoSubsumption => {}
+            other => panic!("cached a<100 must not answer a<=100, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_string_in_lists_do_not_match() {
+        // Previously both lists extracted to empty numeric sets and were
+        // treated as identical cache entries.
+        let cached = make_string_in("s", vec!["a", "b"]);
+        let new = make_string_in("s", vec!["x", "y"]);
+        match check_subsumption(Some(&cached), Some(&new)) {
+            SubsumptionResult::NoSubsumption => {}
+            other => panic!("string IN lists must not be identical, got {:?}", other),
+        }
     }
 
     #[test]
