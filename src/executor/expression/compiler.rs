@@ -1238,11 +1238,7 @@ impl<'a> ExprCompiler<'a> {
 
         let mut values = Vec::with_capacity(expected_size);
         for element in elements {
-            if let Some(value) = try_eval_constant(element) {
-                values.push(value);
-            } else {
-                return None;
-            }
+            values.push(try_eval_constant(element)?);
         }
 
         Some(values)

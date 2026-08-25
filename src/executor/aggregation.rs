@@ -4854,8 +4854,7 @@ impl Executor {
         let mut has_value = false;
 
         // Unroll loop by 4 for better CPU pipelining
-        let chunks = rows.chunks_exact(4);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = rows.as_chunks::<4>();
 
         for chunk in chunks {
             for (_, row) in chunk {

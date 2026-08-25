@@ -283,9 +283,7 @@ impl BloomFilter {
 
     /// Clear the bloom filter
     pub fn clear(&mut self) {
-        for word in &mut self.bits {
-            *word = 0;
-        }
+        self.bits.fill(0);
         self.element_count = 0;
     }
 
