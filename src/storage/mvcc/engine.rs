@@ -3063,7 +3063,8 @@ impl MVCCEngine {
                     return Err(Error::Internal {
                         message: format!(
                             "failed to load manifest for table '{}': {} (refusing to open \
-                             with a partially visible catalog)",
+                             with a partially visible catalog; if the manifest is damaged, \
+                             recover with 'stoolap --reset-volumes --restore' from a snapshot)",
                             table_name, e
                         ),
                     });
@@ -3640,64 +3641,49 @@ impl MVCCEngine {
                 let vol_dir = pm.path().join("volumes");
                 let old_dir = vol_dir.join(&old_name_lower);
                 let new_dir = vol_dir.join(&new_name_lower);
-                // Revert every in-memory rename on disk failure.
-                let revert_in_memory = |message: String| -> Error {
-                    let mut mgrs = self.segment_managers.write().unwrap();
-                    if let Some(mgr) = mgrs.remove(&new_name_lower) {
-                        mgr.manifest_mut().table_name =
-                            crate::common::SmartString::from(old_name_lower.as_str());
-                        mgrs.insert(old_name_lower.clone(), mgr);
-                    }
-                    drop(mgrs);
-                    let mut stores = self.version_stores.write().unwrap();
-                    if let Some(store) = stores.remove(&new_name_lower) {
-                        {
-                            let mut vs_schema_guard = store.schema_mut();
-                            let schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                if old_dir.exists() {
+                    if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                        // Revert in-memory segment manager rename on disk failure
+                        let mut mgrs = self.segment_managers.write().unwrap();
+                        if let Some(mgr) = mgrs.remove(&new_name_lower) {
+                            mgr.manifest_mut().table_name =
+                                crate::common::SmartString::from(old_name_lower.as_str());
+                            mgrs.insert(old_name_lower.clone(), mgr);
+                        }
+                        drop(mgrs);
+                        // Revert version stores
+                        let mut stores = self.version_stores.write().unwrap();
+                        if let Some(store) = stores.remove(&new_name_lower) {
+                            {
+                                let mut vs_schema_guard = store.schema_mut();
+                                let schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                                schema.table_name = old_name.to_string();
+                                schema.table_name_lower = old_name_lower.clone();
+                            }
+                            stores.insert(old_name_lower.clone(), store);
+                        }
+                        drop(stores);
+                        // Revert schemas
+                        let mut schemas = self.schemas.write().unwrap();
+                        if let Some(mut schema_arc) = schemas.remove(&new_name_lower) {
+                            let schema = CompactArc::make_mut(&mut schema_arc);
                             schema.table_name = old_name.to_string();
                             schema.table_name_lower = old_name_lower.clone();
+                            schemas.insert(old_name_lower, schema_arc);
                         }
-                        stores.insert(old_name_lower.clone(), store);
+                        drop(schemas);
+                        return Err(Error::Internal {
+                            message: format!("Failed to rename volume directory: {}", e),
+                        });
                     }
-                    drop(stores);
-                    let mut schemas = self.schemas.write().unwrap();
-                    if let Some(mut schema_arc) = schemas.remove(&new_name_lower) {
-                        let schema = CompactArc::make_mut(&mut schema_arc);
-                        schema.table_name = old_name.to_string();
-                        schema.table_name_lower = old_name_lower.clone();
-                        schemas.insert(old_name_lower.clone(), schema_arc);
-                    }
-                    drop(schemas);
-                    Error::Internal { message }
-                };
-                // Tombstones move first (revert = rename back). A swallowed
-                // failure here resurrects deleted rows after restart.
+                }
                 let snap_dir = pm.path().join("snapshots");
                 let old_ts = snap_dir.join(&old_name_lower).join("tombstones.dat");
                 let new_ts_dir = snap_dir.join(&new_name_lower);
                 let new_ts = new_ts_dir.join("tombstones.dat");
-                let mut tombstones_moved = false;
                 if old_ts.exists() {
-                    if let Err(e) = std::fs::create_dir_all(&new_ts_dir)
-                        .and_then(|_| std::fs::rename(&old_ts, &new_ts))
-                    {
-                        return Err(revert_in_memory(format!(
-                            "Failed to move tombstones for rename: {}",
-                            e
-                        )));
-                    }
-                    tombstones_moved = true;
-                }
-                if old_dir.exists() {
-                    if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
-                        if tombstones_moved {
-                            let _ = std::fs::rename(&new_ts, &old_ts);
-                        }
-                        return Err(revert_in_memory(format!(
-                            "Failed to rename volume directory: {}",
-                            e
-                        )));
-                    }
+                    let _ = std::fs::create_dir_all(&new_ts_dir);
+                    let _ = std::fs::rename(&old_ts, &new_ts);
                 }
             }
         }
@@ -7130,67 +7116,50 @@ impl TransactionEngineOperations for EngineOperations {
                 let vol_dir = pm.path().join("volumes");
                 let old_dir = vol_dir.join(&old_name_lower);
                 let new_dir = vol_dir.join(&new_name_lower);
-                // Revert every in-memory rename on disk failure.
-                let revert_in_memory = |message: String| -> Error {
-                    {
-                        let mut schemas = self.schemas().write().unwrap();
-                        if let Some(mut schema_arc) = schemas.remove(&new_name_lower) {
-                            let schema = CompactArc::make_mut(&mut schema_arc);
-                            schema.table_name = old_name.to_string();
-                            schema.table_name_lower = old_name_lower.clone();
-                            schemas.insert(old_name_lower.clone(), schema_arc);
-                        }
-                    }
-                    {
-                        let mut stores = self.version_stores().write().unwrap();
-                        if let Some(store) = stores.remove(&new_name_lower) {
-                            {
-                                let mut vs_schema_guard = store.schema_mut();
-                                let schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                if old_dir.exists() {
+                    if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                        // Revert ALL in-memory renames on disk failure
+                        {
+                            let mut schemas = self.schemas().write().unwrap();
+                            if let Some(mut schema_arc) = schemas.remove(&new_name_lower) {
+                                let schema = CompactArc::make_mut(&mut schema_arc);
                                 schema.table_name = old_name.to_string();
                                 schema.table_name_lower = old_name_lower.clone();
+                                schemas.insert(old_name_lower.clone(), schema_arc);
                             }
-                            stores.insert(old_name_lower.clone(), store);
                         }
-                    }
-                    {
-                        let mut mgrs = self.segment_managers.write().unwrap();
-                        if let Some(mgr) = mgrs.remove(&new_name_lower) {
-                            mgr.manifest_mut().table_name =
-                                crate::common::SmartString::from(old_name_lower.as_str());
-                            mgrs.insert(old_name_lower.clone(), mgr);
+                        {
+                            let mut stores = self.version_stores().write().unwrap();
+                            if let Some(store) = stores.remove(&new_name_lower) {
+                                {
+                                    let mut vs_schema_guard = store.schema_mut();
+                                    let schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                                    schema.table_name = old_name.to_string();
+                                    schema.table_name_lower = old_name_lower.clone();
+                                }
+                                stores.insert(old_name_lower.clone(), store);
+                            }
                         }
+                        {
+                            let mut mgrs = self.segment_managers.write().unwrap();
+                            if let Some(mgr) = mgrs.remove(&new_name_lower) {
+                                mgr.manifest_mut().table_name =
+                                    crate::common::SmartString::from(old_name_lower.as_str());
+                                mgrs.insert(old_name_lower.clone(), mgr);
+                            }
+                        }
+                        return Err(Error::Internal {
+                            message: format!("Failed to rename volume directory: {}", e),
+                        });
                     }
-                    Error::Internal { message }
-                };
-                // Tombstones move first (revert = rename back). A swallowed
-                // failure here resurrects deleted rows after restart.
+                }
                 let snap_dir = pm.path().join("snapshots");
                 let old_ts = snap_dir.join(&old_name_lower).join("tombstones.dat");
                 let new_ts_dir = snap_dir.join(&new_name_lower);
                 let new_ts = new_ts_dir.join("tombstones.dat");
-                let mut tombstones_moved = false;
                 if old_ts.exists() {
-                    if let Err(e) = std::fs::create_dir_all(&new_ts_dir)
-                        .and_then(|_| std::fs::rename(&old_ts, &new_ts))
-                    {
-                        return Err(revert_in_memory(format!(
-                            "Failed to move tombstones for rename: {}",
-                            e
-                        )));
-                    }
-                    tombstones_moved = true;
-                }
-                if old_dir.exists() {
-                    if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
-                        if tombstones_moved {
-                            let _ = std::fs::rename(&new_ts, &old_ts);
-                        }
-                        return Err(revert_in_memory(format!(
-                            "Failed to rename volume directory: {}",
-                            e
-                        )));
-                    }
+                    let _ = std::fs::create_dir_all(&new_ts_dir);
+                    let _ = std::fs::rename(&old_ts, &new_ts);
                 }
             }
         }

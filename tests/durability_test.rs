@@ -2726,7 +2726,9 @@ fn test_manifest_corrupt_with_valid_volumes() {
     // The open must fail closed to protect the intact volumes.
     let (fixture, _) = setup_db_with_volumes();
 
-    if let Some(manifest_path) = find_manifest_file(&fixture.db_path, "vol_test") {
+    let manifest_path = find_manifest_file(&fixture.db_path, "vol_test")
+        .expect("precondition: checkpoint must write manifest.bin");
+    {
         let mut data = fs::read(&manifest_path).unwrap();
         if data.len() > 10 {
             // Corrupt the magic bytes (first 4 bytes: "STMF")
@@ -4010,7 +4012,9 @@ fn test_manifest_corrupt_magic_bytes() {
     remove_lock_file(&db_path);
 
     // Corrupt magic bytes in manifest.bin
-    if let Some(manifest_path) = find_manifest_file(&db_path, "meta_test") {
+    let manifest_path = find_manifest_file(&db_path, "meta_test")
+        .expect("precondition: checkpoint must write manifest.bin");
+    {
         let mut data = fs::read(&manifest_path).unwrap();
         if data.len() >= 4 {
             zero_range(&mut data, 0, 4); // zero out magic
@@ -4057,7 +4061,9 @@ fn test_manifest_corrupt_checkpoint_lsn() {
     remove_lock_file(&db_path);
 
     // Corrupt the manifest by flipping bits in the middle (where checkpoint_lsn is stored)
-    if let Some(manifest_path) = find_manifest_file(&db_path, "meta_lsn") {
+    let manifest_path = find_manifest_file(&db_path, "meta_lsn")
+        .expect("precondition: checkpoint must write manifest.bin");
+    {
         let mut data = fs::read(&manifest_path).unwrap();
         if data.len() > 20 {
             // Flip bits in the data section
@@ -4150,7 +4156,9 @@ fn test_manifest_truncated() {
     remove_lock_file(&db_path);
 
     // Truncate manifest.bin to half its size
-    if let Some(manifest_path) = find_manifest_file(&db_path, "meta_trunc") {
+    let manifest_path = find_manifest_file(&db_path, "meta_trunc")
+        .expect("precondition: checkpoint must write manifest.bin");
+    {
         let data = fs::read(&manifest_path).unwrap();
         if data.len() > 10 {
             fs::write(&manifest_path, &data[..data.len() / 2]).unwrap();
