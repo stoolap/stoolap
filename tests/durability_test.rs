@@ -2723,7 +2723,7 @@ fn test_volume_valid_wal_corrupt() {
 #[test]
 fn test_manifest_corrupt_with_valid_volumes() {
     // Corrupt manifest.bin but leave .vol files intact.
-    // Recovery may lose track of which volumes exist.
+    // The open must fail closed to protect the intact volumes.
     let (fixture, _) = setup_db_with_volumes();
 
     if let Some(manifest_path) = find_manifest_file(&fixture.db_path, "vol_test") {
@@ -2737,23 +2737,13 @@ fn test_manifest_corrupt_with_valid_volumes() {
 
     remove_lock_file(&fixture.db_path);
 
-    // Database should still open; volumes without valid manifest may be skipped
-    let db = Database::open(&fixture.dsn).unwrap();
-    let result: Result<i64, _> = db.query_one("SELECT COUNT(*) FROM vol_test", ());
-
-    match result {
-        Ok(count) => {
-            assert!(count >= 0, "Should have non-negative row count");
-            db.execute(
-                "INSERT INTO vol_test (id, value, phase) VALUES (999, 'post_recovery', 3)",
-                (),
-            )
-            .unwrap();
-        }
-        Err(_) => {
-            // Table may not exist if manifest + WAL both can't reconstruct it
-        }
-    }
+    // A corrupt manifest with intact volumes must fail the open: skipping it
+    // would let the orphan reaper delete the intact .vol files.
+    let err = match Database::open(&fixture.dsn) {
+        Err(e) => e,
+        Ok(_) => panic!("corrupt manifest must fail the open"),
+    };
+    assert!(err.to_string().contains("manifest"), "got: {}", err);
 }
 
 #[test]
@@ -3981,7 +3971,7 @@ fn test_safe_truncation_survives_restart_cycles() {
 #[test]
 fn test_manifest_corrupt_magic_bytes() {
     // Corrupt first 4 bytes (magic "STMF") of manifest.bin.
-    // Recovery should handle the corrupt manifest gracefully.
+    // The open must fail closed.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let dsn = format!("file://{}?checkpoint_on_close=off", db_path.display());
@@ -4028,28 +4018,19 @@ fn test_manifest_corrupt_magic_bytes() {
         }
     }
 
-    // Reopen — manifest is corrupt, volumes may not load, but WAL data should survive
-    let db = Database::open(&dsn).unwrap();
-    let result: Result<i64, _> = db.query_one("SELECT COUNT(*) FROM meta_test", ());
-    match result {
-        Ok(count) => {
-            assert!(count >= 0, "Should have non-negative count, got {}", count);
-            db.execute(
-                "INSERT INTO meta_test (id, value) VALUES (100, 'post_recovery')",
-                (),
-            )
-            .unwrap();
-        }
-        Err(_) => {
-            // If DDL was in truncated WAL, table may not exist
-        }
-    }
+    // Reopen: a corrupt manifest must fail the open instead of surfacing a
+    // partially visible catalog (which exposes .vol files to the reaper).
+    let err = match Database::open(&dsn) {
+        Err(e) => e,
+        Ok(_) => panic!("corrupt manifest must fail the open"),
+    };
+    assert!(err.to_string().contains("manifest"), "got: {}", err);
 }
 
 #[test]
 fn test_manifest_corrupt_checkpoint_lsn() {
     // Corrupt the checkpoint_lsn field in manifest.bin.
-    // Recovery may replay incorrect WAL range but should not crash.
+    // The CRC catches it and the open must fail closed.
     let dir = tempdir().unwrap();
     let db_path = dir.path().join("test.db");
     let dsn = format!("file://{}?checkpoint_on_close=off", db_path.display());
@@ -4086,12 +4067,12 @@ fn test_manifest_corrupt_checkpoint_lsn() {
         }
     }
 
-    // Database should open without crashing
-    let db = Database::open(&dsn).unwrap();
-    let result: Result<i64, _> = db.query_one("SELECT COUNT(*) FROM meta_lsn", ());
-    if let Ok(count) = result {
-        assert!(count >= 0, "Should have non-negative count");
-    }
+    // Corrupted manifest bytes fail the CRC and must fail the open.
+    let err = match Database::open(&dsn) {
+        Err(e) => e,
+        Ok(_) => panic!("corrupt manifest must fail the open"),
+    };
+    assert!(err.to_string().contains("manifest"), "got: {}", err);
 }
 
 #[test]
@@ -4176,12 +4157,13 @@ fn test_manifest_truncated() {
         }
     }
 
-    // Database should open without crashing
-    let db = Database::open(&dsn).unwrap();
-    let result: Result<i64, _> = db.query_one("SELECT COUNT(*) FROM meta_trunc", ());
-    if let Ok(count) = result {
-        assert!(count >= 0, "Should have non-negative count");
-    }
+    // A truncated manifest must fail the open (a partially visible catalog
+    // exposes intact .vol files to the orphan reaper).
+    let err = match Database::open(&dsn) {
+        Err(e) => e,
+        Ok(_) => panic!("truncated manifest must fail the open"),
+    };
+    assert!(err.to_string().contains("manifest"), "got: {}", err);
 }
 
 // ---------------------------------------------------------------------------
