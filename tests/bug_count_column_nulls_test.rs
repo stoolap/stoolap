@@ -69,6 +69,73 @@ fn test_count_column_in_having() {
 }
 
 #[test]
+fn test_having_count_star_binds_to_count_star() {
+    let db = setup_db("having_star");
+    // Both groups have 2 rows, so HAVING COUNT(*) > 1 must keep both,
+    // even though the SELECT-list COUNT(c) values are 1 and 0.
+    let rows = db
+        .query(
+            "SELECT g, COUNT(c) FROM t GROUP BY g HAVING COUNT(*) > 1",
+            (),
+        )
+        .unwrap();
+    let mut counts = std::collections::HashMap::new();
+    for r in rows {
+        let r = r.unwrap();
+        counts.insert(r.get::<i64>(0).unwrap(), r.get::<i64>(1).unwrap());
+    }
+    assert_eq!(counts.len(), 2, "HAVING COUNT(*) must not read COUNT(c)");
+    assert_eq!(counts.get(&1), Some(&1));
+    assert_eq!(counts.get(&2), Some(&0));
+}
+
+#[test]
+fn test_count_column_with_index_on_group_column() {
+    // An index on the group column routes into the streaming GROUP BY
+    // path, which previously treated COUNT(col) as COUNT(*).
+    let db = setup_db("indexed_group");
+    db.execute("CREATE INDEX idx_t_g ON t (g)", ()).unwrap();
+    let rows = db
+        .query("SELECT g, COUNT(c) FROM t GROUP BY g", ())
+        .unwrap();
+    let mut counts = std::collections::HashMap::new();
+    for r in rows {
+        let r = r.unwrap();
+        counts.insert(r.get::<i64>(0).unwrap(), r.get::<i64>(1).unwrap());
+    }
+    assert_eq!(counts.get(&1), Some(&1), "COUNT(c) must skip NULLs");
+    assert_eq!(counts.get(&2), Some(&0), "all-NULL group counts 0");
+}
+
+#[test]
+fn test_count_distinct_in_derived_table() {
+    let db = setup_db("distinct_derived");
+    // g=3 gets duplicate values: c in [7, 7, NULL].
+    db.execute("INSERT INTO t (id, g, c) VALUES (5, 3, 7)", ())
+        .unwrap();
+    db.execute("INSERT INTO t (id, g, c) VALUES (6, 3, 7)", ())
+        .unwrap();
+    db.execute("INSERT INTO t (id, g, c) VALUES (7, 3, NULL)", ())
+        .unwrap();
+    let rows = db
+        .query(
+            "SELECT g, COUNT(DISTINCT c) FROM (SELECT g, c FROM t) s GROUP BY g",
+            (),
+        )
+        .unwrap();
+    let mut counts = std::collections::HashMap::new();
+    for r in rows {
+        let r = r.unwrap();
+        counts.insert(r.get::<i64>(0).unwrap(), r.get::<i64>(1).unwrap());
+    }
+    assert_eq!(
+        counts.get(&3),
+        Some(&1),
+        "COUNT(DISTINCT c) must dedup and skip NULLs"
+    );
+}
+
+#[test]
 fn test_count_column_without_group_by() {
     let db = setup_db("plain");
     let mut rows = db.query("SELECT COUNT(c), COUNT(*) FROM t", ()).unwrap();

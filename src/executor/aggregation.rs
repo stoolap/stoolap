@@ -172,16 +172,17 @@ fn try_parse_single_having_condition(
                     if agg.name.to_uppercase() == func_upper && !agg.distinct {
                         // Check if column matches (for non-COUNT(*))
                         let col_matches = if func_upper == "COUNT" {
-                            // COUNT(*) or COUNT(col)
-                            func.arguments.first().is_none_or(|arg| {
-                                matches!(arg, Expression::Star(_))
-                                    || match arg {
-                                        Expression::Identifier(id) => {
-                                            id.value_lower == agg.column_lower
-                                        }
-                                        _ => false,
-                                    }
-                            })
+                            // COUNT(*) must bind to a COUNT(*) aggregate;
+                            // matching any COUNT would read a COUNT(col)
+                            // slot, which no longer counts NULL rows.
+                            match func.arguments.first() {
+                                None => agg.column == "*",
+                                Some(Expression::Star(_)) => agg.column == "*",
+                                Some(Expression::Identifier(id)) => {
+                                    id.value_lower == agg.column_lower
+                                }
+                                Some(_) => false,
+                            }
                         } else {
                             // SUM, AVG, etc. - check column
                             func.arguments.first().is_some_and(|arg| match arg {
@@ -5938,11 +5939,13 @@ impl Executor {
         let simple_aggs: Vec<Option<SimpleAgg>> = aggregations
             .iter()
             .map(|agg| {
-                // Must not have DISTINCT (except COUNT), FILTER, ORDER BY, or expression
+                // Must not have DISTINCT, FILTER, ORDER BY, or expression.
+                // This path has no dedup state, so even COUNT(DISTINCT)
+                // cannot stream here.
                 if agg.filter.is_some() || !agg.order_by.is_empty() || agg.expression.is_some() {
                     return None;
                 }
-                if agg.distinct && agg.name != "COUNT" {
+                if agg.distinct {
                     return None;
                 }
 

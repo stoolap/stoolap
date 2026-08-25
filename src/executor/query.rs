@@ -9306,6 +9306,18 @@ impl Executor {
         if aggregations.is_empty() {
             return Ok(None);
         }
+        // The extraction drops DISTINCT flags and this path has no dedup
+        // state, so bail on any DISTINCT aggregate.
+        let has_distinct = stmt.columns.iter().any(|c| match c {
+            Expression::FunctionCall(fc) => fc.is_distinct,
+            Expression::Aliased(a) => {
+                matches!(a.expression.as_ref(), Expression::FunctionCall(fc) if fc.is_distinct)
+            }
+            _ => false,
+        });
+        if has_distinct {
+            return Ok(None);
+        }
 
         // Check for simple aggregates (SUM, COUNT, AVG, MIN, MAX)
         #[derive(Clone, Copy)]
@@ -9320,7 +9332,10 @@ impl Executor {
         let mut simple_aggs: Vec<StreamingAgg> = Vec::with_capacity(aggregations.len());
         for (func_name, col_name, _alias) in &aggregations {
             match func_name.as_str() {
-                "COUNT" => simple_aggs.push(StreamingAgg::Count),
+                // Only COUNT(*) counts rows; COUNT(col) must skip NULLs,
+                // which this streaming path cannot do.
+                "COUNT" if col_name == "*" => simple_aggs.push(StreamingAgg::Count),
+                "COUNT" => return Ok(None),
                 "SUM" | "AVG" | "MIN" | "MAX" => {
                     // Find the column index for aggregate argument
                     let col_idx = all_columns

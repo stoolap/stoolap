@@ -1127,6 +1127,12 @@ fn check_in_subsumption(cached: &Expression, new: &Expression) -> Option<Subsump
         _ => return None,
     };
 
+    // NOT IN inverts the set relationship entirely; never subsume across
+    // (or between) negated lists here.
+    if cached_in.not || new_in.not {
+        return None;
+    }
+
     // Must be same column
     if !expressions_equivalent(&cached_in.left, &new_in.left) {
         return None;
@@ -1142,7 +1148,12 @@ fn check_in_subsumption(cached: &Expression, new: &Expression) -> Option<Subsump
         .all(|nv| cached_values.iter().any(|cv| values_equal(cv, nv)));
 
     if is_subset {
-        if new_values.len() == cached_values.len() {
+        // Identity needs mutual subset-ness; comparing lengths would call
+        // IN (1,1) identical to IN (1,2).
+        let is_superset = cached_values
+            .iter()
+            .all(|cv| new_values.iter().any(|nv| values_equal(cv, nv)));
+        if is_superset {
             Some(SubsumptionResult::Identical)
         } else {
             Some(SubsumptionResult::Subsumed {
@@ -1328,6 +1339,45 @@ mod tests {
         match check_subsumption(Some(&cached), Some(&new)) {
             SubsumptionResult::NoSubsumption => {}
             other => panic!("cached a<100 must not answer a<=100, got {:?}", other),
+        }
+    }
+
+    fn make_not_in(col: &str, values: Vec<i64>) -> Expression {
+        Expression::In(InExpression {
+            token: make_token(),
+            left: Box::new(make_identifier(col)),
+            right: Box::new(Expression::List(Box::new(ListExpression {
+                token: make_token(),
+                elements: values.into_iter().map(make_int_literal).collect(),
+            }))),
+            not: true,
+        })
+    }
+
+    #[test]
+    fn test_not_in_never_subsumes_in() {
+        let cached = make_in("x", vec![1, 2, 3]);
+        let new = make_not_in("x", vec![1, 2]);
+        match check_subsumption(Some(&cached), Some(&new)) {
+            SubsumptionResult::NoSubsumption => {}
+            other => panic!("IN cache must not answer NOT IN, got {:?}", other),
+        }
+        let cached = make_not_in("x", vec![1, 2]);
+        let new = make_in("x", vec![1, 2]);
+        match check_subsumption(Some(&cached), Some(&new)) {
+            SubsumptionResult::NoSubsumption => {}
+            other => panic!("NOT IN cache must not answer IN, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_duplicate_in_elements_not_identical() {
+        // x IN (1,1) is a subset of x IN (1,2) but not identical to it.
+        let cached = make_in("x", vec![1, 2]);
+        let new = make_in("x", vec![1, 1]);
+        match check_subsumption(Some(&cached), Some(&new)) {
+            SubsumptionResult::Subsumed { .. } => {}
+            other => panic!("expected Subsumed (not Identical), got {:?}", other),
         }
     }
 

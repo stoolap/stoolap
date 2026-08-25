@@ -325,7 +325,9 @@ impl Operator for MergeJoinOperator {
                 // Left exhausted - handle remaining right for RIGHT/FULL OUTER
                 if is_right_outer && !self.returning_unmatched_right {
                     self.returning_unmatched_right = true;
-                    self.unmatched_right_idx = self.right_idx;
+                    // Scan from 0: rows skipped by the Ordering::Greater arm
+                    // sit below right_idx and were never marked matched.
+                    self.unmatched_right_idx = 0;
                     return self.next();
                 }
                 return Ok(None);
@@ -502,6 +504,26 @@ mod tests {
             .collect();
         let schema = cols.into_iter().map(ColumnInfo::new).collect();
         Box::new(MaterializedOperator::new(rows, schema))
+    }
+
+    #[test]
+    fn test_full_outer_emits_right_rows_skipped_before_match() {
+        // right id=2 is passed over via Ordering::Greater before the id=3
+        // match; the unmatched-right phase must still emit it.
+        let left = make_operator(vec![vec![3, 30]], vec!["id", "value"]);
+        let right = make_operator(vec![vec![2, 200], vec![3, 300]], vec!["id", "data"]);
+        let mut join = MergeJoinOperator::new(left, right, JoinType::Full, vec![0], vec![0]);
+        let results = collect_results(&mut join).unwrap();
+        assert_eq!(results.len(), 2, "id=3 match plus unmatched right id=2");
+    }
+
+    #[test]
+    fn test_right_outer_emits_right_rows_skipped_before_match() {
+        let left = make_operator(vec![vec![3, 30]], vec!["id", "value"]);
+        let right = make_operator(vec![vec![2, 200], vec![3, 300]], vec!["id", "data"]);
+        let mut join = MergeJoinOperator::new(left, right, JoinType::Right, vec![0], vec![0]);
+        let results = collect_results(&mut join).unwrap();
+        assert_eq!(results.len(), 2, "id=3 match plus unmatched right id=2");
     }
 
     #[test]
