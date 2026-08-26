@@ -55,7 +55,7 @@ const PROGRAM_CACHE_SIZE: usize = 256;
 
 /// Global cache for compiled programs using O(1) LRU eviction.
 /// Uses parking_lot::Mutex for efficient locking.
-static PROGRAM_CACHE: Mutex<Option<LruCache<u64, SharedProgram>>> = Mutex::new(None);
+static PROGRAM_CACHE: Mutex<Option<LruCache<(u64, u64), SharedProgram>>> = Mutex::new(None);
 
 /// Clear the program cache. Call on database drop to release memory.
 pub fn clear_program_cache() {
@@ -65,14 +65,31 @@ pub fn clear_program_cache() {
 
 /// Compute cache key from expression and columns using efficient recursive hashing.
 /// This avoids the overhead of Debug formatting by directly hashing expression structure.
-/// Uses FxHasher which is 2-5x faster than SipHash for small keys.
-fn compute_cache_key(expr: &Expression, columns: &[String]) -> u64 {
-    let mut hasher = FxHasher::default();
-    // Use efficient recursive hashing (same as CompiledEvaluator::hash_expression)
-    hash_expression(expr, &mut hasher);
-    // Hash column names
-    columns.hash(&mut hasher);
-    hasher.finish()
+///
+/// The key is a PAIR of hashes from independent algorithms (FxHash and
+/// ahash with fixed seeds). The cache has no equality check on hit, so a
+/// single 64-bit FxHash key would silently execute the wrong compiled
+/// program on a collision; FxHash's weak diffusion makes structured
+/// collisions realistic. A simultaneous collision in both algorithms is
+/// not.
+fn compute_cache_key(expr: &Expression, columns: &[String]) -> (u64, u64) {
+    let mut h1 = FxHasher::default();
+    hash_expression(expr, &mut h1);
+    columns.hash(&mut h1);
+
+    use std::hash::BuildHasher;
+    // Fixed seeds: the key must be stable across calls within the process.
+    let mut h2 = ahash::RandomState::with_seeds(
+        0x9e37_79b9_7f4a_7c15,
+        0xf39c_c060_5ced_c834,
+        0x1082_276b_f3a2_7251,
+        0x8f4c_a136_bef1_39c9,
+    )
+    .build_hasher();
+    hash_expression(expr, &mut h2);
+    columns.hash(&mut h2);
+
+    (h1.finish(), h2.finish())
 }
 
 /// Compute a u64 hash of an expression without string allocation.
@@ -88,7 +105,7 @@ pub fn compute_expression_hash(expr: &Expression) -> u64 {
 
 /// Recursively hash an expression without string allocation.
 /// This is O(expression_size) and avoids Debug formatting overhead.
-fn hash_expression(expr: &Expression, hasher: &mut FxHasher) {
+fn hash_expression<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
     // First hash the discriminant to distinguish variants
     std::mem::discriminant(expr).hash(hasher);
 
@@ -1397,7 +1414,7 @@ pub struct CompiledEvaluator<'a> {
     vm: ExprVM,
 
     /// Local cache: expression hash -> program (fast, no synchronization)
-    local_cache: FxHashMap<u64, SharedProgram>,
+    local_cache: FxHashMap<(u64, u64), SharedProgram>,
 
     /// Current row values for execution (owned copy for safety)
     current_row: Option<Row>,
@@ -1673,14 +1690,27 @@ impl<'a> CompiledEvaluator<'a> {
     /// Fast recursive hash that avoids string allocation.
     /// Uses FxHasher which is 2-5x faster than SipHash for small keys.
     #[inline]
-    fn expr_hash(&self, expr: &Expression) -> u64 {
-        let mut hasher = FxHasher::default();
-        Self::hash_expression(expr, &mut hasher);
-        hasher.finish()
+    fn expr_hash(&self, expr: &Expression) -> (u64, u64) {
+        // Two independent algorithms; see compute_cache_key for why a
+        // single unverified 64-bit key is not collision-safe.
+        let mut h1 = FxHasher::default();
+        Self::hash_expression(expr, &mut h1);
+
+        use std::hash::BuildHasher;
+        let mut h2 = ahash::RandomState::with_seeds(
+            0x9e37_79b9_7f4a_7c15,
+            0xf39c_c060_5ced_c834,
+            0x1082_276b_f3a2_7251,
+            0x8f4c_a136_bef1_39c9,
+        )
+        .build_hasher();
+        Self::hash_expression(expr, &mut h2);
+
+        (h1.finish(), h2.finish())
     }
 
     /// Recursively hash an expression without string allocation
-    fn hash_expression(expr: &Expression, hasher: &mut FxHasher) {
+    fn hash_expression<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
         // First hash the discriminant to distinguish variants
         std::mem::discriminant(expr).hash(hasher);
 
@@ -2063,6 +2093,37 @@ mod tests {
             token: dummy_token(),
             value,
         })
+    }
+
+    fn make_gt(col: &str, val: i64) -> Expression {
+        Expression::Infix(InfixExpression {
+            token: dummy_token(),
+            left: Box::new(make_identifier(col)),
+            operator: ">".into(),
+            op_type: InfixOperator::GreaterThan,
+            right: Box::new(make_int_literal(val)),
+        })
+    }
+
+    #[test]
+    fn test_cache_key_pair_stable_and_discriminating() {
+        let cols = vec!["a".to_string()];
+        let e1 = make_gt("a", 1);
+        let e2 = make_gt("a", 2);
+
+        // Stable across calls (fixed seeds).
+        assert_eq!(compute_cache_key(&e1, &cols), compute_cache_key(&e1, &cols));
+
+        // Different expressions and different column sets change BOTH
+        // components, so a single-algorithm collision cannot alias entries.
+        let k1 = compute_cache_key(&e1, &cols);
+        let k2 = compute_cache_key(&e2, &cols);
+        assert_ne!(k1, k2);
+        assert_ne!(k1.0, k2.0);
+        assert_ne!(k1.1, k2.1);
+
+        let k3 = compute_cache_key(&e1, &["b".to_string()]);
+        assert_ne!(k1, k3);
     }
 
     fn make_infix(left: Expression, op: InfixOperator, right: Expression) -> Expression {
