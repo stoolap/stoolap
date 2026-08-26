@@ -1540,12 +1540,15 @@ impl WALManager {
                 *wal_file = Some(new_file);
                 *current_filename = new_filename.clone();
 
+                // Reset position counters inside the same critical section:
+                // a commit interleaving between the swap and a late reset
+                // could write+fsync to the new file and then have its
+                // durable floor zeroed underneath it.
+                self.current_file_position.store(0, Ordering::Release);
+                self.synced_position.store(0, Ordering::Release);
+
                 old_filename
             };
-
-            // Reset file position counters (fresh file, nothing synced yet)
-            self.current_file_position.store(0, Ordering::Release);
-            self.synced_position.store(0, Ordering::Release);
 
             // Update checkpoint with new WAL file reference and previous WAL
             // IMPORTANT: Preserve existing checkpoint LSN (which represents snapshot point)
@@ -2280,6 +2283,15 @@ impl WALManager {
         let mut wal_file_guard = self.wal_file.lock().unwrap();
         let mut current_wal_name = self.current_wal_file.lock().unwrap();
 
+        // Re-check under the lock: a concurrent flush may have poisoned
+        // the WAL while we waited, and draining its stale buffer below
+        // would re-write a failed transaction's bytes.
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "WAL is poisoned after a write failure; reopen the database",
+            ));
+        }
+
         // Verify we're still running and have a file
         if !self.running.load(Ordering::Acquire) || wal_file_guard.is_none() {
             return Err(Error::internal(
@@ -2307,24 +2319,32 @@ impl WALManager {
             }
         }
 
-        // First, flush any pending data to make sure everything is on disk
+        // First, flush any pending data to make sure everything is on disk.
+        // Same invariant as flush_and_maybe_sync: a failed write must not
+        // drop the bytes (a later commit marker would then ack an
+        // incomplete transaction) - it poisons and truncates instead.
         {
             let mut buffer = self.buffer.lock().unwrap();
             if !buffer.is_empty() {
-                let buffer_data = std::mem::take(&mut *buffer);
-                if let Some(file) = wal_file_guard.as_mut() {
-                    file.write_all(&buffer_data).map_err(|e| {
+                let write_result = match wal_file_guard.as_mut() {
+                    Some(file) => file.write_all(&buffer).map_err(|e| {
                         Error::internal(format!("failed to flush buffer during truncation: {}", e))
-                    })?;
+                    }),
+                    None => Err(Error::WalFileClosed),
+                };
+                if let Err(e) = write_result {
+                    return Err(self.poison_and_truncate(&mut wal_file_guard, e));
                 }
+                self.current_file_position
+                    .fetch_add(buffer.len() as u64, Ordering::Relaxed);
+                buffer.clear();
             }
         }
 
-        // Sync file to ensure all data is persisted
-        if let Some(file) = wal_file_guard.as_ref() {
-            file.sync_all().map_err(|e| {
-                Error::internal(format!("failed to sync WAL during truncation: {}", e))
-            })?;
+        // Sync file to ensure all data is persisted (advances the durable
+        // floor; poisons on failure like any commit-path sync).
+        if let Err(e) = self.sync_with_file(&wal_file_guard) {
+            return Err(self.poison_and_truncate(&mut wal_file_guard, e));
         }
 
         // Create a new file for the truncated WAL with LSN-based naming
