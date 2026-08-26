@@ -872,6 +872,59 @@ impl SegmentedTable {
     /// Find a row in segments by row_id. Returns (volume, local_offset) if found
     /// and not tombstoned or hot-shadowed. Uses manifest min/max for fast segment
     /// identification, then binary search within the segment.
+    /// Statement-scoped variant of find_segment_row over a pre-verified
+    /// warm snapshot (see segments_snapshot): never needs a reload, so a
+    /// DML statement that already mutated the hot buffer cannot fail
+    /// mid-statement on cold-volume access. Segments compacted away after
+    /// the snapshot are simply found in the snapshot's older volumes,
+    /// which is exactly the statement's view of the data.
+    fn find_segment_row_in(
+        &self,
+        segs: &FxHashMap<u64, super::manifest::ColdSegment>,
+        row_id: i64,
+    ) -> Option<(u64, Arc<FrozenVolume>, usize)> {
+        if self.hot.has_row_id(row_id) {
+            return None;
+        }
+        {
+            let ts = self.segment_mgr.tombstone_set_arc();
+            if self.is_row_tombstoned(&ts, row_id) {
+                return None;
+            }
+        }
+        if self.segment_mgr.is_pending_tombstone(self.txn_id(), row_id) {
+            return None;
+        }
+        let seg_ids: Vec<u64> = {
+            let manifest = self.segment_mgr.manifest();
+            manifest
+                .segments
+                .iter()
+                .rev()
+                .map(|m| m.segment_id)
+                .collect()
+        };
+        for &seg_id in &seg_ids {
+            let Some(cold) = segs.get(&seg_id) else {
+                continue;
+            };
+            let vol = &cold.volume;
+            if vol.meta.row_ids.is_empty() {
+                continue;
+            }
+            let min_id = vol.meta.row_ids[0];
+            let max_id = vol.meta.row_ids[vol.meta.row_count - 1];
+            if row_id < min_id || row_id > max_id {
+                continue;
+            }
+            if let Ok(idx) = vol.meta.row_ids.binary_search(&row_id) {
+                vol.mark_accessed();
+                return Some((seg_id, Arc::clone(vol), idx));
+            }
+        }
+        None
+    }
+
     fn find_segment_row(&self, row_id: i64) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
         // Hot buffer shadows cold: if the row exists in hot, the cold copy is stale
         if self.hot.has_row_id(row_id) {
@@ -1147,17 +1200,24 @@ impl Table for SegmentedTable {
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
-        // Fail on unreloadable cold volumes BEFORE mutating the hot buffer,
-        // so a reload error cannot leave a partially applied statement in
-        // the open transaction.
-        if self.segment_mgr.has_segments() {
-            self.segment_mgr.preflight_cold_access()?;
-        }
+        // Capture a verified all-warm segment snapshot BEFORE mutating the
+        // hot buffer and use it for the entire statement: eviction CoWs
+        // new maps and new volume Arcs, so this snapshot's volumes keep
+        // their column data for the statement's duration and no
+        // mid-statement reload (or reload failure) is possible.
+        let cold_snapshot = if self.segment_mgr.has_segments() {
+            Some(self.segment_mgr.segments_snapshot()?)
+        } else {
+            None
+        };
         let mut count = self.hot.update(where_expr, setter)?;
 
-        // Update matching segment rows.
-        // Lazy: prune on zone maps/bloom filters first, load cold on demand.
-        let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
+        // Update matching segment rows from the statement snapshot
+        // (zone-map pruning still applies; volumes are already warm).
+        let volumes = match &cold_snapshot {
+            Some(segs) => self.segment_mgr.volumes_newest_first_from_snapshot(segs),
+            None => Vec::new(),
+        };
         let has_int_pk = self
             .hot
             .schema()
@@ -1275,12 +1335,16 @@ impl Table for SegmentedTable {
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
-        // Fail on unreloadable cold volumes BEFORE mutating the hot buffer,
-        // so a reload error cannot leave a partially applied statement in
-        // the open transaction.
-        if self.segment_mgr.has_segments() {
-            self.segment_mgr.preflight_cold_access()?;
-        }
+        // Capture a verified all-warm segment snapshot BEFORE mutating the
+        // hot buffer and use it for the entire statement: eviction CoWs
+        // new maps and new volume Arcs, so this snapshot's volumes keep
+        // their column data for the statement's duration and no
+        // mid-statement reload (or reload failure) is possible.
+        let cold_snapshot = if self.segment_mgr.has_segments() {
+            Some(self.segment_mgr.segments_snapshot()?)
+        } else {
+            None
+        };
         let mut count = 0i32;
         let mut hot_ids = Vec::new();
         let schema = self.hot.schema().clone();
@@ -1294,7 +1358,11 @@ impl Table for SegmentedTable {
             super::writer::ColumnMapping,
         )> = None;
         for &row_id in row_ids {
-            if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
+            let found = match &cold_snapshot {
+                Some(segs) => self.find_segment_row_in(segs, row_id),
+                None => None,
+            };
+            if let Some((seg_id, vol, idx)) = found {
                 let vol_ptr = &*vol as *const super::writer::FrozenVolume;
                 let mapping = match &cached_mapping {
                     Some((ptr, m)) if *ptr == vol_ptr => m,
@@ -1363,12 +1431,16 @@ impl Table for SegmentedTable {
 
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
-        // Fail on unreloadable cold volumes BEFORE mutating the hot buffer,
-        // so a reload error cannot leave a partially applied statement in
-        // the open transaction.
-        if self.segment_mgr.has_segments() {
-            self.segment_mgr.preflight_cold_access()?;
-        }
+        // Capture a verified all-warm segment snapshot BEFORE mutating the
+        // hot buffer and use it for the entire statement: eviction CoWs
+        // new maps and new volume Arcs, so this snapshot's volumes keep
+        // their column data for the statement's duration and no
+        // mid-statement reload (or reload failure) is possible.
+        let cold_snapshot = if self.segment_mgr.has_segments() {
+            Some(self.segment_mgr.segments_snapshot()?)
+        } else {
+            None
+        };
         let mut count = 0i32;
         let mut hot_ids = Vec::new();
         let has_int_pk = self
@@ -1379,7 +1451,11 @@ impl Table for SegmentedTable {
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
 
         for &row_id in row_ids {
-            if let Some((_seg_id, _vol, _idx)) = self.find_segment_row(row_id)? {
+            let found = match &cold_snapshot {
+                Some(segs) => self.find_segment_row_in(segs, row_id),
+                None => None,
+            };
+            if let Some((_seg_id, _vol, _idx)) = found {
                 // Claim the cold row to prevent concurrent lost deletes.
                 self.hot.try_claim_row(row_id)?;
                 if has_int_pk {
@@ -1440,12 +1516,16 @@ impl Table for SegmentedTable {
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
-        // Fail on unreloadable cold volumes BEFORE mutating the hot buffer,
-        // so a reload error cannot leave a partially applied statement in
-        // the open transaction.
-        if self.segment_mgr.has_segments() {
-            self.segment_mgr.preflight_cold_access()?;
-        }
+        // Capture a verified all-warm segment snapshot BEFORE mutating the
+        // hot buffer and use it for the entire statement: eviction CoWs
+        // new maps and new volume Arcs, so this snapshot's volumes keep
+        // their column data for the statement's duration and no
+        // mid-statement reload (or reload failure) is possible.
+        let cold_snapshot = if self.segment_mgr.has_segments() {
+            Some(self.segment_mgr.segments_snapshot()?)
+        } else {
+            None
+        };
         let mut count = self.hot.delete(where_expr)?;
         let has_int_pk = self
             .hot
@@ -1457,7 +1537,10 @@ impl Table for SegmentedTable {
         // Build hot_skip from hot row_ids + pending tombstones.
         // Committed tombstones are kept as a shared Arc (no clone).
         // Lazy: prune on zone maps/bloom filters first, load cold on demand.
-        let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
+        let volumes = match &cold_snapshot {
+            Some(segs) => self.segment_mgr.volumes_newest_first_from_snapshot(segs),
+            None => Vec::new(),
+        };
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());

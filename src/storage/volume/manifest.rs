@@ -815,6 +815,28 @@ impl SegmentManager {
         Arc::new(result)
     }
 
+    /// Build the newest-first volume list from a pre-verified snapshot
+    /// (see `segments_snapshot`). DML statements capture one snapshot up
+    /// front and iterate it throughout: eviction copy-on-writes new maps
+    /// and new volume Arcs, so the snapshot's volumes keep their column
+    /// data for the whole statement and no mid-statement reload can ever
+    /// be needed.
+    pub fn volumes_newest_first_from_snapshot(
+        &self,
+        segs: &FxHashMap<u64, ColdSegment>,
+    ) -> Vec<(u64, ColdSegment)> {
+        let seg_ids: Vec<u64> = {
+            let manifest = self.manifest.read();
+            manifest.segments.iter().map(|m| m.segment_id).collect()
+        };
+        let mut result: Vec<(u64, ColdSegment)> = seg_ids
+            .iter()
+            .filter_map(|&id| segs.get(&id).map(|cs| (id, cs.clone())))
+            .collect();
+        result.reverse();
+        result
+    }
+
     /// Check if there are any segments. O(1) atomic read, no lock.
     pub fn has_segments(&self) -> bool {
         self.has_segments_flag
@@ -2492,34 +2514,6 @@ impl SegmentManager {
     /// Reloads cold volumes first so column data is available.
     /// Does NOT mark volumes as accessed — callers that need eviction
     /// protection should mark the specific volumes they use.
-    /// Verify every cold segment can be served before a caller starts
-    /// mutating state. DML paths mutate the hot buffer first and only
-    /// then touch cold volumes; erroring mid-statement would leave the
-    /// open transaction with a partially applied statement. Preflighting
-    /// moves the (persistent) reload failure ahead of the first mutation.
-    /// A volume evicted between preflight and iteration can still fail
-    /// there, but that needs eviction AND a fresh I/O failure inside one
-    /// statement window.
-    pub fn preflight_cold_access(&self) -> crate::core::Result<()> {
-        self.ensure_columns();
-        let segs = self.segments.read();
-        let cold: Vec<u64> = segs
-            .iter()
-            .filter(|(_, cs)| cs.volume.is_cold())
-            .map(|(&id, _)| id)
-            .collect();
-        if !cold.is_empty() {
-            return Err(crate::core::Error::Internal {
-                message: format!(
-                    "table '{}': cold volume reload failed for segment(s) {:?}; \
-                     refusing to serve partial data",
-                    self.table_name, cold
-                ),
-            });
-        }
-        Ok(())
-    }
-
     pub fn segments_snapshot(&self) -> crate::core::Result<Arc<FxHashMap<u64, ColdSegment>>> {
         self.ensure_columns();
         let segs = Arc::clone(&*self.segments.read());
@@ -3259,8 +3253,8 @@ mod tests {
         );
         assert!(mgr.get_cold_row(50).is_err(), "get_cold_row must fail");
         assert!(
-            mgr.preflight_cold_access().is_err(),
-            "DML preflight must fail before any mutation"
+            mgr.segments_snapshot().is_err(),
+            "the DML statement snapshot must fail before any mutation"
         );
     }
 }
