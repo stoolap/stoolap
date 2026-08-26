@@ -978,6 +978,10 @@ pub struct WALManager {
     sync_interval: i64,
     /// Current file position (for rotation check)
     current_file_position: AtomicU64,
+    /// Byte offset up to which the current WAL file is known fsynced.
+    /// On poison the file is truncated back to this durable floor, so
+    /// unsynced markers of failed commits can never persist.
+    synced_position: AtomicU64,
     /// WAL file sequence number (for rotation)
     wal_sequence: AtomicU64,
     /// Count of in-flight writes (entries taken from buffer but not yet written to disk)
@@ -1231,6 +1235,7 @@ impl WALManager {
             commit_batch_size,
             sync_interval,
             current_file_position: AtomicU64::new(initial_file_position),
+            synced_position: AtomicU64::new(initial_file_position),
             wal_sequence: AtomicU64::new(initial_sequence),
             in_flight_writes: AtomicU64::new(0),
         })
@@ -1313,7 +1318,12 @@ impl WALManager {
         };
 
         if do_flush {
-            self.flush_and_maybe_sync(self.should_sync(entry.operation))?;
+            // A DDL transaction's commit marker must sync like the DDL
+            // entry itself: "schema changes must be durable" is void if a
+            // crash inside the sync interval discards the unsynced marker.
+            let ddl_commit = entry.operation.is_transaction_end()
+                && entry.txn_id == crate::storage::mvcc::persistence::DDL_TXN_ID;
+            self.flush_and_maybe_sync(self.should_sync(entry.operation) || ddl_commit)?;
         }
 
         // Track that we wrote encoded_len bytes (even if buffered)
@@ -1333,19 +1343,28 @@ impl WALManager {
     /// commit markers of transactions already reported as failed (recovery
     /// would resurrect them), and re-writing after a partial `write_all`
     /// would corrupt the entry stream. The partial suffix is best-effort
-    /// truncated away; afterwards every append/flush fails until the
-    /// database is reopened.
+    /// truncated back to the last fsynced offset (see
+    /// `poison_and_truncate`); afterwards every append/flush fails until
+    /// the database is reopened.
     fn flush_and_maybe_sync(&self, sync: bool) -> Result<()> {
+        // Fast-path check; the authoritative one is under the lock below.
         if self.poisoned.load(Ordering::Acquire) {
             return Err(Error::internal(
                 "WAL is poisoned after a write failure; reopen the database",
             ));
         }
         let mut wal_file = self.wal_file.lock().unwrap();
+        // Re-check under the lock: a concurrent flush may have poisoned
+        // (and truncated) while we waited, and writing the shared buffer
+        // now would re-write a failed transaction's marker.
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "WAL is poisoned after a write failure; reopen the database",
+            ));
+        }
         {
             let mut buffer = self.buffer.lock().unwrap();
             if !buffer.is_empty() {
-                let pos_before = self.current_file_position.load(Ordering::Relaxed);
                 // Signal checkpoint coordination for the duration of the write.
                 self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
                 let write_result = (|| {
@@ -1364,16 +1383,7 @@ impl WALManager {
                 })();
                 self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
                 if let Err(e) = write_result {
-                    self.poisoned.store(true, Ordering::Release);
-                    // Strip whatever partial suffix reached the fd so a
-                    // fully-written marker of a failed transaction cannot
-                    // survive to recovery. Best-effort: on failure the
-                    // torn-tail recovery scan is the fallback.
-                    if let Some(file) = wal_file.as_mut() {
-                        let _ = file.set_len(pos_before);
-                        let _ = file.sync_all();
-                    }
-                    return Err(e);
+                    return Err(self.poison_and_truncate(&mut wal_file, e));
                 }
 
                 self.current_file_position
@@ -1386,14 +1396,31 @@ impl WALManager {
 
         if sync {
             if let Err(e) = self.sync_with_file(&wal_file) {
-                // A failed fsync leaves the written marker's durability
-                // unknowable; poison rather than let a later sync falsely
-                // succeed over it.
-                self.poisoned.store(true, Ordering::Release);
-                return Err(e);
+                // A failed fsync leaves already-written bytes in an
+                // unknowable durability state, and even without another
+                // sync the kernel would eventually write them back.
+                return Err(self.poison_and_truncate(&mut wal_file, e));
             }
         }
         Ok(())
+    }
+
+    /// Poison the WAL and truncate the file back to the last fsynced
+    /// offset, so no unsynced marker of a failed commit can ever become
+    /// durable (via a later sync or plain kernel writeback). In Full mode
+    /// everything above the floor is unacknowledged by construction; in
+    /// Normal mode it is within the documented sync-interval loss window.
+    /// Truncation is best-effort: if it fails too, the torn-tail recovery
+    /// scan is the fallback.
+    fn poison_and_truncate(&self, wal_file: &mut Option<File>, e: Error) -> Error {
+        self.poisoned.store(true, Ordering::Release);
+        let floor = self.synced_position.load(Ordering::Acquire);
+        if let Some(file) = wal_file.as_mut() {
+            let _ = file.set_len(floor);
+            let _ = file.sync_all();
+        }
+        self.current_file_position.store(floor, Ordering::Release);
+        e
     }
 
     /// Get previous LSN (last written entry's LSN)
@@ -1434,6 +1461,13 @@ impl WALManager {
             file.sync_all()
                 .map_err(|e| Error::internal(format!("failed to sync WAL: {}", e)))?;
         }
+        // Everything written so far is durable; advance the poison
+        // truncation floor. Callers hold the wal_file lock, so the
+        // position is stable here.
+        self.synced_position.store(
+            self.current_file_position.load(Ordering::Relaxed),
+            Ordering::Release,
+        );
 
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1509,8 +1543,9 @@ impl WALManager {
                 old_filename
             };
 
-            // Reset file position counter
+            // Reset file position counters (fresh file, nothing synced yet)
             self.current_file_position.store(0, Ordering::Release);
+            self.synced_position.store(0, Ordering::Release);
 
             // Update checkpoint with new WAL file reference and previous WAL
             // IMPORTANT: Preserve existing checkpoint LSN (which represents snapshot point)
@@ -2092,17 +2127,20 @@ impl WALManager {
             return Ok(()); // Already closed
         }
 
-        // A poisoned WAL must not flush its stale buffer on close; the
-        // remaining shutdown (handle release) still runs.
+        // A poisoned WAL must not flush its stale buffer on close, and it
+        // must not fsync either: the file is already truncated to the
+        // durable floor, and a close-time sync could persist an aborted
+        // commit's marker that was written before the poison. Only the
+        // handle release below still runs.
         if !self.poisoned.load(Ordering::Acquire) {
             // Flush buffer to file (while still running)
             self.flush()?;
-        }
 
-        // Fsync to ensure all WAL data is durable on disk.
-        // Without this, a power failure or kill -9 after close
-        // could lose buffered WAL entries.
-        self.sync_locked()?;
+            // Fsync to ensure all WAL data is durable on disk.
+            // Without this, a power failure or kill -9 after close
+            // could lose buffered WAL entries.
+            self.sync_locked()?;
+        }
 
         // Now mark as not running
         self.running.store(false, Ordering::SeqCst);
@@ -2216,6 +2254,12 @@ impl WALManager {
         // Skip if not running or if up_to_lsn is zero (no valid checkpoint)
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
+        }
+        // A poisoned WAL must not rewrite files or drain its stale buffer.
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "WAL is poisoned after a write failure; reopen the database",
+            ));
         }
 
         if up_to_lsn == 0 {
@@ -2535,9 +2579,11 @@ impl WALManager {
         // Without this, the backward chain would be broken after truncation.
         self.previous_lsn.store(last_copied_lsn, Ordering::Release);
 
-        // Update file position to reflect the new WAL file size
+        // Update file position to reflect the new WAL file size. The new
+        // file was fsynced above, so it is also the durable floor.
         self.current_file_position
             .store(new_file_size, Ordering::Release);
+        self.synced_position.store(new_file_size, Ordering::Release);
 
         Ok(())
     }

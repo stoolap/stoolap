@@ -240,6 +240,37 @@ fn test_wal_sync_fail_returns_error() {
     }
 }
 
+#[test]
+fn test_sync_fail_commit_not_durable_after_close() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let path = format!("file://{}?sync_mode=full", dir.path().display());
+
+    {
+        let db = Database::open(&path).expect("open");
+        db.execute(
+            "CREATE TABLE fp_sync_close (id INTEGER PRIMARY KEY, val TEXT)",
+            (),
+        )
+        .expect("CREATE should succeed");
+        // Arm only the sync failpoint: the commit marker gets WRITTEN to
+        // the fd, then its fsync fails and the commit is aborted.
+        test_failpoints::WAL_SYNC_FAIL.store(true, Ordering::Release);
+        let result = db.execute("INSERT INTO fp_sync_close VALUES (1, 'x')", ());
+        test_failpoints::WAL_SYNC_FAIL.store(false, Ordering::Release);
+        assert!(result.is_err(), "commit must fail when its fsync fails");
+        let _ = db.close();
+    }
+
+    // Neither close() nor kernel writeback may persist the aborted
+    // commit's marker; reopen must not resurrect the row.
+    let db = Database::open(&path).expect("reopen");
+    let count: i64 = db
+        .query_one("SELECT COUNT(*) FROM fp_sync_close", ())
+        .expect("COUNT should work");
+    assert_eq!(count, 0, "aborted commit resurrected after close+reopen");
+}
+
 // ============================================================================
 // Snapshot Write Failpoint Tests
 // ============================================================================
