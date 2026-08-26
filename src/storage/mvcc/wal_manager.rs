@@ -959,6 +959,9 @@ pub struct WALManager {
     sync_mode: SyncMode,
     /// Running flag
     running: AtomicBool,
+    /// Set after a WAL write failure; all further appends/flushes fail.
+    /// See flush_and_maybe_sync for why retrying is never safe.
+    poisoned: AtomicBool,
     /// Pending commits (legacy, kept for API compatibility)
     #[allow(dead_code)]
     pending_commits: AtomicI32,
@@ -1222,6 +1225,7 @@ impl WALManager {
             last_checkpoint: AtomicU64::new(initial_lsn),
             sync_mode,
             running: AtomicBool::new(true),
+            poisoned: AtomicBool::new(false),
             pending_commits: AtomicI32::new(0),
             last_sync_time: AtomicI64::new(now),
             commit_batch_size,
@@ -1266,6 +1270,11 @@ impl WALManager {
     pub fn append_entry(&self, mut entry: WALEntry) -> Result<u64> {
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
+        }
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "WAL is poisoned after a write failure; reopen the database",
+            ));
         }
 
         // Get previous LSN and assign new LSN atomically
@@ -1318,29 +1327,54 @@ impl WALManager {
     /// `wal_file` lock (same `wal_file` -> `buffer` order as `truncate_wal`).
     /// Serializing drains here is what makes a commit sync cover every
     /// byte appended before it: no other thread can be holding drained-but-
-    /// unwritten bytes. On write failure the buffer is left untouched, so
-    /// nothing is lost and the next flush retries.
+    /// unwritten bytes.
+    ///
+    /// A failed write POISONS the WAL: retrying the buffer would re-write
+    /// commit markers of transactions already reported as failed (recovery
+    /// would resurrect them), and re-writing after a partial `write_all`
+    /// would corrupt the entry stream. The partial suffix is best-effort
+    /// truncated away; afterwards every append/flush fails until the
+    /// database is reopened.
     fn flush_and_maybe_sync(&self, sync: bool) -> Result<()> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(Error::internal(
+                "WAL is poisoned after a write failure; reopen the database",
+            ));
+        }
         let mut wal_file = self.wal_file.lock().unwrap();
         {
             let mut buffer = self.buffer.lock().unwrap();
             if !buffer.is_empty() {
-                #[cfg(any(test, feature = "test-failpoints"))]
-                if crate::test_failpoints::WAL_WRITE_FAIL.load(std::sync::atomic::Ordering::Acquire)
-                {
-                    return Err(Error::internal("failpoint: WAL write"));
-                }
-
+                let pos_before = self.current_file_position.load(Ordering::Relaxed);
                 // Signal checkpoint coordination for the duration of the write.
                 self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
-                let write_result = match wal_file.as_mut() {
-                    Some(file) => file
-                        .write_all(&buffer)
-                        .map_err(|e| Error::internal(format!("failed to write to WAL: {}", e))),
-                    None => Err(Error::WalFileClosed),
-                };
+                let write_result = (|| {
+                    #[cfg(any(test, feature = "test-failpoints"))]
+                    if crate::test_failpoints::WAL_WRITE_FAIL
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        return Err(Error::internal("failpoint: WAL write"));
+                    }
+                    match wal_file.as_mut() {
+                        Some(file) => file
+                            .write_all(&buffer)
+                            .map_err(|e| Error::internal(format!("failed to write to WAL: {}", e))),
+                        None => Err(Error::WalFileClosed),
+                    }
+                })();
                 self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
-                write_result?;
+                if let Err(e) = write_result {
+                    self.poisoned.store(true, Ordering::Release);
+                    // Strip whatever partial suffix reached the fd so a
+                    // fully-written marker of a failed transaction cannot
+                    // survive to recovery. Best-effort: on failure the
+                    // torn-tail recovery scan is the fallback.
+                    if let Some(file) = wal_file.as_mut() {
+                        let _ = file.set_len(pos_before);
+                        let _ = file.sync_all();
+                    }
+                    return Err(e);
+                }
 
                 self.current_file_position
                     .fetch_add(buffer.len() as u64, Ordering::Relaxed);
@@ -1351,7 +1385,13 @@ impl WALManager {
         }
 
         if sync {
-            self.sync_with_file(&wal_file)?;
+            if let Err(e) = self.sync_with_file(&wal_file) {
+                // A failed fsync leaves the written marker's durability
+                // unknowable; poison rather than let a later sync falsely
+                // succeed over it.
+                self.poisoned.store(true, Ordering::Release);
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -2052,8 +2092,12 @@ impl WALManager {
             return Ok(()); // Already closed
         }
 
-        // Flush buffer to file (while still running)
-        self.flush()?;
+        // A poisoned WAL must not flush its stale buffer on close; the
+        // remaining shutdown (handle release) still runs.
+        if !self.poisoned.load(Ordering::Acquire) {
+            // Flush buffer to file (while still running)
+            self.flush()?;
+        }
 
         // Fsync to ensure all WAL data is durable on disk.
         // Without this, a power failure or kill -9 after close

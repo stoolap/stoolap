@@ -63,14 +63,26 @@ fn test_wal_write_fail_returns_error() {
     // Disarm
     test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
 
-    // Writes should succeed again (use different id in case id=1 was partially applied)
-    db.execute("INSERT INTO fp_wal VALUES (2, 'after_fail')", ())
-        .expect("INSERT should succeed after disarming failpoint");
+    // The WAL is poisoned: retrying its buffer could re-write the failed
+    // transaction's commit marker and resurrect it at recovery. Writes on
+    // this handle must keep failing until the database is reopened.
+    let result = db.execute("INSERT INTO fp_wal VALUES (2, 'after_fail')", ());
+    assert!(
+        result.is_err(),
+        "writes must fail on a poisoned WAL until reopen"
+    );
 
+    // Reopen: recovery discards the unacknowledged transaction and the
+    // database is usable again.
+    let dsn = format!("file://{}", dir.path().display());
+    let _ = db.close();
+    let db = Database::open(&dsn).expect("reopen after poisoned WAL");
+    db.execute("INSERT INTO fp_wal VALUES (2, 'after_reopen')", ())
+        .expect("INSERT should succeed after reopen");
     let count: i64 = db
         .query_one("SELECT COUNT(*) FROM fp_wal", ())
         .expect("COUNT should work");
-    assert!(count >= 1, "At least one row should exist, got {}", count);
+    assert_eq!(count, 1, "only the post-reopen row exists, got {}", count);
 }
 
 #[test]
@@ -145,9 +157,20 @@ fn test_wal_write_fail_recovery_after_disarm() {
         let _ = db.execute("INSERT INTO fp_wal_rec VALUES (2, 'during_fail')", ());
         test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
 
-        // Should still be usable
-        db.execute("INSERT INTO fp_wal_rec VALUES (3, 'after_fail')", ())
-            .expect("INSERT should succeed after disarming");
+        // Poisoned until reopen: no write may reuse the stale buffer.
+        let result = db.execute("INSERT INTO fp_wal_rec VALUES (3, 'after_fail')", ());
+        assert!(
+            result.is_err(),
+            "writes must fail on a poisoned WAL until reopen"
+        );
+        let _ = db.close();
+    }
+
+    // Reopen after the poisoned handle: writes work again.
+    {
+        let db = Database::open(&path).expect("reopen after poisoned WAL");
+        db.execute("INSERT INTO fp_wal_rec VALUES (3, 'after_reopen')", ())
+            .expect("INSERT should succeed after reopen");
     }
 
     // Reopen and verify consistency
@@ -193,20 +216,28 @@ fn test_wal_sync_fail_returns_error() {
     // Disarm
     test_failpoints::WAL_SYNC_FAIL.store(false, Ordering::Release);
 
-    // Should be usable again
-    let insert_result = db.execute("INSERT INTO fp_sync VALUES (2, 'after')", ());
     if result.is_err() {
-        // If the first insert failed, insert with id=1 too
-        let _ = db.execute("INSERT INTO fp_sync VALUES (1, 'retry')", ());
+        // A failed commit fsync poisons the WAL (the written marker's
+        // durability is unknowable); the handle must fail until reopen.
+        let retry = db.execute("INSERT INTO fp_sync VALUES (2, 'after')", ());
+        assert!(
+            retry.is_err(),
+            "writes must fail on a poisoned WAL until reopen"
+        );
+        let dsn = format!("file://{}", dir.path().display());
+        let _ = db.close();
+        let db = Database::open(&dsn).expect("reopen after poisoned WAL");
+        db.execute("INSERT INTO fp_sync VALUES (2, 'after_reopen')", ())
+            .expect("INSERT should succeed after reopen");
+        let count: i64 = db
+            .query_one("SELECT COUNT(*) FROM fp_sync", ())
+            .expect("COUNT should work after reopen");
+        assert!(count >= 1, "At least one row should exist");
+    } else {
+        // Sync not exercised on this path; the handle stays usable.
+        db.execute("INSERT INTO fp_sync VALUES (2, 'after')", ())
+            .expect("INSERT should succeed");
     }
-
-    // Database should be in a consistent state
-    let count: i64 = db
-        .query_one("SELECT COUNT(*) FROM fp_sync", ())
-        .expect("COUNT should work after sync recovery");
-    assert!(count >= 1, "At least one row should exist");
-
-    drop(insert_result);
 }
 
 // ============================================================================
@@ -450,14 +481,16 @@ fn test_multiple_failpoints_sequential() {
     )
     .expect("CREATE should succeed");
 
-    // Phase 1: WAL write failure
+    // Phase 1: WAL write failure poisons the handle; reopen to continue.
     test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
     let _ = db.execute("INSERT INTO fp_multi VALUES (1, 100)", ());
     test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
+    let _ = db.close();
+    let db = Database::open(&path).expect("reopen after poisoned WAL");
 
     // Phase 2: Normal operation
     db.execute("INSERT INTO fp_multi VALUES (2, 200)", ())
-        .expect("Should succeed after disarming WAL failpoint");
+        .expect("Should succeed after reopen");
 
     // Phase 3: Snapshot failure
     test_failpoints::SNAPSHOT_WRITE_FAIL.store(true, Ordering::Release);
