@@ -582,6 +582,26 @@ fn compute_visibility_bitmaps(
 ///
 /// Thread safety: the manager uses interior mutability via RwLock for
 /// concurrent read access (queries) and exclusive write access (seal, compaction).
+/// Statement-scoped consistent view of cold state (see
+/// `SegmentManager::statement_snapshot`).
+pub struct StatementSnapshot {
+    /// Manifest segment ids, newest first, captured with `segs`.
+    pub seg_ids_newest_first: Vec<u64>,
+    pub segs: Arc<FxHashMap<u64, ColdSegment>>,
+    /// Committed tombstones as of capture.
+    pub tombstones: Arc<FxHashMap<i64, u64>>,
+}
+
+impl StatementSnapshot {
+    /// Newest-first (id, segment) list from the snapshot alone.
+    pub fn volumes_newest_first(&self) -> Vec<(u64, ColdSegment)> {
+        self.seg_ids_newest_first
+            .iter()
+            .filter_map(|&id| self.segs.get(&id).map(|cs| (id, cs.clone())))
+            .collect()
+    }
+}
+
 pub struct SegmentManager {
     /// Table name.
     table_name: SmartString,
@@ -815,26 +835,50 @@ impl SegmentManager {
         Arc::new(result)
     }
 
-    /// Build the newest-first volume list from a pre-verified snapshot
-    /// (see `segments_snapshot`). DML statements capture one snapshot up
-    /// front and iterate it throughout: eviction copy-on-writes new maps
-    /// and new volume Arcs, so the snapshot's volumes keep their column
-    /// data for the whole statement and no mid-statement reload can ever
-    /// be needed.
-    pub fn volumes_newest_first_from_snapshot(
-        &self,
-        segs: &FxHashMap<u64, ColdSegment>,
-    ) -> Vec<(u64, ColdSegment)> {
-        let seg_ids: Vec<u64> = {
+    /// Capture a consistent, statement-scoped view of the cold state:
+    /// newest-first segment ids, the segment map, and the committed
+    /// tombstone set, all under ONE manifest lock hold, with every volume
+    /// verified warm (fail-closed like `segments_snapshot`). DML uses this
+    /// for the whole statement and never re-reads live manager state after
+    /// mutating the hot buffer: eviction and compaction copy-on-write new
+    /// maps/Arcs, so nothing in the snapshot can go cold or disappear.
+    pub fn statement_snapshot(&self) -> crate::core::Result<StatementSnapshot> {
+        let capture = || {
             let manifest = self.manifest.read();
-            manifest.segments.iter().map(|m| m.segment_id).collect()
+            let mut seg_ids_newest_first: Vec<u64> =
+                manifest.segments.iter().map(|m| m.segment_id).collect();
+            seg_ids_newest_first.reverse();
+            let segs = Arc::clone(&*self.segments.read());
+            let tombstones = Arc::clone(&*self.tombstones.read());
+            StatementSnapshot {
+                seg_ids_newest_first,
+                segs,
+                tombstones,
+            }
         };
-        let mut result: Vec<(u64, ColdSegment)> = seg_ids
-            .iter()
-            .filter_map(|&id| segs.get(&id).map(|cs| (id, cs.clone())))
-            .collect();
-        result.reverse();
-        result
+        self.ensure_columns();
+        let mut snap = capture();
+        if snap.segs.values().any(|cs| cs.volume.is_cold()) {
+            // Race with eviction: retry once, then fail closed.
+            self.ensure_columns();
+            snap = capture();
+            let cold: Vec<u64> = snap
+                .segs
+                .iter()
+                .filter(|(_, cs)| cs.volume.is_cold())
+                .map(|(&id, _)| id)
+                .collect();
+            if !cold.is_empty() {
+                return Err(crate::core::Error::Internal {
+                    message: format!(
+                        "table '{}': cold volume reload failed for segment(s) {:?}; \
+                         refusing to serve partial data",
+                        self.table_name, cold
+                    ),
+                });
+            }
+        }
+        Ok(snap)
     }
 
     /// Check if there are any segments. O(1) atomic read, no lock.
@@ -3256,5 +3300,70 @@ mod tests {
             mgr.segments_snapshot().is_err(),
             "the DML statement snapshot must fail before any mutation"
         );
+        assert!(
+            mgr.statement_snapshot().is_err(),
+            "statement_snapshot must fail closed too"
+        );
+    }
+
+    #[test]
+    fn test_statement_snapshot_survives_concurrent_compaction() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+
+        let schema = SchemaBuilder::new("snap_compact")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mgr = SegmentManager::new("snap_compact", None);
+
+        let build_volume = |vals: std::ops::RangeInclusive<i64>| {
+            let mut b = super::super::writer::VolumeBuilder::new(&schema);
+            for i in vals {
+                b.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
+            }
+            Arc::new(b.finish())
+        };
+
+        mgr.register_segment(
+            1,
+            build_volume(1..=10),
+            SegmentMeta {
+                segment_id: 1,
+                file_path: PathBuf::from("s1.vol"),
+                row_count: 10,
+                min_row_id: 1,
+                max_row_id: 10,
+                creation_lsn: 0,
+                seal_seq: 0,
+                schema_version: 0,
+            },
+            None,
+        );
+
+        let snap = mgr.statement_snapshot().unwrap();
+
+        // Background compaction replaces segment 1 with segment 2 while the
+        // statement snapshot is live.
+        mgr.replace_segments_atomic(
+            2,
+            build_volume(1..=10),
+            SegmentMeta {
+                segment_id: 2,
+                file_path: PathBuf::from("s2.vol"),
+                row_count: 10,
+                min_row_id: 1,
+                max_row_id: 10,
+                creation_lsn: 0,
+                seal_seq: 1,
+                schema_version: 0,
+            },
+            &[1],
+        );
+
+        // The snapshot must keep serving ITS view: segment 1, one volume.
+        // (The live-manifest ordering bug returned zero volumes here.)
+        let vols = snap.volumes_newest_first();
+        assert_eq!(vols.len(), 1, "snapshot must not lose its segment");
+        assert_eq!(vols[0].0, 1);
+        assert_eq!(vols[0].1.volume.get_row(0)[0], Value::Integer(1));
     }
 }

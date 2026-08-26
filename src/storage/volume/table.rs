@@ -880,32 +880,22 @@ impl SegmentedTable {
     /// which is exactly the statement's view of the data.
     fn find_segment_row_in(
         &self,
-        segs: &FxHashMap<u64, super::manifest::ColdSegment>,
+        snap: &super::manifest::StatementSnapshot,
         row_id: i64,
-    ) -> Option<(u64, Arc<FrozenVolume>, usize)> {
+    ) -> Option<(u64, super::manifest::ColdSegment, usize)> {
         if self.hot.has_row_id(row_id) {
             return None;
         }
-        {
-            let ts = self.segment_mgr.tombstone_set_arc();
-            if self.is_row_tombstoned(&ts, row_id) {
-                return None;
-            }
+        // Tombstone view from the SAME snapshot; only the pending set is
+        // read live because it is this transaction's own state.
+        if self.is_row_tombstoned(&snap.tombstones, row_id) {
+            return None;
         }
         if self.segment_mgr.is_pending_tombstone(self.txn_id(), row_id) {
             return None;
         }
-        let seg_ids: Vec<u64> = {
-            let manifest = self.segment_mgr.manifest();
-            manifest
-                .segments
-                .iter()
-                .rev()
-                .map(|m| m.segment_id)
-                .collect()
-        };
-        for &seg_id in &seg_ids {
-            let Some(cold) = segs.get(&seg_id) else {
+        for &seg_id in &snap.seg_ids_newest_first {
+            let Some(cold) = snap.segs.get(&seg_id) else {
                 continue;
             };
             let vol = &cold.volume;
@@ -919,7 +909,7 @@ impl SegmentedTable {
             }
             if let Ok(idx) = vol.meta.row_ids.binary_search(&row_id) {
                 vol.mark_accessed();
-                return Some((seg_id, Arc::clone(vol), idx));
+                return Some((seg_id, cold.clone(), idx));
             }
         }
         None
@@ -1206,16 +1196,17 @@ impl Table for SegmentedTable {
         // their column data for the statement's duration and no
         // mid-statement reload (or reload failure) is possible.
         let cold_snapshot = if self.segment_mgr.has_segments() {
-            Some(self.segment_mgr.segments_snapshot()?)
+            Some(self.segment_mgr.statement_snapshot()?)
         } else {
             None
         };
+        let stmt_tombstones = cold_snapshot.as_ref().map(|s| Arc::clone(&s.tombstones));
         let mut count = self.hot.update(where_expr, setter)?;
 
         // Update matching segment rows from the statement snapshot
         // (zone-map pruning still applies; volumes are already warm).
         let volumes = match &cold_snapshot {
-            Some(segs) => self.segment_mgr.volumes_newest_first_from_snapshot(segs),
+            Some(snap) => snap.volumes_newest_first(),
             None => Vec::new(),
         };
         let has_int_pk = self
@@ -1225,13 +1216,14 @@ impl Table for SegmentedTable {
             .iter()
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
 
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+        let tombstones_arc = stmt_tombstones
+            .clone()
+            .unwrap_or_else(|| self.segment_mgr.tombstone_set_arc());
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-        let schema_clone = self.hot.schema().clone();
 
         // Zone-map / bloom pruning from WHERE clause.
         let comparisons = where_expr
@@ -1261,7 +1253,7 @@ impl Table for SegmentedTable {
                 vol
             };
 
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema_clone);
+            let mapping = cs.mapping.clone();
 
             for i in 0..vol.meta.row_count {
                 if !cs.is_visible(i) {
@@ -1341,7 +1333,7 @@ impl Table for SegmentedTable {
         // their column data for the statement's duration and no
         // mid-statement reload (or reload failure) is possible.
         let cold_snapshot = if self.segment_mgr.has_segments() {
-            Some(self.segment_mgr.segments_snapshot()?)
+            Some(self.segment_mgr.statement_snapshot()?)
         } else {
             None
         };
@@ -1359,18 +1351,17 @@ impl Table for SegmentedTable {
         )> = None;
         for &row_id in row_ids {
             let found = match &cold_snapshot {
-                Some(segs) => self.find_segment_row_in(segs, row_id),
+                Some(snap) => self.find_segment_row_in(snap, row_id),
                 None => None,
             };
-            if let Some((seg_id, vol, idx)) = found {
+            if let Some((_seg_id, cs, idx)) = found {
+                let vol = Arc::clone(&cs.volume);
                 let vol_ptr = &*vol as *const super::writer::FrozenVolume;
                 let mapping = match &cached_mapping {
                     Some((ptr, m)) if *ptr == vol_ptr => m,
                     _ => {
-                        cached_mapping = Some((
-                            vol_ptr,
-                            self.segment_mgr.get_volume_mapping(seg_id, &schema),
-                        ));
+                        // Mapping from the SAME snapshot segment.
+                        cached_mapping = Some((vol_ptr, cs.mapping.clone()));
                         &cached_mapping.as_ref().unwrap().1
                     }
                 };
@@ -1437,7 +1428,7 @@ impl Table for SegmentedTable {
         // their column data for the statement's duration and no
         // mid-statement reload (or reload failure) is possible.
         let cold_snapshot = if self.segment_mgr.has_segments() {
-            Some(self.segment_mgr.segments_snapshot()?)
+            Some(self.segment_mgr.statement_snapshot()?)
         } else {
             None
         };
@@ -1452,10 +1443,10 @@ impl Table for SegmentedTable {
 
         for &row_id in row_ids {
             let found = match &cold_snapshot {
-                Some(segs) => self.find_segment_row_in(segs, row_id),
+                Some(snap) => self.find_segment_row_in(snap, row_id),
                 None => None,
             };
-            if let Some((_seg_id, _vol, _idx)) = found {
+            if let Some((_seg_id, _cs, _idx)) = found {
                 // Claim the cold row to prevent concurrent lost deletes.
                 self.hot.try_claim_row(row_id)?;
                 if has_int_pk {
@@ -1522,10 +1513,11 @@ impl Table for SegmentedTable {
         // their column data for the statement's duration and no
         // mid-statement reload (or reload failure) is possible.
         let cold_snapshot = if self.segment_mgr.has_segments() {
-            Some(self.segment_mgr.segments_snapshot()?)
+            Some(self.segment_mgr.statement_snapshot()?)
         } else {
             None
         };
+        let stmt_tombstones = cold_snapshot.as_ref().map(|s| Arc::clone(&s.tombstones));
         let mut count = self.hot.delete(where_expr)?;
         let has_int_pk = self
             .hot
@@ -1538,10 +1530,12 @@ impl Table for SegmentedTable {
         // Committed tombstones are kept as a shared Arc (no clone).
         // Lazy: prune on zone maps/bloom filters first, load cold on demand.
         let volumes = match &cold_snapshot {
-            Some(segs) => self.segment_mgr.volumes_newest_first_from_snapshot(segs),
+            Some(snap) => snap.volumes_newest_first(),
             None => Vec::new(),
         };
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+        let tombstones_arc = stmt_tombstones
+            .clone()
+            .unwrap_or_else(|| self.segment_mgr.tombstone_set_arc());
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
@@ -1605,7 +1599,7 @@ impl Table for SegmentedTable {
                 vol
             };
 
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema_clone);
+            let mapping = cs.mapping.clone();
 
             for i in 0..vol.meta.row_count {
                 if !cs.is_visible(i) {
