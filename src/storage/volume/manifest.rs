@@ -2504,15 +2504,12 @@ impl SegmentManager {
         // Fast path: already loaded (or another thread just loaded it)
         {
             let segs = self.segments.read();
-            if let Some(cs) = segs.get(&seg_id) {
-                if !cs.volume.is_cold() {
-                    cs.volume.mark_accessed();
-                    return Some(Arc::clone(&cs.volume));
-                }
-            } else {
-                // Segment no longer in map (compaction removed it). Caller
-                // should retry with the current manifest.
-                return None;
+            // Missing segment: compaction removed it. Caller should retry
+            // with the current manifest.
+            let cs = segs.get(&seg_id)?;
+            if !cs.volume.is_cold() {
+                cs.volume.mark_accessed();
+                return Some(Arc::clone(&cs.volume));
             }
         }
         // Serialize reloads — prevents concurrent stampede on the same volume.
@@ -2520,19 +2517,13 @@ impl SegmentManager {
         let _guard = self.reloading.lock();
         {
             let segs = self.segments.read();
-            if let Some(cs) = segs.get(&seg_id) {
-                if !cs.volume.is_cold() {
-                    cs.volume.mark_accessed();
-                    return Some(Arc::clone(&cs.volume));
-                }
-            } else {
-                return None;
+            let cs = segs.get(&seg_id)?;
+            if !cs.volume.is_cold() {
+                cs.volume.mark_accessed();
+                return Some(Arc::clone(&cs.volume));
             }
         }
-        let vol_dir = match &self.volume_dir {
-            Some(d) => d,
-            None => return None,
-        };
+        let vol_dir = self.volume_dir.as_ref()?;
         let filename = format!("vol_{:016x}.vol", seg_id);
         let full_path = vol_dir.join(self.table_name.as_str()).join(filename);
         let volume = match crate::storage::volume::io::read_volume_from_disk(&full_path) {
@@ -2548,19 +2539,13 @@ impl SegmentManager {
         volume.mark_accessed();
         let mut segments = self.segments.write();
         let mut new_map = (**segments).clone();
-        // Re-check: segment may have been removed by concurrent compaction
-        // while we were reading from disk.
-        if let Some(cs) = new_map.get_mut(&seg_id) {
-            if !cs.volume.unique_indices.read().is_empty() {
-                *volume.unique_indices.write() =
-                    std::mem::take(&mut *cs.volume.unique_indices.write());
-            }
-            cs.volume = Arc::clone(&volume);
-        } else {
-            // Compaction removed this segment while we were reloading.
-            // The row now lives in a newer compacted volume.
-            return None;
+        // Re-check: concurrent compaction may have removed the segment while
+        // we were reading from disk; the row then lives in a newer volume.
+        let cs = new_map.get_mut(&seg_id)?;
+        if !cs.volume.unique_indices.read().is_empty() {
+            *volume.unique_indices.write() = std::mem::take(&mut *cs.volume.unique_indices.write());
         }
+        cs.volume = Arc::clone(&volume);
         let still_cold = new_map.values().any(|cs| cs.volume.is_cold());
         *segments = Arc::new(new_map);
         if !still_cold {

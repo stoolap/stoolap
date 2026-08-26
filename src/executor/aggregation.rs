@@ -117,11 +117,12 @@ impl SimpleHavingFilter {
 /// Supports COUNT, SUM, AVG, MIN, MAX (no DISTINCT, FILTER, ORDER BY, or expressions)
 #[derive(Clone)]
 enum SimpleAgg {
-    Count,      // COUNT(*) or COUNT(col)
-    Sum(usize), // SUM(col) - stores column index
-    Avg(usize), // AVG(col) - stores column index
-    Min(usize), // MIN(col) - stores column index
-    Max(usize), // MAX(col) - stores column index
+    Count,              // COUNT(*)
+    CountColumn(usize), // COUNT(col) - counts only non-NULL values
+    Sum(usize),         // SUM(col) - stores column index
+    Avg(usize),         // AVG(col) - stores column index
+    Min(usize),         // MIN(col) - stores column index
+    Max(usize),         // MAX(col) - stores column index
 }
 
 /// Try to parse a simple HAVING clause for inline filtering
@@ -171,16 +172,17 @@ fn try_parse_single_having_condition(
                     if agg.name.to_uppercase() == func_upper && !agg.distinct {
                         // Check if column matches (for non-COUNT(*))
                         let col_matches = if func_upper == "COUNT" {
-                            // COUNT(*) or COUNT(col)
-                            func.arguments.first().is_none_or(|arg| {
-                                matches!(arg, Expression::Star(_))
-                                    || match arg {
-                                        Expression::Identifier(id) => {
-                                            id.value_lower == agg.column_lower
-                                        }
-                                        _ => false,
-                                    }
-                            })
+                            // COUNT(*) must bind to a COUNT(*) aggregate;
+                            // matching any COUNT would read a COUNT(col)
+                            // slot, which no longer counts NULL rows.
+                            match func.arguments.first() {
+                                None => agg.column == "*",
+                                Some(Expression::Star(_)) => agg.column == "*",
+                                Some(Expression::Identifier(id)) => {
+                                    id.value_lower == agg.column_lower
+                                }
+                                Some(_) => false,
+                            }
                         } else {
                             // SUM, AVG, etc. - check column
                             func.arguments.first().is_some_and(|arg| match arg {
@@ -2337,7 +2339,14 @@ impl Executor {
                 }
 
                 match agg.name.to_uppercase().as_str() {
-                    "COUNT" => Some(SimpleAgg::Count),
+                    "COUNT" => {
+                        if agg.column == "*" {
+                            Some(SimpleAgg::Count)
+                        } else {
+                            Self::lookup_column_index(&agg.column_lower, col_index_map)
+                                .map(SimpleAgg::CountColumn)
+                        }
+                    }
                     "SUM" => {
                         if agg.column == "*" {
                             None // SUM(*) is not valid
@@ -2524,6 +2533,13 @@ impl Executor {
                     SimpleAgg::Count => {
                         state.counts[i] += 1;
                     }
+                    SimpleAgg::CountColumn(col_idx) => {
+                        if let Some(value) = row.get(*col_idx) {
+                            if !value.is_null() {
+                                state.counts[i] += 1;
+                            }
+                        }
+                    }
                     SimpleAgg::Sum(col_idx) | SimpleAgg::Avg(col_idx) => {
                         if let Some(value) = row.get(*col_idx) {
                             match value {
@@ -2604,7 +2620,9 @@ impl Executor {
                 let mut passes = true;
                 for cond in &filter.conditions {
                     let agg_value = match &simple_aggs[cond.agg_index] {
-                        SimpleAgg::Count => Some(state.counts[cond.agg_index] as f64),
+                        SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
+                            Some(state.counts[cond.agg_index] as f64)
+                        }
                         SimpleAgg::Sum(_) => {
                             if state.agg_has_value[cond.agg_index] {
                                 Some(state.agg_values[cond.agg_index])
@@ -2654,7 +2672,7 @@ impl Executor {
 
             for (i, agg) in simple_aggs.iter().enumerate() {
                 let value = match agg {
-                    SimpleAgg::Count => Value::Integer(state.counts[i]),
+                    SimpleAgg::Count | SimpleAgg::CountColumn(_) => Value::Integer(state.counts[i]),
                     SimpleAgg::Sum(_) => {
                         // SUM returns NULL if no non-NULL values were seen
                         if state.agg_has_value[i] {
@@ -2814,6 +2832,13 @@ impl Executor {
                         SimpleAgg::Count => {
                             state.counts[i] += 1;
                         }
+                        SimpleAgg::CountColumn(col_idx) => {
+                            if let Some(value) = row.get(*col_idx) {
+                                if !value.is_null() {
+                                    state.counts[i] += 1;
+                                }
+                            }
+                        }
                         SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                             if let Some(value) = row.get(*sum_col_idx) {
                                 match value {
@@ -2882,7 +2907,9 @@ impl Executor {
                 if let Some(filter) = having_filter {
                     for cond in &filter.conditions {
                         let agg_value = match &simple_aggs[cond.agg_index] {
-                            SimpleAgg::Count => Some(state.counts[cond.agg_index] as f64),
+                            SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
+                                Some(state.counts[cond.agg_index] as f64)
+                            }
                             SimpleAgg::Sum(_) => {
                                 if state.agg_has_value[cond.agg_index] {
                                     Some(state.agg_values[cond.agg_index])
@@ -2928,7 +2955,9 @@ impl Executor {
                 values.push(key_value);
                 for (i, agg) in simple_aggs.iter().enumerate() {
                     let value = match agg {
-                        SimpleAgg::Count => Value::Integer(state.counts[i]),
+                        SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
+                            Value::Integer(state.counts[i])
+                        }
                         SimpleAgg::Sum(_) => {
                             if state.agg_has_value[i] {
                                 Value::Float(state.agg_values[i])
@@ -3051,6 +3080,13 @@ impl Executor {
                         SimpleAgg::Count => {
                             state.counts[i] += 1;
                         }
+                        SimpleAgg::CountColumn(col_idx) => {
+                            if let Some(value) = row.get(*col_idx) {
+                                if !value.is_null() {
+                                    state.counts[i] += 1;
+                                }
+                            }
+                        }
                         SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                             if let Some(value) = row.get(*sum_col_idx) {
                                 match value {
@@ -3119,7 +3155,9 @@ impl Executor {
                 if let Some(filter) = having_filter {
                     for cond in &filter.conditions {
                         let agg_value = match &simple_aggs[cond.agg_index] {
-                            SimpleAgg::Count => Some(state.counts[cond.agg_index] as f64),
+                            SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
+                                Some(state.counts[cond.agg_index] as f64)
+                            }
                             SimpleAgg::Sum(_) => {
                                 if state.agg_has_value[cond.agg_index] {
                                     Some(state.agg_values[cond.agg_index])
@@ -3165,7 +3203,9 @@ impl Executor {
                 values.push(key_value);
                 for (i, agg) in simple_aggs.iter().enumerate() {
                     let value = match agg {
-                        SimpleAgg::Count => Value::Integer(state.counts[i]),
+                        SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
+                            Value::Integer(state.counts[i])
+                        }
                         SimpleAgg::Sum(_) => {
                             if state.agg_has_value[i] {
                                 Value::Float(state.agg_values[i])
@@ -3267,6 +3307,13 @@ impl Executor {
                     SimpleAgg::Count => {
                         state.counts[i] += 1;
                     }
+                    SimpleAgg::CountColumn(col_idx) => {
+                        if let Some(value) = row.get(*col_idx) {
+                            if !value.is_null() {
+                                state.counts[i] += 1;
+                            }
+                        }
+                    }
                     SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                         if let Some(value) = row.get(*sum_col_idx) {
                             match value {
@@ -3343,7 +3390,9 @@ impl Executor {
                 let mut passes = true;
                 for cond in &filter.conditions {
                     let agg_value = match &simple_aggs[cond.agg_index] {
-                        SimpleAgg::Count => Some(state.counts[cond.agg_index] as f64),
+                        SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
+                            Some(state.counts[cond.agg_index] as f64)
+                        }
                         SimpleAgg::Sum(_) => {
                             if state.agg_has_value[cond.agg_index] {
                                 Some(state.agg_values[cond.agg_index])
@@ -3392,7 +3441,7 @@ impl Executor {
 
             for (i, agg) in simple_aggs.iter().enumerate() {
                 let value = match agg {
-                    SimpleAgg::Count => Value::Integer(state.counts[i]),
+                    SimpleAgg::Count | SimpleAgg::CountColumn(_) => Value::Integer(state.counts[i]),
                     SimpleAgg::Sum(_) => {
                         if state.agg_has_value[i] {
                             Value::Float(state.agg_values[i])
@@ -4804,7 +4853,9 @@ impl Executor {
         let mut has_float = false;
         let mut has_value = false;
 
-        // Unroll loop by 4 for better CPU pipelining
+        // Unroll loop by 4 for better CPU pipelining.
+        // as_chunks needs Rust 1.88; the documented MSRV is 1.70.
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         let chunks = rows.chunks_exact(4);
         let remainder = chunks.remainder();
 
@@ -5890,16 +5941,25 @@ impl Executor {
         let simple_aggs: Vec<Option<SimpleAgg>> = aggregations
             .iter()
             .map(|agg| {
-                // Must not have DISTINCT (except COUNT), FILTER, ORDER BY, or expression
+                // Must not have DISTINCT, FILTER, ORDER BY, or expression.
+                // This path has no dedup state, so even COUNT(DISTINCT)
+                // cannot stream here.
                 if agg.filter.is_some() || !agg.order_by.is_empty() || agg.expression.is_some() {
                     return None;
                 }
-                if agg.distinct && agg.name != "COUNT" {
+                if agg.distinct {
                     return None;
                 }
 
                 match agg.name.to_uppercase().as_str() {
-                    "COUNT" => Some(SimpleAgg::Count),
+                    "COUNT" => {
+                        if agg.column == "*" {
+                            Some(SimpleAgg::Count)
+                        } else {
+                            Self::lookup_column_index(&agg.column_lower, &col_index_map)
+                                .map(SimpleAgg::CountColumn)
+                        }
+                    }
                     "SUM" => {
                         if agg.column == "*" {
                             None
@@ -6050,6 +6110,13 @@ impl Executor {
                             SimpleAgg::Count => {
                                 state.counts[i] += 1;
                             }
+                            SimpleAgg::CountColumn(col_idx) => {
+                                if let Some(value) = row.get(*col_idx) {
+                                    if !value.is_null() {
+                                        state.counts[i] += 1;
+                                    }
+                                }
+                            }
                             SimpleAgg::Sum(col_idx) | SimpleAgg::Avg(col_idx) => {
                                 if let Some(value) = row.get(*col_idx) {
                                     match value {
@@ -6128,7 +6195,9 @@ impl Executor {
                 values.push(key_value);
                 for (i, agg) in simple_aggs.iter().enumerate() {
                     let value = match agg {
-                        SimpleAgg::Count => Value::Integer(state.counts[i]),
+                        SimpleAgg::Count | SimpleAgg::CountColumn(_) => {
+                            Value::Integer(state.counts[i])
+                        }
                         SimpleAgg::Sum(_) => {
                             if state.agg_has_value[i] {
                                 if state.agg_values[i].fract() == 0.0

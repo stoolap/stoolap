@@ -1755,49 +1755,33 @@ impl Executor {
         for expr in &stmt.columns {
             match expr {
                 Expression::Identifier(id) => {
-                    if let Some(idx) = source_columns_lower
+                    let idx = source_columns_lower
                         .iter()
-                        .position(|c| c == id.value_lower.as_str())
-                    {
-                        indices.push(idx);
-                        output_names.push(source_columns[idx].clone());
-                    } else {
-                        return None;
-                    }
+                        .position(|c| c == id.value_lower.as_str())?;
+                    indices.push(idx);
+                    output_names.push(source_columns[idx].clone());
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    if let Some(idx) = source_columns_lower
+                    let idx = source_columns_lower
                         .iter()
-                        .position(|c| c == qid.name.value_lower.as_str())
-                    {
-                        indices.push(idx);
-                        output_names.push(source_columns[idx].clone());
-                    } else {
-                        return None;
-                    }
+                        .position(|c| c == qid.name.value_lower.as_str())?;
+                    indices.push(idx);
+                    output_names.push(source_columns[idx].clone());
                 }
                 Expression::Aliased(aliased) => match aliased.expression.as_ref() {
                     Expression::Identifier(id) => {
-                        if let Some(idx) = source_columns_lower
+                        let idx = source_columns_lower
                             .iter()
-                            .position(|c| c == id.value_lower.as_str())
-                        {
-                            indices.push(idx);
-                            output_names.push(aliased.alias.value.to_string());
-                        } else {
-                            return None;
-                        }
+                            .position(|c| c == id.value_lower.as_str())?;
+                        indices.push(idx);
+                        output_names.push(aliased.alias.value.to_string());
                     }
                     Expression::QualifiedIdentifier(qid) => {
-                        if let Some(idx) = source_columns_lower
+                        let idx = source_columns_lower
                             .iter()
-                            .position(|c| c == qid.name.value_lower.as_str())
-                        {
-                            indices.push(idx);
-                            output_names.push(aliased.alias.value.to_string());
-                        } else {
-                            return None;
-                        }
+                            .position(|c| c == qid.name.value_lower.as_str())?;
+                        indices.push(idx);
+                        output_names.push(aliased.alias.value.to_string());
                     }
                     _ => return None, // Complex expression
                 },
@@ -6732,24 +6716,19 @@ impl Executor {
                                 return None;
                             }
                         // Handle literal op column (reversed: 50000 < balance)
-                        } else if let Some(col_idx) = get_col_idx(&infix.right, col_index_map_lower)
-                        {
-                            if let Some(value) = expr_to_value(&infix.left) {
-                                // Reverse the operator since column is on right
-                                match infix.operator.as_str() {
-                                    "=" => CaseCondition::Equals { col_idx, value },
-                                    "!=" | "<>" => CaseCondition::NotEquals { col_idx, value },
-                                    ">" => CaseCondition::LessThan { col_idx, value }, // 5 > col means col < 5
-                                    ">=" => CaseCondition::LessOrEqual { col_idx, value }, // 5 >= col means col <= 5
-                                    "<" => CaseCondition::GreaterThan { col_idx, value }, // 5 < col means col > 5
-                                    "<=" => CaseCondition::GreaterOrEqual { col_idx, value }, // 5 <= col means col >= 5
-                                    _ => return None,
-                                }
-                            } else {
-                                return None;
-                            }
                         } else {
-                            return None;
+                            let col_idx = get_col_idx(&infix.right, col_index_map_lower)?;
+                            let value = expr_to_value(&infix.left)?;
+                            // Reverse the operator since column is on right
+                            match infix.operator.as_str() {
+                                "=" => CaseCondition::Equals { col_idx, value },
+                                "!=" | "<>" => CaseCondition::NotEquals { col_idx, value },
+                                ">" => CaseCondition::LessThan { col_idx, value }, // 5 > col means col < 5
+                                ">=" => CaseCondition::LessOrEqual { col_idx, value }, // 5 >= col means col <= 5
+                                "<" => CaseCondition::GreaterThan { col_idx, value }, // 5 < col means col > 5
+                                "<=" => CaseCondition::GreaterOrEqual { col_idx, value }, // 5 <= col means col >= 5
+                                _ => return None,
+                            }
                         }
                     }
                     _ => return None, // Complex condition - fall back to VM
@@ -8912,25 +8891,19 @@ impl Executor {
                     }
                     Expression::SubquerySource(sq) => {
                         // Check if subquery is a simple passthrough
-                        if let Some(underlying) = self.extract_simple_subquery_table(&sq.subquery) {
-                            // Use the subquery's alias as the effective alias for join condition matching
-                            let alias = sq.alias.as_ref().map(|a| a.value.to_string());
-                            (underlying, alias)
-                        } else {
-                            return None;
-                        }
+                        let underlying = self.extract_simple_subquery_table(&sq.subquery)?;
+                        // Use the subquery's alias as the effective alias for join condition matching
+                        let alias = sq.alias.as_ref().map(|a| a.value.to_string());
+                        (underlying, alias)
                     }
                     _ => return None,
                 }
             }
             Expression::SubquerySource(sq) => {
                 // Check if subquery is a simple passthrough
-                if let Some(underlying) = self.extract_simple_subquery_table(&sq.subquery) {
-                    let alias = sq.alias.as_ref().map(|a| a.value.to_string());
-                    (underlying, alias)
-                } else {
-                    return None;
-                }
+                let underlying = self.extract_simple_subquery_table(&sq.subquery)?;
+                let alias = sq.alias.as_ref().map(|a| a.value.to_string());
+                (underlying, alias)
             }
             _ => return None,
         };
@@ -9306,6 +9279,18 @@ impl Executor {
         if aggregations.is_empty() {
             return Ok(None);
         }
+        // The extraction drops DISTINCT flags and this path has no dedup
+        // state, so bail on any DISTINCT aggregate.
+        let has_distinct = stmt.columns.iter().any(|c| match c {
+            Expression::FunctionCall(fc) => fc.is_distinct,
+            Expression::Aliased(a) => {
+                matches!(a.expression.as_ref(), Expression::FunctionCall(fc) if fc.is_distinct)
+            }
+            _ => false,
+        });
+        if has_distinct {
+            return Ok(None);
+        }
 
         // Check for simple aggregates (SUM, COUNT, AVG, MIN, MAX)
         #[derive(Clone, Copy)]
@@ -9320,7 +9305,10 @@ impl Executor {
         let mut simple_aggs: Vec<StreamingAgg> = Vec::with_capacity(aggregations.len());
         for (func_name, col_name, _alias) in &aggregations {
             match func_name.as_str() {
-                "COUNT" => simple_aggs.push(StreamingAgg::Count),
+                // Only COUNT(*) counts rows; COUNT(col) must skip NULLs,
+                // which this streaming path cannot do.
+                "COUNT" if col_name == "*" => simple_aggs.push(StreamingAgg::Count),
+                "COUNT" => return Ok(None),
                 "SUM" | "AVG" | "MIN" | "MAX" => {
                     // Find the column index for aggregate argument
                     let col_idx = all_columns
