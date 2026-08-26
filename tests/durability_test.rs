@@ -2770,6 +2770,15 @@ fn test_manifest_deleted() {
             // Acceptable: without manifest, volumes are orphaned
         }
     }
+
+    // The manifest-less volumes may be the only copy of the data; the
+    // open must never reap them.
+    drop(db);
+    let vols_after = find_volume_files(&fixture.db_path, "vol_test");
+    assert!(
+        !vols_after.is_empty(),
+        ".vol files must survive an open with a missing manifest"
+    );
 }
 
 #[test]
@@ -4125,6 +4134,15 @@ fn test_manifest_deleted_volumes_exist() {
     if let Ok(count) = result {
         assert!(count >= 0, "Should have non-negative count");
     }
+
+    // The manifest-less volumes may be the only copy of the data; the
+    // open must never reap them.
+    drop(db);
+    let vols_after = find_volume_files(&db_path, "meta_del");
+    assert!(
+        !vols_after.is_empty(),
+        ".vol files must survive an open with a missing manifest"
+    );
 }
 
 #[test]

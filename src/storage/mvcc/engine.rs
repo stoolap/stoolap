@@ -3221,6 +3221,15 @@ impl MVCCEngine {
                 continue;
             }
 
+            // .vol files with no manifest.bin: either a crash before the
+            // first manifest write (WAL replay covers the data) or a lost
+            // manifest (these files may be the only copy). An empty manager
+            // would treat every segment as an orphan and delete it, so leave
+            // the files untouched instead.
+            if !vol_dir.join(&table_name).join("manifest.bin").exists() {
+                continue;
+            }
+
             let mgr = self.get_or_create_segment_manager(&table_name);
             for path in paths {
                 let volume_id = parse_volume_id(&path);
