@@ -180,6 +180,16 @@ fn hash_expression<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
             in_hash.not.hash(hasher);
             hash_expression(&in_hash.column, hasher);
             in_hash.values.len().hash(hasher);
+            // Hash the actual set contents: length alone made `a IN {1}`
+            // and `a IN {2}` share a key, and no key derivation can help
+            // when its input omits the values. Canonical (sorted) order
+            // keeps the hash set-order-independent while every algorithm
+            // hashing this expression sees the full material directly.
+            let mut sorted: Vec<&crate::core::Value> = in_hash.values.iter().collect();
+            sorted.sort_by(|a, b| crate::executor::utils::compare_values(a, b));
+            for v in sorted {
+                v.hash(hasher);
+            }
         }
         Expression::Between(between) => {
             between.not.hash(hasher);
@@ -298,6 +308,12 @@ fn hash_expression<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
                 false.hash(hasher);
             }
             vs.rows.len().hash(hasher);
+            for row in &vs.rows {
+                row.len().hash(hasher);
+                for e in row {
+                    hash_expression(e, hasher);
+                }
+            }
         }
         Expression::CteReference(cte) => {
             cte.name.value_lower.hash(hasher);
@@ -2103,6 +2119,42 @@ mod tests {
             op_type: InfixOperator::GreaterThan,
             right: Box::new(make_int_literal(val)),
         })
+    }
+
+    #[test]
+    fn test_in_hashset_values_change_the_cache_key() {
+        use crate::common::CompactArc;
+        use crate::core::{Row, Value, ValueSet};
+        use crate::parser::ast::InHashSetExpression;
+
+        fn make_in_hashset(val: i64) -> Expression {
+            let mut set = ValueSet::default();
+            set.insert(Value::Integer(val));
+            Expression::InHashSet(InHashSetExpression {
+                token: dummy_token(),
+                column: Box::new(make_identifier("a")),
+                values: CompactArc::new(set),
+                not: false,
+            })
+        }
+
+        let cols = vec!["a".to_string()];
+        let e1 = make_in_hashset(1);
+        let e2 = make_in_hashset(2);
+
+        // Previously only values.len() was hashed, so these two shared one
+        // key in BOTH hash algorithms and aliased in the program cache.
+        let k1 = compute_cache_key(&e1, &cols);
+        let k2 = compute_cache_key(&e2, &cols);
+        assert_ne!(k1, k2, "IN-set contents must be part of the cache key");
+
+        // Behavioral repro from review: the second filter must not be
+        // served the first filter's compiled program.
+        let f1 = RowFilter::new(&e1, &cols).unwrap();
+        let f2 = RowFilter::new(&e2, &cols).unwrap();
+        let row = Row::from_values(vec![Value::Integer(2)]);
+        assert!(!f1.matches(&row), "a IN {{1}} must reject a = 2");
+        assert!(f2.matches(&row), "a IN {{2}} must accept a = 2");
     }
 
     #[test]
