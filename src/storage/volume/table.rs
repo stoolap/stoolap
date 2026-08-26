@@ -1147,6 +1147,12 @@ impl Table for SegmentedTable {
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
+        // Fail on unreloadable cold volumes BEFORE mutating the hot buffer,
+        // so a reload error cannot leave a partially applied statement in
+        // the open transaction.
+        if self.segment_mgr.has_segments() {
+            self.segment_mgr.preflight_cold_access()?;
+        }
         let mut count = self.hot.update(where_expr, setter)?;
 
         // Update matching segment rows.
@@ -1269,6 +1275,12 @@ impl Table for SegmentedTable {
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
+        // Fail on unreloadable cold volumes BEFORE mutating the hot buffer,
+        // so a reload error cannot leave a partially applied statement in
+        // the open transaction.
+        if self.segment_mgr.has_segments() {
+            self.segment_mgr.preflight_cold_access()?;
+        }
         let mut count = 0i32;
         let mut hot_ids = Vec::new();
         let schema = self.hot.schema().clone();
@@ -1351,6 +1363,12 @@ impl Table for SegmentedTable {
 
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
+        // Fail on unreloadable cold volumes BEFORE mutating the hot buffer,
+        // so a reload error cannot leave a partially applied statement in
+        // the open transaction.
+        if self.segment_mgr.has_segments() {
+            self.segment_mgr.preflight_cold_access()?;
+        }
         let mut count = 0i32;
         let mut hot_ids = Vec::new();
         let has_int_pk = self
@@ -1422,6 +1440,12 @@ impl Table for SegmentedTable {
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
+        // Fail on unreloadable cold volumes BEFORE mutating the hot buffer,
+        // so a reload error cannot leave a partially applied statement in
+        // the open transaction.
+        if self.segment_mgr.has_segments() {
+            self.segment_mgr.preflight_cold_access()?;
+        }
         let mut count = self.hot.delete(where_expr)?;
         let has_int_pk = self
             .hot

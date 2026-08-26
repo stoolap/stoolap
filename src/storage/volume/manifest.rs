@@ -2492,6 +2492,34 @@ impl SegmentManager {
     /// Reloads cold volumes first so column data is available.
     /// Does NOT mark volumes as accessed — callers that need eviction
     /// protection should mark the specific volumes they use.
+    /// Verify every cold segment can be served before a caller starts
+    /// mutating state. DML paths mutate the hot buffer first and only
+    /// then touch cold volumes; erroring mid-statement would leave the
+    /// open transaction with a partially applied statement. Preflighting
+    /// moves the (persistent) reload failure ahead of the first mutation.
+    /// A volume evicted between preflight and iteration can still fail
+    /// there, but that needs eviction AND a fresh I/O failure inside one
+    /// statement window.
+    pub fn preflight_cold_access(&self) -> crate::core::Result<()> {
+        self.ensure_columns();
+        let segs = self.segments.read();
+        let cold: Vec<u64> = segs
+            .iter()
+            .filter(|(_, cs)| cs.volume.is_cold())
+            .map(|(&id, _)| id)
+            .collect();
+        if !cold.is_empty() {
+            return Err(crate::core::Error::Internal {
+                message: format!(
+                    "table '{}': cold volume reload failed for segment(s) {:?}; \
+                     refusing to serve partial data",
+                    self.table_name, cold
+                ),
+            });
+        }
+        Ok(())
+    }
+
     pub fn segments_snapshot(&self) -> crate::core::Result<Arc<FxHashMap<u64, ColdSegment>>> {
         self.ensure_columns();
         let segs = Arc::clone(&*self.segments.read());
@@ -2997,6 +3025,8 @@ mod tests {
         assert!(mgr.tombstone_set_arc().is_empty());
     }
 
+    static EVICTION_EPOCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn test_eviction_lifecycle() {
         use crate::core::{DataType, Row, SchemaBuilder, Value};
@@ -3059,12 +3089,21 @@ mod tests {
             assert_eq!(row[0], Value::Integer(1));
         }
 
+        // GLOBAL_EVICTION_EPOCH is process-global: epoch-driving tests
+        // must serialize and use base-relative epochs or they corrupt
+        // each other's idle-cycle accounting under parallel test runs.
+        let _epoch_guard = EVICTION_EPOCH_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let base =
+            super::super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+
         // Helper: mirror engine's evict_idle_volumes behavior.
         // Engine does: fetch_add → GLOBAL.fetch_max → mgr.evict_idle_volumes.
         let run_eviction = |mgr: &SegmentManager, epoch: u64| {
             super::super::writer::GLOBAL_EVICTION_EPOCH
-                .fetch_max(epoch, std::sync::atomic::Ordering::Relaxed);
-            mgr.evict_idle_volumes(epoch);
+                .fetch_max(base + epoch, std::sync::atomic::Ordering::Relaxed);
+            mgr.evict_idle_volumes(base + epoch);
         };
 
         // ── Eviction cycle 0..2: not enough idle cycles, no eviction ──
@@ -3193,10 +3232,15 @@ mod tests {
             None,
         );
 
+        let _epoch_guard = EVICTION_EPOCH_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let base =
+            super::super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
         let run_eviction = |mgr: &SegmentManager, epoch: u64| {
             super::super::writer::GLOBAL_EVICTION_EPOCH
-                .fetch_max(epoch, std::sync::atomic::Ordering::Relaxed);
-            mgr.evict_idle_volumes(epoch);
+                .fetch_max(base + epoch, std::sync::atomic::Ordering::Relaxed);
+            mgr.evict_idle_volumes(base + epoch);
         };
         for epoch in 0..=10u64 {
             run_eviction(&mgr, epoch);
@@ -3214,5 +3258,9 @@ mod tests {
             "get_volumes_newest_first must fail instead of dropping the segment"
         );
         assert!(mgr.get_cold_row(50).is_err(), "get_cold_row must fail");
+        assert!(
+            mgr.preflight_cold_access().is_err(),
+            "DML preflight must fail before any mutation"
+        );
     }
 }
