@@ -160,7 +160,7 @@ impl SegmentedTable {
             return Ok(());
         }
 
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first()?;
         let ts = self.segment_mgr.tombstone_set_arc();
         let mut seen_values: ahash::AHashMap<Vec<Value>, i64> = ahash::AHashMap::new();
 
@@ -247,7 +247,7 @@ impl SegmentedTable {
         if col_indices.is_empty() {
             return Ok(());
         }
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first()?;
         let ts = self.segment_mgr.tombstone_set_arc();
         for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
@@ -298,7 +298,7 @@ impl SegmentedTable {
         &self,
         col_indices: &[usize],
         values: &[&Value],
-    ) -> Option<i64> {
+    ) -> Result<Option<i64>> {
         let snapshot = self.segment_mgr.cold_snapshot();
         self.find_segment_row_id_by_values_with_snapshot(&snapshot, col_indices, values)
     }
@@ -308,28 +308,30 @@ impl SegmentedTable {
         snapshot: &super::manifest::ColdSnapshot,
         col_indices: &[usize],
         values: &[&Value],
-    ) -> Option<i64> {
+    ) -> Result<Option<i64>> {
         if col_indices.is_empty() || col_indices.len() != values.len() {
-            return None;
+            return Ok(None);
         }
 
         let defaults: smallvec::SmallVec<[Value; 4]> = col_indices
             .iter()
             .map(|&ci| self.column_default(ci))
             .collect();
-        let result = self.segment_mgr.find_row_id_by_values_with_snapshot(
+        let rid = match self.segment_mgr.find_row_id_by_values_with_snapshot(
             snapshot,
             col_indices,
             values,
             &defaults,
-        );
-        let rid = result?;
+        )? {
+            Some(rid) => rid,
+            None => return Ok(None),
+        };
 
         if self.segment_mgr.is_pending_tombstone(self.txn_id(), rid) {
-            return None;
+            return Ok(None);
         }
 
-        Some(rid)
+        Ok(Some(rid))
     }
 
     /// Check PK and UNIQUE constraints against segment data before INSERT.
@@ -361,7 +363,7 @@ impl SegmentedTable {
                 }
                 let values: Vec<&Value> = coerced.iter().collect();
 
-                if let Some(found_id) = self.find_segment_row_id_by_values(&col_indices, &values) {
+                if let Some(found_id) = self.find_segment_row_id_by_values(&col_indices, &values)? {
                     if found_id != exclude_row_id {
                         return Err(crate::core::Error::UniqueConstraint {
                             index: idx_name.to_string(),
@@ -397,7 +399,7 @@ impl SegmentedTable {
                 if !pk_value.is_null() {
                     if let Some(row_id) = self
                         .segment_mgr
-                        .check_value_exists_with_snapshot(snapshot, pk_idx, pk_value)
+                        .check_value_exists_with_snapshot(snapshot, pk_idx, pk_value)?
                     {
                         // check_value_exists_in_segments filters committed tombstones.
                         // Check pending tombstones (no Vec clone).
@@ -445,7 +447,7 @@ impl SegmentedTable {
                     snapshot,
                     &col_indices,
                     &values,
-                ) {
+                )? {
                     return Err(crate::core::Error::UniqueConstraint {
                         index: idx_name.to_string(),
                         column: col_names.join(", "),
@@ -601,7 +603,7 @@ impl SegmentedTable {
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
         hot_skip: FxHashSet<i64>,
-    ) -> Vec<Box<dyn Scanner>> {
+    ) -> Result<Vec<Box<dyn Scanner>>> {
         let comparisons = where_expr
             .map(|e| e.collect_comparisons())
             .unwrap_or_default();
@@ -612,7 +614,7 @@ impl SegmentedTable {
         let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
 
         if volumes.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         // Committed tombstones are kept as a shared Arc (no clone).
@@ -634,7 +636,7 @@ impl SegmentedTable {
             // Re-prune to get binary-search range narrowing on sorted columns.
             let loaded;
             let (vol, start, end) = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id) {
+                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
                     Some(v) => v,
                     None => continue,
                 };
@@ -676,7 +678,7 @@ impl SegmentedTable {
 
         // Reverse so oldest segments come first (consistent iteration order)
         scanners_reverse.reverse();
-        scanners_reverse
+        Ok(scanners_reverse)
     }
 
     /// Collect rows from segments into a RowVec, with zone map pruning
@@ -722,6 +724,7 @@ impl SegmentedTable {
         };
         let hot_skip_ref = &hot_skip;
         let tombstones_ref = &tombstones_arc;
+        let reload_failed = std::sync::atomic::AtomicBool::new(false);
 
         // Per-volume row collection closure. Returns Some(vol_rows) or None if pruned.
         let process_volume =
@@ -735,7 +738,14 @@ impl SegmentedTable {
                 // Load cold volume on demand after zone-map/bloom pruning.
                 let loaded;
                 let (vol, start, end) = if vol.is_cold() {
-                    loaded = self.segment_mgr.ensure_volume(*seg_id)?;
+                    loaded = match self.segment_mgr.ensure_volume(*seg_id) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => return None,
+                        Err(_) => {
+                            reload_failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return None;
+                        }
+                    };
                     let (_, s, e) = Self::prune_volume(&loaded, &comparisons, &bloom_hashes);
                     (&loaded, s, e)
                 } else {
@@ -843,6 +853,14 @@ impl SegmentedTable {
             .filter_map(|v| process_volume(v))
             .collect();
 
+        if reload_failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(crate::core::Error::Internal {
+                message: format!(
+                    "table '{}': cold volume reload failed; refusing to serve partial data",
+                    self.segment_mgr.table_name()
+                ),
+            });
+        }
         for vol_rows in per_volume_rows.into_iter().rev() {
             for entry in vol_rows {
                 rows.push(entry);
@@ -854,21 +872,21 @@ impl SegmentedTable {
     /// Find a row in segments by row_id. Returns (volume, local_offset) if found
     /// and not tombstoned or hot-shadowed. Uses manifest min/max for fast segment
     /// identification, then binary search within the segment.
-    fn find_segment_row(&self, row_id: i64) -> Option<(u64, Arc<FrozenVolume>, usize)> {
+    fn find_segment_row(&self, row_id: i64) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
         // Hot buffer shadows cold: if the row exists in hot, the cold copy is stale
         if self.hot.has_row_id(row_id) {
-            return None;
+            return Ok(None);
         }
         // Check committed tombstones (snapshot-aware: newer tombstones are invisible)
         {
             let ts = self.segment_mgr.tombstone_set_arc();
             if self.is_row_tombstoned(&ts, row_id) {
-                return None;
+                return Ok(None);
             }
         }
         // Check pending tombstones for this transaction (no Vec clone)
         if self.segment_mgr.is_pending_tombstone(self.txn_id(), row_id) {
-            return None;
+            return Ok(None);
         }
 
         // Metadata-only search: row_ids are in vol.meta (available even on cold volumes).
@@ -902,8 +920,8 @@ impl SegmentedTable {
             if let Ok(idx) = vol.meta.row_ids.binary_search(&row_id) {
                 if vol.is_cold() {
                     drop(segs);
-                    if let Some(loaded) = self.segment_mgr.ensure_volume(seg_id) {
-                        return Some((seg_id, loaded, idx));
+                    if let Some(loaded) = self.segment_mgr.ensure_volume(seg_id)? {
+                        return Ok(Some((seg_id, loaded, idx)));
                     }
                     // ensure_volume returned None: compaction removed this
                     // segment. Row now lives in a newer compacted volume.
@@ -911,15 +929,18 @@ impl SegmentedTable {
                     return self.find_segment_row_retry(row_id);
                 }
                 vol.mark_accessed();
-                return Some((seg_id, Arc::clone(vol), idx));
+                return Ok(Some((seg_id, Arc::clone(vol), idx)));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Retry find_segment_row with a fresh consistent snapshot.
     /// Called when ensure_volume returns None (compaction removed the segment).
-    fn find_segment_row_retry(&self, row_id: i64) -> Option<(u64, Arc<FrozenVolume>, usize)> {
+    fn find_segment_row_retry(
+        &self,
+        row_id: i64,
+    ) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
         // ensure_columns before manifest lock to avoid deadlock
         // (ensure_columns may need manifest.write via reload_cold_volumes).
         let segs = self.segment_mgr.segments_snapshot();
@@ -938,11 +959,21 @@ impl SegmentedTable {
             };
             let vol = &cold.volume;
             if let Ok(idx) = vol.meta.row_ids.binary_search(&row_id) {
+                if vol.is_cold() {
+                    return Err(crate::core::Error::Internal {
+                        message: format!(
+                            "table '{}': cold volume reload failed for segment {}; \
+                             refusing to serve partial data",
+                            self.segment_mgr.table_name(),
+                            seg_id
+                        ),
+                    });
+                }
                 vol.mark_accessed();
-                return Some((seg_id, Arc::clone(vol), idx));
+                return Ok(Some((seg_id, Arc::clone(vol), idx)));
             }
         }
-        None
+        Ok(None)
     }
 
     /// Generic fallback for min_column scan on non-numeric column types.
@@ -1163,7 +1194,7 @@ impl Table for SegmentedTable {
             // Load cold volume on demand after pruning.
             let loaded;
             let vol = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id) {
+                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
                     Some(v) => v,
                     None => continue,
                 };
@@ -1260,7 +1291,7 @@ impl Table for SegmentedTable {
             super::writer::ColumnMapping,
         )> = None;
         for &row_id in row_ids {
-            if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id) {
+            if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
                 let vol_ptr = &*vol as *const super::writer::FrozenVolume;
                 let mapping = match &cached_mapping {
                     Some((ptr, m)) if *ptr == vol_ptr => m,
@@ -1339,7 +1370,7 @@ impl Table for SegmentedTable {
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
 
         for &row_id in row_ids {
-            if let Some((_seg_id, _vol, _idx)) = self.find_segment_row(row_id) {
+            if let Some((_seg_id, _vol, _idx)) = self.find_segment_row(row_id)? {
                 // Claim the cold row to prevent concurrent lost deletes.
                 self.hot.try_claim_row(row_id)?;
                 if has_int_pk {
@@ -1362,16 +1393,16 @@ impl Table for SegmentedTable {
         Ok(count)
     }
 
-    fn get_active_row_ids(&self) -> Vec<i64> {
-        let hot_ids = self.hot.get_active_row_ids();
+    fn get_active_row_ids(&self) -> Result<Vec<i64>> {
+        let hot_ids = self.hot.get_active_row_ids()?;
 
         if !self.segment_mgr.has_segments() {
-            return hot_ids;
+            return Ok(hot_ids);
         }
 
         // Build hot_skip from hot row_ids + pending tombstones.
         // Committed tombstones are kept as a shared Arc (no clone).
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first()?;
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
@@ -1395,7 +1426,7 @@ impl Table for SegmentedTable {
             }
         }
         ids.extend(hot_ids);
-        ids
+        Ok(ids)
     }
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
@@ -1466,7 +1497,7 @@ impl Table for SegmentedTable {
             // Load cold volume on demand after pruning.
             let loaded;
             let vol = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id) {
+                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
                     Some(v) => v,
                     None => continue,
                 };
@@ -1603,7 +1634,8 @@ impl Table for SegmentedTable {
         // Create lazy cold scanners with the skip set (no eager collection).
         // This avoids O(total_cold_rows) memory allocation that was making
         // ALL queries slow during checkpoint.
-        let cold_scanners = self.create_segment_scanners_filtered(column_indices, where_expr, skip);
+        let cold_scanners =
+            self.create_segment_scanners_filtered(column_indices, where_expr, skip)?;
 
         // Chain: cold scanners (lazy, streamed) + hot rows (already collected)
         let hot_scanner = Box::new(RowVecScanner::new(hot_rows)) as Box<dyn Scanner>;
@@ -1675,7 +1707,7 @@ impl Table for SegmentedTable {
         )> = None;
 
         for &row_id in row_ids {
-            if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id) {
+            if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
                 let vol_ptr = &*vol as *const super::writer::FrozenVolume;
                 let mapping = match &cached_mapping {
                     Some((ptr, m)) if *ptr == vol_ptr => m,
@@ -1708,10 +1740,10 @@ impl Table for SegmentedTable {
         Ok(result)
     }
 
-    fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> RowVec {
+    fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> Result<RowVec> {
         let mut results = RowVec::with_capacity(row_ids.len());
-        self.fetch_rows_by_ids_into(row_ids, filter, &mut results);
-        results
+        self.fetch_rows_by_ids_into(row_ids, filter, &mut results)?;
+        Ok(results)
     }
 
     fn fetch_rows_by_ids_into(
@@ -1719,10 +1751,9 @@ impl Table for SegmentedTable {
         row_ids: &[i64],
         filter: &dyn Expression,
         buffer: &mut RowVec,
-    ) {
+    ) -> Result<()> {
         if !self.segment_mgr.has_segments() {
-            self.hot.fetch_rows_by_ids_into(row_ids, filter, buffer);
-            return;
+            return self.hot.fetch_rows_by_ids_into(row_ids, filter, buffer);
         }
 
         let mut hot_ids = Vec::new();
@@ -1733,7 +1764,7 @@ impl Table for SegmentedTable {
         )> = None;
 
         for &row_id in row_ids {
-            if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id) {
+            if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
                 let vol_ptr = &*vol as *const super::writer::FrozenVolume;
                 let mapping = match &cached_mapping {
                     Some((ptr, m)) if *ptr == vol_ptr => m,
@@ -1757,8 +1788,9 @@ impl Table for SegmentedTable {
         }
 
         if !hot_ids.is_empty() {
-            self.hot.fetch_rows_by_ids_into(&hot_ids, filter, buffer);
+            self.hot.fetch_rows_by_ids_into(&hot_ids, filter, buffer)?;
         }
+        Ok(())
     }
 
     // =========================================================================
@@ -1831,7 +1863,7 @@ impl Table for SegmentedTable {
             // Load cold volume on demand after pruning.
             let loaded;
             let vol: &Arc<FrozenVolume> = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id) {
+                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
                     Some(v) => v,
                     None => continue,
                 };
@@ -1948,7 +1980,7 @@ impl Table for SegmentedTable {
             // Load cold volume on demand after pruning.
             let loaded;
             let vol: &Arc<FrozenVolume> = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id) {
+                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
                     Some(v) => v,
                     None => continue,
                 };
@@ -2196,7 +2228,7 @@ impl Table for SegmentedTable {
         }
 
         // Tombstones exist: scan columnar data with dedup (avoids full Row materialization)
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first().ok()?;
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
@@ -2330,7 +2362,7 @@ impl Table for SegmentedTable {
             && !self.segment_mgr.has_pending_tombstones(self.txn_id());
 
         // Scan columnar data with dedup (typed direct access, no Value alloc)
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first().ok()?;
         let tombstones_arc = if no_tombstones {
             None
         } else {
@@ -2628,7 +2660,7 @@ impl Table for SegmentedTable {
         let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
             && !self.segment_mgr.has_pending_tombstones(self.txn_id());
 
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first().ok()?;
         let tombstones_arc = if no_tombstones {
             None
         } else {
@@ -2875,7 +2907,7 @@ impl Table for SegmentedTable {
         }
 
         // Build skip set: hot row_ids + tombstones + pending tombstones
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first().ok()?;
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
@@ -2942,7 +2974,7 @@ impl Table for SegmentedTable {
             distinct.insert(v);
         }
 
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first().ok()?;
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
@@ -3019,7 +3051,7 @@ impl Table for SegmentedTable {
         let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
             && !self.segment_mgr.has_pending_tombstones(self.txn_id());
 
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first().ok()?;
         let tombstones_arc = if no_tombstones {
             // Avoid cloning the Arc when we know the set is empty
             Arc::new(FxHashMap::default())
@@ -3130,7 +3162,7 @@ impl Table for SegmentedTable {
         }
 
         // Build hot_skip: hot row_ids + tombstones + pending tombstones
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first().ok()?;
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
@@ -3250,8 +3282,9 @@ impl Table for SegmentedTable {
             let loaded;
             let vol: &Arc<FrozenVolume> = if vol.is_cold() {
                 loaded = match self.segment_mgr.ensure_volume(*seg_id) {
-                    Some(v) => v,
-                    None => continue,
+                    Err(_) => return None,
+                    Ok(Some(v)) => v,
+                    Ok(None) => continue,
                 };
                 &loaded
             } else {
@@ -3359,7 +3392,7 @@ impl Table for SegmentedTable {
 
         // 3. Get volumes (oldest first — segment_id ascending order).
         //    We need column data for materialization, so use ensure_columns path.
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first().ok()?;
         // volumes is oldest-first after the reverse inside get_volumes_newest_first.
 
         // 4. K-way merge using per-source cursors.
@@ -3718,7 +3751,7 @@ impl Table for SegmentedTable {
             values.push(value);
         }
 
-        Ok(self.find_segment_row_id_by_values(&col_indices, &values))
+        self.find_segment_row_id_by_values(&col_indices, &values)
     }
 
     fn has_unique_non_pk_indexes(&self) -> bool {
@@ -3912,7 +3945,7 @@ impl Table for SegmentedTable {
         if is_current_query {
             // Build hot_skip from hot row_ids + pending tombstones.
             // Committed tombstones are kept as a shared Arc (no clone).
-            let volumes = self.segment_mgr.get_volumes_newest_first();
+            let volumes = self.segment_mgr.get_volumes_newest_first()?;
             let tombstones_arc = self.segment_mgr.tombstone_set_arc();
             let mut hot_skip: FxHashSet<i64> =
                 FxHashSet::with_capacity_and_hasher(10_000, Default::default());
@@ -4244,7 +4277,7 @@ impl Table for SegmentedTable {
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
 
         // --- Cold volumes (THE FAST PATH) ------------------------------------
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first().ok()?;
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
@@ -5123,7 +5156,7 @@ impl Table for SegmentedTable {
         }
 
         // ---- Process cold volumes (columnar fast path) ----
-        let volumes = self.segment_mgr.get_volumes_newest_first();
+        let volumes = self.segment_mgr.get_volumes_newest_first().ok()?;
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
@@ -5647,8 +5680,13 @@ mod tests {
         fn delete_by_row_ids(&mut self, _: &[i64]) -> Result<i32> {
             Ok(0)
         }
-        fn get_active_row_ids(&self) -> Vec<i64> {
-            self.rows.iter().map(|(id, _)| *id).collect()
+        fn get_active_row_ids(&self) -> Result<Vec<i64>> {
+            Ok(self.rows.iter().map(|(id, _)| *id).collect())
+        }
+        fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
+            for (id, _) in &self.rows {
+                dest.insert(*id);
+            }
         }
         fn delete(&mut self, _: Option<&dyn Expression>) -> Result<i32> {
             Ok(0)

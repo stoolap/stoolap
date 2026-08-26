@@ -202,7 +202,7 @@ impl Executor {
                             .collect();
 
                         let mut row_ids: Vec<i64> = table
-                            .get_active_row_ids()
+                            .get_active_row_ids()?
                             .into_iter()
                             .filter(|id| !excluded.contains(*id))
                             .collect();

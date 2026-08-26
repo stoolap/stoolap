@@ -281,7 +281,7 @@ impl IndexNestedLoopJoinOperator {
 
     /// Look up matching inner rows for the current outer row.
     /// Uses internal buffers to avoid allocations.
-    fn lookup_inner_rows(&mut self, key_value: &Value) {
+    fn lookup_inner_rows(&mut self, key_value: &Value) -> Result<()> {
         // Clear buffers for reuse
         self.row_id_buffer.clear();
         self.current_inner_rows.clear();
@@ -304,7 +304,7 @@ impl IndexNestedLoopJoinOperator {
         }
 
         if self.row_id_buffer.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Fetch matching rows directly into inner_rows buffer
@@ -312,7 +312,7 @@ impl IndexNestedLoopJoinOperator {
             &self.row_id_buffer,
             &self.true_expr,
             &mut self.current_inner_rows,
-        );
+        )
     }
 
     /// Advance to the next outer row and lookup matching inner rows.
@@ -335,7 +335,7 @@ impl IndexNestedLoopJoinOperator {
                 };
 
                 // Lookup matching inner rows
-                self.lookup_inner_rows(&key_value);
+                self.lookup_inner_rows(&key_value)?;
 
                 self.current_outer_row = Some(outer_row);
                 // self.current_inner_rows is already populated by lookup_inner_rows
@@ -670,7 +670,9 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
 
         // Step 2: Single batch fetch of ALL inner rows at once
         let all_row_ids: Vec<i64> = row_id_set.into_iter().collect();
-        let inner_rows_batch = self.inner_table.fetch_rows_by_ids(&all_row_ids, &true_expr);
+        let inner_rows_batch = self
+            .inner_table
+            .fetch_rows_by_ids(&all_row_ids, &true_expr)?;
 
         // Build inner row map by row_id
         let mut inner_by_id: I64Map<Row> = I64Map::with_capacity(inner_rows_batch.len());

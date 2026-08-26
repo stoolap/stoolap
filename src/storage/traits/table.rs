@@ -374,15 +374,12 @@ pub trait Table: Send + Sync {
 
     /// Returns all active row IDs visible to the current transaction.
     /// Used for NOT IN (anti-join) optimization.
-    fn get_active_row_ids(&self) -> Vec<i64>;
+    fn get_active_row_ids(&self) -> Result<Vec<i64>>;
 
     /// Populate a FxHashSet with all hot row_ids. Avoids the intermediate Vec
-    /// allocation of get_active_row_ids() when building skip sets.
-    fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
-        for id in self.get_active_row_ids() {
-            dest.insert(id);
-        }
-    }
+    /// allocation of get_active_row_ids() when building skip sets. Required
+    /// (no default): implementations must stay infallible for hot data.
+    fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>);
 
     /// Check if a specific row_id exists in the hot buffer.
     /// O(log n) lookup instead of collecting all row_ids.
@@ -1000,10 +997,10 @@ pub trait Table: Send + Sync {
     ///
     /// # Returns
     /// RowVec of (row_id, Row) pairs for visible, non-deleted rows that pass the filter
-    fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> RowVec {
+    fn fetch_rows_by_ids(&self, row_ids: &[i64], filter: &dyn Expression) -> Result<RowVec> {
         let mut results = RowVec::with_capacity(row_ids.len());
-        self.fetch_rows_by_ids_into(row_ids, filter, &mut results);
-        results
+        self.fetch_rows_by_ids_into(row_ids, filter, &mut results)?;
+        Ok(results)
     }
 
     /// Fetch rows into a reusable RowVec buffer
@@ -1012,9 +1009,10 @@ pub trait Table: Send + Sync {
         row_ids: &[i64],
         filter: &dyn Expression,
         buffer: &mut RowVec,
-    ) {
+    ) -> Result<()> {
         let _ = (row_ids, filter, buffer);
         // Default implementation does nothing
+        Ok(())
     }
 
     // ---- Additional Column Operations ----
