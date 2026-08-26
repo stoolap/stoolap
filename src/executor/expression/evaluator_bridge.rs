@@ -55,7 +55,7 @@ const PROGRAM_CACHE_SIZE: usize = 256;
 
 /// Global cache for compiled programs using O(1) LRU eviction.
 /// Uses parking_lot::Mutex for efficient locking.
-static PROGRAM_CACHE: Mutex<Option<LruCache<u64, SharedProgram>>> = Mutex::new(None);
+static PROGRAM_CACHE: Mutex<Option<LruCache<(u64, u64), SharedProgram>>> = Mutex::new(None);
 
 /// Clear the program cache. Call on database drop to release memory.
 pub fn clear_program_cache() {
@@ -65,14 +65,31 @@ pub fn clear_program_cache() {
 
 /// Compute cache key from expression and columns using efficient recursive hashing.
 /// This avoids the overhead of Debug formatting by directly hashing expression structure.
-/// Uses FxHasher which is 2-5x faster than SipHash for small keys.
-fn compute_cache_key(expr: &Expression, columns: &[String]) -> u64 {
-    let mut hasher = FxHasher::default();
-    // Use efficient recursive hashing (same as CompiledEvaluator::hash_expression)
-    hash_expression(expr, &mut hasher);
-    // Hash column names
-    columns.hash(&mut hasher);
-    hasher.finish()
+///
+/// The key is a PAIR of hashes from independent algorithms (FxHash and
+/// ahash with fixed seeds). The cache has no equality check on hit, so a
+/// single 64-bit FxHash key would silently execute the wrong compiled
+/// program on a collision; FxHash's weak diffusion makes structured
+/// collisions realistic. A simultaneous collision in both algorithms is
+/// not.
+fn compute_cache_key(expr: &Expression, columns: &[String]) -> (u64, u64) {
+    let mut h1 = FxHasher::default();
+    hash_expression(expr, &mut h1);
+    columns.hash(&mut h1);
+
+    use std::hash::BuildHasher;
+    // Fixed seeds: the key must be stable across calls within the process.
+    let mut h2 = ahash::RandomState::with_seeds(
+        0x9e37_79b9_7f4a_7c15,
+        0xf39c_c060_5ced_c834,
+        0x1082_276b_f3a2_7251,
+        0x8f4c_a136_bef1_39c9,
+    )
+    .build_hasher();
+    hash_expression(expr, &mut h2);
+    columns.hash(&mut h2);
+
+    (h1.finish(), h2.finish())
 }
 
 /// Compute a u64 hash of an expression without string allocation.
@@ -88,7 +105,7 @@ pub fn compute_expression_hash(expr: &Expression) -> u64 {
 
 /// Recursively hash an expression without string allocation.
 /// This is O(expression_size) and avoids Debug formatting overhead.
-fn hash_expression(expr: &Expression, hasher: &mut FxHasher) {
+fn hash_expression<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
     // First hash the discriminant to distinguish variants
     std::mem::discriminant(expr).hash(hasher);
 
@@ -163,6 +180,16 @@ fn hash_expression(expr: &Expression, hasher: &mut FxHasher) {
             in_hash.not.hash(hasher);
             hash_expression(&in_hash.column, hasher);
             in_hash.values.len().hash(hasher);
+            // Hash the actual set contents: length alone made `a IN {1}`
+            // and `a IN {2}` share a key, and no key derivation can help
+            // when its input omits the values. Canonical (sorted) order
+            // keeps the hash set-order-independent while every algorithm
+            // hashing this expression sees the full material directly.
+            let mut sorted: Vec<&crate::core::Value> = in_hash.values.iter().collect();
+            sorted.sort_by(|a, b| crate::executor::utils::compare_values(a, b));
+            for v in sorted {
+                v.hash(hasher);
+            }
         }
         Expression::Between(between) => {
             between.not.hash(hasher);
@@ -281,6 +308,12 @@ fn hash_expression(expr: &Expression, hasher: &mut FxHasher) {
                 false.hash(hasher);
             }
             vs.rows.len().hash(hasher);
+            for row in &vs.rows {
+                row.len().hash(hasher);
+                for e in row {
+                    hash_expression(e, hasher);
+                }
+            }
         }
         Expression::CteReference(cte) => {
             cte.name.value_lower.hash(hasher);
@@ -1397,7 +1430,7 @@ pub struct CompiledEvaluator<'a> {
     vm: ExprVM,
 
     /// Local cache: expression hash -> program (fast, no synchronization)
-    local_cache: FxHashMap<u64, SharedProgram>,
+    local_cache: FxHashMap<(u64, u64), SharedProgram>,
 
     /// Current row values for execution (owned copy for safety)
     current_row: Option<Row>,
@@ -1673,14 +1706,27 @@ impl<'a> CompiledEvaluator<'a> {
     /// Fast recursive hash that avoids string allocation.
     /// Uses FxHasher which is 2-5x faster than SipHash for small keys.
     #[inline]
-    fn expr_hash(&self, expr: &Expression) -> u64 {
-        let mut hasher = FxHasher::default();
-        Self::hash_expression(expr, &mut hasher);
-        hasher.finish()
+    fn expr_hash(&self, expr: &Expression) -> (u64, u64) {
+        // Two independent algorithms; see compute_cache_key for why a
+        // single unverified 64-bit key is not collision-safe.
+        let mut h1 = FxHasher::default();
+        Self::hash_expression(expr, &mut h1);
+
+        use std::hash::BuildHasher;
+        let mut h2 = ahash::RandomState::with_seeds(
+            0x9e37_79b9_7f4a_7c15,
+            0xf39c_c060_5ced_c834,
+            0x1082_276b_f3a2_7251,
+            0x8f4c_a136_bef1_39c9,
+        )
+        .build_hasher();
+        Self::hash_expression(expr, &mut h2);
+
+        (h1.finish(), h2.finish())
     }
 
     /// Recursively hash an expression without string allocation
-    fn hash_expression(expr: &Expression, hasher: &mut FxHasher) {
+    fn hash_expression<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
         // First hash the discriminant to distinguish variants
         std::mem::discriminant(expr).hash(hasher);
 
@@ -2063,6 +2109,73 @@ mod tests {
             token: dummy_token(),
             value,
         })
+    }
+
+    fn make_gt(col: &str, val: i64) -> Expression {
+        Expression::Infix(InfixExpression {
+            token: dummy_token(),
+            left: Box::new(make_identifier(col)),
+            operator: ">".into(),
+            op_type: InfixOperator::GreaterThan,
+            right: Box::new(make_int_literal(val)),
+        })
+    }
+
+    #[test]
+    fn test_in_hashset_values_change_the_cache_key() {
+        use crate::common::CompactArc;
+        use crate::core::{Row, Value, ValueSet};
+        use crate::parser::ast::InHashSetExpression;
+
+        fn make_in_hashset(val: i64) -> Expression {
+            let mut set = ValueSet::default();
+            set.insert(Value::Integer(val));
+            Expression::InHashSet(InHashSetExpression {
+                token: dummy_token(),
+                column: Box::new(make_identifier("a")),
+                values: CompactArc::new(set),
+                not: false,
+            })
+        }
+
+        let cols = vec!["a".to_string()];
+        let e1 = make_in_hashset(1);
+        let e2 = make_in_hashset(2);
+
+        // Previously only values.len() was hashed, so these two shared one
+        // key in BOTH hash algorithms and aliased in the program cache.
+        let k1 = compute_cache_key(&e1, &cols);
+        let k2 = compute_cache_key(&e2, &cols);
+        assert_ne!(k1, k2, "IN-set contents must be part of the cache key");
+
+        // Behavioral repro from review: the second filter must not be
+        // served the first filter's compiled program.
+        let f1 = RowFilter::new(&e1, &cols).unwrap();
+        let f2 = RowFilter::new(&e2, &cols).unwrap();
+        let row = Row::from_values(vec![Value::Integer(2)]);
+        assert!(!f1.matches(&row), "a IN {{1}} must reject a = 2");
+        assert!(f2.matches(&row), "a IN {{2}} must accept a = 2");
+    }
+
+    #[test]
+    fn test_cache_key_pair_stable_and_discriminating() {
+        let cols = vec!["a".to_string()];
+        let e1 = make_gt("a", 1);
+        let e2 = make_gt("a", 2);
+
+        // Stable across calls (fixed seeds).
+        assert_eq!(compute_cache_key(&e1, &cols), compute_cache_key(&e1, &cols));
+
+        // Different expressions and different column sets change BOTH
+        // components, so a single-algorithm collision cannot alias entries.
+        let k1 = compute_cache_key(&e1, &cols);
+        let k2 = compute_cache_key(&e2, &cols);
+        assert_ne!(k1, k2);
+        assert_ne!(k1.0, k2.0);
+        assert_ne!(k1.1, k2.1);
+
+        let k3 = compute_cache_key(&e1, &["b".to_string()]);
+        assert_ne!(k1, k3);
     }
 
     fn make_infix(left: Expression, op: InfixOperator, right: Expression) -> Expression {
