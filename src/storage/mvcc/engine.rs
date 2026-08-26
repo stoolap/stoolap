@@ -603,7 +603,7 @@ impl MVCCEngine {
                     // New path: load manifests + volumes BEFORE WAL replay.
                     // Volumes must be loaded so is_row_id_in_volume() can check
                     // row_ids for idempotent INSERT during replay.
-                    let lsn = self.load_manifests_from_volumes();
+                    let lsn = self.load_manifests_from_volumes()?;
                     self.load_standalone_volumes_no_schema_check();
                     lsn
                 } else if has_legacy_snapshots {
@@ -3009,22 +3009,24 @@ impl MVCCEngine {
     /// - The minimum checkpoint_lsn determines where WAL replay starts
     ///
     /// Returns the minimum checkpoint_lsn across all loaded manifests (0 if none found).
+    /// Fails closed on an unreadable or unsupported manifest: opening with a
+    /// partially visible catalog lets the orphan reaper destroy live volumes.
     /// Actual .vol files are loaded later by `load_standalone_volumes()` after WAL replay
     /// creates the required schemas and version stores.
-    fn load_manifests_from_volumes(&self) -> u64 {
+    fn load_manifests_from_volumes(&self) -> Result<u64> {
         let pm = match self.persistence.as_ref() {
             Some(pm) if pm.is_enabled() => pm,
-            _ => return 0,
+            _ => return Ok(0),
         };
 
         let vol_dir = pm.path().join("volumes");
         if !vol_dir.exists() {
-            return 0;
+            return Ok(0);
         }
 
         let entries = match std::fs::read_dir(&vol_dir) {
             Ok(e) => e,
-            Err(_) => return 0,
+            Err(_) => return Ok(0),
         };
 
         let mut min_checkpoint_lsn: u64 = u64::MAX;
@@ -3058,7 +3060,14 @@ impl MVCCEngine {
                     // No manifest.bin in this directory, skip
                 }
                 Err(e) => {
-                    eprintln!("Warning: Failed to load manifest for {}: {}", table_name, e);
+                    return Err(Error::Internal {
+                        message: format!(
+                            "failed to load manifest for table '{}': {} (refusing to open \
+                             with a partially visible catalog; if the manifest is damaged, \
+                             recover with 'stoolap --reset-volumes --restore' from a snapshot)",
+                            table_name, e
+                        ),
+                    });
                 }
             }
         }
@@ -3068,14 +3077,14 @@ impl MVCCEngine {
             // to ensure full WAL replay
             let checkpoint_path = pm.path().join("wal").join("checkpoint.meta");
             let _ = std::fs::remove_file(checkpoint_path);
-            return 0;
+            return Ok(0);
         }
 
-        if min_checkpoint_lsn == u64::MAX {
+        Ok(if min_checkpoint_lsn == u64::MAX {
             0
         } else {
             min_checkpoint_lsn
-        }
+        })
     }
 
     /// Load standalone volumes from the volumes/ directory.
@@ -3209,6 +3218,15 @@ impl MVCCEngine {
 
             let paths = crate::storage::volume::io::list_volumes(&vol_dir, &table_name);
             if paths.is_empty() {
+                continue;
+            }
+
+            // .vol files with no manifest.bin: either a crash before the
+            // first manifest write (WAL replay covers the data) or a lost
+            // manifest (these files may be the only copy). An empty manager
+            // would treat every segment as an orphan and delete it, so leave
+            // the files untouched instead.
+            if !vol_dir.join(&table_name).join("manifest.bin").exists() {
                 continue;
             }
 

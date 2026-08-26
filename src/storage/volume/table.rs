@@ -1343,7 +1343,9 @@ impl Table for SegmentedTable {
                 // Claim the cold row to prevent concurrent lost deletes.
                 self.hot.try_claim_row(row_id)?;
                 if has_int_pk {
-                    let _ = self.hot.delete_by_row_ids(&[row_id]);
+                    // A swallowed failure here tombstones the cold row while
+                    // its hot PK index entry survives, wedging that PK value.
+                    self.hot.delete_by_row_ids(&[row_id])?;
                 }
                 // Track tombstone for commit. Pending tombstones are applied on commit
                 // and discarded on rollback to prevent isolation violations.
@@ -1547,7 +1549,9 @@ impl Table for SegmentedTable {
                 // Claim the cold row to prevent concurrent lost deletes.
                 self.hot.try_claim_row(row_id)?;
                 if has_int_pk {
-                    let _ = self.hot.delete_by_row_ids(&[row_id]);
+                    // A swallowed failure here tombstones the cold row while
+                    // its hot PK index entry survives, wedging that PK value.
+                    self.hot.delete_by_row_ids(&[row_id])?;
                 }
                 deleted_cold_ids.push(row_id);
                 count += 1;
