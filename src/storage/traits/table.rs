@@ -984,9 +984,9 @@ pub trait Table: Send + Sync {
         &self,
         column_name: &str,
         partition_value: &Value,
-    ) -> Option<RowVec> {
+    ) -> Result<Option<RowVec>> {
         let _ = (column_name, partition_value);
-        None // Default implementation - override in concrete tables
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Fetch rows by their row IDs with an optional filter.

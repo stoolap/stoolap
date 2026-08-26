@@ -3877,17 +3877,20 @@ impl Table for MVCCTable {
         &self,
         column_name: &str,
         partition_value: &Value,
-    ) -> Option<RowVec> {
+    ) -> Result<Option<RowVec>> {
         // If transaction has local changes, fall back to regular path
         {
             let txn_versions = self.txn_versions.read().unwrap();
             if txn_versions.has_local_changes() {
-                return None;
+                return Ok(None);
             }
         }
 
         // Get index for the column
-        let index = self.version_store.get_index_by_column(column_name)?;
+        let index = match self.version_store.get_index_by_column(column_name) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
 
         // Get row IDs for this partition value
         let row_ids = index.get_row_ids_equal(std::slice::from_ref(partition_value));
@@ -3902,7 +3905,7 @@ impl Table for MVCCTable {
             }
         }
 
-        Some(rows)
+        Ok(Some(rows))
     }
 
     fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()> {

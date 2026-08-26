@@ -943,7 +943,7 @@ impl SegmentedTable {
     ) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
         // ensure_columns before manifest lock to avoid deadlock
         // (ensure_columns may need manifest.write via reload_cold_volumes).
-        let segs = self.segment_mgr.segments_snapshot();
+        let segs = self.segment_mgr.segments_snapshot()?;
         let seg_ids: Vec<u64> = {
             let manifest = self.segment_mgr.manifest();
             manifest
@@ -959,16 +959,7 @@ impl SegmentedTable {
             };
             let vol = &cold.volume;
             if let Ok(idx) = vol.meta.row_ids.binary_search(&row_id) {
-                if vol.is_cold() {
-                    return Err(crate::core::Error::Internal {
-                        message: format!(
-                            "table '{}': cold volume reload failed for segment {}; \
-                             refusing to serve partial data",
-                            self.segment_mgr.table_name(),
-                            seg_id
-                        ),
-                    });
-                }
+                // segments_snapshot fails closed, so vol is never cold here.
                 vol.mark_accessed();
                 return Ok(Some((seg_id, Arc::clone(vol), idx)));
             }
@@ -3219,9 +3210,9 @@ impl Table for SegmentedTable {
         &self,
         column_name: &str,
         partition_value: &Value,
-    ) -> Option<RowVec> {
+    ) -> Result<Option<RowVec>> {
         if self.snapshot_seq.is_some() {
-            return None;
+            return Ok(None);
         }
         if !self.segment_mgr.has_segments() {
             return self
@@ -3230,16 +3221,19 @@ impl Table for SegmentedTable {
         }
 
         if self.segment_mgr.seal_overlap() > 0 {
-            return None;
+            return Ok(None);
         }
 
         let schema = self.hot.schema();
-        let col_idx = *schema.column_index_map().get(&column_name.to_lowercase())?;
+        let col_idx = match schema.column_index_map().get(&column_name.to_lowercase()) {
+            Some(&idx) => idx,
+            None => return Ok(None),
+        };
 
         // Get hot rows for this partition value
         let mut result = self
             .hot
-            .get_rows_for_partition_value(column_name, partition_value)
+            .get_rows_for_partition_value(column_name, partition_value)?
             .unwrap_or_default();
 
         // Build hot_skip: hot row_ids + tombstones + pending tombstones
@@ -3281,10 +3275,9 @@ impl Table for SegmentedTable {
             // Load cold volume on demand after pruning.
             let loaded;
             let vol: &Arc<FrozenVolume> = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id) {
-                    Err(_) => return None,
-                    Ok(Some(v)) => v,
-                    Ok(None) => continue,
+                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
+                    Some(v) => v,
+                    None => continue,
                 };
                 &loaded
             } else {
@@ -3321,7 +3314,7 @@ impl Table for SegmentedTable {
             }
         }
 
-        Some(result)
+        Ok(Some(result))
     }
 
     fn collect_rows_ordered_by_index(

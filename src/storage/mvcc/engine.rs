@@ -4035,7 +4035,17 @@ impl MVCCEngine {
             };
 
             if let Some(mgr) = mgr {
-                let volumes = mgr.get_volumes_newest_first()?;
+                let volumes = match mgr.get_volumes_newest_first() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Same protocol as any other snapshot failure:
+                        // mark the writer failed so Phase 3 removes every
+                        // pending temp file instead of leaking them.
+                        writer.fail();
+                        all_succeeded = false;
+                        break;
+                    }
+                };
 
                 // Use the frozen tombstone snapshot captured immediately after
                 // commit_seq. The commit path increments seq BEFORE applying

@@ -2492,32 +2492,31 @@ impl SegmentManager {
     /// Reloads cold volumes first so column data is available.
     /// Does NOT mark volumes as accessed — callers that need eviction
     /// protection should mark the specific volumes they use.
-    pub fn segments_snapshot(&self) -> Arc<FxHashMap<u64, ColdSegment>> {
+    pub fn segments_snapshot(&self) -> crate::core::Result<Arc<FxHashMap<u64, ColdSegment>>> {
         self.ensure_columns();
         let segs = Arc::clone(&*self.segments.read());
         if !segs.values().any(|cs| cs.volume.is_cold()) {
-            return segs;
+            return Ok(segs);
         }
-        // Race or persistent failure: retry once then filter.
+        // Race with eviction: retry once, then fail closed. Filtering the
+        // cold segments out would hand callers a silently smaller table.
         self.ensure_columns();
         let segs = Arc::clone(&*self.segments.read());
-        if segs.values().any(|cs| cs.volume.is_cold()) {
-            let mut filtered = (*segs).clone();
-            let cold: Vec<(u64, usize)> = filtered
-                .iter()
-                .filter(|(_, cs)| cs.volume.is_cold())
-                .map(|(&id, cs)| (id, cs.volume.meta.row_count))
-                .collect();
-            for &(seg_id, rows) in &cold {
-                eprintln!(
-                    "Warning: table {} seg={}: cold volume excluded from snapshot ({} rows, reload failed)",
-                    self.table_name, seg_id, rows
-                );
-            }
-            filtered.retain(|_, cs| !cs.volume.is_cold());
-            return Arc::new(filtered);
+        let cold: Vec<u64> = segs
+            .iter()
+            .filter(|(_, cs)| cs.volume.is_cold())
+            .map(|(&id, _)| id)
+            .collect();
+        if !cold.is_empty() {
+            return Err(crate::core::Error::Internal {
+                message: format!(
+                    "table '{}': cold volume reload failed for segment(s) {:?}; \
+                     refusing to serve partial data",
+                    self.table_name, cold
+                ),
+            });
         }
-        segs
+        Ok(segs)
     }
 
     /// Raw CoW snapshot without ensure_columns. Callers that only need
