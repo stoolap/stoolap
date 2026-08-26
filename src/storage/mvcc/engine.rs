@@ -1329,7 +1329,7 @@ impl MVCCEngine {
 
                 // HNSW indexes need cold segment data too — vector similarity search
                 // cannot fall back to zone maps like other index types.
-                self.populate_hnsw_from_segments();
+                self.populate_hnsw_from_segments()?;
 
                 Ok(())
             }
@@ -1355,7 +1355,7 @@ impl MVCCEngine {
     /// row_id exists in multiple overlapping volumes, only the newest version is
     /// added to the HNSW graph. Also skips row_ids that are in the hot buffer
     /// (already indexed by populate_all_indexes).
-    fn populate_hnsw_from_segments(&self) {
+    fn populate_hnsw_from_segments(&self) -> Result<()> {
         let stores = self.version_stores.read().unwrap();
         let mgrs = self.segment_managers.read().unwrap();
 
@@ -1387,7 +1387,7 @@ impl MVCCEngine {
 
                 let tombstones = mgr.tombstone_set_arc();
                 // Use newest-first ordering so overlapping row_ids resolve to newest version
-                let volumes = mgr.get_volumes_newest_first();
+                let volumes = mgr.get_volumes_newest_first()?;
 
                 // Seed seen set with hot row_ids (already indexed by populate_all_indexes)
                 let mut seen: rustc_hash::FxHashSet<i64> = store
@@ -1476,6 +1476,7 @@ impl MVCCEngine {
                 }
             }
         }
+        Ok(())
     }
 
     /// Populate pre-computed `default_value` from `default_expr` on all schema columns.
@@ -4034,7 +4035,17 @@ impl MVCCEngine {
             };
 
             if let Some(mgr) = mgr {
-                let volumes = mgr.get_volumes_newest_first();
+                let volumes = match mgr.get_volumes_newest_first() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // Same protocol as any other snapshot failure:
+                        // mark the writer failed so Phase 3 removes every
+                        // pending temp file instead of leaking them.
+                        writer.fail();
+                        all_succeeded = false;
+                        break;
+                    }
+                };
 
                 // Use the frozen tombstone snapshot captured immediately after
                 // commit_seq. The commit path increments seq BEFORE applying
@@ -5388,7 +5399,7 @@ impl MVCCEngine {
                             let vol = segs.get(&seg.segment_id)?;
                             if vol.volume.is_cold() {
                                 // Load only this merge candidate from disk.
-                                let loaded = mgr.ensure_volume(seg.segment_id)?;
+                                let loaded = mgr.ensure_volume(seg.segment_id).ok()??;
                                 Some((seg.segment_id, loaded))
                             } else {
                                 Some((seg.segment_id, Arc::clone(&vol.volume)))
@@ -6391,7 +6402,7 @@ impl Engine for MVCCEngine {
                     result.iter().map(|(id, _)| *id).collect();
                 for &rid in row_ids {
                     if !found_ids.contains(&rid) {
-                        if let Some(row) = mgr.get_cold_row_normalized(rid, &schema) {
+                        if let Some(row) = mgr.get_cold_row_normalized(rid, &schema)? {
                             result.push((rid, row));
                         }
                     }
@@ -6404,7 +6415,7 @@ impl Engine for MVCCEngine {
     fn get_row_fetcher(
         &self,
         table_name: &str,
-    ) -> Result<Box<dyn Fn(&[i64]) -> crate::core::RowVec + Send + Sync>> {
+    ) -> Result<Box<dyn Fn(&[i64]) -> Result<crate::core::RowVec> + Send + Sync>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6421,13 +6432,13 @@ impl Engine for MVCCEngine {
                     result.iter().map(|(id, _)| *id).collect();
                 for &rid in row_ids {
                     if !found_ids.contains(&rid) {
-                        if let Some(row) = mgr.get_cold_row_normalized(rid, &schema) {
+                        if let Some(row) = mgr.get_cold_row_normalized(rid, &schema)? {
                             result.push((rid, row));
                         }
                     }
                 }
             }
-            result
+            Ok(result)
         }))
     }
 
@@ -6754,7 +6765,7 @@ impl EngineOperations {
                     if let Some(pk_val) = row.get(pk_col) {
                         if !pk_val.is_null() {
                             if let Some(cold_rid) =
-                                mgr.check_value_exists_in_segments(pk_col, pk_val)
+                                mgr.check_value_exists_in_segments(pk_col, pk_val)?
                             {
                                 if !mgr.is_pending_tombstone(txn_id, cold_rid) {
                                     return Err(crate::core::Error::PrimaryKeyConstraint {
@@ -6779,7 +6790,7 @@ impl EngineOperations {
                     }
                     let values: Vec<&crate::core::Value> = coerced.iter().collect();
                     if let Some(cold_rid) =
-                        mgr.find_row_id_by_values(col_indices, &values, defaults)
+                        mgr.find_row_id_by_values(col_indices, &values, defaults)?
                     {
                         if !mgr.is_pending_tombstone(txn_id, cold_rid) {
                             return Err(crate::core::Error::UniqueConstraint {
@@ -6808,7 +6819,7 @@ impl EngineOperations {
                         if let Some(pk_val) = new_pk {
                             if !pk_val.is_null() {
                                 if let Some(cold_rid) =
-                                    mgr.check_value_exists_in_segments(pk_col, pk_val)
+                                    mgr.check_value_exists_in_segments(pk_col, pk_val)?
                                 {
                                     if cold_rid != row_id
                                         && !mgr.is_pending_tombstone(txn_id, cold_rid)
@@ -6853,7 +6864,7 @@ impl EngineOperations {
                     }
                     let values: Vec<&crate::core::Value> = coerced.iter().collect();
                     if let Some(cold_rid) =
-                        mgr.find_row_id_by_values(col_indices, &values, defaults)
+                        mgr.find_row_id_by_values(col_indices, &values, defaults)?
                     {
                         if cold_rid != row_id && !mgr.is_pending_tombstone(txn_id, cold_rid) {
                             return Err(crate::core::Error::UniqueConstraint {

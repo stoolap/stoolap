@@ -284,7 +284,7 @@ pub trait Engine: Send + Sync {
     fn get_row_fetcher(
         &self,
         table_name: &str,
-    ) -> Result<Box<dyn Fn(&[i64]) -> RowVec + Send + Sync>> {
+    ) -> Result<Box<dyn Fn(&[i64]) -> Result<RowVec> + Send + Sync>> {
         // Default implementation: fall back to fetch_rows_by_ids
         let _ = table_name;
         Err(crate::core::Error::internal(

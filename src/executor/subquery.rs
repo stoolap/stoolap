@@ -507,7 +507,7 @@ impl Executor {
             // Check batches until we find a visible row or exhaust all row_ids
             // We can't stop after first batch because deleted rows may precede visible ones
             for chunk in row_ids.chunks(VISIBILITY_CHECK_BATCH_SIZE) {
-                let visible = row_fetcher(chunk);
+                let visible = row_fetcher(chunk)?;
                 if !visible.is_empty() {
                     return Ok(Some(true)); // Found at least one visible row
                 }
@@ -616,7 +616,7 @@ impl Executor {
         // Fetch rows by their IDs using the cached row fetcher
         const BATCH_SIZE: usize = 100;
         for batch in row_ids.chunks(BATCH_SIZE) {
-            let fetched = row_fetcher(batch);
+            let fetched = row_fetcher(batch)?;
 
             // Check each row against the predicate
             for (_row_id, row) in fetched {
@@ -861,7 +861,7 @@ impl Executor {
                                 }
                             }
                         };
-                        let visible_rows = row_fetcher(&row_ids);
+                        let visible_rows = row_fetcher(&row_ids)?;
                         return Ok(Some(visible_rows.len() as i64));
                     }
                 },

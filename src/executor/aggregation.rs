@@ -6797,14 +6797,16 @@ impl Executor {
             }
         };
 
-        // Check if column has an index (required for fast path)
-        if table.get_partition_count(&column_name).is_none() {
-            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
-            return None;
-        }
-
-        // Get the count
-        let count = table.get_partition_count(&column_name).unwrap();
+        // Check if column has an index (required for fast path). Reuse the
+        // value: a second call could return None (e.g. seal overlap or a
+        // cold-volume reload failure) and an unwrap would panic.
+        let count = match table.get_partition_count(&column_name) {
+            Some(c) => c,
+            None => {
+                *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+                return None;
+            }
+        };
 
         // Cache the compiled state
         let compiled_cd = CompiledCountDistinct {

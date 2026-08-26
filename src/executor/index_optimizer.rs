@@ -1109,7 +1109,7 @@ impl Executor {
             Box::new(ConstBoolExpr::true_expr());
 
         // Fetch rows by row_ids - returns RowVec directly
-        let mut rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref());
+        let mut rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref())?;
 
         // Apply remaining predicate if any
         if let Some(ref remaining) = remaining_predicate {
@@ -1330,7 +1330,7 @@ impl Executor {
             Box::new(ConstBoolExpr::true_expr());
 
         // Fetch rows by row_ids - returns RowVec directly
-        let mut rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref());
+        let mut rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref())?;
 
         // Apply remaining predicate if any
         if let Some(ref remaining) = remaining_predicate {
@@ -1732,7 +1732,7 @@ impl Executor {
             Box::new(ConstBoolExpr::true_expr());
 
         // Fetch rows by row_ids - returns RowVec directly
-        let mut rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref());
+        let mut rows = table.fetch_rows_by_ids(&all_row_ids, filter.as_ref())?;
 
         // Apply remaining predicate if any
         if let Some(ref remaining) = remaining_predicate {

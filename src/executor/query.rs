@@ -9435,7 +9435,7 @@ impl Executor {
                 if needs_row_fetch {
                     // Use the reusable buffer for row fetching
                     row_buffer.clear();
-                    table.fetch_rows_by_ids_into(row_ids, &true_expr, &mut row_buffer);
+                    table.fetch_rows_by_ids_into(row_ids, &true_expr, &mut row_buffer)?;
 
                     for (_row_id, row) in &row_buffer {
                         for (i, agg) in simple_aggs.iter().enumerate() {

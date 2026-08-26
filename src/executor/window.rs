@@ -887,7 +887,7 @@ impl Executor {
 
             // Fetch rows for this partition only (KEY OPTIMIZATION!)
             let partition_rows =
-                match table.get_rows_for_partition_value(partition_col, &partition_value) {
+                match table.get_rows_for_partition_value(partition_col, &partition_value)? {
                     Some(rows) => rows,
                     None => continue,
                 };

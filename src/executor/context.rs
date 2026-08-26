@@ -325,7 +325,7 @@ pub fn cache_exists_index(key: String, index: std::sync::Arc<dyn Index>) {
 }
 
 /// Type alias for row fetcher function used in EXISTS/COUNT optimization.
-pub type RowFetcher = Box<dyn Fn(&[i64]) -> crate::core::RowVec + Send + Sync>;
+pub type RowFetcher = Box<dyn Fn(&[i64]) -> crate::core::Result<crate::core::RowVec> + Send + Sync>;
 
 /// Type alias for row counter function used in COUNT(*) optimization.
 /// This only counts visible rows without cloning their data.

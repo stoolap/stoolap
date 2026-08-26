@@ -1830,7 +1830,12 @@ impl Table for MVCCTable {
     /// Fetch rows into a reusable RowVec buffer.
     /// Optimized to use batch fetch for global store rows,
     /// reducing lock contention from O(n) to O(1).
-    fn fetch_rows_by_ids_into(&self, row_ids: &[i64], filter: &dyn Expression, rows: &mut RowVec) {
+    fn fetch_rows_by_ids_into(
+        &self,
+        row_ids: &[i64],
+        filter: &dyn Expression,
+        rows: &mut RowVec,
+    ) -> Result<()> {
         let txn_versions = self.txn_versions.read().unwrap();
         let schema = &self.cached_schema;
 
@@ -1872,6 +1877,7 @@ impl Table for MVCCTable {
                 }
             }
         }
+        Ok(())
     }
 
     fn create_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
@@ -2436,8 +2442,8 @@ impl Table for MVCCTable {
         Ok(delete_count)
     }
 
-    fn get_active_row_ids(&self) -> Vec<i64> {
-        self.version_store.get_all_row_ids()
+    fn get_active_row_ids(&self) -> Result<Vec<i64>> {
+        Ok(self.version_store.get_all_row_ids())
     }
 
     fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
@@ -2767,7 +2773,7 @@ impl Table for MVCCTable {
             // Try index lookup for non-PK columns
             if let Some(filtered_row_ids) = self.try_index_lookup(expr, &schema) {
                 // Use index-based scan - much more efficient
-                let rows = self.fetch_rows_by_ids(&filtered_row_ids, expr);
+                let rows = self.fetch_rows_by_ids(&filtered_row_ids, expr)?;
                 let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
                 return Ok(Box::new(scanner));
             }
@@ -3871,17 +3877,20 @@ impl Table for MVCCTable {
         &self,
         column_name: &str,
         partition_value: &Value,
-    ) -> Option<RowVec> {
+    ) -> Result<Option<RowVec>> {
         // If transaction has local changes, fall back to regular path
         {
             let txn_versions = self.txn_versions.read().unwrap();
             if txn_versions.has_local_changes() {
-                return None;
+                return Ok(None);
             }
         }
 
         // Get index for the column
-        let index = self.version_store.get_index_by_column(column_name)?;
+        let index = match self.version_store.get_index_by_column(column_name) {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
 
         // Get row IDs for this partition value
         let row_ids = index.get_row_ids_equal(std::slice::from_ref(partition_value));
@@ -3896,7 +3905,7 @@ impl Table for MVCCTable {
             }
         }
 
-        Some(rows)
+        Ok(Some(rows))
     }
 
     fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()> {
