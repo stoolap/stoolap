@@ -842,6 +842,21 @@ impl SegmentManager {
     /// for the whole statement and never re-reads live manager state after
     /// mutating the hot buffer: eviction and compaction copy-on-write new
     /// maps/Arcs, so nothing in the snapshot can go cold or disappear.
+    /// Statement-snapshot variant of `find_row_id_by_values`: runs
+    /// entirely against the given captured parts, so it can neither
+    /// observe concurrent compaction nor need a live cold reload.
+    pub fn find_row_id_by_values_in(
+        &self,
+        seg_ids: &[u64],
+        segs: &FxHashMap<u64, ColdSegment>,
+        ts: &FxHashMap<i64, u64>,
+        col_indices: &[usize],
+        values: &[&Value],
+        column_defaults: &[Value],
+    ) -> crate::core::Result<Option<i64>> {
+        self.find_row_id_by_values_impl(seg_ids, segs, ts, col_indices, values, column_defaults)
+    }
+
     pub fn statement_snapshot(&self) -> crate::core::Result<StatementSnapshot> {
         let capture = || {
             let manifest = self.manifest.read();
@@ -944,23 +959,16 @@ impl SegmentManager {
     /// Iterates newest-first with per-volume physical mapping. Used by
     /// overlap verification to check the authoritative version after
     /// UPDATE changes a PK value + seal (schema-evolution safe).
+    /// Resolve against the CALLER'S segment view (newest-first ids + map)
+    /// so statement-snapshot flows never re-read live state here.
     fn get_authoritative_value(
         &self,
+        seg_ids: &[u64],
+        segments: &FxHashMap<u64, ColdSegment>,
         row_id: i64,
         col_idx: usize,
     ) -> crate::core::Result<Option<crate::core::Value>> {
-        let (seg_ids, segments) = {
-            let manifest = self.manifest.read();
-            let seg_ids: Vec<u64> = manifest
-                .segments
-                .iter()
-                .rev()
-                .map(|m| m.segment_id)
-                .collect();
-            let segments = Arc::clone(&*self.segments.read());
-            (seg_ids, segments)
-        };
-        for seg_id in &seg_ids {
+        for seg_id in seg_ids {
             if let Some(cold) = segments.get(seg_id) {
                 if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
                     let pi = if cold.mapping.is_identity {
@@ -1051,7 +1059,7 @@ impl SegmentManager {
                         if seen.insert(rid) && !ts.contains_key(&rid) {
                             if seg_ids.len() > 1 {
                                 if let Some(current_val) =
-                                    self.get_authoritative_value(rid, col_idx)?
+                                    self.get_authoritative_value(seg_ids, segs, rid, col_idx)?
                                 {
                                     if &current_val != value {
                                         i += 1;
@@ -1075,7 +1083,7 @@ impl SegmentManager {
                         {
                             if seg_ids.len() > 1 {
                                 if let Some(current_val) =
-                                    self.get_authoritative_value(rid, col_idx)?
+                                    self.get_authoritative_value(seg_ids, segs, rid, col_idx)?
                                 {
                                     if &current_val != value {
                                         continue;
@@ -1291,7 +1299,7 @@ impl SegmentManager {
                 if seg_ids.len() > 1 {
                     let mut still_matches = true;
                     for (i, &ci) in col_indices.iter().enumerate() {
-                        let ok = match self.get_authoritative_value(rid, ci)? {
+                        let ok = match self.get_authoritative_value(seg_ids, segs, rid, ci)? {
                             Some(v) => !v.is_null() && v == *values[i],
                             None => column_defaults[i] == *values[i],
                         };
@@ -3365,5 +3373,76 @@ mod tests {
         assert_eq!(vols.len(), 1, "snapshot must not lose its segment");
         assert_eq!(vols[0].0, 1);
         assert_eq!(vols[0].1.volume.get_row(0)[0], Value::Integer(1));
+    }
+    #[test]
+    fn test_unique_lookup_uses_statement_snapshot_not_live_state() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+
+        let schema = SchemaBuilder::new("uniq_snap")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        // No volume_dir: once the live map goes cold, live lookups must
+        // fail to reload while the statement snapshot keeps working.
+        let mgr = SegmentManager::new("uniq_snap", None);
+        let mut b = super::super::writer::VolumeBuilder::new(&schema);
+        for i in 1..=10i64 {
+            b.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
+        }
+        let mut volume = b.finish();
+        let (_, store) = crate::storage::volume::io::serialize_v4_public(&volume).unwrap();
+        volume.columns.attach_compressed_store(store);
+        mgr.register_segment(
+            1,
+            Arc::new(volume),
+            SegmentMeta {
+                segment_id: 1,
+                file_path: PathBuf::from("uniq.vol"),
+                row_count: 10,
+                min_row_id: 1,
+                max_row_id: 10,
+                creation_lsn: 0,
+                seal_seq: 0,
+                schema_version: 0,
+            },
+            None,
+        );
+
+        let snap = mgr.statement_snapshot().unwrap();
+
+        let _epoch_guard = EVICTION_EPOCH_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let base =
+            super::super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        for e in 0..=10u64 {
+            super::super::writer::GLOBAL_EVICTION_EPOCH
+                .fetch_max(base + e, std::sync::atomic::Ordering::Relaxed);
+            mgr.evict_idle_volumes(base + e);
+        }
+        assert!(
+            mgr.segments_raw().get(&1).unwrap().volume.is_cold(),
+            "precondition: live map must be cold"
+        );
+
+        let target = Value::Integer(5);
+        let defaults = [Value::Integer(0)];
+        // Review probe: the live lookup fails to reload...
+        assert!(
+            mgr.find_row_id_by_values(&[0], &[&target], &defaults)
+                .is_err(),
+            "live lookup must fail on unreloadable cold state"
+        );
+        // ...while the statement-snapshot lookup keeps serving its view.
+        let found = mgr
+            .find_row_id_by_values_in(
+                &snap.seg_ids_newest_first,
+                &snap.segs,
+                &snap.tombstones,
+                &[0],
+                &[&target],
+                &defaults,
+            )
+            .unwrap();
+        assert_eq!(found, Some(5), "snapshot lookup must succeed");
     }
 }

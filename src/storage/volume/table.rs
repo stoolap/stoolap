@@ -303,6 +303,39 @@ impl SegmentedTable {
         self.find_segment_row_id_by_values_with_snapshot(&snapshot, col_indices, values)
     }
 
+    /// Statement-snapshot variant: the unique lookup runs entirely
+    /// against the statement's captured view, so it cannot need a live
+    /// cold reload after the statement has already mutated state.
+    fn find_segment_row_id_by_values_in_stmt(
+        &self,
+        snap: &super::manifest::StatementSnapshot,
+        col_indices: &[usize],
+        values: &[&Value],
+    ) -> Result<Option<i64>> {
+        if col_indices.is_empty() || col_indices.len() != values.len() {
+            return Ok(None);
+        }
+        let defaults: smallvec::SmallVec<[Value; 4]> = col_indices
+            .iter()
+            .map(|&ci| self.column_default(ci))
+            .collect();
+        let rid = match self.segment_mgr.find_row_id_by_values_in(
+            &snap.seg_ids_newest_first,
+            &snap.segs,
+            &snap.tombstones,
+            col_indices,
+            values,
+            &defaults,
+        )? {
+            Some(rid) => rid,
+            None => return Ok(None),
+        };
+        if self.segment_mgr.is_pending_tombstone(self.txn_id(), rid) {
+            return Ok(None);
+        }
+        Ok(Some(rid))
+    }
+
     fn find_segment_row_id_by_values_with_snapshot(
         &self,
         snapshot: &super::manifest::ColdSnapshot,
@@ -339,7 +372,12 @@ impl SegmentedTable {
     /// Uses zone maps, bloom filters, dictionary pre-filters, and binary search
     /// on sorted columns for fast rejection. No index population needed.
     /// Check cold unique constraints for UPDATE, excluding the row being updated.
-    fn check_cold_unique_for_update(&self, new_row: &Row, exclude_row_id: i64) -> Result<()> {
+    fn check_cold_unique_for_update(
+        &self,
+        new_row: &Row,
+        exclude_row_id: i64,
+        snap: Option<&super::manifest::StatementSnapshot>,
+    ) -> Result<()> {
         let schema = self.hot.schema();
         self.hot
             .for_each_unique_non_pk_index(&mut |idx_name, col_names| {
@@ -363,7 +401,13 @@ impl SegmentedTable {
                 }
                 let values: Vec<&Value> = coerced.iter().collect();
 
-                if let Some(found_id) = self.find_segment_row_id_by_values(&col_indices, &values)? {
+                let found = match snap {
+                    Some(snap) => {
+                        self.find_segment_row_id_by_values_in_stmt(snap, &col_indices, &values)?
+                    }
+                    None => self.find_segment_row_id_by_values(&col_indices, &values)?,
+                };
+                if let Some(found_id) = found {
                     if found_id != exclude_row_id {
                         return Err(crate::core::Error::UniqueConstraint {
                             index: idx_name.to_string(),
@@ -1281,7 +1325,11 @@ impl Table for SegmentedTable {
 
                     // Check unique constraints against cold segments.
                     if self.hot.has_unique_non_pk_indexes() {
-                        self.check_cold_unique_for_update(&new_row, row_id)?;
+                        self.check_cold_unique_for_update(
+                            &new_row,
+                            row_id,
+                            cold_snapshot.as_ref(),
+                        )?;
                     }
 
                     // Insert the NEW row into hot. For int PK tables, first
@@ -1376,7 +1424,11 @@ impl Table for SegmentedTable {
                     // Claim the cold row to prevent concurrent lost updates.
                     self.hot.try_claim_row(row_id)?;
                     if self.hot.has_unique_non_pk_indexes() {
-                        self.check_cold_unique_for_update(&new_row, row_id)?;
+                        self.check_cold_unique_for_update(
+                            &new_row,
+                            row_id,
+                            cold_snapshot.as_ref(),
+                        )?;
                     }
                     let result = if has_int_pk {
                         let insert_ok = match self.hot.insert_discard(old_row) {
