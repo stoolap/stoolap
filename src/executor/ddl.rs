@@ -908,6 +908,10 @@ impl Executor {
         match stmt.operation {
             AlterTableOperation::AddColumn => {
                 if let Some(ref col_def) = stmt.column_def {
+                    if stmt.if_not_exists && table.schema().has_column(&col_def.name.value) {
+                        return Ok(Box::new(ExecResult::empty()));
+                    }
+
                     let data_type = self.parse_data_type(&col_def.data_type)?;
                     let nullable = !col_def
                         .constraints
@@ -970,6 +974,10 @@ impl Executor {
             }
             AlterTableOperation::DropColumn => {
                 if let Some(ref col_name) = stmt.column_name {
+                    if stmt.if_exists && !table.schema().has_column(&col_name.value) {
+                        return Ok(Box::new(ExecResult::empty()));
+                    }
+
                     table.drop_column(&col_name.value)?;
 
                     // Refresh schema cache FIRST so invalidate_mappings sees the post-drop schema
@@ -990,6 +998,10 @@ impl Executor {
             }
             AlterTableOperation::RenameColumn => match (&stmt.column_name, &stmt.new_column_name) {
                 (Some(old_name), Some(new_name)) => {
+                    if stmt.if_exists && !table.schema().has_column(&old_name.value) {
+                        return Ok(Box::new(ExecResult::empty()));
+                    }
+
                     table.rename_column(&old_name.value, &new_name.value)?;
 
                     // Propagate rename alias to cold volumes

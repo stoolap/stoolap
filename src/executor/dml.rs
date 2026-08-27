@@ -148,6 +148,8 @@ struct CompiledUpsert {
     /// (column_index, column_name, check_expression_text, compiled_check_program)
     /// The program is executed with a single-column row containing the new value.
     compiled_checks: Vec<(usize, String, String, super::expression::SharedProgram)>,
+    /// Optional WHERE condition for conditional upsert (ON CONFLICT ... DO UPDATE ... WHERE ...)
+    compiled_where: Option<super::expression::SharedProgram>,
 }
 
 impl Executor {
@@ -2813,18 +2815,48 @@ impl Executor {
 
         let col_map = schema.column_index_map();
 
+        let fallback_all_columns = if stmt.update_columns.is_empty() {
+            schema
+                .columns
+                .iter()
+                .map(|c| {
+                    Expression::QualifiedIdentifier(QualifiedIdentifier {
+                        token: dummy_token_clone(),
+                        qualifier: Box::new(Identifier::new(dummy_token_clone(), "EXCLUDED".to_string())),
+                        name: Box::new(Identifier::new(dummy_token_clone(), c.name.clone())),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        let (update_columns_ref, update_expressions_ref): (Vec<Identifier>, Vec<&Expression>) =
+            if stmt.update_columns.is_empty() {
+                let cols = schema
+                    .columns
+                    .iter()
+                    .map(|col| Identifier::new(dummy_token_clone(), col.name.clone()))
+                    .collect();
+                let exprs = fallback_all_columns.iter().collect();
+                (cols, exprs)
+            } else {
+                let cols = stmt.update_columns.clone();
+                let exprs = stmt.update_expressions.iter().collect();
+                (cols, exprs)
+            };
+
         // Resolve each update column to its schema index, type, and AST expression.
-        let update_specs: Vec<(usize, DataType, u16, &Expression)> = stmt
-            .update_columns
+        let update_specs: Vec<(usize, DataType, u16, &Expression)> = update_columns_ref
             .iter()
-            .zip(stmt.update_expressions.iter())
+            .zip(update_expressions_ref.iter())
             .filter_map(|(col, expr)| {
                 col_map.get(col.value_lower.as_str()).map(|&idx| {
                     (
                         idx,
                         schema.columns[idx].data_type,
                         schema.columns[idx].vector_dimensions,
-                        expr,
+                        *expr,
                     )
                 })
             })
@@ -2880,9 +2912,28 @@ impl Executor {
             })
             .collect();
 
+        // Compile optional WHERE condition for conditional ON CONFLICT DO UPDATE ... WHERE ...
+        let compiled_where = if let Some(ref where_expr) = stmt.update_where {
+            let compile_ctx = CompileContext::new(&column_names, global_registry())
+                .with_second_row(&excluded_columns);
+            let compiler = ExprCompiler::new(&compile_ctx);
+            match compiler.compile(where_expr) {
+                Ok(program) => Some(CompactArc::new(program)),
+                Err(e) => {
+                    return Err(Error::internal(format!(
+                        "failed to compile ON CONFLICT update WHERE expression: {}",
+                        e
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(CompiledUpsert {
             compiled_updates,
             compiled_checks,
+            compiled_where,
         })
     }
 
@@ -2978,17 +3029,42 @@ impl Executor {
 
         // Create a setter function that applies the ON DUPLICATE KEY UPDATE
         let mut setter = |mut row: Row| -> Result<(Row, bool)> {
+            // Build execution context joining existing row with EXCLUDED row
+            let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row);
+            if !params.is_empty() {
+                exec_ctx = exec_ctx.with_params(params);
+            }
+            if !named_params.is_empty() {
+                exec_ctx = exec_ctx.with_named_params(named_params);
+            }
+
+            // Check optional WHERE condition for conditional upsert (e.g. ON CONFLICT ... DO UPDATE ... WHERE condition)
+            if let Some(ref where_prog) = effective.compiled_where {
+                if let Ok(res) = vm.execute_cow(where_prog, &exec_ctx) {
+                    let is_true = match &res {
+                        Value::Boolean(b) => *b,
+                        Value::Integer(i) => *i != 0,
+                        Value::Float(f) => *f != 0.0,
+                        Value::Text(s) => s.eq_ignore_ascii_case("true") || s == "1",
+                        _ => false,
+                    };
+                    if !is_true {
+                        // WHERE condition not satisfied -> skip update on this row
+                        if capture_row {
+                            captured_row = Some(row.clone());
+                        }
+                        return Ok((row, false));
+                    }
+                } else {
+                    if capture_row {
+                        captured_row = Some(row.clone());
+                    }
+                    return Ok((row, false));
+                }
+            }
+
             // Collect all updates first to avoid borrow conflicts
             let updates_to_apply: Vec<(usize, Value)> = {
-                // Use for_join to make EXCLUDED columns available as row2
-                let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row);
-                if !params.is_empty() {
-                    exec_ctx = exec_ctx.with_params(params);
-                }
-                if !named_params.is_empty() {
-                    exec_ctx = exec_ctx.with_named_params(named_params);
-                }
-
                 let mut updates = Vec::with_capacity(effective.compiled_updates.len());
                 for (idx, col_type, vec_dims, program) in &effective.compiled_updates {
                     if let Ok(v) = vm.execute_cow(program, &exec_ctx) {

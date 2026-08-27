@@ -29,6 +29,7 @@ struct ConflictClause {
     on_duplicate: bool,
     update_columns: Vec<Identifier>,
     update_expressions: Vec<Expression>,
+    update_where: Option<Expression>,
     do_nothing: bool,
     conflict_target: Vec<Identifier>,
 }
@@ -86,6 +87,7 @@ impl Parser {
                 "SELECT" => self.parse_select_statement().map(Statement::Select),
                 "WITH" => self.parse_with_statement(),
                 "INSERT" => self.parse_insert_statement().map(Statement::Insert),
+                "REPLACE" => self.parse_replace_statement().map(Statement::Insert),
                 "UPDATE" => self.parse_update_statement().map(Statement::Update),
                 "DELETE" => self.parse_delete_statement().map(Statement::Delete),
                 "TRUNCATE" => self.parse_truncate_statement().map(Statement::Truncate),
@@ -885,6 +887,26 @@ impl Parser {
     /// Parse an INSERT statement
     fn parse_insert_statement(&mut self) -> Option<InsertStatement> {
         let token = self.cur_token.clone();
+        let mut or_ignore = false;
+        let mut or_replace = false;
+
+        // Check for SQLite "OR IGNORE" / "OR REPLACE" (e.g. INSERT OR IGNORE INTO ...)
+        if self.peek_token_is_keyword("OR") {
+            self.next_token(); // consume OR
+            if self.peek_token.literal.eq_ignore_ascii_case("IGNORE") {
+                self.next_token(); // consume IGNORE
+                or_ignore = true;
+            } else if self.peek_token.literal.eq_ignore_ascii_case("REPLACE") {
+                self.next_token(); // consume REPLACE
+                or_replace = true;
+            } else {
+                self.add_error(format!(
+                    "expected IGNORE or REPLACE after OR at {}",
+                    self.cur_token.position
+                ));
+                return None;
+            }
+        }
 
         // Expect INTO
         if !self.expect_keyword("INTO") {
@@ -926,10 +948,11 @@ impl Parser {
                 columns,
                 values: Vec::new(),
                 select: Some(Box::new(select_stmt)),
-                on_duplicate: conflict.on_duplicate,
+                on_duplicate: conflict.on_duplicate || or_replace,
                 update_columns: conflict.update_columns,
                 update_expressions: conflict.update_expressions,
-                do_nothing: conflict.do_nothing,
+                update_where: conflict.update_where,
+                do_nothing: conflict.do_nothing || or_ignore,
                 conflict_target: conflict.conflict_target,
                 returning,
             });
@@ -963,10 +986,11 @@ impl Parser {
                 columns,
                 values: Vec::new(),
                 select: Some(Box::new(select_stmt)),
-                on_duplicate: conflict.on_duplicate,
+                on_duplicate: conflict.on_duplicate || or_replace,
                 update_columns: conflict.update_columns,
                 update_expressions: conflict.update_expressions,
-                do_nothing: conflict.do_nothing,
+                update_where: conflict.update_where,
+                do_nothing: conflict.do_nothing || or_ignore,
                 conflict_target: conflict.conflict_target,
                 returning,
             });
@@ -992,11 +1016,83 @@ impl Parser {
             columns,
             values,
             select: None,
-            on_duplicate: conflict.on_duplicate,
+            on_duplicate: conflict.on_duplicate || or_replace,
             update_columns: conflict.update_columns,
             update_expressions: conflict.update_expressions,
-            do_nothing: conflict.do_nothing,
+            update_where: conflict.update_where,
+            do_nothing: conflict.do_nothing || or_ignore,
             conflict_target: conflict.conflict_target,
+            returning,
+        })
+    }
+
+    /// Parse a REPLACE statement (e.g. REPLACE INTO table (cols) VALUES (...))
+    fn parse_replace_statement(&mut self) -> Option<InsertStatement> {
+        let token = self.cur_token.clone();
+
+        // Expect INTO
+        if !self.expect_keyword("INTO") {
+            return None;
+        }
+
+        // Parse table name
+        if !self.expect_peek(TokenType::Identifier) {
+            return None;
+        }
+        let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
+
+        // Parse optional column list
+        let mut columns = Vec::new();
+        if self.peek_token_is_punctuator("(") {
+            self.next_token(); // consume (
+            columns = self.parse_identifier_list();
+            if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
+                self.add_error(format!("expected ')' at {}", self.cur_token.position));
+                return None;
+            }
+        }
+
+        // Check if next is VALUES, SELECT, or WITH (CTE)
+        if self.peek_token_is_keyword("SELECT") {
+            self.next_token();
+            let select_stmt = self.parse_select_statement()?;
+            let returning = self.parse_returning_clause();
+
+            return Some(InsertStatement {
+                token,
+                table_name,
+                columns,
+                values: Vec::new(),
+                select: Some(Box::new(select_stmt)),
+                on_duplicate: true,
+                update_columns: Vec::new(),
+                update_expressions: Vec::new(),
+                update_where: None,
+                do_nothing: false,
+                conflict_target: Vec::new(),
+                returning,
+            });
+        }
+
+        if !self.expect_keyword("VALUES") {
+            return None;
+        }
+
+        let values = self.parse_value_lists()?;
+        let returning = self.parse_returning_clause();
+
+        Some(InsertStatement {
+            token,
+            table_name,
+            columns,
+            values,
+            select: None,
+            on_duplicate: true,
+            update_columns: Vec::new(),
+            update_expressions: Vec::new(),
+            update_where: None,
+            do_nothing: false,
+            conflict_target: Vec::new(),
             returning,
         })
     }
@@ -1020,10 +1116,19 @@ impl Parser {
                 return ConflictClause::default();
             }
             let (update_columns, update_expressions) = self.parse_update_assignments();
+            let update_where = if self.peek_token_is_keyword("WHERE") {
+                self.next_token(); // move to WHERE
+                self.current_clause = "WHERE".to_string();
+                self.next_token(); // move to first token of expression
+                self.parse_expression(Precedence::Lowest)
+            } else {
+                None
+            };
             ConflictClause {
                 on_duplicate: true,
                 update_columns,
                 update_expressions,
+                update_where,
                 ..Default::default()
             }
         } else if self.peek_token_is_keyword("CONFLICT") {
@@ -1065,10 +1170,19 @@ impl Parser {
                     return ConflictClause::default();
                 }
                 let (update_columns, update_expressions) = self.parse_update_assignments();
+                let update_where = if self.peek_token_is_keyword("WHERE") {
+                    self.next_token(); // move to WHERE
+                    self.current_clause = "WHERE".to_string();
+                    self.next_token(); // move to first token of expression
+                    self.parse_expression(Precedence::Lowest)
+                } else {
+                    None
+                };
                 ConflictClause {
                     on_duplicate: true,
                     update_columns,
                     update_expressions,
+                    update_where,
                     conflict_target,
                     do_nothing: false,
                 }
@@ -2446,12 +2560,25 @@ impl Parser {
         self.next_token();
 
         let operation_keyword = self.cur_token.literal.to_uppercase();
+        let mut if_not_exists = false;
+        let mut if_exists = false;
         let (operation, column_def, column_name, new_column_name, new_table_name) =
             match operation_keyword.as_str() {
                 "ADD" => {
                     // Check for optional COLUMN keyword
                     if self.peek_token_is_keyword("COLUMN") {
                         self.next_token();
+                    }
+                    // Check for optional IF NOT EXISTS
+                    if self.peek_token_is_keyword("IF") {
+                        self.next_token(); // consume IF
+                        if !self.expect_keyword("NOT") {
+                            return None;
+                        }
+                        if !self.expect_keyword("EXISTS") {
+                            return None;
+                        }
+                        if_not_exists = true;
                     }
                     self.next_token();
                     let col_def = self.parse_column_definition()?;
@@ -2467,6 +2594,14 @@ impl Parser {
                     // Check for optional COLUMN keyword
                     if self.peek_token_is_keyword("COLUMN") {
                         self.next_token();
+                    }
+                    // Check for optional IF EXISTS
+                    if self.peek_token_is_keyword("IF") {
+                        self.next_token(); // consume IF
+                        if !self.expect_keyword("EXISTS") {
+                            return None;
+                        }
+                        if_exists = true;
                     }
                     if !self.expect_peek(TokenType::Identifier) {
                         return None;
@@ -2487,6 +2622,14 @@ impl Parser {
                     }
                     let rename_keyword = self.cur_token.literal.to_uppercase();
                     if rename_keyword == "COLUMN" {
+                        // Check for optional IF EXISTS
+                        if self.peek_token_is_keyword("IF") {
+                            self.next_token(); // consume IF
+                            if !self.expect_keyword("EXISTS") {
+                                return None;
+                            }
+                            if_exists = true;
+                        }
                         if !self.expect_peek(TokenType::Identifier) {
                             return None;
                         }
@@ -2560,6 +2703,8 @@ impl Parser {
             column_name,
             new_column_name,
             new_table_name,
+            if_exists,
+            if_not_exists,
         })
     }
 

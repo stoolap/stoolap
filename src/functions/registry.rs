@@ -38,28 +38,42 @@ use super::aggregate::{
 };
 #[cfg(feature = "semantic")]
 use super::scalar::semantic::EmbedFunction;
-use super::scalar::vector::{
-    VecDimsFunction, VecDistanceCosineFunction, VecDistanceIpFunction, VecDistanceL2Function,
-    VecNormFunction, VecToTextFunction,
-};
 use super::scalar::{
-    AbsFunction, CastFunction, CeilFunction, CeilingFunction, CharFunction, CharLengthFunction,
-    CoalesceFunction, CollateFunction, ConcatFunction, ConcatWsFunction, ContainsFunction,
-    CosFunction, Crc32Function, CurrentDateFunction, CurrentTimeFunction, CurrentTimestampFunction,
-    DateAddFunction, DateDiffAliasFunction, DateDiffFunction, DateSubFunction, DateTruncFunction,
-    DayFunction, EndsWithFunction, ExpFunction, ExtractFunction, FloorFunction, GreatestFunction,
-    HourFunction, IfNullFunction, IifFunction, InstrFunction, JsonArrayFunction,
-    JsonArrayLengthFunction, JsonExtractFunction, JsonKeysFunction, JsonObjectFunction,
-    JsonTypeFunction, JsonTypeOfFunction, JsonValidFunction, LeastFunction, LeftFunction,
-    LengthFunction, LnFunction, LocateFunction, Log10Function, Log2Function, LogFunction,
-    LowerFunction, LpadFunction, LtrimFunction, Md5Function, MinuteFunction, ModFunction,
-    MonthFunction, NowFunction, NullIfFunction, PiFunction, PositionFunction, PowFunction,
-    PowerFunction, RandomFunction, RepeatFunction, ReplaceFunction, ReverseFunction, RightFunction,
-    RoundFunction, RpadFunction, RtrimFunction, SecondFunction, Sha1Function, Sha256Function,
-    Sha384Function, Sha512Function, SignFunction, SinFunction, SleepFunction, SplitPartFunction,
-    SqrtFunction, StartsWithFunction, StrposFunction, SubstrFunction, SubstringFunction,
-    TanFunction, TimeTruncFunction, ToCharFunction, TrimFunction, TruncFunction, TruncateFunction,
-    TypeOfFunction, UpperFunction, VersionFunction, YearFunction,
+    AbsFunction, AgeFunction, ArrayContainsFunction, ArrayLengthFunction, CastFunction,
+    CeilFunction, CeilingFunction, CharFunction, CharLengthFunction, ChebyshevDistanceFunction,
+    ClockTimestampFunction, CoalesceFunction, CollateFunction, ConcatFunction, ConcatWsFunction,
+    ContainsFunction, ConvertTzFunction, CosFunction, CosineDistanceFunction,
+    CosineSimilarityFunction, Crc32Function, CurrentDateFunction, CurrentTimeFunction,
+    CurrentTimestampFunction, DateAddFunction, DateDiffAliasFunction, DateDiffFunction,
+    DateSubFunction, DateTruncFunction, DayFunction, EltFunction, EndsWithFunction, ExpFunction,
+    ExtractFunction, FieldFunction, FindInSetFunction, FloorFunction, GenRandomUuidFunction,
+    GreatestFunction, HammingDistanceFunction, HexFunction, HourFunction, IfNullFunction,
+    IifFunction, Inet6AtonFunction, Inet6NtoaFunction, InetAtonFunction, InetNtoaFunction,
+    InnerProductFunction, InstrFunction, IsIpv4Function, IsIpv6Function, IsValidJsonFunction,
+    JsonArrayFunction, JsonArrayLengthFunction, JsonContainsFunction, JsonContainsPathFunction,
+    JsonExtractFunction, JsonInsertFunction, JsonKeysFunction, JsonObjectFunction,
+    JsonQuoteFunction, JsonRemoveFunction, JsonReplaceFunction, JsonSetFunction, JsonTypeFunction,
+    JsonTypeOfFunction, JsonUnquoteFunction, JsonValidFunction, L2DistanceFunction, LastDayFunction,
+    LeastFunction, LeftFunction, LengthFunction, LnFunction, LocateFunction, Log10Function,
+    Log2Function, LogFunction, LowerFunction, LpadFunction, LtrimFunction, MakeDateFunction,
+    MakeTimeFunction, MakeTimestampFunction, ManhattanDistanceFunction, Md5Function, MinuteFunction,
+    ModFunction, MonthFunction, NowFunction, NullIfFunction, PiFunction, PositionFunction,
+    PowFunction, PowerFunction, QuoteFunction, RandomFunction, RegexpLikeFunction,
+    RegexpReplaceFunction, RegexpSubstrFunction, RepeatFunction, ReplaceFunction, ReverseFunction,
+    RightFunction, RoundFunction, RpadFunction, RtrimFunction, SecondFunction, Sha1Function,
+    Sha256Function, Sha384Function, Sha512Function, SignFunction, SinFunction, SleepFunction,
+    SoundexFunction, SplitPartFunction, SqrtFunction, StAreaFunction, StAsTextFunction,
+    StCentroidFunction, StContainsFunction, StDWithinFunction, StDistanceFunction,
+    StDistanceSphereFunction, StEnvelopeFunction, StGeomFromTextFunction, StIntersectsFunction,
+    StLengthFunction, StMakePointFunction, StNumPointsFunction, StPerimeterFunction,
+    StPointFunction, StSetSridFunction, StSridFunction, StXFunction, StYFunction,
+    StartsWithFunction, StatementTimestampFunction, StrposFunction, SubstrFunction,
+    SubstringFunction, SubstringIndexFunction, TanFunction, TimeTruncFunction, TimeofdayFunction,
+    ToCharFunction, TrimFunction, TruncFunction, TruncateFunction, TypeOfFunction, UnhexFunction,
+    UpperFunction, UuidFunction, VecAddFunction, VecConcatFunction, VecDimsFunction,
+    VecDistanceCosineFunction, VecDistanceIpFunction, VecDistanceL2Function, VecMulFunction,
+    VecNormFunction, VecNormalizeFunction, VecSliceFunction, VecSubFunction, VecToTextFunction,
+    VectorNormFunction, VersionFunction, YearFunction,
 };
 use super::tvf::{GenerateSeriesFunction, GenerateSeriesScalarFunction, TableValuedFunction};
 use super::window::{
@@ -157,6 +171,17 @@ impl FunctionRegistry {
         registry.register_scalar::<LocateFunction>();
         registry.register_scalar::<LpadFunction>();
         registry.register_scalar::<RpadFunction>();
+        registry.register_scalar::<SubstringIndexFunction>();
+        registry.register_scalar::<RegexpLikeFunction>();
+        registry.register_scalar::<RegexpReplaceFunction>();
+        registry.register_scalar::<RegexpSubstrFunction>();
+        registry.register_scalar::<HexFunction>();
+        registry.register_scalar::<UnhexFunction>();
+        registry.register_scalar::<FieldFunction>();
+        registry.register_scalar::<FindInSetFunction>();
+        registry.register_scalar::<EltFunction>();
+        registry.register_scalar::<SoundexFunction>();
+        registry.register_scalar::<QuoteFunction>();
 
         // Math functions
         registry.register_scalar::<AbsFunction>();
@@ -201,6 +226,15 @@ impl FunctionRegistry {
         registry.register_scalar::<DateDiffFunction>();
         registry.register_scalar::<DateDiffAliasFunction>(); // DATE_DIFF alias for DATEDIFF
         registry.register_scalar::<ToCharFunction>();
+        registry.register_scalar::<ConvertTzFunction>();
+        registry.register_scalar::<MakeDateFunction>();
+        registry.register_scalar::<MakeTimeFunction>();
+        registry.register_scalar::<MakeTimestampFunction>();
+        registry.register_scalar::<AgeFunction>();
+        registry.register_scalar::<TimeofdayFunction>();
+        registry.register_scalar::<ClockTimestampFunction>();
+        registry.register_scalar::<StatementTimestampFunction>();
+        registry.register_scalar::<LastDayFunction>();
 
         // Utility/System functions
         registry.register_scalar::<VersionFunction>();
@@ -216,12 +250,31 @@ impl FunctionRegistry {
         registry.register_scalar::<JsonArrayLengthFunction>();
         registry.register_scalar::<JsonArrayFunction>();
         registry.register_scalar::<JsonObjectFunction>();
+        registry.register_scalar::<JsonSetFunction>();
+        registry.register_scalar::<JsonInsertFunction>();
+        registry.register_scalar::<JsonReplaceFunction>();
+        registry.register_scalar::<JsonRemoveFunction>();
+        registry.register_scalar::<JsonContainsFunction>();
+        registry.register_scalar::<JsonContainsPathFunction>();
+        registry.register_scalar::<JsonQuoteFunction>();
+        registry.register_scalar::<JsonUnquoteFunction>();
+        registry.register_scalar::<ArrayLengthFunction>();
+        registry.register_scalar::<ArrayContainsFunction>();
         registry.register_scalar::<JsonTypeFunction>();
         registry.register_scalar::<JsonTypeOfFunction>();
         registry.register_scalar::<JsonValidFunction>();
         registry.register_scalar::<JsonKeysFunction>();
         registry.register_scalar::<TypeOfFunction>();
         registry.register_scalar::<SleepFunction>();
+        registry.register_scalar::<GenRandomUuidFunction>();
+        registry.register_scalar::<UuidFunction>();
+        registry.register_scalar::<InetAtonFunction>();
+        registry.register_scalar::<InetNtoaFunction>();
+        registry.register_scalar::<Inet6AtonFunction>();
+        registry.register_scalar::<Inet6NtoaFunction>();
+        registry.register_scalar::<IsIpv4Function>();
+        registry.register_scalar::<IsIpv6Function>();
+        registry.register_scalar::<IsValidJsonFunction>();
 
         // Hash functions
         registry.register_scalar::<Md5Function>();
@@ -233,11 +286,46 @@ impl FunctionRegistry {
 
         // Register vector functions
         registry.register_scalar::<VecDistanceL2Function>();
+        registry.register_scalar::<L2DistanceFunction>();
         registry.register_scalar::<VecDistanceCosineFunction>();
+        registry.register_scalar::<CosineDistanceFunction>();
+        registry.register_scalar::<CosineSimilarityFunction>();
         registry.register_scalar::<VecDistanceIpFunction>();
+        registry.register_scalar::<InnerProductFunction>();
+        registry.register_scalar::<ManhattanDistanceFunction>();
+        registry.register_scalar::<ChebyshevDistanceFunction>();
+        registry.register_scalar::<HammingDistanceFunction>();
+        registry.register_scalar::<VecSliceFunction>();
+        registry.register_scalar::<VecConcatFunction>();
+        registry.register_scalar::<VecAddFunction>();
+        registry.register_scalar::<VecSubFunction>();
+        registry.register_scalar::<VecMulFunction>();
         registry.register_scalar::<VecDimsFunction>();
         registry.register_scalar::<VecNormFunction>();
+        registry.register_scalar::<VectorNormFunction>();
+        registry.register_scalar::<VecNormalizeFunction>();
         registry.register_scalar::<VecToTextFunction>();
+
+        // Register spatial GIS functions
+        registry.register_scalar::<StPointFunction>();
+        registry.register_scalar::<StMakePointFunction>();
+        registry.register_scalar::<StXFunction>();
+        registry.register_scalar::<StYFunction>();
+        registry.register_scalar::<StDistanceFunction>();
+        registry.register_scalar::<StDistanceSphereFunction>();
+        registry.register_scalar::<StDWithinFunction>();
+        registry.register_scalar::<StAsTextFunction>();
+        registry.register_scalar::<StGeomFromTextFunction>();
+        registry.register_scalar::<StContainsFunction>();
+        registry.register_scalar::<StIntersectsFunction>();
+        registry.register_scalar::<StEnvelopeFunction>();
+        registry.register_scalar::<StAreaFunction>();
+        registry.register_scalar::<StCentroidFunction>();
+        registry.register_scalar::<StLengthFunction>();
+        registry.register_scalar::<StPerimeterFunction>();
+        registry.register_scalar::<StNumPointsFunction>();
+        registry.register_scalar::<StSridFunction>();
+        registry.register_scalar::<StSetSridFunction>();
 
         // Register semantic embedding function (requires --features semantic)
         #[cfg(feature = "semantic")]
