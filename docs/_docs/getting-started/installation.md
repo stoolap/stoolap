@@ -11,7 +11,7 @@ This guide walks you through the process of installing Stoolap on different plat
 
 ## Prerequisites
 
-- Rust 1.70 or later (with Cargo)
+- Rust 1.88 or later (with Cargo)
 - Git (for installation from source)
 - Basic familiarity with command line tools
 
@@ -143,7 +143,7 @@ After installing Stoolap, you can:
 
 If you encounter issues during installation:
 
-- Ensure Rust is installed: `rustc --version` (should be 1.70+)
+- Ensure Rust is installed: `rustc --version` (should be 1.88+)
 - Ensure Cargo is available: `cargo --version`
 - For permission issues on Linux/macOS, use `sudo` as needed
 
