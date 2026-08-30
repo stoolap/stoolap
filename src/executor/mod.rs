@@ -51,7 +51,6 @@ pub mod join_executor;
 pub mod operator;
 pub mod operators;
 pub mod parallel;
-pub mod pattern_cache;
 pub mod planner;
 pub mod query_cache;
 pub mod result;
