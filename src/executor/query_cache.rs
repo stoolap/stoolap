@@ -94,6 +94,9 @@ pub struct CompiledUpdateColumn {
     pub column_type: crate::core::DataType,
     /// How to get the new value (literal or parameter)
     pub value_source: UpdateValueSource,
+    /// Vector dimensions of the target column (0 for non-vector columns);
+    /// updates must validate like the full path (VectorDimensionMismatch)
+    pub column_vector_dims: u16,
 }
 
 /// How to get the update value

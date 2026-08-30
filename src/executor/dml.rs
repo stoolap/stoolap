@@ -86,7 +86,7 @@ fn conflict_matches_target(conflict_target: &[Identifier], schema: &Schema, erro
 
 /// Validate type coercion didn't silently fail.
 /// Returns an error if a non-null value became null during coercion.
-fn validate_coercion(
+pub(crate) fn validate_coercion(
     original: &Value,
     coerced: &Value,
     column_name: &str,
@@ -2218,6 +2218,13 @@ impl Executor {
                         .collect()
                 };
 
+            // Column names for coercion errors, captured before the setter
+            // borrows the table mutably
+            let update_col_names: Vec<String> = compiled_updates
+                .iter()
+                .map(|(idx, _, _, _)| schema.columns[*idx].name.to_string())
+                .collect();
+
             // Pre-compile CHECK constraints for columns being updated (once, not per row)
             let compiled_check_exprs: Vec<(usize, String, String, SharedProgram)> =
                 compiled_updates
@@ -2269,26 +2276,23 @@ impl Executor {
                         .with_named_params(named_params);
 
                     let mut updates = Vec::with_capacity(compiled_updates.len());
-                    for (idx, col_type, vec_dims, program) in &compiled_updates {
-                        if let Ok(v) = vm.execute_cow(program, &exec_ctx) {
-                            let coerced = v.into_coerce_to_type(*col_type);
-                            // Validate vector dimensions
-                            if *col_type == DataType::Vector && *vec_dims > 0 {
-                                if let Value::Extension(data) = &coerced {
-                                    if data.first() == Some(&(DataType::Vector as u8)) {
-                                        let got_dim =
-                                            u16::try_from((data.len() - 1) / 4).unwrap_or(u16::MAX);
-                                        if got_dim != *vec_dims {
-                                            return Err(Error::VectorDimensionMismatch {
-                                                expected: *vec_dims,
-                                                got: got_dim,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                            updates.push((*idx, coerced));
-                        }
+                    for (k, (idx, col_type, vec_dims, program)) in
+                        compiled_updates.iter().enumerate()
+                    {
+                        // Propagate VM errors (overflow etc.): silently
+                        // skipping a SET column would half-apply the row.
+                        // Coercion validates like INSERT and the fast path
+                        // (vector dims, no silent non-null-to-NULL).
+                        let v = vm.execute_cow(program, &exec_ctx)?;
+                        let coerced = v.coerce_to_type(*col_type);
+                        validate_coercion(
+                            &v,
+                            &coerced,
+                            &update_col_names[k],
+                            *col_type,
+                            *vec_dims,
+                        )?;
+                        updates.push((*idx, coerced));
                     }
                     updates
                 };

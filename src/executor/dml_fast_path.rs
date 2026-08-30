@@ -297,7 +297,20 @@ impl Executor {
                     let mut updates = Vec::with_capacity(update.updates.len());
                     for u in &update.updates {
                         let value = Self::extract_update_value_from_slice(&u.value_source, params)?;
-                        updates.push((u.column_idx, value.coerce_to_type(u.column_type)));
+                        let coerced = value.coerce_to_type(u.column_type);
+                        if super::dml::validate_coercion(
+                            &value,
+                            &coerced,
+                            &update.schema.columns[u.column_idx].name,
+                            u.column_type,
+                            u.column_vector_dims,
+                        )
+                        .is_err()
+                        {
+                            // Let the normal path produce the full error
+                            return None;
+                        }
+                        updates.push((u.column_idx, coerced));
                     }
                     // Clone only what we need (cheap: SmartString + Arc)
                     let table_name = update.table_name.clone();
@@ -371,6 +384,7 @@ impl Executor {
             usize,
             super::expression::SharedProgram,
             crate::core::DataType,
+            u16,
         )],
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
@@ -402,9 +416,17 @@ impl Executor {
                     if !named_params.is_empty() {
                         exec_ctx = exec_ctx.with_named_params(named_params);
                     }
-                    for (idx, program, col_type) in expr_updates {
+                    for (idx, program, col_type, vector_dims) in expr_updates {
                         let value = vm.execute_cow(program, &exec_ctx)?;
-                        computed.push((*idx, value.coerce_to_type(*col_type)));
+                        let coerced = value.coerce_to_type(*col_type);
+                        super::dml::validate_coercion(
+                            &value,
+                            &coerced,
+                            &schema.columns[*idx].name,
+                            *col_type,
+                            *vector_dims,
+                        )?;
+                        computed.push((*idx, coerced));
                     }
                 }
                 for (idx, value) in computed {
@@ -496,6 +518,7 @@ impl Executor {
             usize,
             super::expression::SharedProgram,
             crate::core::DataType,
+            u16,
         )> = Vec::new();
         for u in &compiled.updates {
             let value = match &u.value_source {
@@ -512,11 +535,24 @@ impl Executor {
                     None => continue,
                 },
                 UpdateValueSource::Expression(program) => {
-                    expr_updates.push((u.column_idx, program.clone(), u.column_type));
+                    expr_updates.push((
+                        u.column_idx,
+                        program.clone(),
+                        u.column_type,
+                        u.column_vector_dims,
+                    ));
                     continue;
                 }
             };
-            updates.push((u.column_idx, value.coerce_to_type(u.column_type)));
+            let coerced = value.coerce_to_type(u.column_type);
+            super::dml::validate_coercion(
+                &value,
+                &coerced,
+                &compiled.schema.columns[u.column_idx].name,
+                u.column_type,
+                u.column_vector_dims,
+            )?;
+            updates.push((u.column_idx, coerced));
         }
 
         self.execute_pk_update_minimal(
@@ -673,6 +709,7 @@ impl Executor {
                 column_idx: col_idx,
                 column_type: col_type,
                 value_source,
+                column_vector_dims: schema.columns[col_idx].vector_dimensions,
             });
         }
 
@@ -848,7 +885,15 @@ impl Executor {
                 Self::expr_contains_subquery(&i.left) || Self::expr_contains_subquery(&i.right)
             }
             Expression::Prefix(p) => Self::expr_contains_subquery(&p.right),
-            Expression::FunctionCall(f) => f.arguments.iter().any(Self::expr_contains_subquery),
+            Expression::FunctionCall(f) => {
+                f.arguments.iter().any(Self::expr_contains_subquery)
+                    || f.filter
+                        .as_ref()
+                        .is_some_and(|e| Self::expr_contains_subquery(e))
+                    || f.order_by
+                        .iter()
+                        .any(|ob| Self::expr_contains_subquery(&ob.expression))
+            }
             Expression::Cast(c) => Self::expr_contains_subquery(&c.expr),
             Expression::Aliased(a) => Self::expr_contains_subquery(&a.expression),
             Expression::Case(c) => {
@@ -869,7 +914,11 @@ impl Executor {
                     || Self::expr_contains_subquery(&b.upper)
             }
             Expression::Like(l) => {
-                Self::expr_contains_subquery(&l.left) || Self::expr_contains_subquery(&l.pattern)
+                Self::expr_contains_subquery(&l.left)
+                    || Self::expr_contains_subquery(&l.pattern)
+                    || l.escape
+                        .as_ref()
+                        .is_some_and(|e| Self::expr_contains_subquery(e))
             }
             Expression::List(l) => l.elements.iter().any(Self::expr_contains_subquery),
             Expression::ExpressionList(l) => l.expressions.iter().any(Self::expr_contains_subquery),
@@ -881,6 +930,7 @@ impl Executor {
             | Expression::StringLiteral(_)
             | Expression::BooleanLiteral(_)
             | Expression::NullLiteral(_)
+            | Expression::IntervalLiteral(_)
             | Expression::Parameter(_) => false,
             // Unknown container: be conservative
             _ => true,

@@ -110,3 +110,68 @@ fn scalar_subquery_set_takes_the_full_path() {
     let a: i64 = db.query_one("SELECT a FROM t WHERE id = 1", ()).unwrap();
     assert_eq!(a, 99);
 }
+
+#[test]
+fn vector_dimension_validation_on_fast_update_path() {
+    let db = Database::open("memory://update_path_vec").unwrap();
+    db.execute("CREATE TABLE v (id INTEGER PRIMARY KEY, emb VECTOR(3))", ())
+        .unwrap();
+    db.execute("INSERT INTO v VALUES (1, CAST('[1,2,3]' AS VECTOR))", ())
+        .unwrap();
+
+    // Expression SET with a wrong-dimension vector must be rejected like
+    // the full path (VectorDimensionMismatch), not silently stored
+    let stmt = db
+        .prepare("UPDATE v SET emb = CAST('[1,2]' AS VECTOR) WHERE id = $1")
+        .unwrap();
+    assert!(stmt.execute((1i64,)).is_err());
+
+    // Same through a parameter source
+    let two_dim: Vec<f32> = vec![1.0, 2.0];
+    let stmt2 = db.prepare("UPDATE v SET emb = $1 WHERE id = $2").unwrap();
+    let _ = two_dim;
+    let res = stmt2.execute(("[1,2]", 1i64));
+    assert!(res.is_err(), "wrong-dimension vector text must not store");
+
+    // The stored row is unchanged and correct updates still work
+    let stmt3 = db
+        .prepare("UPDATE v SET emb = CAST('[4,5,6]' AS VECTOR) WHERE id = $1")
+        .unwrap();
+    stmt3.execute((1i64,)).unwrap();
+}
+
+#[test]
+fn set_errors_are_consistent_across_paths() {
+    let db = Database::open("memory://update_path_err").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 9223372036854775807, 0)", ())
+        .unwrap();
+
+    // Overflow must fail the statement on BOTH paths, applying nothing
+    assert!(db
+        .execute("UPDATE t SET a = a + 1, b = 5 WHERE id = 1", ())
+        .is_err());
+    let mut tx = db.begin().unwrap();
+    assert!(tx
+        .execute("UPDATE t SET a = a + 1, b = 5 WHERE id = 1", ())
+        .is_err());
+    drop(tx);
+    let b: i64 = db.query_one("SELECT b FROM t WHERE id = 1", ()).unwrap();
+    assert_eq!(b, 0, "no partial application on either path");
+
+    // Non-null-to-NULL coercion must error on BOTH paths
+    assert!(db
+        .execute("UPDATE t SET a = 'abc' WHERE id = 1", ())
+        .is_err());
+    let mut tx = db.begin().unwrap();
+    assert!(tx
+        .execute("UPDATE t SET a = 'abc' WHERE id = 1", ())
+        .is_err());
+    drop(tx);
+    let a: i64 = db.query_one("SELECT a FROM t WHERE id = 1", ()).unwrap();
+    assert_eq!(a, 9223372036854775807);
+}
