@@ -978,11 +978,11 @@ fn check_range_subsumption(cached: &Expression, new: &Expression) -> Option<Subs
     match (&cached_infix.op_type, &new_infix.op_type) {
         // Greater than: new > cached means new is stricter
         (InfixOperator::GreaterThan, InfixOperator::GreaterThan) => {
-            if new_val > cached_val {
+            if new_val.exact_cmp(&cached_val) == Some(std::cmp::Ordering::Greater) {
                 Some(SubsumptionResult::Subsumed {
                     filter: Box::new(new.clone()),
                 })
-            } else if (new_val - cached_val).abs() < f64::EPSILON {
+            } else if new_val == cached_val {
                 Some(SubsumptionResult::Identical)
             } else {
                 None
@@ -991,7 +991,7 @@ fn check_range_subsumption(cached: &Expression, new: &Expression) -> Option<Subs
         // Equal values are NOT identical here: new `>= v` includes v,
         // cached `> v` does not.
         (InfixOperator::GreaterThan, InfixOperator::GreaterEqual) => {
-            if new_val > cached_val {
+            if new_val.exact_cmp(&cached_val) == Some(std::cmp::Ordering::Greater) {
                 Some(SubsumptionResult::Subsumed {
                     filter: Box::new(new.clone()),
                 })
@@ -1002,8 +1002,11 @@ fn check_range_subsumption(cached: &Expression, new: &Expression) -> Option<Subs
 
         (InfixOperator::GreaterEqual, InfixOperator::GreaterThan)
         | (InfixOperator::GreaterEqual, InfixOperator::GreaterEqual) => {
-            if new_val >= cached_val {
-                if (new_val - cached_val).abs() < f64::EPSILON
+            if matches!(
+                new_val.exact_cmp(&cached_val),
+                Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
+            ) {
+                if new_val == cached_val
                     && matches!(cached_infix.op_type, InfixOperator::GreaterEqual)
                     && matches!(new_infix.op_type, InfixOperator::GreaterEqual)
                 {
@@ -1020,11 +1023,11 @@ fn check_range_subsumption(cached: &Expression, new: &Expression) -> Option<Subs
 
         // Less than: new < cached means new is stricter
         (InfixOperator::LessThan, InfixOperator::LessThan) => {
-            if new_val < cached_val {
+            if new_val.exact_cmp(&cached_val) == Some(std::cmp::Ordering::Less) {
                 Some(SubsumptionResult::Subsumed {
                     filter: Box::new(new.clone()),
                 })
-            } else if (new_val - cached_val).abs() < f64::EPSILON {
+            } else if new_val == cached_val {
                 Some(SubsumptionResult::Identical)
             } else {
                 None
@@ -1033,7 +1036,7 @@ fn check_range_subsumption(cached: &Expression, new: &Expression) -> Option<Subs
         // Equal values are NOT identical here: new `<= v` includes v,
         // cached `< v` does not.
         (InfixOperator::LessThan, InfixOperator::LessEqual) => {
-            if new_val < cached_val {
+            if new_val.exact_cmp(&cached_val) == Some(std::cmp::Ordering::Less) {
                 Some(SubsumptionResult::Subsumed {
                     filter: Box::new(new.clone()),
                 })
@@ -1044,8 +1047,11 @@ fn check_range_subsumption(cached: &Expression, new: &Expression) -> Option<Subs
 
         (InfixOperator::LessEqual, InfixOperator::LessThan)
         | (InfixOperator::LessEqual, InfixOperator::LessEqual) => {
-            if new_val <= cached_val {
-                if (new_val - cached_val).abs() < f64::EPSILON
+            if matches!(
+                new_val.exact_cmp(&cached_val),
+                Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
+            ) {
+                if new_val == cached_val
                     && matches!(cached_infix.op_type, InfixOperator::LessEqual)
                     && matches!(new_infix.op_type, InfixOperator::LessEqual)
                 {
@@ -1062,7 +1068,7 @@ fn check_range_subsumption(cached: &Expression, new: &Expression) -> Option<Subs
 
         // Equality: values must match for identity
         (InfixOperator::Equal, InfixOperator::Equal) => {
-            if (new_val - cached_val).abs() < f64::EPSILON {
+            if new_val == cached_val {
                 Some(SubsumptionResult::Identical)
             } else {
                 None
@@ -1173,23 +1179,26 @@ enum NumericValue {
 }
 
 impl NumericValue {
-    fn as_f64(&self) -> f64 {
-        match self {
-            NumericValue::Integer(i) => *i as f64,
-            NumericValue::Float(f) => *f,
+    /// Exact ordering: cache identity decisions must never round.
+    /// None only for NaN.
+    fn exact_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        use crate::core::value::cmp_i64_f64;
+        match (self, other) {
+            (NumericValue::Integer(a), NumericValue::Integer(b)) => Some(a.cmp(b)),
+            (NumericValue::Float(a), NumericValue::Float(b)) => a.partial_cmp(b),
+            (NumericValue::Integer(a), NumericValue::Float(b)) => cmp_i64_f64(*a, *b),
+            (NumericValue::Float(a), NumericValue::Integer(b)) => {
+                cmp_i64_f64(*b, *a).map(std::cmp::Ordering::reverse)
+            }
         }
     }
 }
 
 impl PartialEq for NumericValue {
     fn eq(&self, other: &Self) -> bool {
-        // For database predicate comparison, exact integer comparison is preferred,
-        // but for floats we use a reasonable tolerance (1e-10) rather than f64::EPSILON
-        // which is too strict (~2.2e-16) and can cause false negatives.
-        match (self, other) {
-            (NumericValue::Integer(a), NumericValue::Integer(b)) => a == b,
-            _ => (self.as_f64() - other.as_f64()).abs() < 1e-10,
-        }
+        // Exact: a tolerance here lets two different predicates share a
+        // cache identity, and Identical hits serve cached rows unfiltered.
+        self.exact_cmp(other) == Some(std::cmp::Ordering::Equal)
     }
 }
 
@@ -1216,11 +1225,13 @@ fn values_equal(a: &NumericValue, b: &NumericValue) -> bool {
     a == b
 }
 
-/// Extract numeric value from a literal expression
-fn extract_numeric_value(expr: &Expression) -> Option<f64> {
+/// Extract numeric value from a literal expression, keeping integer
+/// precision: `i as f64` rounds above 2^53, and two large-integer
+/// predicates differing by 1 must not be judged identical.
+fn extract_numeric_value(expr: &Expression) -> Option<NumericValue> {
     match expr {
-        Expression::IntegerLiteral(lit) => Some(lit.value as f64),
-        Expression::FloatLiteral(lit) => Some(lit.value),
+        Expression::IntegerLiteral(lit) => Some(NumericValue::Integer(lit.value)),
+        Expression::FloatLiteral(lit) => Some(NumericValue::Float(lit.value)),
         _ => None,
     }
 }

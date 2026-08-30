@@ -1168,20 +1168,16 @@ impl Ord for Value {
         // This MUST be consistent with PartialEq where Integer(5) == Float(5.0)
         match (self, other) {
             (Value::Integer(i), Value::Float(f)) => {
-                let i_as_f64 = *i as f64;
-                // Handle NaN: NaN is ordered last
-                if f.is_nan() {
-                    return Ordering::Less; // Any number < NaN
-                }
-                return i_as_f64.partial_cmp(f).unwrap_or(Ordering::Equal);
+                // Exact comparison: `i as f64` rounds above 2^53 and would
+                // make Ord call i64::MAX equal to Float(2^63), breaking the
+                // Eq/Ord consistency the BTree indexes rely on.
+                // NaN orders last (cmp_i64_f64 returns None only for NaN).
+                return crate::core::value::cmp_i64_f64(*i, *f).unwrap_or(Ordering::Less);
             }
             (Value::Float(f), Value::Integer(i)) => {
-                let i_as_f64 = *i as f64;
-                // Handle NaN: NaN is ordered last
-                if f.is_nan() {
-                    return Ordering::Greater; // NaN > any number
-                }
-                return f.partial_cmp(&i_as_f64).unwrap_or(Ordering::Equal);
+                return crate::core::value::cmp_i64_f64(*i, *f)
+                    .map(Ordering::reverse)
+                    .unwrap_or(Ordering::Greater);
             }
             _ => {} // Continue to same-type comparison
         }
@@ -1992,5 +1988,21 @@ mod tests {
             Value::Float(9_223_372_036_854_775_808.0)
         );
         assert_eq!(Value::Integer(5), Value::Float(5.0));
+
+        // Eq/Ord/PartialOrd must agree at the extremes: a BTree index
+        // merges keys that Ord calls Equal
+        let i = Value::Integer(i64::MAX);
+        let f = Value::Float(9_223_372_036_854_775_808.0);
+        assert_eq!(i.cmp(&f), Less);
+        assert_eq!(f.cmp(&i), Greater);
+        assert_eq!(i.partial_cmp(&f), Some(Less));
+        assert_eq!(Value::Integer(5).cmp(&Value::Float(5.0)), Equal);
+        assert_eq!(
+            Value::Integer(i64::MIN).cmp(&Value::Float(-9_223_372_036_854_775_808.0)),
+            Equal
+        );
+        // NaN ordering: NaN last, both directions consistent
+        assert_eq!(Value::Integer(0).cmp(&Value::Float(f64::NAN)), Less);
+        assert_eq!(Value::Float(f64::NAN).cmp(&Value::Integer(0)), Greater);
     }
 }

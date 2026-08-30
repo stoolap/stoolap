@@ -181,3 +181,140 @@ fn integer_column_float_aggregate_pushdown() {
         .unwrap();
     assert_eq!(s, 3); // 0 + 1 + 2
 }
+
+#[test]
+fn in_list_out_of_range_whole_float_does_not_match_extremes() {
+    let db = Database::open("memory://float_int_inrange").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 9223372036854775807)", ())
+        .unwrap();
+
+    // 2^63 is whole but saturates to i64::MAX under a cast
+    assert_eq!(
+        row_count(&db, "SELECT * FROM t WHERE n IN (1, 9223372036854775808.0)"),
+        0
+    );
+    assert_eq!(
+        row_count(
+            &db,
+            "SELECT * FROM t WHERE n NOT IN (1, 9223372036854775808.0)"
+        ),
+        1
+    );
+    // 2^53 + 1 rounds to 2^53 as f64; the linear fallback must not match
+    db.execute("INSERT INTO t VALUES (2, 9007199254740993)", ())
+        .unwrap();
+    assert_eq!(
+        row_count(&db, "SELECT * FROM t WHERE n IN (1.5, 9007199254740992.0)"),
+        0
+    );
+}
+
+#[test]
+fn join_on_integer_float_keys_is_exact_at_extremes() {
+    let db = Database::open("memory://float_int_join").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, i INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, f FLOAT)", ())
+        .unwrap();
+    db.execute("INSERT INTO a VALUES (1, 9223372036854775807)", ())
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (1, 9223372036854775808.0)", ())
+        .unwrap();
+
+    // i64::MAX must not join Float(2^63)
+    assert_eq!(row_count(&db, "SELECT * FROM a JOIN b ON a.i = b.f"), 0);
+    // NOTE: representable cross-type pairs (42 vs 42.0) do not hash-join
+    // on main either; the join hash table buckets Integer and Float keys
+    // separately. Tracked as a separate pre-existing bug.
+}
+
+#[test]
+fn float_column_integer_threshold_is_exact_at_extremes() {
+    let db = Database::open("memory://float_int_thresh").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, f FLOAT)", ())
+        .unwrap();
+    // Largest f64 below i64::MAX
+    db.execute("INSERT INTO t VALUES (1, 9223372036854774784.0)", ())
+        .unwrap();
+
+    // cell < threshold, so >= must reject; a rounded cast accepts it
+    assert_eq!(
+        row_count(&db, "SELECT * FROM t WHERE f >= 9223372036854774785"),
+        0
+    );
+    assert_eq!(
+        row_count(&db, "SELECT * FROM t WHERE f < 9223372036854774785"),
+        1
+    );
+}
+
+#[test]
+fn semantic_cache_distinguishes_large_integer_predicates() {
+    let db = Database::open("memory://float_int_semcache").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 9223372036854775807)", ())
+        .unwrap();
+
+    // Warm the cache with the broader predicate, then run one that differs
+    // only below f64 precision: they must not share a cache identity
+    assert_eq!(
+        row_count(&db, "SELECT * FROM t WHERE n > 9223372036854775806"),
+        1
+    );
+    assert_eq!(
+        row_count(&db, "SELECT * FROM t WHERE n > 9223372036854775807"),
+        0
+    );
+}
+
+#[test]
+fn between_mixed_bounds_are_exact_at_extremes() {
+    let db = Database::open("memory://float_int_btwmix").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 9223372036854775807)", ())
+        .unwrap();
+
+    // Integer lower bound must not round through f64: i64::MAX stays
+    // within [i64::MAX, 2^63]
+    assert_eq!(
+        row_count(
+            &db,
+            "SELECT * FROM t WHERE n BETWEEN 9223372036854775807 AND 9223372036854775808.0"
+        ),
+        1
+    );
+    // i64::MAX - 1 is below the integer lower bound
+    db.execute("UPDATE t SET n = 9223372036854775806 WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(
+        row_count(
+            &db,
+            "SELECT * FROM t WHERE n BETWEEN 9223372036854775807 AND 9223372036854775808.0"
+        ),
+        0
+    );
+
+    // Float cell against an integer upper bound: 2^63 is above i64::MAX
+    db.execute("CREATE TABLE tf (id INTEGER PRIMARY KEY, f FLOAT)", ())
+        .unwrap();
+    db.execute("INSERT INTO tf VALUES (1, 9223372036854775808.0)", ())
+        .unwrap();
+    assert_eq!(
+        row_count(
+            &db,
+            "SELECT * FROM tf WHERE f BETWEEN 0 AND 9223372036854775807"
+        ),
+        0
+    );
+    assert_eq!(
+        row_count(
+            &db,
+            "SELECT * FROM tf WHERE f BETWEEN 9223372036854775807 AND 1e19"
+        ),
+        1
+    );
+}

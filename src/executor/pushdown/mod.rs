@@ -105,6 +105,17 @@ impl<'a> PushdownContext<'a> {
                     None => value,
                 }
             }
+            // Same rule in the other direction: `i as f64` rounds above
+            // 2^53, so a large integer constant against a FLOAT column
+            // stays an Integer and compares exactly downstream.
+            (Some(crate::core::DataType::Float), Value::Integer(i)) => {
+                let f = *i as f64;
+                if f as i64 == *i && i.abs() < (1_i64 << 53) {
+                    Value::Float(f)
+                } else {
+                    value
+                }
+            }
             (Some(col_type), _) => value.into_coerce_to_type(col_type),
             (None, _) => value,
         }

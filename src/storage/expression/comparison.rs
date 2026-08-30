@@ -333,13 +333,14 @@ impl Expression for ComparisonExpr {
             (ComparisonValue::Integer(cmp_val), Value::Float(col_val)) => {
                 match crate::core::value::cmp_i64_f64(*cmp_val, *col_val) {
                     Some(ord) => Ok(self.check_ordering(ord.reverse())),
-                    None => Ok(false),
+                    // NaN cell: only <> is true (IEEE), matching the VM arms
+                    None => Ok(self.operator == Operator::Ne),
                 }
             }
             (ComparisonValue::Float(cmp_val), Value::Integer(col_val)) => {
                 match crate::core::value::cmp_i64_f64(*col_val, *cmp_val) {
                     Some(ord) => Ok(self.check_ordering(ord)),
-                    None => Ok(false),
+                    None => Ok(self.operator == Operator::Ne),
                 }
             }
 
@@ -397,13 +398,14 @@ impl Expression for ComparisonExpr {
             (ComparisonValue::Integer(cmp_val), Value::Float(col_val)) => {
                 match crate::core::value::cmp_i64_f64(*cmp_val, *col_val) {
                     Some(ord) => self.check_ordering(ord.reverse()),
-                    None => false,
+                    // NaN cell: only <> is true (IEEE), matching the VM arms
+                    None => self.operator == Operator::Ne,
                 }
             }
             (ComparisonValue::Float(cmp_val), Value::Integer(col_val)) => {
                 match crate::core::value::cmp_i64_f64(*col_val, *cmp_val) {
                     Some(ord) => self.check_ordering(ord),
-                    None => false,
+                    None => self.operator == Operator::Ne,
                 }
             }
             _ => false,

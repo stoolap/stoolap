@@ -709,6 +709,29 @@ impl CompiledFilter {
         match value {
             Value::Integer(i) => {
                 let i = *i;
+                // Integer-typed filters never match float cells; against a
+                // FLOAT column use the float variant when the constant is
+                // exactly representable, else the dynamic exact path.
+                let col_is_float = schema
+                    .columns
+                    .get(col_idx)
+                    .map(|c| c.data_type == crate::core::DataType::Float)
+                    .unwrap_or(false);
+                if col_is_float {
+                    let f = i as f64;
+                    if !(f as i64 == i && i.abs() < (1_i64 << 53)) {
+                        return CompiledFilter::Dynamic(expr.clone_box());
+                    }
+                    return match op {
+                        Operator::Eq => CompiledFilter::FloatEq { col_idx, value: f },
+                        Operator::Ne => CompiledFilter::FloatNe { col_idx, value: f },
+                        Operator::Gt => CompiledFilter::FloatGt { col_idx, value: f },
+                        Operator::Gte => CompiledFilter::FloatGte { col_idx, value: f },
+                        Operator::Lt => CompiledFilter::FloatLt { col_idx, value: f },
+                        Operator::Lte => CompiledFilter::FloatLte { col_idx, value: f },
+                        _ => CompiledFilter::Dynamic(expr.clone_box()),
+                    };
+                }
                 match op {
                     Operator::Eq => CompiledFilter::IntegerEq { col_idx, value: i },
                     Operator::Ne => CompiledFilter::IntegerNe { col_idx, value: i },

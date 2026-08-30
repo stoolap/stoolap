@@ -717,10 +717,10 @@ impl ExprVM {
                             Self::between_float(col_val, *lo, *hi)
                         }
                         (Value::Integer(lo), Value::Float(hi)) => {
-                            Self::between_float(col_val, *lo as f64, *hi)
+                            Self::between_mixed_int_lo(col_val, *lo, *hi)
                         }
                         (Value::Float(lo), Value::Integer(hi)) => {
-                            Self::between_float(col_val, *lo, *hi as f64)
+                            Self::between_mixed_int_hi(col_val, *lo, *hi)
                         }
                         _ if col_val.is_null() || low.is_null() || high.is_null() => {
                             Value::Null(DataType::Boolean)
@@ -1399,23 +1399,27 @@ impl ExprVM {
                             Value::Boolean(*v >= *lo && *v <= *hi)
                         }
                         (Value::Integer(v), Value::Integer(lo), Value::Float(hi)) => {
-                            Value::Boolean((*v as f64) >= (*lo as f64) && (*v as f64) <= *hi)
+                            Value::Boolean(*v >= *lo && crate::core::value::i64_le_f64(*v, *hi))
                         }
                         (Value::Integer(v), Value::Float(lo), Value::Integer(hi)) => {
-                            Value::Boolean((*v as f64) >= *lo && (*v as f64) <= (*hi as f64))
+                            Value::Boolean(crate::core::value::i64_ge_f64(*v, *lo) && *v <= *hi)
                         }
                         (Value::Float(v), Value::Integer(lo), Value::Integer(hi)) => {
-                            Value::Boolean(*v >= (*lo as f64) && *v <= (*hi as f64))
+                            Value::Boolean(
+                                crate::core::value::i64_le_f64(*lo, *v)
+                                    && crate::core::value::i64_ge_f64(*hi, *v),
+                            )
                         }
                         (Value::Float(v), Value::Integer(lo), Value::Float(hi)) => {
-                            Value::Boolean(*v >= (*lo as f64) && *v <= *hi)
+                            Value::Boolean(crate::core::value::i64_le_f64(*lo, *v) && *v <= *hi)
                         }
                         (Value::Float(v), Value::Float(lo), Value::Integer(hi)) => {
-                            Value::Boolean(*v >= *lo && *v <= (*hi as f64))
+                            Value::Boolean(*v >= *lo && crate::core::value::i64_ge_f64(*hi, *v))
                         }
-                        (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => {
-                            Value::Boolean((*v as f64) >= *lo && (*v as f64) <= *hi)
-                        }
+                        (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => Value::Boolean(
+                            crate::core::value::i64_ge_f64(*v, *lo)
+                                && crate::core::value::i64_le_f64(*v, *hi),
+                        ),
                         _ if val.is_null() || low.is_null() || high.is_null() => {
                             Value::Null(DataType::Boolean)
                         }
@@ -1439,23 +1443,27 @@ impl ExprVM {
                             Value::Boolean(*v < *lo || *v > *hi)
                         }
                         (Value::Integer(v), Value::Integer(lo), Value::Float(hi)) => {
-                            Value::Boolean((*v as f64) < (*lo as f64) || (*v as f64) > *hi)
+                            Value::Boolean(*v < *lo || crate::core::value::i64_gt_f64(*v, *hi))
                         }
                         (Value::Integer(v), Value::Float(lo), Value::Integer(hi)) => {
-                            Value::Boolean((*v as f64) < *lo || (*v as f64) > (*hi as f64))
+                            Value::Boolean(crate::core::value::i64_lt_f64(*v, *lo) || *v > *hi)
                         }
                         (Value::Float(v), Value::Integer(lo), Value::Integer(hi)) => {
-                            Value::Boolean(*v < (*lo as f64) || *v > (*hi as f64))
+                            Value::Boolean(
+                                crate::core::value::i64_gt_f64(*lo, *v)
+                                    || crate::core::value::i64_lt_f64(*hi, *v),
+                            )
                         }
                         (Value::Float(v), Value::Integer(lo), Value::Float(hi)) => {
-                            Value::Boolean(*v < (*lo as f64) || *v > *hi)
+                            Value::Boolean(crate::core::value::i64_gt_f64(*lo, *v) || *v > *hi)
                         }
                         (Value::Float(v), Value::Float(lo), Value::Integer(hi)) => {
-                            Value::Boolean(*v < *lo || *v > (*hi as f64))
+                            Value::Boolean(*v < *lo || crate::core::value::i64_lt_f64(*hi, *v))
                         }
-                        (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => {
-                            Value::Boolean((*v as f64) < *lo || (*v as f64) > *hi)
-                        }
+                        (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => Value::Boolean(
+                            crate::core::value::i64_lt_f64(*v, *lo)
+                                || crate::core::value::i64_gt_f64(*v, *hi),
+                        ),
                         _ if val.is_null() || low.is_null() || high.is_null() => {
                             Value::Null(DataType::Boolean)
                         }
@@ -3068,7 +3076,7 @@ impl ExprVM {
                         Some(crate::core::value::i64_le_f64(*lo, *v) && *v <= *hi)
                     }
                     Some(Value::Integer(v)) => {
-                        Some((*v as f64) >= *lo as f64 && (*v as f64) <= *hi)
+                        Some(*v >= *lo && crate::core::value::i64_le_f64(*v, *hi))
                     }
                     Some(Value::Null(_)) | None => None,
                     _ => Some(false),
@@ -3080,7 +3088,7 @@ impl ExprVM {
                         Some(*v >= *lo && crate::core::value::i64_ge_f64(*hi, *v))
                     }
                     Some(Value::Integer(v)) => {
-                        Some((*v as f64) >= *lo && (*v as f64) <= *hi as f64)
+                        Some(crate::core::value::i64_ge_f64(*v, *lo) && *v <= *hi)
                     }
                     Some(Value::Null(_)) | None => None,
                     _ => Some(false),
@@ -3240,7 +3248,7 @@ impl ExprVM {
     fn gt_int(col_val: &Value, threshold: i64) -> Value {
         match col_val {
             Value::Integer(v) => Value::Boolean(*v > threshold),
-            Value::Float(v) => Value::Boolean(*v > threshold as f64),
+            Value::Float(v) => Value::Boolean(crate::core::value::i64_lt_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3262,7 +3270,7 @@ impl ExprVM {
     fn lt_int(col_val: &Value, threshold: i64) -> Value {
         match col_val {
             Value::Integer(v) => Value::Boolean(*v < threshold),
-            Value::Float(v) => Value::Boolean(*v < (threshold as f64)),
+            Value::Float(v) => Value::Boolean(crate::core::value::i64_gt_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3284,7 +3292,7 @@ impl ExprVM {
     fn ge_int(col_val: &Value, threshold: i64) -> Value {
         match col_val {
             Value::Integer(v) => Value::Boolean(*v >= threshold),
-            Value::Float(v) => Value::Boolean(*v >= threshold as f64),
+            Value::Float(v) => Value::Boolean(crate::core::value::i64_le_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3306,7 +3314,7 @@ impl ExprVM {
     fn le_int(col_val: &Value, threshold: i64) -> Value {
         match col_val {
             Value::Integer(v) => Value::Boolean(*v <= threshold),
-            Value::Float(v) => Value::Boolean(*v <= threshold as f64),
+            Value::Float(v) => Value::Boolean(crate::core::value::i64_ge_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3367,12 +3375,37 @@ impl ExprVM {
         }
     }
 
+    /// BETWEEN with an integer lower bound and float upper bound, exact
+    /// above 2^53 for both cell types
+    #[inline(always)]
+    fn between_mixed_int_lo(col_val: &Value, lo: i64, hi: f64) -> Value {
+        match col_val {
+            Value::Integer(v) => Value::Boolean(*v >= lo && crate::core::value::i64_le_f64(*v, hi)),
+            Value::Float(v) => Value::Boolean(crate::core::value::i64_le_f64(lo, *v) && *v <= hi),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// BETWEEN with a float lower bound and integer upper bound
+    #[inline(always)]
+    fn between_mixed_int_hi(col_val: &Value, lo: f64, hi: i64) -> Value {
+        match col_val {
+            Value::Integer(v) => Value::Boolean(crate::core::value::i64_ge_f64(*v, lo) && *v <= hi),
+            Value::Float(v) => Value::Boolean(*v >= lo && crate::core::value::i64_ge_f64(hi, *v)),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
     /// Inline BETWEEN check for integer bounds
     #[inline(always)]
     fn between_int(col_val: &Value, low: i64, high: i64) -> Value {
         match col_val {
             Value::Integer(v) => Value::Boolean(*v >= low && *v <= high),
-            Value::Float(v) => Value::Boolean(*v >= low as f64 && *v <= high as f64),
+            Value::Float(v) => Value::Boolean(
+                crate::core::value::i64_le_f64(low, *v) && crate::core::value::i64_ge_f64(high, *v),
+            ),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }

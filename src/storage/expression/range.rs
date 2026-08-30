@@ -24,6 +24,9 @@ use crate::core::{DataType, Result, Row, Schema, Value};
 /// Pre-computed bounds for different types
 #[derive(Debug, Clone)]
 pub struct RangeBounds {
+    /// Whether either bound was a float (integer cells then compare as f64)
+    pub has_float_bound: bool,
+
     /// Integer bounds
     pub int_min: i64,
     pub int_max: i64,
@@ -47,6 +50,7 @@ pub struct RangeBounds {
 impl Default for RangeBounds {
     fn default() -> Self {
         Self {
+            has_float_bound: false,
             int_min: 0,
             int_max: 0,
             float_min: 0.0,
@@ -151,6 +155,7 @@ impl RangeExpr {
                 let f = *v;
                 self.bounds.float_min = f;
                 self.bounds.int_min = f as i64;
+                self.bounds.has_float_bound = true;
                 self.bounds.data_type = DataType::Float;
             }
             Value::Text(v) => {
@@ -192,6 +197,7 @@ impl RangeExpr {
                 let f = *v;
                 self.bounds.float_max = f;
                 self.bounds.int_max = f as i64;
+                self.bounds.has_float_bound = true;
                 if self.bounds.data_type == DataType::Null {
                     self.bounds.data_type = DataType::Float;
                 }
@@ -234,7 +240,7 @@ impl RangeExpr {
     /// BETWEEN 5.1 AND 5.9 into [5, 5] and match 5.
     #[inline]
     fn check_integer(&self, val: i64) -> bool {
-        if self.bounds.data_type == DataType::Float {
+        if self.bounds.has_float_bound || self.bounds.data_type == DataType::Float {
             return self.check_float(val as f64);
         }
         // Check minimum

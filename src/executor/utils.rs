@@ -472,9 +472,10 @@ pub fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Null(_), Value::Null(_)) => false, // NULL != NULL in SQL
         (Value::Timestamp(x), Value::Timestamp(y)) => x == y,
         (Value::Extension(x), Value::Extension(y)) => x == y,
-        // Cross-type comparisons - try numeric
+        // Cross-type comparisons - exact numeric equality (epsilon-based
+        // equality matched near-values, and `i as f64` rounds above 2^53)
         (Value::Integer(x), Value::Float(y)) | (Value::Float(y), Value::Integer(x)) => {
-            (*x as f64 - y).abs() < f64::EPSILON
+            crate::core::value::i64_eq_f64(*x, *y)
         }
         _ => false,
     }
@@ -490,13 +491,14 @@ pub fn compare_values(a: &Value, b: &Value) -> Ordering {
         (Value::Null(_), Value::Null(_)) => Ordering::Equal,
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         (Value::Extension(x), Value::Extension(y)) => x.cmp(y),
-        // Cross-type comparisons - try numeric
+        // Cross-type comparisons - exact numeric ordering, consistent
+        // with Value::compare (merge join consumes ORDER BY output)
         (Value::Integer(x), Value::Float(y)) => {
-            (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
+            crate::core::value::cmp_i64_f64(*x, *y).unwrap_or(Ordering::Less)
         }
-        (Value::Float(x), Value::Integer(y)) => {
-            x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
-        }
+        (Value::Float(x), Value::Integer(y)) => crate::core::value::cmp_i64_f64(*y, *x)
+            .map(Ordering::reverse)
+            .unwrap_or(Ordering::Greater),
         // NULL sorts last
         (Value::Null(_), _) => Ordering::Greater,
         (_, Value::Null(_)) => Ordering::Less,
