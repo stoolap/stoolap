@@ -157,8 +157,12 @@ impl InListExpr {
                         Value::Integer(i) => {
                             set.insert(*i);
                         }
-                        // Only include floats if they are whole numbers.
-                        Value::Float(f) if f.fract() == 0.0 => {
+                        // Only include floats with an exact i64 equivalent:
+                        // 2^63 is whole but saturates to i64::MAX under the
+                        // cast, matching a value no i64 equals.
+                        Value::Float(f)
+                            if crate::executor::Executor::lossless_float_key(*f).is_some() =>
+                        {
                             set.insert(*f as i64);
                         }
                         Value::Float(_) => {
@@ -253,14 +257,16 @@ impl InListExpr {
         match &self.hashed {
             HashedValues::Integers(set) => set.contains(val),
             _ => {
-                // Fallback to linear search
+                // Fallback to linear search. Float list values compare
+                // numerically first: as_int64 would truncate 5.5 to 5 and
+                // match the wrong integers.
                 for v in &self.values {
-                    if let Some(list_val) = v.as_int64() {
-                        if val == list_val {
+                    if let Value::Float(f) = v {
+                        if crate::core::value::i64_eq_f64(val, *f) {
                             return true;
                         }
-                    } else if let Some(list_val) = v.as_float64() {
-                        if val as f64 == list_val {
+                    } else if let Some(list_val) = v.as_int64() {
+                        if val == list_val {
                             return true;
                         }
                     }
@@ -275,13 +281,23 @@ impl InListExpr {
     fn check_float(&self, val: f64) -> bool {
         // Floats use linear search due to precision issues with hashing
         for v in &self.values {
-            if let Some(list_val) = v.as_float64() {
-                if val == list_val {
-                    return true;
+            match v {
+                Value::Float(f) => {
+                    if val == *f {
+                        return true;
+                    }
                 }
-            } else if let Some(list_val) = v.as_int64() {
-                if val == list_val as f64 {
-                    return true;
+                Value::Integer(i) => {
+                    if crate::core::value::i64_eq_f64(*i, val) {
+                        return true;
+                    }
+                }
+                _ => {
+                    if let Some(list_val) = v.as_float64() {
+                        if val == list_val {
+                            return true;
+                        }
+                    }
                 }
             }
         }

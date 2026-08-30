@@ -406,8 +406,12 @@ impl ExprVM {
                     let result = match (&a, &b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x < *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(*x < *y),
-                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) < *y),
-                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x < (*y as f64)),
+                        (Value::Integer(x), Value::Float(y)) => {
+                            Value::Boolean(crate::core::value::i64_lt_f64(*x, *y))
+                        }
+                        (Value::Float(x), Value::Integer(y)) => {
+                            Value::Boolean(crate::core::value::i64_gt_f64(*y, *x))
+                        }
                         _ => self.compare_values(&a, &b, std::cmp::Ordering::Less),
                     };
                     self.stack.push(result);
@@ -421,8 +425,12 @@ impl ExprVM {
                     let result = match (&a, &b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x <= *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(*x <= *y),
-                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) <= *y),
-                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x <= (*y as f64)),
+                        (Value::Integer(x), Value::Float(y)) => {
+                            Value::Boolean(crate::core::value::i64_le_f64(*x, *y))
+                        }
+                        (Value::Float(x), Value::Integer(y)) => {
+                            Value::Boolean(crate::core::value::i64_ge_f64(*y, *x))
+                        }
                         _ => match a.partial_cmp(&b) {
                             Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
                                 Value::Boolean(true)
@@ -442,8 +450,12 @@ impl ExprVM {
                     let result = match (&a, &b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x > *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(*x > *y),
-                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) > *y),
-                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x > (*y as f64)),
+                        (Value::Integer(x), Value::Float(y)) => {
+                            Value::Boolean(crate::core::value::i64_gt_f64(*x, *y))
+                        }
+                        (Value::Float(x), Value::Integer(y)) => {
+                            Value::Boolean(crate::core::value::i64_lt_f64(*y, *x))
+                        }
                         _ => self.compare_values(&a, &b, std::cmp::Ordering::Greater),
                     };
                     self.stack.push(result);
@@ -457,8 +469,12 @@ impl ExprVM {
                     let result = match (&a, &b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x >= *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(*x >= *y),
-                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) >= *y),
-                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x >= (*y as f64)),
+                        (Value::Integer(x), Value::Float(y)) => {
+                            Value::Boolean(crate::core::value::i64_ge_f64(*x, *y))
+                        }
+                        (Value::Float(x), Value::Integer(y)) => {
+                            Value::Boolean(crate::core::value::i64_le_f64(*y, *x))
+                        }
                         _ => match a.partial_cmp(&b) {
                             Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
                                 Value::Boolean(true)
@@ -701,10 +717,10 @@ impl ExprVM {
                             Self::between_float(col_val, *lo, *hi)
                         }
                         (Value::Integer(lo), Value::Float(hi)) => {
-                            Self::between_float(col_val, *lo as f64, *hi)
+                            Self::between_mixed_int_lo(col_val, *lo, *hi)
                         }
                         (Value::Float(lo), Value::Integer(hi)) => {
-                            Self::between_float(col_val, *lo, *hi as f64)
+                            Self::between_mixed_int_hi(col_val, *lo, *hi)
                         }
                         _ if col_val.is_null() || low.is_null() || high.is_null() => {
                             Value::Null(DataType::Boolean)
@@ -1383,23 +1399,27 @@ impl ExprVM {
                             Value::Boolean(*v >= *lo && *v <= *hi)
                         }
                         (Value::Integer(v), Value::Integer(lo), Value::Float(hi)) => {
-                            Value::Boolean((*v as f64) >= (*lo as f64) && (*v as f64) <= *hi)
+                            Value::Boolean(*v >= *lo && crate::core::value::i64_le_f64(*v, *hi))
                         }
                         (Value::Integer(v), Value::Float(lo), Value::Integer(hi)) => {
-                            Value::Boolean((*v as f64) >= *lo && (*v as f64) <= (*hi as f64))
+                            Value::Boolean(crate::core::value::i64_ge_f64(*v, *lo) && *v <= *hi)
                         }
                         (Value::Float(v), Value::Integer(lo), Value::Integer(hi)) => {
-                            Value::Boolean(*v >= (*lo as f64) && *v <= (*hi as f64))
+                            Value::Boolean(
+                                crate::core::value::i64_le_f64(*lo, *v)
+                                    && crate::core::value::i64_ge_f64(*hi, *v),
+                            )
                         }
                         (Value::Float(v), Value::Integer(lo), Value::Float(hi)) => {
-                            Value::Boolean(*v >= (*lo as f64) && *v <= *hi)
+                            Value::Boolean(crate::core::value::i64_le_f64(*lo, *v) && *v <= *hi)
                         }
                         (Value::Float(v), Value::Float(lo), Value::Integer(hi)) => {
-                            Value::Boolean(*v >= *lo && *v <= (*hi as f64))
+                            Value::Boolean(*v >= *lo && crate::core::value::i64_ge_f64(*hi, *v))
                         }
-                        (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => {
-                            Value::Boolean((*v as f64) >= *lo && (*v as f64) <= *hi)
-                        }
+                        (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => Value::Boolean(
+                            crate::core::value::i64_ge_f64(*v, *lo)
+                                && crate::core::value::i64_le_f64(*v, *hi),
+                        ),
                         _ if val.is_null() || low.is_null() || high.is_null() => {
                             Value::Null(DataType::Boolean)
                         }
@@ -1423,23 +1443,27 @@ impl ExprVM {
                             Value::Boolean(*v < *lo || *v > *hi)
                         }
                         (Value::Integer(v), Value::Integer(lo), Value::Float(hi)) => {
-                            Value::Boolean((*v as f64) < (*lo as f64) || (*v as f64) > *hi)
+                            Value::Boolean(*v < *lo || crate::core::value::i64_gt_f64(*v, *hi))
                         }
                         (Value::Integer(v), Value::Float(lo), Value::Integer(hi)) => {
-                            Value::Boolean((*v as f64) < *lo || (*v as f64) > (*hi as f64))
+                            Value::Boolean(crate::core::value::i64_lt_f64(*v, *lo) || *v > *hi)
                         }
                         (Value::Float(v), Value::Integer(lo), Value::Integer(hi)) => {
-                            Value::Boolean(*v < (*lo as f64) || *v > (*hi as f64))
+                            Value::Boolean(
+                                crate::core::value::i64_gt_f64(*lo, *v)
+                                    || crate::core::value::i64_lt_f64(*hi, *v),
+                            )
                         }
                         (Value::Float(v), Value::Integer(lo), Value::Float(hi)) => {
-                            Value::Boolean(*v < (*lo as f64) || *v > *hi)
+                            Value::Boolean(crate::core::value::i64_gt_f64(*lo, *v) || *v > *hi)
                         }
                         (Value::Float(v), Value::Float(lo), Value::Integer(hi)) => {
-                            Value::Boolean(*v < *lo || *v > (*hi as f64))
+                            Value::Boolean(*v < *lo || crate::core::value::i64_lt_f64(*hi, *v))
                         }
-                        (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => {
-                            Value::Boolean((*v as f64) < *lo || (*v as f64) > *hi)
-                        }
+                        (Value::Integer(v), Value::Float(lo), Value::Float(hi)) => Value::Boolean(
+                            crate::core::value::i64_lt_f64(*v, *lo)
+                                || crate::core::value::i64_gt_f64(*v, *hi),
+                        ),
                         _ if val.is_null() || low.is_null() || high.is_null() => {
                             Value::Null(DataType::Boolean)
                         }
@@ -2128,8 +2152,12 @@ impl ExprVM {
                     let result = match (&*a, &*b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x < *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(*x < *y),
-                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) < *y),
-                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x < (*y as f64)),
+                        (Value::Integer(x), Value::Float(y)) => {
+                            Value::Boolean(crate::core::value::i64_lt_f64(*x, *y))
+                        }
+                        (Value::Float(x), Value::Integer(y)) => {
+                            Value::Boolean(crate::core::value::i64_gt_f64(*y, *x))
+                        }
                         _ => self.compare_values(&a, &b, std::cmp::Ordering::Less),
                     };
                     stack.push(Cow::Owned(result));
@@ -2142,8 +2170,12 @@ impl ExprVM {
                     let result = match (&*a, &*b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x <= *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(*x <= *y),
-                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) <= *y),
-                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x <= (*y as f64)),
+                        (Value::Integer(x), Value::Float(y)) => {
+                            Value::Boolean(crate::core::value::i64_le_f64(*x, *y))
+                        }
+                        (Value::Float(x), Value::Integer(y)) => {
+                            Value::Boolean(crate::core::value::i64_ge_f64(*y, *x))
+                        }
                         _ => match (*a).partial_cmp(&*b) {
                             Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
                                 Value::Boolean(true)
@@ -2162,8 +2194,12 @@ impl ExprVM {
                     let result = match (&*a, &*b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x > *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(*x > *y),
-                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) > *y),
-                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x > (*y as f64)),
+                        (Value::Integer(x), Value::Float(y)) => {
+                            Value::Boolean(crate::core::value::i64_gt_f64(*x, *y))
+                        }
+                        (Value::Float(x), Value::Integer(y)) => {
+                            Value::Boolean(crate::core::value::i64_lt_f64(*y, *x))
+                        }
                         _ => self.compare_values(&a, &b, std::cmp::Ordering::Greater),
                     };
                     stack.push(Cow::Owned(result));
@@ -2176,8 +2212,12 @@ impl ExprVM {
                     let result = match (&*a, &*b) {
                         (Value::Integer(x), Value::Integer(y)) => Value::Boolean(*x >= *y),
                         (Value::Float(x), Value::Float(y)) => Value::Boolean(*x >= *y),
-                        (Value::Integer(x), Value::Float(y)) => Value::Boolean((*x as f64) >= *y),
-                        (Value::Float(x), Value::Integer(y)) => Value::Boolean(*x >= (*y as f64)),
+                        (Value::Integer(x), Value::Float(y)) => {
+                            Value::Boolean(crate::core::value::i64_ge_f64(*x, *y))
+                        }
+                        (Value::Float(x), Value::Integer(y)) => {
+                            Value::Boolean(crate::core::value::i64_le_f64(*y, *x))
+                        }
                         _ => match (*a).partial_cmp(&*b) {
                             Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
                                 Value::Boolean(true)
@@ -2795,63 +2835,63 @@ impl ExprVM {
         match op {
             Op::GtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => *v > *threshold,
-                Some(Value::Float(v)) => *v > *threshold as f64,
+                Some(Value::Float(v)) => crate::core::value::i64_lt_f64(*threshold, *v),
                 _ => false,
             },
             Op::GtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => *v > *threshold,
-                Some(Value::Integer(v)) => (*v as f64) > *threshold,
+                Some(Value::Integer(v)) => crate::core::value::i64_gt_f64(*v, *threshold),
                 _ => false,
             },
             Op::LtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => *v < *threshold,
-                Some(Value::Float(v)) => *v < *threshold as f64,
+                Some(Value::Float(v)) => crate::core::value::i64_gt_f64(*threshold, *v),
                 _ => false,
             },
             Op::LtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => *v < *threshold,
-                Some(Value::Integer(v)) => (*v as f64) < *threshold,
+                Some(Value::Integer(v)) => crate::core::value::i64_lt_f64(*v, *threshold),
                 _ => false,
             },
             Op::GeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => *v >= *threshold,
-                Some(Value::Float(v)) => *v >= *threshold as f64,
+                Some(Value::Float(v)) => crate::core::value::i64_le_f64(*threshold, *v),
                 _ => false,
             },
             Op::GeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => *v >= *threshold,
-                Some(Value::Integer(v)) => (*v as f64) >= *threshold,
+                Some(Value::Integer(v)) => crate::core::value::i64_ge_f64(*v, *threshold),
                 _ => false,
             },
             Op::LeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => *v <= *threshold,
-                Some(Value::Float(v)) => *v <= *threshold as f64,
+                Some(Value::Float(v)) => crate::core::value::i64_ge_f64(*threshold, *v),
                 _ => false,
             },
             Op::LeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => *v <= *threshold,
-                Some(Value::Integer(v)) => (*v as f64) <= *threshold,
+                Some(Value::Integer(v)) => crate::core::value::i64_le_f64(*v, *threshold),
                 _ => false,
             },
             Op::EqColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => *v == *val,
-                Some(Value::Float(v)) => *v == *val as f64,
+                Some(Value::Float(v)) => crate::core::value::i64_eq_f64(*val, *v),
                 _ => false,
             },
             Op::EqColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => *v == *val,
-                Some(Value::Integer(v)) => (*v as f64) == *val,
+                Some(Value::Integer(v)) => crate::core::value::i64_eq_f64(*v, *val),
                 _ => false,
             },
             Op::NeColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => *v != *val,
-                Some(Value::Float(v)) => *v != *val as f64,
+                Some(Value::Float(v)) => crate::core::value::i64_ne_f64(*val, *v),
                 Some(Value::Null(_)) => false,
                 _ => true,
             },
             Op::NeColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => *v != *val,
-                Some(Value::Integer(v)) => (*v as f64) != *val,
+                Some(Value::Integer(v)) => crate::core::value::i64_ne_f64(*v, *val),
                 Some(Value::Null(_)) => false,
                 _ => true,
             },
@@ -2860,28 +2900,34 @@ impl ExprVM {
             Op::BetweenColumnConst(idx, Value::Integer(lo), Value::Integer(hi)) => {
                 match ctx.row.get(*idx as usize) {
                     Some(Value::Integer(v)) => *v >= *lo && *v <= *hi,
-                    Some(Value::Float(v)) => *v >= *lo as f64 && *v <= *hi as f64,
+                    Some(Value::Float(v)) => {
+                        crate::core::value::i64_le_f64(*lo, *v)
+                            && crate::core::value::i64_ge_f64(*hi, *v)
+                    }
                     _ => false,
                 }
             }
             Op::BetweenColumnConst(idx, Value::Float(lo), Value::Float(hi)) => {
                 match ctx.row.get(*idx as usize) {
                     Some(Value::Float(v)) => *v >= *lo && *v <= *hi,
-                    Some(Value::Integer(v)) => (*v as f64) >= *lo && (*v as f64) <= *hi,
+                    Some(Value::Integer(v)) => {
+                        crate::core::value::i64_ge_f64(*v, *lo)
+                            && crate::core::value::i64_le_f64(*v, *hi)
+                    }
                     _ => false,
                 }
             }
             Op::BetweenColumnConst(idx, Value::Integer(lo), Value::Float(hi)) => {
                 match ctx.row.get(*idx as usize) {
-                    Some(Value::Float(v)) => *v >= *lo as f64 && *v <= *hi,
-                    Some(Value::Integer(v)) => (*v as f64) >= *lo as f64 && (*v as f64) <= *hi,
+                    Some(Value::Float(v)) => crate::core::value::i64_le_f64(*lo, *v) && *v <= *hi,
+                    Some(Value::Integer(v)) => *v >= *lo && crate::core::value::i64_le_f64(*v, *hi),
                     _ => false,
                 }
             }
             Op::BetweenColumnConst(idx, Value::Float(lo), Value::Integer(hi)) => {
                 match ctx.row.get(*idx as usize) {
-                    Some(Value::Float(v)) => *v >= *lo && *v <= *hi as f64,
-                    Some(Value::Integer(v)) => (*v as f64) >= *lo && (*v as f64) <= *hi as f64,
+                    Some(Value::Float(v)) => *v >= *lo && crate::core::value::i64_ge_f64(*hi, *v),
+                    Some(Value::Integer(v)) => crate::core::value::i64_ge_f64(*v, *lo) && *v <= *hi,
                     _ => false,
                 }
             }
@@ -2928,73 +2974,73 @@ impl ExprVM {
         match op {
             Op::GtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => Some(*v > *threshold),
-                Some(Value::Float(v)) => Some(*v > *threshold as f64),
+                Some(Value::Float(v)) => Some(crate::core::value::i64_lt_f64(*threshold, *v)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(false),
             },
             Op::GtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => Some(*v > *threshold),
-                Some(Value::Integer(v)) => Some((*v as f64) > *threshold),
+                Some(Value::Integer(v)) => Some(crate::core::value::i64_gt_f64(*v, *threshold)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(false),
             },
             Op::LtColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => Some(*v < *threshold),
-                Some(Value::Float(v)) => Some(*v < *threshold as f64),
+                Some(Value::Float(v)) => Some(crate::core::value::i64_gt_f64(*threshold, *v)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(false),
             },
             Op::LtColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => Some(*v < *threshold),
-                Some(Value::Integer(v)) => Some((*v as f64) < *threshold),
+                Some(Value::Integer(v)) => Some(crate::core::value::i64_lt_f64(*v, *threshold)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(false),
             },
             Op::GeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => Some(*v >= *threshold),
-                Some(Value::Float(v)) => Some(*v >= *threshold as f64),
+                Some(Value::Float(v)) => Some(crate::core::value::i64_le_f64(*threshold, *v)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(false),
             },
             Op::GeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => Some(*v >= *threshold),
-                Some(Value::Integer(v)) => Some((*v as f64) >= *threshold),
+                Some(Value::Integer(v)) => Some(crate::core::value::i64_ge_f64(*v, *threshold)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(false),
             },
             Op::LeColumnConst(idx, Value::Integer(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => Some(*v <= *threshold),
-                Some(Value::Float(v)) => Some(*v <= *threshold as f64),
+                Some(Value::Float(v)) => Some(crate::core::value::i64_ge_f64(*threshold, *v)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(false),
             },
             Op::LeColumnConst(idx, Value::Float(threshold)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => Some(*v <= *threshold),
-                Some(Value::Integer(v)) => Some((*v as f64) <= *threshold),
+                Some(Value::Integer(v)) => Some(crate::core::value::i64_le_f64(*v, *threshold)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(false),
             },
             Op::EqColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => Some(*v == *val),
-                Some(Value::Float(v)) => Some(*v == *val as f64),
+                Some(Value::Float(v)) => Some(crate::core::value::i64_eq_f64(*val, *v)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(false),
             },
             Op::EqColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => Some(*v == *val),
-                Some(Value::Integer(v)) => Some((*v as f64) == *val),
+                Some(Value::Integer(v)) => Some(crate::core::value::i64_eq_f64(*v, *val)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(false),
             },
             Op::NeColumnConst(idx, Value::Integer(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Integer(v)) => Some(*v != *val),
-                Some(Value::Float(v)) => Some(*v != *val as f64),
+                Some(Value::Float(v)) => Some(crate::core::value::i64_ne_f64(*val, *v)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(true),
             },
             Op::NeColumnConst(idx, Value::Float(val)) => match ctx.row.get(*idx as usize) {
                 Some(Value::Float(v)) => Some(*v != *val),
-                Some(Value::Integer(v)) => Some((*v as f64) != *val),
+                Some(Value::Integer(v)) => Some(crate::core::value::i64_ne_f64(*v, *val)),
                 Some(Value::Null(_)) | None => None,
                 _ => Some(true),
             },
@@ -3005,7 +3051,10 @@ impl ExprVM {
             Op::BetweenColumnConst(idx, Value::Integer(lo), Value::Integer(hi)) => {
                 match ctx.row.get(*idx as usize) {
                     Some(Value::Integer(v)) => Some(*v >= *lo && *v <= *hi),
-                    Some(Value::Float(v)) => Some(*v >= *lo as f64 && *v <= *hi as f64),
+                    Some(Value::Float(v)) => Some(
+                        crate::core::value::i64_le_f64(*lo, *v)
+                            && crate::core::value::i64_ge_f64(*hi, *v),
+                    ),
                     Some(Value::Null(_)) | None => None,
                     _ => Some(false),
                 }
@@ -3013,16 +3062,21 @@ impl ExprVM {
             Op::BetweenColumnConst(idx, Value::Float(lo), Value::Float(hi)) => {
                 match ctx.row.get(*idx as usize) {
                     Some(Value::Float(v)) => Some(*v >= *lo && *v <= *hi),
-                    Some(Value::Integer(v)) => Some((*v as f64) >= *lo && (*v as f64) <= *hi),
+                    Some(Value::Integer(v)) => Some(
+                        crate::core::value::i64_ge_f64(*v, *lo)
+                            && crate::core::value::i64_le_f64(*v, *hi),
+                    ),
                     Some(Value::Null(_)) | None => None,
                     _ => Some(false),
                 }
             }
             Op::BetweenColumnConst(idx, Value::Integer(lo), Value::Float(hi)) => {
                 match ctx.row.get(*idx as usize) {
-                    Some(Value::Float(v)) => Some(*v >= *lo as f64 && *v <= *hi),
+                    Some(Value::Float(v)) => {
+                        Some(crate::core::value::i64_le_f64(*lo, *v) && *v <= *hi)
+                    }
                     Some(Value::Integer(v)) => {
-                        Some((*v as f64) >= *lo as f64 && (*v as f64) <= *hi)
+                        Some(*v >= *lo && crate::core::value::i64_le_f64(*v, *hi))
                     }
                     Some(Value::Null(_)) | None => None,
                     _ => Some(false),
@@ -3030,9 +3084,11 @@ impl ExprVM {
             }
             Op::BetweenColumnConst(idx, Value::Float(lo), Value::Integer(hi)) => {
                 match ctx.row.get(*idx as usize) {
-                    Some(Value::Float(v)) => Some(*v >= *lo && *v <= *hi as f64),
+                    Some(Value::Float(v)) => {
+                        Some(*v >= *lo && crate::core::value::i64_ge_f64(*hi, *v))
+                    }
                     Some(Value::Integer(v)) => {
-                        Some((*v as f64) >= *lo && (*v as f64) <= *hi as f64)
+                        Some(crate::core::value::i64_ge_f64(*v, *lo) && *v <= *hi)
                     }
                     Some(Value::Null(_)) | None => None,
                     _ => Some(false),
@@ -3192,7 +3248,7 @@ impl ExprVM {
     fn gt_int(col_val: &Value, threshold: i64) -> Value {
         match col_val {
             Value::Integer(v) => Value::Boolean(*v > threshold),
-            Value::Float(v) => Value::Boolean(*v > threshold as f64),
+            Value::Float(v) => Value::Boolean(crate::core::value::i64_lt_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3203,7 +3259,7 @@ impl ExprVM {
     fn gt_float(col_val: &Value, threshold: f64) -> Value {
         match col_val {
             Value::Float(v) => Value::Boolean(*v > threshold),
-            Value::Integer(v) => Value::Boolean((*v as f64) > threshold),
+            Value::Integer(v) => Value::Boolean(crate::core::value::i64_gt_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3214,7 +3270,7 @@ impl ExprVM {
     fn lt_int(col_val: &Value, threshold: i64) -> Value {
         match col_val {
             Value::Integer(v) => Value::Boolean(*v < threshold),
-            Value::Float(v) => Value::Boolean(*v < (threshold as f64)),
+            Value::Float(v) => Value::Boolean(crate::core::value::i64_gt_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3225,7 +3281,7 @@ impl ExprVM {
     fn lt_float(col_val: &Value, threshold: f64) -> Value {
         match col_val {
             Value::Float(v) => Value::Boolean(*v < threshold),
-            Value::Integer(v) => Value::Boolean((*v as f64) < threshold),
+            Value::Integer(v) => Value::Boolean(crate::core::value::i64_lt_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3236,7 +3292,7 @@ impl ExprVM {
     fn ge_int(col_val: &Value, threshold: i64) -> Value {
         match col_val {
             Value::Integer(v) => Value::Boolean(*v >= threshold),
-            Value::Float(v) => Value::Boolean(*v >= threshold as f64),
+            Value::Float(v) => Value::Boolean(crate::core::value::i64_le_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3247,7 +3303,7 @@ impl ExprVM {
     fn ge_float(col_val: &Value, threshold: f64) -> Value {
         match col_val {
             Value::Float(v) => Value::Boolean(*v >= threshold),
-            Value::Integer(v) => Value::Boolean((*v as f64) >= threshold),
+            Value::Integer(v) => Value::Boolean(crate::core::value::i64_ge_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3258,7 +3314,7 @@ impl ExprVM {
     fn le_int(col_val: &Value, threshold: i64) -> Value {
         match col_val {
             Value::Integer(v) => Value::Boolean(*v <= threshold),
-            Value::Float(v) => Value::Boolean(*v <= threshold as f64),
+            Value::Float(v) => Value::Boolean(crate::core::value::i64_ge_f64(threshold, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3269,7 +3325,7 @@ impl ExprVM {
     fn le_float(col_val: &Value, threshold: f64) -> Value {
         match col_val {
             Value::Float(v) => Value::Boolean(*v <= threshold),
-            Value::Integer(v) => Value::Boolean((*v as f64) <= threshold),
+            Value::Integer(v) => Value::Boolean(crate::core::value::i64_le_f64(*v, threshold)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3280,7 +3336,7 @@ impl ExprVM {
     fn eq_int(col_val: &Value, val: i64) -> Value {
         match col_val {
             Value::Integer(v) => Value::Boolean(*v == val),
-            Value::Float(v) => Value::Boolean(*v == val as f64),
+            Value::Float(v) => Value::Boolean(crate::core::value::i64_eq_f64(val, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3291,7 +3347,7 @@ impl ExprVM {
     fn eq_float(col_val: &Value, val: f64) -> Value {
         match col_val {
             Value::Float(v) => Value::Boolean(*v == val),
-            Value::Integer(v) => Value::Boolean((*v as f64) == val),
+            Value::Integer(v) => Value::Boolean(crate::core::value::i64_eq_f64(*v, val)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3302,7 +3358,7 @@ impl ExprVM {
     fn ne_int(col_val: &Value, val: i64) -> Value {
         match col_val {
             Value::Integer(v) => Value::Boolean(*v != val),
-            Value::Float(v) => Value::Boolean(*v != val as f64),
+            Value::Float(v) => Value::Boolean(crate::core::value::i64_ne_f64(val, *v)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(true),
         }
@@ -3313,9 +3369,32 @@ impl ExprVM {
     fn ne_float(col_val: &Value, val: f64) -> Value {
         match col_val {
             Value::Float(v) => Value::Boolean(*v != val),
-            Value::Integer(v) => Value::Boolean((*v as f64) != val),
+            Value::Integer(v) => Value::Boolean(crate::core::value::i64_ne_f64(*v, val)),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(true),
+        }
+    }
+
+    /// BETWEEN with an integer lower bound and float upper bound, exact
+    /// above 2^53 for both cell types
+    #[inline(always)]
+    fn between_mixed_int_lo(col_val: &Value, lo: i64, hi: f64) -> Value {
+        match col_val {
+            Value::Integer(v) => Value::Boolean(*v >= lo && crate::core::value::i64_le_f64(*v, hi)),
+            Value::Float(v) => Value::Boolean(crate::core::value::i64_le_f64(lo, *v) && *v <= hi),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
+    /// BETWEEN with a float lower bound and integer upper bound
+    #[inline(always)]
+    fn between_mixed_int_hi(col_val: &Value, lo: f64, hi: i64) -> Value {
+        match col_val {
+            Value::Integer(v) => Value::Boolean(crate::core::value::i64_ge_f64(*v, lo) && *v <= hi),
+            Value::Float(v) => Value::Boolean(*v >= lo && crate::core::value::i64_ge_f64(hi, *v)),
+            Value::Null(_) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
         }
     }
 
@@ -3324,7 +3403,9 @@ impl ExprVM {
     fn between_int(col_val: &Value, low: i64, high: i64) -> Value {
         match col_val {
             Value::Integer(v) => Value::Boolean(*v >= low && *v <= high),
-            Value::Float(v) => Value::Boolean(*v >= low as f64 && *v <= high as f64),
+            Value::Float(v) => Value::Boolean(
+                crate::core::value::i64_le_f64(low, *v) && crate::core::value::i64_ge_f64(high, *v),
+            ),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }
@@ -3335,7 +3416,9 @@ impl ExprVM {
     fn between_float(col_val: &Value, low: f64, high: f64) -> Value {
         match col_val {
             Value::Float(v) => Value::Boolean(*v >= low && *v <= high),
-            Value::Integer(v) => Value::Boolean((*v as f64) >= low && (*v as f64) <= high),
+            Value::Integer(v) => Value::Boolean(
+                crate::core::value::i64_ge_f64(*v, low) && crate::core::value::i64_le_f64(*v, high),
+            ),
             Value::Null(_) => Value::Null(DataType::Boolean),
             _ => Value::Boolean(false),
         }

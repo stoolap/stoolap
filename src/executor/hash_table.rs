@@ -454,8 +454,10 @@ fn values_equal(a: &Value, b: &Value) -> bool {
         (Value::Timestamp(x), Value::Timestamp(y)) => x == y,
         (Value::Extension(x), Value::Extension(y)) => x == y,
         // Cross-type numeric comparison: convert integer to float and compare bits
-        (Value::Integer(x), Value::Float(y)) => (*x as f64).to_bits() == y.to_bits(),
-        (Value::Float(x), Value::Integer(y)) => x.to_bits() == (*y as f64).to_bits(),
+        // Exact above 2^53: `i as f64` rounds and would join i64::MAX
+        // with Float(2^63)
+        (Value::Integer(x), Value::Float(y)) => crate::core::value::i64_eq_f64(*x, *y),
+        (Value::Float(x), Value::Integer(y)) => crate::core::value::i64_eq_f64(*y, *x),
         _ => false,
     }
 }

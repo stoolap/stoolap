@@ -24,6 +24,12 @@ use crate::core::{DataType, Result, Row, Schema, Value};
 /// Pre-computed bounds for different types
 #[derive(Debug, Clone)]
 pub struct RangeBounds {
+    /// Per-bound types: integer cells compare each bound in the bound's
+    /// own type, exactly (converting either side through f64 rounds
+    /// above 2^53)
+    pub min_is_float: bool,
+    pub max_is_float: bool,
+
     /// Integer bounds
     pub int_min: i64,
     pub int_max: i64,
@@ -47,6 +53,8 @@ pub struct RangeBounds {
 impl Default for RangeBounds {
     fn default() -> Self {
         Self {
+            min_is_float: false,
+            max_is_float: false,
             int_min: 0,
             int_max: 0,
             float_min: 0.0,
@@ -151,6 +159,7 @@ impl RangeExpr {
                 let f = *v;
                 self.bounds.float_min = f;
                 self.bounds.int_min = f as i64;
+                self.bounds.min_is_float = true;
                 self.bounds.data_type = DataType::Float;
             }
             Value::Text(v) => {
@@ -192,6 +201,7 @@ impl RangeExpr {
                 let f = *v;
                 self.bounds.float_max = f;
                 self.bounds.int_max = f as i64;
+                self.bounds.max_is_float = true;
                 if self.bounds.data_type == DataType::Null {
                     self.bounds.data_type = DataType::Float;
                 }
@@ -229,52 +239,72 @@ impl RangeExpr {
         }
     }
 
-    /// Check integer bounds
+    /// Check integer bounds, each bound in its own type: a float bound
+    /// must not truncate (5.1..5.9 is not [5, 5]) and an integer bound
+    /// must not round through f64 (Integer(i64::MAX) is not 2^63).
     #[inline]
     fn check_integer(&self, val: i64) -> bool {
-        // Check minimum
-        if self.include_min {
-            if val < self.bounds.int_min {
-                return false;
+        use crate::core::value::{i64_ge_f64, i64_gt_f64, i64_le_f64, i64_lt_f64};
+
+        let lower_ok = if self.bounds.min_is_float {
+            if self.include_min {
+                i64_ge_f64(val, self.bounds.float_min)
+            } else {
+                i64_gt_f64(val, self.bounds.float_min)
             }
-        } else if val <= self.bounds.int_min {
+        } else if self.include_min {
+            val >= self.bounds.int_min
+        } else {
+            val > self.bounds.int_min
+        };
+        if !lower_ok {
             return false;
         }
 
-        // Check maximum
-        if self.include_max {
-            if val > self.bounds.int_max {
-                return false;
+        if self.bounds.max_is_float {
+            if self.include_max {
+                i64_le_f64(val, self.bounds.float_max)
+            } else {
+                i64_lt_f64(val, self.bounds.float_max)
             }
-        } else if val >= self.bounds.int_max {
-            return false;
+        } else if self.include_max {
+            val <= self.bounds.int_max
+        } else {
+            val < self.bounds.int_max
         }
-
-        true
     }
 
-    /// Check float bounds
+    /// Check float bounds, each bound in its own type
     #[inline]
     fn check_float(&self, val: f64) -> bool {
-        // Check minimum
-        if self.include_min {
-            if val < self.bounds.float_min {
-                return false;
+        use crate::core::value::{i64_ge_f64, i64_gt_f64, i64_le_f64, i64_lt_f64};
+
+        let lower_ok = if self.bounds.min_is_float {
+            if self.include_min {
+                val >= self.bounds.float_min
+            } else {
+                val > self.bounds.float_min
             }
-        } else if val <= self.bounds.float_min {
+        } else if self.include_min {
+            i64_le_f64(self.bounds.int_min, val)
+        } else {
+            i64_lt_f64(self.bounds.int_min, val)
+        };
+        if !lower_ok {
             return false;
         }
 
-        // Check maximum
-        if self.include_max {
-            if val > self.bounds.float_max {
-                return false;
+        if self.bounds.max_is_float {
+            if self.include_max {
+                val <= self.bounds.float_max
+            } else {
+                val < self.bounds.float_max
             }
-        } else if val >= self.bounds.float_max {
-            return false;
+        } else if self.include_max {
+            i64_ge_f64(self.bounds.int_max, val)
+        } else {
+            i64_gt_f64(self.bounds.int_max, val)
         }
-
-        true
     }
 
     /// Check string bounds
@@ -661,5 +691,54 @@ mod tests {
     fn test_get_column_name() {
         let expr = RangeExpr::inclusive("id", Value::integer(1), Value::integer(10));
         assert_eq!(expr.get_column_name(), Some("id"));
+    }
+
+    #[test]
+    fn mixed_bounds_are_exact_at_extremes() {
+        let schema = test_schema();
+
+        // [Integer(i64::MAX), Float(2^63)]: i64::MAX - 1 is below the
+        // integer lower bound; rounding it through f64 would accept it
+        let mut expr = RangeExpr::inclusive(
+            "id",
+            Value::integer(i64::MAX),
+            Value::float(9_223_372_036_854_775_808.0),
+        );
+        expr.prepare_for_schema(&schema);
+
+        let below = Row::from_values(vec![
+            Value::integer(i64::MAX - 1),
+            Value::float(0.0),
+            Value::text("x"),
+        ]);
+        assert!(!expr.evaluate(&below).unwrap());
+        assert!(!expr.evaluate_fast(&below));
+
+        let at_max = Row::from_values(vec![
+            Value::integer(i64::MAX),
+            Value::float(0.0),
+            Value::text("x"),
+        ]);
+        assert!(expr.evaluate(&at_max).unwrap());
+        assert!(expr.evaluate_fast(&at_max));
+
+        // Float cell 2^63 against an Integer(i64::MAX) upper bound:
+        // above the bound, must reject
+        let mut expr = RangeExpr::inclusive("score", Value::integer(0), Value::integer(i64::MAX));
+        expr.prepare_for_schema(&schema);
+        let high = Row::from_values(vec![
+            Value::integer(1),
+            Value::float(9_223_372_036_854_775_808.0),
+            Value::text("x"),
+        ]);
+        assert!(!expr.evaluate(&high).unwrap());
+        assert!(!expr.evaluate_fast(&high));
+
+        // Fractional float bounds stay empty for integers
+        let mut expr = RangeExpr::inclusive("id", Value::float(5.1), Value::float(5.9));
+        expr.prepare_for_schema(&schema);
+        let five = Row::from_values(vec![Value::integer(5), Value::float(0.0), Value::text("x")]);
+        assert!(!expr.evaluate(&five).unwrap());
+        assert!(!expr.evaluate_fast(&five));
     }
 }

@@ -479,7 +479,12 @@ impl VolumeScanner {
                             .saturating_add(dt.timestamp_subsec_nanos() as i64)
                     }))
                 }
-                (Value::Integer(v), crate::core::DataType::Float) => {
+                // Only lossless integers: `i as f64` rounds above 2^53 and
+                // the pre-filter must never reject rows the full filter
+                // accepts
+                (Value::Integer(v), crate::core::DataType::Float)
+                    if crate::core::value::lossless_f64_from_i64(*v).is_some() =>
+                {
                     TypedTarget::Float64(*v as f64)
                 }
                 _ => continue,

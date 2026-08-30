@@ -112,24 +112,122 @@ impl BetweenExpr {
         self.not
     }
 
-    /// Compare integers with bounds
-    #[inline]
-    fn check_integer(&self, val: i64, lower: i64, upper: i64) -> bool {
-        if self.inclusive {
-            val >= lower && val <= upper
-        } else {
-            val > lower && val < upper
-        }
+    /// val >= lower bound (or > when exclusive), exact PER BOUND TYPE:
+    /// converting an Integer bound through f64 rounds above 2^53
+    /// (Integer(i64::MAX) would become 2^63).
+    fn int_cell_lower_ok(&self, val: i64, bound: &Value) -> Option<bool> {
+        use crate::core::value::{i64_ge_f64, i64_gt_f64};
+        Some(match bound {
+            Value::Integer(lo) => {
+                if self.inclusive {
+                    val >= *lo
+                } else {
+                    val > *lo
+                }
+            }
+            Value::Float(lo) => {
+                if self.inclusive {
+                    i64_ge_f64(val, *lo)
+                } else {
+                    i64_gt_f64(val, *lo)
+                }
+            }
+            _ => {
+                let lo = bound.as_int64()?;
+                if self.inclusive {
+                    val >= lo
+                } else {
+                    val > lo
+                }
+            }
+        })
     }
 
-    /// Compare floats with bounds
-    #[inline]
-    fn check_float(&self, val: f64, lower: f64, upper: f64) -> bool {
-        if self.inclusive {
-            val >= lower && val <= upper
-        } else {
-            val > lower && val < upper
-        }
+    /// val <= upper bound (or < when exclusive), exact per bound type
+    fn int_cell_upper_ok(&self, val: i64, bound: &Value) -> Option<bool> {
+        use crate::core::value::{i64_le_f64, i64_lt_f64};
+        Some(match bound {
+            Value::Integer(hi) => {
+                if self.inclusive {
+                    val <= *hi
+                } else {
+                    val < *hi
+                }
+            }
+            Value::Float(hi) => {
+                if self.inclusive {
+                    i64_le_f64(val, *hi)
+                } else {
+                    i64_lt_f64(val, *hi)
+                }
+            }
+            _ => {
+                let hi = bound.as_int64()?;
+                if self.inclusive {
+                    val <= hi
+                } else {
+                    val < hi
+                }
+            }
+        })
+    }
+
+    /// Float cell >= lower bound, exact per bound type
+    fn float_cell_lower_ok(&self, val: f64, bound: &Value) -> Option<bool> {
+        use crate::core::value::{i64_le_f64, i64_lt_f64};
+        Some(match bound {
+            Value::Float(lo) => {
+                if self.inclusive {
+                    val >= *lo
+                } else {
+                    val > *lo
+                }
+            }
+            Value::Integer(lo) => {
+                if self.inclusive {
+                    i64_le_f64(*lo, val)
+                } else {
+                    i64_lt_f64(*lo, val)
+                }
+            }
+            _ => {
+                let lo = bound.as_float64()?;
+                if self.inclusive {
+                    val >= lo
+                } else {
+                    val > lo
+                }
+            }
+        })
+    }
+
+    /// Float cell <= upper bound, exact per bound type
+    fn float_cell_upper_ok(&self, val: f64, bound: &Value) -> Option<bool> {
+        use crate::core::value::{i64_ge_f64, i64_gt_f64};
+        Some(match bound {
+            Value::Float(hi) => {
+                if self.inclusive {
+                    val <= *hi
+                } else {
+                    val < *hi
+                }
+            }
+            Value::Integer(hi) => {
+                if self.inclusive {
+                    i64_ge_f64(*hi, val)
+                } else {
+                    i64_gt_f64(*hi, val)
+                }
+            }
+            _ => {
+                let hi = bound.as_float64()?;
+                if self.inclusive {
+                    val <= hi
+                } else {
+                    val < hi
+                }
+            }
+        })
     }
 
     /// Compare strings with bounds
@@ -174,50 +272,55 @@ impl Expression for BetweenExpr {
         }
 
         // Type-specific comparisons
-        let in_range =
-            match col_value {
-                Value::Integer(val) => {
-                    let lower = self.lower_bound.as_int64().ok_or_else(|| {
-                        crate::core::Error::type_conversion("lower bound", "integer")
-                    })?;
-                    let upper = self.upper_bound.as_int64().ok_or_else(|| {
-                        crate::core::Error::type_conversion("upper bound", "integer")
-                    })?;
-                    self.check_integer(*val, lower, upper)
-                }
+        let in_range = match col_value {
+            Value::Integer(val) => {
+                // Each bound compares in its own type: float bounds must
+                // not truncate (BETWEEN 5.1 AND 5.9 is empty for
+                // integers), and integer bounds must not round through
+                // f64 (Integer(i64::MAX) is not 2^63)
+                let lower_ok = self
+                    .int_cell_lower_ok(*val, &self.lower_bound)
+                    .ok_or_else(|| crate::core::Error::type_conversion("lower bound", "integer"))?;
+                let upper_ok = self
+                    .int_cell_upper_ok(*val, &self.upper_bound)
+                    .ok_or_else(|| crate::core::Error::type_conversion("upper bound", "integer"))?;
+                lower_ok && upper_ok
+            }
 
-                Value::Float(val) => {
-                    let lower = self.lower_bound.as_float64().ok_or_else(|| {
-                        crate::core::Error::type_conversion("lower bound", "float")
-                    })?;
-                    let upper = self.upper_bound.as_float64().ok_or_else(|| {
-                        crate::core::Error::type_conversion("upper bound", "float")
-                    })?;
-                    self.check_float(*val, lower, upper)
-                }
+            Value::Float(val) => {
+                let lower_ok = self
+                    .float_cell_lower_ok(*val, &self.lower_bound)
+                    .ok_or_else(|| crate::core::Error::type_conversion("lower bound", "float"))?;
+                let upper_ok = self
+                    .float_cell_upper_ok(*val, &self.upper_bound)
+                    .ok_or_else(|| crate::core::Error::type_conversion("upper bound", "float"))?;
+                lower_ok && upper_ok
+            }
 
-                Value::Text(val) => {
-                    let lower = self.lower_bound.as_string().ok_or_else(|| {
-                        crate::core::Error::type_conversion("lower bound", "string")
-                    })?;
-                    let upper = self.upper_bound.as_string().ok_or_else(|| {
-                        crate::core::Error::type_conversion("upper bound", "string")
-                    })?;
-                    self.check_string(val, &lower, &upper)
-                }
+            Value::Text(val) => {
+                let lower = self
+                    .lower_bound
+                    .as_string()
+                    .ok_or_else(|| crate::core::Error::type_conversion("lower bound", "string"))?;
+                let upper = self
+                    .upper_bound
+                    .as_string()
+                    .ok_or_else(|| crate::core::Error::type_conversion("upper bound", "string"))?;
+                self.check_string(val, &lower, &upper)
+            }
 
-                Value::Timestamp(val) => {
-                    let lower = self.lower_bound.as_timestamp().ok_or_else(|| {
-                        crate::core::Error::type_conversion("lower bound", "timestamp")
-                    })?;
-                    let upper = self.upper_bound.as_timestamp().ok_or_else(|| {
-                        crate::core::Error::type_conversion("upper bound", "timestamp")
-                    })?;
-                    self.check_timestamp(*val, lower, upper)
-                }
+            Value::Timestamp(val) => {
+                let lower = self.lower_bound.as_timestamp().ok_or_else(|| {
+                    crate::core::Error::type_conversion("lower bound", "timestamp")
+                })?;
+                let upper = self.upper_bound.as_timestamp().ok_or_else(|| {
+                    crate::core::Error::type_conversion("upper bound", "timestamp")
+                })?;
+                self.check_timestamp(*val, lower, upper)
+            }
 
-                _ => false,
-            };
+            _ => false,
+        };
 
         // Apply NOT if this is a NOT BETWEEN expression
         Ok(if self.not { !in_range } else { in_range })
@@ -239,22 +342,22 @@ impl Expression for BetweenExpr {
 
         let in_range = match col_value {
             Value::Integer(val) => {
-                if let (Some(lower), Some(upper)) =
-                    (self.lower_bound.as_int64(), self.upper_bound.as_int64())
-                {
-                    self.check_integer(*val, lower, upper)
-                } else {
-                    return false;
+                match (
+                    self.int_cell_lower_ok(*val, &self.lower_bound),
+                    self.int_cell_upper_ok(*val, &self.upper_bound),
+                ) {
+                    (Some(lo), Some(hi)) => lo && hi,
+                    _ => return false,
                 }
             }
 
             Value::Float(val) => {
-                if let (Some(lower), Some(upper)) =
-                    (self.lower_bound.as_float64(), self.upper_bound.as_float64())
-                {
-                    self.check_float(*val, lower, upper)
-                } else {
-                    return false;
+                match (
+                    self.float_cell_lower_ok(*val, &self.lower_bound),
+                    self.float_cell_upper_ok(*val, &self.upper_bound),
+                ) {
+                    (Some(lo), Some(hi)) => lo && hi,
+                    _ => return false,
                 }
             }
 
