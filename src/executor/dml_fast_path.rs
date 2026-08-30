@@ -273,6 +273,7 @@ impl Executor {
             UpdateValueSource::Literal(v) => Some(v.clone()),
             UpdateValueSource::Parameter(idx) => params.get(*idx).cloned(),
             UpdateValueSource::NamedParameter(_) => None, // No ctx available in slice path
+            UpdateValueSource::Expression(_) => None,     // Needs a row context; normal path
         }
     }
 
@@ -296,19 +297,36 @@ impl Executor {
                     let mut updates = Vec::with_capacity(update.updates.len());
                     for u in &update.updates {
                         let value = Self::extract_update_value_from_slice(&u.value_source, params)?;
-                        updates.push((u.column_idx, value.coerce_to_type(u.column_type)));
+                        let coerced = value.coerce_to_type(u.column_type);
+                        if super::dml::validate_coercion(
+                            &value,
+                            &coerced,
+                            &update.schema.columns[u.column_idx].name,
+                            u.column_type,
+                            u.column_vector_dims,
+                        )
+                        .is_err()
+                        {
+                            // Let the normal path produce the full error
+                            return None;
+                        }
+                        updates.push((u.column_idx, coerced));
                     }
                     // Clone only what we need (cheap: SmartString + Arc)
                     let table_name = update.table_name.clone();
                     let pk_column_name = update.pk_column_name.clone();
                     let schema = update.schema.clone();
                     drop(compiled_guard);
+                    // Expression sources bail above, so no row programs
+                    // and no parameters are needed here
                     return Some(self.execute_pk_update_minimal(
                         &table_name,
                         &pk_column_name,
                         &schema,
                         pk_value,
                         updates,
+                        &[],
+                        &ExecutionContext::new(),
                     ));
                 }
                 None // Epoch changed, use normal path
@@ -354,6 +372,7 @@ impl Executor {
     }
 
     /// Execute PK update with minimal data (avoids cloning CompiledPkUpdate)
+    #[allow(clippy::too_many_arguments)]
     fn execute_pk_update_minimal(
         &self,
         table_name: &str,
@@ -361,6 +380,13 @@ impl Executor {
         schema: &CompactArc<Schema>,
         pk_value: i64,
         updates: Vec<(usize, Value)>,
+        expr_updates: &[(
+            usize,
+            super::expression::SharedProgram,
+            crate::core::DataType,
+            u16,
+        )],
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         // Create auto-commit transaction
         let tx = self.engine.begin_transaction()?;
@@ -374,8 +400,39 @@ impl Executor {
         );
         pk_expr.prepare_for_schema(schema);
 
-        // Execute update with simple setter
+        // Execute update with simple setter. Row expressions all read the
+        // ORIGINAL row (SET a = b, b = a swaps), then everything applies.
+        let mut vm = super::expression::ExprVM::new();
+        let params = ctx.params();
+        let named_params = ctx.named_params();
         let mut setter = |mut row: Row| -> Result<(Row, bool)> {
+            if !expr_updates.is_empty() {
+                let mut computed = Vec::with_capacity(expr_updates.len());
+                {
+                    let mut exec_ctx = super::expression::ExecuteContext::new(&row);
+                    if !params.is_empty() {
+                        exec_ctx = exec_ctx.with_params(params);
+                    }
+                    if !named_params.is_empty() {
+                        exec_ctx = exec_ctx.with_named_params(named_params);
+                    }
+                    for (idx, program, col_type, vector_dims) in expr_updates {
+                        let value = vm.execute_cow(program, &exec_ctx)?;
+                        let coerced = value.coerce_to_type(*col_type);
+                        super::dml::validate_coercion(
+                            &value,
+                            &coerced,
+                            &schema.columns[*idx].name,
+                            *col_type,
+                            *vector_dims,
+                        )?;
+                        computed.push((*idx, coerced));
+                    }
+                }
+                for (idx, value) in computed {
+                    let _ = row.set(idx, value);
+                }
+            }
             for (idx, new_value) in &updates {
                 let _ = row.set(*idx, new_value.clone());
             }
@@ -454,8 +511,15 @@ impl Executor {
         pk_value: i64,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        // Extract values from compiled sources
+        // Extract constant values; row expressions run per update inside
+        // the setter (they read the current row, e.g. SET n = n + 1)
         let mut updates = Vec::with_capacity(compiled.updates.len());
+        let mut expr_updates: Vec<(
+            usize,
+            super::expression::SharedProgram,
+            crate::core::DataType,
+            u16,
+        )> = Vec::new();
         for u in &compiled.updates {
             let value = match &u.value_source {
                 UpdateValueSource::Literal(v) => v.clone(),
@@ -470,8 +534,25 @@ impl Executor {
                     Some(v) => v.clone(),
                     None => continue,
                 },
+                UpdateValueSource::Expression(program) => {
+                    expr_updates.push((
+                        u.column_idx,
+                        program.clone(),
+                        u.column_type,
+                        u.column_vector_dims,
+                    ));
+                    continue;
+                }
             };
-            updates.push((u.column_idx, value.coerce_to_type(u.column_type)));
+            let coerced = value.coerce_to_type(u.column_type);
+            super::dml::validate_coercion(
+                &value,
+                &coerced,
+                &compiled.schema.columns[u.column_idx].name,
+                u.column_type,
+                u.column_vector_dims,
+            )?;
+            updates.push((u.column_idx, coerced));
         }
 
         self.execute_pk_update_minimal(
@@ -480,6 +561,8 @@ impl Executor {
             &compiled.schema,
             pk_value,
             updates,
+            &expr_updates,
+            ctx,
         )
     }
 
@@ -614,7 +697,7 @@ impl Executor {
             };
             let col_type = schema.columns[col_idx].data_type;
 
-            let value_source = match self.extract_value_source(expr) {
+            let value_source = match self.extract_value_source(expr, schema.column_names_owned()) {
                 Some(s) => s,
                 None => {
                     *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
@@ -626,6 +709,7 @@ impl Executor {
                 column_idx: col_idx,
                 column_type: col_type,
                 value_source,
+                column_vector_dims: schema.columns[col_idx].vector_dimensions,
             });
         }
 
@@ -729,7 +813,11 @@ impl Executor {
     }
 
     /// Extract value source (literal or parameter) from expression
-    fn extract_value_source(&self, expr: &Expression) -> Option<UpdateValueSource> {
+    fn extract_value_source(
+        &self,
+        expr: &Expression,
+        schema_columns: &[String],
+    ) -> Option<UpdateValueSource> {
         match expr {
             Expression::IntegerLiteral(lit) => {
                 Some(UpdateValueSource::Literal(Value::Integer(lit.value)))
@@ -766,7 +854,86 @@ impl Executor {
                     Some(UpdateValueSource::Parameter(param_idx))
                 }
             }
-            _ => None, // Complex expression
+            // Row expressions (e.g. SET n = n + 1) compile once per plan
+            // against the schema columns. Subquery-bearing expressions must
+            // take the normal path: the compiler emits placeholder ops for
+            // them that only the full planner can resolve.
+            _ => {
+                if Self::expr_contains_subquery(expr) {
+                    return None;
+                }
+                use super::expression::compile_expression;
+                compile_expression(expr, schema_columns)
+                    .ok()
+                    .map(UpdateValueSource::Expression)
+            }
+        }
+    }
+
+    /// Conservative subquery detection for SET expressions; anything
+    /// unrecognized that can carry one is treated as containing one
+    fn expr_contains_subquery(expr: &Expression) -> bool {
+        match expr {
+            Expression::ScalarSubquery(_)
+            | Expression::Exists(_)
+            | Expression::AllAny(_)
+            | Expression::SubquerySource(_)
+            | Expression::In(_)
+            | Expression::InHashSet(_)
+            | Expression::CteReference(_) => true,
+            Expression::Infix(i) => {
+                Self::expr_contains_subquery(&i.left) || Self::expr_contains_subquery(&i.right)
+            }
+            Expression::Prefix(p) => Self::expr_contains_subquery(&p.right),
+            Expression::FunctionCall(f) => {
+                f.arguments.iter().any(Self::expr_contains_subquery)
+                    || f.filter
+                        .as_ref()
+                        .is_some_and(|e| Self::expr_contains_subquery(e))
+                    || f.order_by
+                        .iter()
+                        .any(|ob| Self::expr_contains_subquery(&ob.expression))
+            }
+            Expression::Cast(c) => Self::expr_contains_subquery(&c.expr),
+            Expression::Aliased(a) => Self::expr_contains_subquery(&a.expression),
+            Expression::Case(c) => {
+                c.value
+                    .as_ref()
+                    .is_some_and(|v| Self::expr_contains_subquery(v))
+                    || c.when_clauses.iter().any(|w| {
+                        Self::expr_contains_subquery(&w.condition)
+                            || Self::expr_contains_subquery(&w.then_result)
+                    })
+                    || c.else_value
+                        .as_ref()
+                        .is_some_and(|v| Self::expr_contains_subquery(v))
+            }
+            Expression::Between(b) => {
+                Self::expr_contains_subquery(&b.expr)
+                    || Self::expr_contains_subquery(&b.lower)
+                    || Self::expr_contains_subquery(&b.upper)
+            }
+            Expression::Like(l) => {
+                Self::expr_contains_subquery(&l.left)
+                    || Self::expr_contains_subquery(&l.pattern)
+                    || l.escape
+                        .as_ref()
+                        .is_some_and(|e| Self::expr_contains_subquery(e))
+            }
+            Expression::List(l) => l.elements.iter().any(Self::expr_contains_subquery),
+            Expression::ExpressionList(l) => l.expressions.iter().any(Self::expr_contains_subquery),
+            // Simple leaves cannot carry a subquery
+            Expression::Identifier(_)
+            | Expression::QualifiedIdentifier(_)
+            | Expression::IntegerLiteral(_)
+            | Expression::FloatLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::IntervalLiteral(_)
+            | Expression::Parameter(_) => false,
+            // Unknown container: be conservative
+            _ => true,
         }
     }
 }
