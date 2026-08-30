@@ -95,3 +95,55 @@ fn insert_defaults_apply_from_statement_template() {
         .unwrap();
     assert_eq!(s, "new");
 }
+
+#[test]
+fn volatile_defaults_evaluate_per_row() {
+    let db = Database::open("memory://insert_path_volatile").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, r FLOAT DEFAULT (RANDOM()))",
+        (),
+    )
+    .unwrap();
+
+    // Plain multi-row insert: each row must get its own RANDOM()
+    db.execute("INSERT INTO t (id) VALUES (1), (2), (3), (4)", ())
+        .unwrap();
+    let distinct: i64 = db.query_one("SELECT COUNT(DISTINCT r) FROM t", ()).unwrap();
+    assert_eq!(
+        distinct, 4,
+        "each row must evaluate DEFAULT RANDOM() itself"
+    );
+
+    // Prepared path: values must differ across executions too
+    let stmt = db.prepare("INSERT INTO t (id) VALUES ($1)").unwrap();
+    for id in 5..9i64 {
+        stmt.execute((id,)).unwrap();
+    }
+    let distinct: i64 = db.query_one("SELECT COUNT(DISTINCT r) FROM t", ()).unwrap();
+    assert_eq!(distinct, 8);
+
+    // DEFAULT keyword goes through the same per-row evaluation
+    db.execute("INSERT INTO t VALUES (9, DEFAULT), (10, DEFAULT)", ())
+        .unwrap();
+    let distinct: i64 = db.query_one("SELECT COUNT(DISTINCT r) FROM t", ()).unwrap();
+    assert_eq!(distinct, 10);
+}
+
+#[test]
+fn uncompilable_check_still_rejects_inserts() {
+    let db = Database::open("memory://insert_path_badcheck").unwrap();
+    // The check references a column that cannot resolve in the check's
+    // single-column context; DDL does not validate it
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER CHECK (nosuch > 0))",
+        (),
+    )
+    .unwrap();
+
+    // The old per-row path errored on every insert; a compile failure must
+    // not silently disable the constraint
+    let stmt = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
+    assert!(stmt.execute((1i64, 5i64)).is_err());
+    let n: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(n, 0);
+}

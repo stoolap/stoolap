@@ -153,10 +153,19 @@ pub struct CompiledInsert {
     pub column_vector_dims: Arc<Vec<u16>>,
     /// Column names for error messages (Arc for zero-copy sharing)
     pub column_names: Arc<Vec<SmartString>>,
-    /// All column types in the schema (for default value evaluation)
-    pub all_column_types: Arc<Vec<crate::core::DataType>>,
-    /// Pre-evaluated default values for all columns (avoids re-evaluation per row)
-    /// Each element is either the default Value or null_unknown if no default.
+    /// Per-row default programs: Some for non-literal defaults, which
+    /// must execute per row (DEFAULT (RANDOM()) differs per row)
+    #[allow(clippy::type_complexity)]
+    pub default_programs: Arc<
+        Vec<
+            Option<(
+                crate::executor::expression::SharedProgram,
+                crate::core::DataType,
+            )>,
+        >,
+    >,
+    /// Constant default values for all columns (null_unknown when the
+    /// column has no default or a per-row program)
     pub default_row_template: Arc<Vec<crate::core::Value>>,
     /// CHECK constraints, pre-compiled once per plan:
     /// (column_idx, column_name, check_expr, program). Re-parsing the
