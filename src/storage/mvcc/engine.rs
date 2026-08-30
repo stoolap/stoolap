@@ -437,6 +437,10 @@ pub struct MVCCEngine {
     /// Schema epoch counter - increments on any CREATE/ALTER/DROP TABLE
     /// Used for fast cache invalidation without HashMap lookup
     schema_epoch: AtomicU64,
+    /// Statistics epoch counter - increments on ANALYZE. Shared across all
+    /// executors on this engine so per-executor stats caches can spot
+    /// stats written through another handle.
+    stats_epoch: AtomicU64,
     /// Handle for the background cleanup thread (None if not started)
     cleanup_handle: Mutex<Option<CleanupHandle>>,
     /// Cached reverse FK mapping: parent_table → Vec<(child_table, FK constraint)>
@@ -523,6 +527,7 @@ impl MVCCEngine {
             loading_from_disk: Arc::new(AtomicBool::new(false)),
             file_lock: Mutex::new(None),
             schema_epoch: AtomicU64::new(0),
+            stats_epoch: AtomicU64::new(0),
             cleanup_handle: Mutex::new(None),
             fk_reverse_cache: RwLock::new((u64::MAX, StringMap::default())),
             snapshot_timestamps: RwLock::new(FxHashMap::default()),
@@ -5939,6 +5944,21 @@ impl MVCCEngine {
         }
 
         Ok(())
+    }
+}
+
+impl MVCCEngine {
+    /// Current statistics epoch (bumped by ANALYZE on any handle sharing
+    /// this engine).
+    #[inline]
+    pub fn stats_epoch(&self) -> u64 {
+        self.stats_epoch.load(Ordering::Acquire)
+    }
+
+    /// Bump after publishing new statistics rows, so per-executor stats
+    /// caches on other handles reload instead of serving a stale verdict.
+    pub fn bump_stats_epoch(&self) {
+        self.stats_epoch.fetch_add(1, Ordering::Release);
     }
 }
 

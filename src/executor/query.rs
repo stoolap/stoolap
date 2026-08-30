@@ -195,6 +195,18 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        self.execute_select_with_plan(stmt, ctx, None)
+    }
+
+    /// `execute_select` with the cached plan's classification slot, so
+    /// repeated executions skip the AST hash and the global
+    /// classification-cache mutex after the first resolution.
+    pub(crate) fn execute_select_with_plan(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
+    ) -> Result<Box<dyn QueryResult>> {
         // Start timeout guard ONLY at the top level (query_depth == 0).
         // For nested queries (subqueries, views), the parent's TimeoutGuard handles timeout.
         // This ensures the timeout applies to the entire query, not each nested call.
@@ -237,10 +249,22 @@ impl Executor {
         // OPTIMIZATION: Get cached query classification ONCE at entry point
         // This classification is passed through the call chain to avoid
         // redundant hash computations and cache lookups (was 10+ calls per query)
-        let classification = get_classification(stmt);
+        let classification = match plan_classification {
+            Some(slot) => slot.get_or_init(|| get_classification(stmt)).clone(),
+            None => get_classification(stmt),
+        };
 
         // Evaluate LIMIT/OFFSET early (needed for set operations optimization)
-        let limit = if let Some(ref limit_expr) = stmt.limit {
+        // Literal fast path: `LIMIT 10` needs no compile/cache/VM round trip
+        let limit = if let Some(Expression::IntegerLiteral(lit)) = stmt.limit.as_deref() {
+            if lit.value < 0 {
+                return Err(Error::Parse(format!(
+                    "LIMIT must be non-negative, got {}",
+                    lit.value
+                )));
+            }
+            Some(lit.value as usize)
+        } else if let Some(ref limit_expr) = stmt.limit {
             match ExpressionEval::compile(limit_expr, &[])?
                 .with_context(ctx)
                 .eval_slice(&Row::new())?
@@ -275,7 +299,15 @@ impl Executor {
             None
         };
 
-        let offset = if let Some(ref offset_expr) = stmt.offset {
+        let offset = if let Some(Expression::IntegerLiteral(lit)) = stmt.offset.as_deref() {
+            if lit.value < 0 {
+                return Err(Error::Parse(format!(
+                    "OFFSET must be non-negative, got {}",
+                    lit.value
+                )));
+            }
+            lit.value as usize
+        } else if let Some(ref offset_expr) = stmt.offset {
             match ExpressionEval::compile(offset_expr, &[])
                 .ok()
                 .and_then(|eval| eval.with_context(ctx).eval_slice(&Row::new()).ok())
@@ -1952,8 +1984,9 @@ impl Executor {
             (table, Some(tx))
         };
 
-        // Build column list from schema (using cached version to avoid repeated clones)
-        let all_columns: Vec<String> = table.schema().column_names_owned().to_vec();
+        // Build column list from schema: refcount bump, not a per-statement
+        // deep clone of every column name
+        let all_columns = table.schema().column_names_arc();
         // Get pre-cached lowercase column names to avoid per-query to_lowercase() calls
         let all_columns_lower = table.schema().column_names_lower_arc();
 
@@ -3033,7 +3066,7 @@ impl Executor {
 
                 // OPTIMIZATION: Wrap all_columns in Arc once, reuse for all rows (only if needed)
                 let all_columns_arc: Option<CompactArc<Vec<String>>> = if has_correlated {
-                    Some(CompactArc::new(all_columns.clone()))
+                    Some(all_columns.clone())
                 } else {
                     None
                 };
@@ -3605,7 +3638,7 @@ impl Executor {
                 let rows_for_cache: Vec<Row> = projected_rows.rows().cloned().collect();
                 self.semantic_cache.insert(
                     table_name,
-                    all_columns.clone(),
+                    all_columns.to_vec(),
                     rows_for_cache,
                     Some(where_expr.clone()),
                 );

@@ -49,16 +49,8 @@ impl Executor {
         ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Quick reject: explicit transaction (use try_lock for fast rejection)
-        {
-            let active_tx = match self.active_transaction.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => return None, // Lock contention - fall back to normal path
-            };
-            if active_tx.is_some() {
-                return None;
-            }
-        }
+        // Caller (try_compiled_fast_paths) guarantees no explicit transaction
+        // is active; this path reads and writes committed state only.
 
         // Try read lock first - check if already compiled
         {
@@ -98,16 +90,8 @@ impl Executor {
         ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Quick reject: explicit transaction (use try_lock for fast rejection)
-        {
-            let active_tx = match self.active_transaction.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => return None, // Lock contention - fall back to normal path
-            };
-            if active_tx.is_some() {
-                return None;
-            }
-        }
+        // Caller (try_compiled_fast_paths) guarantees no explicit transaction
+        // is active; this path reads and writes committed state only.
 
         // Try read lock first - check if already compiled
         {
@@ -200,7 +184,9 @@ impl Executor {
         let (pk_value, pk_value_source) = match val_expr {
             Expression::IntegerLiteral(lit) => (lit.value, PkValueSource::Literal(lit.value)),
             Expression::FloatLiteral(lit) => {
-                let v = lit.value as i64;
+                // Only lossless float keys qualify: truncating 5.5 to 5
+                // would mutate row 5 where correct execution matches nothing.
+                let v = Self::lossless_float_key(lit.value)?;
                 (v, PkValueSource::Literal(v))
             }
             Expression::Parameter(param) => {
@@ -211,7 +197,7 @@ impl Executor {
                     let value = ctx.get_named_param(name)?;
                     let pk_value = match value {
                         Value::Integer(i) => *i,
-                        Value::Float(f) => *f as i64,
+                        Value::Float(f) => Self::lossless_float_key(*f)?,
                         _ => return None,
                     };
                     (
@@ -230,7 +216,7 @@ impl Executor {
                     }
                     let pk_value = match &params[param_idx] {
                         Value::Integer(i) => *i,
-                        Value::Float(f) => *f as i64,
+                        Value::Float(f) => Self::lossless_float_key(*f)?,
                         _ => return None,
                     };
                     (pk_value, PkValueSource::Parameter(param_idx))
@@ -251,7 +237,7 @@ impl Executor {
         match source {
             PkValueSource::NamedParameter(name) => match ctx.get_named_param(name)? {
                 Value::Integer(i) => Some(*i),
-                Value::Float(f) => Some(*f as i64),
+                Value::Float(f) => Self::lossless_float_key(*f),
                 _ => None,
             },
             _ => Self::extract_pk_value_from_params(source, ctx.params()),
@@ -269,7 +255,7 @@ impl Executor {
                 }
                 match &params[*idx] {
                     Value::Integer(i) => Some(*i),
-                    Value::Float(f) => Some(*f as i64),
+                    Value::Float(f) => Self::lossless_float_key(*f),
                     _ => None,
                 }
             }
