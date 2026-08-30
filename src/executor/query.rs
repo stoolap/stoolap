@@ -189,6 +189,54 @@ fn partition_where_for_join(
 }
 
 impl Executor {
+    /// Multi-column ORDER BY comparator over precomputed sort keys, with
+    /// NULLS FIRST/LAST semantics (default: NULLS LAST for ASC, FIRST for
+    /// DESC)
+    fn compare_by_sort_keys_impl(
+        a_keys: &[Value],
+        b_keys: &[Value],
+        order_by: &[crate::parser::ast::OrderByExpression],
+        num_order_cols: usize,
+    ) -> Ordering {
+        for (i, ob) in order_by.iter().take(num_order_cols).enumerate() {
+            let ascending = ob.ascending;
+            let nulls_first = ob.nulls_first;
+            let a_val = a_keys.get(i);
+            let b_val = b_keys.get(i);
+
+            let a_is_null = a_val.is_none() || a_val.map(|v| v.is_null()).unwrap_or(true);
+            let b_is_null = b_val.is_none() || b_val.map(|v| v.is_null()).unwrap_or(true);
+
+            if a_is_null || b_is_null {
+                if a_is_null && b_is_null {
+                    continue;
+                }
+                let nulls_come_first = nulls_first.unwrap_or(!ascending);
+                return if a_is_null {
+                    if nulls_come_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                } else if nulls_come_first {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                };
+            }
+
+            let cmp = match (a_val, b_val) {
+                (Some(av), Some(bv)) => av.partial_cmp(bv).unwrap_or(Ordering::Equal),
+                _ => Ordering::Equal,
+            };
+            let cmp = if !ascending { cmp.reverse() } else { cmp };
+            if cmp != Ordering::Equal {
+                return cmp;
+            }
+        }
+        Ordering::Equal
+    }
+
     /// Execute a SELECT statement
     pub(crate) fn execute_select(
         &self,
@@ -670,53 +718,36 @@ impl Executor {
                 // Create indices and sort them based on sort_keys
                 let mut indices: Vec<usize> = (0..rows.len()).collect();
 
+                // Top-K: with LIMIT (and no DISTINCT ON, which dedups after
+                // the sort), select the needed prefix in O(n) and sort only
+                // that, instead of sorting all n rows
+                let top_k = if stmt.distinct_on.is_empty() {
+                    limit
+                        .map(|l| l.saturating_add(offset))
+                        .filter(|&k| k > 0 && k < indices.len())
+                } else {
+                    None
+                };
+                if let Some(k) = top_k {
+                    indices.select_nth_unstable_by(k - 1, |&a_idx, &b_idx| {
+                        Self::compare_by_sort_keys_impl(
+                            &sort_keys[a_idx],
+                            &sort_keys[b_idx],
+                            &stmt.order_by,
+                            num_order_cols,
+                        )
+                    });
+                    indices.truncate(k);
+                }
+
                 // Use sort_unstable_by for ~10-20% speedup (stability not needed for ORDER BY)
                 indices.sort_unstable_by(|&a_idx, &b_idx| {
-                    let a_keys = &sort_keys[a_idx];
-                    let b_keys = &sort_keys[b_idx];
-
-                    for i in 0..num_order_cols {
-                        let ascending = stmt.order_by[i].ascending;
-                        let nulls_first = stmt.order_by[i].nulls_first;
-                        let a_val = a_keys.get(i);
-                        let b_val = b_keys.get(i);
-
-                        // Check if either value is NULL
-                        let a_is_null =
-                            a_val.is_none() || a_val.map(|v| v.is_null()).unwrap_or(true);
-                        let b_is_null =
-                            b_val.is_none() || b_val.map(|v| v.is_null()).unwrap_or(true);
-
-                        // Handle NULL comparison
-                        if a_is_null || b_is_null {
-                            if a_is_null && b_is_null {
-                                continue; // Both NULL, move to next column
-                            }
-                            // Default: NULLS LAST for ASC, NULLS FIRST for DESC
-                            let nulls_come_first = nulls_first.unwrap_or(!ascending);
-                            return if a_is_null {
-                                if nulls_come_first {
-                                    Ordering::Less
-                                } else {
-                                    Ordering::Greater
-                                }
-                            } else if nulls_come_first {
-                                Ordering::Greater
-                            } else {
-                                Ordering::Less
-                            };
-                        }
-
-                        let cmp = match (a_val, b_val) {
-                            (Some(av), Some(bv)) => av.partial_cmp(bv).unwrap_or(Ordering::Equal),
-                            _ => Ordering::Equal,
-                        };
-                        let cmp = if !ascending { cmp.reverse() } else { cmp };
-                        if cmp != Ordering::Equal {
-                            return cmp;
-                        }
-                    }
-                    Ordering::Equal
+                    Self::compare_by_sort_keys_impl(
+                        &sort_keys[a_idx],
+                        &sort_keys[b_idx],
+                        &stmt.order_by,
+                        num_order_cols,
+                    )
                 });
 
                 // Reorder rows using sorted indices
@@ -4224,10 +4255,10 @@ impl Executor {
                             Ordering::Equal
                         });
 
-                        // Reorder rows
-                        final_rows = indices.into_iter().map(|i| final_rows[i].clone()).collect();
-
-                        // Apply LIMIT/OFFSET after sorting
+                        // Apply LIMIT/OFFSET while reordering: with a
+                        // limit only the needed rows move; otherwise the
+                        // permutation happens in place instead of
+                        // deep-cloning every joined row
                         let offset = stmt
                             .offset
                             .as_ref()
@@ -4260,7 +4291,35 @@ impl Executor {
                             })
                             .unwrap_or(usize::MAX);
 
-                        final_rows = final_rows.into_iter().skip(offset).take(limit).collect();
+                        if offset > 0 || limit != usize::MAX {
+                            final_rows = indices
+                                .into_iter()
+                                .skip(offset)
+                                .take(limit)
+                                .map(|i| (final_rows[i].0, std::mem::take(&mut final_rows[i].1)))
+                                .collect();
+                        } else {
+                            // In-place cycle-based permutation (same
+                            // pattern as the single-table ORDER BY path)
+                            let n = final_rows.len();
+                            let mut indices = indices;
+                            for start in 0..n {
+                                if indices[start] == start || indices[start] == usize::MAX {
+                                    continue;
+                                }
+                                let mut current = start;
+                                loop {
+                                    let target = indices[current];
+                                    if target == start {
+                                        indices[current] = usize::MAX;
+                                        break;
+                                    }
+                                    final_rows.swap(current, target);
+                                    indices[current] = usize::MAX;
+                                    current = target;
+                                }
+                            }
+                        }
                     }
 
                     // Check for aggregation/window functions that need special handling

@@ -1,0 +1,121 @@
+// Copyright 2026 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! ORDER BY + LIMIT top-K selection and the in-place JOIN reorder must
+//! preserve ordering semantics, including NULLS placement and OFFSET.
+
+use stoolap::api::Database;
+
+#[test]
+fn order_by_limit_offset_matches_full_sort() {
+    let db = Database::open("memory://topk_basic").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER, w INTEGER)",
+        (),
+    )
+    .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..500i64 {
+        // v cycles so there are plenty of ties; w breaks them
+        tx.execute("INSERT INTO t VALUES ($1, $2, $3)", (i, i % 7, i))
+            .unwrap();
+    }
+    // A few NULLs in v
+    for i in 500..510i64 {
+        tx.execute("INSERT INTO t (id, w) VALUES ($1, $2)", (i, i))
+            .unwrap();
+    }
+    tx.commit().unwrap();
+
+    // Deterministic two-column ordering with OFFSET through the top-K path
+    let rows = db
+        .query(
+            "SELECT v, w FROM t ORDER BY v DESC, w ASC LIMIT 10 OFFSET 5",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    let expected = db
+        .query("SELECT v, w FROM t ORDER BY v DESC, w ASC", ())
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    assert_eq!(rows.len(), 10);
+    for (i, r) in rows.iter().enumerate() {
+        let (v1, w1): (Option<i64>, i64) = (r.get(0).ok(), r.get(1).unwrap());
+        let e = &expected[i + 5];
+        let (v2, w2): (Option<i64>, i64) = (e.get(0).ok(), e.get(1).unwrap());
+        assert_eq!((v1, w1), (v2, w2), "row {i} diverges from full sort");
+    }
+
+    // NULLS placement: default DESC puts NULLs first
+    let first = db
+        .query("SELECT v FROM t ORDER BY v DESC LIMIT 3", ())
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    for r in &first {
+        assert!(r.get::<i64>(0).is_err(), "DESC default is NULLS FIRST");
+    }
+}
+
+#[test]
+fn join_order_by_is_sorted_and_complete() {
+    let db = Database::open("memory://topk_join").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..300i64 {
+        tx.execute("INSERT INTO a VALUES ($1, $2)", (i, 299 - i))
+            .unwrap();
+        tx.execute("INSERT INTO b VALUES ($1, $2)", (i, i * 3))
+            .unwrap();
+    }
+    tx.commit().unwrap();
+
+    let rows = db
+        .query(
+            "SELECT a.x, b.y FROM a JOIN b ON a.id = b.id ORDER BY a.x ASC",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    assert_eq!(rows.len(), 300, "in-place permutation must keep all rows");
+    let mut prev = -1i64;
+    for r in &rows {
+        let x: i64 = r.get(0).unwrap();
+        assert!(x > prev, "rows must be sorted ascending");
+        prev = x;
+    }
+    // Pairing stays intact after the permutation
+    let (x0, y0): (i64, i64) = (rows[0].get(0).unwrap(), rows[0].get(1).unwrap());
+    assert_eq!(x0, 0);
+    assert_eq!(y0, 299 * 3);
+
+    // And with LIMIT via the take-path
+    let top = db
+        .query(
+            "SELECT a.x FROM a JOIN b ON a.id = b.id ORDER BY a.x DESC LIMIT 5",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    let xs: Vec<i64> = top.iter().map(|r| r.get(0).unwrap()).collect();
+    assert_eq!(xs, vec![299, 298, 297, 296, 295]);
+}

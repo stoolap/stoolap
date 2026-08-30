@@ -1015,27 +1015,42 @@ impl OrderedResult {
             }
         }
 
-        // All integers - use radix sort on (id, Row) tuples
-        // We use radsort which handles negative numbers correctly
+        // Partition NULL rows out before the radix pass: the default
+        // ordering is NULLS LAST for ASC and NULLS FIRST for DESC (like
+        // the comparison paths), and a sentinel key would both invert
+        // that and collide with real i64::MIN/MAX values.
+        let mut nulls = RowVec::new();
+        let mut non_nulls = RowVec::with_capacity(rows.len());
+        for pair in rows.drain(..) {
+            let is_null = pair.1.get(col_idx).map(|v| v.is_null()).unwrap_or(true);
+            if is_null {
+                nulls.push(pair);
+            } else {
+                non_nulls.push(pair);
+            }
+        }
+
+        // radsort handles negative numbers correctly; for descending we
+        // apply the monotone-decreasing map -i - 1 (radix is ascending
+        // only)
         if ascending {
-            radsort::sort_by_key(rows, |(_, row)| {
-                match row.get(col_idx) {
-                    Some(Value::Integer(i)) => *i,
-                    _ => i64::MIN, // NULLs sort first in ascending order
-                }
+            radsort::sort_by_key(&mut non_nulls, |(_, row)| match row.get(col_idx) {
+                Some(Value::Integer(i)) => *i,
+                _ => 0,
             });
         } else {
-            // For descending, we negate the key (radix sort is ascending only)
-            // But we need to be careful with i64::MIN
-            radsort::sort_by_key(rows, |(_, row)| {
-                match row.get(col_idx) {
-                    Some(Value::Integer(i)) => {
-                        // Negate for descending order, handle overflow
-                        i.wrapping_neg().wrapping_sub(1)
-                    }
-                    _ => i64::MAX, // NULLs sort last in descending order
-                }
+            radsort::sort_by_key(&mut non_nulls, |(_, row)| match row.get(col_idx) {
+                Some(Value::Integer(i)) => i.wrapping_neg().wrapping_sub(1),
+                _ => 0,
             });
+        }
+
+        if ascending {
+            rows.extend(non_nulls);
+            rows.extend(nulls);
+        } else {
+            rows.extend(nulls);
+            rows.extend(non_nulls);
         }
 
         true
@@ -1049,7 +1064,10 @@ impl OrderedResult {
             for spec in order_specs {
                 match row.get(spec.col_idx) {
                     Some(Value::Integer(_)) => continue,
-                    Some(Value::Null(_)) => continue,
+                    // NULLs need FIRST/LAST placement the composite
+                    // sentinel keys cannot express; the comparison sort
+                    // fallback handles them with the correct default
+                    Some(Value::Null(_)) => return false,
                     _ => return false,
                 }
             }
