@@ -242,6 +242,11 @@ impl QueryPlanner {
 
     /// Load statistics from system tables
     fn load_stats_from_system_tables(&self, table_name: &str) -> Result<TableStats> {
+        // Capture the epoch BEFORE reading: if an ANALYZE on another handle
+        // commits and bumps between the read and the cache insert, the
+        // entry carries the pre-read epoch and the next access sees it as
+        // stale instead of serving old stats stamped fresh for the TTL.
+        let stats_epoch_before_read = self.engine.stats_epoch();
         let tx = self.engine.begin_transaction()?;
 
         // Check if system tables exist
@@ -292,7 +297,7 @@ impl QueryPlanner {
                     column_stats,
                     zone_maps: None, // Zone maps are stored in the table, not here
                     cached_at: crate::common::time_compat::Instant::now(),
-                    stats_epoch: self.engine.stats_epoch(),
+                    stats_epoch: stats_epoch_before_read,
                     last_accessed: std::sync::atomic::AtomicU64::new(self.now_secs()),
                 },
             );

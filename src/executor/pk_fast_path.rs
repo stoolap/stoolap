@@ -219,14 +219,8 @@ impl Executor {
         let source = match val_expr {
             Expression::IntegerLiteral(lit) => PkValueSource::Literal(lit.value),
             Expression::FloatLiteral(lit) => {
-                // Only lossless float keys qualify: truncating 5.5 to 5
-                // would serve row 5 where correct execution matches nothing.
-                let v = lit.value as i64;
-                if v as f64 == lit.value {
-                    PkValueSource::Literal(v)
-                } else {
-                    return None;
-                }
+                // Only lossless float keys qualify; see lossless_float_key
+                PkValueSource::Literal(Self::lossless_float_key(lit.value)?)
             }
             Expression::Parameter(param) => {
                 // Named parameters (e.g., :name); positional ($1, $2, ...)
@@ -368,8 +362,17 @@ impl Executor {
     /// A float key qualifies only when it converts to i64 without loss:
     /// truncating 5.5 to 5 would serve row 5 where correct execution
     /// matches nothing. None falls back to the standard path.
+    ///
+    /// The range check must happen BEFORE the cast: 2^63 saturates to
+    /// i64::MAX, and i64::MAX rounds back to 2^63 as f64, so a naive
+    /// round-trip equality check passes at the boundary.
     #[inline]
     pub(crate) fn lossless_float_key(f: f64) -> Option<i64> {
+        const I64_MIN_F: f64 = -9_223_372_036_854_775_808.0; // -2^63, exact
+        const I64_MAX_PLUS_1_F: f64 = 9_223_372_036_854_775_808.0; // 2^63, not representable as i64
+        if !(I64_MIN_F..I64_MAX_PLUS_1_F).contains(&f) {
+            return None; // Also rejects NaN and infinities
+        }
         let v = f as i64;
         (v as f64 == f).then_some(v)
     }
@@ -559,5 +562,39 @@ impl Executor {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Executor;
+
+    #[test]
+    fn lossless_float_key_boundaries() {
+        // Exact conversions pass
+        assert_eq!(Executor::lossless_float_key(5.0), Some(5));
+        assert_eq!(Executor::lossless_float_key(-5.0), Some(-5));
+        assert_eq!(Executor::lossless_float_key(0.0), Some(0));
+        // i64::MIN is exactly representable as f64
+        assert_eq!(
+            Executor::lossless_float_key(-9_223_372_036_854_775_808.0),
+            Some(i64::MIN)
+        );
+        // Fractional values reject
+        assert_eq!(Executor::lossless_float_key(5.5), None);
+        assert_eq!(Executor::lossless_float_key(-0.5), None);
+        // 2^63 saturates to i64::MAX under `as i64` and i64::MAX rounds
+        // back to 2^63, so a naive round-trip check passes; the range
+        // check must reject it
+        assert_eq!(
+            Executor::lossless_float_key(9_223_372_036_854_775_808.0),
+            None
+        );
+        assert_eq!(Executor::lossless_float_key(1e19), None);
+        assert_eq!(Executor::lossless_float_key(-1e19), None);
+        // Non-finite rejects
+        assert_eq!(Executor::lossless_float_key(f64::NAN), None);
+        assert_eq!(Executor::lossless_float_key(f64::INFINITY), None);
+        assert_eq!(Executor::lossless_float_key(f64::NEG_INFINITY), None);
     }
 }
