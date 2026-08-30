@@ -1054,9 +1054,27 @@ fn hash_classification_inputs<H: std::hash::Hasher>(stmt: &SelectStatement, hash
     }
 }
 
+/// Hash what a subquery's classification depends on: correlation reads the
+/// FROM table/alias list plus WHERE and SELECT columns
+/// (`is_subquery_correlated`), and non-determinism reads the columns.
+fn hash_subquery_structure<H: std::hash::Hasher>(subquery: &SelectStatement, hasher: &mut H) {
+    subquery.columns.len().hash(hasher);
+    for col in &subquery.columns {
+        hash_expression_structure(col, hasher);
+    }
+    subquery.table_expr.is_some().hash(hasher);
+    if let Some(ref table_expr) = subquery.table_expr {
+        hash_table_expr_structure(table_expr, hasher);
+    }
+    if let Some(ref where_clause) = subquery.where_clause {
+        hash_expression_structure(where_clause, hasher);
+    }
+}
+
 /// Hash the join/derived-table shape of a FROM expression, mirroring what
-/// `analyze_table_source` reads: join nesting, join types, and source
-/// discriminants.
+/// `analyze_table_source` and `collect_tables_recursive` read: join
+/// nesting, join types, and source names WITH aliases (the alias decides
+/// whether a qualified reference is local or an outer correlation).
 fn hash_table_expr_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &mut H) {
     std::mem::discriminant(expr).hash(hasher);
     match expr {
@@ -1066,10 +1084,30 @@ fn hash_table_expr_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
             hash_table_expr_structure(&join.right, hasher);
         }
         Expression::Aliased(aliased) => {
+            aliased.alias.value_lower.hash(hasher);
             hash_table_expr_structure(&aliased.expression, hasher);
         }
         Expression::TableSource(ts) => {
             ts.name.value_lower.hash(hasher);
+            ts.alias.is_some().hash(hasher);
+            if let Some(ref alias) = ts.alias {
+                alias.value_lower.hash(hasher);
+            }
+        }
+        Expression::Identifier(ident) => {
+            ident.value_lower.hash(hasher);
+        }
+        Expression::SubquerySource(subquery) => {
+            if let Some(ref alias) = subquery.alias {
+                alias.value_lower.hash(hasher);
+            }
+            hash_subquery_structure(&subquery.subquery, hasher);
+        }
+        Expression::FunctionTableSource(fs) => {
+            fs.function.value_lower.hash(hasher);
+            if let Some(ref alias) = fs.alias {
+                alias.value_lower.hash(hasher);
+            }
         }
         _ => {}
     }
@@ -1166,34 +1204,20 @@ fn hash_expression_structure<H: std::hash::Hasher>(expr: &Expression, hasher: &m
             in_hash.values.len().hash(hasher);
         }
         Expression::ScalarSubquery(subquery) => {
-            // The classifier reads subquery columns (non-determinism) and
-            // WHERE structure (correlation); both belong in the key.
-            for col in &subquery.subquery.columns {
-                hash_expression_structure(col, hasher);
-            }
-            if let Some(ref where_clause) = subquery.subquery.where_clause {
-                hash_expression_structure(where_clause, hasher);
-            }
+            hash_subquery_structure(&subquery.subquery, hasher);
         }
         Expression::SubquerySource(subquery) => {
-            // Hash subquery WHERE structure to distinguish correlated vs uncorrelated
-            if let Some(ref where_clause) = subquery.subquery.where_clause {
-                hash_expression_structure(where_clause, hasher);
+            if let Some(ref alias) = subquery.alias {
+                alias.value_lower.hash(hasher);
             }
+            hash_subquery_structure(&subquery.subquery, hasher);
         }
         Expression::Exists(exists) => {
-            // Hash EXISTS subquery WHERE structure to distinguish correlated vs uncorrelated
-            if let Some(ref where_clause) = exists.subquery.where_clause {
-                hash_expression_structure(where_clause, hasher);
-            }
+            hash_subquery_structure(&exists.subquery, hasher);
         }
         Expression::AllAny(all_any) => {
-            // The classifier reads the left side (non-determinism) and the
-            // subquery WHERE structure (correlation)
             hash_expression_structure(&all_any.left, hasher);
-            if let Some(ref where_clause) = all_any.subquery.where_clause {
-                hash_expression_structure(where_clause, hasher);
-            }
+            hash_subquery_structure(&all_any.subquery, hasher);
         }
         Expression::QualifiedIdentifier(qi) => {
             // CRITICAL: Hash the qualifier (table name/alias) to distinguish correlated references
@@ -1364,5 +1388,37 @@ mod tests {
         let c_rand = get_classification(&random);
         assert!(!c_det.has_nondeterministic_functions);
         assert!(c_rand.has_nondeterministic_functions);
+    }
+
+    #[test]
+    fn classification_key_distinguishes_subquery_aliases() {
+        let parse = |sql: &str| {
+            let mut parser = crate::parser::Parser::new(sql);
+            let mut program = parser.parse_program().unwrap();
+            match program.statements.pop().unwrap() {
+                crate::parser::ast::Statement::Select(s) => s,
+                other => panic!("expected SELECT, got {:?}", other),
+            }
+        };
+        // Identical except the inner FROM alias: with `o` the qualified
+        // `o.id` resolves locally (uncorrelated), with `i` it refers to
+        // the outer table (correlated).
+        let local =
+            parse("SELECT * FROM outer_t o WHERE EXISTS (SELECT 1 FROM inner_t o WHERE o.id = 1)");
+        let correlated =
+            parse("SELECT * FROM outer_t o WHERE EXISTS (SELECT 1 FROM inner_t i WHERE o.id = 1)");
+
+        let k_local = compute_classification_key(&local);
+        let k_corr = compute_classification_key(&correlated);
+        assert_ne!(
+            k_local, k_corr,
+            "subquery FROM aliases must be part of the key"
+        );
+
+        clear_cache();
+        let c_local = get_classification(&local);
+        let c_corr = get_classification(&correlated);
+        assert!(!c_local.where_has_correlated_subqueries);
+        assert!(c_corr.where_has_correlated_subqueries);
     }
 }
