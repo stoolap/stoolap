@@ -2257,23 +2257,36 @@ impl Executor {
             // Extract params before the closure so they can be captured
             let params = ctx.params();
             let named_params = ctx.named_params();
+            // Pre-compile the memory WHERE once: evaluate_bool re-hashes
+            // the AST per row through the program cache. Subquery-bearing
+            // clauses stay on the evaluator (compiled placeholder subquery
+            // ops cannot run standalone), as do clauses that fail to
+            // compile.
+            let memory_where_program = memory_where_clause
+                .as_ref()
+                .filter(|expr| !Self::expr_contains_subquery(expr))
+                .and_then(|expr| compile_expression(expr, &column_names).ok());
             let mut setter = |mut row: Row| -> Result<(Row, bool)> {
-                // If we need in-memory WHERE filtering, check the condition first
-                if needs_memory_filter {
-                    evaluator.set_row_array(&row);
-                    if let Some(ref where_expr) = memory_where_clause {
-                        match evaluator.evaluate_bool(where_expr) {
-                            Ok(true) => {}
-                            _ => return Ok((row, false)),
-                        }
-                    }
-                }
-
                 // Execute pre-compiled programs (no recompilation per row)
                 let updates_to_apply: Vec<(usize, Value)> = {
                     let exec_ctx = ExecuteContext::new(&row)
                         .with_params(params)
                         .with_named_params(named_params);
+
+                    // In-memory WHERE filtering shares the row context
+                    if needs_memory_filter {
+                        if let Some(ref program) = memory_where_program {
+                            if !vm.execute_bool(program, &exec_ctx) {
+                                return Ok((row, false));
+                            }
+                        } else if let Some(ref where_expr) = memory_where_clause {
+                            evaluator.set_row_array(&row);
+                            match evaluator.evaluate_bool(where_expr) {
+                                Ok(true) => {}
+                                _ => return Ok((row, false)),
+                            }
+                        }
+                    }
 
                     let mut updates = Vec::with_capacity(compiled_updates.len());
                     for (k, (idx, col_type, vec_dims, program)) in
@@ -2654,6 +2667,19 @@ impl Executor {
             // Initialize with prefixed column names to support alias.column syntax
             evaluator.init_columns(&column_names_with_prefix);
 
+            // Pre-compile the memory WHERE once with the same prefixed
+            // columns: evaluate_bool re-hashes the AST per row through the
+            // program cache. Subquery-bearing clauses stay on the evaluator
+            // (compiled placeholder subquery ops cannot run standalone).
+            use super::expression::{compile_expression, ExecuteContext, ExprVM};
+            let mut delete_vm = ExprVM::new();
+            let params = ctx.params();
+            let named_params = ctx.named_params();
+            let memory_where_program = memory_where_clause
+                .as_ref()
+                .filter(|expr| !Self::expr_contains_subquery(expr))
+                .and_then(|expr| compile_expression(expr, &column_names_with_prefix).ok());
+
             // Scan all rows and collect IDs of rows to delete
             let column_indices: Vec<usize> = (0..column_count).collect();
             let mut scanner = table.scan(&column_indices, where_expr.as_deref())?;
@@ -2750,6 +2776,15 @@ impl Executor {
                                     false
                                 }
                             }
+                        } else if let Some(ref program) = memory_where_program {
+                            let mut exec_ctx = ExecuteContext::new(row);
+                            if !params.is_empty() {
+                                exec_ctx = exec_ctx.with_params(params);
+                            }
+                            if !named_params.is_empty() {
+                                exec_ctx = exec_ctx.with_named_params(named_params);
+                            }
+                            delete_vm.execute_bool(program, &exec_ctx)
                         } else {
                             matches!(evaluator.evaluate_bool(where_expr), Ok(true))
                         }

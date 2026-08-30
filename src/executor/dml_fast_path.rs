@@ -872,7 +872,7 @@ impl Executor {
 
     /// Conservative subquery detection for SET expressions; anything
     /// unrecognized that can carry one is treated as containing one
-    fn expr_contains_subquery(expr: &Expression) -> bool {
+    pub(crate) fn expr_contains_subquery(expr: &Expression) -> bool {
         match expr {
             Expression::ScalarSubquery(_)
             | Expression::Exists(_)
