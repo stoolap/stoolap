@@ -141,7 +141,7 @@ pub struct CompiledPkDelete {
 
 /// Pre-compiled state for INSERT statements
 /// Caches schema-derived information to avoid recomputation on every INSERT execution
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CompiledInsert {
     /// Table name (already lowercased, SmartString for inline storage)
     pub table_name: SmartString,
@@ -153,15 +153,45 @@ pub struct CompiledInsert {
     pub column_vector_dims: Arc<Vec<u16>>,
     /// Column names for error messages (Arc for zero-copy sharing)
     pub column_names: Arc<Vec<SmartString>>,
-    /// All column types in the schema (for default value evaluation)
-    pub all_column_types: Arc<Vec<crate::core::DataType>>,
-    /// Pre-evaluated default values for all columns (avoids re-evaluation per row)
-    /// Each element is either the default Value or null_unknown if no default.
+    /// Per-row default programs: Some for non-literal defaults, which
+    /// must execute per row (DEFAULT (RANDOM()) differs per row)
+    #[allow(clippy::type_complexity)]
+    pub default_programs: Arc<
+        Vec<
+            Option<(
+                crate::executor::expression::SharedProgram,
+                crate::core::DataType,
+            )>,
+        >,
+    >,
+    /// Constant default values for all columns (null_unknown when the
+    /// column has no default or a per-row program)
     pub default_row_template: Arc<Vec<crate::core::Value>>,
-    /// CHECK constraint expressions: (column_idx, column_name, check_expr)
-    pub check_exprs: Arc<Vec<(usize, SmartString, SmartString)>>,
+    /// CHECK constraints, pre-compiled once per plan:
+    /// (column_idx, column_name, check_expr, program). Re-parsing the
+    /// check SQL per row costs a tokenizer plus parser run per inserted
+    /// row per constrained column.
+    pub compiled_checks: Arc<
+        Vec<(
+            usize,
+            SmartString,
+            SmartString,
+            crate::executor::expression::SharedProgram,
+        )>,
+    >,
     /// Schema epoch at compilation time (for fast cache invalidation)
     pub cached_epoch: u64,
+}
+
+impl std::fmt::Debug for CompiledInsert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompiledInsert")
+            .field("table_name", &self.table_name)
+            .field("column_indices", &self.column_indices)
+            .field("cached_epoch", &self.cached_epoch)
+            .field("compiled_checks", &self.compiled_checks.len())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Pre-compiled state for COUNT(DISTINCT col) queries

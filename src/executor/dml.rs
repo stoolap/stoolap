@@ -139,6 +139,92 @@ fn try_extract_literal(expr: &Expression) -> Option<Value> {
     }
 }
 
+/// Literal extraction plus direct parameter resolution: a bound $n is
+/// already a Value in the context, and routing it through the program
+/// cache costs an AST hash plus a global mutex per parameter per row.
+#[inline]
+fn try_extract_simple_value(expr: &Expression, ctx: &ExecutionContext) -> Option<Value> {
+    if let Some(v) = try_extract_literal(expr) {
+        return Some(v);
+    }
+    if let Expression::Parameter(param) = expr {
+        if let Some(name) = param.name.strip_prefix(':') {
+            return ctx.get_named_param(name).cloned();
+        }
+        if param.index > 0 {
+            return ctx.params().get(param.index - 1).cloned();
+        }
+    }
+    None
+}
+
+/// Evaluate one default slot for a row: run the per-row program when the
+/// default is non-literal, else clone the constant template value.
+fn eval_default_slot(
+    vm: &mut super::expression::ExprVM,
+    exec_ctx: &super::expression::ExecuteContext,
+    program: &Option<(super::expression::SharedProgram, DataType)>,
+    template_val: &Value,
+) -> Value {
+    match program {
+        Some((program, target)) => match vm.execute_cow(program, exec_ctx) {
+            Ok(v) => v.into_coerce_to_type(*target),
+            Err(_) => Value::null_unknown(),
+        },
+        None => template_val.clone(),
+    }
+}
+
+/// Per-statement default machinery: constant defaults land in the value
+/// template; non-literal defaults compile ONCE and execute PER ROW, so
+/// DEFAULT (RANDOM()) differs per row. Parse and compile failures degrade
+/// the slot to NULL, preserving evaluate_default_expr's swallowed-error
+/// behavior for defaults.
+#[allow(clippy::type_complexity)]
+fn build_default_slots(
+    schema: &crate::core::Schema,
+) -> (
+    Vec<Value>,
+    Vec<Option<(super::expression::SharedProgram, DataType)>>,
+) {
+    use super::expression::compile_expression;
+    let n = schema.columns.len();
+    let mut values = Vec::with_capacity(n);
+    let mut programs: Vec<Option<(super::expression::SharedProgram, DataType)>> = vec![None; n];
+    for (i, c) in schema.columns.iter().enumerate() {
+        let Some(expr_str) = c.default_expr.as_ref() else {
+            values.push(Value::null_unknown());
+            continue;
+        };
+        let target = c.data_type;
+        let sql = format!("SELECT {}", expr_str);
+        let Ok(stmts) = crate::parser::parse_sql(&sql) else {
+            values.push(Value::null_unknown());
+            continue;
+        };
+        let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() else {
+            values.push(Value::null_unknown());
+            continue;
+        };
+        let Some(expr) = select.columns.first() else {
+            values.push(Value::null_unknown());
+            continue;
+        };
+        if let Some(lit) = try_extract_literal(expr) {
+            values.push(lit.into_coerce_to_type(target));
+            continue;
+        }
+        match compile_expression(expr, &[]) {
+            Ok(program) => {
+                values.push(Value::null_unknown());
+                programs[i] = Some((program, target));
+            }
+            Err(_) => values.push(Value::null_unknown()),
+        }
+    }
+    (values, programs)
+}
+
 /// Pre-compiled upsert expressions built once per INSERT statement and reused for every
 /// conflicting row. Without this, `apply_on_duplicate_update` recompiles expressions and
 /// re-parses CHECK constraint SQL on every conflict, causing O(n) allocation churn.
@@ -335,20 +421,19 @@ impl Executor {
         let column_names: Vec<String>;
         // Pre-compute ALL column types for default values and check constraints
         let all_column_types: Vec<crate::core::DataType>;
-        // Pre-compute default values and check expressions for all columns
-        let default_exprs: Vec<Option<String>>;
+        // Per-statement default slots: constant values plus per-row programs
+        let default_values: Vec<Value>;
+        let default_programs: Vec<Option<(super::expression::SharedProgram, DataType)>>;
         // OPTIMIZATION: Only collect columns that have CHECK constraints (saves 3ms clone overhead)
         let check_exprs: Vec<(usize, String, String)>; // (col_idx, column_name, check_expr)
         {
             let schema = table.schema();
             schema_column_count = schema.columns.len();
 
-            // Extract default and check expressions from schema
-            default_exprs = schema
-                .columns
-                .iter()
-                .map(|c| c.default_expr.clone())
-                .collect();
+            // Build default slots from schema
+            let (dv, dp) = build_default_slots(schema);
+            default_values = dv;
+            default_programs = dp;
             // Only collect columns that actually have CHECK constraints
             check_exprs = schema
                 .columns
@@ -487,15 +572,15 @@ impl Executor {
                 // This matches the behavior of regular INSERT
                 let mut row_values = Vec::with_capacity(schema_column_count);
                 for i in 0..schema_column_count {
-                    if let Some(ref default_expr) = default_exprs[i] {
-                        let default_type = all_column_types[i];
-                        match self.evaluate_default_expr(default_expr, default_type) {
-                            Ok(val) => row_values.push(val),
-                            Err(_) => row_values.push(Value::null_unknown()),
-                        }
-                    } else {
-                        row_values.push(Value::null_unknown());
-                    }
+                    row_values.push(match &default_programs[i] {
+                        // Non-literal defaults run per row (RANDOM() must
+                        // differ per row); constant defaults clone
+                        Some((program, target)) => match vm.execute_cow(program, &base_exec_ctx) {
+                            Ok(v) => v.into_coerce_to_type(*target),
+                            Err(_) => Value::null_unknown(),
+                        },
+                        None => default_values[i].clone(),
+                    });
                 }
 
                 // Fill in values from SELECT using pre-computed indices with type coercion
@@ -762,15 +847,15 @@ impl Executor {
                 // Build row values - need Vec for error handling paths
                 let mut row_values = Vec::with_capacity(schema_column_count);
                 for i in 0..schema_column_count {
-                    if let Some(ref default_expr) = default_exprs[i] {
-                        let default_type = all_column_types[i];
-                        match self.evaluate_default_expr(default_expr, default_type) {
-                            Ok(val) => row_values.push(val),
-                            Err(_) => row_values.push(Value::null_unknown()),
-                        }
-                    } else {
-                        row_values.push(Value::null_unknown());
-                    }
+                    row_values.push(match &default_programs[i] {
+                        // Non-literal defaults run per row (RANDOM() must
+                        // differ per row); constant defaults clone
+                        Some((program, target)) => match vm.execute_cow(program, &base_exec_ctx) {
+                            Ok(v) => v.into_coerce_to_type(*target),
+                            Err(_) => Value::null_unknown(),
+                        },
+                        None => default_values[i].clone(),
+                    });
                 }
                 // Fill in provided values using pre-computed indices with type coercion
                 for (i, expr) in value_row.iter().enumerate() {
@@ -965,16 +1050,15 @@ impl Executor {
                 // Build row values - initialize with DEFAULT values for missing columns
                 let mut row_values = Vec::with_capacity(schema_column_count);
                 for i in 0..schema_column_count {
-                    if let Some(ref default_expr) = default_exprs[i] {
-                        // Evaluate the default expression using the actual column type
-                        let default_type = all_column_types[i];
-                        match self.evaluate_default_expr(default_expr, default_type) {
-                            Ok(val) => row_values.push(val),
-                            Err(_) => row_values.push(Value::null_unknown()),
-                        }
-                    } else {
-                        row_values.push(Value::null_unknown());
-                    }
+                    row_values.push(match &default_programs[i] {
+                        // Non-literal defaults run per row (RANDOM() must
+                        // differ per row); constant defaults clone
+                        Some((program, target)) => match vm.execute_cow(program, &base_exec_ctx) {
+                            Ok(v) => v.into_coerce_to_type(*target),
+                            Err(_) => Value::null_unknown(),
+                        },
+                        None => default_values[i].clone(),
+                    });
                 }
 
                 // Fill in provided values using pre-computed indices with type coercion
@@ -1155,9 +1239,9 @@ impl Executor {
             column_types,
             column_vector_dims,
             column_names,
-            all_column_types,
+            default_programs,
             default_row_template,
-            check_exprs,
+            compiled_checks,
         ) = if let Some(cached) = cached_insert {
             // Use cached values (Arc clone is cheap)
             (
@@ -1165,47 +1249,62 @@ impl Executor {
                 cached.column_types,
                 cached.column_vector_dims,
                 cached.column_names,
-                cached.all_column_types,
+                cached.default_programs,
                 cached.default_row_template,
-                cached.check_exprs,
+                cached.compiled_checks,
             )
         } else {
             // Compile and cache
             let schema = table.schema();
             let schema_column_count = schema.columns.len();
 
-            // Only collect columns that actually have CHECK constraints
-            let check_exprs: Vec<(usize, SmartString, SmartString)> = schema
-                .columns
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, c)| {
-                    c.check_expr
-                        .as_ref()
-                        .map(|expr| (idx, SmartString::new(&c.name), SmartString::new(expr)))
-                })
-                .collect();
+            // Pre-compile CHECK constraints once per plan. Parse failures
+            // skip validation (matching validate_check_constraint), but a
+            // COMPILE failure must fail the INSERT: the per-row path
+            // propagated it, and swallowing it here would silently disable
+            // the constraint (e.g. after RENAME COLUMN leaves a stale
+            // check_expr).
+            let mut compiled_checks: Vec<(
+                usize,
+                SmartString,
+                SmartString,
+                super::expression::SharedProgram,
+            )> = Vec::new();
+            for (idx, c) in schema.columns.iter().enumerate() {
+                let Some(check_expr) = c.check_expr.as_ref() else {
+                    continue;
+                };
+                let sql = format!("SELECT {}", check_expr);
+                let Ok(stmts) = crate::parser::parse_sql(&sql) else {
+                    continue;
+                };
+                let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() else {
+                    continue;
+                };
+                let Some(expr) = select.columns.first() else {
+                    continue;
+                };
+                let columns = vec![c.name.to_string()];
+                let program = compile_expression(expr, &columns).map_err(|e| {
+                    Error::internal(format!(
+                        "CHECK constraint on column '{}' failed to compile: {}",
+                        c.name, e
+                    ))
+                })?;
+                compiled_checks.push((
+                    idx,
+                    SmartString::new(&c.name),
+                    SmartString::new(check_expr),
+                    program,
+                ));
+            }
 
             let all_column_types: Vec<DataType> =
                 schema.columns.iter().map(|c| c.data_type).collect();
 
-            // Pre-evaluate all default expressions into a template row
-            // This avoids re-evaluating defaults on every INSERT
-            let default_row_template: Vec<Value> = schema
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, c)| {
-                    if let Some(ref default_expr) = c.default_expr {
-                        match self.evaluate_default_expr(default_expr, all_column_types[i]) {
-                            Ok(val) => val,
-                            Err(_) => Value::null_unknown(),
-                        }
-                    } else {
-                        Value::null_unknown()
-                    }
-                })
-                .collect();
+            // Constant defaults land in the template; non-literal defaults
+            // compile once and execute per row
+            let (default_row_template, default_programs) = build_default_slots(schema);
 
             let (column_indices, column_types, column_vector_dims, column_names) =
                 if stmt.columns.is_empty() {
@@ -1255,9 +1354,9 @@ impl Executor {
                 column_types: Arc::new(column_types.clone()),
                 column_vector_dims: Arc::new(column_vector_dims.clone()),
                 column_names: Arc::new(column_names.clone()),
-                all_column_types: Arc::new(all_column_types.clone()),
+                default_programs: Arc::new(default_programs.clone()),
                 default_row_template: Arc::new(default_row_template.clone()),
-                check_exprs: Arc::new(check_exprs.clone()),
+                compiled_checks: Arc::new(compiled_checks.clone()),
                 cached_epoch: current_epoch,
             };
 
@@ -1271,9 +1370,9 @@ impl Executor {
                 Arc::new(column_types),
                 Arc::new(column_vector_dims),
                 Arc::new(column_names),
-                Arc::new(all_column_types),
+                Arc::new(default_programs),
                 Arc::new(default_row_template),
-                Arc::new(check_exprs),
+                Arc::new(compiled_checks),
             )
         };
 
@@ -1361,19 +1460,39 @@ impl Executor {
                         row_values.push(coerced);
                     } else {
                         // Column not in insert list - use default
-                        row_values.push(default_val.clone());
+                        row_values.push(eval_default_slot(
+                            &mut vm,
+                            &base_exec_ctx,
+                            &default_programs[col_idx],
+                            default_val,
+                        ));
                     }
                 }
 
-                // Validate CHECK constraints
-                for (col_idx, col_name, check_expr) in check_exprs.iter() {
-                    let col_type = all_column_types[*col_idx];
-                    self.validate_check_constraint(
-                        check_expr,
-                        col_name,
-                        &row_values[*col_idx],
-                        col_type,
-                    )?;
+                // Validate CHECK constraints via the pre-compiled programs
+                // (NULL passes per the SQL standard)
+                for (col_idx, col_name, check_expr, program) in compiled_checks.iter() {
+                    let col_value = &row_values[*col_idx];
+                    if col_value.is_null() {
+                        continue;
+                    }
+                    let check_row = Row::from_values(vec![col_value.clone()]);
+                    let check_ctx = ExecuteContext::new(&check_row);
+                    let result = vm.execute_cow(program, &check_ctx)?;
+                    let is_truthy = match &result {
+                        Value::Boolean(b) => *b,
+                        Value::Null(_) => true, // NULL passes CHECK (SQL standard)
+                        Value::Integer(i) => *i != 0,
+                        Value::Float(f) => *f != 0.0,
+                        Value::Text(t) => !t.is_empty(),
+                        _ => true, // Timestamp, Extension, etc. are truthy
+                    };
+                    if !is_truthy {
+                        return Err(Error::CheckConstraintViolation {
+                            column: col_name.to_string(),
+                            expression: check_expr.to_string(),
+                        });
+                    }
                 }
 
                 // Insert row
@@ -1419,12 +1538,18 @@ impl Executor {
                         // Column in insert list - evaluate expression
                         let expr = &value_list[value_pos];
                         if matches!(expr, Expression::Default(_)) {
-                            // DEFAULT keyword - use pre-evaluated default
-                            row_values.push(default_val.clone());
+                            // DEFAULT keyword - same per-row slot machinery
+                            row_values.push(eval_default_slot(
+                                &mut vm,
+                                &base_exec_ctx,
+                                &default_programs[col_idx],
+                                default_val,
+                            ));
                         } else {
-                            // OPTIMIZATION: Try literal extraction first (avoids VM compilation)
-                            let value = if let Some(lit_val) = try_extract_literal(expr) {
-                                lit_val
+                            // OPTIMIZATION: literals and bound parameters
+                            // resolve directly (avoids VM compilation)
+                            let value = if let Some(simple) = try_extract_simple_value(expr, ctx) {
+                                simple
                             } else {
                                 // Fall back to VM evaluation for complex expressions
                                 let program = compile_expression(expr, &[])?;
@@ -1444,19 +1569,38 @@ impl Executor {
                         }
                     } else {
                         // Column not in insert list - use default
-                        row_values.push(default_val.clone());
+                        row_values.push(eval_default_slot(
+                            &mut vm,
+                            &base_exec_ctx,
+                            &default_programs[col_idx],
+                            default_val,
+                        ));
                     }
                 }
 
-                // Validate CHECK constraints
-                for (col_idx, col_name, check_expr) in check_exprs.iter() {
-                    let col_type = all_column_types[*col_idx];
-                    self.validate_check_constraint(
-                        check_expr,
-                        col_name,
-                        &row_values[*col_idx],
-                        col_type,
-                    )?;
+                // Validate CHECK constraints via the pre-compiled programs
+                for (col_idx, col_name, check_expr, program) in compiled_checks.iter() {
+                    let col_value = &row_values[*col_idx];
+                    if col_value.is_null() {
+                        continue;
+                    }
+                    let check_row = Row::from_values(vec![col_value.clone()]);
+                    let check_ctx = ExecuteContext::new(&check_row);
+                    let result = vm.execute_cow(program, &check_ctx)?;
+                    let is_truthy = match &result {
+                        Value::Boolean(b) => *b,
+                        Value::Null(_) => true, // NULL passes CHECK (SQL standard)
+                        Value::Integer(i) => *i != 0,
+                        Value::Float(f) => *f != 0.0,
+                        Value::Text(t) => !t.is_empty(),
+                        _ => true, // Timestamp, Extension, etc. are truthy
+                    };
+                    if !is_truthy {
+                        return Err(Error::CheckConstraintViolation {
+                            column: col_name.to_string(),
+                            expression: check_expr.to_string(),
+                        });
+                    }
                 }
 
                 // Insert row
@@ -2865,20 +3009,32 @@ impl Executor {
             .iter()
             .filter_map(|(idx, _, _, _)| {
                 let col = &schema.columns[*idx];
-                col.check_expr.as_ref().and_then(|check_expr| {
-                    let sql = format!("SELECT {}", check_expr);
-                    let stmts = parse_sql(&sql).ok()?;
-                    if let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() {
-                        let expr = select.columns.first()?;
-                        let columns = vec![col.name.to_string()];
-                        let program = compile_expression(expr, &columns).ok()?;
-                        Some((*idx, col.name.to_string(), check_expr.to_string(), program))
-                    } else {
-                        None
-                    }
-                })
+                let check_expr = col.check_expr.as_ref()?;
+                let sql = format!("SELECT {}", check_expr);
+                // Parse failures skip validation (matching
+                // validate_check_constraint); compile failures propagate
+                let Ok(stmts) = parse_sql(&sql) else {
+                    return None;
+                };
+                let crate::parser::ast::Statement::Select(select) = stmts.first()? else {
+                    return None;
+                };
+                let expr = select.columns.first()?;
+                let columns = vec![col.name.to_string()];
+                Some(
+                    compile_expression(expr, &columns)
+                        .map(|program| {
+                            (*idx, col.name.to_string(), check_expr.to_string(), program)
+                        })
+                        .map_err(|e| {
+                            Error::internal(format!(
+                                "CHECK constraint on column '{}' failed to compile: {}",
+                                col.name, e
+                            ))
+                        }),
+                )
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(CompiledUpsert {
             compiled_updates,
