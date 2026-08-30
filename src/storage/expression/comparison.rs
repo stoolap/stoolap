@@ -201,6 +201,21 @@ impl ComparisonExpr {
         }
     }
 
+    /// Apply the configured operator to a column-vs-value ordering
+    #[inline]
+    fn check_ordering(&self, ord: std::cmp::Ordering) -> bool {
+        use std::cmp::Ordering;
+        match self.operator {
+            Operator::Eq => ord == Ordering::Equal,
+            Operator::Ne => ord != Ordering::Equal,
+            Operator::Gt => ord == Ordering::Greater,
+            Operator::Gte => ord != Ordering::Less,
+            Operator::Lt => ord == Ordering::Less,
+            Operator::Lte => ord != Ordering::Greater,
+            _ => false,
+        }
+    }
+
     /// Compare two floats with the configured operator
     #[inline]
     fn compare_floats(&self, col_val: f64, cmp_val: f64) -> bool {
@@ -313,12 +328,19 @@ impl Expression for ComparisonExpr {
                 Ok(self.compare_timestamps(*col_val, *cmp_val))
             }
 
-            // Cross-type numeric comparisons (integer vs float)
+            // Cross-type numeric comparisons (integer vs float), exact at
+            // the extremes where `i as f64` rounds
             (ComparisonValue::Integer(cmp_val), Value::Float(col_val)) => {
-                Ok(self.compare_floats(*col_val, *cmp_val as f64))
+                match crate::core::value::cmp_i64_f64(*cmp_val, *col_val) {
+                    Some(ord) => Ok(self.check_ordering(ord.reverse())),
+                    None => Ok(false),
+                }
             }
             (ComparisonValue::Float(cmp_val), Value::Integer(col_val)) => {
-                Ok(self.compare_floats(*col_val as f64, *cmp_val))
+                match crate::core::value::cmp_i64_f64(*col_val, *cmp_val) {
+                    Some(ord) => Ok(self.check_ordering(ord)),
+                    None => Ok(false),
+                }
             }
 
             // Type mismatch
@@ -370,12 +392,19 @@ impl Expression for ComparisonExpr {
             (ComparisonValue::Timestamp(cmp_val), Value::Timestamp(col_val)) => {
                 self.compare_timestamps(*col_val, *cmp_val)
             }
-            // Cross-type numeric
+            // Cross-type numeric, exact at the extremes where `i as f64`
+            // rounds
             (ComparisonValue::Integer(cmp_val), Value::Float(col_val)) => {
-                self.compare_floats(*col_val, *cmp_val as f64)
+                match crate::core::value::cmp_i64_f64(*cmp_val, *col_val) {
+                    Some(ord) => self.check_ordering(ord.reverse()),
+                    None => false,
+                }
             }
             (ComparisonValue::Float(cmp_val), Value::Integer(col_val)) => {
-                self.compare_floats(*col_val as f64, *cmp_val)
+                match crate::core::value::cmp_i64_f64(*col_val, *cmp_val) {
+                    Some(ord) => self.check_ordering(ord),
+                    None => false,
+                }
             }
             _ => false,
         }

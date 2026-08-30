@@ -114,6 +114,10 @@ impl BetweenExpr {
 
     /// Compare integers with bounds
     #[inline]
+    fn has_float_bound(&self) -> bool {
+        matches!(self.lower_bound, Value::Float(_)) || matches!(self.upper_bound, Value::Float(_))
+    }
+
     fn check_integer(&self, val: i64, lower: i64, upper: i64) -> bool {
         if self.inclusive {
             val >= lower && val <= upper
@@ -177,13 +181,25 @@ impl Expression for BetweenExpr {
         let in_range =
             match col_value {
                 Value::Integer(val) => {
-                    let lower = self.lower_bound.as_int64().ok_or_else(|| {
-                        crate::core::Error::type_conversion("lower bound", "integer")
-                    })?;
-                    let upper = self.upper_bound.as_int64().ok_or_else(|| {
-                        crate::core::Error::type_conversion("upper bound", "integer")
-                    })?;
-                    self.check_integer(*val, lower, upper)
+                    // Float bounds must compare numerically, not truncate:
+                    // BETWEEN 5.1 AND 5.9 is empty for integers, not [5, 5]
+                    if self.has_float_bound() {
+                        let lower = self.lower_bound.as_float64().ok_or_else(|| {
+                            crate::core::Error::type_conversion("lower bound", "float")
+                        })?;
+                        let upper = self.upper_bound.as_float64().ok_or_else(|| {
+                            crate::core::Error::type_conversion("upper bound", "float")
+                        })?;
+                        self.check_float(*val as f64, lower, upper)
+                    } else {
+                        let lower = self.lower_bound.as_int64().ok_or_else(|| {
+                            crate::core::Error::type_conversion("lower bound", "integer")
+                        })?;
+                        let upper = self.upper_bound.as_int64().ok_or_else(|| {
+                            crate::core::Error::type_conversion("upper bound", "integer")
+                        })?;
+                        self.check_integer(*val, lower, upper)
+                    }
                 }
 
                 Value::Float(val) => {
@@ -239,7 +255,15 @@ impl Expression for BetweenExpr {
 
         let in_range = match col_value {
             Value::Integer(val) => {
-                if let (Some(lower), Some(upper)) =
+                if self.has_float_bound() {
+                    if let (Some(lower), Some(upper)) =
+                        (self.lower_bound.as_float64(), self.upper_bound.as_float64())
+                    {
+                        self.check_float(*val as f64, lower, upper)
+                    } else {
+                        return false;
+                    }
+                } else if let (Some(lower), Some(upper)) =
                     (self.lower_bound.as_int64(), self.upper_bound.as_int64())
                 {
                     self.check_integer(*val, lower, upper)

@@ -229,9 +229,14 @@ impl RangeExpr {
         }
     }
 
-    /// Check integer bounds
+    /// Check integer bounds. With Float-typed bounds the integer cell is
+    /// compared as f64: the truncated int_min/int_max would turn
+    /// BETWEEN 5.1 AND 5.9 into [5, 5] and match 5.
     #[inline]
     fn check_integer(&self, val: i64) -> bool {
+        if self.bounds.data_type == DataType::Float {
+            return self.check_float(val as f64);
+        }
         // Check minimum
         if self.include_min {
             if val < self.bounds.int_min {

@@ -643,6 +643,57 @@ impl CompiledFilter {
         Self::compile(expr, schema)
     }
 
+    /// Compile a float-constant comparison against an INTEGER column with
+    /// exact numeric semantics. A whole-number float in i64 range becomes
+    /// the equivalent integer filter; a fractional in-range float rewrites
+    /// ordering comparisons to exact integer bounds (`n < 5.5` is
+    /// `n <= 5`, `n > -5.5` is `n >= -5`); everything else (fractional
+    /// equality, out-of-range, NaN) falls back to the dynamic path whose
+    /// generic comparison is numeric.
+    fn compile_float_vs_integer_column(
+        expr: &ComparisonExpr,
+        col_idx: usize,
+        op: Operator,
+        f: f64,
+    ) -> Self {
+        const I64_MIN_F: f64 = -9_223_372_036_854_775_808.0; // -2^63, exact
+        const I64_MAX_PLUS_1_F: f64 = 9_223_372_036_854_775_808.0; // 2^63
+
+        if !(I64_MIN_F..I64_MAX_PLUS_1_F).contains(&f) {
+            return CompiledFilter::Dynamic(expr.clone_box());
+        }
+
+        if f.fract() == 0.0 {
+            let i = f as i64;
+            return match op {
+                Operator::Eq => CompiledFilter::IntegerEq { col_idx, value: i },
+                Operator::Ne => CompiledFilter::IntegerNe { col_idx, value: i },
+                Operator::Gt => CompiledFilter::IntegerGt { col_idx, value: i },
+                Operator::Gte => CompiledFilter::IntegerGte { col_idx, value: i },
+                Operator::Lt => CompiledFilter::IntegerLt { col_idx, value: i },
+                Operator::Lte => CompiledFilter::IntegerLte { col_idx, value: i },
+                _ => CompiledFilter::Dynamic(expr.clone_box()),
+            };
+        }
+
+        // Fractional: |f| < 2^53 (f64 has no fractional values beyond),
+        // so floor and floor + 1 stay in i64 range.
+        let floor = f.floor() as i64;
+        match op {
+            Operator::Lt | Operator::Lte => CompiledFilter::IntegerLte {
+                col_idx,
+                value: floor,
+            },
+            Operator::Gt | Operator::Gte => CompiledFilter::IntegerGte {
+                col_idx,
+                value: floor + 1,
+            },
+            // No integer equals a fractional value; the dynamic generic
+            // comparison keeps exact Eq/Ne and NULL semantics.
+            _ => CompiledFilter::Dynamic(expr.clone_box()),
+        }
+    }
+
     fn compile_comparison(expr: &ComparisonExpr, schema: &Schema) -> Self {
         let col_name = expr.get_column_name().unwrap_or("");
         let col_idx = match super::find_column_index(schema, col_name) {
@@ -670,6 +721,17 @@ impl CompiledFilter {
             }
             Value::Float(f) => {
                 let f = *f;
+                // The Float-typed filters pattern-match Value::Float cells,
+                // so against an INTEGER column they would never match. Map
+                // the comparison onto exact integer semantics instead.
+                let col_is_integer = schema
+                    .columns
+                    .get(col_idx)
+                    .map(|c| c.data_type == crate::core::DataType::Integer)
+                    .unwrap_or(false);
+                if col_is_integer {
+                    return Self::compile_float_vs_integer_column(expr, col_idx, op, f);
+                }
                 match op {
                     Operator::Eq => CompiledFilter::FloatEq { col_idx, value: f },
                     Operator::Ne => CompiledFilter::FloatNe { col_idx, value: f },
@@ -910,12 +972,38 @@ impl CompiledFilter {
         let (low, high) = expr.get_bounds();
         let is_negated = expr.is_negated();
 
+        let col_is_integer = schema
+            .columns
+            .get(col_idx)
+            .map(|c| c.data_type == crate::core::DataType::Integer)
+            .unwrap_or(false);
+
         let between_filter = match (low, high) {
             (Value::Integer(min), Value::Integer(max)) => CompiledFilter::IntegerBetween {
                 col_idx,
                 min: *min,
                 max: *max,
             },
+            // Float bounds against an INTEGER column: FloatBetween never
+            // matches integer cells, and truncating would turn
+            // BETWEEN 5.1 AND 5.9 into [5, 5]. Exact integer bounds are
+            // [ceil(min), floor(max)]; out-of-range bounds fall back to
+            // the dynamic path.
+            (Value::Float(min), Value::Float(max)) if col_is_integer => {
+                const I64_MIN_F: f64 = -9_223_372_036_854_775_808.0;
+                const I64_MAX_PLUS_1_F: f64 = 9_223_372_036_854_775_808.0;
+                let (min_c, max_f) = (min.ceil(), max.floor());
+                if !(I64_MIN_F..I64_MAX_PLUS_1_F).contains(&min_c)
+                    || !(I64_MIN_F..I64_MAX_PLUS_1_F).contains(&max_f)
+                {
+                    return CompiledFilter::Dynamic(expr.clone_box());
+                }
+                CompiledFilter::IntegerBetween {
+                    col_idx,
+                    min: min_c as i64,
+                    max: max_f as i64,
+                }
+            }
             (Value::Float(min), Value::Float(max)) => CompiledFilter::FloatBetween {
                 col_idx,
                 min: *min,

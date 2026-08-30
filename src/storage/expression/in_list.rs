@@ -253,14 +253,16 @@ impl InListExpr {
         match &self.hashed {
             HashedValues::Integers(set) => set.contains(val),
             _ => {
-                // Fallback to linear search
+                // Fallback to linear search. Float list values compare
+                // numerically first: as_int64 would truncate 5.5 to 5 and
+                // match the wrong integers.
                 for v in &self.values {
-                    if let Some(list_val) = v.as_int64() {
-                        if val == list_val {
+                    if let Value::Float(f) = v {
+                        if val as f64 == *f {
                             return true;
                         }
-                    } else if let Some(list_val) = v.as_float64() {
-                        if val as f64 == list_val {
+                    } else if let Some(list_val) = v.as_int64() {
+                        if val == list_val {
                             return true;
                         }
                     }

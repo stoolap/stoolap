@@ -390,7 +390,21 @@ impl Value {
             return self.compare_same_type(other);
         }
 
-        // Cross-type numeric comparison (integer vs float)
+        // Cross-type numeric comparison (integer vs float), exact at the
+        // extremes where `i as f64` rounds
+        match (self, other) {
+            (Value::Integer(i), Value::Float(f)) => {
+                if let Some(ord) = cmp_i64_f64(*i, *f) {
+                    return Ok(ord);
+                }
+            }
+            (Value::Float(f), Value::Integer(i)) => {
+                if let Some(ord) = cmp_i64_f64(*i, *f) {
+                    return Ok(ord.reverse());
+                }
+            }
+            _ => {}
+        }
         if self.data_type().is_numeric() && other.data_type().is_numeric() {
             let v1 = self.as_float64().unwrap();
             let v2 = other.as_float64().unwrap();
@@ -892,7 +906,7 @@ impl PartialEq for Value {
             // Cross-type numeric comparison: Integer vs Float
             // This is critical for queries like WHERE id = 5.0 or WHERE price = 100
             (Value::Integer(i), Value::Float(f)) | (Value::Float(f), Value::Integer(i)) => {
-                *f == (*i as f64)
+                cmp_i64_f64(*i, *f) == Some(std::cmp::Ordering::Equal)
             }
             (Value::Text(a), Value::Text(b)) => a == b,
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
@@ -904,6 +918,73 @@ impl PartialEq for Value {
 }
 
 impl Eq for Value {}
+
+/// Compare an i64 with an f64 exactly. `i as f64` rounds above 2^53, so
+/// e.g. i64::MAX as f64 == 2^63 and a naive float comparison calls
+/// i64::MAX equal to 9223372036854775808.0, which no i64 equals.
+pub fn cmp_i64_f64(i: i64, f: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    if f.is_nan() {
+        return None;
+    }
+    const I64_MIN_F: f64 = -9_223_372_036_854_775_808.0; // -2^63, exact
+    const I64_MAX_PLUS_1_F: f64 = 9_223_372_036_854_775_808.0; // 2^63
+    if f < I64_MIN_F {
+        return Some(Ordering::Greater);
+    }
+    if f >= I64_MAX_PLUS_1_F {
+        return Some(Ordering::Less);
+    }
+    // f is in i64 range: trunc converts exactly
+    let ft = f.trunc();
+    let fi = ft as i64;
+    Some(match i.cmp(&fi) {
+        Ordering::Equal => {
+            let frac = f - ft;
+            if frac > 0.0 {
+                Ordering::Less
+            } else if frac < 0.0 {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        }
+        ord => ord,
+    })
+}
+
+/// Operator wrappers over `cmp_i64_f64`. NaN compares false except `!=`,
+/// matching IEEE semantics of the casts they replace.
+#[inline]
+pub fn i64_eq_f64(i: i64, f: f64) -> bool {
+    cmp_i64_f64(i, f) == Some(std::cmp::Ordering::Equal)
+}
+#[inline]
+pub fn i64_ne_f64(i: i64, f: f64) -> bool {
+    cmp_i64_f64(i, f) != Some(std::cmp::Ordering::Equal)
+}
+#[inline]
+pub fn i64_lt_f64(i: i64, f: f64) -> bool {
+    cmp_i64_f64(i, f) == Some(std::cmp::Ordering::Less)
+}
+#[inline]
+pub fn i64_le_f64(i: i64, f: f64) -> bool {
+    matches!(
+        cmp_i64_f64(i, f),
+        Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal)
+    )
+}
+#[inline]
+pub fn i64_gt_f64(i: i64, f: f64) -> bool {
+    cmp_i64_f64(i, f) == Some(std::cmp::Ordering::Greater)
+}
+#[inline]
+pub fn i64_ge_f64(i: i64, f: f64) -> bool {
+    matches!(
+        cmp_i64_f64(i, f),
+        Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal)
+    )
+}
 
 /// Maximum i64 value that can be safely hashed as i64 without f64 conversion.
 /// Integers in the range [I64_SAFE_MIN, I64_SAFE_MAX] have unique f64 representations,
@@ -1876,5 +1957,28 @@ mod tests {
         // Verify they're equal in PartialEq
         assert_eq!(nan1, nan2);
         assert_eq!(nan2, nan3);
+    }
+
+    #[test]
+    fn cmp_i64_f64_is_exact_at_extremes() {
+        use std::cmp::Ordering::*;
+        // In-range basics
+        assert_eq!(cmp_i64_f64(5, 5.0), Some(Equal));
+        assert_eq!(cmp_i64_f64(5, 5.5), Some(Less));
+        assert_eq!(cmp_i64_f64(-5, -5.5), Some(Greater));
+        // i64::MAX as f64 rounds to 2^63; the naive cast comparison calls
+        // them equal, the exact comparison must not
+        assert_eq!(cmp_i64_f64(i64::MAX, 9_223_372_036_854_775_808.0), Some(Less));
+        assert_eq!(cmp_i64_f64(i64::MAX, 9_223_372_036_854_774_784.0), Some(Greater));
+        assert_eq!(cmp_i64_f64(i64::MIN, -9_223_372_036_854_775_808.0), Some(Equal));
+        // Out-of-range floats
+        assert_eq!(cmp_i64_f64(i64::MAX, 1e19), Some(Less));
+        assert_eq!(cmp_i64_f64(i64::MIN, -1e19), Some(Greater));
+        assert_eq!(cmp_i64_f64(0, f64::INFINITY), Some(Less));
+        assert_eq!(cmp_i64_f64(0, f64::NEG_INFINITY), Some(Greater));
+        assert_eq!(cmp_i64_f64(0, f64::NAN), None);
+        // PartialEq consequences
+        assert_ne!(Value::Integer(i64::MAX), Value::Float(9_223_372_036_854_775_808.0));
+        assert_eq!(Value::Integer(5), Value::Float(5.0));
     }
 }

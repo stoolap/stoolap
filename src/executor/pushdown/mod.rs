@@ -89,12 +89,24 @@ impl<'a> PushdownContext<'a> {
         self.schema.has_column(name)
     }
 
-    /// Coerce value to column type if known
+    /// Coerce a WHERE-clause constant to the column type for pushdown.
+    ///
+    /// This must preserve COMPARISON semantics, not storage semantics:
+    /// `into_coerce_to_type` truncates Float to Integer the way an INSERT
+    /// would, which would turn `n = 5.5` into `n = 5` and match the wrong
+    /// rows. A float constant against an INTEGER column converts only when
+    /// lossless; otherwise it stays a Float and the storage comparison
+    /// compares numerically.
     pub fn coerce_to_column_type(&self, column: &str, value: Value) -> Value {
-        if let Some(col_type) = self.column_type(column) {
-            value.into_coerce_to_type(col_type)
-        } else {
-            value
+        match (self.column_type(column), &value) {
+            (Some(crate::core::DataType::Integer), Value::Float(f)) => {
+                match crate::executor::Executor::lossless_float_key(*f) {
+                    Some(i) => Value::Integer(i),
+                    None => value,
+                }
+            }
+            (Some(col_type), _) => value.into_coerce_to_type(col_type),
+            (None, _) => value,
         }
     }
 }
