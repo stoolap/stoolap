@@ -2265,13 +2265,26 @@ impl Executor {
             let memory_where_program = memory_where_clause
                 .as_ref()
                 .filter(|expr| !Self::expr_contains_subquery(expr))
-                .and_then(|expr| compile_expression(expr, &column_names).ok());
+                .and_then(|expr| {
+                    // The executor's registry, not the global one: custom
+                    // function overrides must behave like the evaluator
+                    // path this replaces
+                    super::expression::compile_expression_with_context(
+                        expr,
+                        &column_names,
+                        None,
+                        &self.function_registry,
+                    )
+                    .ok()
+                });
+            let transaction_id = ctx.transaction_id();
             let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                 // Execute pre-compiled programs (no recompilation per row)
                 let updates_to_apply: Vec<(usize, Value)> = {
                     let exec_ctx = ExecuteContext::new(&row)
                         .with_params(params)
-                        .with_named_params(named_params);
+                        .with_named_params(named_params)
+                        .with_transaction_id(transaction_id);
 
                     // In-memory WHERE filtering shares the row context
                     if needs_memory_filter {
@@ -2671,14 +2684,23 @@ impl Executor {
             // columns: evaluate_bool re-hashes the AST per row through the
             // program cache. Subquery-bearing clauses stay on the evaluator
             // (compiled placeholder subquery ops cannot run standalone).
-            use super::expression::{compile_expression, ExecuteContext, ExprVM};
+            use super::expression::{ExecuteContext, ExprVM};
             let mut delete_vm = ExprVM::new();
             let params = ctx.params();
             let named_params = ctx.named_params();
             let memory_where_program = memory_where_clause
                 .as_ref()
                 .filter(|expr| !Self::expr_contains_subquery(expr))
-                .and_then(|expr| compile_expression(expr, &column_names_with_prefix).ok());
+                .and_then(|expr| {
+                    super::expression::compile_expression_with_context(
+                        expr,
+                        &column_names_with_prefix,
+                        None,
+                        &self.function_registry,
+                    )
+                    .ok()
+                });
+            let transaction_id = ctx.transaction_id();
 
             // Scan all rows and collect IDs of rows to delete
             let column_indices: Vec<usize> = (0..column_count).collect();
@@ -2777,7 +2799,8 @@ impl Executor {
                                 }
                             }
                         } else if let Some(ref program) = memory_where_program {
-                            let mut exec_ctx = ExecuteContext::new(row);
+                            let mut exec_ctx =
+                                ExecuteContext::new(row).with_transaction_id(transaction_id);
                             if !params.is_empty() {
                                 exec_ctx = exec_ctx.with_params(params);
                             }
