@@ -18,16 +18,23 @@
 
 use stoolap::api::Database;
 
+/// One database per test: under `cargo test` all tests share a process,
+/// and `memory://` DSNs are registry-shared within it.
+fn test_db(name: &str) -> Database {
+    let db = Database::open(&format!("memory://pk_fast_path_limit_{}", name)).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (5, 'x')", ()).unwrap();
+    db
+}
+
 fn row_count(db: &Database, sql: &str) -> usize {
     db.query(sql, ()).unwrap().collect_vec().unwrap().len()
 }
 
 #[test]
 fn pk_lookup_respects_limit_zero() {
-    let db = Database::open("memory://").unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", ())
-        .unwrap();
-    db.execute("INSERT INTO t VALUES (5, 'x')", ()).unwrap();
+    let db = test_db("pk_lookup_respects_limit_zero");
 
     // Run twice: the second execution takes the cached/compiled path.
     assert_eq!(row_count(&db, "SELECT * FROM t WHERE id = 5 LIMIT 0"), 0);
@@ -36,10 +43,7 @@ fn pk_lookup_respects_limit_zero() {
 
 #[test]
 fn pk_lookup_respects_offset() {
-    let db = Database::open("memory://").unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", ())
-        .unwrap();
-    db.execute("INSERT INTO t VALUES (5, 'x')", ()).unwrap();
+    let db = test_db("pk_lookup_respects_offset");
 
     assert_eq!(
         row_count(&db, "SELECT * FROM t WHERE id = 5 LIMIT 10 OFFSET 1"),
@@ -53,10 +57,7 @@ fn pk_lookup_respects_offset() {
 
 #[test]
 fn pk_lookup_with_limit_one_still_returns_the_row() {
-    let db = Database::open("memory://").unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", ())
-        .unwrap();
-    db.execute("INSERT INTO t VALUES (5, 'x')", ()).unwrap();
+    let db = test_db("pk_lookup_with_limit_one_still_returns_the_row");
 
     assert_eq!(row_count(&db, "SELECT * FROM t WHERE id = 5 LIMIT 1"), 1);
     assert_eq!(row_count(&db, "SELECT * FROM t WHERE id = 5 LIMIT 1"), 1);
@@ -64,10 +65,7 @@ fn pk_lookup_with_limit_one_still_returns_the_row() {
 
 #[test]
 fn prepared_pk_lookup_respects_limit_zero() {
-    let db = Database::open("memory://").unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", ())
-        .unwrap();
-    db.execute("INSERT INTO t VALUES (5, 'x')", ()).unwrap();
+    let db = test_db("prepared_pk_lookup_respects_limit_zero");
 
     let stmt = db.prepare("SELECT * FROM t WHERE id = $1 LIMIT 0").unwrap();
     for _ in 0..3 {
@@ -84,10 +82,7 @@ fn prepared_pk_lookup_respects_limit_zero() {
 
 #[test]
 fn prepared_pk_lookup_survives_wrongly_typed_first_execution() {
-    let db = Database::open("memory://").unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", ())
-        .unwrap();
-    db.execute("INSERT INTO t VALUES (5, 'x')", ()).unwrap();
+    let db = test_db("prepared_pk_lookup_survives_wrongly_typed_first_execution");
 
     let stmt = db.prepare("SELECT * FROM t WHERE id = $1").unwrap();
 
