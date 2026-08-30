@@ -1022,7 +1022,36 @@ fn compute_classification_key(stmt: &SelectStatement) -> u64 {
         hash_expression_structure(having, &mut hasher);
     }
 
+    // Hash FROM structure: without it `SELECT * FROM a` and
+    // `SELECT * FROM a JOIN b ON ...` share a key and trade
+    // classifications (has_joins, join_count, is_simple_scan).
+    stmt.table_expr.is_some().hash(&mut hasher);
+    if let Some(ref table_expr) = stmt.table_expr {
+        hash_table_expr_structure(table_expr, &mut hasher);
+    }
+
     hasher.finish()
+}
+
+/// Hash the join/derived-table shape of a FROM expression, mirroring what
+/// `analyze_table_source` reads: join nesting, join types, and source
+/// discriminants.
+fn hash_table_expr_structure(expr: &Expression, hasher: &mut FxHasher) {
+    std::mem::discriminant(expr).hash(hasher);
+    match expr {
+        Expression::JoinSource(join) => {
+            join.join_type.hash(hasher);
+            hash_table_expr_structure(&join.left, hasher);
+            hash_table_expr_structure(&join.right, hasher);
+        }
+        Expression::Aliased(aliased) => {
+            hash_table_expr_structure(&aliased.expression, hasher);
+        }
+        Expression::TableSource(ts) => {
+            ts.name.value_lower.hash(hasher);
+        }
+        _ => {}
+    }
 }
 
 /// Hash the structural elements of an expression (discriminants, not values)
@@ -1225,5 +1254,34 @@ mod tests {
         // Second call - should hit cache (same Arc)
         let class2 = get_classification(&stmt);
         assert!(Arc::ptr_eq(&class1, &class2));
+    }
+
+    #[test]
+    fn classification_key_distinguishes_join_shape() {
+        // Same SELECT list, WHERE, ORDER BY (all absent); only FROM differs.
+        let parse = |sql: &str| {
+            let mut parser = crate::parser::Parser::new(sql);
+            let mut program = parser.parse_program().unwrap();
+            match program.statements.pop().unwrap() {
+                crate::parser::ast::Statement::Select(s) => s,
+                other => panic!("expected SELECT, got {:?}", other),
+            }
+        };
+        let plain = parse("SELECT * FROM a");
+        let joined = parse("SELECT * FROM a JOIN b ON a.id = b.id");
+        let left_joined = parse("SELECT * FROM a LEFT JOIN b ON a.id = b.id");
+
+        let k_plain = compute_classification_key(&plain);
+        let k_joined = compute_classification_key(&joined);
+        let k_left = compute_classification_key(&left_joined);
+        assert_ne!(k_plain, k_joined, "join shape must be part of the key");
+        assert_ne!(k_joined, k_left, "join type must be part of the key");
+
+        clear_cache();
+        let c_plain = get_classification(&plain);
+        let c_joined = get_classification(&joined);
+        assert!(!c_plain.has_joins);
+        assert!(c_joined.has_joins);
+        assert!(c_joined.join_count >= 1);
     }
 }

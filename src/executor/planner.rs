@@ -66,15 +66,21 @@ struct CachedStats {
     zone_maps: Option<TableZoneMap>,
     /// Timestamp when this cache entry was created
     cached_at: crate::common::time_compat::Instant,
+    /// Engine stats epoch at creation: ANALYZE through any handle bumps
+    /// the engine epoch, so entries cached by other executors go stale
+    /// immediately instead of waiting out the TTL.
+    stats_epoch: u64,
     /// Seconds since planner creation at last access (for LRU eviction).
     /// Atomic so cache hits can touch it under the read lock.
     last_accessed: std::sync::atomic::AtomicU64,
 }
 
 impl CachedStats {
-    /// Check if this cache entry is stale (older than TTL)
-    fn is_stale(&self) -> bool {
-        self.cached_at.elapsed().as_secs() > STATS_CACHE_TTL_SECS
+    /// Check if this cache entry is stale (older than TTL, or superseded
+    /// by an ANALYZE elsewhere)
+    fn is_stale(&self, current_stats_epoch: u64) -> bool {
+        self.stats_epoch != current_stats_epoch
+            || self.cached_at.elapsed().as_secs() > STATS_CACHE_TTL_SECS
     }
 
     /// Update last accessed time
@@ -143,13 +149,14 @@ impl QueryPlanner {
         let key = table_name.to_lowercase();
 
         {
+            let current_epoch = self.engine.stats_epoch();
             let cache = self.stats_cache.read().unwrap();
             if let Some(cached) = cache.get(&key) {
                 // A fresh entry is authoritative either way: row_count == 0
                 // is the cached "no stats collected" verdict, kept so every
                 // statement does not re-probe the system tables until
                 // ANALYZE invalidates the entry or the TTL expires.
-                if !cached.is_stale() {
+                if !cached.is_stale(current_epoch) {
                     cached.touch(self.now_secs());
                     return (cached.table_stats.row_count > 0).then(|| cached.table_stats.clone());
                 }
@@ -201,9 +208,10 @@ impl QueryPlanner {
 
         // Check cache first
         let should_reload = {
+            let current_epoch = self.engine.stats_epoch();
             let cache = self.stats_cache.read().unwrap();
             if let Some(cached) = cache.get(&table_key) {
-                if !cached.is_stale() {
+                if !cached.is_stale(current_epoch) {
                     cached.touch(self.now_secs());
                     return cached.column_stats.get(&col_key).cloned();
                 }
@@ -284,6 +292,7 @@ impl QueryPlanner {
                     column_stats,
                     zone_maps: None, // Zone maps are stored in the table, not here
                     cached_at: crate::common::time_compat::Instant::now(),
+                    stats_epoch: self.engine.stats_epoch(),
                     last_accessed: std::sync::atomic::AtomicU64::new(self.now_secs()),
                 },
             );
@@ -1467,5 +1476,21 @@ mod tests {
         let decision = planner.plan_runtime_join(1000, 1000, true);
         // Explanation should not be empty
         assert!(!decision.explanation.is_empty());
+    }
+
+    #[test]
+    fn cached_stats_go_stale_on_epoch_change() {
+        let entry = CachedStats {
+            table_stats: TableStats::default(),
+            column_stats: StringMap::new(),
+            zone_maps: None,
+            cached_at: crate::common::time_compat::Instant::now(),
+            stats_epoch: 1,
+            last_accessed: std::sync::atomic::AtomicU64::new(0),
+        };
+        assert!(!entry.is_stale(1));
+        // ANALYZE through another handle bumps the engine epoch: the pinned
+        // verdict (including a negative row_count == 0 one) must reload.
+        assert!(entry.is_stale(2));
     }
 }

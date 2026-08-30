@@ -44,8 +44,6 @@ struct PkLookupInfo {
     table_name: String,
     /// PK value to look up
     pk_value: i64,
-    /// How to extract the PK value (for caching)
-    pk_value_source: PkValueSource,
     /// Cached schema to avoid second lookup
     schema: CompactArc<Schema>,
 }
@@ -95,6 +93,11 @@ impl Executor {
             return None;
         }
 
+        // Quick reject: LIMIT 0 or OFFSET would change the result
+        if !Self::pk_fast_path_limit_ok(stmt) {
+            return None;
+        }
+
         // Must be SELECT * (for now - column projection adds complexity)
         if stmt.columns.len() != 1 || !matches!(&stmt.columns[0], Expression::Star(_)) {
             return None;
@@ -121,6 +124,23 @@ impl Executor {
         where_clause: &Expression,
         ctx: &ExecutionContext,
     ) -> Option<PkLookupInfo> {
+        let (pk_value_source, schema) =
+            self.extract_pk_lookup_structure(table_name, where_clause)?;
+        let pk_value = self.extract_pk_value_fast(&pk_value_source, ctx)?;
+        Some(PkLookupInfo {
+            table_name: table_name.to_string(),
+            pk_value,
+            schema,
+        })
+    }
+
+    /// Structural half of PK-lookup detection: schema/PK/equality shape,
+    /// with parameter values left unresolved.
+    fn extract_pk_lookup_structure(
+        &self,
+        table_name: &str,
+        where_clause: &Expression,
+    ) -> Option<(PkValueSource, CompactArc<Schema>)> {
         // Get table schema to find PK column
         let schema = self.engine.get_table_schema(table_name).ok()?;
         let pk_indices = schema.primary_key_indices();
@@ -130,11 +150,9 @@ impl Executor {
             return None;
         }
         let pk_idx = pk_indices[0];
-        let pk_column = &schema.columns[pk_idx].name;
 
-        // Extract comparison info from WHERE clause
-        let (col_name, pk_value, pk_value_source) =
-            self.extract_pk_equality(where_clause, pk_column, ctx)?;
+        // Extract comparison structure from WHERE clause
+        let (col_name, pk_value_source) = Self::extract_pk_equality_source(where_clause)?;
 
         // Column must match PK (case-insensitive)
         // Use schema's pre-computed lowercase for pk_column
@@ -148,56 +166,49 @@ impl Executor {
             return None;
         }
 
-        Some(PkLookupInfo {
-            table_name: table_name.to_string(),
-            pk_value,
-            pk_value_source,
-            schema,
-        })
+        Some((pk_value_source, schema))
     }
 
-    /// Extract PK equality from WHERE clause
-    /// Returns (column_name, pk_value, pk_value_source) if WHERE is `pk_col = literal` or `pk_col = $param`
-    fn extract_pk_equality(
-        &self,
-        expr: &Expression,
-        _pk_column: &str,
-        ctx: &ExecutionContext,
-    ) -> Option<(String, i64, PkValueSource)> {
+    /// The PK fast path returns at most one row, so a literal LIMIT >= 1
+    /// with no OFFSET cannot change the result. Anything else (LIMIT 0,
+    /// any OFFSET, a parameter or expression limit) must take the full
+    /// execution path.
+    fn pk_fast_path_limit_ok(stmt: &SelectStatement) -> bool {
+        if stmt.offset.is_some() {
+            return false;
+        }
+        match stmt.limit.as_deref() {
+            None => true,
+            Some(Expression::IntegerLiteral(lit)) => lit.value >= 1,
+            Some(_) => false,
+        }
+    }
+
+    /// Extract PK equality structure from WHERE clause without resolving
+    /// parameter values. Returns (column_name, pk_value_source) if WHERE is
+    /// `pk_col = literal` or `pk_col = $param`.
+    fn extract_pk_equality_source(expr: &Expression) -> Option<(String, PkValueSource)> {
         match expr {
             Expression::Infix(infix) => {
                 // Must be equality operator
                 if infix.operator != "=" {
                     return None;
                 }
-
-                // Try column = value pattern
-                if let Some((col, val, source)) =
-                    self.extract_col_eq_val(&infix.left, &infix.right, ctx)
-                {
-                    return Some((col, val, source));
-                }
-
-                // Try value = column pattern
-                if let Some((col, val, source)) =
-                    self.extract_col_eq_val(&infix.right, &infix.left, ctx)
-                {
-                    return Some((col, val, source));
-                }
-
-                None
+                Self::extract_col_eq_source(&infix.left, &infix.right)
+                    .or_else(|| Self::extract_col_eq_source(&infix.right, &infix.left))
             }
             _ => None,
         }
     }
 
-    /// Extract column name, integer value, and value source from col = val pattern
-    fn extract_col_eq_val(
-        &self,
+    /// Extract column name and value source from a col = val pattern.
+    /// Purely structural: parameter values are resolved per execution by
+    /// `extract_pk_value_fast`, so a wrongly-typed parameter this time must
+    /// not make the statement look structurally non-optimizable.
+    fn extract_col_eq_source(
         col_expr: &Expression,
         val_expr: &Expression,
-        ctx: &ExecutionContext,
-    ) -> Option<(String, i64, PkValueSource)> {
+    ) -> Option<(String, PkValueSource)> {
         // Get column name
         let col_name = match col_expr {
             Expression::Identifier(id) => id.value.to_string(),
@@ -205,51 +216,33 @@ impl Executor {
             _ => return None,
         };
 
-        // Get integer value and source
-        let (pk_value, pk_value_source) = match val_expr {
-            Expression::IntegerLiteral(lit) => (lit.value, PkValueSource::Literal(lit.value)),
+        let source = match val_expr {
+            Expression::IntegerLiteral(lit) => PkValueSource::Literal(lit.value),
             Expression::FloatLiteral(lit) => {
+                // Only lossless float keys qualify: truncating 5.5 to 5
+                // would serve row 5 where correct execution matches nothing.
                 let v = lit.value as i64;
-                (v, PkValueSource::Literal(v))
+                if v as f64 == lit.value {
+                    PkValueSource::Literal(v)
+                } else {
+                    return None;
+                }
             }
             Expression::Parameter(param) => {
-                // Resolve parameter from context
-                // Named parameters (e.g., :name) use get_named_param()
-                // Positional parameters ($1, $2, ...) are 1-indexed, array is 0-indexed
+                // Named parameters (e.g., :name); positional ($1, $2, ...)
+                // are 1-indexed, the array is 0-indexed
                 if param.name.starts_with(':') {
-                    let name = &param.name[1..];
-                    let value = ctx.get_named_param(name)?;
-                    let pk_value = match value {
-                        Value::Integer(i) => *i,
-                        Value::Float(f) => *f as i64,
-                        _ => return None,
-                    };
-                    (
-                        pk_value,
-                        PkValueSource::NamedParameter(SmartString::new(name)),
-                    )
+                    PkValueSource::NamedParameter(SmartString::new(&param.name[1..]))
+                } else if param.index > 0 {
+                    PkValueSource::Parameter(param.index - 1)
                 } else {
-                    let params = ctx.params();
-                    let param_idx = if param.index > 0 {
-                        param.index - 1
-                    } else {
-                        return None;
-                    };
-                    if param_idx >= params.len() {
-                        return None;
-                    }
-                    let pk_value = match &params[param_idx] {
-                        Value::Integer(i) => *i,
-                        Value::Float(f) => *f as i64,
-                        _ => return None,
-                    };
-                    (pk_value, PkValueSource::Parameter(param_idx))
+                    return None;
                 }
             }
             _ => return None,
         };
 
-        Some((col_name, pk_value, pk_value_source))
+        Some((col_name, source))
     }
 
     /// Normalize a row to match the current schema
@@ -365,11 +358,20 @@ impl Executor {
         match source {
             PkValueSource::NamedParameter(name) => match ctx.get_named_param(name)? {
                 Value::Integer(i) => Some(*i),
-                Value::Float(f) => Some(*f as i64),
+                Value::Float(f) => Self::lossless_float_key(*f),
                 _ => None,
             },
             _ => Self::extract_pk_value_from_slice(source, ctx.params()),
         }
+    }
+
+    /// A float key qualifies only when it converts to i64 without loss:
+    /// truncating 5.5 to 5 would serve row 5 where correct execution
+    /// matches nothing. None falls back to the standard path.
+    #[inline]
+    pub(crate) fn lossless_float_key(f: f64) -> Option<i64> {
+        let v = f as i64;
+        (v as f64 == f).then_some(v)
     }
 
     /// Extract PK value from params slice directly (avoids ExecutionContext overhead)
@@ -383,7 +385,7 @@ impl Executor {
                 }
                 match &params[*idx] {
                     Value::Integer(i) => Some(*i),
-                    Value::Float(f) => Some(*f as i64),
+                    Value::Float(f) => Self::lossless_float_key(*f),
                     _ => None,
                 }
             }
@@ -501,6 +503,12 @@ impl Executor {
             return None;
         }
 
+        // Quick reject: LIMIT 0 or OFFSET would change the result
+        if !Self::pk_fast_path_limit_ok(stmt) {
+            *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
+            return None;
+        }
+
         // Must be SELECT *
         // Don't set NotOptimizable here - other fast paths (like COUNT DISTINCT) may handle this
         if stmt.columns.len() != 1 || !matches!(&stmt.columns[0], Expression::Star(_)) {
@@ -516,25 +524,35 @@ impl Executor {
             }
         };
 
-        // Try to extract PK lookup info
-        match self.extract_pk_lookup_info(table_name, where_clause, ctx) {
-            Some(info) => {
+        // Try to extract the PK lookup structure. Only a STRUCTURAL reject
+        // may poison the slot: a value-dependent failure (e.g. a text or
+        // NULL parameter this execution) must leave the compiled lookup in
+        // place so later executions with an integer parameter still
+        // fast-path.
+        match self.extract_pk_lookup_structure(table_name, where_clause) {
+            Some((pk_value_source, schema)) => {
                 // Build and cache compiled lookup
                 // Use schema's column_names_arc() directly - O(1) Arc clone on execution
-                let column_names = info.schema.column_names_arc();
+                let column_names = schema.column_names_arc();
                 let cached_epoch = self.engine.schema_epoch();
                 let compiled_lookup = CompiledPkLookup {
-                    table_name: SmartString::new(&info.table_name),
-                    schema: info.schema.clone(),
+                    table_name: SmartString::new(table_name),
+                    schema: schema.clone(),
                     column_names,
-                    pk_value_source: info.pk_value_source.clone(),
+                    pk_value_source: pk_value_source.clone(),
                     cached_epoch,
                 };
                 *compiled_guard = CompiledExecution::PkLookup(compiled_lookup);
                 drop(compiled_guard);
 
-                // Execute
-                Some(self.execute_pk_lookup(info))
+                // Resolve this execution's value; on failure fall back to
+                // the standard path (the stored PkLookup stays valid).
+                let pk_value = self.extract_pk_value_fast(&pk_value_source, ctx)?;
+                Some(self.execute_pk_lookup(PkLookupInfo {
+                    table_name: table_name.to_string(),
+                    pk_value,
+                    schema,
+                }))
             }
             None => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());

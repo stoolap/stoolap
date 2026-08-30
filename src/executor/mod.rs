@@ -399,11 +399,6 @@ impl Executor {
     /// If found, it uses the cached AST. Otherwise, it parses the query
     /// and caches the result for future use.
     fn execute_cached(&self, sql: &str, ctx: &ExecutionContext) -> Result<Box<dyn QueryResult>> {
-        // Capture transaction state once for the whole statement: the probe
-        // battery and the ctx txn-id injection both need it, and repeated
-        // mutex acquisitions dominate the fixed cost of cached statements.
-        let active_txn_id = self.active_txn_id();
-
         // Try to get from cache
         if let Some(cached) = self.query_cache.get(sql) {
             // Validate parameter count if query has parameters
@@ -416,6 +411,19 @@ impl Executor {
                     )));
                 }
             }
+
+            // INSERT handles the active transaction itself; dispatch before
+            // the txn-state capture so the hot prepared-INSERT path takes
+            // the transaction mutex only once.
+            if let Statement::Insert(stmt) = cached.statement.as_ref() {
+                return self.execute_insert_with_compiled_cache(stmt, ctx, &cached.compiled);
+            }
+
+            // Capture transaction state once for the rest of the statement:
+            // the probe battery and the ctx txn-id injection both need it,
+            // and repeated mutex acquisitions dominate the fixed cost of
+            // cached statements.
+            let active_txn_id = self.active_txn_id();
 
             if let Some(result) = self.try_compiled_fast_paths(
                 cached.statement.as_ref(),
@@ -451,6 +459,12 @@ impl Executor {
                 .query_cache
                 .put(sql, stmt_arc.clone(), has_params, param_count);
 
+            if let Statement::Insert(stmt) = stmt_arc.as_ref() {
+                return self.execute_insert_with_compiled_cache(stmt, ctx, &cached_plan.compiled);
+            }
+
+            let active_txn_id = self.active_txn_id();
+
             if let Some(result) = self.try_compiled_fast_paths(
                 stmt_arc.as_ref(),
                 ctx,
@@ -483,11 +497,11 @@ impl Executor {
     }
 
     /// Run the compiled fast-path battery for a single cached statement.
+    /// Callers dispatch INSERT before calling this (its compiled path
+    /// handles the active transaction itself).
     ///
     /// `in_txn` gates the SELECT/UPDATE/DELETE probes: they read committed
     /// state only, so inside an explicit transaction they must not fire.
-    /// INSERT is exempt; its compiled path handles the active transaction
-    /// itself.
     #[inline]
     fn try_compiled_fast_paths(
         &self,
@@ -511,10 +525,6 @@ impl Executor {
             }
             Statement::Delete(stmt) if !in_txn => {
                 self.try_fast_pk_delete_compiled(stmt, ctx, compiled)
-            }
-            // INSERT: Use compiled cache to avoid recomputing schema metadata
-            Statement::Insert(stmt) => {
-                Some(self.execute_insert_with_compiled_cache(stmt, ctx, compiled))
             }
             _ => None,
         }
@@ -753,6 +763,12 @@ impl Executor {
                     plan.param_count, provided
                 )));
             }
+        }
+
+        // INSERT handles the active transaction itself; dispatch before the
+        // txn-state capture so prepared INSERT takes the mutex only once.
+        if let Statement::Insert(stmt) = plan.statement.as_ref() {
+            return self.execute_insert_with_compiled_cache(stmt, ctx, &plan.compiled);
         }
 
         let active_txn_id = self.active_txn_id();

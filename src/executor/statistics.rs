@@ -92,6 +92,9 @@ impl Executor {
             // and stats_cache write lock
             if success {
                 self.get_query_planner().invalidate_stats_cache(table_name);
+                // Other handles (Database::clone) have their own planners;
+                // the engine-wide epoch makes their cached verdicts stale.
+                self.engine.bump_stats_epoch();
             }
         }
 
