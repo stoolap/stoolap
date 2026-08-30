@@ -1711,8 +1711,8 @@ impl QueryResult for ProjectedResult {
 pub struct ScannerResult {
     /// The underlying scanner
     scanner: Box<dyn crate::storage::traits::Scanner>,
-    /// Column names
-    columns: Vec<String>,
+    /// Column names (shared with the schema cache, not cloned per statement)
+    columns: CompactArc<Vec<String>>,
     /// Current row (cloned from scanner since scanner.row() returns a reference)
     current_row: Row,
     /// Whether we have a valid current row
@@ -1721,7 +1721,10 @@ pub struct ScannerResult {
 
 impl ScannerResult {
     /// Create a new scanner result
-    pub fn new(scanner: Box<dyn crate::storage::traits::Scanner>, columns: Vec<String>) -> Self {
+    pub fn new(
+        scanner: Box<dyn crate::storage::traits::Scanner>,
+        columns: CompactArc<Vec<String>>,
+    ) -> Self {
         Self {
             scanner,
             columns,

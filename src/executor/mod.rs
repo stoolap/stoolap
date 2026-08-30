@@ -399,6 +399,11 @@ impl Executor {
     /// If found, it uses the cached AST. Otherwise, it parses the query
     /// and caches the result for future use.
     fn execute_cached(&self, sql: &str, ctx: &ExecutionContext) -> Result<Box<dyn QueryResult>> {
+        // Capture transaction state once for the whole statement: the probe
+        // battery and the ctx txn-id injection both need it, and repeated
+        // mutex acquisitions dominate the fixed cost of cached statements.
+        let active_txn_id = self.active_txn_id();
+
         // Try to get from cache
         if let Some(cached) = self.query_cache.get(sql) {
             // Validate parameter count if query has parameters
@@ -412,50 +417,22 @@ impl Executor {
                 }
             }
 
-            // Try compiled fast paths based on statement type
-            match cached.statement.as_ref() {
-                Statement::Select(stmt) => {
-                    // Try PK lookup fast path first
-                    if let Some(result) =
-                        self.try_fast_pk_lookup_compiled(stmt, ctx, &cached.compiled)
-                    {
-                        return result;
-                    }
-                    // Try COUNT(DISTINCT col) fast path
-                    if let Some(result) =
-                        self.try_fast_count_distinct_compiled(stmt, &cached.compiled)
-                    {
-                        return result;
-                    }
-                    // Try COUNT(*) fast path
-                    if let Some(result) = self.try_fast_count_star_compiled(stmt, &cached.compiled)
-                    {
-                        return result;
-                    }
-                }
-                Statement::Update(stmt) => {
-                    if let Some(result) =
-                        self.try_fast_pk_update_compiled(stmt, ctx, &cached.compiled)
-                    {
-                        return result;
-                    }
-                }
-                Statement::Delete(stmt) => {
-                    if let Some(result) =
-                        self.try_fast_pk_delete_compiled(stmt, ctx, &cached.compiled)
-                    {
-                        return result;
-                    }
-                }
-                // INSERT: Use compiled cache to avoid recomputing schema metadata
-                Statement::Insert(stmt) => {
-                    return self.execute_insert_with_compiled_cache(stmt, ctx, &cached.compiled);
-                }
-                _ => {}
+            if let Some(result) = self.try_compiled_fast_paths(
+                cached.statement.as_ref(),
+                ctx,
+                &cached.compiled,
+                active_txn_id.is_some(),
+            ) {
+                return result;
             }
 
             // Execute the cached statement (standard path)
-            return self.execute_statement(&cached.statement, ctx);
+            return self.execute_statement_inner(
+                &cached.statement,
+                ctx,
+                active_txn_id,
+                Some(&cached.classification),
+            );
         }
 
         // Parse the query
@@ -474,58 +451,73 @@ impl Executor {
                 .query_cache
                 .put(sql, stmt_arc.clone(), has_params, param_count);
 
-            // Try compiled fast paths based on statement type
-            match stmt_arc.as_ref() {
-                Statement::Select(select) => {
-                    // Try PK lookup fast path first
-                    if let Some(result) =
-                        self.try_fast_pk_lookup_compiled(select, ctx, &cached_plan.compiled)
-                    {
-                        return result;
-                    }
-                    // Try COUNT(DISTINCT col) fast path
-                    if let Some(result) =
-                        self.try_fast_count_distinct_compiled(select, &cached_plan.compiled)
-                    {
-                        return result;
-                    }
-                    // Try COUNT(*) fast path
-                    if let Some(result) =
-                        self.try_fast_count_star_compiled(select, &cached_plan.compiled)
-                    {
-                        return result;
-                    }
-                }
-                Statement::Update(update) => {
-                    if let Some(result) =
-                        self.try_fast_pk_update_compiled(update, ctx, &cached_plan.compiled)
-                    {
-                        return result;
-                    }
-                }
-                Statement::Delete(delete) => {
-                    if let Some(result) =
-                        self.try_fast_pk_delete_compiled(delete, ctx, &cached_plan.compiled)
-                    {
-                        return result;
-                    }
-                }
-                // INSERT: Use compiled cache to avoid recomputing schema metadata
-                Statement::Insert(insert) => {
-                    return self.execute_insert_with_compiled_cache(
-                        insert,
-                        ctx,
-                        &cached_plan.compiled,
-                    );
-                }
-                _ => {}
+            if let Some(result) = self.try_compiled_fast_paths(
+                stmt_arc.as_ref(),
+                ctx,
+                &cached_plan.compiled,
+                active_txn_id.is_some(),
+            ) {
+                return result;
             }
 
             // Execute directly from the Arc (no clone needed)
-            return self.execute_statement(&stmt_arc, ctx);
+            return self.execute_statement_inner(
+                &stmt_arc,
+                ctx,
+                active_txn_id,
+                Some(&cached_plan.classification),
+            );
         }
 
         self.execute_program_with_context(&program, ctx)
+    }
+
+    /// Current explicit-transaction id, if one is active.
+    #[inline]
+    fn active_txn_id(&self) -> Option<i64> {
+        self.active_transaction
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|t| t.transaction.id())
+    }
+
+    /// Run the compiled fast-path battery for a single cached statement.
+    ///
+    /// `in_txn` gates the SELECT/UPDATE/DELETE probes: they read committed
+    /// state only, so inside an explicit transaction they must not fire.
+    /// INSERT is exempt; its compiled path handles the active transaction
+    /// itself.
+    #[inline]
+    fn try_compiled_fast_paths(
+        &self,
+        statement: &Statement,
+        ctx: &ExecutionContext,
+        compiled: &Arc<std::sync::RwLock<query_cache::CompiledExecution>>,
+        in_txn: bool,
+    ) -> Option<Result<Box<dyn QueryResult>>> {
+        match statement {
+            Statement::Select(stmt) if !in_txn => {
+                if let Some(result) = self.try_fast_pk_lookup_compiled(stmt, ctx, compiled) {
+                    return Some(result);
+                }
+                if let Some(result) = self.try_fast_count_distinct_compiled(stmt, compiled) {
+                    return Some(result);
+                }
+                self.try_fast_count_star_compiled(stmt, compiled)
+            }
+            Statement::Update(stmt) if !in_txn => {
+                self.try_fast_pk_update_compiled(stmt, ctx, compiled)
+            }
+            Statement::Delete(stmt) if !in_txn => {
+                self.try_fast_pk_delete_compiled(stmt, ctx, compiled)
+            }
+            // INSERT: Use compiled cache to avoid recomputing schema metadata
+            Statement::Insert(stmt) => {
+                Some(self.execute_insert_with_compiled_cache(stmt, ctx, compiled))
+            }
+            _ => None,
+        }
     }
 
     /// Get the query cache
@@ -596,65 +588,86 @@ impl Executor {
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        self.execute_statement_inner(statement, ctx, self.active_txn_id(), None)
+    }
+
+    /// Execute a single statement with pre-captured transaction state.
+    ///
+    /// `plan_slots` is Some for statements coming through the query cache:
+    /// it carries the plan's classification slot, and doubles as the
+    /// "compiled probe battery already ran" signal (the battery ran or was
+    /// skipped for an explicit transaction, where the uncompiled probe
+    /// would bail too).
+    fn execute_statement_inner(
+        &self,
+        statement: &Statement,
+        ctx: &ExecutionContext,
+        active_txn_id: Option<i64>,
+        plan_classification: Option<
+            &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
+        >,
+    ) -> Result<Box<dyn QueryResult>> {
         // If there's an active transaction, inject the transaction ID into the context
         // This enables CURRENT_TRANSACTION_ID() function to return the correct value
-        let ctx = {
-            let active_tx = self.active_transaction.lock().unwrap();
-            if let Some(ref tx_state) = *active_tx {
-                let txn_id = tx_state.transaction.id();
-                ctx.with_transaction_id(txn_id as u64)
-            } else {
-                ctx.clone()
+        let ctx_with_txn;
+        let ctx = match active_txn_id {
+            Some(txn_id) => {
+                ctx_with_txn = ctx.with_transaction_id(txn_id as u64);
+                &ctx_with_txn
             }
+            None => ctx,
         };
 
         match statement {
             // DDL statements
-            Statement::CreateTable(stmt) => self.execute_create_table(stmt, &ctx),
-            Statement::DropTable(stmt) => self.execute_drop_table(stmt, &ctx),
-            Statement::CreateIndex(stmt) => self.execute_create_index(stmt, &ctx),
-            Statement::DropIndex(stmt) => self.execute_drop_index(stmt, &ctx),
-            Statement::AlterTable(stmt) => self.execute_alter_table(stmt, &ctx),
-            Statement::CreateView(stmt) => self.execute_create_view(stmt, &ctx),
-            Statement::DropView(stmt) => self.execute_drop_view(stmt, &ctx),
+            Statement::CreateTable(stmt) => self.execute_create_table(stmt, ctx),
+            Statement::DropTable(stmt) => self.execute_drop_table(stmt, ctx),
+            Statement::CreateIndex(stmt) => self.execute_create_index(stmt, ctx),
+            Statement::DropIndex(stmt) => self.execute_drop_index(stmt, ctx),
+            Statement::AlterTable(stmt) => self.execute_alter_table(stmt, ctx),
+            Statement::CreateView(stmt) => self.execute_create_view(stmt, ctx),
+            Statement::DropView(stmt) => self.execute_drop_view(stmt, ctx),
 
             // DML statements
-            Statement::Insert(stmt) => self.execute_insert(stmt, &ctx),
-            Statement::Update(stmt) => self.execute_update(stmt, &ctx),
-            Statement::Delete(stmt) => self.execute_delete(stmt, &ctx),
-            Statement::Truncate(stmt) => self.execute_truncate(stmt, &ctx),
+            Statement::Insert(stmt) => self.execute_insert(stmt, ctx),
+            Statement::Update(stmt) => self.execute_update(stmt, ctx),
+            Statement::Delete(stmt) => self.execute_delete(stmt, ctx),
+            Statement::Truncate(stmt) => self.execute_truncate(stmt, ctx),
 
             // Query statements - try fast-path first for simple PK lookups
             Statement::Select(stmt) => {
-                // Fast-path for simple PK lookups (bypasses full planner)
-                if let Some(result) = self.try_fast_pk_lookup(stmt, &ctx) {
-                    return result;
+                // Fast-path for simple PK lookups (bypasses full planner);
+                // cached plans already ran the compiled probe battery.
+                if plan_classification.is_none() {
+                    if let Some(result) = self.try_fast_pk_lookup(stmt, ctx) {
+                        return result;
+                    }
                 }
                 // Fall back to full query execution
-                self.execute_select(stmt, &ctx)
+                self.execute_select_with_plan(stmt, ctx, plan_classification)
             }
 
             // Transaction control
-            Statement::Begin(stmt) => self.execute_begin(stmt, &ctx),
-            Statement::Commit(stmt) => self.execute_commit_stmt(stmt, &ctx),
-            Statement::Rollback(stmt) => self.execute_rollback_stmt(stmt, &ctx),
-            Statement::Savepoint(stmt) => self.execute_savepoint(stmt, &ctx),
-            Statement::ReleaseSavepoint(stmt) => self.execute_release_savepoint(stmt, &ctx),
+            Statement::Begin(stmt) => self.execute_begin(stmt, ctx),
+            Statement::Commit(stmt) => self.execute_commit_stmt(stmt, ctx),
+            Statement::Rollback(stmt) => self.execute_rollback_stmt(stmt, ctx),
+            Statement::Savepoint(stmt) => self.execute_savepoint(stmt, ctx),
+            Statement::ReleaseSavepoint(stmt) => self.execute_release_savepoint(stmt, ctx),
 
             // Utility statements
-            Statement::Set(stmt) => self.execute_set(stmt, &ctx),
-            Statement::ShowTables(stmt) => self.execute_show_tables(stmt, &ctx),
-            Statement::ShowViews(stmt) => self.execute_show_views(stmt, &ctx),
-            Statement::ShowCreateTable(stmt) => self.execute_show_create_table(stmt, &ctx),
-            Statement::ShowCreateView(stmt) => self.execute_show_create_view(stmt, &ctx),
-            Statement::ShowIndexes(stmt) => self.execute_show_indexes(stmt, &ctx),
-            Statement::Describe(stmt) => self.execute_describe(stmt, &ctx),
-            Statement::Pragma(stmt) => self.execute_pragma(stmt, &ctx),
-            Statement::Expression(stmt) => self.execute_expression_stmt(stmt, &ctx),
-            Statement::Explain(stmt) => self.execute_explain(stmt, &ctx),
-            Statement::Analyze(stmt) => self.execute_analyze(stmt, &ctx),
-            Statement::Vacuum(stmt) => self.execute_vacuum(stmt, &ctx),
-            Statement::Copy(stmt) => self.execute_copy(stmt, &ctx),
+            Statement::Set(stmt) => self.execute_set(stmt, ctx),
+            Statement::ShowTables(stmt) => self.execute_show_tables(stmt, ctx),
+            Statement::ShowViews(stmt) => self.execute_show_views(stmt, ctx),
+            Statement::ShowCreateTable(stmt) => self.execute_show_create_table(stmt, ctx),
+            Statement::ShowCreateView(stmt) => self.execute_show_create_view(stmt, ctx),
+            Statement::ShowIndexes(stmt) => self.execute_show_indexes(stmt, ctx),
+            Statement::Describe(stmt) => self.execute_describe(stmt, ctx),
+            Statement::Pragma(stmt) => self.execute_pragma(stmt, ctx),
+            Statement::Expression(stmt) => self.execute_expression_stmt(stmt, ctx),
+            Statement::Explain(stmt) => self.execute_explain(stmt, ctx),
+            Statement::Analyze(stmt) => self.execute_analyze(stmt, ctx),
+            Statement::Vacuum(stmt) => self.execute_vacuum(stmt, ctx),
+            Statement::Copy(stmt) => self.execute_copy(stmt, ctx),
         }
     }
 
@@ -742,36 +755,22 @@ impl Executor {
             }
         }
 
-        // Try compiled fast paths based on statement type
-        match plan.statement.as_ref() {
-            Statement::Select(stmt) => {
-                if let Some(result) = self.try_fast_pk_lookup_compiled(stmt, ctx, &plan.compiled) {
-                    return result;
-                }
-                if let Some(result) = self.try_fast_count_distinct_compiled(stmt, &plan.compiled) {
-                    return result;
-                }
-                if let Some(result) = self.try_fast_count_star_compiled(stmt, &plan.compiled) {
-                    return result;
-                }
-            }
-            Statement::Update(stmt) => {
-                if let Some(result) = self.try_fast_pk_update_compiled(stmt, ctx, &plan.compiled) {
-                    return result;
-                }
-            }
-            Statement::Delete(stmt) => {
-                if let Some(result) = self.try_fast_pk_delete_compiled(stmt, ctx, &plan.compiled) {
-                    return result;
-                }
-            }
-            Statement::Insert(stmt) => {
-                return self.execute_insert_with_compiled_cache(stmt, ctx, &plan.compiled);
-            }
-            _ => {}
+        let active_txn_id = self.active_txn_id();
+        if let Some(result) = self.try_compiled_fast_paths(
+            plan.statement.as_ref(),
+            ctx,
+            &plan.compiled,
+            active_txn_id.is_some(),
+        ) {
+            return result;
         }
 
-        self.execute_statement(&plan.statement, ctx)
+        self.execute_statement_inner(
+            &plan.statement,
+            ctx,
+            active_txn_id,
+            Some(&plan.classification),
+        )
     }
 }
 

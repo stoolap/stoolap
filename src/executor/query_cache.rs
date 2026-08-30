@@ -47,6 +47,8 @@ use crate::common::CompactArc;
 use crate::core::Schema;
 use crate::parser::ast::Statement;
 
+use super::query_classification::QueryClassification;
+
 /// Convert to lowercase without allocation if already lowercase.
 #[inline]
 fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
@@ -225,6 +227,8 @@ pub struct CachedPlanRef {
     pub param_count: usize,
     /// Shared reference to compiled execution state (lazily populated)
     pub compiled: Arc<RwLock<CompiledExecution>>,
+    /// Classification of the SELECT, resolved once per plan (lazily populated)
+    pub classification: Arc<std::sync::OnceLock<Arc<QueryClassification>>>,
 }
 
 /// Represents a parsed and prepared statement stored in the cache
@@ -246,6 +250,8 @@ pub struct CachedQueryPlan {
     pub normalized_query: SmartString,
     /// Compiled execution state (lazily populated on first execution)
     pub compiled: Arc<RwLock<CompiledExecution>>,
+    /// Classification of the SELECT, resolved once per plan (lazily populated)
+    pub classification: Arc<std::sync::OnceLock<Arc<QueryClassification>>>,
 }
 
 impl CachedQueryPlan {
@@ -266,6 +272,7 @@ impl CachedQueryPlan {
             param_count,
             normalized_query,
             compiled: Arc::new(RwLock::new(CompiledExecution::Unknown)),
+            classification: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
@@ -319,6 +326,7 @@ impl QueryCache {
             has_params: plan.has_params,
             param_count: plan.param_count,
             compiled: plan.compiled.clone(), // Share compiled state
+            classification: plan.classification.clone(),
         })
     }
 
@@ -343,6 +351,7 @@ impl QueryCache {
 
         // Create the compiled state upfront - shared between stored plan and returned ref
         let compiled = Arc::new(RwLock::new(CompiledExecution::Unknown));
+        let classification = Arc::new(std::sync::OnceLock::new());
 
         if let Ok(mut plans) = self.plans.write() {
             // Check if we need to prune the cache
@@ -364,6 +373,7 @@ impl QueryCache {
                     param_count,
                     normalized_query: normalized_key, // moved, not cloned
                     compiled: compiled.clone(),       // Arc clone - cheap
+                    classification: classification.clone(),
                 },
             );
         }
@@ -374,6 +384,7 @@ impl QueryCache {
             has_params,
             param_count,
             compiled,
+            classification,
         }
     }
 

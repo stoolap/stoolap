@@ -6572,16 +6572,8 @@ impl Executor {
         stmt: &SelectStatement,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Quick reject: must not be in an explicit transaction (for simplicity)
-        {
-            let active_tx = match self.active_transaction.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => return None,
-            };
-            if active_tx.is_some() {
-                return None;
-            }
-        }
+        // Caller (try_compiled_fast_paths) guarantees no explicit transaction
+        // is active; this path reads committed state only.
 
         // Try read lock first - check if already compiled
         {
@@ -6850,16 +6842,8 @@ impl Executor {
         stmt: &SelectStatement,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Quick reject: must not be in an explicit transaction (for simplicity)
-        {
-            let active_tx = match self.active_transaction.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => return None,
-            };
-            if active_tx.is_some() {
-                return None;
-            }
-        }
+        // Caller (try_compiled_fast_paths) guarantees no explicit transaction
+        // is active; this path reads committed state only.
 
         // Try read lock first - check if already compiled
         {

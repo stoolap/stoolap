@@ -49,16 +49,8 @@ impl Executor {
         ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Quick reject: explicit transaction (use try_lock for fast rejection)
-        {
-            let active_tx = match self.active_transaction.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => return None, // Lock contention - fall back to normal path
-            };
-            if active_tx.is_some() {
-                return None;
-            }
-        }
+        // Caller (try_compiled_fast_paths) guarantees no explicit transaction
+        // is active; this path reads and writes committed state only.
 
         // Try read lock first - check if already compiled
         {
@@ -98,16 +90,8 @@ impl Executor {
         ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
-        // Quick reject: explicit transaction (use try_lock for fast rejection)
-        {
-            let active_tx = match self.active_transaction.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => return None, // Lock contention - fall back to normal path
-            };
-            if active_tx.is_some() {
-                return None;
-            }
-        }
+        // Caller (try_compiled_fast_paths) guarantees no explicit transaction
+        // is active; this path reads and writes committed state only.
 
         // Try read lock first - check if already compiled
         {
