@@ -97,7 +97,7 @@ pub struct CompiledUpdateColumn {
 }
 
 /// How to get the update value
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum UpdateValueSource {
     /// Value is a literal
     Literal(crate::core::Value),
@@ -105,6 +105,22 @@ pub enum UpdateValueSource {
     Parameter(usize),
     /// Value comes from a named parameter (e.g., :new_name)
     NamedParameter(SmartString),
+    /// Value is a row expression (e.g. SET n = n + 1), compiled once per
+    /// plan and executed per update against the current row
+    Expression(crate::executor::expression::SharedProgram),
+}
+
+impl std::fmt::Debug for UpdateValueSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpdateValueSource::Literal(v) => f.debug_tuple("Literal").field(v).finish(),
+            UpdateValueSource::Parameter(i) => f.debug_tuple("Parameter").field(i).finish(),
+            UpdateValueSource::NamedParameter(n) => {
+                f.debug_tuple("NamedParameter").field(n).finish()
+            }
+            UpdateValueSource::Expression(_) => f.write_str("Expression(<compiled>)"),
+        }
+    }
 }
 
 /// Pre-compiled state for PK-based UPDATE (UPDATE table SET col = val WHERE pk = value)
