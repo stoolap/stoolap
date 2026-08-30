@@ -1968,9 +1968,18 @@ mod tests {
         assert_eq!(cmp_i64_f64(-5, -5.5), Some(Greater));
         // i64::MAX as f64 rounds to 2^63; the naive cast comparison calls
         // them equal, the exact comparison must not
-        assert_eq!(cmp_i64_f64(i64::MAX, 9_223_372_036_854_775_808.0), Some(Less));
-        assert_eq!(cmp_i64_f64(i64::MAX, 9_223_372_036_854_774_784.0), Some(Greater));
-        assert_eq!(cmp_i64_f64(i64::MIN, -9_223_372_036_854_775_808.0), Some(Equal));
+        assert_eq!(
+            cmp_i64_f64(i64::MAX, 9_223_372_036_854_775_808.0),
+            Some(Less)
+        );
+        assert_eq!(
+            cmp_i64_f64(i64::MAX, 9_223_372_036_854_774_784.0),
+            Some(Greater)
+        );
+        assert_eq!(
+            cmp_i64_f64(i64::MIN, -9_223_372_036_854_775_808.0),
+            Some(Equal)
+        );
         // Out-of-range floats
         assert_eq!(cmp_i64_f64(i64::MAX, 1e19), Some(Less));
         assert_eq!(cmp_i64_f64(i64::MIN, -1e19), Some(Greater));
@@ -1978,7 +1987,10 @@ mod tests {
         assert_eq!(cmp_i64_f64(0, f64::NEG_INFINITY), Some(Greater));
         assert_eq!(cmp_i64_f64(0, f64::NAN), None);
         // PartialEq consequences
-        assert_ne!(Value::Integer(i64::MAX), Value::Float(9_223_372_036_854_775_808.0));
+        assert_ne!(
+            Value::Integer(i64::MAX),
+            Value::Float(9_223_372_036_854_775_808.0)
+        );
         assert_eq!(Value::Integer(5), Value::Float(5.0));
     }
 }
