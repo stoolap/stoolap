@@ -718,10 +718,9 @@ impl CompiledFilter {
                     .map(|c| c.data_type == crate::core::DataType::Float)
                     .unwrap_or(false);
                 if col_is_float {
-                    let f = i as f64;
-                    if !(f as i64 == i && i.abs() < (1_i64 << 53)) {
+                    let Some(f) = crate::core::value::lossless_f64_from_i64(i) else {
                         return CompiledFilter::Dynamic(expr.clone_box());
-                    }
+                    };
                     return match op {
                         Operator::Eq => CompiledFilter::FloatEq { col_idx, value: f },
                         Operator::Ne => CompiledFilter::FloatNe { col_idx, value: f },

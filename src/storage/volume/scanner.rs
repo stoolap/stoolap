@@ -483,7 +483,7 @@ impl VolumeScanner {
                 // the pre-filter must never reject rows the full filter
                 // accepts
                 (Value::Integer(v), crate::core::DataType::Float)
-                    if (*v as f64) as i64 == *v && v.abs() < (1_i64 << 53) =>
+                    if crate::core::value::lossless_f64_from_i64(*v).is_some() =>
                 {
                     TypedTarget::Float64(*v as f64)
                 }

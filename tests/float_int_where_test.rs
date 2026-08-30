@@ -318,3 +318,29 @@ fn between_mixed_bounds_are_exact_at_extremes() {
         1
     );
 }
+
+#[test]
+fn i64_min_against_float_column_does_not_panic() {
+    let db = Database::open("memory://float_int_min").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, f FLOAT)", ())
+        .unwrap();
+    // -2^63 is exactly representable as f64
+    db.execute("INSERT INTO t VALUES (1, -9223372036854775808.0)", ())
+        .unwrap();
+
+    let stmt = db.prepare("SELECT * FROM t WHERE f = $1").unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            stmt.query((i64::MIN,))
+                .unwrap()
+                .collect_vec()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    assert_eq!(
+        row_count(&db, "SELECT * FROM t WHERE f <= -9223372036854775807"),
+        1
+    );
+}

@@ -109,11 +109,9 @@ impl<'a> PushdownContext<'a> {
             // 2^53, so a large integer constant against a FLOAT column
             // stays an Integer and compares exactly downstream.
             (Some(crate::core::DataType::Float), Value::Integer(i)) => {
-                let f = *i as f64;
-                if f as i64 == *i && i.abs() < (1_i64 << 53) {
-                    Value::Float(f)
-                } else {
-                    value
+                match crate::core::value::lossless_f64_from_i64(*i) {
+                    Some(f) => Value::Float(f),
+                    None => value,
                 }
             }
             (Some(col_type), _) => value.into_coerce_to_type(col_type),

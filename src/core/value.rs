@@ -953,6 +953,15 @@ pub fn cmp_i64_f64(i: i64, f: f64) -> Option<std::cmp::Ordering> {
     })
 }
 
+/// The exact f64 for an i64, when one exists. Overflow-safe at
+/// i64::MIN (which IS exactly representable; an `i.abs()` range check
+/// both panics there and wrongly rejects it).
+#[inline]
+pub fn lossless_f64_from_i64(i: i64) -> Option<f64> {
+    let f = i as f64;
+    (cmp_i64_f64(i, f) == Some(std::cmp::Ordering::Equal)).then_some(f)
+}
+
 /// Operator wrappers over `cmp_i64_f64`. NaN compares false except `!=`,
 /// matching IEEE semantics of the casts they replace.
 #[inline]
