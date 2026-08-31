@@ -119,3 +119,130 @@ fn join_order_by_is_sorted_and_complete() {
     let xs: Vec<i64> = top.iter().map(|r| r.get(0).unwrap()).collect();
     assert_eq!(xs, vec![299, 298, 297, 296, 295]);
 }
+
+#[test]
+fn join_order_by_offset_applies_once() {
+    let db = Database::open("memory://topk_join_offset").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..30i64 {
+        tx.execute("INSERT INTO a VALUES ($1, $2)", (i, i)).unwrap();
+        tx.execute("INSERT INTO b VALUES ($1, $2)", (i, i)).unwrap();
+    }
+    tx.commit().unwrap();
+
+    // INL-eligible: PK join key, no WHERE. OFFSET must apply exactly once.
+    let rows = db
+        .query(
+            "SELECT a.x FROM a JOIN b ON a.id = b.id ORDER BY a.x ASC LIMIT 10 OFFSET 5",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    let xs: Vec<i64> = rows.iter().map(|r| r.get(0).unwrap()).collect();
+    assert_eq!(xs, (5..15).collect::<Vec<i64>>());
+}
+
+#[test]
+fn complex_order_by_limit_matches_full_sort() {
+    let db = Database::open("memory://topk_complex").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..400i64 {
+        tx.execute("INSERT INTO t VALUES ($1, $2)", (i, i)).unwrap();
+    }
+    tx.commit().unwrap();
+
+    // Expression ORDER BY routes through the complex-sort path (the
+    // select_nth top-K hook)
+    let rows = db
+        .query(
+            "SELECT id FROM t ORDER BY v % 7 ASC, id DESC LIMIT 5 OFFSET 3",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    let expected = db
+        .query("SELECT id FROM t ORDER BY v % 7 ASC, id DESC", ())
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    assert_eq!(rows.len(), 5);
+    for (i, r) in rows.iter().enumerate() {
+        let got: i64 = r.get(0).unwrap();
+        let want: i64 = expected[i + 3].get(0).unwrap();
+        assert_eq!(got, want, "row {i} diverges from full sort");
+    }
+}
+
+#[test]
+fn join_limit_offset_without_order_by_returns_full_count() {
+    let db = Database::open("memory://topk_join_offset_noorder").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..30i64 {
+        tx.execute("INSERT INTO a VALUES ($1, $2)", (i, i)).unwrap();
+        tx.execute("INSERT INTO b VALUES ($1, $2)", (i, i)).unwrap();
+    }
+    tx.commit().unwrap();
+
+    // Early-termination pushdown must collect OFFSET extra rows.
+    // PK join key routes to index nested loop
+    let rows = db
+        .query(
+            "SELECT a.x FROM a JOIN b ON a.id = b.id LIMIT 10 OFFSET 5",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    assert_eq!(rows.len(), 10, "INL join undercounts with OFFSET");
+
+    // Non-indexed join key routes to the hash/streaming join executor
+    let rows = db
+        .query(
+            "SELECT a.x FROM a JOIN b ON a.x = b.y LIMIT 10 OFFSET 5",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    assert_eq!(rows.len(), 10, "hash join undercounts with OFFSET");
+}
+
+#[test]
+fn join_order_by_alias_sorts_correctly() {
+    let db = Database::open("memory://topk_join_alias").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..30i64 {
+        tx.execute("INSERT INTO a VALUES ($1, $2)", (i, i)).unwrap();
+        tx.execute("INSERT INTO b VALUES ($1, $2)", (i, i)).unwrap();
+    }
+    tx.commit().unwrap();
+
+    // ORDER BY references a SELECT alias: the join-local sort cannot
+    // resolve it, so ordering must fall through to the standard path
+    let rows = db
+        .query(
+            "SELECT a.x AS z FROM a JOIN b ON a.id = b.id ORDER BY z DESC LIMIT 10 OFFSET 5",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    let zs: Vec<i64> = rows.iter().map(|r| r.get(0).unwrap()).collect();
+    assert_eq!(zs, (15..25).rev().collect::<Vec<i64>>());
+}

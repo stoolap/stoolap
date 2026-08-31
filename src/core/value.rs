@@ -1343,22 +1343,25 @@ thread_local! {
     /// comparing a timestamp column to a string constant otherwise runs a
     /// full chrono parse of the same constant for every row. Failed parses
     /// are cached too (the fallback string compare also repeats per row).
-    static TS_COMPARE_PARSE_CACHE: std::cell::RefCell<Vec<TsParseEntry>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// Two slots cover the constant shapes (equality, range bounds) while
+    /// keeping the miss cost for per-row text data at two comparisons.
+    static TS_COMPARE_PARSE_CACHE: std::cell::RefCell<([Option<TsParseEntry>; 2], usize)> =
+        const { std::cell::RefCell::new(([None, None], 0)) };
 }
 
 /// `parse_timestamp` with a per-thread memo, for per-row comparison paths
 fn parse_timestamp_for_compare(s: &str) -> Option<DateTime<Utc>> {
     TS_COMPARE_PARSE_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some((_, parsed)) = cache.iter().find(|(k, _)| &**k == s) {
-            return *parsed;
+        let (slots, next) = &mut *cache;
+        for entry in slots.iter().flatten() {
+            if &*entry.0 == s {
+                return entry.1;
+            }
         }
         let parsed = parse_timestamp(s).ok();
-        if cache.len() >= 8 {
-            cache.remove(0);
-        }
-        cache.push((s.into(), parsed));
+        slots[*next] = Some((s.into(), parsed));
+        *next = (*next + 1) % 2;
         parsed
     })
 }
