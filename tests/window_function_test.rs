@@ -1004,3 +1004,33 @@ fn window_constant_args_on_empty_table() {
         assert_eq!(rows.len(), 0, "{sql}");
     }
 }
+
+#[test]
+fn nth_value_arg_not_evaluated_for_empty_frames() {
+    // The n argument must only evaluate when the frame is non-empty:
+    // a single-row partition with a 1-FOLLOWING frame has an empty
+    // frame, so an invalid argument stays unevaluated and the result
+    // is NULL
+    let db = stoolap::Database::open("memory://win_nth_lazy").unwrap();
+    db.execute(
+        "CREATE TABLE one_t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO one_t VALUES (1, 10, 100)", ())
+        .unwrap();
+    let rows = db
+        .query(
+            "SELECT NTH_VALUE(v, grp) OVER (ORDER BY id ROWS BETWEEN 1 FOLLOWING AND 1 FOLLOWING) FROM one_t",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let val: Option<i64> = rows[0].get(0).unwrap();
+    assert_eq!(
+        val, None,
+        "empty frame must yield NULL without evaluating n"
+    );
+}

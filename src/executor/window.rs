@@ -41,11 +41,73 @@ use crate::core::value::NULL_VALUE;
 
 /// Stack constant for COUNT(*) accumulation by reference
 const COUNT_ONE: Value = Value::Integer(1);
+
+/// A window-function argument that cannot reference row columns:
+/// compiled once, evaluated once when deterministic and per call when
+/// volatile (RANDOM and friends keep their per-row behavior)
+struct ConstArg {
+    eval: ExpressionEval,
+    deterministic: bool,
+    cached: Option<Value>,
+}
+
+impl ConstArg {
+    fn compile(
+        expr: &Expression,
+        registry: &FunctionRegistry,
+        ctx: &ExecutionContext,
+    ) -> Result<Self> {
+        Ok(Self {
+            eval: ExpressionEval::compile(expr, &[])?.with_context(ctx),
+            deterministic: expr_is_deterministic(expr, registry),
+            cached: None,
+        })
+    }
+
+    fn value(&mut self) -> Result<Value> {
+        if self.deterministic {
+            if let Some(v) = &self.cached {
+                return Ok(v.clone());
+            }
+            let v = self.eval.eval_slice(&Row::new())?;
+            self.cached = Some(v.clone());
+            Ok(v)
+        } else {
+            self.eval.eval_slice(&Row::new())
+        }
+    }
+}
+
+/// Conservative determinism check: anything unrecognized counts as
+/// volatile and re-evaluates per row
+fn expr_is_deterministic(expr: &Expression, registry: &FunctionRegistry) -> bool {
+    match expr {
+        Expression::IntegerLiteral(_)
+        | Expression::FloatLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_) => true,
+        Expression::Prefix(prefix) => expr_is_deterministic(&prefix.right, registry),
+        Expression::Infix(infix) => {
+            expr_is_deterministic(&infix.left, registry)
+                && expr_is_deterministic(&infix.right, registry)
+        }
+        Expression::FunctionCall(func) => {
+            registry.is_deterministic(&func.function)
+                && func
+                    .arguments
+                    .iter()
+                    .all(|a| expr_is_deterministic(a, registry))
+        }
+        _ => false,
+    }
+}
 use crate::core::{Error, Result, Row, Value};
 
 /// Type alias for partition keys - stack-allocated for common case (up to 4 columns)
 type PartitionKey = SmallVec<[Value; 4]>;
 
+use crate::functions::registry::FunctionRegistry;
 use crate::functions::WindowFunction;
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
@@ -2027,42 +2089,43 @@ impl Executor {
             return Ok((Vec::new(), row_indices));
         }
 
-        // Hoist constant window-function arguments out of the row loop:
-        // offsets and bucket counts compile against no columns; LEAD/LAG's
-        // default compiles once here and evaluates per row below
+        // Compile constant window-function arguments once; deterministic
+        // ones also evaluate once (memoized) while volatile ones (RANDOM
+        // and friends) re-evaluate per row like the old per-row scheme.
+        // NTH_VALUE's n stays fully lazy behind the frame-emptiness check.
         let is_lead_lag = matches!(wf_info.name.as_str(), "LEAD" | "LAG");
-        let lead_lag_offset = if is_lead_lag && wf_info.arguments.len() > 1 {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) => n as usize,
-                _ => 1,
-            }
+        let mut lead_lag_offset_arg = if is_lead_lag && wf_info.arguments.len() > 1 {
+            Some(ConstArg::compile(
+                &wf_info.arguments[1],
+                &self.function_registry,
+                ctx,
+            )?)
         } else {
-            1
+            None
         };
         let mut lead_lag_default_eval = if is_lead_lag && wf_info.arguments.len() > 2 {
             Some(ExpressionEval::compile(&wf_info.arguments[2], columns)?.with_context(ctx))
         } else {
             None
         };
-        let ntile_buckets = if wf_info.name == "NTILE" && !wf_info.arguments.is_empty() {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[0], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) if n > 0 => n as usize,
-                _ => 1,
-            }
-        } else {
-            1
-        };
-        let nth_value_n = if wf_info.name == "NTH_VALUE" && wf_info.arguments.len() > 1 {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) if n > 0 => Some(n as usize),
-                _ => None,
-            }
+        let mut ntile_arg = if wf_info.name == "NTILE" && !wf_info.arguments.is_empty() {
+            Some(ConstArg::compile(
+                &wf_info.arguments[0],
+                &self.function_registry,
+                ctx,
+            )?)
         } else {
             None
         };
+        let nth_n_expr = if wf_info.name == "NTH_VALUE" && wf_info.arguments.len() > 1 {
+            Some(&wf_info.arguments[1])
+        } else {
+            None
+        };
+        let nth_n_deterministic = nth_n_expr
+            .map(|e| expr_is_deterministic(e, &self.function_registry))
+            .unwrap_or(true);
+        let mut nth_n_memo: Option<Option<usize>> = None;
 
         for (i, &row_idx) in row_indices.iter().enumerate() {
             // Handle special functions
@@ -2071,7 +2134,13 @@ impl Executor {
                 // instead of cloning into partition_values Vec
                 "LEAD" | "LAG" => Self::compute_lead_lag_indexed(
                     wf_info.name == "LEAD",
-                    lead_lag_offset,
+                    match &mut lead_lag_offset_arg {
+                        Some(arg) => match arg.value()? {
+                            Value::Integer(n) => n as usize,
+                            _ => 1,
+                        },
+                        None => 1,
+                    },
                     &mut lead_lag_default_eval,
                     all_rows,
                     &row_indices,
@@ -2079,7 +2148,17 @@ impl Executor {
                     i,
                     &all_rows[row_idx].1,
                 )?,
-                "NTILE" => Self::compute_ntile(ntile_buckets, row_indices.len(), i),
+                "NTILE" => Self::compute_ntile(
+                    match &mut ntile_arg {
+                        Some(arg) => match arg.value()? {
+                            Value::Integer(n) if n > 0 => n as usize,
+                            _ => 1,
+                        },
+                        None => 1,
+                    },
+                    row_indices.len(),
+                    i,
+                ),
                 "RANK" | "DENSE_RANK" => Self::compute_rank_fast(is_rank, &rank_info, i),
                 "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                     // Compute frame bounds for navigation functions
@@ -2108,13 +2187,16 @@ impl Executor {
                             frame_end,
                         )?,
                         "NTH_VALUE" => Self::compute_nth_value_indexed(
-                            nth_value_n,
+                            nth_n_expr,
+                            &mut nth_n_memo,
+                            nth_n_deterministic,
                             all_rows,
                             &row_indices,
                             arg_col_idx,
                             frame_start,
                             frame_end,
-                        ),
+                            ctx,
+                        )?,
                         _ => unreachable!(),
                     }
                 }
@@ -2214,49 +2296,56 @@ impl Executor {
             return Ok(());
         }
 
-        // Hoist constant window-function arguments out of the row loop:
-        // offsets and bucket counts compile against no columns; LEAD/LAG's
-        // default compiles once here and evaluates per row below
+        // Compile constant window-function arguments once; deterministic
+        // ones also evaluate once (memoized) while volatile ones (RANDOM
+        // and friends) re-evaluate per row like the old per-row scheme.
+        // NTH_VALUE's n stays fully lazy behind the frame-emptiness check.
         let is_lead_lag = matches!(wf_info.name.as_str(), "LEAD" | "LAG");
-        let lead_lag_offset = if is_lead_lag && wf_info.arguments.len() > 1 {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) => n as usize,
-                _ => 1,
-            }
+        let mut lead_lag_offset_arg = if is_lead_lag && wf_info.arguments.len() > 1 {
+            Some(ConstArg::compile(
+                &wf_info.arguments[1],
+                &self.function_registry,
+                ctx,
+            )?)
         } else {
-            1
+            None
         };
         let mut lead_lag_default_eval = if is_lead_lag && wf_info.arguments.len() > 2 {
             Some(ExpressionEval::compile(&wf_info.arguments[2], columns)?.with_context(ctx))
         } else {
             None
         };
-        let ntile_buckets = if wf_info.name == "NTILE" && !wf_info.arguments.is_empty() {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[0], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) if n > 0 => n as usize,
-                _ => 1,
-            }
-        } else {
-            1
-        };
-        let nth_value_n = if wf_info.name == "NTH_VALUE" && wf_info.arguments.len() > 1 {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) if n > 0 => Some(n as usize),
-                _ => None,
-            }
+        let mut ntile_arg = if wf_info.name == "NTILE" && !wf_info.arguments.is_empty() {
+            Some(ConstArg::compile(
+                &wf_info.arguments[0],
+                &self.function_registry,
+                ctx,
+            )?)
         } else {
             None
         };
+        let nth_n_expr = if wf_info.name == "NTH_VALUE" && wf_info.arguments.len() > 1 {
+            Some(&wf_info.arguments[1])
+        } else {
+            None
+        };
+        let nth_n_deterministic = nth_n_expr
+            .map(|e| expr_is_deterministic(e, &self.function_registry))
+            .unwrap_or(true);
+        let mut nth_n_memo: Option<Option<usize>> = None;
 
         // Compute and write directly to results array
         for (i, &row_idx) in row_indices.iter().enumerate() {
             let value = match wf_info.name.as_str() {
                 "LEAD" | "LAG" => Self::compute_lead_lag_indexed(
                     wf_info.name == "LEAD",
-                    lead_lag_offset,
+                    match &mut lead_lag_offset_arg {
+                        Some(arg) => match arg.value()? {
+                            Value::Integer(n) => n as usize,
+                            _ => 1,
+                        },
+                        None => 1,
+                    },
                     &mut lead_lag_default_eval,
                     all_rows,
                     &row_indices,
@@ -2264,7 +2353,17 @@ impl Executor {
                     i,
                     &all_rows[row_idx].1,
                 )?,
-                "NTILE" => Self::compute_ntile(ntile_buckets, partition_len, i),
+                "NTILE" => Self::compute_ntile(
+                    match &mut ntile_arg {
+                        Some(arg) => match arg.value()? {
+                            Value::Integer(n) if n > 0 => n as usize,
+                            _ => 1,
+                        },
+                        None => 1,
+                    },
+                    partition_len,
+                    i,
+                ),
                 "RANK" | "DENSE_RANK" => Self::compute_rank_fast(is_rank, &rank_info, i),
                 "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                     let peer_end = if i < peer_group_ends.len() {
@@ -2290,13 +2389,16 @@ impl Executor {
                             frame_end,
                         )?,
                         "NTH_VALUE" => Self::compute_nth_value_indexed(
-                            nth_value_n,
+                            nth_n_expr,
+                            &mut nth_n_memo,
+                            nth_n_deterministic,
                             all_rows,
                             &row_indices,
                             arg_col_idx,
                             frame_start,
                             frame_end,
-                        ),
+                            ctx,
+                        )?,
                         _ => unreachable!(),
                     }
                 }
@@ -2397,49 +2499,56 @@ impl Executor {
             return Ok(());
         }
 
-        // Hoist constant window-function arguments out of the row loop:
-        // offsets and bucket counts compile against no columns; LEAD/LAG's
-        // default compiles once here and evaluates per row below
+        // Compile constant window-function arguments once; deterministic
+        // ones also evaluate once (memoized) while volatile ones (RANDOM
+        // and friends) re-evaluate per row like the old per-row scheme.
+        // NTH_VALUE's n stays fully lazy behind the frame-emptiness check.
         let is_lead_lag = matches!(wf_info.name.as_str(), "LEAD" | "LAG");
-        let lead_lag_offset = if is_lead_lag && wf_info.arguments.len() > 1 {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) => n as usize,
-                _ => 1,
-            }
+        let mut lead_lag_offset_arg = if is_lead_lag && wf_info.arguments.len() > 1 {
+            Some(ConstArg::compile(
+                &wf_info.arguments[1],
+                &self.function_registry,
+                ctx,
+            )?)
         } else {
-            1
+            None
         };
         let mut lead_lag_default_eval = if is_lead_lag && wf_info.arguments.len() > 2 {
             Some(ExpressionEval::compile(&wf_info.arguments[2], columns)?.with_context(ctx))
         } else {
             None
         };
-        let ntile_buckets = if wf_info.name == "NTILE" && !wf_info.arguments.is_empty() {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[0], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) if n > 0 => n as usize,
-                _ => 1,
-            }
-        } else {
-            1
-        };
-        let nth_value_n = if wf_info.name == "NTH_VALUE" && wf_info.arguments.len() > 1 {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) if n > 0 => Some(n as usize),
-                _ => None,
-            }
+        let mut ntile_arg = if wf_info.name == "NTILE" && !wf_info.arguments.is_empty() {
+            Some(ConstArg::compile(
+                &wf_info.arguments[0],
+                &self.function_registry,
+                ctx,
+            )?)
         } else {
             None
         };
+        let nth_n_expr = if wf_info.name == "NTH_VALUE" && wf_info.arguments.len() > 1 {
+            Some(&wf_info.arguments[1])
+        } else {
+            None
+        };
+        let nth_n_deterministic = nth_n_expr
+            .map(|e| expr_is_deterministic(e, &self.function_registry))
+            .unwrap_or(true);
+        let mut nth_n_memo: Option<Option<usize>> = None;
 
         // Compute and write directly using ParallelVec
         for (i, &row_idx) in row_indices.iter().enumerate() {
             let value = match wf_info.name.as_str() {
                 "LEAD" | "LAG" => Self::compute_lead_lag_indexed(
                     wf_info.name == "LEAD",
-                    lead_lag_offset,
+                    match &mut lead_lag_offset_arg {
+                        Some(arg) => match arg.value()? {
+                            Value::Integer(n) => n as usize,
+                            _ => 1,
+                        },
+                        None => 1,
+                    },
                     &mut lead_lag_default_eval,
                     all_rows,
                     &row_indices,
@@ -2447,7 +2556,17 @@ impl Executor {
                     i,
                     &all_rows[row_idx].1,
                 )?,
-                "NTILE" => Self::compute_ntile(ntile_buckets, partition_len, i),
+                "NTILE" => Self::compute_ntile(
+                    match &mut ntile_arg {
+                        Some(arg) => match arg.value()? {
+                            Value::Integer(n) if n > 0 => n as usize,
+                            _ => 1,
+                        },
+                        None => 1,
+                    },
+                    partition_len,
+                    i,
+                ),
                 "RANK" | "DENSE_RANK" => Self::compute_rank_fast(is_rank, &rank_info, i),
                 "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                     let peer_end = if i < peer_group_ends.len() {
@@ -2473,13 +2592,16 @@ impl Executor {
                             frame_end,
                         )?,
                         "NTH_VALUE" => Self::compute_nth_value_indexed(
-                            nth_value_n,
+                            nth_n_expr,
+                            &mut nth_n_memo,
+                            nth_n_deterministic,
                             all_rows,
                             &row_indices,
                             arg_col_idx,
                             frame_start,
                             frame_end,
-                        ),
+                            ctx,
+                        )?,
                         _ => unreachable!(),
                     }
                 }
@@ -2667,32 +2789,60 @@ impl Executor {
         }
     }
 
-    /// Compute NTH_VALUE using index-based access (no cloning); n is
-    /// pre-resolved by the caller (None when absent or not a positive int)
+    /// Compute NTH_VALUE using index-based access (no cloning). The n
+    /// argument resolves only for non-empty frames, exactly like the old
+    /// per-row scheme: deterministic expressions memoize after the first
+    /// resolution, volatile ones re-evaluate per row.
+    #[allow(clippy::too_many_arguments)]
     fn compute_nth_value_indexed(
-        n: Option<usize>,
+        n_expr: Option<&Expression>,
+        n_memo: &mut Option<Option<usize>>,
+        n_deterministic: bool,
         all_rows: &[(i64, Row)],
         sorted_indices: &[usize],
         arg_col_idx: Option<usize>,
         frame_start: usize,
         frame_end: usize,
-    ) -> Value {
+        ctx: &ExecutionContext,
+    ) -> Result<Value> {
         if frame_start >= frame_end {
-            return Value::null_unknown();
+            return Ok(Value::null_unknown());
         }
+        let Some(expr) = n_expr else {
+            return Ok(Value::null_unknown());
+        };
+        let resolve = |expr: &Expression| -> Result<Option<usize>> {
+            let mut eval = ExpressionEval::compile(expr, &[])?.with_context(ctx);
+            Ok(match eval.eval_slice(&Row::new())? {
+                Value::Integer(n) if n > 0 => Some(n as usize),
+                _ => None,
+            })
+        };
+        let n = if n_deterministic {
+            match n_memo {
+                Some(resolved) => *resolved,
+                None => {
+                    let resolved = resolve(expr)?;
+                    *n_memo = Some(resolved);
+                    resolved
+                }
+            }
+        } else {
+            resolve(expr)?
+        };
         let Some(n) = n else {
-            return Value::null_unknown();
+            return Ok(Value::null_unknown());
         };
 
         // n is 1-indexed within the frame
         let frame_len = frame_end - frame_start;
         if n > frame_len {
-            return Value::null_unknown();
+            return Ok(Value::null_unknown());
         }
 
         let pos_in_frame = n - 1;
         let row_idx = sorted_indices[frame_start + pos_in_frame];
-        if let Some(col_idx) = arg_col_idx {
+        Ok(if let Some(col_idx) = arg_col_idx {
             all_rows[row_idx]
                 .1
                 .get(col_idx)
@@ -2700,7 +2850,7 @@ impl Executor {
                 .unwrap_or_else(Value::null_unknown)
         } else {
             Value::null_unknown()
-        }
+        })
     }
 
     /// Compute NTILE function; the bucket count is pre-resolved by the caller
