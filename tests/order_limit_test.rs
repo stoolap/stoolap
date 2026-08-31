@@ -246,3 +246,78 @@ fn join_order_by_alias_sorts_correctly() {
     let zs: Vec<i64> = rows.iter().map(|r| r.get(0).unwrap()).collect();
     assert_eq!(zs, (15..25).rev().collect::<Vec<i64>>());
 }
+
+#[test]
+fn join_order_by_ordinal_resolves_to_column() {
+    let db = Database::open("memory://topk_join_ordinal").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..30i64 {
+        tx.execute("INSERT INTO a VALUES ($1, $2)", (i, i)).unwrap();
+        tx.execute("INSERT INTO b VALUES ($1, $2)", (i, i)).unwrap();
+    }
+    tx.commit().unwrap();
+
+    // ORDER BY 1 is positional: it must resolve to the first output
+    // column, not the constant integer 1
+    let rows = db
+        .query(
+            "SELECT a.x FROM a JOIN b ON a.id = b.id ORDER BY 1 DESC LIMIT 10 OFFSET 5",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    let xs: Vec<i64> = rows.iter().map(|r| r.get(0).unwrap()).collect();
+    assert_eq!(xs, (15..25).rev().collect::<Vec<i64>>());
+}
+
+#[test]
+fn join_order_by_desc_null_placement() {
+    let db = Database::open("memory://topk_join_desc_nulls").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, y INTEGER)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..10i64 {
+        if i < 2 {
+            tx.execute("INSERT INTO a VALUES ($1, NULL)", (i,)).unwrap();
+        } else {
+            tx.execute("INSERT INTO a VALUES ($1, $2)", (i, i)).unwrap();
+        }
+        tx.execute("INSERT INTO b VALUES ($1, $2)", (i, i)).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let fetch = |sql: &str| -> Vec<Option<i64>> {
+        db.query(sql, ())
+            .unwrap()
+            .collect_vec()
+            .unwrap()
+            .iter()
+            .map(|r| r.get(0).unwrap())
+            .collect()
+    };
+
+    // Default DESC places NULLs first (AST contract)
+    let got = fetch("SELECT a.x FROM a JOIN b ON a.id = b.id ORDER BY a.x DESC");
+    let mut expected: Vec<Option<i64>> = vec![None, None];
+    expected.extend((2..10).rev().map(Some));
+    assert_eq!(got, expected, "default DESC");
+
+    // Explicit NULLS LAST under DESC must be honored, not inverted
+    let got = fetch("SELECT a.x FROM a JOIN b ON a.id = b.id ORDER BY a.x DESC NULLS LAST");
+    let mut expected: Vec<Option<i64>> = (2..10).rev().map(Some).collect();
+    expected.extend([None, None]);
+    assert_eq!(got, expected, "explicit NULLS LAST");
+
+    // Explicit NULLS FIRST under DESC
+    let got = fetch("SELECT a.x FROM a JOIN b ON a.id = b.id ORDER BY a.x DESC NULLS FIRST");
+    let mut expected: Vec<Option<i64>> = vec![None, None];
+    expected.extend((2..10).rev().map(Some));
+    assert_eq!(got, expected, "explicit NULLS FIRST");
+}

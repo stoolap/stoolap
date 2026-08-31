@@ -92,7 +92,7 @@ use super::result::{
 use super::utils::compute_join_projection;
 use super::utils::{
     add_table_qualifier, build_column_index_map, collect_table_qualifiers,
-    combine_predicates_with_and, compare_values, dummy_token, expression_contains_aggregate,
+    combine_predicates_with_and, dummy_token, expression_contains_aggregate,
     extract_base_column_name, extract_join_keys_and_residual, filter_references_column,
     flatten_and_predicates, get_table_alias_from_expr, strip_table_qualifier,
     substitute_filter_column,
@@ -4221,8 +4221,14 @@ impl Executor {
                     // untruncated rows. An ORDER BY expression the join-local
                     // evaluator cannot resolve (SELECT aliases, positions)
                     // also defers ordering to the standard path.
+                    // A bare integer literal in ORDER BY is an output
+                    // ordinal, which only the standard path resolves
+                    let has_positional = stmt
+                        .order_by
+                        .iter()
+                        .any(|ob| matches!(ob.expression, Expression::IntegerLiteral(_)));
                     let mut order_limit_applied = false;
-                    if !has_agg && !has_window && !stmt.order_by.is_empty() {
+                    if !has_agg && !has_window && !has_positional && !stmt.order_by.is_empty() {
                         // Build sort specs by evaluating ORDER BY expressions
                         let mut evaluator = CompiledEvaluator::new(&self.function_registry);
                         evaluator = evaluator.with_context(ctx);
@@ -4246,39 +4252,16 @@ impl Executor {
                             sort_keys.push(keys);
                         }
                         if keys_ok {
-                            // Sort by indices using sort_unstable_by for ~10-20% speedup
+                            // Sort by indices with the shared NULL-aware
+                            // comparator (the standard path's semantics)
                             let mut indices: Vec<usize> = (0..final_rows.len()).collect();
                             indices.sort_unstable_by(|&a, &b| {
-                                for (i, ob) in stmt.order_by.iter().enumerate() {
-                                    let av = &sort_keys[a][i];
-                                    let bv = &sort_keys[b][i];
-                                    let asc = ob.ascending;
-                                    let nulls_first = ob.nulls_first.unwrap_or(!asc);
-
-                                    let cmp = if av.is_null() && bv.is_null() {
-                                        Ordering::Equal
-                                    } else if av.is_null() {
-                                        if nulls_first {
-                                            Ordering::Less
-                                        } else {
-                                            Ordering::Greater
-                                        }
-                                    } else if bv.is_null() {
-                                        if nulls_first {
-                                            Ordering::Greater
-                                        } else {
-                                            Ordering::Less
-                                        }
-                                    } else {
-                                        compare_values(av, bv)
-                                    };
-
-                                    let cmp = if asc { cmp } else { cmp.reverse() };
-                                    if cmp != Ordering::Equal {
-                                        return cmp;
-                                    }
-                                }
-                                Ordering::Equal
+                                Self::compare_by_sort_keys_impl(
+                                    &sort_keys[a],
+                                    &sort_keys[b],
+                                    &stmt.order_by,
+                                    stmt.order_by.len(),
+                                )
                             });
 
                             // Apply LIMIT/OFFSET while reordering: with a
