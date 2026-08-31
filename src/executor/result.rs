@@ -1214,13 +1214,11 @@ impl TopNResult {
                     row,
                     compare: std::sync::Arc::clone(&compare),
                 });
-            } else if let Some(worst) = heap.peek() {
+            } else if let Some(mut worst) = heap.peek_mut() {
+                // Replace in place: one sift-down on drop instead of a
+                // pop + push double sift
                 if compare(&row, &worst.row) == std::cmp::Ordering::Less {
-                    heap.pop();
-                    heap.push(HeapRow {
-                        row,
-                        compare: std::sync::Arc::clone(&compare),
-                    });
+                    worst.row = row;
                 }
             }
         }
@@ -1348,14 +1346,6 @@ impl DistinctResult {
         }
         hasher.finish()
     }
-
-    /// Extract distinct column values from a row
-    fn extract_distinct_values(&self, row: &Row) -> Vec<Value> {
-        row.iter()
-            .take(self.distinct_column_count)
-            .cloned()
-            .collect()
-    }
 }
 
 impl QueryResult for DistinctResult {
@@ -1369,12 +1359,16 @@ impl QueryResult for DistinctResult {
             let row = self.inner.row();
             let hash = self.hash_row(row);
 
-            // Extract distinct values first for duplicate check
-            let values = self.extract_distinct_values(row);
-
-            // Check if we've seen this combination before
+            // Compare by reference so duplicate rows allocate nothing
+            let prefix_len = row.len().min(self.distinct_column_count);
             let is_dup = if let Some(seen_rows) = self.seen.get(&hash) {
-                seen_rows.contains(&values)
+                seen_rows.iter().any(|seen| {
+                    seen.len() == prefix_len
+                        && seen
+                            .iter()
+                            .zip(row.iter().take(self.distinct_column_count))
+                            .all(|(a, b)| a == b)
+                })
             } else {
                 false
             };
@@ -1382,6 +1376,12 @@ impl QueryResult for DistinctResult {
             if !is_dup {
                 // New unique row found - take ownership and mark as seen
                 self.current_row = self.inner.take_row();
+                let values = self
+                    .current_row
+                    .iter()
+                    .take(self.distinct_column_count)
+                    .cloned()
+                    .collect();
                 self.seen.entry(hash).or_default().push(values);
                 self.has_current = true;
                 return true;
@@ -1472,13 +1472,30 @@ impl DistinctOnResult {
             .collect()
     }
 
-    fn hash_key(&self, key: &[Value]) -> u64 {
+    fn hash_key_from_row(&self, row: &Row) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = FxHasher::default();
-        for value in key {
-            value.hash(&mut hasher);
+        for &i in &self.key_indices {
+            match row.get(i) {
+                Some(v) => v.hash(&mut hasher),
+                None => Value::null_unknown().hash(&mut hasher),
+            }
         }
         hasher.finish()
+    }
+
+    /// Reference comparison against a stored key, matching extract_key's
+    /// null_unknown fallback for missing indices
+    fn row_matches_key(&self, row: &Row, key: &[Value]) -> bool {
+        key.len() == self.key_indices.len()
+            && self
+                .key_indices
+                .iter()
+                .zip(key.iter())
+                .all(|(&i, kv)| match row.get(i) {
+                    Some(v) => v == kv,
+                    None => Value::null_unknown() == *kv,
+                })
     }
 }
 
@@ -1490,12 +1507,11 @@ impl QueryResult for DistinctOnResult {
     fn next(&mut self) -> bool {
         while self.inner.next() {
             let row = self.inner.row();
-            let key = self.extract_key(row);
-            let hash = self.hash_key(&key);
+            let hash = self.hash_key_from_row(row);
 
-            // Check if we've seen this key before
+            // Compare by reference so duplicate rows allocate nothing
             let is_dup = if let Some(seen_keys) = self.seen.get(&hash) {
-                seen_keys.contains(&key)
+                seen_keys.iter().any(|k| self.row_matches_key(row, k))
             } else {
                 false
             };
@@ -1504,8 +1520,9 @@ impl QueryResult for DistinctOnResult {
                 continue; // already emitted a row for this group
             }
 
-            self.seen.entry(hash).or_default().push(key);
             self.current_row = self.inner.take_row();
+            let key = self.extract_key(&self.current_row);
+            self.seen.entry(hash).or_default().push(key);
             self.has_current = true;
             return true;
         }
@@ -1667,14 +1684,21 @@ impl QueryResult for ProjectedResult {
 
     fn next(&mut self) -> bool {
         if self.inner.next() {
-            // Project the row to keep only the first N columns
-            // OPTIMIZATION: Use Inline storage - no Arc overhead for intermediate results
-            self.current_row.reserve_inline(self.keep_columns);
-            self.current_row.clear_inline();
             let full_row = self.inner.row();
-            for i in 0..self.keep_columns {
-                self.current_row
-                    .push_inline(full_row.get(i).cloned().unwrap_or(Value::null_unknown()));
+            if !full_row.is_shared() && full_row.len() >= self.keep_columns {
+                // Owned row: take it and truncate in place, no clones
+                let mut row = self.inner.take_row();
+                row.truncate(self.keep_columns);
+                self.current_row = row;
+            } else {
+                // Shared (or short) row: clone only the kept prefix
+                self.current_row.reserve_inline(self.keep_columns);
+                self.current_row.clear_inline();
+                let full_row = self.inner.row();
+                for i in 0..self.keep_columns {
+                    self.current_row
+                        .push_inline(full_row.get(i).cloned().unwrap_or(Value::null_unknown()));
+                }
             }
             true
         } else {
@@ -2069,9 +2093,11 @@ impl QueryResult for ColumnarResult {
         self.current_row.reserve_inline(self.data.len());
         // Materialize row from column data - clear_inline preserves capacity
         self.current_row.clear_inline();
-        for col_data in &self.data {
-            // Safety: we verified all columns have num_rows elements
-            self.current_row.push_inline(col_data[next_idx].clone());
+        for col_data in &mut self.data {
+            // Iteration is forward-only and close() clears the buffers,
+            // so each cell moves out instead of cloning
+            self.current_row
+                .push_inline(std::mem::take(&mut col_data[next_idx]));
         }
 
         true

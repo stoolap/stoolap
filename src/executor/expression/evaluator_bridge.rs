@@ -32,6 +32,13 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use crate::api::params::ParamVec;
+
+// Shared empty defaults: constructors hand these out with an Arc bump
+// instead of allocating fresh empty collections per instance
+static EMPTY_PARAMS: std::sync::LazyLock<CompactArc<ParamVec>> =
+    std::sync::LazyLock::new(|| CompactArc::new(ParamVec::new()));
+static EMPTY_NAMED_PARAMS: std::sync::LazyLock<Arc<FxHashMap<String, Value>>> =
+    std::sync::LazyLock::new(|| Arc::new(FxHashMap::default()));
 use crate::common::{CompactArc, StringMap};
 use lru::LruCache;
 use parking_lot::Mutex;
@@ -567,8 +574,8 @@ impl RowFilter {
         let program = compile_expression(expr, columns)?;
         Ok(Self {
             program,
-            params: CompactArc::new(ParamVec::new()),
-            named_params: Arc::new(FxHashMap::default()),
+            params: EMPTY_PARAMS.clone(),
+            named_params: EMPTY_NAMED_PARAMS.clone(),
             transaction_id: None,
         })
     }
@@ -616,8 +623,8 @@ impl RowFilter {
 
         Ok(Self {
             program,
-            params: CompactArc::new(ParamVec::new()),
-            named_params: Arc::new(FxHashMap::default()),
+            params: EMPTY_PARAMS.clone(),
+            named_params: EMPTY_NAMED_PARAMS.clone(),
             transaction_id: None,
         })
     }
@@ -650,8 +657,8 @@ impl RowFilter {
     pub fn from_program(program: SharedProgram) -> Self {
         Self {
             program,
-            params: CompactArc::new(ParamVec::new()),
-            named_params: Arc::new(FxHashMap::default()),
+            params: EMPTY_PARAMS.clone(),
+            named_params: EMPTY_NAMED_PARAMS.clone(),
             transaction_id: None,
         }
     }
@@ -828,8 +835,8 @@ impl JoinFilter {
             .map_err(|e| Error::internal(format!("Compile error: {}", e)))?;
         Ok(Self {
             program: CompactArc::new(program),
-            params: CompactArc::new(ParamVec::new()),
-            named_params: Arc::new(FxHashMap::default()),
+            params: EMPTY_PARAMS.clone(),
+            named_params: EMPTY_NAMED_PARAMS.clone(),
         })
     }
 
@@ -932,8 +939,8 @@ impl ExpressionEval {
         Ok(Self {
             program,
             vm: ExprVM::new(),
-            params: CompactArc::new(ParamVec::new()),
-            named_params: Arc::new(FxHashMap::default()),
+            params: EMPTY_PARAMS.clone(),
+            named_params: EMPTY_NAMED_PARAMS.clone(),
             outer_row: None,
             transaction_id: None,
         })
@@ -1003,8 +1010,8 @@ impl ExpressionEval {
         Ok(Self {
             program,
             vm: ExprVM::new(),
-            params: CompactArc::new(ParamVec::new()),
-            named_params: Arc::new(FxHashMap::default()),
+            params: EMPTY_PARAMS.clone(),
+            named_params: EMPTY_NAMED_PARAMS.clone(),
             outer_row: None,
             transaction_id: None,
         })
@@ -1015,8 +1022,8 @@ impl ExpressionEval {
         Self {
             program,
             vm: ExprVM::new(),
-            params: CompactArc::new(ParamVec::new()),
-            named_params: Arc::new(FxHashMap::default()),
+            params: EMPTY_PARAMS.clone(),
+            named_params: EMPTY_NAMED_PARAMS.clone(),
             outer_row: None,
             transaction_id: None,
         }
@@ -1224,8 +1231,8 @@ impl MultiExpressionEval {
         Ok(Self {
             programs,
             vm: ExprVM::new(),
-            params: CompactArc::new(ParamVec::new()),
-            named_params: Arc::new(FxHashMap::default()),
+            params: EMPTY_PARAMS.clone(),
+            named_params: EMPTY_NAMED_PARAMS.clone(),
             transaction_id: None,
         })
     }
@@ -1266,8 +1273,8 @@ impl MultiExpressionEval {
         Ok(Self {
             programs,
             vm: ExprVM::new(),
-            params: CompactArc::new(ParamVec::new()),
-            named_params: Arc::new(FxHashMap::default()),
+            params: EMPTY_PARAMS.clone(),
+            named_params: EMPTY_NAMED_PARAMS.clone(),
             transaction_id: None,
         })
     }
@@ -1452,8 +1459,8 @@ impl<'a> CompiledEvaluator<'a> {
             columns_arc_id: 0,
             columns2: None,
             outer_columns: None,
-            params: CompactArc::new(ParamVec::new()),
-            named_params: Arc::new(FxHashMap::default()),
+            params: EMPTY_PARAMS.clone(),
+            named_params: EMPTY_NAMED_PARAMS.clone(),
             outer_row: None,
             transaction_id: None,
             expression_aliases: StringMap::new(),
@@ -1476,7 +1483,7 @@ impl<'a> CompiledEvaluator<'a> {
         self.columns_arc_id = 0;
         self.columns2 = None;
         self.outer_columns = None;
-        self.params = CompactArc::new(ParamVec::new());
+        self.params = EMPTY_PARAMS.clone();
         self.named_params = Arc::new(FxHashMap::default());
         self.outer_row = None;
         self.transaction_id = None;
@@ -2030,6 +2037,30 @@ impl<'a> CompiledEvaluator<'a> {
 
         // Execute
         self.vm.execute_cow(&program, &ctx)
+    }
+
+    /// Compile and cache an expression, returning the shared program for
+    /// repeated `evaluate_program` calls in per-row loops
+    pub fn compile_cached(&mut self, expr: &Expression) -> Result<SharedProgram> {
+        self.get_or_compile(expr)
+    }
+
+    /// Evaluate a pre-compiled program against the given row directly,
+    /// without storing a per-row copy in the evaluator and without
+    /// re-hashing the expression. Not for join mode (single row only).
+    pub fn evaluate_program(&mut self, program: &SharedProgram, row: &Row) -> Result<Value> {
+        let mut ctx = ExecuteContext::new(row);
+        if !self.params.is_empty() {
+            ctx = ctx.with_params(&self.params);
+        }
+        if !self.named_params.is_empty() {
+            ctx = ctx.with_named_params(&self.named_params);
+        }
+        if let Some(ref outer) = self.outer_row {
+            ctx = ctx.with_outer_row(outer);
+        }
+        ctx = ctx.with_transaction_id(self.transaction_id);
+        self.vm.execute_cow(program, &ctx)
     }
 
     /// Evaluate an expression as a boolean (for WHERE/HAVING clauses)

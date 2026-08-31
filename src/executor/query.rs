@@ -700,15 +700,22 @@ impl Executor {
                         })
                         .collect()
                 } else {
+                    // Pre-compile each ORDER BY expression once; per row
+                    // only the VM runs (no row clone, no expression re-hash)
+                    let programs: Vec<Option<super::expression::SharedProgram>> = stmt
+                        .order_by
+                        .iter()
+                        .map(|ob| evaluator.compile_cached(&ob.expression).ok())
+                        .collect();
                     rows.iter()
                         .map(|(_, row)| {
-                            evaluator.set_row_array(row);
-                            stmt.order_by
+                            programs
                                 .iter()
-                                .map(|ob| {
-                                    evaluator
-                                        .evaluate(&ob.expression)
-                                        .unwrap_or_else(|_| Value::null_unknown())
+                                .map(|p| match p {
+                                    Some(p) => evaluator
+                                        .evaluate_program(p, row)
+                                        .unwrap_or_else(|_| Value::null_unknown()),
+                                    None => Value::null_unknown(),
                                 })
                                 .collect()
                         })
@@ -4234,22 +4241,34 @@ impl Executor {
                         evaluator = evaluator.with_context(ctx);
                         evaluator.init_columns(&all_columns);
 
-                        // Compute sort keys and indices
+                        // Compute sort keys and indices; compile and
+                        // evaluation errors both defer to the standard path
                         let mut keys_ok = true;
-                        let mut sort_keys: Vec<Vec<Value>> = Vec::with_capacity(final_rows.len());
-                        'keys: for (_, row) in final_rows.iter() {
-                            evaluator.set_row_array(row);
-                            let mut keys = Vec::with_capacity(stmt.order_by.len());
-                            for ob in &stmt.order_by {
-                                match evaluator.evaluate(&ob.expression) {
-                                    Ok(v) => keys.push(v),
-                                    Err(_) => {
-                                        keys_ok = false;
-                                        break 'keys;
-                                    }
+                        let mut programs = Vec::with_capacity(stmt.order_by.len());
+                        for ob in &stmt.order_by {
+                            match evaluator.compile_cached(&ob.expression) {
+                                Ok(p) => programs.push(p),
+                                Err(_) => {
+                                    keys_ok = false;
+                                    break;
                                 }
                             }
-                            sort_keys.push(keys);
+                        }
+                        let mut sort_keys: Vec<Vec<Value>> = Vec::with_capacity(final_rows.len());
+                        if keys_ok {
+                            'keys: for (_, row) in final_rows.iter() {
+                                let mut keys = Vec::with_capacity(programs.len());
+                                for p in &programs {
+                                    match evaluator.evaluate_program(p, row) {
+                                        Ok(v) => keys.push(v),
+                                        Err(_) => {
+                                            keys_ok = false;
+                                            break 'keys;
+                                        }
+                                    }
+                                }
+                                sort_keys.push(keys);
+                            }
                         }
                         if keys_ok {
                             // Sort by indices with the shared NULL-aware
