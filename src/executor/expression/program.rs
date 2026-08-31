@@ -57,6 +57,11 @@ pub struct Program {
     /// Whether this program contains subqueries
     has_subqueries: bool,
 
+    /// Whether every op is handled by ExprVM::execute_cow, so the
+    /// borrowed interpreter never bails mid-program into a full owned
+    /// re-execution
+    cow_supported: bool,
+
     /// Source expression string (for debugging)
     #[cfg(debug_assertions)]
     source: Option<String>,
@@ -83,12 +88,15 @@ impl Program {
             )
         });
 
+        let cow_supported = Self::compute_cow_supported(&ops);
+
         Self {
             ops,
             max_stack_depth,
             needs_outer_context,
             needs_second_row,
             has_subqueries,
+            cow_supported,
             #[cfg(debug_assertions)]
             source: None,
         }
@@ -111,12 +119,15 @@ impl Program {
             )
         });
 
+        let cow_supported = Self::compute_cow_supported(&ops);
+
         Self {
             ops,
             max_stack_depth,
             needs_outer_context,
             needs_second_row,
             has_subqueries,
+            cow_supported,
             #[cfg(debug_assertions)]
             source: None,
         }
@@ -360,7 +371,72 @@ impl Program {
         self.ops = Self::peephole_optimize(self.ops);
         // Recalculate metadata after optimization
         self.max_stack_depth = Self::compute_stack_depth(&self.ops);
+        self.cow_supported = Self::compute_cow_supported(&self.ops);
         self
+    }
+
+    /// Whether execute_cow handles every op of this program
+    #[inline]
+    pub fn cow_supported(&self) -> bool {
+        self.cow_supported
+    }
+
+    /// Mirrors the op set ExprVM::execute_cow handles; keep the two in
+    /// sync (drift only costs performance, the cow catch-all stays)
+    fn compute_cow_supported(ops: &[Op]) -> bool {
+        ops.iter().all(|op| {
+            matches!(
+                op,
+                Op::LoadColumn(_)
+                    | Op::LoadColumn2(_)
+                    | Op::LoadConst(_)
+                    | Op::LoadNull(_)
+                    | Op::LoadParam(_)
+                    | Op::LoadAggregateResult(_)
+                    | Op::Eq
+                    | Op::Ne
+                    | Op::Lt
+                    | Op::Le
+                    | Op::Gt
+                    | Op::Ge
+                    | Op::EqColumnConst(..)
+                    | Op::LtColumnConst(..)
+                    | Op::GtColumnConst(..)
+                    | Op::And(_)
+                    | Op::AndFinalize
+                    | Op::Or(_)
+                    | Op::OrFinalize
+                    | Op::Not
+                    | Op::IsNull
+                    | Op::IsNotNull
+                    | Op::Jump(_)
+                    | Op::JumpIfFalse(_)
+                    | Op::JumpIfTrue(_)
+                    | Op::JumpIfNull(_)
+                    | Op::JumpIfNotNull(_)
+                    | Op::PopJumpIfFalse(_)
+                    | Op::PopJumpIfTrue(_)
+                    | Op::Pop
+                    | Op::Nop
+                    | Op::Coalesce(_)
+                    | Op::NullIf
+                    | Op::Greatest(_)
+                    | Op::Least(_)
+                    | Op::Concat
+                    | Op::ConcatN(_)
+                    | Op::CaseStart
+                    | Op::CaseWhen(_)
+                    | Op::CaseThen(_)
+                    | Op::CaseElse
+                    | Op::CaseEnd
+                    | Op::CaseCompare
+                    | Op::CallScalar { .. }
+                    | Op::Return
+                    | Op::ReturnTrue
+                    | Op::ReturnFalse
+                    | Op::ReturnNull(_)
+            )
+        })
     }
 
     /// Peephole optimizer: fuse common instruction patterns into single ops

@@ -2049,6 +2049,10 @@ impl<'a> CompiledEvaluator<'a> {
     /// without storing a per-row copy in the evaluator and without
     /// re-hashing the expression. Not for join mode (single row only).
     pub fn evaluate_program(&mut self, program: &SharedProgram, row: &Row) -> Result<Value> {
+        debug_assert!(
+            self.current_row2.is_none() && self.columns2.is_none(),
+            "evaluate_program does not support join mode"
+        );
         let mut ctx = ExecuteContext::new(row);
         if !self.params.is_empty() {
             ctx = ctx.with_params(&self.params);
