@@ -70,3 +70,63 @@ fn in_subquery_set_survives_repeats_and_invalidation() {
         .unwrap();
     assert_eq!(c, 150);
 }
+
+#[test]
+fn subquery_caches_not_poisoned_by_rollback() {
+    let db = Database::open("memory://in_subq_rollback").unwrap();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE inner_t (id INTEGER PRIMARY KEY, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..200i64 {
+        tx.execute("INSERT INTO users VALUES ($1, $2)", (i, i))
+            .unwrap();
+    }
+    for i in 0..50i64 {
+        tx.execute("INSERT INTO inner_t VALUES ($1, $2)", (i, i))
+            .unwrap();
+    }
+    tx.commit().unwrap();
+
+    let in_sql = "SELECT COUNT(*) FROM users WHERE id IN (SELECT id FROM inner_t WHERE v >= 0)";
+    let scalar_sql = "SELECT COUNT(*) FROM users WHERE id < (SELECT MAX(id) FROM inner_t)";
+
+    // Warm the caches in autocommit
+    let c: i64 = db.query_one(in_sql, ()).unwrap();
+    assert_eq!(c, 50);
+    let c: i64 = db.query_one(scalar_sql, ()).unwrap();
+    assert_eq!(c, 49);
+
+    // An uncommitted INSERT seen by an in-transaction query must not
+    // poison the cache after ROLLBACK
+    let mut tx = db.begin().unwrap();
+    tx.execute("INSERT INTO inner_t VALUES (100, 0)", ())
+        .unwrap();
+    let c: i64 = tx.query_one(in_sql, ()).unwrap();
+    assert_eq!(c, 51, "in-tx read sees own insert");
+    let c: i64 = tx.query_one(scalar_sql, ()).unwrap();
+    assert_eq!(c, 100, "in-tx scalar sees own insert");
+    tx.rollback().unwrap();
+
+    let c: i64 = db.query_one(in_sql, ()).unwrap();
+    assert_eq!(c, 50, "IN cache poisoned by rolled-back insert");
+    let c: i64 = db.query_one(scalar_sql, ()).unwrap();
+    assert_eq!(c, 49, "scalar cache poisoned by rolled-back insert");
+
+    // Same shape for the EXISTS semi-join cache
+    let exists_sql =
+        "SELECT COUNT(*) FROM users u WHERE EXISTS (SELECT 1 FROM inner_t i WHERE i.id = u.id AND i.v >= 0)";
+    let c: i64 = db.query_one(exists_sql, ()).unwrap();
+    assert_eq!(c, 50);
+    let mut tx = db.begin().unwrap();
+    tx.execute("DELETE FROM inner_t WHERE id = 0", ()).unwrap();
+    let c: i64 = tx.query_one(exists_sql, ()).unwrap();
+    assert_eq!(c, 49, "in-tx exists sees own delete");
+    tx.rollback().unwrap();
+    let c: i64 = db.query_one(exists_sql, ()).unwrap();
+    assert_eq!(c, 50, "semi-join cache poisoned by rolled-back delete");
+}

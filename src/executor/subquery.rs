@@ -222,7 +222,8 @@ impl Executor {
                         // A repeated non-correlated subquery reuses the
                         // memoized shared set from the cache entry
                         let is_non_correlated = ctx.outer_row().is_none()
-                            && !Self::is_subquery_correlated(&subquery.subquery);
+                            && !Self::is_subquery_correlated(&subquery.subquery)
+                            && ctx.transaction_id().is_none();
                         let cached_set = if is_non_correlated {
                             get_cached_in_subquery_set(&subquery.subquery.to_string())
                         } else {
@@ -512,19 +513,15 @@ impl Executor {
         // If there's no additional predicate, check if at least one row is visible
         // Note: Index may contain row_ids for deleted rows, so we must verify visibility
         if correlation.additional_predicate.is_none() {
-            // Count visible rows per batch instead of materializing rows
-            // that were only tested for emptiness and discarded
-            let row_counter = match get_cached_count_counter(&correlation.inner_table) {
-                Some(c) => c,
-                None => match self.get_or_create_row_counter(&correlation.inner_table) {
-                    Some(c) => c,
-                    None => return Ok(None), // Fall back if counter creation fails
-                },
+            let row_fetcher = match self.get_or_create_row_fetcher(&correlation.inner_table) {
+                Some(f) => f,
+                None => return Ok(None), // Fall back if fetcher creation fails
             };
             // Check batches until we find a visible row or exhaust all row_ids
             // We can't stop after first batch because deleted rows may precede visible ones
             for chunk in row_ids.chunks(VISIBILITY_CHECK_BATCH_SIZE) {
-                if row_counter(chunk) > 0 {
+                let visible = row_fetcher(chunk)?;
+                if !visible.is_empty() {
                     return Ok(Some(true)); // Found at least one visible row
                 }
             }
@@ -1715,8 +1712,10 @@ impl Executor {
         let is_non_correlated =
             ctx.outer_row().is_none() && !Self::is_subquery_correlated(subquery);
 
-        // For non-correlated subqueries, check cache first using SQL string as key
-        let cache_key = if is_non_correlated {
+        // For non-correlated subqueries, check cache first using SQL string
+        // as key; bypassed inside explicit transactions (see
+        // execute_in_subquery for the ROLLBACK rationale)
+        let cache_key = if is_non_correlated && ctx.transaction_id().is_none() {
             let key = subquery.to_string();
             if let Some(cached_value) = get_cached_scalar_subquery(&key) {
                 return Ok(cached_value);
@@ -1826,8 +1825,11 @@ impl Executor {
         let is_non_correlated =
             ctx.outer_row().is_none() && !Self::is_subquery_correlated(subquery);
 
-        // For non-correlated subqueries, check cache first using SQL string as key
-        let cache_key = if is_non_correlated {
+        // For non-correlated subqueries, check cache first using SQL string
+        // as key. Inside an explicit transaction the caches are bypassed
+        // entirely: an in-transaction execution sees uncommitted rows, and
+        // caching that view would survive a ROLLBACK
+        let cache_key = if is_non_correlated && ctx.transaction_id().is_none() {
             let key = subquery.to_string();
             if let Some(cached_values) = get_cached_in_subquery(&key) {
                 return Ok(cached_values);
@@ -3053,9 +3055,14 @@ impl Executor {
         let cache_key =
             compute_semi_join_cache_key(&info.inner_table, &info.inner_column, pred_hash);
 
-        // Check cache first - return Arc directly (no clone needed)
-        if let Some(cached) = get_cached_semi_join(cache_key) {
-            return Ok(cached);
+        // Check cache first - return Arc directly (no clone needed).
+        // Bypassed inside explicit transactions (a cached in-transaction
+        // view would survive ROLLBACK)
+        let cacheable = ctx.transaction_id().is_none();
+        if cacheable {
+            if let Some(cached) = get_cached_semi_join(cache_key) {
+                return Ok(cached);
+            }
         }
 
         // Build SELECT inner_column FROM inner_table WHERE non_correlated_predicates
@@ -3126,11 +3133,13 @@ impl Executor {
         let hash_set_arc = CompactArc::new(hash_set);
 
         // Cache for subsequent calls within this query (CompactArc clone is cheap)
-        cache_semi_join_arc(
-            cache_key,
-            &info.inner_table,
-            CompactArc::clone(&hash_set_arc),
-        );
+        if cacheable {
+            cache_semi_join_arc(
+                cache_key,
+                &info.inner_table,
+                CompactArc::clone(&hash_set_arc),
+            );
+        }
 
         Ok(hash_set_arc)
     }
