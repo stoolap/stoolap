@@ -2020,6 +2020,13 @@ impl Executor {
             vec![partition_len; partition_len]
         };
 
+        // Empty partition: nothing to compute, and the hoisted argument
+        // evaluation below must not run (an invalid constant argument
+        // never evaluated under the old per-row scheme)
+        if row_indices.is_empty() {
+            return Ok((Vec::new(), row_indices));
+        }
+
         // Hoist constant window-function arguments out of the row loop:
         // offsets and bucket counts compile against no columns; LEAD/LAG's
         // default compiles once here and evaluates per row below
@@ -2200,6 +2207,13 @@ impl Executor {
             vec![partition_len; partition_len]
         };
 
+        // Empty partition: nothing to compute, and the hoisted argument
+        // evaluation below must not run (an invalid constant argument
+        // never evaluated under the old per-row scheme)
+        if row_indices.is_empty() {
+            return Ok(());
+        }
+
         // Hoist constant window-function arguments out of the row loop:
         // offsets and bucket counts compile against no columns; LEAD/LAG's
         // default compiles once here and evaluates per row below
@@ -2375,6 +2389,13 @@ impl Executor {
         } else {
             vec![partition_len; partition_len]
         };
+
+        // Empty partition: nothing to compute, and the hoisted argument
+        // evaluation below must not run (an invalid constant argument
+        // never evaluated under the old per-row scheme)
+        if row_indices.is_empty() {
+            return Ok(());
+        }
 
         // Hoist constant window-function arguments out of the row loop:
         // offsets and bucket counts compile against no columns; LEAD/LAG's
