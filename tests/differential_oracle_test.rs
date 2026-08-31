@@ -709,8 +709,15 @@ fn test_oracle_order_by() {
     let qr = query_sqlite(&sqlite, sql);
     assert_ordered_equal(sql, &sr, &qr);
 
-    // ORDER BY with NULLs - add , id tiebreaker, compare row-by-row (not re-sorted)
-    let sql = "SELECT id, name, score FROM t ORDER BY score ASC, id ASC";
+    // ORDER BY with NULLs: the default placement differs by design
+    // (Stoolap follows the SQL standard / PostgreSQL, SQLite sorts NULLs
+    // smallest), so pin both explicit forms instead
+    let sql = "SELECT id, name, score FROM t ORDER BY score ASC NULLS FIRST, id ASC";
+    let sr = query_stoolap(&stoolap, sql);
+    let qr = query_sqlite(&sqlite, sql);
+    assert_ordered_equal(sql, &sr, &qr);
+
+    let sql = "SELECT id, name, score FROM t ORDER BY score ASC NULLS LAST, id ASC";
     let sr = query_stoolap(&stoolap, sql);
     let qr = query_sqlite(&sqlite, sql);
     assert_ordered_equal(sql, &sr, &qr);

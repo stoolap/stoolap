@@ -307,7 +307,8 @@ fn test_order_by_with_nulls() {
     db.execute("INSERT INTO items VALUES (3, 10)", ())
         .expect("Failed to insert");
 
-    // Default behavior: NULLS FIRST for ASC in Stoolap
+    // Default: NULLS LAST for ASC (SQL standard; see OrderByExpression's
+    // nulls_first contract in the AST)
     let result = db
         .query("SELECT value FROM items ORDER BY value ASC", ())
         .expect("Query failed");
@@ -318,11 +319,11 @@ fn test_order_by_with_nulls() {
         values.push(row.get::<i64>(0).ok());
     }
 
-    // NULLs are at the beginning for ASC (default behavior)
+    // NULLs are at the end for ASC (default behavior)
     assert_eq!(values.len(), 3);
-    assert_eq!(values[0], None);
-    assert_eq!(values[1], Some(10));
-    assert_eq!(values[2], Some(30));
+    assert_eq!(values[0], Some(10));
+    assert_eq!(values[1], Some(30));
+    assert_eq!(values[2], None);
 }
 
 #[test]
@@ -342,7 +343,8 @@ fn test_order_by_with_nulls_desc() {
     db.execute("INSERT INTO items VALUES (3, 10)", ())
         .expect("Failed to insert");
 
-    // Default behavior: NULLS LAST for DESC in Stoolap
+    // Default: NULLS FIRST for DESC (SQL standard; see OrderByExpression's
+    // nulls_first contract in the AST)
     let result = db
         .query("SELECT value FROM items ORDER BY value DESC", ())
         .expect("Query failed");
@@ -353,11 +355,11 @@ fn test_order_by_with_nulls_desc() {
         values.push(row.get::<i64>(0).ok());
     }
 
-    // NULLs are at the end for DESC (default behavior)
+    // NULLs are at the start for DESC (default behavior)
     assert_eq!(values.len(), 3);
-    assert_eq!(values[0], Some(30));
-    assert_eq!(values[1], Some(10));
-    assert_eq!(values[2], None);
+    assert_eq!(values[0], None);
+    assert_eq!(values[1], Some(30));
+    assert_eq!(values[2], Some(10));
 }
 
 #[test]

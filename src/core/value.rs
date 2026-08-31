@@ -414,7 +414,7 @@ impl Value {
         // Timestamp ↔ Text: try parsing the text side as a timestamp
         match (self, other) {
             (Value::Timestamp(ts), Value::Text(s)) => {
-                if let Ok(parsed) = parse_timestamp(s) {
+                if let Some(parsed) = parse_timestamp_for_compare(s) {
                     return Ok(ts.cmp(&parsed));
                 }
             }
@@ -423,12 +423,12 @@ impl Value {
             {
                 // SAFETY: Json data is always valid UTF-8
                 let s = std::str::from_utf8(&data[1..]).unwrap_or("");
-                if let Ok(parsed) = parse_timestamp(s) {
+                if let Some(parsed) = parse_timestamp_for_compare(s) {
                     return Ok(ts.cmp(&parsed));
                 }
             }
             (Value::Text(s), Value::Timestamp(ts)) => {
-                if let Ok(parsed) = parse_timestamp(s) {
+                if let Some(parsed) = parse_timestamp_for_compare(s) {
                     return Ok(parsed.cmp(ts));
                 }
             }
@@ -437,7 +437,7 @@ impl Value {
             {
                 // SAFETY: Json data is always valid UTF-8
                 let s = std::str::from_utf8(&data[1..]).unwrap_or("");
-                if let Ok(parsed) = parse_timestamp(s) {
+                if let Some(parsed) = parse_timestamp_for_compare(s) {
                     return Ok(parsed.cmp(ts));
                 }
             }
@@ -1334,6 +1334,37 @@ impl<T: Into<Value>> From<Option<T>> for Value {
 // =========================================================================
 // Helper functions
 // =========================================================================
+
+/// One memoized text-to-timestamp parse: (source string, parse result)
+type TsParseEntry = (Box<str>, Option<DateTime<Utc>>);
+
+thread_local! {
+    /// Small memo for text-to-timestamp parses in comparisons: a query
+    /// comparing a timestamp column to a string constant otherwise runs a
+    /// full chrono parse of the same constant for every row. Failed parses
+    /// are cached too (the fallback string compare also repeats per row).
+    /// Two slots cover the constant shapes (equality, range bounds) while
+    /// keeping the miss cost for per-row text data at two comparisons.
+    static TS_COMPARE_PARSE_CACHE: std::cell::RefCell<([Option<TsParseEntry>; 2], usize)> =
+        const { std::cell::RefCell::new(([None, None], 0)) };
+}
+
+/// `parse_timestamp` with a per-thread memo, for per-row comparison paths
+fn parse_timestamp_for_compare(s: &str) -> Option<DateTime<Utc>> {
+    TS_COMPARE_PARSE_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let (slots, next) = &mut *cache;
+        for entry in slots.iter().flatten() {
+            if &*entry.0 == s {
+                return entry.1;
+            }
+        }
+        let parsed = parse_timestamp(s).ok();
+        slots[*next] = Some((s.into(), parsed));
+        *next = (*next + 1) % 2;
+        parsed
+    })
+}
 
 /// Parse a timestamp string with multiple format support
 pub fn parse_timestamp(s: &str) -> Result<DateTime<Utc>> {
