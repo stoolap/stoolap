@@ -2468,8 +2468,13 @@ impl Executor {
 
         for (_, row) in rows {
             // OPTIMIZATION: Hash directly from row references (no clone for hashing)
-            // FxHasher has zero initialization cost unlike AHash
+            // FxHasher has zero initialization cost unlike AHash.
+            // The manual hash MUST equal the map hasher's hash_one(&Vec<Value>),
+            // which length-prefixes the slice: on resize hashbrown rehashes
+            // every entry with the map's own hasher, and a mismatch scatters
+            // the table and splits groups
             let mut hasher = FxHasher::default();
+            hasher.write_usize(group_by_indices.len());
             for &idx in &group_by_indices {
                 if let Some(value) = row.get(idx) {
                     value.hash(&mut hasher);
@@ -3645,13 +3650,18 @@ impl Executor {
             // against borrowed row values, clone key Values only when a
             // new group is actually inserted (same pattern as
             // try_fast_aggregation above)
-            let mut keyed_groups: hashbrown::HashMap<Vec<Value>, Vec<usize>> =
-                hashbrown::HashMap::with_capacity(64);
+            // The map hasher and the manual hash must agree exactly
+            // (hash_one(&Vec<Value>) length-prefixes the slice): hashbrown
+            // rehashes with the map's own hasher on resize
+            type FxBuild = BuildHasherDefault<FxHasher>;
+            let mut keyed_groups: hashbrown::HashMap<Vec<Value>, Vec<usize>, FxBuild> =
+                hashbrown::HashMap::with_capacity_and_hasher(64, FxBuild::default());
             let num_cols = column_indices.len();
             let mut group_count: usize = 0;
 
             for (row_idx, (_, row)) in rows.iter().enumerate() {
                 let mut hasher = FxHasher::default();
+                hasher.write_usize(num_cols);
                 for &idx in &column_indices {
                     match row.get(idx) {
                         Some(value) => value.hash(&mut hasher),
