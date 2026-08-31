@@ -31,6 +31,7 @@ use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::storage::expression::ConstBoolExpr;
 use crate::storage::traits::{Index, Table};
+use smallvec::SmallVec;
 
 use super::hash_join::JoinType;
 
@@ -297,7 +298,13 @@ impl IndexNestedLoopJoinOperator {
             IndexLookupStrategy::PrimaryKey => {
                 match key_value {
                     Value::Integer(id) => self.row_id_buffer.push(*id),
-                    Value::Float(f) => self.row_id_buffer.push(*f as i64),
+                    // Only a losslessly integral float can equal a PK;
+                    // truncation would join 5.5 against row 5
+                    Value::Float(f) => {
+                        if let Some(id) = crate::executor::Executor::lossless_float_key(*f) {
+                            self.row_id_buffer.push(id);
+                        }
+                    }
                     _ => {} // Non-numeric PK values can't match
                 }
             }
@@ -619,7 +626,9 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
         // Step 1: Collect all outer rows and their join keys
         let mut outer_rows: Vec<Row> = Vec::new();
         let mut row_id_set: I64Set = I64Set::new();
-        let mut key_to_outer_indices: I64Map<Vec<usize>> = I64Map::new();
+        // SmallVec keeps the common unique-key case inline (no heap Vec
+        // per distinct row id)
+        let mut key_to_outer_indices: I64Map<SmallVec<[usize; 2]>> = I64Map::new();
 
         while let Some(row_ref) = self.outer.next()? {
             let outer_row = row_ref.into_owned();
@@ -646,7 +655,13 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
                 }
                 IndexLookupStrategy::PrimaryKey => match &key_value {
                     Value::Integer(id) => self.row_id_buffer.push(*id),
-                    Value::Float(f) => self.row_id_buffer.push(*f as i64),
+                    // Only a losslessly integral float can equal a PK;
+                    // truncation would join 5.5 against row 5
+                    Value::Float(f) => {
+                        if let Some(id) = crate::executor::Executor::lossless_float_key(*f) {
+                            self.row_id_buffer.push(id);
+                        }
+                    }
                     _ => {}
                 },
             }
@@ -674,17 +689,13 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
             .inner_table
             .fetch_rows_by_ids(&all_row_ids, &true_expr)?;
 
-        // Build inner row map by row_id
-        let mut inner_by_id: I64Map<Row> = I64Map::with_capacity(inner_rows_batch.len());
-        for (row_id, row) in inner_rows_batch {
-            inner_by_id.insert(row_id, row);
-        }
-
-        // Step 3: Build results by matching outer rows with inner rows
+        // Step 3: Build results by matching outer rows with inner rows.
+        // Row ids are already deduplicated, so the fetched batch is
+        // iterated directly (the old I64Map was built only to iterate)
         let mut matched_outers: Vec<bool> = vec![false; outer_rows.len()];
 
-        for (row_id, inner_row) in inner_by_id.iter() {
-            if let Some(outer_indices) = key_to_outer_indices.get(row_id) {
+        for (row_id, inner_row) in inner_rows_batch.iter() {
+            if let Some(outer_indices) = key_to_outer_indices.get(*row_id) {
                 for &outer_idx in outer_indices {
                     let outer_row = &outer_rows[outer_idx];
 
