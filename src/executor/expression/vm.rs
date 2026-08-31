@@ -2050,6 +2050,13 @@ impl ExprVM {
         program: &'a Program,
         ctx: &'a ExecuteContext<'a>,
     ) -> Result<Value> {
+        // A program with any op this loop does not handle goes straight
+        // to the owned VM, instead of bailing mid-program and paying the
+        // already-executed prefix twice
+        if !program.cow_supported() {
+            return self.execute(program, ctx);
+        }
+
         // Local stack with borrowed values - lifetime tied to this execution
         let mut stack: SmallVec<[StackValue<'a>; STACK_INLINE_CAPACITY]> = SmallVec::new();
 

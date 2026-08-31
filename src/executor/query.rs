@@ -3056,12 +3056,22 @@ impl Executor {
                 }
 
                 // Normal path: collect all rows first (for ORDER BY, aggregation, etc.)
-                // Now we create the scanner since we need all rows
-                let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
-                let mut all_rows = RowVec::new();
-                while scanner.next() {
-                    all_rows.push(scanner.take_row_with_id());
-                }
+                // With an identity projection the table hands back the
+                // materialized RowVec directly (with real row ids) instead
+                // of a per-row scanner drain
+                let identity_proj = column_idx_vec.len() == all_columns.len()
+                    && column_idx_vec.iter().enumerate().all(|(i, &c)| c == i);
+                let all_rows = if identity_proj {
+                    table.collect_all_rows(storage_expr.as_deref())?
+                } else {
+                    let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
+                    let mut all_rows =
+                        RowVec::with_capacity(scanner.estimated_count().unwrap_or(64));
+                    while scanner.next() {
+                        all_rows.push(scanner.take_row_with_id());
+                    }
+                    all_rows
+                };
 
                 // Apply parallel filtering if we have enough rows
                 // CRITICAL: Propagate errors with ? instead of silently swallowing them
