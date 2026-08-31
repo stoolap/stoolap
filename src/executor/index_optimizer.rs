@@ -903,9 +903,17 @@ impl Executor {
             None
         };
 
-        // Execute the subquery to get values (with caching for non-correlated subqueries)
-        let cache_key = subquery.subquery.to_string();
-        let values = if let Some(cached) = get_cached_in_subquery(&cache_key) {
+        // Execute the subquery to get values (with caching for
+        // non-correlated subqueries). Inside an explicit transaction the
+        // cache is bypassed: a cached in-transaction view would survive
+        // ROLLBACK
+        let cache_key = if ctx.transaction_id().is_none() {
+            Some(subquery.subquery.to_string())
+        } else {
+            None
+        };
+        let cached = cache_key.as_deref().and_then(get_cached_in_subquery);
+        let values = if let Some(cached) = cached {
             cached
         } else {
             let subquery_ctx = ctx.with_incremented_query_depth();
@@ -927,11 +935,13 @@ impl Executor {
                 return Err(err);
             }
             // Cache for future use
-            cache_in_subquery(
-                cache_key,
-                extract_table_names_for_cache(&subquery.subquery),
-                values.clone(),
-            );
+            if let Some(key) = cache_key {
+                cache_in_subquery(
+                    key,
+                    extract_table_names_for_cache(&subquery.subquery),
+                    values.clone(),
+                );
+            }
             values
         };
 

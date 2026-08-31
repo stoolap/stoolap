@@ -37,8 +37,8 @@ use super::context::{
     get_cached_batch_aggregate, get_cached_batch_aggregate_info, get_cached_count_counter,
     get_cached_exists_correlation, get_cached_exists_fetcher, get_cached_exists_index,
     get_cached_exists_pred_key, get_cached_exists_predicate, get_cached_exists_schema,
-    get_cached_in_subquery, get_cached_scalar_subquery, get_cached_semi_join,
-    BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo,
+    get_cached_in_subquery, get_cached_in_subquery_set, get_cached_scalar_subquery,
+    get_cached_semi_join, BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo,
 };
 use super::expr_converter::convert_ast_to_storage_expr;
 use super::expression::compute_expression_hash;
@@ -218,17 +218,30 @@ impl Executor {
                             not: in_expr.not,
                         }));
                     } else {
-                        // Single-column IN - use InHashSet for O(1) lookups
-                        let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
-
-                        // Collect into FxHashSet for O(1) membership testing (optimized for Value types with WyMix)
-                        let hash_set: ValueSet = values.into_iter().collect();
+                        // Single-column IN - use InHashSet for O(1) lookups.
+                        // A repeated non-correlated subquery reuses the
+                        // memoized shared set from the cache entry
+                        let is_non_correlated = ctx.outer_row().is_none()
+                            && !Self::is_subquery_correlated(&subquery.subquery)
+                            && ctx.transaction_id().is_none();
+                        let cached_set = if is_non_correlated {
+                            get_cached_in_subquery_set(&subquery.subquery.to_string())
+                        } else {
+                            None
+                        };
+                        let values_arc = match cached_set {
+                            Some(arc) => arc,
+                            None => {
+                                let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
+                                CompactArc::new(values.into_iter().collect::<ValueSet>())
+                            }
+                        };
 
                         // Use InHashSet with Arc for fast O(1) lookup per row
                         return Ok(Expression::InHashSet(InHashSetExpression {
                             token: in_expr.token.clone(),
                             column: Box::new(processed_left),
-                            values: CompactArc::new(hash_set),
+                            values: values_arc,
                             not: in_expr.not,
                         }));
                     }
@@ -1699,8 +1712,10 @@ impl Executor {
         let is_non_correlated =
             ctx.outer_row().is_none() && !Self::is_subquery_correlated(subquery);
 
-        // For non-correlated subqueries, check cache first using SQL string as key
-        let cache_key = if is_non_correlated {
+        // For non-correlated subqueries, check cache first using SQL string
+        // as key; bypassed inside explicit transactions (see
+        // execute_in_subquery for the ROLLBACK rationale)
+        let cache_key = if is_non_correlated && ctx.transaction_id().is_none() {
             let key = subquery.to_string();
             if let Some(cached_value) = get_cached_scalar_subquery(&key) {
                 return Ok(cached_value);
@@ -1810,8 +1825,11 @@ impl Executor {
         let is_non_correlated =
             ctx.outer_row().is_none() && !Self::is_subquery_correlated(subquery);
 
-        // For non-correlated subqueries, check cache first using SQL string as key
-        let cache_key = if is_non_correlated {
+        // For non-correlated subqueries, check cache first using SQL string
+        // as key. Inside an explicit transaction the caches are bypassed
+        // entirely: an in-transaction execution sees uncommitted rows, and
+        // caching that view would survive a ROLLBACK
+        let cache_key = if is_non_correlated && ctx.transaction_id().is_none() {
             let key = subquery.to_string();
             if let Some(cached_values) = get_cached_in_subquery(&key) {
                 return Ok(cached_values);
@@ -3037,9 +3055,14 @@ impl Executor {
         let cache_key =
             compute_semi_join_cache_key(&info.inner_table, &info.inner_column, pred_hash);
 
-        // Check cache first - return Arc directly (no clone needed)
-        if let Some(cached) = get_cached_semi_join(cache_key) {
-            return Ok(cached);
+        // Check cache first - return Arc directly (no clone needed).
+        // Bypassed inside explicit transactions (a cached in-transaction
+        // view would survive ROLLBACK)
+        let cacheable = ctx.transaction_id().is_none();
+        if cacheable {
+            if let Some(cached) = get_cached_semi_join(cache_key) {
+                return Ok(cached);
+            }
         }
 
         // Build SELECT inner_column FROM inner_table WHERE non_correlated_predicates
@@ -3110,11 +3133,13 @@ impl Executor {
         let hash_set_arc = CompactArc::new(hash_set);
 
         // Cache for subsequent calls within this query (CompactArc clone is cheap)
-        cache_semi_join_arc(
-            cache_key,
-            &info.inner_table,
-            CompactArc::clone(&hash_set_arc),
-        );
+        if cacheable {
+            cache_semi_join_arc(
+                cache_key,
+                &info.inner_table,
+                CompactArc::clone(&hash_set_arc),
+            );
+        }
 
         Ok(hash_set_arc)
     }
