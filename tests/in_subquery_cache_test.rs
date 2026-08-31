@@ -130,3 +130,44 @@ fn subquery_caches_not_poisoned_by_rollback() {
     let c: i64 = db.query_one(exists_sql, ()).unwrap();
     assert_eq!(c, 50, "semi-join cache poisoned by rolled-back delete");
 }
+
+#[test]
+fn in_index_fast_path_not_poisoned_by_rollback() {
+    let db = Database::open("memory://in_subq_idx_rollback").unwrap();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE inner_t (id INTEGER PRIMARY KEY, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..200i64 {
+        tx.execute("INSERT INTO users VALUES ($1, $2)", (i, i))
+            .unwrap();
+    }
+    for i in 0..50i64 {
+        tx.execute("INSERT INTO inner_t VALUES ($1, $2)", (i, i))
+            .unwrap();
+    }
+    tx.commit().unwrap();
+
+    // No aggregation: routes through the PK/index IN fast path
+    let sql = "SELECT id FROM users WHERE id IN (SELECT id FROM inner_t WHERE v >= 0)";
+    let rows = db.query(sql, ()).unwrap().collect_vec().unwrap();
+    assert_eq!(rows.len(), 50);
+
+    let mut tx = db.begin().unwrap();
+    tx.execute("INSERT INTO inner_t VALUES (100, 0)", ())
+        .unwrap();
+    let rows = tx.query(sql, ()).unwrap().collect_vec().unwrap();
+    assert_eq!(rows.len(), 51, "in-tx read sees own insert");
+    tx.rollback().unwrap();
+
+    let rows = db.query(sql, ()).unwrap().collect_vec().unwrap();
+    assert_eq!(
+        rows.len(),
+        50,
+        "index fast-path cache poisoned by rolled-back insert"
+    );
+}
