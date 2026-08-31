@@ -38,6 +38,9 @@ use std::cmp::Ordering;
 use crate::common::{CompactVec, StringMap};
 use crate::core::row_vec::RowVec;
 use crate::core::value::NULL_VALUE;
+
+/// Stack constant for COUNT(*) accumulation by reference
+const COUNT_ONE: Value = Value::Integer(1);
 use crate::core::{Error, Result, Row, Value};
 
 /// Type alias for partition keys - stack-allocated for common case (up to 4 columns)
@@ -587,7 +590,9 @@ impl Executor {
                                 .unwrap_or(NULL_VALUE);
                             ext_values.push(wf_value);
                         }
-                        let ext_row = Row::from_compact_vec(ext_values.clone());
+                        // Move the buffer into the row instead of cloning it; the
+                        // next iteration's extend refills a fresh one
+                        let ext_row = Row::from_compact_vec(std::mem::take(&mut ext_values));
 
                         if let Ok(ext_result_values) = eval.eval_all(&ext_row) {
                             for (eval_idx, (item_idx, _)) in ext_expr_items.iter().enumerate() {
@@ -814,7 +819,9 @@ impl Executor {
                                     .unwrap_or(NULL_VALUE);
                                 ext_values.push(wf_value);
                             }
-                            let ext_row = Row::from_compact_vec(ext_values.clone());
+                            // Move the buffer into the row instead of cloning it; the
+                            // next iteration's extend refills a fresh one
+                            let ext_row = Row::from_compact_vec(std::mem::take(&mut ext_values));
                             eval.eval(&ext_row)?
                         }
                     };
@@ -1025,7 +1032,9 @@ impl Executor {
                                     .unwrap_or(NULL_VALUE);
                                 ext_values.push(wf_value);
                             }
-                            let ext_row = Row::from_compact_vec(ext_values.clone());
+                            // Move the buffer into the row instead of cloning it; the
+                            // next iteration's extend refills a fresh one
+                            let ext_row = Row::from_compact_vec(std::mem::take(&mut ext_values));
                             eval.eval(&ext_row)?
                         }
                     };
@@ -1964,7 +1973,6 @@ impl Executor {
         skip_sorting: bool,
     ) -> Result<(Vec<Value>, Vec<usize>)> {
         // Suppress unused variable warnings - these are needed for compute_lead_lag, compute_ntile, etc.
-        let _ = columns;
 
         // Empty fallback for when no precomputed values are provided
         let empty_order_by = ColumnarOrderByValues {
@@ -1990,7 +1998,10 @@ impl Executor {
         // MEMORY OPTIMIZATION: Compute rank info directly from ColumnarOrderByValues
         // instead of cloning ORDER BY values into a Vec<Value>
         // This uses rows_equal() for O(n) comparison without allocating order_values
-        let is_rank_function = matches!(wf_info.name.as_str(), "RANK" | "DENSE_RANK");
+        let is_rank_function = matches!(
+            wf_info.name.as_str(),
+            "RANK" | "DENSE_RANK" | "PERCENT_RANK"
+        );
         let is_rank = wf_info.name == "RANK";
         let rank_info = if is_rank_function && !order_by_values.is_empty() {
             Self::precompute_rank_info_columnar(&row_indices, order_by_values)
@@ -2009,22 +2020,59 @@ impl Executor {
             vec![partition_len; partition_len]
         };
 
+        // Hoist constant window-function arguments out of the row loop:
+        // offsets and bucket counts compile against no columns; LEAD/LAG's
+        // default compiles once here and evaluates per row below
+        let is_lead_lag = matches!(wf_info.name.as_str(), "LEAD" | "LAG");
+        let lead_lag_offset = if is_lead_lag && wf_info.arguments.len() > 1 {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
+            match eval.eval_slice(&Row::new())? {
+                Value::Integer(n) => n as usize,
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        let mut lead_lag_default_eval = if is_lead_lag && wf_info.arguments.len() > 2 {
+            Some(ExpressionEval::compile(&wf_info.arguments[2], columns)?.with_context(ctx))
+        } else {
+            None
+        };
+        let ntile_buckets = if wf_info.name == "NTILE" && !wf_info.arguments.is_empty() {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[0], &[])?.with_context(ctx);
+            match eval.eval_slice(&Row::new())? {
+                Value::Integer(n) if n > 0 => n as usize,
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        let nth_value_n = if wf_info.name == "NTH_VALUE" && wf_info.arguments.len() > 1 {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
+            match eval.eval_slice(&Row::new())? {
+                Value::Integer(n) if n > 0 => Some(n as usize),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         for (i, &row_idx) in row_indices.iter().enumerate() {
             // Handle special functions
             let value = match wf_info.name.as_str() {
                 // MEMORY OPTIMIZATION: Access values directly from all_rows via indices
                 // instead of cloning into partition_values Vec
-                "LEAD" | "LAG" => self.compute_lead_lag_indexed(
-                    wf_info,
+                "LEAD" | "LAG" => Self::compute_lead_lag_indexed(
+                    wf_info.name == "LEAD",
+                    lead_lag_offset,
+                    &mut lead_lag_default_eval,
                     all_rows,
                     &row_indices,
                     arg_col_idx,
                     i,
                     &all_rows[row_idx].1,
-                    columns,
-                    ctx,
                 )?,
-                "NTILE" => self.compute_ntile(wf_info, row_indices.len(), i, ctx)?,
+                "NTILE" => Self::compute_ntile(ntile_buckets, row_indices.len(), i),
                 "RANK" | "DENSE_RANK" => Self::compute_rank_fast(is_rank, &rank_info, i),
                 "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                     // Compute frame bounds for navigation functions
@@ -2052,22 +2100,35 @@ impl Executor {
                             frame_start,
                             frame_end,
                         )?,
-                        "NTH_VALUE" => self.compute_nth_value_indexed(
-                            wf_info,
+                        "NTH_VALUE" => Self::compute_nth_value_indexed(
+                            nth_value_n,
                             all_rows,
                             &row_indices,
                             arg_col_idx,
                             frame_start,
                             frame_end,
-                            ctx,
-                        )?,
+                        ),
                         _ => unreachable!(),
                     }
                 }
                 "PERCENT_RANK" => {
-                    self.compute_percent_rank_columnar(order_by_values, &row_indices, i)?
+                    // (rank - 1) / (n - 1) with rank from the O(n) precompute
+                    if partition_len <= 1 {
+                        Value::Float(0.0)
+                    } else {
+                        let rank = rank_info.get(i).map(|&(gs, _)| gs + 1).unwrap_or(1);
+                        Value::Float((rank - 1) as f64 / (partition_len - 1) as f64)
+                    }
                 }
-                "CUME_DIST" => self.compute_cume_dist_columnar(order_by_values, &row_indices, i)?,
+                "CUME_DIST" => {
+                    // peer-group end / n from the O(n) precompute
+                    if partition_len == 0 {
+                        Value::Float(1.0)
+                    } else {
+                        let end = peer_group_ends.get(i).copied().unwrap_or(partition_len);
+                        Value::Float(end as f64 / partition_len as f64)
+                    }
+                }
                 _ => {
                     // ROW_NUMBER and other simple functions - no values needed
                     window_func.process(&[], &[], i)?
@@ -2097,8 +2158,6 @@ impl Executor {
         ctx: &ExecutionContext,
         results: &mut [Value],
     ) -> Result<()> {
-        let _ = columns;
-
         // Empty fallback for when no precomputed values are provided
         let empty_order_by = ColumnarOrderByValues {
             columns: vec![],
@@ -2121,7 +2180,10 @@ impl Executor {
         };
 
         // Compute rank info for RANK/DENSE_RANK
-        let is_rank_function = matches!(wf_info.name.as_str(), "RANK" | "DENSE_RANK");
+        let is_rank_function = matches!(
+            wf_info.name.as_str(),
+            "RANK" | "DENSE_RANK" | "PERCENT_RANK"
+        );
         let is_rank = wf_info.name == "RANK";
         let rank_info = if is_rank_function && !order_by_values.is_empty() {
             Self::precompute_rank_info_columnar(&row_indices, order_by_values)
@@ -2138,20 +2200,57 @@ impl Executor {
             vec![partition_len; partition_len]
         };
 
+        // Hoist constant window-function arguments out of the row loop:
+        // offsets and bucket counts compile against no columns; LEAD/LAG's
+        // default compiles once here and evaluates per row below
+        let is_lead_lag = matches!(wf_info.name.as_str(), "LEAD" | "LAG");
+        let lead_lag_offset = if is_lead_lag && wf_info.arguments.len() > 1 {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
+            match eval.eval_slice(&Row::new())? {
+                Value::Integer(n) => n as usize,
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        let mut lead_lag_default_eval = if is_lead_lag && wf_info.arguments.len() > 2 {
+            Some(ExpressionEval::compile(&wf_info.arguments[2], columns)?.with_context(ctx))
+        } else {
+            None
+        };
+        let ntile_buckets = if wf_info.name == "NTILE" && !wf_info.arguments.is_empty() {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[0], &[])?.with_context(ctx);
+            match eval.eval_slice(&Row::new())? {
+                Value::Integer(n) if n > 0 => n as usize,
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        let nth_value_n = if wf_info.name == "NTH_VALUE" && wf_info.arguments.len() > 1 {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
+            match eval.eval_slice(&Row::new())? {
+                Value::Integer(n) if n > 0 => Some(n as usize),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         // Compute and write directly to results array
         for (i, &row_idx) in row_indices.iter().enumerate() {
             let value = match wf_info.name.as_str() {
-                "LEAD" | "LAG" => self.compute_lead_lag_indexed(
-                    wf_info,
+                "LEAD" | "LAG" => Self::compute_lead_lag_indexed(
+                    wf_info.name == "LEAD",
+                    lead_lag_offset,
+                    &mut lead_lag_default_eval,
                     all_rows,
                     &row_indices,
                     arg_col_idx,
                     i,
                     &all_rows[row_idx].1,
-                    columns,
-                    ctx,
                 )?,
-                "NTILE" => self.compute_ntile(wf_info, partition_len, i, ctx)?,
+                "NTILE" => Self::compute_ntile(ntile_buckets, partition_len, i),
                 "RANK" | "DENSE_RANK" => Self::compute_rank_fast(is_rank, &rank_info, i),
                 "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                     let peer_end = if i < peer_group_ends.len() {
@@ -2176,22 +2275,35 @@ impl Executor {
                             frame_start,
                             frame_end,
                         )?,
-                        "NTH_VALUE" => self.compute_nth_value_indexed(
-                            wf_info,
+                        "NTH_VALUE" => Self::compute_nth_value_indexed(
+                            nth_value_n,
                             all_rows,
                             &row_indices,
                             arg_col_idx,
                             frame_start,
                             frame_end,
-                            ctx,
-                        )?,
+                        ),
                         _ => unreachable!(),
                     }
                 }
                 "PERCENT_RANK" => {
-                    self.compute_percent_rank_columnar(order_by_values, &row_indices, i)?
+                    // (rank - 1) / (n - 1) with rank from the O(n) precompute
+                    if partition_len <= 1 {
+                        Value::Float(0.0)
+                    } else {
+                        let rank = rank_info.get(i).map(|&(gs, _)| gs + 1).unwrap_or(1);
+                        Value::Float((rank - 1) as f64 / (partition_len - 1) as f64)
+                    }
                 }
-                "CUME_DIST" => self.compute_cume_dist_columnar(order_by_values, &row_indices, i)?,
+                "CUME_DIST" => {
+                    // peer-group end / n from the O(n) precompute
+                    if partition_len == 0 {
+                        Value::Float(1.0)
+                    } else {
+                        let end = peer_group_ends.get(i).copied().unwrap_or(partition_len);
+                        Value::Float(end as f64 / partition_len as f64)
+                    }
+                }
                 _ => {
                     // ROW_NUMBER and other simple functions - no values needed
                     window_func.process(&[], &[], i)?
@@ -2222,8 +2334,6 @@ impl Executor {
         ctx: &ExecutionContext,
         results: &ParallelVec,
     ) -> Result<()> {
-        let _ = columns;
-
         // Empty fallback for when no precomputed values are provided
         let empty_order_by = ColumnarOrderByValues {
             columns: vec![],
@@ -2246,7 +2356,10 @@ impl Executor {
         };
 
         // Compute rank info for RANK/DENSE_RANK
-        let is_rank_function = matches!(wf_info.name.as_str(), "RANK" | "DENSE_RANK");
+        let is_rank_function = matches!(
+            wf_info.name.as_str(),
+            "RANK" | "DENSE_RANK" | "PERCENT_RANK"
+        );
         let is_rank = wf_info.name == "RANK";
         let rank_info = if is_rank_function && !order_by_values.is_empty() {
             Self::precompute_rank_info_columnar(&row_indices, order_by_values)
@@ -2263,20 +2376,57 @@ impl Executor {
             vec![partition_len; partition_len]
         };
 
+        // Hoist constant window-function arguments out of the row loop:
+        // offsets and bucket counts compile against no columns; LEAD/LAG's
+        // default compiles once here and evaluates per row below
+        let is_lead_lag = matches!(wf_info.name.as_str(), "LEAD" | "LAG");
+        let lead_lag_offset = if is_lead_lag && wf_info.arguments.len() > 1 {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
+            match eval.eval_slice(&Row::new())? {
+                Value::Integer(n) => n as usize,
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        let mut lead_lag_default_eval = if is_lead_lag && wf_info.arguments.len() > 2 {
+            Some(ExpressionEval::compile(&wf_info.arguments[2], columns)?.with_context(ctx))
+        } else {
+            None
+        };
+        let ntile_buckets = if wf_info.name == "NTILE" && !wf_info.arguments.is_empty() {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[0], &[])?.with_context(ctx);
+            match eval.eval_slice(&Row::new())? {
+                Value::Integer(n) if n > 0 => n as usize,
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        let nth_value_n = if wf_info.name == "NTH_VALUE" && wf_info.arguments.len() > 1 {
+            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
+            match eval.eval_slice(&Row::new())? {
+                Value::Integer(n) if n > 0 => Some(n as usize),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         // Compute and write directly using ParallelVec
         for (i, &row_idx) in row_indices.iter().enumerate() {
             let value = match wf_info.name.as_str() {
-                "LEAD" | "LAG" => self.compute_lead_lag_indexed(
-                    wf_info,
+                "LEAD" | "LAG" => Self::compute_lead_lag_indexed(
+                    wf_info.name == "LEAD",
+                    lead_lag_offset,
+                    &mut lead_lag_default_eval,
                     all_rows,
                     &row_indices,
                     arg_col_idx,
                     i,
                     &all_rows[row_idx].1,
-                    columns,
-                    ctx,
                 )?,
-                "NTILE" => self.compute_ntile(wf_info, partition_len, i, ctx)?,
+                "NTILE" => Self::compute_ntile(ntile_buckets, partition_len, i),
                 "RANK" | "DENSE_RANK" => Self::compute_rank_fast(is_rank, &rank_info, i),
                 "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                     let peer_end = if i < peer_group_ends.len() {
@@ -2301,22 +2451,35 @@ impl Executor {
                             frame_start,
                             frame_end,
                         )?,
-                        "NTH_VALUE" => self.compute_nth_value_indexed(
-                            wf_info,
+                        "NTH_VALUE" => Self::compute_nth_value_indexed(
+                            nth_value_n,
                             all_rows,
                             &row_indices,
                             arg_col_idx,
                             frame_start,
                             frame_end,
-                            ctx,
-                        )?,
+                        ),
                         _ => unreachable!(),
                     }
                 }
                 "PERCENT_RANK" => {
-                    self.compute_percent_rank_columnar(order_by_values, &row_indices, i)?
+                    // (rank - 1) / (n - 1) with rank from the O(n) precompute
+                    if partition_len <= 1 {
+                        Value::Float(0.0)
+                    } else {
+                        let rank = rank_info.get(i).map(|&(gs, _)| gs + 1).unwrap_or(1);
+                        Value::Float((rank - 1) as f64 / (partition_len - 1) as f64)
+                    }
                 }
-                "CUME_DIST" => self.compute_cume_dist_columnar(order_by_values, &row_indices, i)?,
+                "CUME_DIST" => {
+                    // peer-group end / n from the O(n) precompute
+                    if partition_len == 0 {
+                        Value::Float(1.0)
+                    } else {
+                        let end = peer_group_ends.get(i).copied().unwrap_or(partition_len);
+                        Value::Float(end as f64 / partition_len as f64)
+                    }
+                }
                 _ => {
                     // ROW_NUMBER and other simple functions - no values needed
                     window_func.process(&[], &[], i)?
@@ -2388,41 +2551,29 @@ impl Executor {
         ends
     }
 
-    /// Compute LEAD or LAG using index-based access (no cloning)
+    /// Compute LEAD or LAG using index-based access (no cloning).
+    /// The offset is pre-resolved and the default expression pre-compiled
+    /// by the caller; the default still evaluates per row because it can
+    /// reference row columns.
     #[allow(clippy::too_many_arguments)]
     fn compute_lead_lag_indexed(
-        &self,
-        wf_info: &WindowFunctionInfo,
+        is_lead: bool,
+        offset: usize,
+        default_eval: &mut Option<ExpressionEval>,
         all_rows: &[(i64, Row)],
         sorted_indices: &[usize],
         arg_col_idx: Option<usize>,
         current_pos: usize,
         current_row_data: &Row,
-        columns: &[String],
-        ctx: &ExecutionContext,
     ) -> Result<Value> {
-        // Get offset (default 1)
-        let offset = if wf_info.arguments.len() > 1 {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) => n as usize,
-                _ => 1,
-            }
-        } else {
-            1
-        };
-
-        // Get default value - use current row context for column references
-        let default_value = if wf_info.arguments.len() > 2 {
-            let mut eval =
-                ExpressionEval::compile(&wf_info.arguments[2], columns)?.with_context(ctx);
-            eval.eval(current_row_data)?
-        } else {
-            Value::null_unknown()
+        // Evaluated unconditionally to preserve error semantics
+        let default_value = match default_eval {
+            Some(eval) => eval.eval(current_row_data)?,
+            None => Value::null_unknown(),
         };
 
         // Calculate target position in sorted order
-        let target_pos = if wf_info.name == "LEAD" {
+        let target_pos = if is_lead {
             current_pos.checked_add(offset)
         } else {
             // LAG
@@ -2495,133 +2646,44 @@ impl Executor {
         }
     }
 
-    /// Compute NTH_VALUE using index-based access (no cloning)
-    #[allow(clippy::too_many_arguments)]
+    /// Compute NTH_VALUE using index-based access (no cloning); n is
+    /// pre-resolved by the caller (None when absent or not a positive int)
     fn compute_nth_value_indexed(
-        &self,
-        wf_info: &WindowFunctionInfo,
+        n: Option<usize>,
         all_rows: &[(i64, Row)],
         sorted_indices: &[usize],
         arg_col_idx: Option<usize>,
         frame_start: usize,
         frame_end: usize,
-        ctx: &ExecutionContext,
-    ) -> Result<Value> {
+    ) -> Value {
         if frame_start >= frame_end {
-            return Ok(Value::null_unknown());
+            return Value::null_unknown();
         }
-
-        // Get n (1-indexed position) from second argument
-        let n = if wf_info.arguments.len() > 1 {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[1], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) if n > 0 => n as usize,
-                _ => return Ok(Value::null_unknown()),
-            }
-        } else {
-            return Ok(Value::null_unknown());
+        let Some(n) = n else {
+            return Value::null_unknown();
         };
 
         // n is 1-indexed within the frame
         let frame_len = frame_end - frame_start;
         if n > frame_len {
-            return Ok(Value::null_unknown());
+            return Value::null_unknown();
         }
 
         let pos_in_frame = n - 1;
         let row_idx = sorted_indices[frame_start + pos_in_frame];
         if let Some(col_idx) = arg_col_idx {
-            Ok(all_rows[row_idx]
+            all_rows[row_idx]
                 .1
                 .get(col_idx)
                 .cloned()
-                .unwrap_or_else(Value::null_unknown))
+                .unwrap_or_else(Value::null_unknown)
         } else {
-            Ok(Value::null_unknown())
+            Value::null_unknown()
         }
     }
 
-    /// Compute PERCENT_RANK using ColumnarOrderByValues (no cloning)
-    /// PERCENT_RANK = (rank - 1) / (total_rows - 1)
-    fn compute_percent_rank_columnar(
-        &self,
-        order_by: &ColumnarOrderByValues,
-        sorted_indices: &[usize],
-        current_pos: usize,
-    ) -> Result<Value> {
-        let n = sorted_indices.len();
-        if n <= 1 {
-            return Ok(Value::Float(0.0));
-        }
-
-        // Find rank by counting how many preceding rows have different ORDER BY value
-        let mut rank = 1usize;
-        for i in 0..current_pos {
-            if i == 0 || !order_by.rows_equal(sorted_indices[i - 1], sorted_indices[i]) {
-                // New group - this row gets a new rank
-                if i < current_pos
-                    && !order_by.rows_equal(sorted_indices[i], sorted_indices[current_pos])
-                {
-                    rank = i + 1;
-                }
-            }
-        }
-        // Find actual rank of current row (position of first row with same ORDER BY value)
-        for i in 0..=current_pos {
-            if order_by.rows_equal(sorted_indices[i], sorted_indices[current_pos]) {
-                rank = i + 1;
-                break;
-            }
-        }
-
-        Ok(Value::Float((rank - 1) as f64 / (n - 1) as f64))
-    }
-
-    /// Compute CUME_DIST using ColumnarOrderByValues (no cloning)
-    /// CUME_DIST = (number of rows with value <= current) / total_rows
-    fn compute_cume_dist_columnar(
-        &self,
-        order_by: &ColumnarOrderByValues,
-        sorted_indices: &[usize],
-        current_pos: usize,
-    ) -> Result<Value> {
-        let n = sorted_indices.len();
-        if n == 0 {
-            return Ok(Value::Float(1.0));
-        }
-
-        // Find how many rows have ORDER BY value <= current (i.e., last row with same value)
-        let mut count = current_pos + 1;
-        for i in (current_pos + 1)..n {
-            if order_by.rows_equal(sorted_indices[current_pos], sorted_indices[i]) {
-                count = i + 1;
-            } else {
-                break;
-            }
-        }
-
-        Ok(Value::Float(count as f64 / n as f64))
-    }
-
-    /// Compute NTILE function
-    fn compute_ntile(
-        &self,
-        wf_info: &WindowFunctionInfo,
-        partition_size: usize,
-        current_row: usize,
-        ctx: &ExecutionContext,
-    ) -> Result<Value> {
-        // Get n (number of buckets)
-        let n = if !wf_info.arguments.is_empty() {
-            let mut eval = ExpressionEval::compile(&wf_info.arguments[0], &[])?.with_context(ctx);
-            match eval.eval_slice(&Row::new())? {
-                Value::Integer(n) if n > 0 => n as usize,
-                _ => 1,
-            }
-        } else {
-            1
-        };
-
+    /// Compute NTILE function; the bucket count is pre-resolved by the caller
+    fn compute_ntile(n: usize, partition_size: usize, current_row: usize) -> Value {
         // NTILE divides rows into n buckets as evenly as possible.
         // If partition_size doesn't divide evenly by n, the first (partition_size % n)
         // buckets get one extra row.
@@ -2635,7 +2697,7 @@ impl Executor {
 
         if n >= partition_size {
             // More buckets than rows - each row gets its own bucket
-            return Ok(Value::Integer((current_row + 1).min(n) as i64));
+            return Value::Integer((current_row + 1).min(n) as i64);
         }
 
         let base_size = partition_size / n;
@@ -2654,7 +2716,7 @@ impl Executor {
             remainder + row_in_smaller_section / base_size + 1
         };
 
-        Ok(Value::Integer(bucket as i64))
+        Value::Integer(bucket as i64)
     }
 
     /// Compute RANK or DENSE_RANK function using precomputed rank info.
@@ -3490,18 +3552,16 @@ impl Executor {
 
                         // Accumulate only the new values since prev_end
                         for j in prev_end..frame_end {
-                            let value = if let Some(col_idx) = arg_col_idx {
-                                rows[row_indices[j]]
-                                    .1
-                                    .get(col_idx)
-                                    .cloned()
-                                    .unwrap_or_else(Value::null_unknown)
+                            // Bind by reference: accumulate clones
+                            // internally only when it retains the value
+                            let value: &Value = if let Some(col_idx) = arg_col_idx {
+                                rows[row_indices[j]].1.get(col_idx).unwrap_or(&NULL_VALUE)
                             } else if has_expression_arg {
-                                expression_values[row_indices[j]].clone()
+                                &expression_values[row_indices[j]]
                             } else {
-                                Value::Integer(1)
+                                &COUNT_ONE
                             };
-                            agg_func.accumulate(&value, false);
+                            agg_func.accumulate(value, false);
                         }
                         if frame_end > prev_end {
                             prev_end = frame_end;
@@ -3728,20 +3788,18 @@ impl Executor {
 
                         // Accumulate values within the frame
                         for &idx in &row_indices[frame_start..frame_end] {
-                            let value = if let Some(col_idx) = arg_col_idx {
-                                rows[idx]
-                                    .1
-                                    .get(col_idx)
-                                    .cloned()
-                                    .unwrap_or_else(Value::null_unknown)
+                            // Bind by reference: accumulate clones
+                            // internally only when it retains the value
+                            let value: &Value = if let Some(col_idx) = arg_col_idx {
+                                rows[idx].1.get(col_idx).unwrap_or(&NULL_VALUE)
                             } else if has_expression_arg {
                                 // Expression argument (e.g., val * 2) - use pre-computed value
-                                expression_values[idx].clone()
+                                &expression_values[idx]
                             } else {
                                 // COUNT(*) counts all rows
-                                Value::Integer(1)
+                                &COUNT_ONE
                             };
-                            agg_func.accumulate(&value, wf_info.is_distinct);
+                            agg_func.accumulate(value, wf_info.is_distinct);
                         }
                         results[row_idx] = Some(agg_func.result());
                     }
@@ -3757,20 +3815,18 @@ impl Executor {
 
                 // Accumulate all values in the partition
                 for &row_idx in &row_indices {
-                    let value = if let Some(col_idx) = arg_col_idx {
-                        rows[row_idx]
-                            .1
-                            .get(col_idx)
-                            .cloned()
-                            .unwrap_or_else(Value::null_unknown)
+                    // Bind by reference: accumulate clones internally only
+                    // when it retains the value
+                    let value: &Value = if let Some(col_idx) = arg_col_idx {
+                        rows[row_idx].1.get(col_idx).unwrap_or(&NULL_VALUE)
                     } else if has_expression_arg {
                         // Expression argument (e.g., val * 2) - use pre-computed value
-                        expression_values[row_idx].clone()
+                        &expression_values[row_idx]
                     } else {
                         // COUNT(*) counts all rows
-                        Value::Integer(1)
+                        &COUNT_ONE
                     };
-                    agg_func.accumulate(&value, wf_info.is_distinct);
+                    agg_func.accumulate(value, wf_info.is_distinct);
                 }
                 let aggregate_result = agg_func.result();
 
