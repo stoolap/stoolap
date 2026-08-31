@@ -491,7 +491,9 @@ impl HashJoinOperator {
             JoinSide::Left => self.left_col_count,
             JoinSide::Right => self.right_col_count,
         };
-        let row = Row::from_values(vec![NULL_VALUE; count]);
+        // Shared storage: every later clone is an Arc bump, not a
+        // CompactVec allocation per unmatched row
+        let row = Row::from_values(vec![NULL_VALUE; count]).into_shared();
         self.cached_null_build = Some(row.clone());
         row
     }
@@ -507,7 +509,7 @@ impl HashJoinOperator {
             JoinSide::Left => self.right_col_count,
             JoinSide::Right => self.left_col_count,
         };
-        let row = Row::from_values(vec![NULL_VALUE; count]);
+        let row = Row::from_values(vec![NULL_VALUE; count]).into_shared();
         self.cached_null_probe = Some(row.clone());
         row
     }
@@ -604,8 +606,9 @@ impl Operator for HashJoinOperator {
             JoinSide::Right => &mut self.right,
         };
 
-        // Collect all build rows
-        let mut build_rows = Vec::new();
+        // Collect all build rows, pre-sized from the operator's estimate
+        // to avoid doubling reallocation on materialized inputs
+        let mut build_rows = Vec::with_capacity(build_op.estimated_rows().unwrap_or(0));
         while let Some(row_ref) = build_op.next()? {
             build_rows.push(row_ref.into_owned());
         }

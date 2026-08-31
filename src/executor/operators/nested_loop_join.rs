@@ -23,7 +23,7 @@
 //! Despite its higher complexity, it supports all join conditions and types.
 
 use crate::core::value::NULL_VALUE;
-use crate::core::{Result, Row, Value};
+use crate::core::{Result, Row};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::functions::registry::global_registry;
@@ -68,8 +68,8 @@ pub struct NestedLoopJoinOperator {
     unmatched_right_idx: usize,
 
     // Cached null rows for OUTER joins (avoid repeated allocation)
-    cached_null_right: Vec<Value>,
-    cached_null_left: Vec<Value>,
+    cached_null_right: Row,
+    cached_null_left: Row,
 
     // State tracking
     opened: bool,
@@ -114,8 +114,8 @@ impl NestedLoopJoinOperator {
             right_matched: Vec::new(),
             returning_unmatched_right: false,
             unmatched_right_idx: 0,
-            cached_null_right: Vec::new(), // Initialized in open()
-            cached_null_left: Vec::new(),  // Initialized in open()
+            cached_null_right: Row::new(), // Initialized in open()
+            cached_null_left: Row::new(),  // Initialized in open()
             opened: false,
             left_exhausted: false,
         }
@@ -124,13 +124,13 @@ impl NestedLoopJoinOperator {
     /// Create a NULL row for the left side (uses cached values).
     #[inline]
     fn null_left_row(&self) -> Row {
-        Row::from_values(self.cached_null_left.clone())
+        self.cached_null_left.clone()
     }
 
     /// Create a NULL row for the right side (uses cached values).
     #[inline]
     fn null_right_row(&self) -> Row {
-        Row::from_values(self.cached_null_right.clone())
+        self.cached_null_right.clone()
     }
 
     /// Combine left and right rows into output row.
@@ -169,8 +169,10 @@ impl Operator for NestedLoopJoinOperator {
             self.join_type,
             JoinType::Left | JoinType::Right | JoinType::Full
         ) {
-            self.cached_null_right = vec![NULL_VALUE; self.right_col_count];
-            self.cached_null_left = vec![NULL_VALUE; self.left_col_count];
+            self.cached_null_right =
+                Row::from_values(vec![NULL_VALUE; self.right_col_count]).into_shared();
+            self.cached_null_left =
+                Row::from_values(vec![NULL_VALUE; self.left_col_count]).into_shared();
         }
 
         // Build column names for filter compilation
@@ -353,6 +355,7 @@ impl Operator for NestedLoopJoinOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Value;
     use crate::executor::operator::MaterializedOperator;
     use crate::parser::ast::{Identifier, InfixExpression};
     use crate::parser::token::{Position, Token, TokenType};

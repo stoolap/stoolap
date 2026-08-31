@@ -23,7 +23,7 @@
 use std::cmp::Ordering;
 
 use crate::core::value::NULL_VALUE;
-use crate::core::{Result, Row, Value};
+use crate::core::{Result, Row};
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::executor::utils::compare_values;
 
@@ -73,8 +73,8 @@ pub struct MergeJoinOperator {
     unmatched_right_idx: usize,
 
     // Cached null rows for OUTER joins (avoid repeated allocation)
-    cached_null_left: Vec<Value>,
-    cached_null_right: Vec<Value>,
+    cached_null_left: Row,
+    cached_null_right: Row,
 
     // State
     opened: bool,
@@ -136,8 +136,8 @@ impl MergeJoinOperator {
             right_matched: Vec::new(),
             returning_unmatched_right: false,
             unmatched_right_idx: 0,
-            cached_null_left: Vec::new(),  // Initialized in open()
-            cached_null_right: Vec::new(), // Initialized in open()
+            cached_null_left: Row::new(),  // Initialized in open()
+            cached_null_right: Row::new(), // Initialized in open()
             opened: false,
         }
     }
@@ -149,21 +149,17 @@ impl MergeJoinOperator {
             .iter()
             .zip(self.right_key_indices.iter())
         {
-            let lv = left.get(*li).cloned().unwrap_or(NULL_VALUE);
-            let rv = right.get(*ri).cloned().unwrap_or(NULL_VALUE);
+            // Compare by reference; a missing index counts as NULL
+            let lv = left.get(*li).filter(|v| !v.is_null());
+            let rv = right.get(*ri).filter(|v| !v.is_null());
 
             // NULL comparison: NULLs sort last
-            if lv.is_null() && rv.is_null() {
-                continue;
-            }
-            if lv.is_null() {
-                return Ordering::Greater;
-            }
-            if rv.is_null() {
-                return Ordering::Less;
-            }
-
-            let cmp = compare_values(&lv, &rv);
+            let cmp = match (lv, rv) {
+                (None, None) => continue,
+                (None, Some(_)) => return Ordering::Greater,
+                (Some(_), None) => return Ordering::Less,
+                (Some(l), Some(r)) => compare_values(l, r),
+            };
             if cmp != Ordering::Equal {
                 return cmp;
             }
@@ -181,20 +177,16 @@ impl MergeJoinOperator {
     /// Compare two rows from the same side on their keys.
     fn compare_same_side(&self, row1: &Row, row2: &Row, key_indices: &[usize]) -> Ordering {
         for &idx in key_indices {
-            let v1 = row1.get(idx).cloned().unwrap_or(NULL_VALUE);
-            let v2 = row2.get(idx).cloned().unwrap_or(NULL_VALUE);
+            // Compare by reference; a missing index counts as NULL
+            let v1 = row1.get(idx).filter(|v| !v.is_null());
+            let v2 = row2.get(idx).filter(|v| !v.is_null());
 
-            if v1.is_null() && v2.is_null() {
-                continue;
-            }
-            if v1.is_null() {
-                return Ordering::Greater;
-            }
-            if v2.is_null() {
-                return Ordering::Less;
-            }
-
-            let cmp = compare_values(&v1, &v2);
+            let cmp = match (v1, v2) {
+                (None, None) => continue,
+                (None, Some(_)) => return Ordering::Greater,
+                (Some(_), None) => return Ordering::Less,
+                (Some(a), Some(b)) => compare_values(a, b),
+            };
             if cmp != Ordering::Equal {
                 return cmp;
             }
@@ -205,13 +197,14 @@ impl MergeJoinOperator {
     /// Create a NULL row for the left side (uses cached values).
     #[inline]
     fn null_left_row(&self) -> Row {
-        Row::from_values(self.cached_null_left.clone())
+        // Shared storage: clone is an Arc bump
+        self.cached_null_left.clone()
     }
 
     /// Create a NULL row for the right side (uses cached values).
     #[inline]
     fn null_right_row(&self) -> Row {
-        Row::from_values(self.cached_null_right.clone())
+        self.cached_null_right.clone()
     }
 
     /// Combine left and right rows into output row.
@@ -233,8 +226,10 @@ impl Operator for MergeJoinOperator {
             self.join_type,
             JoinType::Left | JoinType::Right | JoinType::Full
         ) {
-            self.cached_null_left = vec![NULL_VALUE; self.left_col_count];
-            self.cached_null_right = vec![NULL_VALUE; self.right_col_count];
+            self.cached_null_left =
+                Row::from_values(vec![NULL_VALUE; self.left_col_count]).into_shared();
+            self.cached_null_right =
+                Row::from_values(vec![NULL_VALUE; self.right_col_count]).into_shared();
         }
 
         // Materialize left
@@ -467,6 +462,7 @@ impl Operator for MergeJoinOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Value;
     use crate::executor::operator::MaterializedOperator;
 
     fn make_rows(data: Vec<Vec<i64>>) -> Vec<Row> {
