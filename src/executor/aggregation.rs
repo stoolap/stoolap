@@ -995,12 +995,20 @@ impl Executor {
         let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
             FxHashMap::with_capacity_and_hasher(estimated_entries, Default::default());
 
+        // Pre-compile plain expression sources once for the row loop
+        let source_programs: Vec<Option<super::expression::SharedProgram>> = column_sources
+            .iter()
+            .map(|s| match s {
+                ColumnSource::Expression(expr) => evaluator.compile_cached(expr).ok(),
+                _ => None,
+            })
+            .collect();
+
         for (id, row) in agg_rows {
             // Use CompactVec directly to avoid Vec→CompactVec conversion
             let mut new_values: CompactVec<Value> = CompactVec::with_capacity(column_sources.len());
-            evaluator.set_row_array(&row);
 
-            for source in &column_sources {
+            for (src_idx, source) in column_sources.iter().enumerate() {
                 let value = match source {
                     ColumnSource::AggColumn(col_name) => {
                         if let Some(&idx) = agg_col_index_map.get(col_name) {
@@ -1009,10 +1017,12 @@ impl Executor {
                             Value::null_unknown()
                         }
                     }
-                    ColumnSource::Expression(expr) => {
-                        // Evaluate the expression using the aggregated row as context
-                        evaluator.evaluate(expr).unwrap_or(Value::null_unknown())
-                    }
+                    ColumnSource::Expression(_) => match &source_programs[src_idx] {
+                        Some(p) => evaluator
+                            .evaluate_program(p, &row)
+                            .unwrap_or(Value::null_unknown()),
+                        None => Value::null_unknown(),
+                    },
                     ColumnSource::CorrelatedExpression(expr) => {
                         // Build outer row context using pre-computed column names
                         outer_row_map.clear();
