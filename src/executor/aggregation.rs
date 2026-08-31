@@ -31,7 +31,7 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 // SmallVec removed - Vec is faster due to spilled() check overhead in hot loops
 
 use crate::common::{CompactArc, CompactVec, I64Map, StringMap};
-use crate::core::{Result, Row, RowVec, Value, ValueMap};
+use crate::core::{Result, Row, RowVec, Value};
 use crate::functions::aggregate::CompiledAggregate;
 use crate::functions::AggregateFunction;
 use crate::parser::ast::*;
@@ -544,58 +544,71 @@ impl Executor {
             // No hidden aggregates - move data directly (no clone)
             self.apply_post_aggregation_expressions(stmt, ctx, having_columns, having_rows)?
         } else {
-            // Hidden aggregates exist - need to clone to preserve original for later use
+            // Hidden aggregates exist: extract only the needed columns
+            // up front, then move the aggregated rows instead of cloning
+            // the whole result set
             let having_col_index_map = build_column_index_map(&having_columns);
-            let (mut cols, mut rows) = self.apply_post_aggregation_expressions(
-                stmt,
-                ctx,
-                having_columns.clone(),
-                having_rows.clone(),
-            )?;
+            let by_index: Vec<(String, Vec<Value>)> = hidden_aggs
+                .iter()
+                .map(|(agg_idx, agg)| {
+                    let having_idx = group_by_count + agg_idx;
+                    let values = having_rows
+                        .iter()
+                        .map(|(_, row)| {
+                            row.get(having_idx)
+                                .cloned()
+                                .unwrap_or_else(Value::null_unknown)
+                        })
+                        .collect();
+                    (agg.get_column_name(), values)
+                })
+                .collect();
+            // Name-based fallback buffers (aggregate deduplicated but
+            // still marked hidden)
+            let by_name: Vec<(String, Vec<Value>)> = hidden_aggs
+                .iter()
+                .filter_map(|(_, agg)| {
+                    let col_name = agg.get_column_name();
+                    having_col_index_map
+                        .get(&col_name.to_lowercase())
+                        .map(|&idx| {
+                            let values = having_rows
+                                .iter()
+                                .map(|(_, row)| {
+                                    row.get(idx).cloned().unwrap_or_else(Value::null_unknown)
+                                })
+                                .collect();
+                            (col_name, values)
+                        })
+                })
+                .collect();
+
+            let (mut cols, mut rows) =
+                self.apply_post_aggregation_expressions(stmt, ctx, having_columns, having_rows)?;
 
             // Append hidden aggregates to the result for ORDER BY to use
-            for (agg_idx, agg) in &hidden_aggs {
-                // Get the column name for this aggregate
-                let col_name = agg.get_column_name();
-                cols.push(col_name.clone());
-
-                // Find the index in having_columns (group_by_count + aggregate index)
-                let having_idx = group_by_count + agg_idx;
-
-                // Append the value from each row
+            for (col_name, values) in by_index {
+                cols.push(col_name);
                 for (row_idx, (_, row)) in rows.iter_mut().enumerate() {
-                    if let Some((_, having_row)) = having_rows.get(row_idx) {
-                        if let Some(val) = having_row.get(having_idx) {
-                            row.push(val.clone());
-                        } else {
-                            row.push(Value::null_unknown());
-                        }
-                    } else {
-                        row.push(Value::null_unknown());
-                    }
+                    row.push(
+                        values
+                            .get(row_idx)
+                            .cloned()
+                            .unwrap_or_else(Value::null_unknown),
+                    );
                 }
             }
-
-            // Also try to find by column name in case index doesn't match
-            // (This handles cases where aggregate was deduplicated but still marked hidden)
-            for (_, agg) in &hidden_aggs {
-                let col_name = agg.get_column_name();
-                let col_lower = col_name.to_lowercase();
-                if let Some(&idx) = having_col_index_map.get(&col_lower) {
-                    // Only add if not already added by index
-                    if !cols.iter().any(|c| c.eq_ignore_ascii_case(&col_name)) {
-                        cols.push(col_name);
-                        for (row_idx, (_, row)) in rows.iter_mut().enumerate() {
-                            if let Some((_, having_row)) = having_rows.get(row_idx) {
-                                if let Some(val) = having_row.get(idx) {
-                                    row.push(val.clone());
-                                } else {
-                                    row.push(Value::null_unknown());
-                                }
-                            } else {
-                                row.push(Value::null_unknown());
-                            }
-                        }
+            for (col_name, values) in by_name {
+                // Only add if not already added by index
+                if !cols.iter().any(|c| c.eq_ignore_ascii_case(&col_name)) {
+                    cols.push(col_name);
+                    for (row_idx, (_, row)) in rows.iter_mut().enumerate() {
+                        row.push(
+                            values
+                                .get(row_idx)
+                                .cloned()
+                                .unwrap_or_else(Value::null_unknown),
+                        );
                     }
                 }
             }
@@ -3628,152 +3641,58 @@ impl Executor {
                 })
                 .collect();
 
-            // OPTIMIZATION: Single-column GROUP BY uses direct hash map (no Vec<Value> overhead)
-            if column_indices.len() == 1 {
-                let col_idx = column_indices[0];
-                // Use ValueMap for Value keys (HashDoS resistant with AHash)
-                let mut single_col_groups: ValueMap<Vec<usize>> = ValueMap::default();
+            // One raw-entry loop for any column count: hash and compare
+            // against borrowed row values, clone key Values only when a
+            // new group is actually inserted (same pattern as
+            // try_fast_aggregation above)
+            let mut keyed_groups: hashbrown::HashMap<Vec<Value>, Vec<usize>> =
+                hashbrown::HashMap::with_capacity(64);
+            let num_cols = column_indices.len();
+            let mut group_count: usize = 0;
 
-                for (row_idx, (_, row)) in rows.iter().enumerate() {
-                    let key_value = row
-                        .get(col_idx)
-                        .cloned()
-                        .unwrap_or_else(Value::null_unknown);
-
-                    // Early termination: skip rows that would create new groups beyond the limit
-                    if has_limit
-                        && single_col_groups.len() >= group_limit
-                        && !single_col_groups.contains_key(&key_value)
-                    {
-                        continue;
+            for (row_idx, (_, row)) in rows.iter().enumerate() {
+                let mut hasher = FxHasher::default();
+                for &idx in &column_indices {
+                    match row.get(idx) {
+                        Some(value) => value.hash(&mut hasher),
+                        None => Value::null_unknown().hash(&mut hasher),
                     }
-
-                    // Use entry API with proper Value equality
-                    single_col_groups
-                        .entry(key_value)
-                        .or_default()
-                        .push(row_idx);
                 }
+                let hash = hasher.finish();
 
-                // Convert to GroupEntry format for downstream processing
-                for (key_value, row_indices) in single_col_groups {
-                    groups
-                        .entry(0) // Use dummy hash, we'll flatten anyway
-                        .or_default()
-                        .push(GroupEntry {
-                            key_values: vec![key_value],
-                            row_indices,
-                        });
-                }
-            } else if column_indices.len() == 2 {
-                // OPTIMIZATION: 2-column GROUP BY uses tuple keys instead of Vec<Value>
-                // Tuples are 30% faster than Vec per CLAUDE.md (no heap allocation)
-                let col_idx0 = column_indices[0];
-                let col_idx1 = column_indices[1];
-                // AHash for HashDoS resistance (user-controlled GROUP BY keys)
-                let mut two_col_groups: ahash::AHashMap<(Value, Value), Vec<usize>> =
-                    ahash::AHashMap::default();
-
-                for (row_idx, (_, row)) in rows.iter().enumerate() {
-                    let key = (
-                        row.get(col_idx0)
-                            .cloned()
-                            .unwrap_or_else(Value::null_unknown),
-                        row.get(col_idx1)
-                            .cloned()
-                            .unwrap_or_else(Value::null_unknown),
-                    );
-
-                    // Early termination: skip rows that would create new groups beyond the limit
-                    if has_limit
-                        && two_col_groups.len() >= group_limit
-                        && !two_col_groups.contains_key(&key)
-                    {
-                        continue;
+                let entry = keyed_groups.raw_entry_mut().from_hash(hash, |stored| {
+                    stored.len() == num_cols
+                        && stored.iter().zip(column_indices.iter()).all(|(s, &idx)| {
+                            match row.get(idx) {
+                                Some(rv) => s == rv,
+                                None => matches!(s, Value::Null(_)),
+                            }
+                        })
+                });
+                match entry {
+                    RawEntryMut::Occupied(mut occupied) => occupied.get_mut().push(row_idx),
+                    RawEntryMut::Vacant(vacant) => {
+                        // Early termination: skip rows that would create
+                        // new groups beyond the limit
+                        if has_limit && group_count >= group_limit {
+                            continue;
+                        }
+                        group_count += 1;
+                        let key: Vec<Value> = column_indices
+                            .iter()
+                            .map(|&idx| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
+                            .collect();
+                        vacant.insert_hashed_nocheck(hash, key, vec![row_idx]);
                     }
-
-                    two_col_groups.entry(key).or_default().push(row_idx);
                 }
+            }
 
-                // Convert to GroupEntry format for downstream processing
-                for ((v0, v1), row_indices) in two_col_groups {
-                    groups
-                        .entry(0) // Use dummy hash, we'll flatten anyway
-                        .or_default()
-                        .push(GroupEntry {
-                            key_values: vec![v0, v1],
-                            row_indices,
-                        });
-                }
-            } else if column_indices.len() == 3 {
-                // OPTIMIZATION: 3-column GROUP BY uses tuple keys (no Vec heap allocation)
-                let col_idx0 = column_indices[0];
-                let col_idx1 = column_indices[1];
-                let col_idx2 = column_indices[2];
-                let mut three_col_groups: ahash::AHashMap<(Value, Value, Value), Vec<usize>> =
-                    ahash::AHashMap::default();
-
-                for (row_idx, (_, row)) in rows.iter().enumerate() {
-                    let key = (
-                        row.get(col_idx0)
-                            .cloned()
-                            .unwrap_or_else(Value::null_unknown),
-                        row.get(col_idx1)
-                            .cloned()
-                            .unwrap_or_else(Value::null_unknown),
-                        row.get(col_idx2)
-                            .cloned()
-                            .unwrap_or_else(Value::null_unknown),
-                    );
-
-                    // Early termination: skip rows that would create new groups beyond the limit
-                    if has_limit
-                        && three_col_groups.len() >= group_limit
-                        && !three_col_groups.contains_key(&key)
-                    {
-                        continue;
-                    }
-
-                    three_col_groups.entry(key).or_default().push(row_idx);
-                }
-
-                for ((v0, v1, v2), row_indices) in three_col_groups {
-                    groups.entry(0).or_default().push(GroupEntry {
-                        key_values: vec![v0, v1, v2],
-                        row_indices,
-                    });
-                }
-            } else {
-                // 4+ columns: use AHashMap<Vec<Value>> directly (no collision handling needed)
-                let mut multi_col_groups: ahash::AHashMap<Vec<Value>, Vec<usize>> =
-                    ahash::AHashMap::default();
-
-                for (row_idx, (_, row)) in rows.iter().enumerate() {
-                    key_buffer.clear();
-                    for &idx in &column_indices {
-                        key_buffer.push(row.get(idx).cloned().unwrap_or_else(Value::null_unknown));
-                    }
-
-                    // Early termination: skip rows that would create new groups beyond the limit
-                    if has_limit
-                        && multi_col_groups.len() >= group_limit
-                        && !multi_col_groups.contains_key(&key_buffer)
-                    {
-                        continue;
-                    }
-
-                    multi_col_groups
-                        .entry(key_buffer.clone())
-                        .or_default()
-                        .push(row_idx);
-                }
-
-                for (key_values, row_indices) in multi_col_groups {
-                    groups.entry(0).or_default().push(GroupEntry {
-                        key_values,
-                        row_indices,
-                    });
-                }
+            // Convert to GroupEntry format for downstream processing
+            for (key_values, row_indices) in keyed_groups {
+                groups.entry(0).or_default().push(GroupEntry {
+                    key_values,
+                    row_indices,
+                });
             }
         } else {
             // Slow path: need to evaluate expressions, use buffer

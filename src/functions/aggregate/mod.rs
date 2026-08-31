@@ -112,6 +112,11 @@ impl DistinctTracker {
     /// Note: Caller must ensure value is not NULL before calling
     #[inline]
     pub fn check_and_add(&mut self, value: &Value) -> bool {
+        // Membership first: duplicates (the common case) then pay no
+        // clone; the extra lookup happens only once per distinct value
+        if self.seen.contains(value) {
+            return false;
+        }
         self.seen.insert(value.clone())
     }
 
@@ -121,7 +126,7 @@ impl DistinctTracker {
         if value.is_null() {
             return false;
         }
-        self.seen.insert(value.clone())
+        self.check_and_add(value)
     }
 
     /// Get the count of distinct values
