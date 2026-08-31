@@ -61,7 +61,7 @@ pub use statistics::{
 pub use string_agg::{GroupConcatFunction, StringAggFunction};
 pub use sum::SumFunction;
 
-use crate::core::{Value, ValueSet};
+use crate::core::Value;
 use std::cmp::Ordering;
 
 /// Compare two Values for ordering (used by FIRST/LAST with ORDER BY).
@@ -100,11 +100,12 @@ fn compare_values_for_sort(a: &Value, b: &Value) -> Ordering {
 
 /// Helper struct for tracking distinct values
 ///
-/// Uses ValueSet directly instead of converting to strings,
-/// avoiding allocation overhead for each value.
+/// Uses a seeded hashbrown set so membership and insert share one
+/// lookup, avoiding both the clone-per-duplicate of a plain insert
+/// and the double hash of contains-then-insert.
 #[derive(Default, Debug)]
 pub struct DistinctTracker {
-    seen: ValueSet,
+    seen: hashbrown::HashSet<Value, ahash::RandomState>,
 }
 
 impl DistinctTracker {
@@ -112,7 +113,11 @@ impl DistinctTracker {
     /// Note: Caller must ensure value is not NULL before calling
     #[inline]
     pub fn check_and_add(&mut self, value: &Value) -> bool {
-        self.seen.insert(value.clone())
+        // One hash, one probe: the closure clones only when the value
+        // is actually new
+        let before = self.seen.len();
+        self.seen.get_or_insert_with(value, |v| v.clone());
+        self.seen.len() > before
     }
 
     /// Check if a value has been seen before, with null handling (returns true if new)
@@ -121,7 +126,7 @@ impl DistinctTracker {
         if value.is_null() {
             return false;
         }
-        self.seen.insert(value.clone())
+        self.check_and_add(value)
     }
 
     /// Get the count of distinct values
