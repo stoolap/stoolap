@@ -425,12 +425,19 @@ impl Executor {
             anchor_columns
         };
 
-        let mut all_rows = Self::materialize_result(result)?;
+        let all_rows = Self::materialize_result(result)?;
 
         // If no anchor rows, return empty result
         if all_rows.is_empty() {
             return Ok((columns, all_rows));
         }
+
+        // Shared rows make every accumulator/working-set/registry copy
+        // an Arc bump instead of a deep row clone
+        let mut all_rows: RowVec = all_rows
+            .into_iter()
+            .map(|(id, row)| (id, row.into_shared()))
+            .collect();
 
         // Current working set (rows from previous iteration)
         let mut working_rows = all_rows.clone();
@@ -447,8 +454,9 @@ impl Executor {
             for (name, (cols, rows)) in cte_registry.iter() {
                 temp_registry.store_arc(name, cols.clone(), CompactArc::clone(rows));
             }
-            // Add current CTE with working rows
-            temp_registry.store(cte_name, columns.clone(), working_rows.clone());
+            // Add current CTE with working rows; the working set is
+            // rebuilt from new_rows below, so move it instead of cloning
+            temp_registry.store(cte_name, columns.clone(), std::mem::take(&mut working_rows));
 
             // Execute each recursive member
             let mut new_rows = RowVec::new();
@@ -468,10 +476,17 @@ impl Executor {
                 break;
             }
 
+            // Convert to Shared once: the accumulator extension and the
+            // next working set then share the same row data
+            let new_rows: RowVec = new_rows
+                .into_iter()
+                .map(|(id, row)| (id, row.into_shared()))
+                .collect();
+
             // Add new rows to total result, renumbering row IDs
             let base_id = all_rows.len() as i64;
-            for (i, (_, row)) in new_rows.clone().into_iter().enumerate() {
-                all_rows.push((base_id + i as i64, row));
+            for (i, (_, row)) in new_rows.iter().enumerate() {
+                all_rows.push((base_id + i as i64, row.clone()));
             }
 
             // New rows become the working set for next iteration
