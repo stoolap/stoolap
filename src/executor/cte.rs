@@ -456,7 +456,14 @@ impl Executor {
             }
             // Add current CTE with working rows; the working set is
             // rebuilt from new_rows below, so move it instead of cloning
-            temp_registry.store(cte_name, columns.clone(), std::mem::take(&mut working_rows));
+            // mem::replace with a pool-free empty vec: RowVec::default
+            // would check a buffer out of the thread-local pool just to
+            // serve as a throwaway placeholder
+            temp_registry.store(
+                cte_name,
+                columns.clone(),
+                std::mem::replace(&mut working_rows, RowVec::from_vec(Vec::new())),
+            );
 
             // Execute each recursive member
             let mut new_rows = RowVec::new();
