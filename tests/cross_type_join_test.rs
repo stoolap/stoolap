@@ -61,9 +61,9 @@ fn int_float_equi_join_hash_path() {
 
 #[test]
 fn int_float_equi_join_sorted_path() {
-    // 400+400 sorted rows: past MERGE_JOIN_MIN_ROWS (500 total), below
-    // the 200-row nested-loop ceiling per side, so the planner picks
-    // merge join for sorted inputs
+    // 400+400 sorted rows: past MERGE_JOIN_MIN_ROWS (500 total) and past
+    // the 200-row small-tables hash ceiling per side, so the planner
+    // reaches the sorted-input check and picks merge join
     let db = setup("memory://xtype_sorted", 400, false);
     let c: i64 = db
         .query_one("SELECT COUNT(*) FROM ta JOIN tb ON ta.k = tb.k", ())
