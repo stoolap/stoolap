@@ -141,3 +141,47 @@ fn large_int_float_boundary_exact() {
     // i64, so only the 42 pair matches
     assert_eq!(c, 1);
 }
+
+#[test]
+fn float_zero_sign_join_matches_where_semantics() {
+    let db = Database::open("memory://xtype_zero").unwrap();
+    db.execute("CREATE TABLE ta (id INTEGER PRIMARY KEY, k FLOAT)", ())
+        .unwrap();
+    db.execute("CREATE TABLE tb (id INTEGER PRIMARY KEY, k FLOAT)", ())
+        .unwrap();
+    db.execute("INSERT INTO ta VALUES (1, 0.0)", ()).unwrap();
+    db.execute("INSERT INTO tb VALUES (1, 0.0 / -1.0)", ())
+        .unwrap();
+    db.execute("INSERT INTO ta VALUES (2, 7.5)", ()).unwrap();
+    db.execute("INSERT INTO tb VALUES (2, 7.5)", ()).unwrap();
+
+    // The WHERE evaluator says 0.0 = -0.0; the join must agree
+    let c: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM ta WHERE k = (SELECT k FROM tb WHERE id = 1)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(c, 1, "expression equality baseline");
+    let c: i64 = db
+        .query_one("SELECT COUNT(*) FROM ta JOIN tb ON ta.k = tb.k", ())
+        .unwrap();
+    assert_eq!(c, 2, "join must match IEEE equality (0.0 = -0.0)");
+}
+
+#[test]
+fn float_infinity_self_join() {
+    let db = Database::open("memory://xtype_inf").unwrap();
+    db.execute("CREATE TABLE ta (id INTEGER PRIMARY KEY, k FLOAT)", ())
+        .unwrap();
+    db.execute("CREATE TABLE tb (id INTEGER PRIMARY KEY, k FLOAT)", ())
+        .unwrap();
+    db.execute("INSERT INTO ta VALUES (1, 1e308 * 10.0)", ())
+        .unwrap();
+    db.execute("INSERT INTO tb VALUES (1, 1e308 * 10.0)", ())
+        .unwrap();
+    let c: i64 = db
+        .query_one("SELECT COUNT(*) FROM ta JOIN tb ON ta.k = tb.k", ())
+        .unwrap();
+    assert_eq!(c, 1, "Infinity = Infinity must join");
+}

@@ -413,7 +413,11 @@ pub fn hash_composite_key(row: &Row, key_indices: &[usize]) -> u64 {
 
     for &idx in key_indices {
         if let Some(value) = row.get(idx) {
-            hash_value_into(value, &mut hasher);
+            // Join keys hash via Value's Hash impl so cross-type numeric
+            // keys (Integer 5, Float 5.0) share a bucket; values_equal
+            // decides the match exactly. hash_value_into is NOT used
+            // here: it keys GROUP BY, whose semantics stay unchanged
+            value.hash(&mut hasher);
         } else {
             // NULL marker
             0xDEADBEEFu64.hash(&mut hasher);
@@ -426,12 +430,35 @@ pub fn hash_composite_key(row: &Row, key_indices: &[usize]) -> u64 {
 /// Hash a single value into an existing hasher.
 #[inline]
 pub fn hash_value_into<H: Hasher>(value: &Value, hasher: &mut H) {
-    // Delegate to Value's Hash impl: it upholds the cross-type numeric
-    // constraint (Integer(5) and Float(5.0) hash equal), so mixed-type
-    // join keys land in the same bucket and values_equal decides the
-    // match exactly. A local type-discriminated hasher here made
-    // cross-type equi-joins return zero rows on the parallel path
-    value.hash(hasher);
+    match value {
+        Value::Integer(i) => {
+            1u8.hash(hasher);
+            i.hash(hasher);
+        }
+        Value::Float(f) => {
+            2u8.hash(hasher);
+            f.to_bits().hash(hasher);
+        }
+        Value::Text(s) => {
+            3u8.hash(hasher);
+            s.hash(hasher);
+        }
+        Value::Boolean(b) => {
+            4u8.hash(hasher);
+            b.hash(hasher);
+        }
+        Value::Null(_) => {
+            5u8.hash(hasher);
+        }
+        Value::Timestamp(ts) => {
+            6u8.hash(hasher);
+            ts.timestamp_nanos_opt().hash(hasher);
+        }
+        Value::Extension(data) => {
+            10u8.hash(hasher);
+            data.hash(hasher);
+        }
+    }
 }
 
 // ============================================================================
@@ -443,7 +470,11 @@ pub fn hash_value_into<H: Hasher>(value: &Value, hasher: &mut H) {
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => (x - y).abs() < f64::EPSILON,
+        // Exact IEEE equality plus the NaN-equals-NaN convention, matching
+        // Value's PartialEq and the streaming join verifier (an epsilon
+        // here dropped Infinity self-joins and diverged from the
+        // streaming path on 0.0 vs -0.0)
+        (Value::Float(x), Value::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Null(_), Value::Null(_)) => false, // NULL != NULL in SQL

@@ -406,8 +406,10 @@ pub fn verify_key_equality(row1: &Row, row2: &Row, indices1: &[usize], indices2:
 fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x == y,
-        // Bit-exact float comparison for consistent join semantics
-        (Value::Float(x), Value::Float(y)) => x.to_bits() == y.to_bits(),
+        // Exact IEEE equality plus the NaN-equals-NaN convention, matching
+        // Value's PartialEq, the bucketing hash, and the WHERE evaluator
+        // (0.0 = -0.0 joins; all NaNs join each other)
+        (Value::Float(x), Value::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Null(_), Value::Null(_)) => false, // NULL != NULL
