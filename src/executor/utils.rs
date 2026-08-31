@@ -2104,6 +2104,30 @@ mod tests {
     // Hashing Tests
     // ============================================================================
 
+    fn verify_pair(a: f64, b: f64) -> bool {
+        let r1 = Row::from_values(vec![Value::Float(a)]);
+        let r2 = Row::from_values(vec![Value::Float(b)]);
+        verify_composite_key_equality(&r1, &r2, &[0], &[0])
+    }
+
+    #[test]
+    fn test_float_key_equality_ieee_semantics() {
+        assert!(verify_pair(0.0, -0.0), "0.0 = -0.0 must join");
+        assert!(
+            verify_pair(f64::INFINITY, f64::INFINITY),
+            "inf = inf must join"
+        );
+        assert!(
+            verify_pair(f64::NAN, f64::NAN),
+            "NaN convention: all NaNs join"
+        );
+        assert!(
+            !verify_pair(0.5, 0.5 + f64::EPSILON),
+            "epsilon-close is not equal"
+        );
+        assert!(!verify_pair(1.0, 1.5));
+    }
+
     #[test]
     fn test_hash_composite_key_single() {
         let row = Row::from(vec![Value::Integer(42)]);

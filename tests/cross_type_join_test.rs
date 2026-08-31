@@ -61,11 +61,14 @@ fn int_float_equi_join_hash_path() {
 
 #[test]
 fn int_float_equi_join_sorted_path() {
-    let db = setup("memory://xtype_sorted", 100, false);
+    // 400+400 sorted rows: past MERGE_JOIN_MIN_ROWS (500 total), below
+    // the 200-row nested-loop ceiling per side, so the planner picks
+    // merge join for sorted inputs
+    let db = setup("memory://xtype_sorted", 400, false);
     let c: i64 = db
         .query_one("SELECT COUNT(*) FROM ta JOIN tb ON ta.k = tb.k", ())
         .unwrap();
-    assert_eq!(c, 100);
+    assert_eq!(c, 400);
 }
 
 #[test]
@@ -184,4 +187,42 @@ fn float_infinity_self_join() {
         .query_one("SELECT COUNT(*) FROM ta JOIN tb ON ta.k = tb.k", ())
         .unwrap();
     assert_eq!(c, 1, "Infinity = Infinity must join");
+}
+
+#[test]
+fn float_zero_and_infinity_parallel_path() {
+    // 11K build rows exceed the 10K parallel-join threshold, so this
+    // exercises verify_composite_key_equality's float arm (an epsilon
+    // there dropped Infinity self-joins and previously diverged from
+    // the streaming verifier on 0.0 vs -0.0)
+    let db = Database::open("memory://xtype_par_float").unwrap();
+    db.execute("CREATE TABLE ta (id INTEGER PRIMARY KEY, k FLOAT)", ())
+        .unwrap();
+    db.execute("CREATE TABLE tb (id INTEGER PRIMARY KEY, k FLOAT)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..11_000i64 {
+        let k = i as f64 + 0.5;
+        tx.execute("INSERT INTO ta VALUES ($1, $2)", (i, k))
+            .unwrap();
+        tx.execute("INSERT INTO tb VALUES ($1, $2)", (i, k))
+            .unwrap();
+    }
+    tx.execute("INSERT INTO ta VALUES (20000, 0.0)", ())
+        .unwrap();
+    tx.execute("INSERT INTO tb VALUES (20000, 0.0 / -1.0)", ())
+        .unwrap();
+    tx.execute("INSERT INTO ta VALUES (20001, 1e308 * 10.0)", ())
+        .unwrap();
+    tx.execute("INSERT INTO tb VALUES (20001, 1e308 * 10.0)", ())
+        .unwrap();
+    tx.commit().unwrap();
+
+    let c: i64 = db
+        .query_one("SELECT COUNT(*) FROM ta JOIN tb ON ta.k = tb.k", ())
+        .unwrap();
+    assert_eq!(
+        c, 11_002,
+        "parallel join must match 0.0 = -0.0 and Infinity"
+    );
 }
