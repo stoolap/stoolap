@@ -3056,13 +3056,12 @@ impl Executor {
                 }
 
                 // Normal path: collect all rows first (for ORDER BY, aggregation, etc.)
-                // With an identity projection the table hands back the
-                // materialized RowVec directly (with real row ids) instead
-                // of a per-row scanner drain
-                let identity_proj = column_idx_vec.len() == all_columns.len()
-                    && column_idx_vec.iter().enumerate().all(|(i, &c)| c == i);
-                let all_rows = if identity_proj {
-                    table.collect_all_rows(storage_expr.as_deref())?
+                // Without a storage filter there is no index opportunity,
+                // so the table hands back the materialized RowVec directly
+                // (with real row ids) instead of a per-row scanner drain.
+                // With one, scan() keeps its PK/index fast paths.
+                let all_rows = if storage_expr.is_none() {
+                    table.collect_all_rows(None)?
                 } else {
                     let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
                     let mut all_rows =
