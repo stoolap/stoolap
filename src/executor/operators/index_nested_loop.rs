@@ -298,7 +298,13 @@ impl IndexNestedLoopJoinOperator {
             IndexLookupStrategy::PrimaryKey => {
                 match key_value {
                     Value::Integer(id) => self.row_id_buffer.push(*id),
-                    Value::Float(f) => self.row_id_buffer.push(*f as i64),
+                    // Only a losslessly integral float can equal a PK;
+                    // truncation would join 5.5 against row 5
+                    Value::Float(f) => {
+                        if let Some(id) = crate::executor::Executor::lossless_float_key(*f) {
+                            self.row_id_buffer.push(id);
+                        }
+                    }
                     _ => {} // Non-numeric PK values can't match
                 }
             }

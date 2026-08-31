@@ -226,3 +226,54 @@ fn float_zero_and_infinity_parallel_path() {
         "parallel join must match 0.0 = -0.0 and Infinity"
     );
 }
+
+#[test]
+fn float_key_pk_inl_join_no_truncation() {
+    let db = Database::open("memory://xtype_inl_pk").unwrap();
+    db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE readings (rid INTEGER PRIMARY KEY, val FLOAT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO items VALUES (0, 'zero'), (5, 'five'), (9223372036854775807, 'max')",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO readings VALUES (1, 5.5), (2, 5.0), (3, 1e19)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO readings VALUES (4, $1)", (f64::NAN,))
+        .unwrap();
+
+    // Batch INL (no LIMIT): only 5.0 = 5 matches; 5.5 must not truncate
+    // to row 5, 1e19 must not saturate to i64::MAX, NaN must not probe 0
+    let rows = db
+        .query(
+            "SELECT r.rid FROM readings r JOIN items i ON r.val = i.id",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "batch INL truncated a float key");
+    let rid: i64 = rows[0].get(0).unwrap();
+    assert_eq!(rid, 2);
+
+    // Streaming INL (LIMIT): same single match
+    let rows = db
+        .query(
+            "SELECT r.rid FROM readings r JOIN items i ON r.val = i.id LIMIT 10",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    assert_eq!(rows.len(), 1, "streaming INL truncated a float key");
+    let rid: i64 = rows[0].get(0).unwrap();
+    assert_eq!(rid, 2);
+}
