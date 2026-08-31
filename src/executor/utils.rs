@@ -426,35 +426,12 @@ pub fn hash_composite_key(row: &Row, key_indices: &[usize]) -> u64 {
 /// Hash a single value into an existing hasher.
 #[inline]
 pub fn hash_value_into<H: Hasher>(value: &Value, hasher: &mut H) {
-    match value {
-        Value::Integer(i) => {
-            1u8.hash(hasher);
-            i.hash(hasher);
-        }
-        Value::Float(f) => {
-            2u8.hash(hasher);
-            f.to_bits().hash(hasher);
-        }
-        Value::Text(s) => {
-            3u8.hash(hasher);
-            s.hash(hasher);
-        }
-        Value::Boolean(b) => {
-            4u8.hash(hasher);
-            b.hash(hasher);
-        }
-        Value::Null(_) => {
-            5u8.hash(hasher);
-        }
-        Value::Timestamp(ts) => {
-            6u8.hash(hasher);
-            ts.timestamp_nanos_opt().hash(hasher);
-        }
-        Value::Extension(data) => {
-            10u8.hash(hasher);
-            data.hash(hasher);
-        }
-    }
+    // Delegate to Value's Hash impl: it upholds the cross-type numeric
+    // constraint (Integer(5) and Float(5.0) hash equal), so mixed-type
+    // join keys land in the same bucket and values_equal decides the
+    // match exactly. A local type-discriminated hasher here made
+    // cross-type equi-joins return zero rows on the parallel path
+    value.hash(hasher);
 }
 
 // ============================================================================

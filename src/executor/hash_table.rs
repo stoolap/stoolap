@@ -308,14 +308,6 @@ pub fn hash_keys_with<'a, F>(key_indices: &[usize], get_value: F) -> u64
 where
     F: Fn(usize) -> Option<&'a Value>,
 {
-    // Fast path for single integer key (most common case: PK joins)
-    if key_indices.len() == 1 {
-        if let Some(Value::Integer(i)) = get_value(key_indices[0]) {
-            // FxHash for single integer - very fast
-            return (*i as u64).wrapping_mul(0x517cc1b727220a95);
-        }
-    }
-
     let mut hasher = FxHasher::default();
 
     for &idx in key_indices {
@@ -336,14 +328,6 @@ where
 /// This is the same algorithm used in utils.rs but kept here to avoid circular deps.
 #[inline]
 pub fn hash_row_keys(row: &Row, key_indices: &[usize]) -> u64 {
-    // Fast path for single integer key (most common case: PK joins)
-    if key_indices.len() == 1 {
-        if let Some(Value::Integer(i)) = row.get(key_indices[0]) {
-            // FxHash for single integer - very fast
-            return (*i as u64).wrapping_mul(0x517cc1b727220a95);
-        }
-    }
-
     let mut hasher = FxHasher::default();
 
     for &idx in key_indices {
@@ -361,37 +345,13 @@ pub fn hash_row_keys(row: &Row, key_indices: &[usize]) -> u64 {
 /// Hash a single value into a hasher.
 #[inline]
 fn hash_value<H: Hasher>(hasher: &mut H, value: &Value) {
-    // Type discriminant first for type safety
-    match value {
-        Value::Integer(i) => {
-            1_u8.hash(hasher);
-            i.hash(hasher);
-        }
-        Value::Float(f) => {
-            2_u8.hash(hasher);
-            // Hash the bits for consistency
-            f.to_bits().hash(hasher);
-        }
-        Value::Text(s) => {
-            3_u8.hash(hasher);
-            s.hash(hasher);
-        }
-        Value::Boolean(b) => {
-            4_u8.hash(hasher);
-            b.hash(hasher);
-        }
-        Value::Null(_) => {
-            5_u8.hash(hasher);
-        }
-        Value::Timestamp(ts) => {
-            6_u8.hash(hasher);
-            ts.timestamp_nanos_opt().hash(hasher);
-        }
-        Value::Extension(data) => {
-            10_u8.hash(hasher);
-            data.hash(hasher);
-        }
-    }
+    // Delegate to Value's Hash impl: it upholds the cross-type numeric
+    // constraint (Integer(5) and Float(5.0) hash equal), so an INTEGER
+    // key lands in the same bucket as an equal FLOAT key and
+    // values_equal decides the match exactly. The previous local
+    // type-discriminated hasher made cross-type equi-joins return
+    // zero rows
+    value.hash(hasher);
 }
 
 /// Verify that two rows have equal key values.
