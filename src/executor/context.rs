@@ -111,8 +111,13 @@ pub fn cache_scalar_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>
 // Stores (tables_referenced, result) for table-based invalidation.
 // LRU-bounded to prevent unbounded memory growth.
 
-/// Cached IN subquery entry: (tables_referenced for invalidation, result values)
-type InSubqueryCacheEntry = (SmallVec<[CompactArc<str>; 2]>, Vec<Value>);
+/// Cached IN subquery entry: (tables_referenced for invalidation, result
+/// values, lazily built shared hash set for single-column IN)
+type InSubqueryCacheEntry = (
+    SmallVec<[CompactArc<str>; 2]>,
+    Vec<Value>,
+    Option<CompactArc<crate::core::ValueSet>>,
+);
 
 thread_local! {
     static IN_SUBQUERY_CACHE: RefCell<LruCache<String, InSubqueryCacheEntry>> =
@@ -140,7 +145,7 @@ pub fn invalidate_in_subquery_cache_for_table(table_name: &str) {
         // Collect keys to remove (LruCache doesn't have retain)
         let keys_to_remove: Vec<String> = c
             .iter()
-            .filter(|(_, (tables, _))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
+            .filter(|(_, (tables, _, _))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
             .map(|(k, _)| k.clone())
             .collect();
         for key in keys_to_remove {
@@ -151,13 +156,27 @@ pub fn invalidate_in_subquery_cache_for_table(table_name: &str) {
 
 /// Get a cached IN subquery result by SQL string key.
 pub fn get_cached_in_subquery(key: &str) -> Option<Vec<Value>> {
-    IN_SUBQUERY_CACHE.with(|cache| cache.borrow_mut().get(key).map(|(_, v)| v.clone()))
+    IN_SUBQUERY_CACHE.with(|cache| cache.borrow_mut().get(key).map(|(_, v, _)| v.clone()))
+}
+
+/// Get a cached IN subquery result as a shared hash set, building and
+/// memoizing the set inside the entry on first request. Later hits are
+/// an Arc clone: no value clones, no set rebuild.
+pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<crate::core::ValueSet>> {
+    IN_SUBQUERY_CACHE.with(|cache| {
+        let mut c = cache.borrow_mut();
+        let entry = c.get_mut(key)?;
+        if entry.2.is_none() {
+            entry.2 = Some(CompactArc::new(entry.1.iter().cloned().collect()));
+        }
+        entry.2.clone()
+    })
 }
 
 /// Cache an IN subquery result with the tables it references.
 pub fn cache_in_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>, values: Vec<Value>) {
     IN_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().put(key, (tables, values));
+        cache.borrow_mut().put(key, (tables, values, None));
     });
 }
 

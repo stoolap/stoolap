@@ -37,8 +37,8 @@ use super::context::{
     get_cached_batch_aggregate, get_cached_batch_aggregate_info, get_cached_count_counter,
     get_cached_exists_correlation, get_cached_exists_fetcher, get_cached_exists_index,
     get_cached_exists_pred_key, get_cached_exists_predicate, get_cached_exists_schema,
-    get_cached_in_subquery, get_cached_scalar_subquery, get_cached_semi_join,
-    BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo,
+    get_cached_in_subquery, get_cached_in_subquery_set, get_cached_scalar_subquery,
+    get_cached_semi_join, BatchAggregateLookupInfo, ExecutionContext, ExistsCorrelationInfo,
 };
 use super::expr_converter::convert_ast_to_storage_expr;
 use super::expression::compute_expression_hash;
@@ -218,17 +218,29 @@ impl Executor {
                             not: in_expr.not,
                         }));
                     } else {
-                        // Single-column IN - use InHashSet for O(1) lookups
-                        let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
-
-                        // Collect into FxHashSet for O(1) membership testing (optimized for Value types with WyMix)
-                        let hash_set: ValueSet = values.into_iter().collect();
+                        // Single-column IN - use InHashSet for O(1) lookups.
+                        // A repeated non-correlated subquery reuses the
+                        // memoized shared set from the cache entry
+                        let is_non_correlated = ctx.outer_row().is_none()
+                            && !Self::is_subquery_correlated(&subquery.subquery);
+                        let cached_set = if is_non_correlated {
+                            get_cached_in_subquery_set(&subquery.subquery.to_string())
+                        } else {
+                            None
+                        };
+                        let values_arc = match cached_set {
+                            Some(arc) => arc,
+                            None => {
+                                let values = self.execute_in_subquery(&subquery.subquery, ctx)?;
+                                CompactArc::new(values.into_iter().collect::<ValueSet>())
+                            }
+                        };
 
                         // Use InHashSet with Arc for fast O(1) lookup per row
                         return Ok(Expression::InHashSet(InHashSetExpression {
                             token: in_expr.token.clone(),
                             column: Box::new(processed_left),
-                            values: CompactArc::new(hash_set),
+                            values: values_arc,
                             not: in_expr.not,
                         }));
                     }
@@ -500,15 +512,19 @@ impl Executor {
         // If there's no additional predicate, check if at least one row is visible
         // Note: Index may contain row_ids for deleted rows, so we must verify visibility
         if correlation.additional_predicate.is_none() {
-            let row_fetcher = match self.get_or_create_row_fetcher(&correlation.inner_table) {
-                Some(f) => f,
-                None => return Ok(None), // Fall back if fetcher creation fails
+            // Count visible rows per batch instead of materializing rows
+            // that were only tested for emptiness and discarded
+            let row_counter = match get_cached_count_counter(&correlation.inner_table) {
+                Some(c) => c,
+                None => match self.get_or_create_row_counter(&correlation.inner_table) {
+                    Some(c) => c,
+                    None => return Ok(None), // Fall back if counter creation fails
+                },
             };
             // Check batches until we find a visible row or exhaust all row_ids
             // We can't stop after first batch because deleted rows may precede visible ones
             for chunk in row_ids.chunks(VISIBILITY_CHECK_BATCH_SIZE) {
-                let visible = row_fetcher(chunk)?;
-                if !visible.is_empty() {
+                if row_counter(chunk) > 0 {
                     return Ok(Some(true)); // Found at least one visible row
                 }
             }
