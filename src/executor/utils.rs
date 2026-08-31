@@ -413,7 +413,11 @@ pub fn hash_composite_key(row: &Row, key_indices: &[usize]) -> u64 {
 
     for &idx in key_indices {
         if let Some(value) = row.get(idx) {
-            hash_value_into(value, &mut hasher);
+            // Join keys hash via Value's Hash impl so cross-type numeric
+            // keys (Integer 5, Float 5.0) share a bucket; values_equal
+            // decides the match exactly. hash_value_into is NOT used
+            // here: it keys GROUP BY, whose semantics stay unchanged
+            value.hash(&mut hasher);
         } else {
             // NULL marker
             0xDEADBEEFu64.hash(&mut hasher);
@@ -466,7 +470,11 @@ pub fn hash_value_into<H: Hasher>(value: &Value, hasher: &mut H) {
 pub fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
         (Value::Integer(x), Value::Integer(y)) => x == y,
-        (Value::Float(x), Value::Float(y)) => (x - y).abs() < f64::EPSILON,
+        // Exact IEEE equality plus the NaN-equals-NaN convention, matching
+        // Value's PartialEq and the streaming join verifier (an epsilon
+        // here dropped Infinity self-joins and diverged from the
+        // streaming path on 0.0 vs -0.0)
+        (Value::Float(x), Value::Float(y)) => x == y || (x.is_nan() && y.is_nan()),
         (Value::Text(x), Value::Text(y)) => x == y,
         (Value::Boolean(x), Value::Boolean(y)) => x == y,
         (Value::Null(_), Value::Null(_)) => false, // NULL != NULL in SQL
@@ -2095,6 +2103,30 @@ mod tests {
     // ============================================================================
     // Hashing Tests
     // ============================================================================
+
+    fn verify_pair(a: f64, b: f64) -> bool {
+        let r1 = Row::from_values(vec![Value::Float(a)]);
+        let r2 = Row::from_values(vec![Value::Float(b)]);
+        verify_composite_key_equality(&r1, &r2, &[0], &[0])
+    }
+
+    #[test]
+    fn test_float_key_equality_ieee_semantics() {
+        assert!(verify_pair(0.0, -0.0), "0.0 = -0.0 must join");
+        assert!(
+            verify_pair(f64::INFINITY, f64::INFINITY),
+            "inf = inf must join"
+        );
+        assert!(
+            verify_pair(f64::NAN, f64::NAN),
+            "NaN convention: all NaNs join"
+        );
+        assert!(
+            !verify_pair(0.5, 0.5 + f64::EPSILON),
+            "epsilon-close is not equal"
+        );
+        assert!(!verify_pair(1.0, 1.5));
+    }
 
     #[test]
     fn test_hash_composite_key_single() {
