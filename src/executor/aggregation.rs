@@ -2821,6 +2821,9 @@ impl Executor {
                 // Extract integer key directly - no clone, no hash
                 // Handle NULL values separately (they form their own group)
                 let key_opt = match row.get(col_idx) {
+                    // i64::MIN is I64Map's reserved empty sentinel: decline
+                    // the fast path and let the general grouping handle it
+                    Some(Value::Integer(i64::MIN)) => return Ok(None),
                     Some(Value::Integer(v)) => Some(*v),
                     Some(Value::Null(_)) => None, // NULL goes to null_group (inline pattern)
                     None => None,                 // Missing value treated as NULL

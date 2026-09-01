@@ -789,7 +789,9 @@ impl Executor {
         }
 
         // Process partitions one at a time, stopping when we have enough rows
-        let mut result_rows = RowVec::with_capacity(limit);
+        // A user-supplied limit can be i64::MAX; only pre-allocate up
+        // to the rows that can actually be produced
+        let mut result_rows = RowVec::with_capacity(limit.min(base_rows.len().max(16)));
         let mut result_row_id = 0i64;
 
         let partitions_vec: Vec<_> = partitions.into_iter().collect();
@@ -977,7 +979,10 @@ impl Executor {
         };
 
         // Process partitions one at a time, stopping when we have enough rows
-        let mut result_rows = RowVec::with_capacity(limit);
+        // Process partitions one at a time, stopping when we have enough
+        // rows. A user-supplied limit can be i64::MAX, so cap the
+        // pre-allocation; rows are fetched lazily per partition
+        let mut result_rows = RowVec::with_capacity(limit.min(4096));
         let mut result_row_id = 0i64;
 
         for partition_value in partition_values {
