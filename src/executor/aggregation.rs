@@ -529,6 +529,29 @@ impl Executor {
             (result_columns, result_rows)
         };
 
+        // ORDER BY may name a grouped column the SELECT list drops. Capture
+        // those columns before projection consumes the aggregate rows; they
+        // are appended below and trimmed again after the sort.
+        let hidden_order_by_columns: Vec<(String, Vec<Value>)> = stmt
+            .order_by
+            .iter()
+            .filter_map(|ob| match &ob.expression {
+                Expression::Identifier(id) => Some(id.value.to_string()),
+                Expression::QualifiedIdentifier(qid) => Some(qid.name.value.to_string()),
+                _ => None,
+            })
+            .filter_map(|name| {
+                let idx = having_columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(&name))?;
+                let values = having_rows
+                    .iter()
+                    .map(|(_, row)| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
+                    .collect();
+                Some((name, values))
+            })
+            .collect();
+
         // Check for hidden aggregates (ORDER BY only) BEFORE cloning
         // These will be removed after sorting by the ProjectedResult wrapper
         let group_by_count = group_by_columns.len();
@@ -616,9 +639,43 @@ impl Executor {
             (cols, rows)
         };
 
+        // ORDER BY may reference a grouped column that the SELECT list does
+        // not project. The sort runs after this function returns, so carry
+        // those columns along; execute_select trims them back off once the
+        // rows are ordered (the same contract the non-aggregate path uses).
+        let (final_columns, final_rows) = Self::append_hidden_order_by_columns(
+            final_columns,
+            final_rows,
+            hidden_order_by_columns,
+        );
+
         let result: Box<dyn QueryResult> = Box::new(ExecutorResult::new(final_columns, final_rows));
 
         Ok(result)
+    }
+
+    /// Append grouped columns that ORDER BY needs but SELECT does not project.
+    /// Values come from the pre-projection aggregate rows, matched by position.
+    fn append_hidden_order_by_columns(
+        mut columns: Vec<String>,
+        mut rows: RowVec,
+        hidden: Vec<(String, Vec<Value>)>,
+    ) -> (Vec<String>, RowVec) {
+        for (name, values) in hidden {
+            if columns.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                continue; // already projected, nothing to carry
+            }
+            columns.push(name);
+            for (row_idx, (_, row)) in rows.iter_mut().enumerate() {
+                row.push(
+                    values
+                        .get(row_idx)
+                        .cloned()
+                        .unwrap_or_else(Value::null_unknown),
+                );
+            }
+        }
+        (columns, rows)
     }
 
     /// Apply post-aggregation expressions to the result
