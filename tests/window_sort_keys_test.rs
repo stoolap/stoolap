@@ -118,3 +118,39 @@ fn window_order_survives_type_drift_past_sample() {
         }
     }
 }
+
+#[test]
+fn window_order_mixed_numeric_text_total_order() {
+    // A CASE producing Integer and Text values routes to the generic
+    // comparator; the old fallback compared cross-type pairs stringly
+    // (2 < 10, 10 < '15', but '15' < 2), a cyclic comparator. The
+    // fallback now uses Value's total order: numerics before text.
+    let db = Database::open("memory://win_mixed_total").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 0..150i64 {
+        tx.execute("INSERT INTO t VALUES ($1)", (i,)).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let rows = db
+        .query(
+            "SELECT id % 3, RANK() OVER (ORDER BY CASE WHEN id % 3 = 0 THEN 2 \
+             WHEN id % 3 = 1 THEN 10 ELSE '15' END) AS r FROM t ORDER BY 1, 2",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    for r in &rows {
+        let bucket: i64 = r.get(0).unwrap();
+        let rank: i64 = r.get(1).unwrap();
+        let expected = match bucket {
+            0 => 1,   // Integer 2: first block of 50
+            1 => 51,  // Integer 10: second block
+            _ => 101, // Text '15': after every numeric
+        };
+        assert_eq!(rank, expected, "bucket {bucket} landed out of order");
+    }
+}

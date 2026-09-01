@@ -3376,7 +3376,10 @@ impl Executor {
             (Value::Null(_), Value::Null(_)) => Ordering::Equal,
             (Value::Null(_), _) => Ordering::Greater, // NULLs last
             (_, Value::Null(_)) => Ordering::Less,
-            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            // Heterogeneous pairs use Value's total order (type rank,
+            // then within-type): the old stringly fallback made the
+            // comparator cyclic (2 < 10, 10 < '15', '15' < 2)
+            _ => a.cmp(b),
         }
     }
 
