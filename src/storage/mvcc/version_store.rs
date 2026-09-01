@@ -6108,13 +6108,7 @@ impl VersionStore {
                             key_type = 0;
                         }
                         if key_type == 0 {
-                            // i64::MIN is I64Map's empty sentinel - route to
-                            // other_groups, as the Float branch below does
-                            if *i == i64::MIN {
-                                None
-                            } else {
-                                Some(*i)
-                            }
+                            Some(*i)
                         } else {
                             None // Type mismatch → other_groups
                         }
@@ -6124,14 +6118,7 @@ impl VersionStore {
                             key_type = 1;
                         }
                         if key_type == 1 {
-                            let bits = f.to_bits() as i64;
-                            // i64::MIN is I64Map's empty sentinel — route to other_groups
-                            // This only affects -0.0 (bits = 0x8000000000000000)
-                            if bits == i64::MIN {
-                                None
-                            } else {
-                                Some(bits)
-                            }
+                            Some(f.to_bits() as i64)
                         } else {
                             None // Type mismatch → other_groups
                         }
@@ -6676,11 +6663,6 @@ impl TransactionVersionStore {
 
     /// Check if we have local changes for a row
     pub fn has_locally_seen(&self, row_id: i64) -> bool {
-        // The row-id maps reserve i64::MIN as their empty sentinel, so
-        // no row can carry it; answer without touching the map
-        if row_id == i64::MIN {
-            return false;
-        }
         self.local_versions
             .as_ref()
             .is_some_and(|lv| lv.contains_key(row_id))
@@ -6737,9 +6719,6 @@ impl TransactionVersionStore {
     /// Get the local version for a row (without checking parent)
     /// Returns the most recent version in the transaction's history
     pub fn get_local_version(&self, row_id: i64) -> Option<&RowVersion> {
-        if row_id == i64::MIN {
-            return None; // reserved sentinel: no row can carry it
-        }
         self.local_versions
             .as_ref()
             .and_then(|lv| lv.get(row_id))
@@ -6748,9 +6727,6 @@ impl TransactionVersionStore {
 
     /// Get a row, checking local versions first then parent store
     pub fn get(&self, row_id: i64) -> Option<Row> {
-        if row_id == i64::MIN {
-            return None; // reserved sentinel: no row can carry it
-        }
         // Check local versions first (get most recent)
         if let Some(lv) = self.local_versions.as_ref() {
             if let Some(versions) = lv.get(row_id) {

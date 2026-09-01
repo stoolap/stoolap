@@ -13,15 +13,12 @@
 // limitations under the License.
 
 //! High-performance i64 HashMap
-// - Uses i64::MIN as empty sentinel (row IDs and txn IDs are always >= 0)
+// - Uses i64::MIN as the empty marker inside the slot array; the entry
+//   for that key lives in a side slot, so the full i64 range is storable
 // - Direct key storage (no XOR transform)
 // - FxHash with pre-mixing (XOR>>16 before multiply) - 0 sequential collisions,
 //   65% reduction in strided key collisions
 // - Backward-shift deletion (no tombstones)
-//
-// SAFETY: i64::MIN CANNOT be used as a key - it is reserved as the empty sentinel.
-// Inserting i64::MIN will cause silent data corruption. This is enforced via
-// assertions in debug and release builds.
 
 use std::mem::MaybeUninit;
 
@@ -34,26 +31,10 @@ const LOAD_FACTOR_DEN: usize = 4;
 const SHRINK_DIVISOR: usize = 4;
 const MIN_SHRINK_CAPACITY: usize = 64;
 
-// Empty sentinel - i64::MIN is never used as row ID or transaction ID
+// Empty marker for slots. An entry whose key equals this marker is held
+// in the map's side slot instead of the array, so callers may use the
+// whole i64 range.
 const EMPTY: i64 = i64::MIN;
-
-/// Panics if key is the reserved EMPTY sentinel (i64::MIN).
-/// Cold-path annotated to minimize branch prediction overhead.
-#[cold]
-#[inline(never)]
-fn assert_valid_key(key: i64) {
-    if key == EMPTY {
-        panic!("i64::MIN cannot be used as a key in I64Map (reserved as empty sentinel)");
-    }
-}
-
-/// Checks if key is valid. Branch predictor should always predict true.
-#[inline(always)]
-fn check_key(key: i64) {
-    if key == EMPTY {
-        assert_valid_key(key);
-    }
-}
 
 /// Slot with key and value. key == EMPTY means slot is empty.
 #[repr(C)]
@@ -62,12 +43,15 @@ struct Slot<V> {
     value: MaybeUninit<V>,
 }
 
-/// High-performance HashMap for i64 keys.
-/// Note: i64::MIN cannot be used as a key (reserved as empty sentinel).
+/// High-performance HashMap for i64 keys, covering the full i64 range.
 pub struct I64Map<V> {
     slots: Box<[Slot<V>]>,
     len: usize,
     mask: usize,
+    /// i64::MIN is the slot array's empty marker, so its entry lives
+    /// beside the table. Callers hand this map keys derived from user
+    /// data, so the full i64 range must be storable.
+    min_slot: Option<V>,
 }
 
 impl<V: Clone> Clone for I64Map<V> {
@@ -88,6 +72,33 @@ impl<V> Default for I64Map<V> {
 }
 
 impl<V> I64Map<V> {
+    // The side slot is touched by one key out of 2^64, so every access
+    // to it is a cold, never-inlined call: the probe loops stay exactly
+    // as tight as they were when this branch was a panic.
+    #[cold]
+    #[inline(never)]
+    fn sentinel_get(&self) -> Option<&V> {
+        self.min_slot.as_ref()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn sentinel_get_mut(&mut self) -> Option<&mut V> {
+        self.min_slot.as_mut()
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn sentinel_insert(&mut self, value: V) -> Option<V> {
+        self.min_slot.replace(value)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn sentinel_remove(&mut self) -> Option<V> {
+        self.min_slot.take()
+    }
+
     #[inline(always)]
     pub fn new() -> Self {
         Self::with_capacity(0)
@@ -115,17 +126,18 @@ impl<V> I64Map<V> {
             slots: slots.into_boxed_slice(),
             len: 0,
             mask: cap - 1,
+            min_slot: None,
         }
     }
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.len
+        self.len + usize::from(self.min_slot.is_some())
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len == 0 && self.min_slot.is_none()
     }
 
     #[inline(always)]
@@ -190,7 +202,9 @@ impl<V> I64Map<V> {
 
     #[inline(always)]
     pub fn insert(&mut self, key: i64, value: V) -> Option<V> {
-        check_key(key);
+        if key == EMPTY {
+            return self.sentinel_insert(value);
+        }
 
         if self.len * LOAD_FACTOR_DEN >= self.slots.len() * LOAD_FACTOR_NUM {
             self.grow();
@@ -225,7 +239,9 @@ impl<V> I64Map<V> {
 
     #[inline(always)]
     pub fn get(&self, key: i64) -> Option<&V> {
-        check_key(key);
+        if key == EMPTY {
+            return self.sentinel_get();
+        }
 
         let mask = self.mask;
         let mut idx = Self::hash(key) & mask;
@@ -249,7 +265,9 @@ impl<V> I64Map<V> {
 
     #[inline(always)]
     pub fn get_mut(&mut self, key: i64) -> Option<&mut V> {
-        check_key(key);
+        if key == EMPTY {
+            return self.sentinel_get_mut();
+        }
 
         let mask = self.mask;
         let mut idx = Self::hash(key) & mask;
@@ -286,7 +304,9 @@ impl<V> I64Map<V> {
 
     #[inline(always)]
     pub fn remove(&mut self, key: i64) -> Option<V> {
-        check_key(key);
+        if key == EMPTY {
+            return self.sentinel_remove();
+        }
 
         let mask = self.mask;
         let mut idx = Self::hash(key) & mask;
@@ -463,18 +483,22 @@ impl<V> I64Map<V> {
             }
         }
         self.len = 0;
+        self.min_slot = None;
     }
 
     #[inline]
     pub fn iter(&self) -> impl Iterator<Item = (i64, &V)> {
-        self.slots.iter().filter_map(|slot| {
-            if slot.key != EMPTY {
-                // SAFETY: slot.key != EMPTY means the value is initialized.
-                Some((slot.key, unsafe { slot.value.assume_init_ref() }))
-            } else {
-                None
-            }
-        })
+        self.slots
+            .iter()
+            .filter_map(|slot| {
+                if slot.key != EMPTY {
+                    // SAFETY: slot.key != EMPTY means the value is initialized.
+                    Some((slot.key, unsafe { slot.value.assume_init_ref() }))
+                } else {
+                    None
+                }
+            })
+            .chain(self.min_slot.as_ref().map(|v| (EMPTY, v)))
     }
 
     #[inline]
@@ -482,30 +506,37 @@ impl<V> I64Map<V> {
         self.slots
             .iter()
             .filter_map(|s| if s.key != EMPTY { Some(s.key) } else { None })
+            .chain(self.min_slot.as_ref().map(|_| EMPTY))
     }
 
     #[inline]
     pub fn values(&self) -> impl Iterator<Item = &V> {
-        self.slots.iter().filter_map(|slot| {
-            if slot.key != EMPTY {
-                // SAFETY: slot.key != EMPTY means the value is initialized.
-                Some(unsafe { slot.value.assume_init_ref() })
-            } else {
-                None
-            }
-        })
+        self.slots
+            .iter()
+            .filter_map(|slot| {
+                if slot.key != EMPTY {
+                    // SAFETY: slot.key != EMPTY means the value is initialized.
+                    Some(unsafe { slot.value.assume_init_ref() })
+                } else {
+                    None
+                }
+            })
+            .chain(self.min_slot.as_ref())
     }
 
     #[inline]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (i64, &mut V)> {
-        self.slots.iter_mut().filter_map(|slot| {
-            if slot.key != EMPTY {
-                // SAFETY: slot.key != EMPTY means the value is initialized.
-                Some((slot.key, unsafe { slot.value.assume_init_mut() }))
-            } else {
-                None
-            }
-        })
+        self.slots
+            .iter_mut()
+            .filter_map(|slot| {
+                if slot.key != EMPTY {
+                    // SAFETY: slot.key != EMPTY means the value is initialized.
+                    Some((slot.key, unsafe { slot.value.assume_init_mut() }))
+                } else {
+                    None
+                }
+            })
+            .chain(self.min_slot.as_mut().map(|v| (EMPTY, v)))
     }
 
     /// Retains only the elements specified by the predicate.
@@ -537,6 +568,12 @@ impl<V> I64Map<V> {
         for key in keys_to_remove {
             self.remove(key);
         }
+
+        if let Some(value) = self.min_slot.as_mut() {
+            if !f(EMPTY, value) {
+                self.min_slot = None;
+            }
+        }
     }
 
     /// Drains all entries from the map, returning an iterator over them
@@ -558,12 +595,24 @@ impl<V> I64Map<V> {
         Drain {
             slots: old_slots,
             pos: 0,
+            min_slot: self.min_slot.take(),
         }
     }
 
     #[inline(always)]
     pub fn entry(&mut self, key: i64) -> Entry<'_, V> {
-        check_key(key);
+        if key == EMPTY {
+            return if self.min_slot.is_some() {
+                Entry::Occupied(OccupiedEntry {
+                    target: EntryTarget::Sentinel(&mut self.min_slot),
+                })
+            } else {
+                Entry::Vacant(VacantEntry {
+                    target: VacantTarget::Sentinel(&mut self.min_slot),
+                    key,
+                })
+            };
+        }
 
         let mask = self.mask;
         let mut idx = Self::hash(key) & mask;
@@ -585,23 +634,26 @@ impl<V> I64Map<V> {
                         let slot = unsafe { self.slots.get_unchecked(new_idx) };
                         if slot.key == EMPTY {
                             return Entry::Vacant(VacantEntry {
-                                map: self,
+                                target: VacantTarget::Slot {
+                                    map: self,
+                                    idx: new_idx,
+                                },
                                 key,
-                                idx: new_idx,
                             });
                         }
                         new_idx = (new_idx + 1) & new_mask;
                     }
                 }
                 return Entry::Vacant(VacantEntry {
-                    map: self,
+                    target: VacantTarget::Slot { map: self, idx },
                     key,
-                    idx,
                 });
             }
 
             if slot.key == key {
-                return Entry::Occupied(OccupiedEntry { map: self, idx });
+                return Entry::Occupied(OccupiedEntry {
+                    target: EntryTarget::Slot { map: self, idx },
+                });
             }
 
             idx = (idx + 1) & mask;
@@ -667,130 +719,144 @@ impl<'a, V> Entry<'a, V> {
     }
 }
 
+/// Where an entry points: a table slot, or the out-of-band slot that
+/// holds the i64::MIN key
+enum EntryTarget<'a, V> {
+    Slot { map: &'a mut I64Map<V>, idx: usize },
+    Sentinel(&'a mut Option<V>),
+}
+
+enum VacantTarget<'a, V> {
+    Slot { map: &'a mut I64Map<V>, idx: usize },
+    Sentinel(&'a mut Option<V>),
+}
+
 pub struct OccupiedEntry<'a, V> {
-    map: &'a mut I64Map<V>,
-    idx: usize,
+    target: EntryTarget<'a, V>,
 }
 
 impl<'a, V> OccupiedEntry<'a, V> {
     #[inline(always)]
     pub fn get(&self) -> &V {
-        // SAFETY: OccupiedEntry is only created for occupied slots, so idx is
-        // valid and the value at that index is initialized.
-        unsafe {
-            self.map
-                .slots
-                .get_unchecked(self.idx)
-                .value
-                .assume_init_ref()
+        match &self.target {
+            // SAFETY: an OccupiedEntry is only built for an occupied slot,
+            // so idx is valid and its value is initialized.
+            EntryTarget::Slot { map, idx } => unsafe {
+                map.slots.get_unchecked(*idx).value.assume_init_ref()
+            },
+            EntryTarget::Sentinel(slot) => slot.as_ref().expect("occupied sentinel"),
         }
     }
 
     #[inline(always)]
     pub fn get_mut(&mut self) -> &mut V {
-        // SAFETY: OccupiedEntry is only created for occupied slots, so idx is
-        // valid and the value at that index is initialized.
-        unsafe {
-            self.map
-                .slots
-                .get_unchecked_mut(self.idx)
-                .value
-                .assume_init_mut()
+        match &mut self.target {
+            // SAFETY: see get().
+            EntryTarget::Slot { map, idx } => unsafe {
+                map.slots.get_unchecked_mut(*idx).value.assume_init_mut()
+            },
+            EntryTarget::Sentinel(slot) => slot.as_mut().expect("occupied sentinel"),
         }
     }
 
     #[inline(always)]
     pub fn into_mut(self) -> &'a mut V {
-        // SAFETY: OccupiedEntry is only created for occupied slots, so idx is
-        // valid and the value at that index is initialized.
-        unsafe {
-            self.map
-                .slots
-                .get_unchecked_mut(self.idx)
-                .value
-                .assume_init_mut()
+        match self.target {
+            // SAFETY: see get().
+            EntryTarget::Slot { map, idx } => unsafe {
+                map.slots.get_unchecked_mut(idx).value.assume_init_mut()
+            },
+            EntryTarget::Sentinel(slot) => slot.as_mut().expect("occupied sentinel"),
         }
     }
 
     #[inline(always)]
     pub fn insert(&mut self, value: V) -> V {
-        // SAFETY: OccupiedEntry is only created for occupied slots.
-        let slot = unsafe { self.map.slots.get_unchecked_mut(self.idx) };
-        // SAFETY: The slot is occupied, so value is initialized.
-        let old = unsafe { slot.value.as_ptr().read() };
-        slot.value.write(value);
-        old
+        match &mut self.target {
+            EntryTarget::Slot { map, idx } => {
+                // SAFETY: OccupiedEntry is only created for occupied slots.
+                let slot = unsafe { map.slots.get_unchecked_mut(*idx) };
+                // SAFETY: The slot is occupied, so value is initialized.
+                let old = unsafe { slot.value.as_ptr().read() };
+                slot.value.write(value);
+                old
+            }
+            EntryTarget::Sentinel(slot) => slot.replace(value).expect("occupied sentinel"),
+        }
     }
 
-    #[inline(always)]
     pub fn remove(self) -> V {
-        // Extract value directly - we already have the index
-        // SAFETY: OccupiedEntry is only created for occupied slots.
-        let key = unsafe { self.map.slots.get_unchecked(self.idx).key };
-        // SAFETY: The slot is occupied, so value is initialized.
-        let value = unsafe { self.map.slots.get_unchecked(self.idx).value.as_ptr().read() };
-        self.map.len -= 1;
+        match self.target {
+            EntryTarget::Slot { map, idx } => {
+                // Extract value directly - we already have the index
+                // SAFETY: OccupiedEntry is only created for occupied slots.
+                let key = unsafe { map.slots.get_unchecked(idx).key };
+                // SAFETY: The slot is occupied, so value is initialized.
+                let value = unsafe { map.slots.get_unchecked(idx).value.as_ptr().read() };
+                map.len -= 1;
 
-        // Backward shift deletion at known index
-        let mask = self.map.mask;
-        let mut empty_idx = self.idx;
-        let mut next_idx = (self.idx + 1) & mask;
+                // Backward shift deletion at known index
+                let mask = map.mask;
+                let mut empty_idx = idx;
+                let mut next_idx = (idx + 1) & mask;
 
-        loop {
-            // SAFETY: next_idx is always in bounds due to masking.
-            let next_slot = unsafe { self.map.slots.get_unchecked(next_idx) };
+                loop {
+                    // SAFETY: next_idx is always in bounds due to masking.
+                    let next_slot = unsafe { map.slots.get_unchecked(next_idx) };
 
-            if next_slot.key == EMPTY {
-                break;
-            }
+                    if next_slot.key == EMPTY {
+                        break;
+                    }
 
-            let next_home = I64Map::<V>::hash(next_slot.key) & mask;
+                    let next_home = I64Map::<V>::hash(next_slot.key) & mask;
 
-            // Check if empty_idx is between next_home and next_idx (considering wrap)
-            let can_move = if next_home <= next_idx {
-                empty_idx >= next_home && empty_idx < next_idx
-            } else {
-                empty_idx >= next_home || empty_idx < next_idx
-            };
+                    // Check if empty_idx is between next_home and next_idx (considering wrap)
+                    let can_move = if next_home <= next_idx {
+                        empty_idx >= next_home && empty_idx < next_idx
+                    } else {
+                        empty_idx >= next_home || empty_idx < next_idx
+                    };
 
-            if can_move {
-                // Move entry back
-                // SAFETY: Both indices are in bounds, src slot is occupied, dst slot is empty.
-                // Derive both pointers from a single as_mut_ptr() call to avoid
-                // Stacked Borrows invalidation (as_ptr then as_mut_ptr conflicts).
-                unsafe {
-                    let base = self.map.slots.as_mut_ptr();
-                    let src = base.add(next_idx);
-                    let dst = base.add(empty_idx);
-                    (*dst).key = (*src).key;
-                    std::ptr::copy_nonoverlapping(
-                        (*src).value.as_ptr(),
-                        (*dst).value.as_mut_ptr(),
-                        1,
-                    );
+                    if can_move {
+                        // Move entry back
+                        // SAFETY: Both indices are in bounds, src slot is occupied, dst slot is empty.
+                        // Derive both pointers from a single as_mut_ptr() call to avoid
+                        // Stacked Borrows invalidation (as_ptr then as_mut_ptr conflicts).
+                        unsafe {
+                            let base = map.slots.as_mut_ptr();
+                            let src = base.add(next_idx);
+                            let dst = base.add(empty_idx);
+                            (*dst).key = (*src).key;
+                            std::ptr::copy_nonoverlapping(
+                                (*src).value.as_ptr(),
+                                (*dst).value.as_mut_ptr(),
+                                1,
+                            );
+                        }
+                        empty_idx = next_idx;
+                    }
+
+                    next_idx = (next_idx + 1) & mask;
                 }
-                empty_idx = next_idx;
+
+                // SAFETY: empty_idx is in bounds and we're marking the now-empty slot.
+                unsafe {
+                    map.slots.get_unchecked_mut(empty_idx).key = EMPTY;
+                }
+
+                // Suppress unused variable warning
+                let _ = key;
+
+                value
             }
-
-            next_idx = (next_idx + 1) & mask;
+            EntryTarget::Sentinel(slot) => slot.take().expect("occupied sentinel"),
         }
-
-        // SAFETY: empty_idx is in bounds and we're marking the now-empty slot.
-        unsafe {
-            self.map.slots.get_unchecked_mut(empty_idx).key = EMPTY;
-        }
-
-        // Suppress unused variable warning
-        let _ = key;
-
-        value
     }
 }
 
 pub struct VacantEntry<'a, V> {
-    map: &'a mut I64Map<V>,
+    target: VacantTarget<'a, V>,
     key: i64,
-    idx: usize,
 }
 
 impl<'a, V> VacantEntry<'a, V> {
@@ -801,14 +867,19 @@ impl<'a, V> VacantEntry<'a, V> {
 
     #[inline(always)]
     pub fn insert(self, value: V) -> &'a mut V {
-        // Direct insert at pre-computed index - NO re-lookup needed
-        // SAFETY: VacantEntry stores a valid idx that was found during entry() lookup.
-        let slot = unsafe { self.map.slots.get_unchecked_mut(self.idx) };
-        slot.key = self.key;
-        slot.value.write(value);
-        self.map.len += 1;
-        // SAFETY: We just wrote the value, so it's initialized.
-        unsafe { slot.value.assume_init_mut() }
+        match self.target {
+            VacantTarget::Slot { map, idx } => {
+                // Direct insert at pre-computed index - NO re-lookup needed
+                // SAFETY: VacantEntry stores a valid idx that was found during entry() lookup.
+                let slot = unsafe { map.slots.get_unchecked_mut(idx) };
+                slot.key = self.key;
+                slot.value.write(value);
+                map.len += 1;
+                // SAFETY: We just wrote the value, so it's initialized.
+                unsafe { slot.value.assume_init_mut() }
+            }
+            VacantTarget::Sentinel(slot) => slot.insert(value),
+        }
     }
 }
 
@@ -816,6 +887,7 @@ impl<'a, V> VacantEntry<'a, V> {
 pub struct IntoIter<V> {
     slots: Box<[Slot<V>]>,
     pos: usize,
+    min_slot: Option<V>,
 }
 
 impl<V> Iterator for IntoIter<V> {
@@ -835,12 +907,14 @@ impl<V> Iterator for IntoIter<V> {
                 return Some((key, value));
             }
         }
-        None
+        // The sentinel entry lives beside the table and is yielded last
+        self.min_slot.take().map(|v| (EMPTY, v))
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.slots.len() - self.pos))
+        let pending = usize::from(self.min_slot.is_some());
+        (pending, Some(self.slots.len() - self.pos + pending))
     }
 }
 
@@ -868,8 +942,13 @@ impl<V> IntoIterator for I64Map<V> {
 
     fn into_iter(mut self) -> Self::IntoIter {
         let slots = std::mem::take(&mut self.slots);
+        let min_slot = self.min_slot.take();
         self.len = 0; // Prevent drop from cleaning up values we're moving out
-        IntoIter { slots, pos: 0 }
+        IntoIter {
+            slots,
+            pos: 0,
+            min_slot,
+        }
     }
 }
 
@@ -877,6 +956,7 @@ impl<V> IntoIterator for I64Map<V> {
 pub struct Drain<V> {
     slots: Box<[Slot<V>]>,
     pos: usize,
+    min_slot: Option<V>,
 }
 
 // =============================================================================
@@ -886,11 +966,9 @@ pub struct Drain<V> {
 /// High-performance HashSet for i64 keys.
 ///
 /// Uses the same optimizations as I64Map:
-/// - i64::MIN as empty sentinel (row IDs and txn IDs are always >= 0)
+/// - i64::MIN marks empty slots; that member is held beside the array
 /// - FxHash with pre-mixing (XOR>>16 before multiply) - 0 sequential collisions
 /// - Backward-shift deletion (no tombstones)
-///
-/// Note: i64::MIN cannot be used as a value (reserved as empty sentinel).
 pub struct I64Set {
     slots: Box<[i64]>,
     len: usize,
@@ -1235,22 +1313,20 @@ impl I64Set {
     /// Drains all values from the set, returning an iterator over them
     #[inline]
     pub fn drain(&mut self) -> impl Iterator<Item = i64> + '_ {
-        let len = self.len;
+        // Hand the storage to the iterator instead of clearing lazily:
+        // a drain dropped half-way used to leave the slots populated
+        // while len said the set was empty, so contains() still matched
+        let old_slots = std::mem::replace(
+            &mut self.slots,
+            vec![EMPTY; MIN_CAPACITY].into_boxed_slice(),
+        );
+        let had_min = std::mem::replace(&mut self.has_min, false);
         self.len = 0;
-        let had_min = self.has_min;
-        self.has_min = false;
-        self.slots
-            .iter_mut()
-            .filter_map(move |slot| {
-                if *slot != EMPTY {
-                    let val = *slot;
-                    *slot = EMPTY;
-                    Some(val)
-                } else {
-                    None
-                }
-            })
-            .take(len)
+        self.mask = MIN_CAPACITY - 1;
+        old_slots
+            .into_vec()
+            .into_iter()
+            .filter(|&slot| slot != EMPTY)
             .chain(if had_min { Some(EMPTY) } else { None })
     }
 }
@@ -1345,12 +1421,14 @@ impl<V> Iterator for Drain<V> {
                 return Some((key, value));
             }
         }
-        None
+        // The side-slot entry drains last
+        self.min_slot.take().map(|v| (EMPTY, v))
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.slots.len() - self.pos))
+        let pending = usize::from(self.min_slot.is_some());
+        (pending, Some(self.slots.len() - self.pos + pending))
     }
 }
 
@@ -1713,24 +1791,110 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "i64::MIN cannot be used as a key")]
-    fn test_i64_min_panics_on_insert() {
+    fn test_i64_min_is_a_regular_key() {
+        // The empty marker lives in the slot array only; the entry for
+        // that key is held beside it, so the whole i64 range works
+        let mut map = I64Map::<i64>::new();
+        assert!(map.get(i64::MIN).is_none());
+        assert!(map.is_empty());
+
+        assert_eq!(map.insert(i64::MIN, 42), None);
+        assert_eq!(map.get(i64::MIN), Some(&42));
+        assert_eq!(map.insert(i64::MIN, 7), Some(42));
+        assert_eq!(map.len(), 1);
+        assert!(!map.is_empty());
+        assert!(map.contains_key(i64::MIN));
+
+        map.insert(3, 30);
+        map.insert(-1, -10);
+        assert_eq!(map.len(), 3);
+        let mut pairs: Vec<(i64, i64)> = map.iter().map(|(k, v)| (k, *v)).collect();
+        pairs.sort_unstable();
+        assert_eq!(pairs, vec![(i64::MIN, 7), (-1, -10), (3, 30)]);
+
+        *map.get_mut(i64::MIN).unwrap() += 1;
+        assert_eq!(map.get(i64::MIN), Some(&8));
+
+        let mut owned: Vec<(i64, i64)> = map.clone().into_iter().collect();
+        owned.sort_unstable();
+        assert_eq!(owned, vec![(i64::MIN, 8), (-1, -10), (3, 30)]);
+
+        assert_eq!(map.remove(i64::MIN), Some(8));
+        assert_eq!(map.remove(i64::MIN), None);
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn test_i64set_partial_drain_leaves_no_stale_keys() {
+        let mut set = I64Set::new();
+        set.insert(5);
+        set.insert(6);
+        set.insert(7);
+        {
+            let mut d = set.drain();
+            let _ = d.next();
+        }
+        assert!(set.is_empty(), "drain must empty the set");
+        for k in [5, 6, 7] {
+            assert!(!set.contains(k), "stale key {k} still visible after drain");
+        }
+    }
+
+    #[test]
+    fn test_i64_min_drain() {
         let mut map = I64Map::<i64>::new();
         map.insert(i64::MIN, 42);
+        map.insert(9, 90);
+
+        let mut drained: Vec<(i64, i64)> = map.drain().collect();
+        drained.sort_unstable();
+        assert_eq!(drained, vec![(i64::MIN, 42), (9, 90)]);
+        assert!(map.is_empty(), "drain must leave the map empty");
+        assert!(map.get(i64::MIN).is_none());
+
+        // A dropped, partially consumed drain must not leave the entry behind
+        map.insert(i64::MIN, 7);
+        map.insert(1, 10);
+        {
+            let mut d = map.drain();
+            let _ = d.next();
+        }
+        assert!(map.is_empty());
+        assert!(map.get(i64::MIN).is_none());
     }
 
     #[test]
-    #[should_panic(expected = "i64::MIN cannot be used as a key")]
-    fn test_i64_min_panics_on_get() {
-        let map = I64Map::<i64>::new();
-        let _ = map.get(i64::MIN);
-    }
-
-    #[test]
-    #[should_panic(expected = "i64::MIN cannot be used as a key")]
-    fn test_i64_min_panics_on_entry() {
+    fn test_i64_min_entry_api() {
         let mut map = I64Map::<i64>::new();
-        let _ = map.entry(i64::MIN);
+        *map.entry(i64::MIN).or_insert(1) += 5;
+        assert_eq!(map.get(i64::MIN), Some(&6));
+
+        match map.entry(i64::MIN) {
+            Entry::Occupied(mut e) => {
+                assert_eq!(*e.get(), 6);
+                assert_eq!(e.insert(9), 6);
+                assert_eq!(e.remove(), 9);
+            }
+            Entry::Vacant(_) => panic!("sentinel entry should be occupied"),
+        }
+        assert!(map.get(i64::MIN).is_none());
+
+        match map.entry(i64::MIN) {
+            Entry::Vacant(e) => {
+                assert_eq!(e.key(), i64::MIN);
+                *e.insert(4) += 1;
+            }
+            Entry::Occupied(_) => panic!("sentinel entry should be vacant"),
+        }
+        assert_eq!(map.get(i64::MIN), Some(&5));
+
+        map.retain(|k, _| k != i64::MIN);
+        assert!(map.get(i64::MIN).is_none());
+
+        map.insert(i64::MIN, 1);
+        map.clear();
+        assert!(map.is_empty());
+        assert!(map.get(i64::MIN).is_none());
     }
 
     // =========================================================================

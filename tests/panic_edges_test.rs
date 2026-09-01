@@ -245,10 +245,14 @@ fn i64_min_group_by_value() {
     let first_count: i64 = rows[0].get(1).unwrap();
     assert_eq!(first, i64::MIN);
     assert_eq!(first_count, 2);
-    let s: i64 = db
-        .query_one("SELECT SUM(id) FROM t GROUP BY v ORDER BY v LIMIT 1", ())
+    // Project the grouped column so the ordering is well defined
+    let rows = db
+        .query("SELECT v, SUM(id) FROM t GROUP BY v ORDER BY v", ())
+        .unwrap()
+        .collect_vec()
         .unwrap();
-    assert_eq!(s, 4);
+    let sums: Vec<i64> = rows.iter().map(|r| r.get(1).unwrap()).collect();
+    assert_eq!(sums, vec![4, 2], "sentinel group sums ids 1 and 3");
 }
 
 #[test]

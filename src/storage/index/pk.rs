@@ -19,7 +19,6 @@
 //!   ~0.125 bytes/row.
 //! - An `I64Set` overflow for row_ids outside that range — O(1) amortized lookups
 //!   at ~10.7 bytes/entry.
-//! - A `has_i64_min` flag because I64Set uses `i64::MIN` as its empty sentinel.
 //!
 //! All mutable state lives behind a **single `RwLock<PkIndexInner>`** to prevent
 //! deadlocks (no lock-ordering concerns) and keep `count` always consistent.
@@ -54,7 +53,6 @@ struct PkIndexInner {
     /// Overflow set for row_ids >= BITSET_MAX_BITS or negative (except i64::MIN).
     overflow: I64Set,
     /// Separate flag for i64::MIN which I64Set cannot store (used as sentinel).
-    has_i64_min: bool,
     /// Exact count of present entries.
     count: usize,
 }
@@ -64,7 +62,6 @@ impl PkIndexInner {
         Self {
             words: Vec::new(),
             overflow: I64Set::new(),
-            has_i64_min: false,
             count: 0,
         }
     }
@@ -76,8 +73,6 @@ impl PkIndexInner {
     fn contains(&self, id: i64) -> bool {
         if let Some((word_idx, mask)) = to_word_bit(id) {
             word_idx < self.words.len() && (self.words[word_idx] & mask) != 0
-        } else if id == i64::MIN {
-            self.has_i64_min
         } else {
             self.overflow.contains(id)
         }
@@ -94,14 +89,6 @@ impl PkIndexInner {
                 true
             } else {
                 false
-            }
-        } else if id == i64::MIN {
-            if self.has_i64_min {
-                false
-            } else {
-                self.has_i64_min = true;
-                self.count += 1;
-                true
             }
         } else if self.overflow.insert(id) {
             self.count += 1;
@@ -122,14 +109,6 @@ impl PkIndexInner {
             } else {
                 false
             }
-        } else if id == i64::MIN {
-            if self.has_i64_min {
-                self.has_i64_min = false;
-                self.count -= 1;
-                true
-            } else {
-                false
-            }
         } else if self.overflow.remove(id) {
             self.count -= 1;
             true
@@ -141,14 +120,13 @@ impl PkIndexInner {
     /// True when there are no entries in the overflow region.
     #[inline]
     fn overflow_empty(&self) -> bool {
-        self.overflow.is_empty() && !self.has_i64_min
+        self.overflow.is_empty()
     }
 
     /// Reset everything.
     fn clear(&mut self) {
         self.words.clear();
         self.overflow = I64Set::new();
-        self.has_i64_min = false;
         self.count = 0;
     }
 }
@@ -335,13 +313,9 @@ impl PkIndex {
         })
     }
 
-    /// Compute the overflow min, considering both I64Set and the i64::MIN flag.
+    /// Compute the overflow min.
     #[inline]
     fn overflow_min(inner: &PkIndexInner) -> Option<i64> {
-        if inner.has_i64_min {
-            // i64::MIN is the absolute minimum — no need to compare with set entries.
-            return Some(i64::MIN);
-        }
         if !inner.overflow.is_empty() {
             inner.overflow.iter().min()
         } else {
@@ -357,12 +331,7 @@ impl PkIndex {
         } else {
             None
         };
-        if inner.has_i64_min {
-            // i64::MIN is always <= any other value, so it only matters when alone.
-            Some(set_max.unwrap_or(i64::MIN))
-        } else {
-            set_max
-        }
+        set_max
     }
 }
 
@@ -515,14 +484,8 @@ impl Index for PkIndex {
             Vec::new()
         };
 
-        // Collect from overflow (I64Set + i64::MIN flag)
+        // Collect from overflow
         if !inner.overflow_empty() {
-            if inner.has_i64_min && lo == i64::MIN {
-                result.push(IndexEntry {
-                    row_id: i64::MIN,
-                    ref_id: i64::MIN,
-                });
-            }
             for id in inner.overflow.iter() {
                 if id >= lo && id <= hi {
                     result.push(IndexEntry {
@@ -560,12 +523,6 @@ impl Index for PkIndex {
                     }
                     true
                 });
-                if inner.has_i64_min && i64::MIN != exclude_id {
-                    result.push(IndexEntry {
-                        row_id: i64::MIN,
-                        ref_id: i64::MIN,
-                    });
-                }
                 for id in inner.overflow.iter() {
                     if id != exclude_id {
                         result.push(IndexEntry {
@@ -727,9 +684,6 @@ impl Index for PkIndex {
             true
         });
         if !inner.overflow_empty() {
-            if inner.has_i64_min {
-                result.push(Value::Integer(i64::MIN));
-            }
             let mut overflow_ids: Vec<i64> = inner.overflow.iter().collect();
             overflow_ids.sort_unstable();
             for id in overflow_ids {
@@ -779,11 +733,7 @@ impl Index for PkIndex {
         }
 
         // Collect and sort the (typically tiny) overflow set
-        let mut overflow_ids =
-            Vec::with_capacity(inner.overflow.len() + inner.has_i64_min as usize);
-        if inner.has_i64_min {
-            overflow_ids.push(i64::MIN);
-        }
+        let mut overflow_ids = Vec::with_capacity(inner.overflow.len());
         for id in inner.overflow.iter() {
             overflow_ids.push(id);
         }
@@ -877,9 +827,6 @@ impl Index for PkIndex {
             result.push((Value::Integer(rid), vec![rid]));
             true
         });
-        if inner.has_i64_min {
-            result.push((Value::Integer(i64::MIN), vec![i64::MIN]));
-        }
         for id in inner.overflow.iter() {
             result.push((Value::Integer(id), vec![id]));
         }
@@ -913,11 +860,7 @@ impl Index for PkIndex {
         }
 
         // Slow path: collect and sort overflow, then merge in sorted order.
-        let overflow_cap = inner.overflow.len() + if inner.has_i64_min { 1 } else { 0 };
-        let mut overflow_sorted: Vec<i64> = Vec::with_capacity(overflow_cap);
-        if inner.has_i64_min {
-            overflow_sorted.push(i64::MIN);
-        }
+        let mut overflow_sorted: Vec<i64> = Vec::with_capacity(inner.overflow.len());
         overflow_sorted.extend(inner.overflow.iter());
         overflow_sorted.sort_unstable();
 
