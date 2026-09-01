@@ -3240,6 +3240,9 @@ impl Executor {
                 Mixed,
             }
 
+            // A 100-row sample picks the candidate fast path; the typed
+            // extractors bail to the generic sort when the type drifts
+            // past the sample, so this is only a hint
             let mut detected = DetectedType::Unknown;
             for &idx in row_indices.iter().take(100) {
                 if let Some(val) = col.get(idx) {
@@ -3272,20 +3275,21 @@ impl Executor {
             }
 
             match detected {
-                DetectedType::Integer => {
-                    Self::sort_by_integer_key_columnar(row_indices, col, ascending);
+                DetectedType::Integer
+                    if Self::sort_by_integer_key_columnar(row_indices, col, ascending) =>
+                {
                     return;
                 }
-                DetectedType::Float => {
-                    Self::sort_by_float_key_columnar(row_indices, col, ascending);
+                DetectedType::Float
+                    if Self::sort_by_float_key_columnar(row_indices, col, ascending) =>
+                {
                     return;
                 }
-                _ => {
-                    // Mixed types or unknown - use generic single column sort
-                    Self::sort_single_column_columnar(row_indices, col, ascending);
-                    return;
-                }
+                _ => {}
             }
+            // Mixed types, unknown, or drift past the sample - generic sort
+            Self::sort_single_column_columnar(row_indices, col, ascending);
+            return;
         }
 
         // Multi-column ORDER BY: use parallel sort for large partitions
@@ -3341,24 +3345,52 @@ impl Executor {
     /// Fast value comparison with type-specific paths
     #[inline]
     fn compare_values_fast(a: &Value, b: &Value) -> Ordering {
+        use crate::core::value::cmp_i64_f64;
         match (a, b) {
             (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
-            (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+            // Total order: all NaNs equal to each other and after every
+            // real (an Equal-vs-everything NaN makes the sort comparator
+            // inconsistent); mixed compares are exact above 2^53
+            (Value::Float(x), Value::Float(y)) => match (x.is_nan(), y.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+            },
             (Value::Integer(x), Value::Float(y)) => {
-                (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
+                if y.is_nan() {
+                    Ordering::Less
+                } else {
+                    cmp_i64_f64(*x, *y).unwrap_or(Ordering::Equal)
+                }
             }
             (Value::Float(x), Value::Integer(y)) => {
-                x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
+                if x.is_nan() {
+                    Ordering::Greater
+                } else {
+                    cmp_i64_f64(*y, *x)
+                        .map(Ordering::reverse)
+                        .unwrap_or(Ordering::Equal)
+                }
             }
             (Value::Null(_), Value::Null(_)) => Ordering::Equal,
             (Value::Null(_), _) => Ordering::Greater, // NULLs last
             (_, Value::Null(_)) => Ordering::Less,
-            _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            // Heterogeneous pairs use Value's total order (type rank,
+            // then within-type): the old stringly fallback made the
+            // comparator cyclic (2 < 10, 10 < '15', '15' < 2)
+            _ => a.cmp(b),
         }
     }
 
     /// Ultra-fast sort for integer ORDER BY column (columnar layout)
-    fn sort_by_integer_key_columnar(row_indices: &mut [usize], col: &[Value], ascending: bool) {
+    /// Returns false without touching row_indices when a non-Integer,
+    /// non-NULL value appears (type drift past the detection sample)
+    fn sort_by_integer_key_columnar(
+        row_indices: &mut [usize],
+        col: &[Value],
+        ascending: bool,
+    ) -> bool {
         const PARALLEL_THRESHOLD: usize = 50_000;
 
         // OPTIMIZATION: Pre-extract sort keys to avoid bounds checking in the comparison hot path.
@@ -3370,17 +3402,22 @@ impl Executor {
         // then extract the sorted positions back to row_indices.
         let n = row_indices.len();
         if n < 2 {
-            return;
+            return true;
         }
 
-        // Pre-extract sort keys: O(k) where k = partition size
-        let mut keyed: Vec<(usize, i64)> = Vec::with_capacity(n);
+        // Pre-extract sort keys: O(k) where k = partition size.
+        // NULL rows are kept out of band instead of using a sentinel key,
+        // so a genuine i64::MAX row can never tie with NULLs and the hot
+        // sort stays a bare-u64 comparison. The i64 -> u64 map is
+        // order-preserving (flip the sign bit).
+        let mut keyed: Vec<(usize, u64)> = Vec::with_capacity(n);
+        let mut null_indices: Vec<usize> = Vec::new();
         for &idx in row_indices.iter() {
-            let key = match col.get(idx) {
-                Some(Value::Integer(i)) => *i,
-                _ => i64::MAX, // NULLs sort last
-            };
-            keyed.push((idx, key));
+            match col.get(idx) {
+                Some(Value::Integer(i)) => keyed.push((idx, (*i as u64) ^ (1u64 << 63))),
+                Some(Value::Null(_)) | None => null_indices.push(idx),
+                _ => return false, // type drift
+            }
         }
 
         // Sort by pre-extracted key - no bounds checking in comparison!
@@ -3402,14 +3439,37 @@ impl Executor {
             keyed.sort_unstable_by_key(|&(_, key)| std::cmp::Reverse(key));
         }
 
-        // Write sorted indices back
-        for (i, (idx, _)) in keyed.into_iter().enumerate() {
-            row_indices[i] = idx;
+        // Write back: NULLs strictly last ascending, first descending.
+        // For floats this also fixes the old sentinel's misplacement of
+        // NULLs before +inf and NaN
+        let mut pos = 0;
+        if !ascending {
+            for &idx in &null_indices {
+                row_indices[pos] = idx;
+                pos += 1;
+            }
         }
+        for (idx, _) in keyed {
+            row_indices[pos] = idx;
+            pos += 1;
+        }
+        if ascending {
+            for &idx in &null_indices {
+                row_indices[pos] = idx;
+                pos += 1;
+            }
+        }
+        true
     }
 
     /// Fast sort for float ORDER BY column (columnar layout)
-    fn sort_by_float_key_columnar(row_indices: &mut [usize], col: &[Value], ascending: bool) {
+    /// Returns false without touching row_indices when a value that is
+    /// neither Float nor NULL appears (type drift past the sample)
+    fn sort_by_float_key_columnar(
+        row_indices: &mut [usize],
+        col: &[Value],
+        ascending: bool,
+    ) -> bool {
         const PARALLEL_THRESHOLD: usize = 50_000;
 
         // OPTIMIZATION: Pre-extract sort keys to avoid bounds checking in the comparison hot path.
@@ -3419,31 +3479,36 @@ impl Executor {
         // comparison via sort_by_key instead of sort_by with a closure.
         let n = row_indices.len();
         if n < 2 {
-            return;
+            return true;
         }
 
-        // Pre-extract sort keys as OrderedFloat bits for fast integer comparison
-        // Using to_bits() allows sort_by_key which is faster than sort_by with closure
+        // Pre-extract sort keys as ordered bits for fast integer
+        // comparison. The leading class separates NULLs from values, so a
+        // genuine f64::MAX row can never tie with NULL rows; NaN keeps a
+        // maximal key inside the value class (after all reals, before
+        // NULLs, matching the generic comparator)
         let mut keyed: Vec<(usize, u64)> = Vec::with_capacity(n);
+        let mut null_indices: Vec<usize> = Vec::new();
         for &idx in row_indices.iter() {
-            let f = match col.get(idx) {
-                Some(Value::Float(f)) => *f,
-                Some(Value::Integer(i)) => *i as f64,
-                _ => f64::MAX, // NULLs sort last
-            };
-            // Convert to sortable integer representation (handles NaN, -0.0, negative numbers)
-            let bits = if f.is_nan() {
-                u64::MAX // NaN sorts last
-            } else {
-                let b = f.to_bits();
-                // Flip sign bit and conditionally flip all bits for proper ordering
-                if (b & (1u64 << 63)) != 0 {
-                    !b // Negative: flip all bits
-                } else {
-                    b | (1u64 << 63) // Positive: set sign bit
+            match col.get(idx) {
+                Some(Value::Float(f)) => {
+                    let bits = if f.is_nan() {
+                        u64::MAX // all NaNs equal, after every real
+                    } else {
+                        let b = f.to_bits();
+                        // Flip sign bit and conditionally flip all bits
+                        // for proper ordering
+                        if (b & (1u64 << 63)) != 0 {
+                            !b // Negative: flip all bits
+                        } else {
+                            b | (1u64 << 63) // Positive: set sign bit
+                        }
+                    };
+                    keyed.push((idx, bits));
                 }
-            };
-            keyed.push((idx, bits));
+                Some(Value::Null(_)) | None => null_indices.push(idx),
+                _ => return false, // type drift
+            }
         }
 
         // Sort by pre-extracted key - no bounds checking, pure integer comparison!
@@ -3465,10 +3530,27 @@ impl Executor {
             keyed.sort_unstable_by_key(|&(_, key)| std::cmp::Reverse(key));
         }
 
-        // Write sorted indices back
-        for (i, (idx, _)) in keyed.into_iter().enumerate() {
-            row_indices[i] = idx;
+        // Write back: NULLs strictly last ascending, first descending.
+        // For floats this also fixes the old sentinel's misplacement of
+        // NULLs before +inf and NaN
+        let mut pos = 0;
+        if !ascending {
+            for &idx in &null_indices {
+                row_indices[pos] = idx;
+                pos += 1;
+            }
         }
+        for (idx, _) in keyed {
+            row_indices[pos] = idx;
+            pos += 1;
+        }
+        if ascending {
+            for &idx in &null_indices {
+                row_indices[pos] = idx;
+                pos += 1;
+            }
+        }
+        true
     }
 
     /// Single column generic sort (columnar layout)
