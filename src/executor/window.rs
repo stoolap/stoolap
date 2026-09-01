@@ -697,8 +697,57 @@ impl Executor {
             }
         }
 
+        // ORDER BY may name a base column the projection drops (a grouped
+        // column when this runs over aggregated rows). Carry those columns
+        // so the sort in execute_select can see them; the expected-column
+        // trim removes them again afterwards.
+        let (mut result_columns, mut column_data) = (result_columns, column_data);
+        for (name, values) in
+            Self::collect_hidden_order_by_columns_from_slice(stmt, base_columns, base_rows)
+        {
+            if result_columns.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                continue;
+            }
+            result_columns.push(name);
+            column_data.push(values);
+        }
+
         // Return ColumnarResult which materializes rows lazily with zero per-row allocation
         Ok(Box::new(ColumnarResult::new(result_columns, column_data)))
+    }
+
+    /// Same contract as the aggregate path's collector, over a row slice
+    fn collect_hidden_order_by_columns_from_slice(
+        stmt: &SelectStatement,
+        source_columns: &[String],
+        source_rows: &[(i64, Row)],
+    ) -> Vec<(String, Vec<Value>)> {
+        stmt.order_by
+            .iter()
+            .filter_map(|ob| match &ob.expression {
+                Expression::Identifier(id) => {
+                    Some((id.value.to_string(), vec![id.value.to_string()]))
+                }
+                Expression::QualifiedIdentifier(qid) => {
+                    let full = format!("{}.{}", qid.qualifier.value, qid.name.value);
+                    let bare = qid.name.value.to_string();
+                    Some((full.clone(), vec![full, bare]))
+                }
+                _ => None,
+            })
+            .filter_map(|(publish_as, candidates)| {
+                let idx = candidates.iter().find_map(|cand| {
+                    source_columns
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(cand))
+                })?;
+                let values = source_rows
+                    .iter()
+                    .map(|(_, row)| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
+                    .collect();
+                Some((publish_as, values))
+            })
+            .collect()
     }
 
     /// Streaming execution for window functions with LIMIT pushdown

@@ -532,25 +532,8 @@ impl Executor {
         // ORDER BY may name a grouped column the SELECT list drops. Capture
         // those columns before projection consumes the aggregate rows; they
         // are appended below and trimmed again after the sort.
-        let hidden_order_by_columns: Vec<(String, Vec<Value>)> = stmt
-            .order_by
-            .iter()
-            .filter_map(|ob| match &ob.expression {
-                Expression::Identifier(id) => Some(id.value.to_string()),
-                Expression::QualifiedIdentifier(qid) => Some(qid.name.value.to_string()),
-                _ => None,
-            })
-            .filter_map(|name| {
-                let idx = having_columns
-                    .iter()
-                    .position(|c| c.eq_ignore_ascii_case(&name))?;
-                let values = having_rows
-                    .iter()
-                    .map(|(_, row)| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
-                    .collect();
-                Some((name, values))
-            })
-            .collect();
+        let hidden_order_by_columns =
+            Self::collect_hidden_order_by_columns(stmt, &having_columns, &having_rows);
 
         // Check for hidden aggregates (ORDER BY only) BEFORE cloning
         // These will be removed after sorting by the ProjectedResult wrapper
@@ -656,6 +639,43 @@ impl Executor {
 
     /// Append grouped columns that ORDER BY needs but SELECT does not project.
     /// Values come from the pre-projection aggregate rows, matched by position.
+    /// Grouped columns that ORDER BY names but the SELECT list does not
+    /// project, paired with their per-group values. A grouped column may be
+    /// stored qualified ("t.v") or bare, and ORDER BY resolves the qualified
+    /// form first, so both spellings are tried in that order.
+    pub(crate) fn collect_hidden_order_by_columns(
+        stmt: &SelectStatement,
+        source_columns: &[String],
+        source_rows: &RowVec,
+    ) -> Vec<(String, Vec<Value>)> {
+        stmt.order_by
+            .iter()
+            .filter_map(|ob| match &ob.expression {
+                Expression::Identifier(id) => {
+                    Some((id.value.to_string(), vec![id.value.to_string()]))
+                }
+                Expression::QualifiedIdentifier(qid) => {
+                    let full = format!("{}.{}", qid.qualifier.value, qid.name.value);
+                    let bare = qid.name.value.to_string();
+                    Some((full.clone(), vec![full, bare]))
+                }
+                _ => None,
+            })
+            .filter_map(|(publish_as, candidates)| {
+                let idx = candidates.iter().find_map(|cand| {
+                    source_columns
+                        .iter()
+                        .position(|c| c.eq_ignore_ascii_case(cand))
+                })?;
+                let values = source_rows
+                    .iter()
+                    .map(|(_, row)| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
+                    .collect();
+                Some((publish_as, values))
+            })
+            .collect()
+    }
+
     fn append_hidden_order_by_columns(
         mut columns: Vec<String>,
         mut rows: RowVec,

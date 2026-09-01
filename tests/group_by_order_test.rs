@@ -85,3 +85,49 @@ fn order_by_projected_group_column_still_works() {
         .collect();
     assert_eq!(vs, vec![1, 5, 7]);
 }
+
+#[test]
+fn order_by_unprojected_qualified_group_column() {
+    let db = setup("memory://gb_order_qualified");
+    let sums: Vec<i64> = db
+        .query("SELECT SUM(t.id) FROM t GROUP BY t.v ORDER BY t.v", ())
+        .unwrap()
+        .collect_vec()
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0).unwrap())
+        .collect();
+    assert_eq!(sums, vec![2, 4, 4], "qualified group key must still sort");
+
+    let sums: Vec<i64> = db
+        .query("SELECT SUM(id) FROM t GROUP BY v ORDER BY t.v DESC", ())
+        .unwrap()
+        .collect_vec()
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0).unwrap())
+        .collect();
+    assert_eq!(sums, vec![4, 4, 2], "qualified ORDER BY over bare GROUP BY");
+}
+
+#[test]
+fn order_by_unprojected_group_column_with_window() {
+    let db = setup("memory://gb_order_window");
+    let mins: Vec<i64> = db
+        .query(
+            "SELECT MIN(id), ROW_NUMBER() OVER () FROM t GROUP BY v ORDER BY v",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0).unwrap())
+        .collect();
+    // groups v=1 (min id 2), v=5 (4), v=7 (1)
+    assert_eq!(
+        mins,
+        vec![2, 4, 1],
+        "window projection must keep the sort key"
+    );
+}
