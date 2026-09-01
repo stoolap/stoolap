@@ -643,6 +643,56 @@ impl Executor {
     /// project, paired with their per-group values. A grouped column may be
     /// stored qualified ("t.v") or bare, and ORDER BY resolves the qualified
     /// form first, so both spellings are tried in that order.
+    /// Resolve one ORDER BY item against the pre-projection columns.
+    /// Returns the name to publish the carried column under (the spelling
+    /// the sorter will look for) and its index in `source_columns`.
+    ///
+    /// The two spellings do not have to agree: a query may group by `t.v`
+    /// and order by `v`, or the reverse, so a bare name also matches a
+    /// unique `<qualifier>.<name>` column and a qualified name falls back
+    /// to its bare form.
+    pub(crate) fn resolve_hidden_order_by_column(
+        ob: &crate::parser::ast::OrderByExpression,
+        source_columns: &[String],
+    ) -> Option<(String, usize)> {
+        let (publish_as, candidates) = match &ob.expression {
+            Expression::Identifier(id) => (id.value.to_string(), vec![id.value.to_string()]),
+            Expression::QualifiedIdentifier(qid) => {
+                let full = format!("{}.{}", qid.qualifier.value, qid.name.value);
+                (full.clone(), vec![full, qid.name.value.to_string()])
+            }
+            _ => return None,
+        };
+
+        for cand in &candidates {
+            if let Some(idx) = source_columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(cand))
+            {
+                return Some((publish_as, idx));
+            }
+        }
+
+        // Bare name against a qualified column: only when unambiguous
+        let bare = match &ob.expression {
+            Expression::Identifier(id) => id.value.to_string(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
+            _ => return None,
+        };
+        let suffix = format!(".{}", bare);
+        let mut matches = source_columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.to_lowercase().ends_with(&suffix.to_lowercase()));
+        let (idx, _) = matches.next()?;
+        if matches.next().is_some() {
+            return None; // ambiguous across qualifiers
+        }
+        Some((publish_as, idx))
+    }
+
+    /// Grouped columns that ORDER BY names but the SELECT list does not
+    /// project, paired with their per-group values.
     pub(crate) fn collect_hidden_order_by_columns(
         stmt: &SelectStatement,
         source_columns: &[String],
@@ -650,23 +700,8 @@ impl Executor {
     ) -> Vec<(String, Vec<Value>)> {
         stmt.order_by
             .iter()
-            .filter_map(|ob| match &ob.expression {
-                Expression::Identifier(id) => {
-                    Some((id.value.to_string(), vec![id.value.to_string()]))
-                }
-                Expression::QualifiedIdentifier(qid) => {
-                    let full = format!("{}.{}", qid.qualifier.value, qid.name.value);
-                    let bare = qid.name.value.to_string();
-                    Some((full.clone(), vec![full, bare]))
-                }
-                _ => None,
-            })
-            .filter_map(|(publish_as, candidates)| {
-                let idx = candidates.iter().find_map(|cand| {
-                    source_columns
-                        .iter()
-                        .position(|c| c.eq_ignore_ascii_case(cand))
-                })?;
+            .filter_map(|ob| {
+                let (publish_as, idx) = Self::resolve_hidden_order_by_column(ob, source_columns)?;
                 let values = source_rows
                     .iter()
                     .map(|(_, row)| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))

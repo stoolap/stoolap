@@ -724,23 +724,9 @@ impl Executor {
     ) -> Vec<(String, Vec<Value>)> {
         stmt.order_by
             .iter()
-            .filter_map(|ob| match &ob.expression {
-                Expression::Identifier(id) => {
-                    Some((id.value.to_string(), vec![id.value.to_string()]))
-                }
-                Expression::QualifiedIdentifier(qid) => {
-                    let full = format!("{}.{}", qid.qualifier.value, qid.name.value);
-                    let bare = qid.name.value.to_string();
-                    Some((full.clone(), vec![full, bare]))
-                }
-                _ => None,
-            })
-            .filter_map(|(publish_as, candidates)| {
-                let idx = candidates.iter().find_map(|cand| {
-                    source_columns
-                        .iter()
-                        .position(|c| c.eq_ignore_ascii_case(cand))
-                })?;
+            .filter_map(|ob| {
+                // One shared name-resolution rule with the aggregate path
+                let (publish_as, idx) = Self::resolve_hidden_order_by_column(ob, source_columns)?;
                 let values = source_rows
                     .iter()
                     .map(|(_, row)| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))

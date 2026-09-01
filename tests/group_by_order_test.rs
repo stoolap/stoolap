@@ -131,3 +131,55 @@ fn order_by_unprojected_group_column_with_window() {
         "window projection must keep the sort key"
     );
 }
+
+#[test]
+fn bare_order_by_over_qualified_group_key() {
+    let db = setup("memory://gb_order_bare_over_qualified");
+    let maxs: Vec<i64> = db
+        .query("SELECT MAX(id) FROM t GROUP BY t.v ORDER BY v", ())
+        .unwrap()
+        .collect_vec()
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0).unwrap())
+        .collect();
+    // groups v=1 (max id 2), v=5 (4), v=7 (3)
+    assert_eq!(
+        maxs,
+        vec![2, 4, 3],
+        "bare ORDER BY must find the qualified key"
+    );
+}
+
+#[test]
+fn qualified_order_by_prefers_group_key_over_alias() {
+    let db = setup("memory://gb_order_alias_shadow");
+    let vals: Vec<i64> = db
+        .query("SELECT MAX(id) AS v FROM t GROUP BY t.v ORDER BY t.v", ())
+        .unwrap()
+        .collect_vec()
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0).unwrap())
+        .collect();
+    // ordering by the group key t.v (1, 5, 7) yields max ids 2, 4, 3;
+    // ordering by the alias MAX(id) would yield 2, 3, 4
+    assert_eq!(vals, vec![2, 4, 3], "qualified key must beat the alias");
+}
+
+#[test]
+fn bare_order_by_over_qualified_group_key_with_window() {
+    let db = setup("memory://gb_order_bare_window");
+    let maxs: Vec<i64> = db
+        .query(
+            "SELECT MAX(id), ROW_NUMBER() OVER () FROM t GROUP BY t.v ORDER BY v",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0).unwrap())
+        .collect();
+    assert_eq!(maxs, vec![2, 4, 3]);
+}
