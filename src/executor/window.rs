@@ -78,15 +78,20 @@ impl ConstArg {
     }
 }
 
-/// Conservative determinism check: anything unrecognized counts as
-/// volatile and re-evaluates per row
+/// Conservative determinism check: does this expression yield the same
+/// value every time it is evaluated against the same row? Column
+/// references and bound parameters qualify; RANDOM and friends do not,
+/// and anything unrecognized counts as volatile.
 fn expr_is_deterministic(expr: &Expression, registry: &FunctionRegistry) -> bool {
     match expr {
         Expression::IntegerLiteral(_)
         | Expression::FloatLiteral(_)
         | Expression::StringLiteral(_)
         | Expression::BooleanLiteral(_)
-        | Expression::NullLiteral(_) => true,
+        | Expression::NullLiteral(_)
+        | Expression::Identifier(_)
+        | Expression::QualifiedIdentifier(_)
+        | Expression::Parameter(_) => true,
         Expression::Prefix(prefix) => expr_is_deterministic(&prefix.right, registry),
         Expression::Infix(infix) => {
             expr_is_deterministic(&infix.left, registry)
@@ -111,14 +116,16 @@ type PartitionKey = SmallVec<[Value; 4]>;
 /// shared across window functions with the same OVER clause
 type SharedSortedPartitions = std::sync::Arc<Vec<Vec<usize>>>;
 
-/// Structural identity of an ORDER BY clause: per item the expression
-/// hash plus its direction and NULLS placement. Hashes (not rendered
-/// SQL) because Display drops positional parameter indices and cannot
-/// escape separators.
-type OrderByKey = SmallVec<[(u64, bool, Option<bool>); 2]>;
+/// Identity of one ORDER BY item: expression hash, rendered expression,
+/// direction and NULLS placement. The hash alone is not identity (two
+/// expressions can collide), and rendered SQL alone is not either
+/// (Display drops positional parameter indices), so a cache hit
+/// requires both to match.
+type OrderByItemKey = (u64, String, bool, Option<bool>);
+type OrderByKey = SmallVec<[OrderByItemKey; 2]>;
 
-/// Structural identity of a whole OVER clause
-type OverClauseKey = (SmallVec<[u64; 2]>, OrderByKey);
+/// Identity of a whole OVER clause: partition items then ORDER BY items
+type OverClauseKey = (SmallVec<[(u64, String); 2]>, OrderByKey);
 
 use crate::functions::registry::FunctionRegistry;
 use crate::functions::WindowFunction;
@@ -1757,9 +1764,12 @@ impl Executor {
         order_by_values: Option<&ColumnarOrderByValues>,
         partition_cache: &mut Vec<(OverClauseKey, SharedSortedPartitions)>,
     ) -> Result<SharedSortedPartitions> {
+        let shareable = self.over_clause_is_shareable(wf_info);
         let key = Self::over_clause_cache_key(wf_info);
-        if let Some((_, cached)) = partition_cache.iter().find(|(k, _)| k == &key) {
-            return Ok(std::sync::Arc::clone(cached));
+        if shareable {
+            if let Some((_, cached)) = partition_cache.iter().find(|(k, _)| k == &key) {
+                return Ok(std::sync::Arc::clone(cached));
+            }
         }
 
         let mut partition_vec: Vec<Vec<usize>> = if wf_info.partition_by_exprs.is_empty() {
@@ -1783,7 +1793,9 @@ impl Executor {
         }
 
         let shared: SharedSortedPartitions = std::sync::Arc::new(partition_vec);
-        partition_cache.push((key, std::sync::Arc::clone(&shared)));
+        if shareable {
+            partition_cache.push((key, std::sync::Arc::clone(&shared)));
+        }
         Ok(shared)
     }
 
@@ -1793,9 +1805,22 @@ impl Executor {
         let partition = wf
             .partition_by_exprs
             .iter()
-            .map(compute_expression_hash)
+            .map(|e| (compute_expression_hash(e), e.to_string()))
             .collect();
         (partition, Self::order_by_cache_key(&wf.order_by))
+    }
+
+    /// Window functions whose OVER clause contains a volatile expression
+    /// (RANDOM, UUID, NOW, ...) must not share partitions: each function
+    /// evaluates its own draw
+    fn over_clause_is_shareable(&self, wf: &WindowFunctionInfo) -> bool {
+        wf.partition_by_exprs
+            .iter()
+            .all(|e| expr_is_deterministic(e, &self.function_registry))
+            && wf
+                .order_by
+                .iter()
+                .all(|ob| expr_is_deterministic(&ob.expression, &self.function_registry))
     }
 
     /// Structural identity of an ORDER BY clause. Rendered SQL cannot
@@ -1809,6 +1834,7 @@ impl Executor {
             .map(|ob| {
                 (
                     compute_expression_hash(&ob.expression),
+                    ob.expression.to_string(),
                     ob.ascending,
                     ob.nulls_first,
                 )
@@ -1821,21 +1847,20 @@ impl Executor {
     /// different partition scheme, because the streaming path builds only one
     /// partition map and computes per-partition subsets.
     fn all_partitions_match(window_functions: &[WindowFunctionInfo]) -> bool {
-        use std::fmt::Write;
-        let mut canonical: Option<String> = None;
+        let mut canonical: Option<SmallVec<[(u64, String); 2]>> = None;
         for wf in window_functions {
             // A global (unpartitioned) window must see all rows, so
             // per-partition streaming is unsafe.
             if wf.partition_by_exprs.is_empty() {
                 return false;
             }
-            let mut key = String::with_capacity(64);
-            for (i, expr) in wf.partition_by_exprs.iter().enumerate() {
-                if i > 0 {
-                    key.push(',');
-                }
-                let _ = write!(key, "{}", expr);
-            }
+            // Same identity the partition cache uses: hash plus rendered
+            // form, per item, so parameters and separators cannot merge
+            let key: SmallVec<[(u64, String); 2]> = wf
+                .partition_by_exprs
+                .iter()
+                .map(|e| (compute_expression_hash(e), e.to_string()))
+                .collect();
             match &canonical {
                 None => canonical = Some(key),
                 Some(c) if c != &key => return false,

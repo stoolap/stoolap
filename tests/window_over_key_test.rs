@@ -83,3 +83,60 @@ fn quoted_comma_identifier_does_not_collide_with_two_columns() {
         "each (a, b) pair is its own partition"
     );
 }
+
+#[test]
+fn hash_colliding_partition_expressions_stay_separate() {
+    // Two different literals whose expression hashes collide must not
+    // share a partition map: the cache must verify structural identity,
+    // not just the hash
+    let db = Database::open("memory://win_key_collide").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    for i in 1..=4i64 {
+        db.execute("INSERT INTO t VALUES ($1)", (i,)).unwrap();
+    }
+    let rows = db
+        .query(
+            "SELECT id, \
+             ROW_NUMBER() OVER (PARTITION BY id = -9223372036854775808 ORDER BY id) AS a, \
+             ROW_NUMBER() OVER (PARTITION BY id = -1.9149084435936727e80 ORDER BY id) AS b \
+             FROM t ORDER BY id",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    let a: Vec<i64> = rows.iter().map(|r| r.get(1).unwrap()).collect();
+    let b: Vec<i64> = rows.iter().map(|r| r.get(2).unwrap()).collect();
+    assert_eq!(a, vec![1, 2, 3, 4], "no row matches the integer literal");
+    assert_eq!(b, vec![1, 2, 3, 4], "no row matches the float literal");
+}
+
+#[test]
+fn volatile_partition_expressions_are_not_shared() {
+    // PARTITION BY RANDOM() must be evaluated per window function; a
+    // shared partition map would force both columns to agree
+    let db = Database::open("memory://win_key_volatile").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 1..=200i64 {
+        tx.execute("INSERT INTO t VALUES ($1)", (i,)).unwrap();
+    }
+    tx.commit().unwrap();
+    let rows = db
+        .query(
+            "SELECT ROW_NUMBER() OVER (PARTITION BY RANDOM() < 0.5 ORDER BY id) AS a, \
+             ROW_NUMBER() OVER (PARTITION BY RANDOM() < 0.5 ORDER BY id) AS b \
+             FROM t ORDER BY id",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    let a: Vec<i64> = rows.iter().map(|r| r.get(0).unwrap()).collect();
+    let b: Vec<i64> = rows.iter().map(|r| r.get(1).unwrap()).collect();
+    // Two independent random partitionings of 200 rows agreeing on every
+    // row has probability ~2^-200
+    assert_ne!(a, b, "volatile partitions must not share a cached map");
+}
