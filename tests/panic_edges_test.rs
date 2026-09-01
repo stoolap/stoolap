@@ -314,3 +314,112 @@ fn auto_increment_exhaustion_reports_cleanly() {
     let c: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
     assert_eq!(c, 1);
 }
+
+#[test]
+fn huge_limit_inside_transaction() {
+    // The local-changes path builds its own result buffer
+    let db = Database::open("memory://panic_limit_tx").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+
+    let mut tx = db.begin().unwrap();
+    tx.execute("INSERT INTO t VALUES (3, 3)", ()).unwrap();
+    let n = tx
+        .query("SELECT * FROM t LIMIT 9223372036854775807", ())
+        .unwrap()
+        .collect_vec()
+        .unwrap()
+        .len();
+    assert_eq!(n, 3);
+    tx.commit().unwrap();
+}
+
+#[test]
+fn huge_limit_with_cte_join() {
+    let db = Database::open("memory://panic_limit_cte").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 1..=20i64 {
+        tx.execute("INSERT INTO t VALUES ($1, $2)", (i, i)).unwrap();
+    }
+    tx.commit().unwrap();
+
+    let n = db
+        .query(
+            "WITH c AS (SELECT id, v FROM t WHERE v > 5) \
+             SELECT c.id FROM c JOIN t ON t.id = c.id LIMIT 9223372036854775807",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap()
+        .len();
+    assert_eq!(n, 15);
+}
+
+#[test]
+fn i64_min_join_key_against_pk() {
+    // A non-PK column may legally hold i64::MIN; joining it against a PK
+    // can never match, but it must not panic on the way there
+    let db = Database::open("memory://panic_join_sentinel").unwrap();
+    db.execute(
+        "CREATE TABLE outer_t (id INTEGER PRIMARY KEY, k INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE inner_t (id INTEGER PRIMARY KEY, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 1..=50i64 {
+        tx.execute("INSERT INTO inner_t VALUES ($1, $2)", (i, i * 2))
+            .unwrap();
+        tx.execute("INSERT INTO outer_t VALUES ($1, $2)", (i, i))
+            .unwrap();
+    }
+    tx.execute("INSERT INTO outer_t VALUES ($1, $2)", (100i64, i64::MIN))
+        .unwrap();
+    tx.commit().unwrap();
+
+    let c: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM outer_t o JOIN inner_t i ON i.id = o.k",
+            (),
+        )
+        .unwrap();
+    assert_eq!(c, 50, "the sentinel key matches nothing");
+}
+
+#[test]
+fn i64_min_not_in_subquery_on_pk() {
+    let db = Database::open("memory://panic_not_in_sub").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE ex (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 1..=30i64 {
+        tx.execute("INSERT INTO t VALUES ($1, $2)", (i, i)).unwrap();
+    }
+    tx.execute("INSERT INTO ex VALUES (1, $1)", (i64::MIN,))
+        .unwrap();
+    tx.execute("INSERT INTO ex VALUES (2, 5)", ()).unwrap();
+    tx.commit().unwrap();
+
+    let c: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM t WHERE id NOT IN (SELECT k FROM ex)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(c, 29, "only id = 5 is excluded");
+    let n = db
+        .execute("DELETE FROM t WHERE id IN (SELECT k FROM ex)", ())
+        .unwrap();
+    assert_eq!(n, 1);
+}

@@ -1693,7 +1693,9 @@ impl MVCCTable {
             }
         }
 
-        let mut result = RowVec::with_capacity(limit);
+        // A user-supplied limit can be i64::MAX; only pre-allocate what
+        // can actually be returned
+        let mut result = RowVec::with_capacity(limit.min(4096));
         let mut count = 0;
 
         // Add global rows that don't have local overrides
