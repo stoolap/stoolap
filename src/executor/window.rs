@@ -394,9 +394,13 @@ impl Executor {
 
         // OPTIMIZATION: LIMIT pushdown for PARTITION BY queries
         // Only safe when there is no top-level ORDER BY (otherwise the sort must see all
-        // rows before LIMIT can be applied) and when all window functions share the same
-        // PARTITION BY so one partition map can serve them all.
-        if stmt.order_by.is_empty() && stmt.offset.is_none() {
+        // rows before LIMIT can be applied), when all window functions share the same
+        // PARTITION BY so one partition map can serve them all, and when no OVER clause
+        // is volatile (RANDOM and friends must draw per window function).
+        let all_over_clauses_shareable = window_functions
+            .iter()
+            .all(|wf| self.over_clause_is_shareable(wf));
+        if all_over_clauses_shareable && stmt.order_by.is_empty() && stmt.offset.is_none() {
             if let Some(limit_expr) = &stmt.limit {
                 let has_partition_by = window_functions
                     .iter()
@@ -4342,6 +4346,7 @@ impl Executor {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::storage::mvcc::engine::MVCCEngine;
     use std::sync::Arc;

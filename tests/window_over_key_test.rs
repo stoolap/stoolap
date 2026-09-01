@@ -88,18 +88,21 @@ fn quoted_comma_identifier_does_not_collide_with_two_columns() {
 fn hash_colliding_partition_expressions_stay_separate() {
     // Two different literals whose expression hashes collide must not
     // share a partition map: the cache must verify structural identity,
-    // not just the hash
+    // not just the hash. The i64::MIN row satisfies the integer
+    // predicate and no float predicate, so a shared map is visible.
     let db = Database::open("memory://win_key_collide").unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
         .unwrap();
-    for i in 1..=4i64 {
-        db.execute("INSERT INTO t VALUES ($1)", (i,)).unwrap();
+    db.execute("INSERT INTO t VALUES ($1, $2)", (1i64, i64::MIN))
+        .unwrap();
+    for i in 2..=5i64 {
+        db.execute("INSERT INTO t VALUES ($1, $2)", (i, i)).unwrap();
     }
     let rows = db
         .query(
             "SELECT id, \
-             ROW_NUMBER() OVER (PARTITION BY id = -9223372036854775808 ORDER BY id) AS a, \
-             ROW_NUMBER() OVER (PARTITION BY id = -1.9149084435936727e80 ORDER BY id) AS b \
+             ROW_NUMBER() OVER (PARTITION BY v = -9223372036854775808 ORDER BY id) AS a, \
+             ROW_NUMBER() OVER (PARTITION BY v = -1.9149084435936727e80 ORDER BY id) AS b \
              FROM t ORDER BY id",
             (),
         )
@@ -108,8 +111,12 @@ fn hash_colliding_partition_expressions_stay_separate() {
         .unwrap();
     let a: Vec<i64> = rows.iter().map(|r| r.get(1).unwrap()).collect();
     let b: Vec<i64> = rows.iter().map(|r| r.get(2).unwrap()).collect();
-    assert_eq!(a, vec![1, 2, 3, 4], "no row matches the integer literal");
-    assert_eq!(b, vec![1, 2, 3, 4], "no row matches the float literal");
+    assert_eq!(
+        a,
+        vec![1, 1, 2, 3, 4],
+        "integer predicate splits i64::MIN off"
+    );
+    assert_eq!(b, vec![1, 2, 3, 4, 5], "float predicate matches nothing");
 }
 
 #[test]
@@ -139,4 +146,31 @@ fn volatile_partition_expressions_are_not_shared() {
     // Two independent random partitionings of 200 rows agreeing on every
     // row has probability ~2^-200
     assert_ne!(a, b, "volatile partitions must not share a cached map");
+}
+
+#[test]
+fn volatile_partitions_not_shared_under_limit() {
+    // The LIMIT streaming path builds one partition map for all window
+    // functions; volatile OVER clauses must keep it off that path
+    let db = Database::open("memory://win_key_volatile_limit").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    for i in 1..=200i64 {
+        tx.execute("INSERT INTO t VALUES ($1)", (i,)).unwrap();
+    }
+    tx.commit().unwrap();
+    let rows = db
+        .query(
+            "SELECT ROW_NUMBER() OVER (PARTITION BY RANDOM() < 0.5 ORDER BY id) AS a, \
+             ROW_NUMBER() OVER (PARTITION BY RANDOM() < 0.5 ORDER BY id) AS b \
+             FROM t LIMIT 150",
+            (),
+        )
+        .unwrap()
+        .collect_vec()
+        .unwrap();
+    let a: Vec<i64> = rows.iter().map(|r| r.get(0).unwrap()).collect();
+    let b: Vec<i64> = rows.iter().map(|r| r.get(1).unwrap()).collect();
+    assert_ne!(a, b, "volatile partitions must not share under LIMIT");
 }
