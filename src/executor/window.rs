@@ -3436,8 +3436,9 @@ impl Executor {
             keyed.sort_unstable_by_key(|&(_, key)| std::cmp::Reverse(key));
         }
 
-        // Write back: NULLs last ascending, first descending (the
-        // placement the old sentinel keys produced)
+        // Write back: NULLs strictly last ascending, first descending.
+        // For floats this also fixes the old sentinel's misplacement of
+        // NULLs before +inf and NaN
         let mut pos = 0;
         if !ascending {
             for &idx in &null_indices {
@@ -3526,8 +3527,9 @@ impl Executor {
             keyed.sort_unstable_by_key(|&(_, key)| std::cmp::Reverse(key));
         }
 
-        // Write back: NULLs last ascending, first descending (the
-        // placement the old sentinel keys produced)
+        // Write back: NULLs strictly last ascending, first descending.
+        // For floats this also fixes the old sentinel's misplacement of
+        // NULLs before +inf and NaN
         let mut pos = 0;
         if !ascending {
             for &idx in &null_indices {

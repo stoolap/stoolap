@@ -85,36 +85,36 @@ fn window_rank_f64_max_vs_null() {
 
 #[test]
 fn window_order_survives_type_drift_past_sample() {
-    // 150 Integer values then a Float appears past the 100-row
-    // detection sample; ordering must still interleave correctly
+    // 120 Integer values sample as the integer fast path; Float 0.5
+    // appears past the 100-row sample, so the typed extractor must bail
+    // to the generic sort instead of keying the floats as i64::MAX
     let db = Database::open("memory://win_drift").unwrap();
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k FLOAT)", ())
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
         .unwrap();
     let mut tx = db.begin().unwrap();
-    for i in 0..150i64 {
-        // Stored as integers via coercion-free int literals in a FLOAT
-        // column stay Float; use an INTEGER column shape instead
-        tx.execute("INSERT INTO t VALUES ($1, $2)", (i, (i * 2) as f64))
+    for i in 0..130i64 {
+        tx.execute("INSERT INTO t VALUES ($1, $2)", (i, i + 1))
             .unwrap();
     }
     tx.commit().unwrap();
-    let db2 = Database::open("memory://win_drift2").unwrap();
-    db2.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT)", ())
-        .unwrap();
-    let mut tx = db2.begin().unwrap();
-    for i in 0..150i64 {
-        tx.execute("INSERT INTO t VALUES ($1, $2)", (i, format!("{:05}", i)))
-            .unwrap();
-    }
-    // Row 150: numerically-small text that must sort FIRST
-    tx.execute("INSERT INTO t VALUES (150, '00000')", ())
-        .unwrap();
-    tx.commit().unwrap();
-    let first: String = db2
-        .query_one(
-            "SELECT k FROM (SELECT k, ROW_NUMBER() OVER (ORDER BY k) AS rn FROM t) s WHERE rn = 1",
+
+    let rows = db
+        .query(
+            "SELECT id, RANK() OVER (ORDER BY CASE WHEN id < 120 THEN v ELSE 0.5 END) AS r              FROM t ORDER BY id",
             (),
         )
+        .unwrap()
+        .collect_vec()
         .unwrap();
-    assert_eq!(first, "00000");
+    // Rows 120..129 carry 0.5 and must rank 1 together; row id=0 (v=1)
+    // must rank 11 after them
+    for r in &rows {
+        let id: i64 = r.get(0).unwrap();
+        let rank: i64 = r.get(1).unwrap();
+        if id >= 120 {
+            assert_eq!(rank, 1, "0.5 rows must rank first (id {id})");
+        } else {
+            assert_eq!(rank, 11 + id, "integer rows shift by the ten 0.5 rows");
+        }
+    }
 }
