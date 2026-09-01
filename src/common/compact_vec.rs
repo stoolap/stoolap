@@ -417,13 +417,18 @@ impl<T> CompactVec<T> {
                     }
                 }
                 guard.write_idx += 1;
+                guard.read_idx += 1;
             } else {
+                // Advance past the slot before dropping it: if `T::drop`
+                // panics, the guard must not count this element as untouched
+                // tail and hand the dropped value back to the vector.
+                let idx = guard.read_idx;
+                guard.read_idx += 1;
                 // SAFETY: the element is initialized and is not moved anywhere.
                 unsafe {
-                    ptr::drop_in_place(ptr.add(guard.read_idx));
+                    ptr::drop_in_place(ptr.add(idx));
                 }
             }
-            guard.read_idx += 1;
         }
     }
 
@@ -1053,13 +1058,19 @@ impl<'a, T> ExactSizeIterator for Drain<'a, T> {
 
 impl<'a, T> Drop for Drain<'a, T> {
     fn drop(&mut self) {
-        // Drop any remaining elements not yet consumed
-        while self.current < self.end {
-            // SAFETY: Elements [current..end] are initialized but not yet consumed.
+        let remaining = self.end - self.current;
+        if remaining > 0 {
+            let first = self.current;
+            self.current = self.end;
+            // Drop the rest as a slice: slice drop glue keeps dropping the
+            // remaining elements when one destructor panics, where an
+            // element-by-element loop would strand them. The vector no longer
+            // owns this range, so nothing else would ever free them.
+            // SAFETY: [first..end] are initialized and owned by this drain.
             unsafe {
-                ptr::drop_in_place(self.vec.ptr.as_ptr().add(self.current));
+                let start = self.vec.ptr.as_ptr().add(first);
+                ptr::drop_in_place(ptr::slice_from_raw_parts_mut(start, remaining));
             }
-            self.current += 1;
         }
         // The length was already lowered to `start` by `drain()`, so there is
         // nothing to restore here.
@@ -1317,6 +1328,86 @@ mod tests {
             DROP_COUNT.load(Ordering::SeqCst),
             5,
             "each of the 5 elements must be dropped exactly once"
+        );
+    }
+
+    /// A destructor that panics while `retain` is dropping a rejected element
+    /// must not hand that element back to the vector.
+    #[test]
+    fn test_retain_destructor_panic_does_not_double_drop() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static PANICKED: AtomicBool = AtomicBool::new(false);
+
+        struct PanicOnDrop(usize);
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+                // Panic once, so a second drop of the same slot is observable
+                // in the counter instead of aborting the process.
+                if self.0 == 2 && !PANICKED.swap(true, Ordering::SeqCst) {
+                    panic!("intentional panic in destructor");
+                }
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        PANICKED.store(false, Ordering::SeqCst);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut vec: CompactVec<PanicOnDrop> = CompactVec::new();
+            for i in 0..5 {
+                vec.push(PanicOnDrop(i));
+            }
+            vec.retain(|item| item.0 != 2);
+        }));
+
+        assert!(result.is_err(), "the destructor panic must propagate");
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            5,
+            "each of the 5 elements must be dropped exactly once"
+        );
+    }
+
+    /// A destructor that panics while a Drain is cleaning up must not strand
+    /// the elements behind it: the vector no longer owns them.
+    #[test]
+    fn test_drain_drop_finishes_after_destructor_panic() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static PANICKED: AtomicBool = AtomicBool::new(false);
+
+        struct PanicOnDrop(usize);
+
+        impl Drop for PanicOnDrop {
+            fn drop(&mut self) {
+                DROP_COUNT.fetch_add(1, Ordering::SeqCst);
+                if self.0 == 2 && !PANICKED.swap(true, Ordering::SeqCst) {
+                    panic!("intentional panic in destructor");
+                }
+            }
+        }
+
+        DROP_COUNT.store(0, Ordering::SeqCst);
+        PANICKED.store(false, Ordering::SeqCst);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut vec: CompactVec<PanicOnDrop> = CompactVec::new();
+            for i in 0..5 {
+                vec.push(PanicOnDrop(i));
+            }
+            drop(vec.drain(1..));
+        }));
+
+        assert!(result.is_err(), "the destructor panic must propagate");
+        assert_eq!(
+            DROP_COUNT.load(Ordering::SeqCst),
+            5,
+            "the drain must drop 1..5 and the vector must drop 0, none stranded"
         );
     }
 
