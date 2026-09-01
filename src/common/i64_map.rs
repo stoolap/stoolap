@@ -595,6 +595,7 @@ impl<V> I64Map<V> {
         Drain {
             slots: old_slots,
             pos: 0,
+            min_slot: self.min_slot.take(),
         }
     }
 
@@ -955,6 +956,7 @@ impl<V> IntoIterator for I64Map<V> {
 pub struct Drain<V> {
     slots: Box<[Slot<V>]>,
     pos: usize,
+    min_slot: Option<V>,
 }
 
 // =============================================================================
@@ -964,11 +966,9 @@ pub struct Drain<V> {
 /// High-performance HashSet for i64 keys.
 ///
 /// Uses the same optimizations as I64Map:
-/// - i64::MIN as empty sentinel (row IDs and txn IDs are always >= 0)
+/// - i64::MIN marks empty slots; that member is held beside the array
 /// - FxHash with pre-mixing (XOR>>16 before multiply) - 0 sequential collisions
 /// - Backward-shift deletion (no tombstones)
-///
-/// Note: i64::MIN cannot be used as a value (reserved as empty sentinel).
 pub struct I64Set {
     slots: Box<[i64]>,
     len: usize,
@@ -1313,22 +1313,20 @@ impl I64Set {
     /// Drains all values from the set, returning an iterator over them
     #[inline]
     pub fn drain(&mut self) -> impl Iterator<Item = i64> + '_ {
-        let len = self.len;
+        // Hand the storage to the iterator instead of clearing lazily:
+        // a drain dropped half-way used to leave the slots populated
+        // while len said the set was empty, so contains() still matched
+        let old_slots = std::mem::replace(
+            &mut self.slots,
+            vec![EMPTY; MIN_CAPACITY].into_boxed_slice(),
+        );
+        let had_min = std::mem::replace(&mut self.has_min, false);
         self.len = 0;
-        let had_min = self.has_min;
-        self.has_min = false;
-        self.slots
-            .iter_mut()
-            .filter_map(move |slot| {
-                if *slot != EMPTY {
-                    let val = *slot;
-                    *slot = EMPTY;
-                    Some(val)
-                } else {
-                    None
-                }
-            })
-            .take(len)
+        self.mask = MIN_CAPACITY - 1;
+        old_slots
+            .into_vec()
+            .into_iter()
+            .filter(|&slot| slot != EMPTY)
             .chain(if had_min { Some(EMPTY) } else { None })
     }
 }
@@ -1423,12 +1421,14 @@ impl<V> Iterator for Drain<V> {
                 return Some((key, value));
             }
         }
-        None
+        // The side-slot entry drains last
+        self.min_slot.take().map(|v| (EMPTY, v))
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.slots.len() - self.pos))
+        let pending = usize::from(self.min_slot.is_some());
+        (pending, Some(self.slots.len() - self.pos + pending))
     }
 }
 
@@ -1822,6 +1822,45 @@ mod tests {
         assert_eq!(map.remove(i64::MIN), Some(8));
         assert_eq!(map.remove(i64::MIN), None);
         assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn test_i64set_partial_drain_leaves_no_stale_keys() {
+        let mut set = I64Set::new();
+        set.insert(5);
+        set.insert(6);
+        set.insert(7);
+        {
+            let mut d = set.drain();
+            let _ = d.next();
+        }
+        assert!(set.is_empty(), "drain must empty the set");
+        for k in [5, 6, 7] {
+            assert!(!set.contains(k), "stale key {k} still visible after drain");
+        }
+    }
+
+    #[test]
+    fn test_i64_min_drain() {
+        let mut map = I64Map::<i64>::new();
+        map.insert(i64::MIN, 42);
+        map.insert(9, 90);
+
+        let mut drained: Vec<(i64, i64)> = map.drain().collect();
+        drained.sort_unstable();
+        assert_eq!(drained, vec![(i64::MIN, 42), (9, 90)]);
+        assert!(map.is_empty(), "drain must leave the map empty");
+        assert!(map.get(i64::MIN).is_none());
+
+        // A dropped, partially consumed drain must not leave the entry behind
+        map.insert(i64::MIN, 7);
+        map.insert(1, 10);
+        {
+            let mut d = map.drain();
+            let _ = d.next();
+        }
+        assert!(map.is_empty());
+        assert!(map.get(i64::MIN).is_none());
     }
 
     #[test]
