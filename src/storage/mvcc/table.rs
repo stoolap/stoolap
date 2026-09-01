@@ -1343,6 +1343,15 @@ impl MVCCTable {
         // Extract row ID
         let row_id = self.extract_row_pk(row);
 
+        // An INTEGER PRIMARY KEY doubles as the row id, and i64::MIN is
+        // the reserved empty sentinel of the row-id maps, so it cannot
+        // address a row. Report it instead of corrupting the map.
+        if row_id == i64::MIN {
+            return Err(Error::internal(
+                "PRIMARY KEY value -9223372036854775808 is out of range (reserved)".to_string(),
+            ));
+        }
+
         // Check if row already exists in local versions
         {
             let txn_versions = self.txn_versions.read().unwrap();
@@ -3678,7 +3687,13 @@ impl Table for MVCCTable {
 
         // Try using the efficient ordered iteration method (available in B-tree indexes)
         // We request more row IDs than needed to account for invisible rows
-        let batch_size = (limit + offset) * 2 + 100; // Request extra to handle filtered rows
+        // Request extra to handle filtered rows. Saturating: an unbounded
+        // LIMIT arrives as usize::MAX and would overflow (a debug panic,
+        // a silent wrap in release)
+        let batch_size = limit
+            .saturating_add(offset)
+            .saturating_mul(2)
+            .saturating_add(100);
 
         if let Some(ordered_row_ids) = index.get_row_ids_ordered(ascending, batch_size, 0) {
             // Fast path: B-tree index supports ordered iteration
