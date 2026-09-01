@@ -189,12 +189,9 @@ impl MVCCTable {
             return None;
         }
 
-        // Get the integer value (PKs are always integers in our system).
-        // i64::MIN is the row-id maps' reserved empty sentinel, so no row
-        // can carry it: decline the fast path and let the scan return
-        // nothing rather than probing with the sentinel
+        // Get the integer value (PKs are always integers in our system)
         match value {
-            Value::Integer(i) if *i != i64::MIN => Some(*i),
+            Value::Integer(i) => Some(*i),
             _ => None,
         }
     }
@@ -1358,9 +1355,10 @@ impl MVCCTable {
         // Extract row ID
         let row_id = self.extract_row_pk(row);
 
-        // An INTEGER PRIMARY KEY doubles as the row id, and i64::MIN is
-        // the reserved empty sentinel of the row-id maps, so it cannot
-        // address a row. Report it instead of corrupting the map.
+        // An INTEGER PRIMARY KEY doubles as the row id. The row-id maps
+        // now store i64::MIN, but it is still the arena's and the
+        // segment layer's "no row" marker, so the value stays outside
+        // the addressable id space and is reported rather than accepted.
         if row_id == i64::MIN {
             return Err(Error::invalid_argument(format!(
                 "PRIMARY KEY value {} is out of range (reserved) for column '{}'",

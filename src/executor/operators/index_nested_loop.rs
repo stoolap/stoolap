@@ -666,13 +666,8 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
                 },
             }
 
-            // Map row IDs to outer row indices. i64::MIN is the row-id
-            // maps' reserved sentinel and no row can carry it, so such a
-            // probe simply matches nothing.
+            // Map row IDs to outer row indices
             for &row_id in &self.row_id_buffer {
-                if row_id == i64::MIN {
-                    continue;
-                }
                 key_to_outer_indices
                     .entry(row_id)
                     .or_default()

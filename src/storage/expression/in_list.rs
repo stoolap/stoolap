@@ -34,10 +34,8 @@ use crate::core::{Result, Row, Schema, Value};
 enum HashedValues {
     /// Not yet computed
     None,
-    /// Integer hash set for O(1) lookup. i64::MIN is the set's reserved
-    /// empty sentinel, so it is tracked out of band (same shape the PK
-    /// index uses)
-    Integers { set: I64Set, has_i64_min: bool },
+    /// Integer hash set for O(1) lookup
+    Integers(I64Set),
     /// String hash set for O(1) lookup
     Strings(FxHashSet<String>),
     /// Boolean set (only 2 possible values)
@@ -153,13 +151,9 @@ impl InListExpr {
             Some("int") => {
                 // Check if all values are integers (or convertible floats)
                 let mut set = I64Set::new();
-                let mut has_i64_min = false;
                 let mut all_int = true;
                 for v in &self.values {
                     match v {
-                        Value::Integer(i64::MIN) => {
-                            has_i64_min = true;
-                        }
                         Value::Integer(i) => {
                             set.insert(*i);
                         }
@@ -169,12 +163,7 @@ impl InListExpr {
                         Value::Float(f)
                             if crate::executor::Executor::lossless_float_key(*f).is_some() =>
                         {
-                            let key = *f as i64;
-                            if key == i64::MIN {
-                                has_i64_min = true;
-                            } else {
-                                set.insert(key);
-                            }
+                            set.insert(*f as i64);
                         }
                         Value::Float(_) => {
                             all_int = false;
@@ -188,7 +177,7 @@ impl InListExpr {
                     }
                 }
                 if all_int {
-                    self.hashed = HashedValues::Integers { set, has_i64_min };
+                    self.hashed = HashedValues::Integers(set);
                 } else {
                     self.hashed = HashedValues::Mixed;
                 }
@@ -266,13 +255,7 @@ impl InListExpr {
     #[inline]
     fn check_integer(&self, val: i64) -> bool {
         match &self.hashed {
-            HashedValues::Integers { set, has_i64_min } => {
-                if val == i64::MIN {
-                    *has_i64_min
-                } else {
-                    set.contains(val)
-                }
-            }
+            HashedValues::Integers(set) => set.contains(val),
             _ => {
                 // Fallback to linear search. Float list values compare
                 // numerically first: as_int64 would truncate 5.5 to 5 and
