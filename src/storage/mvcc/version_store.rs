@@ -653,9 +653,24 @@ impl VersionStore {
         self.auto_increment_counter.load(Ordering::Acquire)
     }
 
-    /// Returns the next available auto-increment ID
-    pub fn get_next_auto_increment_id(&self) -> i64 {
-        self.auto_increment_counter.fetch_add(1, Ordering::AcqRel) + 1
+    /// Returns the next available auto-increment ID, or None when the
+    /// counter is exhausted. A plain fetch_add would overflow past
+    /// i64::MAX: a panic in debug, and in release a wrap to i64::MIN that
+    /// poisons every later id.
+    pub fn try_next_auto_increment_id(&self) -> Option<i64> {
+        let mut current = self.auto_increment_counter.load(Ordering::Acquire);
+        loop {
+            let next = current.checked_add(1)?;
+            match self.auto_increment_counter.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(next),
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     /// Sets the auto-increment counter to a specific value (only if current is lower)
@@ -2602,7 +2617,9 @@ impl VersionStore {
         };
 
         // Collect with early termination
-        let mut result = RowVec::with_capacity(limit);
+        // A user-supplied limit can be i64::MAX; only pre-allocate what
+        // the store could actually return
+        let mut result = RowVec::with_capacity(limit.min(4096));
         let mut skipped = 0usize;
 
         for (&row_id, chain) in versions.iter() {
@@ -3057,7 +3074,9 @@ impl VersionStore {
         };
 
         // Collect with early termination
-        let mut result = RowVec::with_capacity(limit);
+        // A user-supplied limit can be i64::MAX; only pre-allocate what
+        // the store could actually return
+        let mut result = RowVec::with_capacity(limit.min(4096));
 
         if ascending {
             for (&row_id, chain) in versions.range((start_bound, std::ops::Bound::Unbounded::<i64>))
@@ -3265,7 +3284,9 @@ impl VersionStore {
         let arena_data = arena_guard.data();
 
         // Collect with offset/limit and early termination
-        let mut result = RowVec::with_capacity(limit);
+        // A user-supplied limit can be i64::MAX; only pre-allocate what
+        // the store could actually return
+        let mut result = RowVec::with_capacity(limit.min(4096));
         let mut skipped = 0usize;
 
         for (&row_id, chain) in versions.iter() {
@@ -6087,7 +6108,13 @@ impl VersionStore {
                             key_type = 0;
                         }
                         if key_type == 0 {
-                            Some(*i)
+                            // i64::MIN is I64Map's empty sentinel - route to
+                            // other_groups, as the Float branch below does
+                            if *i == i64::MIN {
+                                None
+                            } else {
+                                Some(*i)
+                            }
                         } else {
                             None // Type mismatch → other_groups
                         }
@@ -6649,6 +6676,11 @@ impl TransactionVersionStore {
 
     /// Check if we have local changes for a row
     pub fn has_locally_seen(&self, row_id: i64) -> bool {
+        // The row-id maps reserve i64::MIN as their empty sentinel, so
+        // no row can carry it; answer without touching the map
+        if row_id == i64::MIN {
+            return false;
+        }
         self.local_versions
             .as_ref()
             .is_some_and(|lv| lv.contains_key(row_id))
@@ -6705,6 +6737,9 @@ impl TransactionVersionStore {
     /// Get the local version for a row (without checking parent)
     /// Returns the most recent version in the transaction's history
     pub fn get_local_version(&self, row_id: i64) -> Option<&RowVersion> {
+        if row_id == i64::MIN {
+            return None; // reserved sentinel: no row can carry it
+        }
         self.local_versions
             .as_ref()
             .and_then(|lv| lv.get(row_id))
@@ -6713,6 +6748,9 @@ impl TransactionVersionStore {
 
     /// Get a row, checking local versions first then parent store
     pub fn get(&self, row_id: i64) -> Option<Row> {
+        if row_id == i64::MIN {
+            return None; // reserved sentinel: no row can carry it
+        }
         // Check local versions first (get most recent)
         if let Some(lv) = self.local_versions.as_ref() {
             if let Some(versions) = lv.get(row_id) {
@@ -7542,8 +7580,8 @@ mod tests {
         let store = VersionStore::new("test_table".to_string(), test_schema());
 
         assert_eq!(store.get_current_auto_increment_value(), 0);
-        assert_eq!(store.get_next_auto_increment_id(), 1);
-        assert_eq!(store.get_next_auto_increment_id(), 2);
+        assert_eq!(store.try_next_auto_increment_id(), Some(1));
+        assert_eq!(store.try_next_auto_increment_id(), Some(2));
         assert_eq!(store.get_current_auto_increment_value(), 2);
     }
 

@@ -189,9 +189,12 @@ impl MVCCTable {
             return None;
         }
 
-        // Get the integer value (PKs are always integers in our system)
+        // Get the integer value (PKs are always integers in our system).
+        // i64::MIN is the row-id maps' reserved empty sentinel, so no row
+        // can carry it: decline the fast path and let the scan return
+        // nothing rather than probing with the sentinel
         match value {
-            Value::Integer(i) => Some(*i),
+            Value::Integer(i) if *i != i64::MIN => Some(*i),
             _ => None,
         }
     }
@@ -1251,7 +1254,11 @@ impl MVCCTable {
         }
 
         // Fallback: If no primary key or not an integer, generate a synthetic row ID
-        self.version_store.get_next_auto_increment_id()
+        // Synthetic row id for non-integer primary keys; the caller
+        // rejects the exhausted case via prepare_insert
+        self.version_store
+            .try_next_auto_increment_id()
+            .unwrap_or(i64::MIN)
     }
 
     /// Finds the primary key column index
@@ -1317,7 +1324,15 @@ impl MVCCTable {
                 if value.is_null() {
                     if is_auto_increment {
                         // Generate new ID for NULL primary key
-                        let next_id = self.version_store.get_next_auto_increment_id();
+                        let next_id =
+                            self.version_store
+                                .try_next_auto_increment_id()
+                                .ok_or_else(|| {
+                                    Error::invalid_argument(format!(
+                                        "AUTO_INCREMENT counter exhausted for column '{}'",
+                                        pk_col.name
+                                    ))
+                                })?;
                         let _ = row.set(pk_idx, Value::Integer(next_id));
                     } else {
                         // Non-INTEGER PRIMARY KEY without AUTO_INCREMENT cannot be NULL
@@ -1347,9 +1362,14 @@ impl MVCCTable {
         // the reserved empty sentinel of the row-id maps, so it cannot
         // address a row. Report it instead of corrupting the map.
         if row_id == i64::MIN {
-            return Err(Error::internal(
-                "PRIMARY KEY value -9223372036854775808 is out of range (reserved)".to_string(),
-            ));
+            return Err(Error::invalid_argument(format!(
+                "PRIMARY KEY value {} is out of range (reserved) for column '{}'",
+                i64::MIN,
+                self.cached_schema
+                    .pk_column_index()
+                    .map(|i| self.cached_schema.columns[i].name.as_str())
+                    .unwrap_or("?"),
+            )));
         }
 
         // Check if row already exists in local versions
@@ -1673,7 +1693,9 @@ impl MVCCTable {
             }
         }
 
-        let mut result = RowVec::with_capacity(limit);
+        // A user-supplied limit can be i64::MAX; only pre-allocate what
+        // can actually be returned
+        let mut result = RowVec::with_capacity(limit.min(4096));
         let mut count = 0;
 
         // Add global rows that don't have local overrides

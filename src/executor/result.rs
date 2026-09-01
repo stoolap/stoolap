@@ -1204,7 +1204,10 @@ impl TopNResult {
             }
         }
 
-        let mut heap: BinaryHeap<HeapRow<F>> = BinaryHeap::with_capacity(heap_capacity + 1);
+        // heap_capacity saturates at usize::MAX for an unbounded LIMIT, so
+        // cap the pre-allocation; the heap grows on demand anyway
+        let mut heap: BinaryHeap<HeapRow<F>> =
+            BinaryHeap::with_capacity(heap_capacity.saturating_add(1).min(4096));
 
         while inner.next() {
             let row = inner.take_row();

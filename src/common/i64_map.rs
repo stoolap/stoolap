@@ -895,6 +895,10 @@ pub struct I64Set {
     slots: Box<[i64]>,
     len: usize,
     mask: usize,
+    /// i64::MIN is the slot array's empty sentinel, so it is stored out
+    /// of band. Callers pass user data (join keys, IN lists), so the set
+    /// must accept the full i64 range instead of panicking.
+    has_min: bool,
 }
 
 impl Clone for I64Set {
@@ -943,17 +947,18 @@ impl I64Set {
             slots: slots.into_boxed_slice(),
             len: 0,
             mask: cap - 1,
+            has_min: false,
         }
     }
 
     #[inline(always)]
     pub fn len(&self) -> usize {
-        self.len
+        self.len + usize::from(self.has_min)
     }
 
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.len == 0 && !self.has_min
     }
 
     #[inline(always)]
@@ -1008,7 +1013,11 @@ impl I64Set {
     /// Insert a value into the set. Returns true if the value was newly inserted.
     #[inline(always)]
     pub fn insert(&mut self, key: i64) -> bool {
-        check_key(key);
+        if key == EMPTY {
+            let inserted = !self.has_min;
+            self.has_min = true;
+            return inserted;
+        }
 
         if self.len * LOAD_FACTOR_DEN >= self.slots.len() * LOAD_FACTOR_NUM {
             self.grow();
@@ -1039,7 +1048,9 @@ impl I64Set {
 
     #[inline(always)]
     pub fn contains(&self, key: i64) -> bool {
-        check_key(key);
+        if key == EMPTY {
+            return self.has_min;
+        }
 
         let mask = self.mask;
         let mut idx = Self::hash(key) & mask;
@@ -1063,7 +1074,11 @@ impl I64Set {
 
     #[inline(always)]
     pub fn remove(&mut self, key: i64) -> bool {
-        check_key(key);
+        if key == EMPTY {
+            let removed = self.has_min;
+            self.has_min = false;
+            return removed;
+        }
 
         let mask = self.mask;
         let mut idx = Self::hash(key) & mask;
@@ -1206,6 +1221,7 @@ impl I64Set {
             *slot = EMPTY;
         }
         self.len = 0;
+        self.has_min = false;
     }
 
     #[inline]
@@ -1213,6 +1229,7 @@ impl I64Set {
         self.slots
             .iter()
             .filter_map(|&slot| if slot != EMPTY { Some(slot) } else { None })
+            .chain(if self.has_min { Some(EMPTY) } else { None })
     }
 
     /// Drains all values from the set, returning an iterator over them
@@ -1220,6 +1237,8 @@ impl I64Set {
     pub fn drain(&mut self) -> impl Iterator<Item = i64> + '_ {
         let len = self.len;
         self.len = 0;
+        let had_min = self.has_min;
+        self.has_min = false;
         self.slots
             .iter_mut()
             .filter_map(move |slot| {
@@ -1232,6 +1251,7 @@ impl I64Set {
                 }
             })
             .take(len)
+            .chain(if had_min { Some(EMPTY) } else { None })
     }
 }
 
@@ -1243,6 +1263,7 @@ impl IntoIterator for I64Set {
         I64SetIntoIter {
             slots: self.slots,
             pos: 0,
+            has_min: self.has_min,
         }
     }
 }
@@ -1251,6 +1272,7 @@ impl IntoIterator for I64Set {
 pub struct I64SetIntoIter {
     slots: Box<[i64]>,
     pos: usize,
+    has_min: bool,
 }
 
 impl Iterator for I64SetIntoIter {
@@ -1266,12 +1288,23 @@ impl Iterator for I64SetIntoIter {
                 return Some(slot);
             }
         }
+        if self.has_min {
+            self.has_min = false;
+            return Some(EMPTY);
+        }
         None
     }
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.slots.len() - self.pos))
+        // The out-of-band sentinel is still pending after the slots are
+        // exhausted, so it counts toward the upper bound
+        // The out-of-band sentinel is still pending after the slots are
+        // exhausted, so it counts toward both bounds
+        (
+            usize::from(self.has_min),
+            Some(self.slots.len() - self.pos + usize::from(self.has_min)),
+        )
     }
 }
 
@@ -1863,16 +1896,59 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "i64::MIN cannot be used as a key")]
-    fn test_i64set_min_panics_on_insert() {
+    fn test_i64set_into_iter_size_hint_covers_sentinel() {
+        // The buggy state is "slots exhausted, sentinel still pending",
+        // which occurs whenever the last occupied slot is the final one.
+        // Construct it directly so the assertion cannot depend on where
+        // the hash happened to place a key.
         let mut set = I64Set::new();
         set.insert(i64::MIN);
+        let mut iter = set.into_iter();
+        iter.pos = iter.slots.len();
+
+        let (lower, upper) = iter.size_hint();
+        assert_eq!(lower, 1, "a pending sentinel is a guaranteed item");
+        assert_eq!(
+            upper,
+            Some(1),
+            "upper bound must still admit the pending sentinel"
+        );
+        assert_eq!(iter.next(), Some(i64::MIN));
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
     }
 
     #[test]
-    #[should_panic(expected = "i64::MIN cannot be used as a key")]
-    fn test_i64set_min_panics_on_contains() {
-        let set = I64Set::new();
-        let _ = set.contains(i64::MIN);
+    fn test_i64set_handles_min_out_of_band() {
+        // I64Set stores i64::MIN beside the slot array, so callers can
+        // hand it user data without a sentinel dance
+        let mut set = I64Set::new();
+        assert!(!set.contains(i64::MIN));
+        assert!(set.insert(i64::MIN));
+        assert!(!set.insert(i64::MIN));
+        assert!(set.contains(i64::MIN));
+        assert_eq!(set.len(), 1);
+        assert!(!set.is_empty());
+
+        set.insert(7);
+        set.insert(-3);
+        let mut collected: Vec<i64> = set.iter().collect();
+        collected.sort_unstable();
+        assert_eq!(collected, vec![i64::MIN, -3, 7]);
+        assert_eq!(set.len(), 3);
+
+        let mut drained: Vec<i64> = set.clone().into_iter().collect();
+        drained.sort_unstable();
+        assert_eq!(drained, vec![i64::MIN, -3, 7]);
+
+        assert!(set.remove(i64::MIN));
+        assert!(!set.remove(i64::MIN));
+        assert!(!set.contains(i64::MIN));
+        assert_eq!(set.len(), 2);
+
+        set.insert(i64::MIN);
+        set.clear();
+        assert!(set.is_empty());
+        assert!(!set.contains(i64::MIN));
     }
 }

@@ -2291,7 +2291,9 @@ impl Executor {
         // Execute and collect results with synthetic row IDs
         join_op.open()?;
         let mut row_id = 0i64;
-        let mut result_rows = RowVec::with_capacity(effective_limit.unwrap_or(1000) as usize);
+        // effective_limit is user-supplied and can be i64::MAX
+        let mut result_rows =
+            RowVec::with_capacity((effective_limit.unwrap_or(1000) as usize).min(4096));
         while let Some(row_ref) = join_op.next()? {
             result_rows.push((row_id, row_ref.into_owned()));
             row_id += 1;
