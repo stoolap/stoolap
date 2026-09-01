@@ -16,14 +16,16 @@
 //!
 //! Run with: cargo bench --bench group_by_keys
 //!
-//! The grouping fast path keys its hash map by the raw integer, or by
-//! `f64::to_bits()` for a float column. Some perfectly ordinary column values
-//! are adversarial for a hash that only mixes part of the key: a DOUBLE column
-//! holding round values has all-zero low mantissa bits, and an integer column
-//! holding a large stride has all-zero low bits. This benchmark keeps those
-//! shapes next to the benign ones so a hash change that reintroduces the
-//! clustering shows up as a large, obvious regression rather than as a slow
-//! query somebody reports later.
+//! The grouping fast path keys its hash map by the raw integer for an integer
+//! column, and by an encoded form of the bit pattern for a float column. The
+//! encoding exists because some perfectly ordinary column values are
+//! adversarial for a hash that can only see part of the key: a DOUBLE column
+//! holding round values has all-zero low mantissa bits, and it used to be
+//! keyed by `f64::to_bits()` directly, which put every group in one bucket.
+//! An integer column holding a large stride has the same shape and is still
+//! keyed raw. This benchmark keeps those distributions next to the benign ones
+//! so a change that reintroduces the clustering shows up as a large, obvious
+//! regression rather than as a slow query somebody reports later.
 
 use criterion::{criterion_group, criterion_main, Criterion};
 use std::hint::black_box;

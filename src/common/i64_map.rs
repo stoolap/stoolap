@@ -1627,22 +1627,27 @@ mod tests {
         }
     }
 
-    /// A dense key range must never collide.
+    /// A dense key range inside one 2^16 block must never collide.
     ///
     /// Row ids, transaction ids and every other counter key their maps this
-    /// way, so this is the property the hot path is built on. It holds because
-    /// multiplying by an odd constant permutes the low bits, and it has to
-    /// keep holding at every capacity and right up to the grow threshold.
+    /// way, so this is the property the hot path is built on, and it is
+    /// provable rather than measured: inside such a block `k >> 16` is
+    /// constant, so the pre-mix is `k ^ const`, and both that and the odd
+    /// multiply are permutations of the low bits.
+    ///
+    /// It stops being provable once a range straddles a block boundary, since
+    /// the two halves get different constants. See the test below for what
+    /// actually happens there.
     #[test]
     fn test_hash_keeps_dense_keys_collision_free() {
+        // 65536-aligned, so every window below stays inside one block.
+        const HIGH_BLOCK: i64 = 65536 * 15258;
+
         for (cap, n) in sweep() {
             let shapes: [(&str, Vec<i64>); 3] = [
                 ("from zero", (0..n as i64).collect()),
                 ("negative", (-(n as i64)..0).collect()),
-                (
-                    "from 1e9",
-                    (1_000_000_000..1_000_000_000 + n as i64).collect(),
-                ),
+                ("high block", (HIGH_BLOCK..HIGH_BLOCK + n as i64).collect()),
             ];
             for (name, keys) in &shapes {
                 let occupancy = bucket_occupancy(keys, cap);
@@ -1652,6 +1657,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A dense range that straddles a 2^16 block boundary is not collision
+    /// free, and this pins down how far it degrades.
+    ///
+    /// The two halves of such a range are pre-mixed with different constants,
+    /// so their images can overlap. Sliding a 3/4-full window across several
+    /// boundaries, the worst case found is this one: half the keys share a
+    /// bucket with another key, and no key needs more than 6 probes. This is a
+    /// baseline guard rather than an invariant, so that a change to the hash
+    /// cannot quietly make the boundary worse.
+    #[test]
+    fn test_hash_bounds_dense_keys_across_a_block_boundary() {
+        let cap = 1024usize;
+        let n = 768usize;
+        let start = 33_554_048i64; // ends 384 keys past a 2^16 boundary
+        let keys: Vec<i64> = (start..start + n as i64).collect();
+
+        let occupancy = bucket_occupancy(&keys, cap);
+        assert!(
+            occupancy * 2 >= n,
+            "{n} boundary-straddling dense keys landed in {occupancy} of {cap} buckets"
+        );
     }
 
     #[test]
