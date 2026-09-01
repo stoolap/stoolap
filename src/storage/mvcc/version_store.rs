@@ -35,6 +35,7 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::common::SmartString;
 
+use crate::common::i64_map::{f64_from_key, key_from_f64};
 use crate::common::{
     new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CompactArc, CowBTreeMap, I64Map,
 };
@@ -6118,7 +6119,7 @@ impl VersionStore {
                             key_type = 1;
                         }
                         if key_type == 1 {
-                            Some(f.to_bits() as i64)
+                            Some(key_from_f64(*f))
                         } else {
                             None // Type mismatch → other_groups
                         }
@@ -6165,10 +6166,10 @@ impl VersionStore {
             // Convert int_groups based on key_type
             for (key, accums) in int_groups.iter() {
                 let group_value = match key_type {
-                    0 => Value::Integer(key),                      // Integer
-                    1 => Value::Float(f64::from_bits(key as u64)), // Float
-                    2 => Value::Boolean(key != 0),                 // Boolean
-                    _ => Value::Integer(key),                      // Fallback
+                    0 => Value::Integer(key),             // Integer
+                    1 => Value::Float(f64_from_key(key)), // Float
+                    2 => Value::Boolean(key != 0),        // Boolean
+                    _ => Value::Integer(key),             // Fallback
                 };
                 results.push(GroupedAggregateResult {
                     group_values: vec![group_value],
