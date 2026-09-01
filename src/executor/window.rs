@@ -107,6 +107,10 @@ use crate::core::{Error, Result, Row, Value};
 /// Type alias for partition keys - stack-allocated for common case (up to 4 columns)
 type PartitionKey = SmallVec<[Value; 4]>;
 
+/// Partitions of row indices, each already sorted by its ORDER BY,
+/// shared across window functions with the same OVER clause
+type SharedSortedPartitions = std::sync::Arc<Vec<Vec<usize>>>;
+
 use crate::functions::registry::FunctionRegistry;
 use crate::functions::WindowFunction;
 use crate::parser::ast::*;
@@ -451,6 +455,9 @@ impl Executor {
         }
 
         let mut window_value_map: StringMap<Vec<Value>> = StringMap::new();
+        // Sorted partitions shared across window functions with the same
+        // OVER clause (K functions pay one map build and one sort)
+        let mut partition_cache: Vec<(String, SharedSortedPartitions)> = Vec::new();
         for wf in &window_functions {
             let window_values = self.compute_window_function(
                 wf,
@@ -461,6 +468,7 @@ impl Executor {
                 pre_sorted.as_ref(),
                 pre_grouped.as_ref(),
                 &order_by_cache,
+                &mut partition_cache,
             )?;
             window_value_map.insert(wf.column_name.to_lowercase(), window_values);
         }
@@ -737,6 +745,7 @@ impl Executor {
 
         // Precompute aggregate window functions once over all rows (not per partition)
         let mut precomputed_agg: StringMap<Vec<Value>> = StringMap::new();
+        let mut streaming_partition_cache: Vec<(String, SharedSortedPartitions)> = Vec::new();
         for (wf, _, is_agg) in &resolved_wfs {
             if *is_agg {
                 let cache_key = Self::order_by_cache_key(&wf.order_by);
@@ -752,6 +761,7 @@ impl Executor {
                     ctx,
                     None,
                     precomputed_order_by,
+                    &mut streaming_partition_cache,
                 )?;
                 precomputed_agg.insert(wf.column_name.to_lowercase(), agg_results);
             }
@@ -988,6 +998,9 @@ impl Executor {
             // Values are stored keyed by local position within row_indices.
             let row_indices: Vec<usize> = (0..partition_rows.len()).collect();
             let mut window_value_map: StringMap<Vec<Value>> = StringMap::new();
+            // Per-partition rows: the shared cache would key on the OVER
+            // clause while indices differ per partition, so keep it local
+            let mut lazy_partition_cache: Vec<(String, SharedSortedPartitions)> = Vec::new();
 
             for (wf, win_func_opt, is_agg) in &resolved_wfs {
                 let cache_key = Self::order_by_cache_key(&wf.order_by);
@@ -1005,6 +1018,7 @@ impl Executor {
                         ctx,
                         None,
                         precomputed_order_by,
+                        &mut lazy_partition_cache,
                     )?;
                     // agg_results is already indexed by local row index
                     window_value_map.insert(wf.column_name.to_lowercase(), agg_results);
@@ -1721,6 +1735,67 @@ impl Executor {
     /// Create a cache key for ORDER BY expressions using their string representation.
     /// This enables semantic comparison (ignoring token positions) for ORDER BY clause deduplication.
     #[inline]
+    /// Resolve the sorted partitions for a window function's OVER clause,
+    /// sharing the partition map build and the per-partition sort across
+    /// window functions with identical PARTITION BY and ORDER BY
+    #[allow(clippy::too_many_arguments)]
+    fn shared_sorted_partitions(
+        &self,
+        wf_info: &WindowFunctionInfo,
+        rows: &[(i64, Row)],
+        columns: &[String],
+        col_index_map: &StringMap<usize>,
+        ctx: &ExecutionContext,
+        pre_grouped: Option<&WindowPreGroupedState>,
+        order_by_values: Option<&ColumnarOrderByValues>,
+        partition_cache: &mut Vec<(String, SharedSortedPartitions)>,
+    ) -> Result<SharedSortedPartitions> {
+        let key = Self::over_clause_cache_key(wf_info);
+        if let Some((_, cached)) = partition_cache.iter().find(|(k, _)| k == &key) {
+            return Ok(std::sync::Arc::clone(cached));
+        }
+
+        let mut partition_vec: Vec<Vec<usize>> = if wf_info.partition_by_exprs.is_empty() {
+            vec![(0..rows.len()).collect()]
+        } else if let Some(pg) = pre_grouped.filter(|pg| {
+            wf_info.partition_by.len() == 1
+                && wf_info.partition_by.len() == wf_info.partition_by_exprs.len()
+                && wf_info.partition_by[0].to_lowercase() == pg.partition_column
+        }) {
+            pg.partition_map.values().cloned().collect()
+        } else {
+            Self::build_partition_map(wf_info, rows, columns, col_index_map, ctx)?
+                .into_values()
+                .collect()
+        };
+
+        if let Some(order_by) = order_by_values.filter(|v| !v.is_empty()) {
+            for indices in partition_vec.iter_mut() {
+                Self::sort_by_order_values(indices, order_by);
+            }
+        }
+
+        let shared: SharedSortedPartitions = std::sync::Arc::new(partition_vec);
+        partition_cache.push((key, std::sync::Arc::clone(&shared)));
+        Ok(shared)
+    }
+
+    /// Semantic cache key for a (PARTITION BY, ORDER BY) pair; window
+    /// functions sharing both reuse one partition map and one sort
+    fn over_clause_cache_key(wf: &WindowFunctionInfo) -> String {
+        use std::fmt::Write;
+        let mut key = String::with_capacity(96);
+        for (i, expr) in wf.partition_by_exprs.iter().enumerate() {
+            if i > 0 {
+                key.push(',');
+            }
+            let _ = write!(key, "{}", expr);
+        }
+        key.push('\x1f');
+        key.push_str(&Self::order_by_cache_key(&wf.order_by));
+        key
+    }
+
     fn order_by_cache_key(order_by: &[OrderByExpression]) -> String {
         use std::fmt::Write;
         let mut key = String::with_capacity(64);
@@ -1843,6 +1918,7 @@ impl Executor {
     /// pre_grouped: Optional pre-grouped partitions from index (avoids hash-based grouping)
     /// order_by_cache: Precomputed ORDER BY values cache (keyed by semantic string representation)
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn compute_window_function(
         &self,
         wf_info: &WindowFunctionInfo,
@@ -1853,6 +1929,7 @@ impl Executor {
         pre_sorted: Option<&WindowPreSortedState>,
         pre_grouped: Option<&WindowPreGroupedState>,
         order_by_cache: &[(String, ColumnarOrderByValues)],
+        partition_cache: &mut Vec<(String, SharedSortedPartitions)>,
     ) -> Result<Vec<Value>> {
         // Check if this is an aggregate function used as window function
         let is_aggregate = self.function_registry.is_aggregate(&wf_info.name);
@@ -1873,6 +1950,7 @@ impl Executor {
                 ctx,
                 pre_sorted,
                 cached_order_by,
+                partition_cache,
             );
         }
 
@@ -1895,17 +1973,30 @@ impl Executor {
             None
         };
 
-        // If there's no partitioning, treat all rows as one partition
+        // Resolve partitions once per distinct OVER clause: the map build
+        // and the per-partition sort are shared across window functions
+        let partitions = self.shared_sorted_partitions(
+            wf_info,
+            rows,
+            columns,
+            col_index_map,
+            ctx,
+            pre_grouped,
+            precomputed_order_by,
+            partition_cache,
+        )?;
+
+        // If there's no partitioning, all rows form one partition
         if wf_info.partition_by_exprs.is_empty() {
             // Pre-allocate results array and use direct-writing variant
             let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
-            let row_indices: Vec<usize> = (0..rows.len()).collect();
 
             self.compute_window_for_partition_direct(
                 &*window_func,
                 wf_info,
                 rows,
-                row_indices,
+                partitions[0].clone(),
+                true,
                 precomputed_order_by,
                 columns,
                 col_index_map,
@@ -1915,21 +2006,6 @@ impl Executor {
 
             return Ok(results);
         }
-
-        // Group rows by partition key
-        // OPTIMIZATION: Use pre-grouped partitions from index if available (avoids O(n) hashing)
-        // Only valid when this WF partitions by the exact same single simple column that
-        // the planner used to build the pre-grouped map.
-        let partitions: FxHashMap<PartitionKey, Vec<usize>> = if let Some(pg) =
-            pre_grouped.filter(|pg| {
-                wf_info.partition_by.len() == 1
-                    && wf_info.partition_by.len() == wf_info.partition_by_exprs.len()
-                    && wf_info.partition_by[0].to_lowercase() == pg.partition_column
-            }) {
-            pg.partition_map.clone()
-        } else {
-            Self::build_partition_map(wf_info, rows, columns, col_index_map, ctx)?
-        };
 
         // Compute window function for each partition
         // Use parallel execution for large number of partitions
@@ -1946,43 +2022,40 @@ impl Executor {
             let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
             let parallel_results = ParallelVec::new(&mut results);
 
-            let partitions_vec: Vec<_> = partitions.into_iter().collect();
             #[cfg(feature = "parallel")]
-            let iter_result =
-                partitions_vec
-                    .par_iter()
-                    .try_for_each(|(_key, row_indices)| -> Result<()> {
-                        // Direct writing: each partition writes to its own indices
-                        self.compute_window_for_partition_parallel(
-                            &*window_func,
-                            wf_info,
-                            rows,
-                            row_indices.clone(),
-                            precomputed_order_by,
-                            columns,
-                            col_index_map,
-                            ctx,
-                            &parallel_results,
-                        )
-                    });
+            let iter_result = partitions
+                .par_iter()
+                .try_for_each(|row_indices| -> Result<()> {
+                    // Direct writing: each partition writes to its own indices
+                    self.compute_window_for_partition_parallel(
+                        &*window_func,
+                        wf_info,
+                        rows,
+                        row_indices.clone(),
+                        true,
+                        precomputed_order_by,
+                        columns,
+                        col_index_map,
+                        ctx,
+                        &parallel_results,
+                    )
+                });
             #[cfg(not(feature = "parallel"))]
-            let iter_result =
-                partitions_vec
-                    .iter()
-                    .try_for_each(|(_key, row_indices)| -> Result<()> {
-                        // Direct writing: each partition writes to its own indices
-                        self.compute_window_for_partition_parallel(
-                            &*window_func,
-                            wf_info,
-                            rows,
-                            row_indices.clone(),
-                            precomputed_order_by,
-                            columns,
-                            col_index_map,
-                            ctx,
-                            &parallel_results,
-                        )
-                    });
+            let iter_result = partitions.iter().try_for_each(|row_indices| -> Result<()> {
+                // Direct writing: each partition writes to its own indices
+                self.compute_window_for_partition_parallel(
+                    &*window_func,
+                    wf_info,
+                    rows,
+                    row_indices.clone(),
+                    true,
+                    precomputed_order_by,
+                    columns,
+                    col_index_map,
+                    ctx,
+                    &parallel_results,
+                )
+            });
             iter_result?;
 
             // ParallelVec is done, results are written in place
@@ -1993,13 +2066,14 @@ impl Executor {
             // creating per-partition Vec<Value> and then mapping back
             let mut results: Vec<Value> = vec![NULL_VALUE; rows.len()];
 
-            for (_key, row_indices) in partitions {
+            for row_indices in partitions.iter() {
                 // MEMORY OPTIMIZATION: Direct writing variant - writes to results in-place
                 self.compute_window_for_partition_direct(
                     &*window_func,
                     wf_info,
                     rows,
-                    row_indices,
+                    row_indices.clone(),
+                    true,
                     precomputed_order_by,
                     columns,
                     col_index_map,
@@ -2241,6 +2315,7 @@ impl Executor {
         wf_info: &WindowFunctionInfo,
         all_rows: &[(i64, Row)],
         mut row_indices: Vec<usize>,
+        already_sorted: bool,
         precomputed_order_by: Option<&ColumnarOrderByValues>,
         columns: &[String],
         col_index_map: &StringMap<usize>,
@@ -2255,8 +2330,9 @@ impl Executor {
         };
         let order_by_values = precomputed_order_by.unwrap_or(&empty_order_by);
 
-        // Sort partition by ORDER BY if specified
-        if !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
+        // Sort partition by ORDER BY if specified (the shared-partition
+        // cache hands in pre-sorted indices)
+        if !already_sorted && !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
             Self::sort_by_order_values(&mut row_indices, order_by_values);
         }
 
@@ -2444,6 +2520,7 @@ impl Executor {
         wf_info: &WindowFunctionInfo,
         all_rows: &[(i64, Row)],
         mut row_indices: Vec<usize>,
+        already_sorted: bool,
         precomputed_order_by: Option<&ColumnarOrderByValues>,
         columns: &[String],
         col_index_map: &StringMap<usize>,
@@ -2458,8 +2535,9 @@ impl Executor {
         };
         let order_by_values = precomputed_order_by.unwrap_or(&empty_order_by);
 
-        // Sort partition by ORDER BY if specified
-        if !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
+        // Sort partition by ORDER BY if specified (the shared-partition
+        // cache hands in pre-sorted indices)
+        if !already_sorted && !wf_info.order_by.is_empty() && !order_by_values.is_empty() {
             Self::sort_by_order_values(&mut row_indices, order_by_values);
         }
 
@@ -3587,6 +3665,7 @@ impl Executor {
     /// Compute aggregate function as window function (SUM, COUNT, AVG, MIN, MAX)
     /// cached_order_by: Optional precomputed ORDER BY values from cache to avoid redundant computation
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn compute_aggregate_window_function(
         &self,
         wf_info: &WindowFunctionInfo,
@@ -3596,6 +3675,7 @@ impl Executor {
         ctx: &ExecutionContext,
         pre_sorted: Option<&WindowPreSortedState>,
         cached_order_by: Option<&ColumnarOrderByValues>,
+        partition_cache: &mut Vec<(String, SharedSortedPartitions)>,
     ) -> Result<Vec<Value>> {
         // Check if this is COUNT(*) - Star expression means count all rows
         let is_count_star =
@@ -3634,27 +3714,41 @@ impl Executor {
         };
         let order_by_values: &ColumnarOrderByValues = cached_order_by.unwrap_or(&empty_order_by);
 
-        // Group rows by partition key
-        let partitions = Self::build_partition_map(wf_info, rows, columns, col_index_map, ctx)?;
-
         // Check if we can skip sorting (index optimization)
         // Only applies when there's no PARTITION BY (single partition)
         let skip_sorting =
             wf_info.partition_by_exprs.is_empty() && self.check_rows_presorted(wf_info, pre_sorted);
+
+        // Resolve partitions once per distinct OVER clause (map build and
+        // per-partition sort shared across window functions). The
+        // presorted-by-index path keeps unsorted indices, so it bypasses
+        // the shared cache
+        let partitions: Vec<Vec<usize>> = if skip_sorting {
+            Self::build_partition_map(wf_info, rows, columns, col_index_map, ctx)?
+                .into_values()
+                .collect()
+        } else {
+            let shared = self.shared_sorted_partitions(
+                wf_info,
+                rows,
+                columns,
+                col_index_map,
+                ctx,
+                None,
+                cached_order_by,
+                partition_cache,
+            )?;
+            shared.iter().cloned().collect()
+        };
 
         // Compute aggregate for each partition
         // OPTIMIZATION: Use Option<Value> with vec![None; n] - None is just a discriminant
         // (no data to clone), much faster than vec![NULL_VALUE; n] which clones ~32 byte Values
         let mut results: Vec<Option<Value>> = vec![None; rows.len()];
 
-        for (_key, mut row_indices) in partitions {
-            // Sort partition by ORDER BY if specified (skip if pre-sorted)
+        for row_indices in partitions {
+            // Partitions from the shared cache arrive pre-sorted
             if !wf_info.order_by.is_empty() {
-                // Only sort if not already pre-sorted by index
-                if !skip_sorting {
-                    Self::sort_by_order_values(&mut row_indices, order_by_values);
-                }
-
                 // With ORDER BY, compute aggregate with frame specification
                 // Default frame is UNBOUNDED PRECEDING to CURRENT ROW if no explicit frame
                 let partition_len = row_indices.len();
