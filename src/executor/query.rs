@@ -512,8 +512,20 @@ impl Executor {
                                             return Some(i);
                                         }
                                     }
-                                    // Also check if the alias matches the base column name
-                                    if aliased.alias.value_lower == qid.name.value_lower {
+                                    // An alias whose name happens to equal the
+                                    // column part only matches when no column
+                                    // carries the qualified name (an alias is
+                                    // never itself qualified), so it is tried
+                                    // after the full-name lookup below
+                                    let full_name = format!(
+                                        "{}.{}",
+                                        qid.qualifier.value_lower, qid.name.value_lower
+                                    );
+                                    if aliased.alias.value_lower == qid.name.value_lower
+                                        && !columns
+                                            .iter()
+                                            .any(|c| c.eq_ignore_ascii_case(&full_name))
+                                    {
                                         return Some(i);
                                     }
                                 }

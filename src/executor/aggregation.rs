@@ -529,6 +529,12 @@ impl Executor {
             (result_columns, result_rows)
         };
 
+        // ORDER BY may name a grouped column the SELECT list drops. Capture
+        // those columns before projection consumes the aggregate rows; they
+        // are appended below and trimmed again after the sort.
+        let hidden_order_by_columns =
+            Self::collect_hidden_order_by_columns(stmt, &having_columns, &having_rows);
+
         // Check for hidden aggregates (ORDER BY only) BEFORE cloning
         // These will be removed after sorting by the ProjectedResult wrapper
         let group_by_count = group_by_columns.len();
@@ -616,9 +622,115 @@ impl Executor {
             (cols, rows)
         };
 
+        // ORDER BY may reference a grouped column that the SELECT list does
+        // not project. The sort runs after this function returns, so carry
+        // those columns along; execute_select trims them back off once the
+        // rows are ordered (the same contract the non-aggregate path uses).
+        let (final_columns, final_rows) = Self::append_hidden_order_by_columns(
+            final_columns,
+            final_rows,
+            hidden_order_by_columns,
+        );
+
         let result: Box<dyn QueryResult> = Box::new(ExecutorResult::new(final_columns, final_rows));
 
         Ok(result)
+    }
+
+    /// Append grouped columns that ORDER BY needs but SELECT does not project.
+    /// Values come from the pre-projection aggregate rows, matched by position.
+    /// Grouped columns that ORDER BY names but the SELECT list does not
+    /// project, paired with their per-group values. A grouped column may be
+    /// stored qualified ("t.v") or bare, and ORDER BY resolves the qualified
+    /// form first, so both spellings are tried in that order.
+    /// Resolve one ORDER BY item against the pre-projection columns.
+    /// Returns the name to publish the carried column under (the spelling
+    /// the sorter will look for) and its index in `source_columns`.
+    ///
+    /// The two spellings do not have to agree: a query may group by `t.v`
+    /// and order by `v`, or the reverse, so a bare name also matches a
+    /// unique `<qualifier>.<name>` column and a qualified name falls back
+    /// to its bare form.
+    pub(crate) fn resolve_hidden_order_by_column(
+        ob: &crate::parser::ast::OrderByExpression,
+        source_columns: &[String],
+    ) -> Option<(String, usize)> {
+        let (publish_as, candidates) = match &ob.expression {
+            Expression::Identifier(id) => (id.value.to_string(), vec![id.value.to_string()]),
+            Expression::QualifiedIdentifier(qid) => {
+                let full = format!("{}.{}", qid.qualifier.value, qid.name.value);
+                (full.clone(), vec![full, qid.name.value.to_string()])
+            }
+            _ => return None,
+        };
+
+        for cand in &candidates {
+            if let Some(idx) = source_columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(cand))
+            {
+                return Some((publish_as, idx));
+            }
+        }
+
+        // Bare name against a qualified column: only when unambiguous
+        let bare = match &ob.expression {
+            Expression::Identifier(id) => id.value.to_string(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.to_string(),
+            _ => return None,
+        };
+        let suffix = format!(".{}", bare);
+        let mut matches = source_columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.to_lowercase().ends_with(&suffix.to_lowercase()));
+        let (idx, _) = matches.next()?;
+        if matches.next().is_some() {
+            return None; // ambiguous across qualifiers
+        }
+        Some((publish_as, idx))
+    }
+
+    /// Grouped columns that ORDER BY names but the SELECT list does not
+    /// project, paired with their per-group values.
+    pub(crate) fn collect_hidden_order_by_columns(
+        stmt: &SelectStatement,
+        source_columns: &[String],
+        source_rows: &RowVec,
+    ) -> Vec<(String, Vec<Value>)> {
+        stmt.order_by
+            .iter()
+            .filter_map(|ob| {
+                let (publish_as, idx) = Self::resolve_hidden_order_by_column(ob, source_columns)?;
+                let values = source_rows
+                    .iter()
+                    .map(|(_, row)| row.get(idx).cloned().unwrap_or_else(Value::null_unknown))
+                    .collect();
+                Some((publish_as, values))
+            })
+            .collect()
+    }
+
+    fn append_hidden_order_by_columns(
+        mut columns: Vec<String>,
+        mut rows: RowVec,
+        hidden: Vec<(String, Vec<Value>)>,
+    ) -> (Vec<String>, RowVec) {
+        for (name, values) in hidden {
+            if columns.iter().any(|c| c.eq_ignore_ascii_case(&name)) {
+                continue; // already projected, nothing to carry
+            }
+            columns.push(name);
+            for (row_idx, (_, row)) in rows.iter_mut().enumerate() {
+                row.push(
+                    values
+                        .get(row_idx)
+                        .cloned()
+                        .unwrap_or_else(Value::null_unknown),
+                );
+            }
+        }
+        (columns, rows)
     }
 
     /// Apply post-aggregation expressions to the result
