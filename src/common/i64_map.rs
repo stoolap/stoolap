@@ -1297,7 +1297,14 @@ impl Iterator for I64SetIntoIter {
 
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        (0, Some(self.slots.len() - self.pos))
+        // The out-of-band sentinel is still pending after the slots are
+        // exhausted, so it counts toward the upper bound
+        // The out-of-band sentinel is still pending after the slots are
+        // exhausted, so it counts toward both bounds
+        (
+            usize::from(self.has_min),
+            Some(self.slots.len() - self.pos + usize::from(self.has_min)),
+        )
     }
 }
 
@@ -1886,6 +1893,29 @@ mod tests {
         for i in 0..10000i64 {
             assert!(set.contains(i * stride), "Missing key {}", i * stride);
         }
+    }
+
+    #[test]
+    fn test_i64set_into_iter_size_hint_covers_sentinel() {
+        // The buggy state is "slots exhausted, sentinel still pending",
+        // which occurs whenever the last occupied slot is the final one.
+        // Construct it directly so the assertion cannot depend on where
+        // the hash happened to place a key.
+        let mut set = I64Set::new();
+        set.insert(i64::MIN);
+        let mut iter = set.into_iter();
+        iter.pos = iter.slots.len();
+
+        let (lower, upper) = iter.size_hint();
+        assert_eq!(lower, 1, "a pending sentinel is a guaranteed item");
+        assert_eq!(
+            upper,
+            Some(1),
+            "upper bound must still admit the pending sentinel"
+        );
+        assert_eq!(iter.next(), Some(i64::MIN));
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+        assert_eq!(iter.next(), None);
     }
 
     #[test]
