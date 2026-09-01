@@ -1406,9 +1406,6 @@ pub struct CompiledEvaluator<'a> {
     /// Column names for compilation context (Arc for zero-copy sharing)
     columns: CompactArc<Vec<String>>,
 
-    /// Cached Arc pointer for fast equality check (avoids Arc comparison)
-    columns_arc_id: usize,
-
     /// Second row columns (for joins)
     columns2: Option<Vec<String>>,
 
@@ -1456,7 +1453,6 @@ impl<'a> CompiledEvaluator<'a> {
         Self {
             function_registry,
             columns: CompactArc::new(Vec::new()),
-            columns_arc_id: 0,
             columns2: None,
             outer_columns: None,
             params: EMPTY_PARAMS.clone(),
@@ -1480,7 +1476,6 @@ impl<'a> CompiledEvaluator<'a> {
     /// Clear all state for reuse.
     pub fn clear(&mut self) {
         self.columns = CompactArc::new(Vec::new());
-        self.columns_arc_id = 0;
         self.columns2 = None;
         self.outer_columns = None;
         self.params = EMPTY_PARAMS.clone();
@@ -1555,20 +1550,16 @@ impl<'a> CompiledEvaluator<'a> {
 
     /// Initialize the column index mapping (call once before set_row_array)
     ///
-    /// Performance: This method caches the source slice pointer. When called
-    /// repeatedly with the same slice (e.g., same table schema), it skips
-    /// the expensive string cloning operation.
+    /// Performance: when the names are unchanged (e.g. the same table schema
+    /// across UPDATE/SELECT operations), the string cloning is skipped. The
+    /// comparison is by content: the caller's buffer is not retained, so its
+    /// address cannot stand in for its identity.
     pub fn init_columns(&mut self, columns: &[String]) {
-        // Fast path: if same slice by pointer and length, skip clone
-        // This handles the common case where init_columns is called repeatedly
-        // with the same table schema during UPDATE/SELECT operations
-        let new_source_id = columns.as_ptr() as usize;
-        if self.columns_arc_id == new_source_id && self.columns.len() == columns.len() {
+        if self.columns.as_slice() == columns {
             return;
         }
 
         self.columns = CompactArc::new(columns.to_vec());
-        self.columns_arc_id = new_source_id;
         // Clear local cache since compilation context changed
         self.local_cache.clear();
     }
@@ -1579,14 +1570,12 @@ impl<'a> CompiledEvaluator<'a> {
     /// such as from `Schema::column_names_arc()`. It avoids all string cloning.
     #[inline]
     pub fn init_columns_arc(&mut self, columns: CompactArc<Vec<String>>) {
-        // Use CompactArc pointer for identity check
-        let new_arc_id = CompactArc::as_ptr(&columns) as usize;
-        if self.columns_arc_id == new_arc_id {
+        // Both handles are alive here, so pointer equality is exact identity.
+        if CompactArc::ptr_eq(&self.columns, &columns) {
             return;
         }
 
         self.columns = columns;
-        self.columns_arc_id = new_arc_id;
         // Clear local cache since compilation context changed
         self.local_cache.clear();
     }
@@ -1630,7 +1619,6 @@ impl<'a> CompiledEvaluator<'a> {
     /// Initialize join columns
     pub fn init_join_columns(&mut self, left_columns: &[String], right_columns: &[String]) {
         self.columns = CompactArc::new(left_columns.to_vec());
-        self.columns_arc_id = 0; // Reset since we're creating a new CompactArc
         self.columns2 = Some(right_columns.to_vec());
         // Invalidate local cache since compilation context changed
         self.local_cache.clear();
@@ -2497,6 +2485,29 @@ mod tests {
         let mut eval = CompiledEvaluator::with_defaults();
         eval.init_columns(&["col1".to_string(), "col2".to_string()]);
         assert_eq!(eval.columns.len(), 2);
+    }
+
+    /// Column names are identified by content, not by the address of the
+    /// caller's buffer: a reused buffer holding different names must be picked
+    /// up rather than served from a stale copy.
+    #[test]
+    fn test_compiled_evaluator_init_columns_reused_buffer() {
+        let mut eval = CompiledEvaluator::with_defaults();
+        let mut names = vec!["a".to_string(), "b".to_string()];
+        eval.init_columns(&names);
+
+        // Same buffer address, same length, different names.
+        names[0] = "z".to_string();
+        eval.init_columns(&names);
+
+        assert_eq!(eval.columns.as_slice(), names.as_slice());
+
+        let row = Row::from(vec![Value::Integer(7), Value::Integer(9)]);
+        eval.set_row_array(&row);
+        assert_eq!(
+            eval.evaluate(&make_identifier("z")).unwrap(),
+            Value::Integer(7)
+        );
     }
 
     #[test]
