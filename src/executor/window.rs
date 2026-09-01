@@ -111,13 +111,22 @@ type PartitionKey = SmallVec<[Value; 4]>;
 /// shared across window functions with the same OVER clause
 type SharedSortedPartitions = std::sync::Arc<Vec<Vec<usize>>>;
 
+/// Structural identity of an ORDER BY clause: per item the expression
+/// hash plus its direction and NULLS placement. Hashes (not rendered
+/// SQL) because Display drops positional parameter indices and cannot
+/// escape separators.
+type OrderByKey = SmallVec<[(u64, bool, Option<bool>); 2]>;
+
+/// Structural identity of a whole OVER clause
+type OverClauseKey = (SmallVec<[u64; 2]>, OrderByKey);
+
 use crate::functions::registry::FunctionRegistry;
 use crate::functions::WindowFunction;
 use crate::parser::ast::*;
 use crate::storage::traits::{QueryResult, Table};
 
 use super::context::ExecutionContext;
-use super::expression::{ExpressionEval, MultiExpressionEval};
+use super::expression::{compute_expression_hash, ExpressionEval, MultiExpressionEval};
 use super::result::{ColumnarResult, ExecutorResult};
 use super::utils::build_column_index_map;
 use super::Executor;
@@ -434,7 +443,7 @@ impl Executor {
         // NOTE: We use string representation for semantic comparison because PartialEq on expressions
         // compares token positions, making structurally identical expressions from different window
         // functions appear different.
-        let mut order_by_cache: Vec<(String, ColumnarOrderByValues)> = Vec::new();
+        let mut order_by_cache: Vec<(OrderByKey, ColumnarOrderByValues)> = Vec::new();
         for wf in &window_functions {
             if !wf.order_by.is_empty() {
                 // Create a semantic key from the ORDER BY expressions (ignores token positions)
@@ -457,7 +466,7 @@ impl Executor {
         let mut window_value_map: StringMap<Vec<Value>> = StringMap::new();
         // Sorted partitions shared across window functions with the same
         // OVER clause (K functions pay one map build and one sort)
-        let mut partition_cache: Vec<(String, SharedSortedPartitions)> = Vec::new();
+        let mut partition_cache: Vec<(OverClauseKey, SharedSortedPartitions)> = Vec::new();
         for wf in &window_functions {
             let window_values = self.compute_window_function(
                 wf,
@@ -711,7 +720,7 @@ impl Executor {
             select_items.iter().map(|i| i.output_name.clone()).collect();
 
         // Precompute ORDER BY values once for each unique ORDER BY clause
-        let mut order_by_cache: Vec<(String, ColumnarOrderByValues)> = Vec::new();
+        let mut order_by_cache: Vec<(OrderByKey, ColumnarOrderByValues)> = Vec::new();
         for wf in window_functions {
             if !wf.order_by.is_empty() {
                 let cache_key = Self::order_by_cache_key(&wf.order_by);
@@ -745,7 +754,8 @@ impl Executor {
 
         // Precompute aggregate window functions once over all rows (not per partition)
         let mut precomputed_agg: StringMap<Vec<Value>> = StringMap::new();
-        let mut streaming_partition_cache: Vec<(String, SharedSortedPartitions)> = Vec::new();
+        let mut streaming_partition_cache: Vec<(OverClauseKey, SharedSortedPartitions)> =
+            Vec::new();
         for (wf, _, is_agg) in &resolved_wfs {
             if *is_agg {
                 let cache_key = Self::order_by_cache_key(&wf.order_by);
@@ -976,7 +986,7 @@ impl Executor {
             }
 
             // Precompute ORDER BY values for each unique ORDER BY clause
-            let mut order_by_cache: Vec<(String, ColumnarOrderByValues)> = Vec::new();
+            let mut order_by_cache: Vec<(OrderByKey, ColumnarOrderByValues)> = Vec::new();
             for wf in &window_functions {
                 if !wf.order_by.is_empty() {
                     let cache_key = Self::order_by_cache_key(&wf.order_by);
@@ -1000,7 +1010,7 @@ impl Executor {
             let mut window_value_map: StringMap<Vec<Value>> = StringMap::new();
             // Per-partition rows: the shared cache would key on the OVER
             // clause while indices differ per partition, so keep it local
-            let mut lazy_partition_cache: Vec<(String, SharedSortedPartitions)> = Vec::new();
+            let mut lazy_partition_cache: Vec<(OverClauseKey, SharedSortedPartitions)> = Vec::new();
 
             for (wf, win_func_opt, is_agg) in &resolved_wfs {
                 let cache_key = Self::order_by_cache_key(&wf.order_by);
@@ -1732,9 +1742,6 @@ impl Executor {
         })
     }
 
-    /// Create a cache key for ORDER BY expressions using their string representation.
-    /// This enables semantic comparison (ignoring token positions) for ORDER BY clause deduplication.
-    #[inline]
     /// Resolve the sorted partitions for a window function's OVER clause,
     /// sharing the partition map build and the per-partition sort across
     /// window functions with identical PARTITION BY and ORDER BY
@@ -1748,7 +1755,7 @@ impl Executor {
         ctx: &ExecutionContext,
         pre_grouped: Option<&WindowPreGroupedState>,
         order_by_values: Option<&ColumnarOrderByValues>,
-        partition_cache: &mut Vec<(String, SharedSortedPartitions)>,
+        partition_cache: &mut Vec<(OverClauseKey, SharedSortedPartitions)>,
     ) -> Result<SharedSortedPartitions> {
         let key = Self::over_clause_cache_key(wf_info);
         if let Some((_, cached)) = partition_cache.iter().find(|(k, _)| k == &key) {
@@ -1780,33 +1787,33 @@ impl Executor {
         Ok(shared)
     }
 
-    /// Semantic cache key for a (PARTITION BY, ORDER BY) pair; window
+    /// Structural cache key for a (PARTITION BY, ORDER BY) pair; window
     /// functions sharing both reuse one partition map and one sort
-    fn over_clause_cache_key(wf: &WindowFunctionInfo) -> String {
-        use std::fmt::Write;
-        let mut key = String::with_capacity(96);
-        for (i, expr) in wf.partition_by_exprs.iter().enumerate() {
-            if i > 0 {
-                key.push(',');
-            }
-            let _ = write!(key, "{}", expr);
-        }
-        key.push('\x1f');
-        key.push_str(&Self::order_by_cache_key(&wf.order_by));
-        key
+    fn over_clause_cache_key(wf: &WindowFunctionInfo) -> OverClauseKey {
+        let partition = wf
+            .partition_by_exprs
+            .iter()
+            .map(compute_expression_hash)
+            .collect();
+        (partition, Self::order_by_cache_key(&wf.order_by))
     }
 
-    fn order_by_cache_key(order_by: &[OrderByExpression]) -> String {
-        use std::fmt::Write;
-        let mut key = String::with_capacity(64);
-        for (i, ob) in order_by.iter().enumerate() {
-            if i > 0 {
-                key.push(',');
-            }
-            // Use Display trait to get semantic string representation
-            let _ = write!(key, "{}", ob);
-        }
-        key
+    /// Structural identity of an ORDER BY clause. Rendered SQL cannot
+    /// serve here: Display prints bare positional parameters as "?"
+    /// without their index, so two clauses binding different values
+    /// would share a cache entry.
+    #[inline]
+    fn order_by_cache_key(order_by: &[OrderByExpression]) -> OrderByKey {
+        order_by
+            .iter()
+            .map(|ob| {
+                (
+                    compute_expression_hash(&ob.expression),
+                    ob.ascending,
+                    ob.nulls_first,
+                )
+            })
+            .collect()
     }
 
     /// Check that ALL window functions share the exact same PARTITION BY clause.
@@ -1918,7 +1925,6 @@ impl Executor {
     /// pre_grouped: Optional pre-grouped partitions from index (avoids hash-based grouping)
     /// order_by_cache: Precomputed ORDER BY values cache (keyed by semantic string representation)
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn compute_window_function(
         &self,
         wf_info: &WindowFunctionInfo,
@@ -1928,8 +1934,8 @@ impl Executor {
         ctx: &ExecutionContext,
         pre_sorted: Option<&WindowPreSortedState>,
         pre_grouped: Option<&WindowPreGroupedState>,
-        order_by_cache: &[(String, ColumnarOrderByValues)],
-        partition_cache: &mut Vec<(String, SharedSortedPartitions)>,
+        order_by_cache: &[(OrderByKey, ColumnarOrderByValues)],
+        partition_cache: &mut Vec<(OverClauseKey, SharedSortedPartitions)>,
     ) -> Result<Vec<Value>> {
         // Check if this is an aggregate function used as window function
         let is_aggregate = self.function_registry.is_aggregate(&wf_info.name);
@@ -3665,7 +3671,6 @@ impl Executor {
     /// Compute aggregate function as window function (SUM, COUNT, AVG, MIN, MAX)
     /// cached_order_by: Optional precomputed ORDER BY values from cache to avoid redundant computation
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn compute_aggregate_window_function(
         &self,
         wf_info: &WindowFunctionInfo,
@@ -3675,7 +3680,7 @@ impl Executor {
         ctx: &ExecutionContext,
         pre_sorted: Option<&WindowPreSortedState>,
         cached_order_by: Option<&ColumnarOrderByValues>,
-        partition_cache: &mut Vec<(String, SharedSortedPartitions)>,
+        partition_cache: &mut Vec<(OverClauseKey, SharedSortedPartitions)>,
     ) -> Result<Vec<Value>> {
         // Check if this is COUNT(*) - Star expression means count all rows
         let is_count_star =
@@ -3723,12 +3728,18 @@ impl Executor {
         // per-partition sort shared across window functions). The
         // presorted-by-index path keeps unsorted indices, so it bypasses
         // the shared cache
-        let partitions: Vec<Vec<usize>> = if skip_sorting {
-            Self::build_partition_map(wf_info, rows, columns, col_index_map, ctx)?
-                .into_values()
-                .collect()
+        let owned_partitions: Option<Vec<Vec<usize>>> = if skip_sorting {
+            Some(
+                Self::build_partition_map(wf_info, rows, columns, col_index_map, ctx)?
+                    .into_values()
+                    .collect(),
+            )
         } else {
-            let shared = self.shared_sorted_partitions(
+            None
+        };
+        let shared_partitions = match &owned_partitions {
+            Some(_) => None,
+            None => Some(self.shared_sorted_partitions(
                 wf_info,
                 rows,
                 columns,
@@ -3737,8 +3748,13 @@ impl Executor {
                 None,
                 cached_order_by,
                 partition_cache,
-            )?;
-            shared.iter().cloned().collect()
+            )?),
+        };
+        // Borrow the shared entry instead of cloning the index vectors
+        let partitions: &[Vec<usize>] = match (&owned_partitions, &shared_partitions) {
+            (Some(owned), _) => owned,
+            (None, Some(shared)) => shared,
+            (None, None) => &[],
         };
 
         // Compute aggregate for each partition
@@ -3746,7 +3762,8 @@ impl Executor {
         // (no data to clone), much faster than vec![NULL_VALUE; n] which clones ~32 byte Values
         let mut results: Vec<Option<Value>> = vec![None; rows.len()];
 
-        for row_indices in partitions {
+        for row_indices in partitions.iter() {
+            let row_indices = row_indices.as_slice();
             // Partitions from the shared cache arrive pre-sorted
             if !wf_info.order_by.is_empty() {
                 // With ORDER BY, compute aggregate with frame specification
@@ -4161,7 +4178,7 @@ impl Executor {
                     })?;
 
                 // Accumulate all values in the partition
-                for &row_idx in &row_indices {
+                for &row_idx in row_indices {
                     // Bind by reference: accumulate clones internally only
                     // when it retains the value
                     let value: &Value = if let Some(col_idx) = arg_col_idx {
@@ -4178,7 +4195,7 @@ impl Executor {
                 let aggregate_result = agg_func.result();
 
                 // Assign the same aggregate result to all rows in the partition
-                for &row_idx in &row_indices {
+                for &row_idx in row_indices {
                     results[row_idx] = Some(aggregate_result.clone());
                 }
             }
