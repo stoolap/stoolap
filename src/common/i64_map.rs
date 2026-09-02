@@ -590,18 +590,24 @@ impl<V> I64Map<V> {
         }
     }
 
-    /// Drains all entries from the map, returning an iterator over them
-    #[inline]
-    /// Move every entry out, leaving the map empty with its table intact.
+    /// Move every entry out, leaving the map empty.
     ///
-    /// The iterator borrows the map and empties slots as it yields them, so
-    /// the map's capacity survives the drain. Swapping in a fresh 8-slot
-    /// table, as this used to, meant every pooled transaction map came back
-    /// at minimum size and regrew from scratch on the next transaction. An
-    /// entry the iterator has not reached yet stays in the map, so a leaked
-    /// drain leaves a consistent, merely undrained map behind.
+    /// The iterator borrows the map and empties slots as it yields them.
+    /// The table is kept when the drained batch filled a fair share of it,
+    /// so a pooled transaction map does not regrow from the minimum size on
+    /// every transaction. A table far larger than the batch it held is
+    /// released and rebuilt for that batch size, so one large batch does
+    /// not tax every later small drain with its empty slots. An entry the
+    /// iterator has not reached yet stays in the map, so a leaked drain
+    /// leaves a consistent, merely undrained map behind.
+    #[inline]
     pub fn drain(&mut self) -> Drain<'_, V> {
-        Drain { map: self, pos: 0 }
+        let start_len = self.len;
+        Drain {
+            map: self,
+            pos: 0,
+            start_len,
+        }
     }
 
     #[inline(always)]
@@ -1010,6 +1016,7 @@ impl<V> IntoIterator for I64Map<V> {
 pub struct Drain<'a, V> {
     map: &'a mut I64Map<V>,
     pos: usize,
+    start_len: usize,
 }
 
 // =============================================================================
@@ -1498,6 +1505,13 @@ impl<V> Drop for Drain<'_, V> {
     fn drop(&mut self) {
         // Consume remaining elements so they are dropped and the map is empty
         for _ in self.by_ref() {}
+        // A table far larger than the batch it just held would tax every
+        // later drain with its empty slots, so it is released here, sized
+        // for that batch.
+        let cap = self.map.slots.len();
+        if cap > MIN_SHRINK_CAPACITY && self.start_len < cap / SHRINK_DIVISOR {
+            *self.map = I64Map::with_capacity(self.start_len);
+        }
     }
 }
 
@@ -1932,6 +1946,29 @@ mod tests {
         assert_eq!(map.get(first).copied(), Some("c"));
     }
 
+    /// One large batch must not leave every later small drain scanning a
+    /// table sized for it: the table is released once the batch it held
+    /// is far below its capacity.
+    #[test]
+    fn test_drain_releases_an_oversized_table() {
+        let mut map: I64Map<u64> = I64Map::new();
+        for i in 0..2000 {
+            map.insert(i, i as u64);
+        }
+        assert_eq!(map.drain().count(), 2000);
+        let grown = map.capacity();
+        assert!(grown > MIN_SHRINK_CAPACITY);
+
+        map.insert(1, 1);
+        assert_eq!(map.drain().count(), 1);
+        assert_eq!(map.capacity(), MIN_CAPACITY);
+        assert!(map.is_empty());
+        map.insert(2, 2);
+        assert_eq!(map.get(2), Some(&2));
+    }
+
+    /// A batch that filled a fair share of the table keeps it: the map is
+    /// reusable afterwards without growing again.
     #[test]
     fn test_drain_keeps_capacity() {
         let mut map: I64Map<u64> = I64Map::new();
@@ -1943,7 +1980,11 @@ mod tests {
         let drained = map.drain().count();
         assert_eq!(drained, 1000);
         assert!(map.is_empty());
-        assert_eq!(map.capacity(), before, "drain must keep the table");
+        assert_eq!(
+            map.capacity(),
+            before,
+            "drain must keep a table its batch filled"
+        );
 
         // and the map is fully usable afterwards, without growing
         for i in 0..1000 {
