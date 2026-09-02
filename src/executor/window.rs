@@ -598,7 +598,11 @@ impl Executor {
         } else {
             0
         };
-        let mut ext_values: CompactVec<Value> = CompactVec::with_capacity(ext_values_capacity);
+        // One row buffer reused for every evaluated row. Handing the buffer to
+        // the Row and taking it back with `mem::take` left a zero-capacity
+        // vector behind, so each row paid two allocations to rebuild it.
+        let mut ext_row = Row::from_compact_vec(CompactVec::with_capacity(ext_values_capacity));
+        let mut ext_results: Vec<Value> = Vec::with_capacity(ext_expr_items.len());
 
         // Number of output columns
         let num_items = select_items.len();
@@ -670,25 +674,21 @@ impl Executor {
                 // Evaluate extended expressions (if any) and update their column values
                 if !ext_expr_items.is_empty() {
                     if let Some(ref mut eval) = ext_eval {
-                        // Reuse ext_values buffer: clear and refill
-                        ext_values.clear();
-                        ext_values.extend(base_row.iter().cloned());
+                        ext_row.clear();
+                        ext_row.extend_from_slice(base_row.as_slice());
                         for wf_name in &added_wf_names {
                             let wf_value = window_value_map
                                 .get(wf_name)
                                 .and_then(|vals| vals.get(row_idx).cloned())
                                 .unwrap_or(NULL_VALUE);
-                            ext_values.push(wf_value);
+                            ext_row.push(wf_value);
                         }
-                        // Move the buffer into the row instead of cloning it; the
-                        // next iteration's extend refills a fresh one
-                        let ext_row = Row::from_compact_vec(std::mem::take(&mut ext_values));
 
-                        if let Ok(ext_result_values) = eval.eval_all(&ext_row) {
+                        ext_results.clear();
+                        if eval.eval_into(&ext_row, &mut ext_results).is_ok() {
                             for (eval_idx, (item_idx, _)) in ext_expr_items.iter().enumerate() {
-                                if eval_idx < ext_result_values.len() {
-                                    column_data[*item_idx][row_idx] =
-                                        ext_result_values[eval_idx].clone();
+                                if eval_idx < ext_results.len() {
+                                    column_data[*item_idx][row_idx] = ext_results[eval_idx].clone();
                                 }
                             }
                         }
@@ -918,7 +918,8 @@ impl Executor {
             }
 
             let ext_capacity = base_rows.first().map_or(0, |r| r.1.len()) + 1;
-            let mut ext_values: CompactVec<Value> = CompactVec::with_capacity(ext_capacity);
+            // Reused for every row, see the note on the other window path.
+            let mut ext_row = Row::from_compact_vec(CompactVec::with_capacity(ext_capacity));
 
             // Output rows in partition order (row_indices order)
             for (local_pos, &orig_idx) in row_indices.iter().enumerate() {
@@ -940,18 +941,15 @@ impl Executor {
                             .unwrap_or(NULL_VALUE),
                         CompiledItem::Expression(eval) => eval.eval(base_row)?,
                         CompiledItem::ExpressionWithWindow(eval, wf_name_refs) => {
-                            ext_values.clear();
-                            ext_values.extend(base_row.iter().cloned());
+                            ext_row.clear();
+                            ext_row.extend_from_slice(base_row.as_slice());
                             for wf_name in wf_name_refs.iter() {
                                 let wf_value = window_value_map
                                     .get(*wf_name)
                                     .and_then(|vals| vals.get(local_pos).cloned())
                                     .unwrap_or(NULL_VALUE);
-                                ext_values.push(wf_value);
+                                ext_row.push(wf_value);
                             }
-                            // Move the buffer into the row instead of cloning it; the
-                            // next iteration's extend refills a fresh one
-                            let ext_row = Row::from_compact_vec(std::mem::take(&mut ext_values));
                             eval.eval(&ext_row)?
                         }
                     };
@@ -1137,8 +1135,10 @@ impl Executor {
                 });
             }
 
-            let mut ext_values: CompactVec<Value> =
-                CompactVec::with_capacity(partition_rows.first().map_or(0, |r| r.1.len()) + 1);
+            // Reused for every row, see the note on the other window path.
+            let mut ext_row = Row::from_compact_vec(CompactVec::with_capacity(
+                partition_rows.first().map_or(0, |r| r.1.len()) + 1,
+            ));
 
             // Output rows in partition order
             for (local_pos, &row_idx) in row_indices.iter().enumerate() {
@@ -1160,18 +1160,15 @@ impl Executor {
                             .unwrap_or(NULL_VALUE),
                         CompiledItemLazy::Expression(eval) => eval.eval(base_row)?,
                         CompiledItemLazy::ExpressionWithWindow(eval, wf_name_refs) => {
-                            ext_values.clear();
-                            ext_values.extend(base_row.iter().cloned());
+                            ext_row.clear();
+                            ext_row.extend_from_slice(base_row.as_slice());
                             for wf_name in wf_name_refs.iter() {
                                 let wf_value = window_value_map
                                     .get(*wf_name)
                                     .and_then(|vals| vals.get(local_pos).cloned())
                                     .unwrap_or(NULL_VALUE);
-                                ext_values.push(wf_value);
+                                ext_row.push(wf_value);
                             }
-                            // Move the buffer into the row instead of cloning it; the
-                            // next iteration's extend refills a fresh one
-                            let ext_row = Row::from_compact_vec(std::mem::take(&mut ext_values));
                             eval.eval(&ext_row)?
                         }
                     };
