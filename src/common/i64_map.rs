@@ -601,7 +601,12 @@ impl<V> I64Map<V> {
     /// entry the iterator has not reached yet stays in the map, so a leaked
     /// drain leaves a consistent, merely undrained map behind.
     pub fn drain(&mut self) -> Drain<'_, V> {
-        Drain { map: self, pos: 0 }
+        let start_len = self.len;
+        Drain {
+            map: self,
+            pos: 0,
+            start_len,
+        }
     }
 
     #[inline(always)]
@@ -1010,6 +1015,7 @@ impl<V> IntoIterator for I64Map<V> {
 pub struct Drain<'a, V> {
     map: &'a mut I64Map<V>,
     pos: usize,
+    start_len: usize,
 }
 
 // =============================================================================
@@ -1498,6 +1504,13 @@ impl<V> Drop for Drain<'_, V> {
     fn drop(&mut self) {
         // Consume remaining elements so they are dropped and the map is empty
         for _ in self.by_ref() {}
+        // A table far larger than the batch it just held would tax every
+        // later drain with its empty slots, so it is released here, sized
+        // for that batch.
+        let cap = self.map.slots.len();
+        if cap > MIN_SHRINK_CAPACITY && self.start_len < cap / SHRINK_DIVISOR {
+            *self.map = I64Map::with_capacity(self.start_len);
+        }
     }
 }
 
@@ -1930,6 +1943,27 @@ mod tests {
         map.insert(first, "c");
         assert_eq!(map.len(), 2);
         assert_eq!(map.get(first).copied(), Some("c"));
+    }
+
+    /// One large batch must not leave every later small drain scanning a
+    /// table sized for it: the table is released once the batch it held
+    /// is far below its capacity.
+    #[test]
+    fn test_drain_releases_an_oversized_table() {
+        let mut map: I64Map<u64> = I64Map::new();
+        for i in 0..2000 {
+            map.insert(i, i as u64);
+        }
+        assert_eq!(map.drain().count(), 2000);
+        let grown = map.capacity();
+        assert!(grown > MIN_SHRINK_CAPACITY);
+
+        map.insert(1, 1);
+        assert_eq!(map.drain().count(), 1);
+        assert_eq!(map.capacity(), MIN_CAPACITY);
+        assert!(map.is_empty());
+        map.insert(2, 2);
+        assert_eq!(map.get(2), Some(&2));
     }
 
     #[test]
