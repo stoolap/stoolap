@@ -11,7 +11,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | Mode | In-memory |
 | Platform | Apple Silicon |
 | Sampling | best of 10 runs per engine, measured back to back |
-| Measured | 2026-09-02, `main` at 2526f538 |
+| Measured | 2026-09-03, `main` at 31364b6f |
 | SQLite | rusqlite v0.40.2 |
 | DuckDB | duckdb v1.10501.0 |
 
@@ -20,7 +20,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 ```
 +---------------------------------------------------------------+
 |                                                               |
-|   STOOLAP vs SQLite:    46 wins / 7 losses    (87% win rate)  |
+|   STOOLAP vs SQLite:    45 wins / 8 losses    (85% win rate)  |
 |   STOOLAP vs DuckDB:    52 wins / 1 loss     (98% win rate)  |
 |                                                               |
 +---------------------------------------------------------------+
@@ -32,17 +32,17 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 
 | Operation | Stoolap (us) | SQLite (us) | DuckDB (us) | Best |
 |-----------|-------------|-------------|-------------|------|
-| SELECT by ID | **0.13** | 0.21 | 72.54 | Stoolap |
-| SELECT by index (exact) | **3.27** | 27.44 | 1283.59 | Stoolap |
-| SELECT by index (range) | **27.20** | 249.63 | 314.86 | Stoolap |
-| SELECT complex | **102.42** | 482.93 | 170.17 | Stoolap |
-| SELECT * (full scan) | **84.70** | 485.73 | 622.47 | Stoolap |
-| UPDATE by ID | 0.60 | **0.55** | 86.91 | SQLite |
-| UPDATE complex | **56.61** | 394.35 | 145.22 | Stoolap |
-| INSERT single | **0.82** | 1.40 | 150.74 | Stoolap |
-| DELETE by ID | **0.69** | 1.18 | 99.71 | Stoolap |
-| DELETE complex | **2.29** | 345.08 | 116.55 | Stoolap |
-| Aggregation (GROUP BY) | **43.73** | 1154.25 | 100.39 | Stoolap |
+| SELECT by ID | **0.12** | 0.16 | 69.70 | Stoolap |
+| SELECT by index (exact) | **3.06** | 22.91 | 1186.94 | Stoolap |
+| SELECT by index (range) | **25.20** | 227.87 | 309.96 | Stoolap |
+| SELECT complex | **101.12** | 470.02 | 164.66 | Stoolap |
+| SELECT * (full scan) | **81.99** | 434.31 | 598.39 | Stoolap |
+| UPDATE by ID | 0.61 | **0.53** | 70.94 | SQLite |
+| UPDATE complex | **50.44** | 391.94 | 119.49 | Stoolap |
+| INSERT single | **0.75** | 1.36 | 122.53 | Stoolap |
+| DELETE by ID | **0.59** | 1.16 | 82.32 | Stoolap |
+| DELETE complex | **2.23** | 338.53 | 107.44 | Stoolap |
+| Aggregation (GROUP BY) | **42.21** | 1126.52 | 102.80 | Stoolap |
 
 ---
 
@@ -50,19 +50,19 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 
 | Operation | Stoolap (us) | SQLite (us) | DuckDB (us) | Best |
 |-----------|-------------|-------------|-------------|------|
-| INNER JOIN | 20.61 | **13.67** | 352.72 | SQLite |
-| LEFT JOIN + GROUP BY | **45.47** | 54.18 | 1404.65 | Stoolap |
-| Scalar subquery | **8.49** | 332.67 | 255.46 | Stoolap |
-| IN subquery | **93.63** | 1630.64 | 624.48 | Stoolap |
-| EXISTS subquery | **2.60** | 30.25 | 977.45 | Stoolap |
-| CTE + JOIN | **31.53** | 65.19 | 1097.58 | Stoolap |
-| Window ROW_NUMBER | **240.48** | 1549.46 | 797.31 | Stoolap |
-| Window ROW_NUMBER (PK) | **5.91** | 17.97 | 481.57 | Stoolap |
-| Window PARTITION BY | **8.13** | 49.13 | 708.42 | Stoolap |
-| UNION ALL | **4.89** | 5.85 | 220.02 | Stoolap |
-| CASE expression | **4.29** | 4.39 | 225.71 | Stoolap |
-| Complex JOIN+GROUP+HAVING | **48.73** | 71.83 | 2174.61 | Stoolap |
-| Batch INSERT (100 rows) | **51.71** | 64.75 | 9153.49 | Stoolap |
+| INNER JOIN | 19.67 | **12.07** | 307.31 | SQLite |
+| LEFT JOIN + GROUP BY | **42.80** | 47.74 | 1132.88 | Stoolap |
+| Scalar subquery | **8.17** | 330.70 | 220.47 | Stoolap |
+| IN subquery | **92.54** | 1628.15 | 482.80 | Stoolap |
+| EXISTS subquery | **2.50** | 27.75 | 744.22 | Stoolap |
+| CTE + JOIN | **31.96** | 62.63 | 781.58 | Stoolap |
+| Window ROW_NUMBER | **235.23** | 1519.95 | 615.79 | Stoolap |
+| Window ROW_NUMBER (PK) | **5.63** | 17.22 | 372.81 | Stoolap |
+| Window PARTITION BY | **8.20** | 47.89 | 541.97 | Stoolap |
+| UNION ALL | **4.86** | 5.04 | 148.38 | Stoolap |
+| CASE expression | 4.30 | **4.24** | 180.82 | SQLite |
+| Complex JOIN+GROUP+HAVING | **46.13** | 68.70 | 1637.86 | Stoolap |
+| Batch INSERT (100 rows) | **50.18** | 62.99 | 7757.23 | Stoolap |
 
 ---
 
@@ -70,35 +70,35 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 
 | Operation | Stoolap (us) | SQLite (us) | DuckDB (us) | Best |
 |-----------|-------------|-------------|-------------|------|
-| DISTINCT (no ORDER) | **4.40** | 97.75 | 258.64 | Stoolap |
-| DISTINCT + ORDER BY | **4.73** | 123.02 | 335.87 | Stoolap |
-| COUNT DISTINCT | **0.26** | 91.07 | 269.60 | Stoolap |
-| LIKE prefix (User_1%) | **3.51** | 8.19 | 253.31 | Stoolap |
-| LIKE contains (%50%) | **30.14** | 133.87 | 243.19 | Stoolap |
-| OR conditions (3 vals) | **2.92** | 12.68 | 207.39 | Stoolap |
-| IN list (7 values) | **2.05** | 12.50 | 8600.29 | Stoolap |
-| NOT IN subquery | **67.48** | 1693.86 | 621.88 | Stoolap |
-| NOT EXISTS subquery | **21.77** | 86.66 | 1042.73 | Stoolap |
-| OFFSET pagination (5000) | **11.62** | 21.24 | 542.62 | Stoolap |
-| Multi-col ORDER BY (3) | **141.29** | 360.62 | 344.13 | Stoolap |
-| Self JOIN (same age) | 12.65 | **9.43** | 419.84 | SQLite |
-| Multi window funcs (3) | **399.55** | 1579.36 | 828.94 | Stoolap |
-| Nested subquery (3 lvl) | **323.75** | 5585.09 | 967.97 | Stoolap |
-| Multi aggregates (6) | **114.25** | 760.42 | 355.11 | Stoolap |
-| COALESCE + IS NOT NULL | 3.68 | **2.94** | 82.59 | SQLite |
-| Expr in WHERE (funcs) | **5.41** | 14.06 | 324.14 | Stoolap |
-| Math expressions | 12.36 | **11.74** | 216.67 | SQLite |
-| String concat (\|\|) | 6.13 | **5.25** | 251.33 | SQLite |
-| Large result (no LIMIT) | **234.14** | 465.87 | 372.65 | Stoolap |
-| Multiple CTEs (2) | 20.12 | **17.41** | 312.59 | SQLite |
-| Correlated in SELECT | **251.33** | 523.02 | 1306.52 | Stoolap |
-| BETWEEN (non-indexed) | **3.00** | 8.90 | 171.87 | Stoolap |
-| GROUP BY (2 columns) | **140.68** | 2370.70 | 404.03 | Stoolap |
-| CROSS JOIN (limited) | **89.24** | 1462.06 | 332.74 | Stoolap |
-| Derived table (FROM sub) | 379.44 | 943.29 | **327.14** | DuckDB |
-| Window ROWS frame | **354.91** | 2109.35 | 2461.63 | Stoolap |
-| HAVING complex | **88.77** | 1492.41 | 94.98 | Stoolap |
-| Compare with subquery | **5.10** | 1642.36 | 250.43 | Stoolap |
+| DISTINCT (no ORDER) | **4.08** | 91.43 | 206.90 | Stoolap |
+| DISTINCT + ORDER BY | **4.56** | 121.32 | 247.00 | Stoolap |
+| COUNT DISTINCT | **0.26** | 92.07 | 190.66 | Stoolap |
+| LIKE prefix (User_1%) | **3.32** | 8.29 | 181.92 | Stoolap |
+| LIKE contains (%50%) | **29.77** | 134.32 | 189.46 | Stoolap |
+| OR conditions (3 vals) | **2.81** | 12.58 | 169.62 | Stoolap |
+| IN list (7 values) | **2.07** | 12.29 | 7369.91 | Stoolap |
+| NOT IN subquery | **65.01** | 1668.07 | 519.09 | Stoolap |
+| NOT EXISTS subquery | **21.78** | 76.56 | 898.08 | Stoolap |
+| OFFSET pagination (5000) | **11.45** | 21.71 | 440.42 | Stoolap |
+| Multi-col ORDER BY (3) | **136.92** | 359.28 | 289.59 | Stoolap |
+| Self JOIN (same age) | 12.54 | **9.07** | 356.03 | SQLite |
+| Multi window funcs (3) | **394.38** | 1559.68 | 661.82 | Stoolap |
+| Nested subquery (3 lvl) | **315.17** | 5530.04 | 766.03 | Stoolap |
+| Multi aggregates (6) | **111.31** | 713.77 | 280.07 | Stoolap |
+| COALESCE + IS NOT NULL | 3.79 | **2.56** | 72.09 | SQLite |
+| Expr in WHERE (funcs) | **4.72** | 12.46 | 258.36 | Stoolap |
+| Math expressions | 11.78 | **10.23** | 176.87 | SQLite |
+| String concat (\|\|) | 5.89 | **4.74** | 206.59 | SQLite |
+| Large result (no LIMIT) | **226.66** | 412.98 | 299.37 | Stoolap |
+| Multiple CTEs (2) | 19.82 | **14.77** | 265.89 | SQLite |
+| Correlated in SELECT | **233.63** | 459.84 | 1005.40 | Stoolap |
+| BETWEEN (non-indexed) | **2.64** | 7.75 | 133.74 | Stoolap |
+| GROUP BY (2 columns) | **139.29** | 1827.71 | 316.01 | Stoolap |
+| CROSS JOIN (limited) | **85.53** | 1164.07 | 238.74 | Stoolap |
+| Derived table (FROM sub) | 380.09 | 700.80 | **223.94** | DuckDB |
+| Window ROWS frame | **349.78** | 1576.43 | 2808.85 | Stoolap |
+| HAVING complex | **84.37** | 1128.71 | 120.62 | Stoolap |
+| Compare with subquery | **4.81** | 1273.44 | 247.97 | Stoolap |
 
 ---
 
@@ -107,9 +107,9 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | Category | Stoolap Wins | SQLite Wins | DuckDB Wins |
 |----------|-------------|-------------|-------------|
 | Basic Operations | 10 | 1 | 0 |
-| Advanced Operations | 12 | 1 | 0 |
+| Advanced Operations | 11 | 2 | 0 |
 | Bottleneck Hunters | 23 | 5 | 1 |
-| **Total** | **45** | **7** | **1** |
+| **Total** | **44** | **8** | **1** |
 
 ---
 
@@ -117,21 +117,21 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 
 | Operation | Stoolap | SQLite | Speedup |
 |-----------|---------|--------|---------|
-| COUNT DISTINCT | 0.26 us | 91.07 us | **352x** |
-| Compare with subquery | 5.10 us | 1642.36 us | **322x** |
-| DELETE complex | 2.29 us | 345.08 us | **151x** |
-| Scalar subquery | 8.49 us | 332.67 us | **39x** |
-| Aggregation (GROUP BY) | 43.73 us | 1154.25 us | **26x** |
-| DISTINCT + ORDER BY | 4.73 us | 123.02 us | **26x** |
-| NOT IN subquery | 67.48 us | 1693.86 us | **25x** |
-| DISTINCT (no ORDER) | 4.40 us | 97.75 us | **22x** |
-| IN subquery | 93.63 us | 1630.64 us | **17x** |
-| Nested subquery (3 lvl) | 323.75 us | 5585.09 us | **17x** |
-| GROUP BY (2 columns) | 140.68 us | 2370.70 us | **17x** |
-| HAVING complex | 88.77 us | 1492.41 us | **17x** |
-| CROSS JOIN (limited) | 89.24 us | 1462.06 us | **16x** |
-| EXISTS subquery | 2.60 us | 30.25 us | **12x** |
-| SELECT by index (range) | 27.20 us | 249.63 us | **9x** |
+| COUNT DISTINCT | 0.26 us | 92.07 us | **360x** |
+| Compare with subquery | 4.81 us | 1273.44 us | **265x** |
+| DELETE complex | 2.23 us | 338.53 us | **152x** |
+| Scalar subquery | 8.17 us | 330.70 us | **40x** |
+| Aggregation (GROUP BY) | 42.21 us | 1126.52 us | **27x** |
+| DISTINCT + ORDER BY | 4.56 us | 121.32 us | **27x** |
+| NOT IN subquery | 65.01 us | 1668.07 us | **26x** |
+| DISTINCT (no ORDER) | 4.08 us | 91.43 us | **22x** |
+| IN subquery | 92.54 us | 1628.15 us | **18x** |
+| Nested subquery (3 lvl) | 315.17 us | 5530.04 us | **18x** |
+| CROSS JOIN (limited) | 85.53 us | 1164.07 us | **14x** |
+| HAVING complex | 84.37 us | 1128.71 us | **13x** |
+| GROUP BY (2 columns) | 139.29 us | 1827.71 us | **13x** |
+| EXISTS subquery | 2.50 us | 27.75 us | **11x** |
+| SELECT by index (range) | 25.20 us | 227.87 us | **9x** |
 
 ---
 
@@ -139,31 +139,31 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 
 | Operation | Stoolap | DuckDB | Speedup |
 |-----------|---------|--------|---------|
-| IN list (7 values) | 2.05 us | 8600.29 us | **4193x** |
-| COUNT DISTINCT | 0.26 us | 269.60 us | **1041x** |
-| SELECT by ID | 0.13 us | 72.54 us | **545x** |
-| SELECT by index (exact) | 3.27 us | 1283.59 us | **392x** |
-| EXISTS subquery | 2.60 us | 977.45 us | **377x** |
-| INSERT single | 0.82 us | 150.74 us | **185x** |
-| Batch INSERT (100 rows) | 51.71 us | 9153.49 us | **177x** |
-| DELETE by ID | 0.69 us | 99.71 us | **144x** |
-| UPDATE by ID | 0.60 us | 86.91 us | **144x** |
-| Window PARTITION BY | 8.13 us | 708.42 us | **87x** |
-| Window ROW_NUMBER (PK) | 5.91 us | 481.57 us | **81x** |
-| LIKE prefix (User_1%) | 3.51 us | 253.31 us | **72x** |
-| OR conditions (3 vals) | 2.92 us | 207.39 us | **71x** |
-| DISTINCT + ORDER BY | 4.73 us | 335.87 us | **71x** |
-| Expr in WHERE (funcs) | 5.41 us | 324.14 us | **60x** |
-| DISTINCT (no ORDER) | 4.40 us | 258.64 us | **59x** |
-| BETWEEN (non-indexed) | 3.00 us | 171.87 us | **57x** |
-| CASE expression | 4.29 us | 225.71 us | **53x** |
-| DELETE complex | 2.29 us | 116.55 us | **51x** |
-| Compare with subquery | 5.10 us | 250.43 us | **49x** |
-| NOT EXISTS subquery | 21.77 us | 1042.73 us | **48x** |
-| OFFSET pagination (5000) | 11.62 us | 542.62 us | **47x** |
-| UNION ALL | 4.89 us | 220.02 us | **45x** |
-| Complex JOIN+GROUP+HAVING | 48.73 us | 2174.61 us | **45x** |
-| String concat (\|\|) | 6.13 us | 251.33 us | **41x** |
+| IN list (7 values) | 2.07 us | 7369.91 us | **3557x** |
+| COUNT DISTINCT | 0.26 us | 190.66 us | **745x** |
+| SELECT by ID | 0.12 us | 69.70 us | **586x** |
+| SELECT by index (exact) | 3.06 us | 1186.94 us | **388x** |
+| EXISTS subquery | 2.50 us | 744.22 us | **297x** |
+| INSERT single | 0.75 us | 122.53 us | **164x** |
+| Batch INSERT (100 rows) | 50.18 us | 7757.23 us | **155x** |
+| DELETE by ID | 0.59 us | 82.32 us | **139x** |
+| UPDATE by ID | 0.61 us | 70.94 us | **116x** |
+| Window ROW_NUMBER (PK) | 5.63 us | 372.81 us | **66x** |
+| Window PARTITION BY | 8.20 us | 541.97 us | **66x** |
+| OR conditions (3 vals) | 2.81 us | 169.62 us | **60x** |
+| LIKE prefix (User_1%) | 3.32 us | 181.92 us | **55x** |
+| Expr in WHERE (funcs) | 4.72 us | 258.36 us | **55x** |
+| DISTINCT + ORDER BY | 4.56 us | 247.00 us | **54x** |
+| Compare with subquery | 4.81 us | 247.97 us | **52x** |
+| DISTINCT (no ORDER) | 4.08 us | 206.90 us | **51x** |
+| BETWEEN (non-indexed) | 2.64 us | 133.74 us | **51x** |
+| DELETE complex | 2.23 us | 107.44 us | **48x** |
+| CASE expression | 4.30 us | 180.82 us | **42x** |
+| NOT EXISTS subquery | 21.78 us | 898.08 us | **41x** |
+| OFFSET pagination (5000) | 11.45 us | 440.42 us | **38x** |
+| Complex JOIN+GROUP+HAVING | 46.13 us | 1637.86 us | **36x** |
+| String concat (\|\|) | 5.89 us | 206.59 us | **35x** |
+| UNION ALL | 4.86 us | 148.38 us | **31x** |
 
 ---
 
@@ -173,19 +173,20 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 
 | Operation | SQLite | Stoolap | Factor |
 |-----------|--------|---------|--------|
-| INNER JOIN | 13.67 us | 20.61 us | 1.5x |
-| Self JOIN (same age) | 9.43 us | 12.65 us | 1.3x |
-| COALESCE + IS NOT NULL | 2.94 us | 3.68 us | 1.3x |
-| String concat (\|\|) | 5.25 us | 6.13 us | 1.2x |
-| Multiple CTEs (2) | 17.41 us | 20.12 us | 1.2x |
-| UPDATE by ID | 0.55 us | 0.60 us | 1.1x |
-| Math expressions | 11.74 us | 12.36 us | 1.1x |
+| INNER JOIN | 12.07 us | 19.67 us | 1.6x |
+| COALESCE + IS NOT NULL | 2.56 us | 3.79 us | 1.5x |
+| Self JOIN (same age) | 9.07 us | 12.54 us | 1.4x |
+| Multiple CTEs (2) | 14.77 us | 19.82 us | 1.3x |
+| String concat (\|\|) | 4.74 us | 5.89 us | 1.2x |
+| Math expressions | 10.23 us | 11.78 us | 1.2x |
+| UPDATE by ID | 0.53 us | 0.61 us | 1.2x |
+| CASE expression | 4.24 us | 4.30 us | 1.0x |
 
 ### DuckDB Advantages
 
 | Operation | DuckDB | Stoolap | Factor |
 |-----------|--------|---------|--------|
-| Derived table (FROM sub) | 327.14 us | 379.44 us | 1.2x |
+| Derived table (FROM sub) | 223.94 us | 380.09 us | 1.7x |
 
 ---
 
@@ -206,22 +207,22 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 
 ```
 Stoolap Strengths:
-  Point Queries (ID):     ████████████████████  545x vs DuckDB
-  Subquery Compare:       ████████████████████  322x vs SQLite
-  DISTINCT Operations:    ████████████████████  22-352x vs SQLite
-  Semi-joins (EXISTS):    ████████████████████  4-377x faster
-  Batch Inserts:          ████████████████████  177x vs DuckDB
-  Window (PARTITION BY):  ████████████████████  87x vs DuckDB
-  OFFSET Pagination:      ████████████████████  47x vs DuckDB
-  Complex DML:            ████████████████████  3-151x faster
-  Aggregations:           ████████████████████  26x vs SQLite
+  Point Queries (ID):     ████████████████████  586x vs DuckDB
+  Subquery Compare:       ████████████████████  265x vs SQLite
+  DISTINCT Operations:    ████████████████████  22-360x vs SQLite
+  Semi-joins (EXISTS):    ████████████████████  4-297x faster
+  Batch Inserts:          ████████████████████  155x vs DuckDB
+  Window (PARTITION BY):  ████████████████████  66x vs DuckDB
+  OFFSET Pagination:      ████████████████████  38x vs DuckDB
+  Complex DML:            ████████████████████  2-152x faster
+  Aggregations:           ████████████████████  27x vs SQLite
 
 SQLite Strengths:
-  Simple JOINs:           ████████              SQLite ~1.3-1.5x faster
-  Simple Expressions:     ██████                SQLite ~1.1-1.3x faster
+  Simple JOINs:           ████████              SQLite ~1.4-1.6x faster
+  Simple Expressions:     ██████                SQLite ~1.0-1.5x faster
 
 DuckDB Strengths:
-  Derived Tables:         ██████                DuckDB ~1.2x faster
+  Derived Tables:         ██████                DuckDB ~1.7x faster
 ```
 
 ---
@@ -229,7 +230,7 @@ DuckDB Strengths:
 ## Best Use Cases
 
 ### Choose Stoolap for:
-- **OLTP workloads** - Point queries, updates, deletes
+- **OLTP workloads** - Point queries, inserts, deletes
 - **Real-time analytics** - Fast aggregations with DISTINCT
 - **Semi-join patterns** - EXISTS, IN subqueries
 - **Time-travel queries** - AS OF temporal queries
@@ -269,4 +270,4 @@ cargo build --release --example benchmark --example benchmark_sqlite --example b
 
 ---
 
-*Benchmarks performed on Apple Silicon, in-memory mode, best of 10 runs, all three engines measured back to back on one idle machine. Results are point-in-time for `main` at 2526f538, which is after the v0.4.0 release, not the release itself; re-run on your hardware and workload for current numbers.*
+*Benchmarks performed on Apple Silicon, in-memory mode, best of 10 runs, all three engines measured back to back on one idle machine. Results are point-in-time for `main` at 31364b6f, which is after the v0.4.0 release, not the release itself; re-run on your hardware and workload for current numbers.*
