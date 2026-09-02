@@ -2481,9 +2481,11 @@ impl Executor {
         // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows.
         // Tried even when the IN list pushed down: pushdown turns it into a
         // min..max range, which on spread-out values scans the whole table.
-        // Left to the normal pipeline: aggregation and window functions
-        // (this projection cannot compile them) and an ORDER BY key that is
-        // not projected (the sorter would not find it afterwards).
+        // Tried for every primary-key IN list, since pushdown would turn it
+        // into a min..max range; for other indexed columns only when a memory
+        // filter is needed anyway. Left to the normal pipeline: aggregation
+        // and window functions (this projection cannot compile them) and an
+        // ORDER BY key that is not projected (the sorter would not find it).
         if !has_outer_context
             && !classification.has_group_by
             && !classification.has_aggregation
@@ -2500,6 +2502,7 @@ impl Executor {
                         table_alias.as_deref(),
                         ctx,
                         classification,
+                        needs_memory_filter,
                     )?
                 {
                     return Ok((result, columns, limit_applied, None));

@@ -1216,6 +1216,7 @@ impl Executor {
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
         classification: &Arc<QueryClassification>,
+        probe_secondary_index: bool,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>, bool)>> {
         // Extract IN list info: (column_name, values, is_negated, remaining_predicate)
         let (column_name, values, is_negated, remaining_predicate) =
@@ -1239,7 +1240,14 @@ impl Executor {
         };
 
         // If not PK, check for index
+        // A secondary index probe collects every matching row id for every
+        // value before fetching, while the pushed-down range scan streams
+        // and stops at LIMIT; so it is only taken when a memory filter is
+        // needed anyway. Primary key values are the row ids themselves.
         let index = if !is_pk_column {
+            if !probe_secondary_index {
+                return Ok(None);
+            }
             match table.get_index_on_column(&column_name) {
                 Some(idx) => Some(idx),
                 None => return Ok(None), // No PK, no index, can't optimize
