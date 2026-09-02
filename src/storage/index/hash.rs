@@ -39,8 +39,8 @@
 //!
 //! ## Known Limitations:
 //!
-//! ### Triple Lock Pattern for Write Operations
-//! The `add` and `remove` methods acquire three RwLock write locks simultaneously:
+//! ### Paired Lock Pattern for Write Operations
+//! The `add` and `remove` methods acquire both RwLock write locks simultaneously:
 //! - `row_to_hash`: Maps row_id -> hash for efficient removal
 //! - `hash_to_values`: Maps hash -> values for collision handling
 //!
@@ -53,7 +53,7 @@
 //!
 //! **Alternative considered**: Using a single RwLock<struct> would have similar
 //! contention characteristics. A concurrent map could help for truly concurrent writes
-//! but would complicate atomicity across the three maps.
+//! but would complicate atomicity across the two maps.
 
 use parking_lot::RwLock;
 use std::hash::{BuildHasher, Hash, Hasher};
