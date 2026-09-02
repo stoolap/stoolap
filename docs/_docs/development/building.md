@@ -11,7 +11,7 @@ This page covers how to build Stoolap from source, including prerequisites, feat
 
 ## Prerequisites
 
-- **Rust toolchain**: Latest stable (edition 2021, Rust 1.56+)
+- **Rust toolchain**: Rust 1.88 or later (edition 2021)
 - **Git**: For version embedding at build time
 
 Install Rust via [rustup](https://rustup.rs/):
