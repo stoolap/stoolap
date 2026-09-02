@@ -82,14 +82,20 @@ pub struct RowArena {
 }
 
 impl RowArena {
-    /// Create a new arena
-    /// Note: Pre-allocate 10,000 slots to avoid reallocation during bulk inserts.
-    /// Vec doubling during growth can cause peak memory spikes.
+    /// Create a new arena.
+    ///
+    /// Nothing is reserved up front. Reserving 10,000 slots cost every table
+    /// 320 KB before it held a row (80 KB of pointers plus 240 KB of metadata),
+    /// which a schema with many small tables pays over and over, and it bought
+    /// very little: growing a Vec by doubling copies about 2n elements in total
+    /// whatever it starts from, so a 10,000 slot head start only saves copying
+    /// the first 10,000, and the expensive doublings at the end happen either
+    /// way. A caller that knows the size should use [`RowArena::with_capacity`].
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(ArenaInner {
-                data: Vec::with_capacity(10_000),
-                meta: Vec::with_capacity(10_000),
+                data: Vec::new(),
+                meta: Vec::new(),
             }),
             free_list: Mutex::new(Vec::new()),
         }
@@ -359,13 +365,13 @@ impl RowArena {
         }
     }
 
-    /// Drop all data and recreate with default capacity.
+    /// Drop all data and release the memory.
     /// This releases all memory immediately (O(1) memory release)
     /// unlike clear_batch which only clears slots but retains Vec capacity.
     pub fn clear_all(&self) {
         let mut inner = self.inner.write();
-        inner.data = Vec::with_capacity(10_000);
-        inner.meta = Vec::with_capacity(10_000);
+        inner.data = Vec::new();
+        inner.meta = Vec::new();
         self.free_list.lock().clear();
     }
 

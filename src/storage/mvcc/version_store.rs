@@ -534,7 +534,6 @@ impl VersionStore {
         checker: Option<Arc<TransactionRegistry>>,
         expected_rows: usize,
     ) -> Self {
-        let _ = expected_rows;
         let versions = new_cow_btree_map();
 
         Self {
@@ -546,7 +545,7 @@ impl VersionStore {
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: RwLock::new(new_i64_map()),
             visibility_checker: checker,
-            arena: RowArena::new(),
+            arena: RowArena::with_capacity(expected_rows),
             zone_maps: RwLock::new(None),
             max_version_history: 10, // Default: keep up to 10 previous versions
             committed_row_count: AtomicUsize::new(0),
@@ -562,7 +561,6 @@ impl VersionStore {
         checker: Option<Arc<dyn VisibilityChecker>>,
         expected_rows: usize,
     ) -> Self {
-        let _ = expected_rows;
         let versions = new_cow_btree_map();
 
         Self {
@@ -574,7 +572,7 @@ impl VersionStore {
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: RwLock::new(new_i64_map()),
             visibility_checker: checker,
-            arena: RowArena::new(),
+            arena: RowArena::with_capacity(expected_rows),
             zone_maps: RwLock::new(None),
             max_version_history: 10,
             committed_row_count: AtomicUsize::new(0),
