@@ -287,32 +287,21 @@ impl MVCCTable {
     /// Returns Some(row_ids) if an index can be used, None otherwise
     /// Returns a pooled RowIdVec for efficient memory reuse.
     #[allow(clippy::only_used_in_recursion)]
-    /// Rows the committed index cannot know about: this transaction inserted
-    /// them, or changed them so that they satisfy `expr` now. Returned ids
-    /// are not in `indexed`, so the caller can append them and let its own
-    /// per-id local-version handling do the rest.
-    fn local_matches_missing_from(
-        &self,
-        indexed: &[i64],
-        expr: &dyn Expression,
-        schema: &Schema,
-    ) -> Vec<i64> {
+    /// Row ids the committed index cannot know about: rows this transaction
+    /// inserted or re-keyed. They are handed to the caller unfiltered, so the
+    /// expression runs exactly once, in the caller's own per-id handling, as
+    /// it does for rows the index returned.
+    fn local_ids_missing_from(&self, indexed: &[i64]) -> Vec<i64> {
         let txn_versions = self.txn_versions.read().unwrap();
         if !txn_versions.has_local_changes() {
             return Vec::new();
         }
         let present: I64Set = indexed.iter().copied().collect();
-        let mut extra = Vec::new();
-        for (row_id, version) in txn_versions.iter_local() {
-            if version.is_deleted() || present.contains(row_id) {
-                continue;
-            }
-            let row = self.normalize_row_to_schema(version.data.clone(), schema);
-            if expr.evaluate_fast(&row) {
-                extra.push(row_id);
-            }
-        }
-        extra
+        txn_versions
+            .iter_local()
+            .filter(|(row_id, version)| !version.is_deleted() && !present.contains(*row_id))
+            .map(|(row_id, _)| row_id)
+            .collect()
     }
 
     fn try_index_lookup(&self, expr: &dyn Expression) -> Option<RowIdVec> {
@@ -2134,11 +2123,7 @@ impl Table for MVCCTable {
 
             // Try index lookup for non-PK columns
             if let Some(mut filtered_row_ids) = self.try_index_lookup(expr) {
-                filtered_row_ids.extend(self.local_matches_missing_from(
-                    &filtered_row_ids,
-                    expr,
-                    schema,
-                ));
+                filtered_row_ids.extend(self.local_ids_missing_from(&filtered_row_ids));
                 // Step 1: Check local versions first (these don't need write-set tracking)
                 // Use get_local_version to distinguish "no local version" from "locally deleted"
                 let mut local_rows_to_update = RowVec::with_capacity(filtered_row_ids.len() / 4);
@@ -2631,11 +2616,7 @@ impl Table for MVCCTable {
 
             // Try index lookup for non-PK columns
             if let Some(mut filtered_row_ids) = self.try_index_lookup(expr) {
-                filtered_row_ids.extend(self.local_matches_missing_from(
-                    &filtered_row_ids,
-                    expr,
-                    schema,
-                ));
+                filtered_row_ids.extend(self.local_ids_missing_from(&filtered_row_ids));
                 // OPTIMIZATION: Batch collect rows to delete, then batch put
                 // This reduces lock contention from 2N locks to 2 locks for N rows
                 let mut rows_to_delete = RowVec::with_capacity(filtered_row_ids.len());
@@ -2839,11 +2820,7 @@ impl Table for MVCCTable {
 
             // Try index lookup for non-PK columns
             if let Some(mut filtered_row_ids) = self.try_index_lookup(expr) {
-                filtered_row_ids.extend(self.local_matches_missing_from(
-                    &filtered_row_ids,
-                    expr,
-                    &schema,
-                ));
+                filtered_row_ids.extend(self.local_ids_missing_from(&filtered_row_ids));
                 // Use index-based scan - much more efficient
                 let rows = self.fetch_rows_by_ids(&filtered_row_ids, expr)?;
                 let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
