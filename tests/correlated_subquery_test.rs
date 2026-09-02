@@ -1466,3 +1466,62 @@ fn test_correlated_scalar_qualified_sum() {
     assert!((customers[2].2.unwrap_or(0.0) - 150.0).abs() < 0.1); // Charlie: 150
     assert!((customers[3].2.unwrap_or(0.0) - 300.0).abs() < 0.1); // David: 300
 }
+
+/// The inner table's columns share names with the outer table's. Each
+/// shape binds the name to the inner scope, and the outer value that is
+/// substituted must still reach the primary key.
+#[test]
+fn test_correlated_inner_scope_shadows_outer_names() {
+    let db = Database::open("memory://correlated_inner_scope").expect("Failed to create database");
+    db.execute(
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    for i in 1..=10i64 {
+        db.execute("INSERT INTO parent VALUES ($1, $2)", (i, format!("p{}", i)))
+            .unwrap();
+        db.execute("INSERT INTO child VALUES ($1, $2, $3)", (i, 11 - i, i))
+            .unwrap();
+    }
+    let count = |sql: &str| -> i64 {
+        db.query(sql, ())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap()
+    };
+
+    // qualified inner column, outer column of the same name
+    assert_eq!(
+        count("SELECT COUNT(*) FROM child c WHERE c.v > (SELECT p.id FROM parent p WHERE p.id = c.pid)"),
+        5
+    );
+    // unqualified inner column shadows the outer one
+    assert_eq!(
+        count("SELECT COUNT(*) FROM child c WHERE c.v > (SELECT id FROM parent WHERE id = c.pid)"),
+        5
+    );
+    // inner column used twice, once against a literal
+    assert_eq!(
+        count("SELECT COUNT(*) FROM child c WHERE (SELECT p.name FROM parent p WHERE p.id = 5 AND p.id <> c.id) = 'p5'"),
+        9
+    );
+    // outer-only name in an aggregate shape
+    assert_eq!(
+        count("SELECT COUNT(*) FROM child c WHERE (SELECT COUNT(*) FROM parent p WHERE p.id >= c.v) = 11 - c.v"),
+        10
+    );
+    // EXISTS with the clashing name
+    assert_eq!(
+        count("SELECT COUNT(*) FROM child c WHERE EXISTS (SELECT 1 FROM parent p WHERE p.id = c.pid AND p.id > c.id)"),
+        5
+    );
+}

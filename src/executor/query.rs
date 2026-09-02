@@ -2281,9 +2281,15 @@ impl Executor {
                 // to enable predicate pushdown for index usage.
                 // Example: WHERE o.user_id = u.id -> WHERE o.user_id = 42
                 if let Some(outer_row) = ctx.outer_row() {
-                    let substituted_expr =
-                        super::utils::substitute_outer_references(where_expr, outer_row);
                     let schema = table.schema();
+                    let scope = super::utils::InnerScope {
+                        table: table_name,
+                        alias: table_alias.as_deref(),
+                        schema,
+                    };
+                    let substituted_expr = super::utils::substitute_outer_references_in_scope(
+                        where_expr, outer_row, &scope,
+                    );
                     // Try to push down the substituted expression
                     let (storage_expr, needs_filter) =
                         pushdown::try_pushdown(&substituted_expr, schema, Some(ctx));
