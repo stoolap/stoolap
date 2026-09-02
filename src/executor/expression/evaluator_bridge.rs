@@ -1354,6 +1354,11 @@ pub type SharedProgram = CompactArc<Program>;
 // COMPILED EVALUATOR - DEPRECATED, use ExpressionEval instead
 // ============================================================================
 
+/// Upper bound on programs an evaluator keeps between rows. A statement
+/// compiles a few dozen distinct expressions at most; anything past this is
+/// row-specific churn from correlated substitution.
+const LOCAL_PROGRAM_CACHE_MAX: usize = 128;
+
 /// Compiled expression evaluator using the Expression VM.
 ///
 /// # Deprecated
@@ -1812,13 +1817,15 @@ impl<'a> CompiledEvaluator<'a> {
                 // the members commutatively so equal sets hash equal in any
                 // iteration order.
                 in_hash.values.len().hash(hasher);
-                let mut members: u64 = 0;
-                for value in in_hash.values.iter() {
-                    let mut h = FxHasher::default();
-                    value.hash(&mut h);
-                    members = members.wrapping_add(h.finish());
+                // Written straight into the caller's hasher in a canonical
+                // order, so each of the two independent keys sees the members
+                // themselves. Folding them into one 64-bit value first would
+                // hand both keys the same collision.
+                let mut members: Vec<&Value> = in_hash.values.iter().collect();
+                members.sort_unstable();
+                for value in members {
+                    value.hash(hasher);
                 }
-                members.hash(hasher);
             }
             Expression::Between(between) => {
                 between.not.hash(hasher);
@@ -1972,6 +1979,14 @@ impl<'a> CompiledEvaluator<'a> {
 
         // Cache miss: compile the expression
         let program = CompactArc::new(self.compile_expression(expr)?);
+        // A correlated WHERE substitutes each outer row's subquery result
+        // into the expression, so with the cache kept across rows every
+        // distinct result would compile its own program and an IN program
+        // would keep its whole set alive. Bounding the cache keeps the win
+        // when results repeat and caps memory when they do not.
+        if self.local_cache.len() >= LOCAL_PROGRAM_CACHE_MAX {
+            self.local_cache.clear();
+        }
         self.local_cache
             .insert(expr_key, CompactArc::clone(&program));
 
@@ -2538,6 +2553,26 @@ mod tests {
     /// program, and the same members in any order must. A correlated IN
     /// builds a fresh one-element set per outer row, so hashing only the
     /// length handed every row the first row's program.
+    /// Per-row substituted expressions must not grow the program cache
+    /// without bound: a correlated subquery can produce a new literal or a
+    /// new IN set on every outer row.
+    #[test]
+    fn test_local_program_cache_is_bounded() {
+        let mut eval = CompiledEvaluator::with_defaults();
+        eval.init_columns(&["id".to_string()]);
+        let row = Row::from(vec![Value::Integer(1)]);
+        eval.set_row_array(&row);
+        for i in 0..(LOCAL_PROGRAM_CACHE_MAX as i64 * 4) {
+            let expr = make_infix(
+                make_identifier("id"),
+                InfixOperator::Add,
+                make_int_literal(i),
+            );
+            let _ = eval.evaluate(&expr).unwrap();
+            assert!(eval.local_cache.len() <= LOCAL_PROGRAM_CACHE_MAX);
+        }
+    }
+
     #[test]
     fn test_expr_hash_distinguishes_in_hash_set_members() {
         use crate::core::ValueSet;
