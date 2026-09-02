@@ -287,7 +287,35 @@ impl MVCCTable {
     /// Returns Some(row_ids) if an index can be used, None otherwise
     /// Returns a pooled RowIdVec for efficient memory reuse.
     #[allow(clippy::only_used_in_recursion)]
-    fn try_index_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<RowIdVec> {
+    /// Rows the committed index cannot know about: this transaction inserted
+    /// them, or changed them so that they satisfy `expr` now. Returned ids
+    /// are not in `indexed`, so the caller can append them and let its own
+    /// per-id local-version handling do the rest.
+    fn local_matches_missing_from(
+        &self,
+        indexed: &[i64],
+        expr: &dyn Expression,
+        schema: &Schema,
+    ) -> Vec<i64> {
+        let txn_versions = self.txn_versions.read().unwrap();
+        if !txn_versions.has_local_changes() {
+            return Vec::new();
+        }
+        let present: I64Set = indexed.iter().copied().collect();
+        let mut extra = Vec::new();
+        for (row_id, version) in txn_versions.iter_local() {
+            if version.is_deleted() || present.contains(row_id) {
+                continue;
+            }
+            let row = self.normalize_row_to_schema(version.data.clone(), schema);
+            if expr.evaluate_fast(&row) {
+                extra.push(row_id);
+            }
+        }
+        extra
+    }
+
+    fn try_index_lookup(&self, expr: &dyn Expression) -> Option<RowIdVec> {
         use crate::core::Operator;
         use crate::storage::index::intersect_sorted_ids;
 
@@ -317,7 +345,7 @@ impl MVCCTable {
 
             for operand in or_operands {
                 // Recursively try index lookup for each OR operand
-                if let Some(row_ids) = self.try_index_lookup(operand.as_ref(), schema) {
+                if let Some(row_ids) = self.try_index_lookup(operand.as_ref()) {
                     indexed_row_ids.push(row_ids);
                 } else {
                     // This operand can't use an index
@@ -458,7 +486,7 @@ impl MVCCTable {
             for operand in and_operands {
                 // Recursively try index lookup for each AND operand
                 // OPTIMIZATION: Don't sort here - defer sorting until we know intersection is needed
-                if let Some(row_ids) = self.try_index_lookup(operand.as_ref(), schema) {
+                if let Some(row_ids) = self.try_index_lookup(operand.as_ref()) {
                     indexed_row_ids.push(row_ids);
                 }
                 // If an operand can't use an index, we'll still proceed with available indexes
@@ -1010,7 +1038,7 @@ impl MVCCTable {
         let mut unindexed_operands: Vec<Box<dyn Expression>> = Vec::new();
 
         for operand in or_operands {
-            if let Some(row_ids) = self.try_index_lookup(operand.as_ref(), schema) {
+            if let Some(row_ids) = self.try_index_lookup(operand.as_ref()) {
                 indexed_row_ids.push(row_ids);
             } else {
                 unindexed_operands.push(operand.clone_box());
@@ -1631,7 +1659,7 @@ impl MVCCTable {
 
             // OPTIMIZATION: Try secondary index lookup for OR/AND expressions on indexed columns
             // This handles queries like: WHERE age = 25 OR age = 50 OR age = 75
-            if let Some(row_ids) = self.try_index_lookup(expr, schema) {
+            if let Some(row_ids) = self.try_index_lookup(expr) {
                 if let Some(result) =
                     self.try_fetch_from_index(row_ids, expr, schema, limit, offset)
                 {
@@ -1791,7 +1819,7 @@ impl MVCCTable {
 
             // OPTIMIZATION: Try secondary index lookup for OR/AND expressions on indexed columns
             // This handles queries like: WHERE age = 25 OR age = 50 OR age = 75
-            if let Some(row_ids) = self.try_index_lookup(expr, schema) {
+            if let Some(row_ids) = self.try_index_lookup(expr) {
                 if let Some(result) =
                     self.try_fetch_from_index(row_ids, expr, schema, limit, offset)
                 {
@@ -2105,7 +2133,12 @@ impl Table for MVCCTable {
             }
 
             // Try index lookup for non-PK columns
-            if let Some(filtered_row_ids) = self.try_index_lookup(expr, schema) {
+            if let Some(mut filtered_row_ids) = self.try_index_lookup(expr) {
+                filtered_row_ids.extend(self.local_matches_missing_from(
+                    &filtered_row_ids,
+                    expr,
+                    schema,
+                ));
                 // Step 1: Check local versions first (these don't need write-set tracking)
                 // Use get_local_version to distinguish "no local version" from "locally deleted"
                 let mut local_rows_to_update = RowVec::with_capacity(filtered_row_ids.len() / 4);
@@ -2597,7 +2630,12 @@ impl Table for MVCCTable {
             }
 
             // Try index lookup for non-PK columns
-            if let Some(filtered_row_ids) = self.try_index_lookup(expr, schema) {
+            if let Some(mut filtered_row_ids) = self.try_index_lookup(expr) {
+                filtered_row_ids.extend(self.local_matches_missing_from(
+                    &filtered_row_ids,
+                    expr,
+                    schema,
+                ));
                 // OPTIMIZATION: Batch collect rows to delete, then batch put
                 // This reduces lock contention from 2N locks to 2 locks for N rows
                 let mut rows_to_delete = RowVec::with_capacity(filtered_row_ids.len());
@@ -2800,7 +2838,12 @@ impl Table for MVCCTable {
             }
 
             // Try index lookup for non-PK columns
-            if let Some(filtered_row_ids) = self.try_index_lookup(expr, &schema) {
+            if let Some(mut filtered_row_ids) = self.try_index_lookup(expr) {
+                filtered_row_ids.extend(self.local_matches_missing_from(
+                    &filtered_row_ids,
+                    expr,
+                    &schema,
+                ));
                 // Use index-based scan - much more efficient
                 let rows = self.fetch_rows_by_ids(&filtered_row_ids, expr)?;
                 let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
