@@ -581,7 +581,7 @@ fn json_value_to_stoolap(
                     return Ok(Value::null_unknown());
                 }
             }
-            Value::text(s)
+            Value::text(s.as_str())
         }
         serde_json::Value::Object(_) | serde_json::Value::Array(_) => Value::text(v.to_string()),
     };

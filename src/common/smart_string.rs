@@ -335,13 +335,33 @@ impl SmartString {
         *self = Self::from_string(s);
     }
 
+    /// Lowercase copy. An inline ASCII string, which is what nearly every
+    /// identifier is, is folded in the 15-byte buffer without touching the
+    /// heap; Unicode lowercasing of pure ASCII is byte for byte the ASCII
+    /// fold, so the result is the same as the general path.
     #[inline]
     pub fn to_lowercase(&self) -> SmartString {
+        if let Some(len) = self.tag.inline_len() {
+            if self.data[..len].is_ascii() {
+                let mut copy = self.clone();
+                copy.data[..len].make_ascii_lowercase();
+                return copy;
+            }
+        }
         SmartString::from_string(self.as_str().to_lowercase())
     }
 
+    /// Uppercase copy, with the same inline ASCII fast path as
+    /// [`SmartString::to_lowercase`].
     #[inline]
     pub fn to_uppercase(&self) -> SmartString {
+        if let Some(len) = self.tag.inline_len() {
+            if self.data[..len].is_ascii() {
+                let mut copy = self.clone();
+                copy.data[..len].make_ascii_uppercase();
+                return copy;
+            }
+        }
         SmartString::from_string(self.as_str().to_uppercase())
     }
 
@@ -841,6 +861,39 @@ mod tests {
         let s = SmartString::new("Hello World");
         assert_eq!(s.to_lowercase().as_str(), "hello world");
         assert_eq!(s.to_uppercase().as_str(), "HELLO WORLD");
+    }
+
+    /// The inline fast path only fires for ASCII; anything else must still
+    /// take the Unicode-aware path and produce the same folding it always did.
+    #[test]
+    fn test_case_conversion_non_ascii_inline() {
+        let s = SmartString::new("Ünal Çağ");
+        assert!(s.len() <= MAX_INLINE_LEN);
+        assert_eq!(s.to_lowercase().as_str(), "ünal çağ");
+        assert_eq!(s.to_uppercase().as_str(), "ÜNAL ÇAĞ");
+
+        let s = SmartString::new("İSTANBUL");
+        assert_eq!(s.to_lowercase().as_str(), "İSTANBUL".to_lowercase());
+    }
+
+    #[test]
+    fn test_case_conversion_ascii_stays_inline_and_heap_folds() {
+        let inline = SmartString::new("Hello_World_15");
+        let lowered = inline.to_lowercase();
+        assert_eq!(lowered.as_str(), "hello_world_15");
+        assert!(lowered.tag.is_inline());
+        assert_eq!(inline.to_uppercase().as_str(), "HELLO_WORLD_15");
+
+        let heap = SmartString::new("A_Column_Name_Past_Fifteen_Bytes");
+        assert!(!heap.tag.is_inline());
+        assert_eq!(
+            heap.to_lowercase().as_str(),
+            "a_column_name_past_fifteen_bytes"
+        );
+        assert_eq!(
+            heap.to_uppercase().as_str(),
+            "A_COLUMN_NAME_PAST_FIFTEEN_BYTES"
+        );
     }
 
     #[test]

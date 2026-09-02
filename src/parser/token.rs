@@ -122,12 +122,16 @@ pub struct Token {
 }
 
 impl Token {
-    /// Create a new token
+    /// Create a new token.
+    ///
+    /// A `SmartString` the lexer has already built moves in as is; taking
+    /// `AsRef<str>` here used to copy it into a second one, which for a long
+    /// comment or identifier meant a second heap string and Arc.
     #[inline]
-    pub fn new(token_type: TokenType, literal: impl AsRef<str>, position: Position) -> Self {
+    pub fn new(token_type: TokenType, literal: impl Into<SmartString>, position: Position) -> Self {
         Self {
             token_type,
-            literal: SmartString::from(literal.as_ref()),
+            literal: literal.into(),
             position,
             quoted: false,
         }
@@ -135,10 +139,14 @@ impl Token {
 
     /// Create a new double-quoted token (identifier with string fallback)
     #[inline]
-    pub fn new_quoted(token_type: TokenType, literal: impl AsRef<str>, position: Position) -> Self {
+    pub fn new_quoted(
+        token_type: TokenType,
+        literal: impl Into<SmartString>,
+        position: Position,
+    ) -> Self {
         Self {
             token_type,
-            literal: SmartString::from(literal.as_ref()),
+            literal: literal.into(),
             position,
             quoted: true,
         }
