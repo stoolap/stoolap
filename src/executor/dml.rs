@@ -236,6 +236,86 @@ struct CompiledUpsert {
     compiled_checks: Vec<(usize, String, String, super::expression::SharedProgram)>,
 }
 
+/// A column's CHECK constraint, compiled once: (column index, column name,
+/// constraint text, program). The program runs against a one-column row
+/// holding the value under test.
+pub(crate) type CompiledCheck = (
+    usize,
+    SmartString,
+    SmartString,
+    super::expression::SharedProgram,
+);
+
+/// Compile every CHECK constraint of `schema`.
+///
+/// Parsing and compiling a constraint costs dozens of allocations. The COPY
+/// path used to do it again for every row, which made a CHECK the dominant
+/// cost of a bulk load. A constraint that fails to compile is an error rather
+/// than a silently skipped check.
+pub(crate) fn compile_check_programs(schema: &Schema) -> Result<Vec<CompiledCheck>> {
+    let mut compiled = Vec::new();
+    for (idx, c) in schema.columns.iter().enumerate() {
+        let Some(check_expr) = c.check_expr.as_ref() else {
+            continue;
+        };
+        let sql = format!("SELECT {}", check_expr);
+        let Ok(stmts) = crate::parser::parse_sql(&sql) else {
+            continue;
+        };
+        let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() else {
+            continue;
+        };
+        let Some(expr) = select.columns.first() else {
+            continue;
+        };
+        let columns = vec![c.name.to_string()];
+        let program = super::expression::compile_expression(expr, &columns).map_err(|e| {
+            Error::internal(format!(
+                "CHECK constraint on column '{}' failed to compile: {}",
+                c.name, e
+            ))
+        })?;
+        compiled.push((
+            idx,
+            SmartString::new(&c.name),
+            SmartString::new(check_expr),
+            program,
+        ));
+    }
+    Ok(compiled)
+}
+
+/// Run one compiled CHECK against `value`. NULL passes, per the standard.
+pub(crate) fn run_check_program(
+    vm: &mut super::expression::ExprVM,
+    program: &super::expression::SharedProgram,
+    col_name: &str,
+    check_expr: &str,
+    value: &Value,
+) -> Result<()> {
+    if value.is_null() {
+        return Ok(());
+    }
+    let check_row = Row::from_values(vec![value.clone()]);
+    let check_ctx = super::expression::ExecuteContext::new(&check_row);
+    let result = vm.execute_cow(program, &check_ctx)?;
+    let is_truthy = match &result {
+        Value::Boolean(b) => *b,
+        Value::Null(_) => true, // NULL passes CHECK (SQL standard)
+        Value::Integer(i) => *i != 0,
+        Value::Float(f) => *f != 0.0,
+        Value::Text(t) => !t.is_empty(),
+        _ => true, // Timestamp, Extension, etc. are truthy
+    };
+    if !is_truthy {
+        return Err(Error::CheckConstraintViolation {
+            column: col_name.to_string(),
+            expression: check_expr.to_string(),
+        });
+    }
+    Ok(())
+}
+
 impl Executor {
     /// Select row_ids for DML operations using the full SELECT executor.
     /// This reuses all SELECT optimizations (indexes, semi-joins, parallel execution, etc.)
@@ -1264,40 +1344,7 @@ impl Executor {
             // propagated it, and swallowing it here would silently disable
             // the constraint (e.g. after RENAME COLUMN leaves a stale
             // check_expr).
-            let mut compiled_checks: Vec<(
-                usize,
-                SmartString,
-                SmartString,
-                super::expression::SharedProgram,
-            )> = Vec::new();
-            for (idx, c) in schema.columns.iter().enumerate() {
-                let Some(check_expr) = c.check_expr.as_ref() else {
-                    continue;
-                };
-                let sql = format!("SELECT {}", check_expr);
-                let Ok(stmts) = crate::parser::parse_sql(&sql) else {
-                    continue;
-                };
-                let Some(crate::parser::ast::Statement::Select(select)) = stmts.first() else {
-                    continue;
-                };
-                let Some(expr) = select.columns.first() else {
-                    continue;
-                };
-                let columns = vec![c.name.to_string()];
-                let program = compile_expression(expr, &columns).map_err(|e| {
-                    Error::internal(format!(
-                        "CHECK constraint on column '{}' failed to compile: {}",
-                        c.name, e
-                    ))
-                })?;
-                compiled_checks.push((
-                    idx,
-                    SmartString::new(&c.name),
-                    SmartString::new(check_expr),
-                    program,
-                ));
-            }
+            let compiled_checks = compile_check_programs(schema)?;
 
             let all_column_types: Vec<DataType> =
                 schema.columns.iter().map(|c| c.data_type).collect();
@@ -1472,27 +1519,13 @@ impl Executor {
                 // Validate CHECK constraints via the pre-compiled programs
                 // (NULL passes per the SQL standard)
                 for (col_idx, col_name, check_expr, program) in compiled_checks.iter() {
-                    let col_value = &row_values[*col_idx];
-                    if col_value.is_null() {
-                        continue;
-                    }
-                    let check_row = Row::from_values(vec![col_value.clone()]);
-                    let check_ctx = ExecuteContext::new(&check_row);
-                    let result = vm.execute_cow(program, &check_ctx)?;
-                    let is_truthy = match &result {
-                        Value::Boolean(b) => *b,
-                        Value::Null(_) => true, // NULL passes CHECK (SQL standard)
-                        Value::Integer(i) => *i != 0,
-                        Value::Float(f) => *f != 0.0,
-                        Value::Text(t) => !t.is_empty(),
-                        _ => true, // Timestamp, Extension, etc. are truthy
-                    };
-                    if !is_truthy {
-                        return Err(Error::CheckConstraintViolation {
-                            column: col_name.to_string(),
-                            expression: check_expr.to_string(),
-                        });
-                    }
+                    run_check_program(
+                        &mut vm,
+                        program,
+                        col_name,
+                        check_expr,
+                        &row_values[*col_idx],
+                    )?;
                 }
 
                 // Insert row
@@ -1580,27 +1613,13 @@ impl Executor {
 
                 // Validate CHECK constraints via the pre-compiled programs
                 for (col_idx, col_name, check_expr, program) in compiled_checks.iter() {
-                    let col_value = &row_values[*col_idx];
-                    if col_value.is_null() {
-                        continue;
-                    }
-                    let check_row = Row::from_values(vec![col_value.clone()]);
-                    let check_ctx = ExecuteContext::new(&check_row);
-                    let result = vm.execute_cow(program, &check_ctx)?;
-                    let is_truthy = match &result {
-                        Value::Boolean(b) => *b,
-                        Value::Null(_) => true, // NULL passes CHECK (SQL standard)
-                        Value::Integer(i) => *i != 0,
-                        Value::Float(f) => *f != 0.0,
-                        Value::Text(t) => !t.is_empty(),
-                        _ => true, // Timestamp, Extension, etc. are truthy
-                    };
-                    if !is_truthy {
-                        return Err(Error::CheckConstraintViolation {
-                            column: col_name.to_string(),
-                            expression: check_expr.to_string(),
-                        });
-                    }
+                    run_check_program(
+                        &mut vm,
+                        program,
+                        col_name,
+                        check_expr,
+                        &row_values[*col_idx],
+                    )?;
                 }
 
                 // Insert row
