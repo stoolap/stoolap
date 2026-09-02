@@ -922,11 +922,11 @@ impl SegmentedTable {
     /// mid-statement on cold-volume access. Segments compacted away after
     /// the snapshot are simply found in the snapshot's older volumes,
     /// which is exactly the statement's view of the data.
-    fn find_segment_row_in(
+    fn find_segment_row_in<'a>(
         &self,
-        snap: &super::manifest::StatementSnapshot,
+        snap: &'a super::manifest::StatementSnapshot,
         row_id: i64,
-    ) -> Option<(u64, super::manifest::ColdSegment, usize)> {
+    ) -> Option<(u64, &'a super::manifest::ColdSegment, usize)> {
         if self.hot.has_row_id(row_id) {
             return None;
         }
@@ -953,105 +953,10 @@ impl SegmentedTable {
             }
             if let Ok(idx) = vol.meta.row_ids.binary_search(&row_id) {
                 vol.mark_accessed();
-                return Some((seg_id, cold.clone(), idx));
+                return Some((seg_id, cold, idx));
             }
         }
         None
-    }
-
-    fn find_segment_row(&self, row_id: i64) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
-        // Hot buffer shadows cold: if the row exists in hot, the cold copy is stale
-        if self.hot.has_row_id(row_id) {
-            return Ok(None);
-        }
-        // Check committed tombstones (snapshot-aware: newer tombstones are invisible)
-        {
-            let ts = self.segment_mgr.tombstone_set_arc();
-            if self.is_row_tombstoned(&ts, row_id) {
-                return Ok(None);
-            }
-        }
-        // Check pending tombstones for this transaction (no Vec clone)
-        if self.segment_mgr.is_pending_tombstone(self.txn_id(), row_id) {
-            return Ok(None);
-        }
-
-        // Metadata-only search: row_ids are in vol.meta (available even on cold volumes).
-        // No ensure_columns needed — avoids reloading all cold segments for a point lookup.
-        // Atomic snapshot: hold manifest lock while cloning segments to prevent
-        // compaction from swapping the map between the two reads.
-        let (seg_ids, segs) = {
-            let manifest = self.segment_mgr.manifest();
-            let seg_ids: Vec<u64> = manifest
-                .segments
-                .iter()
-                .rev()
-                .map(|m| m.segment_id)
-                .collect();
-            let segs = self.segment_mgr.segments_raw();
-            (seg_ids, segs)
-        };
-        for &seg_id in &seg_ids {
-            let Some(cold) = segs.get(&seg_id) else {
-                continue;
-            };
-            let vol = &cold.volume;
-            if vol.meta.row_ids.is_empty() {
-                continue;
-            }
-            let min_id = vol.meta.row_ids[0];
-            let max_id = vol.meta.row_ids[vol.meta.row_count - 1];
-            if row_id < min_id || row_id > max_id {
-                continue;
-            }
-            if let Ok(idx) = vol.meta.row_ids.binary_search(&row_id) {
-                if vol.is_cold() {
-                    drop(segs);
-                    if let Some(loaded) = self.segment_mgr.ensure_volume(seg_id)? {
-                        return Ok(Some((seg_id, loaded, idx)));
-                    }
-                    // ensure_volume returned None: compaction removed this
-                    // segment. Row now lives in a newer compacted volume.
-                    // Retry once with fresh manifest state.
-                    return self.find_segment_row_retry(row_id);
-                }
-                vol.mark_accessed();
-                return Ok(Some((seg_id, Arc::clone(vol), idx)));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Retry find_segment_row with a fresh consistent snapshot.
-    /// Called when ensure_volume returns None (compaction removed the segment).
-    fn find_segment_row_retry(
-        &self,
-        row_id: i64,
-    ) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
-        // ensure_columns before manifest lock to avoid deadlock
-        // (ensure_columns may need manifest.write via reload_cold_volumes).
-        let segs = self.segment_mgr.segments_snapshot()?;
-        let seg_ids: Vec<u64> = {
-            let manifest = self.segment_mgr.manifest();
-            manifest
-                .segments
-                .iter()
-                .rev()
-                .map(|m| m.segment_id)
-                .collect()
-        };
-        for &seg_id in &seg_ids {
-            let Some(cold) = segs.get(&seg_id) else {
-                continue;
-            };
-            let vol = &cold.volume;
-            if let Ok(idx) = vol.meta.row_ids.binary_search(&row_id) {
-                // segments_snapshot fails closed, so vol is never cold here.
-                vol.mark_accessed();
-                return Ok(Some((seg_id, Arc::clone(vol), idx)));
-            }
-        }
-        Ok(None)
     }
 
     /// Generic fallback for min_column scan on non-numeric column types.
@@ -1842,7 +1747,6 @@ impl Table for SegmentedTable {
             return self.hot.collect_rows_by_ids(row_ids);
         }
 
-        let schema = self.hot.schema().clone();
         let mut result = RowVec::with_capacity(row_ids.len());
         let mut hot_ids = Vec::new();
         let mut cached_mapping: Option<(
@@ -1850,16 +1754,17 @@ impl Table for SegmentedTable {
             super::writer::ColumnMapping,
         )> = None;
 
+        // One snapshot of the manifest, segments and tombstones for the whole
+        // batch instead of four lock reads and a Vec per probed id.
+        let snap = self.segment_mgr.statement_snapshot()?;
         for &row_id in row_ids {
-            if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
-                let vol_ptr = &*vol as *const super::writer::FrozenVolume;
+            if let Some((_, cold, idx)) = self.find_segment_row_in(&snap, row_id) {
+                let vol = &cold.volume;
+                let vol_ptr = &**vol as *const super::writer::FrozenVolume;
                 let mapping = match &cached_mapping {
                     Some((ptr, m)) if *ptr == vol_ptr => m,
                     _ => {
-                        cached_mapping = Some((
-                            vol_ptr,
-                            self.segment_mgr.get_volume_mapping(seg_id, &schema),
-                        ));
+                        cached_mapping = Some((vol_ptr, cold.mapping.clone()));
                         &cached_mapping.as_ref().unwrap().1
                     }
                 };
@@ -1901,20 +1806,22 @@ impl Table for SegmentedTable {
         }
 
         let mut hot_ids = Vec::new();
-        let schema = self.hot.schema();
         let mut cached_mapping: Option<(
             *const super::writer::FrozenVolume,
             super::writer::ColumnMapping,
         )> = None;
 
+        // One snapshot of the manifest, segments and tombstones for the whole
+        // batch instead of four lock reads and a Vec per probed id.
+        let snap = self.segment_mgr.statement_snapshot()?;
         for &row_id in row_ids {
-            if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
-                let vol_ptr = &*vol as *const super::writer::FrozenVolume;
+            if let Some((_, cold, idx)) = self.find_segment_row_in(&snap, row_id) {
+                let vol = &cold.volume;
+                let vol_ptr = &**vol as *const super::writer::FrozenVolume;
                 let mapping = match &cached_mapping {
                     Some((ptr, m)) if *ptr == vol_ptr => m,
                     _ => {
-                        cached_mapping =
-                            Some((vol_ptr, self.segment_mgr.get_volume_mapping(seg_id, schema)));
+                        cached_mapping = Some((vol_ptr, cold.mapping.clone()));
                         &cached_mapping.as_ref().unwrap().1
                     }
                 };
