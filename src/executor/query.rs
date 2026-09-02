@@ -2478,24 +2478,24 @@ impl Executor {
 
         // FAST PATH: IN list literal index optimization
         // For queries like `SELECT * FROM table WHERE id IN (1, 2, 3, 5, 8)`
-        // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows
+        // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows.
+        // Tried even when the IN list pushed down: pushdown turns it into a
+        // min..max range, which on spread-out values scans the whole table.
         // Skip if query has aggregation: projection cannot compile aggregate functions
-        if needs_memory_filter
-            && !has_outer_context
-            && !classification.has_group_by
-            && !classification.has_aggregation
-        {
+        if !has_outer_context && !classification.has_group_by && !classification.has_aggregation {
             if let Some(where_expr) = where_to_use {
-                if let Some((result, columns)) = self.try_in_list_index_optimization(
-                    stmt,
-                    where_expr,
-                    &*table,
-                    &all_columns,
-                    table_alias.as_deref(),
-                    ctx,
-                    classification,
-                )? {
-                    return Ok((result, columns, false, None));
+                if let Some((result, columns, limit_applied)) = self
+                    .try_in_list_index_optimization(
+                        stmt,
+                        where_expr,
+                        &*table,
+                        &all_columns,
+                        table_alias.as_deref(),
+                        ctx,
+                        classification,
+                    )?
+                {
+                    return Ok((result, columns, limit_applied, None));
                 }
             }
         }

@@ -727,3 +727,72 @@ fn test_explain_shows_plan() {
     // EXPLAIN should return something about the query plan
     assert!(!lines.is_empty(), "Expected EXPLAIN to return plan lines");
 }
+
+/// A primary-key IN list whose values are spread across the table used to
+/// push down as a min..max range and scan everything. It now probes the
+/// listed ids directly, so every shape around it must still come out right,
+/// and LIMIT and OFFSET must be applied exactly once.
+#[test]
+fn test_spread_pk_in_list_probes_ids() {
+    let db = Database::open("memory://spread_pk_in_list").expect("Failed to create database");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    for i in 1..=2000i64 {
+        db.execute("INSERT INTO t VALUES ($1, $2, $3)", (i, i % 7, i * 3))
+            .unwrap();
+    }
+    let ids = |sql: &str| -> Vec<i64> {
+        db.query(sql, ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+
+    assert_eq!(
+        ids("SELECT id FROM t WHERE id IN (1999, 3, 1000, 42, 5000) ORDER BY id"),
+        vec![3, 42, 1000, 1999]
+    );
+    assert_eq!(
+        ids("SELECT id FROM t WHERE id IN (1999, 3, 1004, 42) AND grp = 3 ORDER BY id"),
+        vec![3, 1004]
+    );
+    assert_eq!(
+        ids("SELECT id FROM t WHERE id IN (1999, 3, 1000, 42) ORDER BY id DESC LIMIT 2"),
+        vec![1999, 1000]
+    );
+    assert_eq!(
+        ids("SELECT id FROM t WHERE id NOT IN (1, 2) AND id <= 4 ORDER BY id"),
+        vec![3, 4]
+    );
+    assert_eq!(
+        ids("SELECT id FROM t WHERE id IN (1999, 3, 1000, 42) AND v > 3000 ORDER BY id"),
+        vec![1999]
+    );
+    let count: i64 = db
+        .query("SELECT COUNT(*) FROM t WHERE id IN (1999, 3, 1000, 42)", ())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(count, 4);
+
+    // the probe path applies LIMIT and OFFSET itself when there is no
+    // ORDER BY and tells the caller so; they must not be applied twice
+    assert_eq!(
+        ids("SELECT id FROM t WHERE id IN (1, 2, 3, 4, 5) LIMIT 2 OFFSET 2").len(),
+        2
+    );
+    assert_eq!(
+        ids("SELECT id FROM t WHERE id IN (1, 2, 3, 4, 5) AND v > 0 OFFSET 2").len(),
+        3
+    );
+    assert_eq!(
+        ids("SELECT id FROM t WHERE grp IN (1, 2) AND v > 0 LIMIT 3 OFFSET 1").len(),
+        3
+    );
+}

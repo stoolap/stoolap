@@ -1216,7 +1216,7 @@ impl Executor {
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
         classification: &Arc<QueryClassification>,
-    ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
+    ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>, bool)>> {
         // Extract IN list info: (column_name, values, is_negated, remaining_predicate)
         let (column_name, values, is_negated, remaining_predicate) =
             match Self::extract_in_list_info(where_expr, ctx) {
@@ -1264,7 +1264,7 @@ impl Executor {
                     CompactArc::clone(&output_columns),
                     RowVec::new(),
                 );
-                return Ok(Some((Box::new(result), output_columns)));
+                return Ok(Some((Box::new(result), output_columns, false)));
             }
         }
 
@@ -1418,7 +1418,11 @@ impl Executor {
             CompactArc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
-        Ok(Some((Box::new(result), output_columns)))
+        // Without ORDER BY the LIMIT and OFFSET were applied above; the
+        // caller must not apply them a second time.
+        let limit_applied =
+            stmt.order_by.is_empty() && (stmt.limit.is_some() || stmt.offset.is_some());
+        Ok(Some((Box::new(result), output_columns, limit_applied)))
     }
 
     /// Extract IN list literal information from a WHERE clause.
