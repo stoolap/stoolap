@@ -491,7 +491,7 @@ fn json_to_value(json: &serde_json::Value) -> Result<Value> {
                 Ok(Value::text(n.to_string()))
             }
         }
-        serde_json::Value::String(s) => Ok(Value::text(s.as_str())),
+        serde_json::Value::String(s) => Ok(Value::text(s)),
         // For arrays and objects, return as JSON string
         _ => Ok(Value::json(json.to_string())),
     }

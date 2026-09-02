@@ -564,10 +564,10 @@ impl MVCCTable {
             if let Some(index) = self.version_store.get_index_by_column(col_name) {
                 // Create range from prefix to prefix + '\xff' (highest byte)
                 // This captures all strings starting with the prefix
-                let min_value = Value::text(prefix.as_str());
+                let min_value = Value::text(&prefix);
                 let mut max_prefix = prefix.clone();
                 max_prefix.push('\u{FFFF}'); // Highest unicode char
-                let max_value = Value::text(max_prefix.as_str());
+                let max_value = Value::text(&max_prefix);
 
                 // Use index range query
                 if let Ok(entries) = index.find_range(

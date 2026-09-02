@@ -552,6 +552,25 @@ impl From<&str> for SmartString {
     }
 }
 
+/// Borrowed `String`s are read straight into the buffer, so a caller that
+/// used to hand `&String` to an `Into<String>` parameter keeps compiling and
+/// no longer pays for a temporary `String` on the way.
+impl From<&String> for SmartString {
+    #[inline]
+    fn from(s: &String) -> Self {
+        SmartString::new(s.as_str())
+    }
+}
+
+/// A borrowed `SmartString` is a clone: a 16-byte copy when inline, a
+/// refcount bump when on the heap.
+impl From<&SmartString> for SmartString {
+    #[inline]
+    fn from(s: &SmartString) -> Self {
+        s.clone()
+    }
+}
+
 impl From<String> for SmartString {
     #[inline]
     fn from(s: String) -> Self {
@@ -894,6 +913,23 @@ mod tests {
             heap.to_uppercase().as_str(),
             "A_COLUMN_NAME_PAST_FIFTEEN_BYTES"
         );
+    }
+
+    /// `&String` and `&SmartString` convert without a temporary `String`, so
+    /// callers written against `Into<String>` parameters keep compiling.
+    #[test]
+    fn test_from_borrowed_string_and_smart_string() {
+        let owned = String::from("user_42");
+        let from_ref: SmartString = SmartString::from(&owned);
+        assert_eq!(from_ref.as_str(), "user_42");
+        assert!(from_ref.tag.is_inline());
+
+        let long = String::from("a value past the inline buffer");
+        let from_long: SmartString = SmartString::from(&long);
+        assert_eq!(from_long.as_str(), long);
+
+        let again: SmartString = SmartString::from(&from_long);
+        assert_eq!(again.as_str(), from_long.as_str());
     }
 
     #[test]

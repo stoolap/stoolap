@@ -8125,7 +8125,7 @@ impl Executor {
 
                 let columns = vec!["result".to_string()];
                 let mut rows = RowVec::with_capacity(1);
-                rows.push((0, Row::from_values(vec![Value::text(result_msg.as_str())])));
+                rows.push((0, Row::from_values(vec![Value::text(&result_msg)])));
                 Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
             "DEDUP_SEGMENTS" => {
@@ -8304,7 +8304,7 @@ impl Executor {
                     rows.push((
                         i as i64,
                         Row::from_values(vec![
-                            Value::text(table.as_str()),
+                            Value::text(&table),
                             Value::Integer(seg_id as i64),
                             Value::text(tier),
                             Value::Integer(row_count as i64),

@@ -1321,7 +1321,7 @@ impl ScalarFunction for ToCharFunction {
 
         // Format the timestamp according to the pattern
         let result = format_timestamp(ts, &format);
-        Ok(Value::text(result.as_str()))
+        Ok(Value::text(&result))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
