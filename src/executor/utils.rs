@@ -138,8 +138,10 @@ pub struct InnerScope<'a> {
 }
 
 impl InnerScope<'_> {
+    /// With an alias only the alias names the inner table; the table's own
+    /// name may then be an alias in the outer query.
     fn owns_qualifier(&self, qualifier: &str) -> bool {
-        qualifier == self.table || self.alias == Some(qualifier)
+        qualifier == self.alias.unwrap_or(self.table)
     }
 
     fn owns_column(&self, column: &str) -> bool {
@@ -2053,13 +2055,8 @@ mod tests {
 
         let is_literal = |expr: &Expression, expected: i64| matches!(expr, Expression::IntegerLiteral(l) if l.value == expected);
 
-        // inner references, qualified by alias or table name, or bare
-        for expr in [
-            qualified("p", "id"),
-            qualified("parent", "id"),
-            ident("id"),
-            ident("name"),
-        ] {
+        // inner references, qualified by the alias or bare
+        for expr in [qualified("p", "id"), ident("id"), ident("name")] {
             let out = substitute_outer_references_in_scope(&expr, &outer, &scope);
             assert!(
                 matches!(
@@ -2082,6 +2079,29 @@ mod tests {
         assert!(is_literal(
             &substitute_outer_references_in_scope(&ident("pid"), &outer, &scope),
             7
+        ));
+
+        // with an alias, the table name is not inner: it may be an outer alias
+        outer.insert(CompactArc::from("parent.id"), Value::Integer(5));
+        outer.insert(CompactArc::from("parent.pid"), Value::Integer(7));
+        assert!(is_literal(
+            &substitute_outer_references_in_scope(&qualified("parent", "id"), &outer, &scope),
+            5
+        ));
+        assert!(is_literal(
+            &substitute_outer_references_in_scope(&qualified("parent", "pid"), &outer, &scope),
+            7
+        ));
+
+        // without an alias, the table name is the inner qualifier
+        let bare = InnerScope {
+            table: "parent",
+            alias: None,
+            schema: &schema,
+        };
+        assert!(matches!(
+            substitute_outer_references_in_scope(&qualified("parent", "id"), &outer, &bare),
+            Expression::QualifiedIdentifier(_)
         ));
     }
 
