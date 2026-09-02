@@ -132,11 +132,13 @@ impl Value {
 
     /// Create a text value
     ///
-    /// Uses SmartString::from_string_shared() for heap strings to enable
-    /// O(1) clone via Arc<str>. This allows string sharing between
-    /// Arena, Index, and VersionStore.
-    pub fn text(value: impl Into<String>) -> Self {
-        Value::Text(SmartString::from_string_shared(value.into()))
+    /// A `&str` up to 15 bytes lands inline with no allocation; anything
+    /// longer, or an owned `String`, goes to the shared heap representation
+    /// that gives O(1) clone across Arena, Index and VersionStore. Taking
+    /// `Into<String>` here used to force every `&str` through a temporary
+    /// `String` first, one allocation and one free per value for nothing.
+    pub fn text(value: impl Into<SmartString>) -> Self {
+        Value::Text(value.into())
     }
 
     /// Create a text value from Arc<str> (zero-copy for heap strings)

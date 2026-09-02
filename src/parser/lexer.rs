@@ -119,6 +119,23 @@ impl Lexer {
         self.decode_char_at(self.read_position).0
     }
 
+    /// The token that started at byte `start` and ends at the current char.
+    ///
+    /// Every reader below advances only through `read_char`, so `position`
+    /// is the first byte of the character that ended the token and the bytes
+    /// in between are the token, decoded once. Pushing char by char into a
+    /// `SmartString` re-allocated and re-copied the whole token on every
+    /// character past its inline buffer, which made a 400-character comment
+    /// cost more than ten short queries.
+    fn token_since(&self, start: usize) -> SmartString {
+        // SAFETY: `input` is the byte form of a `&str`, `start` is the first
+        // byte of a decoded char and `position` is the first byte of the
+        // current one, so both bounds are char boundaries.
+        SmartString::new(unsafe {
+            std::str::from_utf8_unchecked(&self.input[start..self.position])
+        })
+    }
+
     /// Get the next token
     pub fn next_token(&mut self) -> Token {
         self.skip_whitespace();
@@ -260,67 +277,58 @@ impl Lexer {
 
     /// Read an identifier
     fn read_identifier(&mut self) -> SmartString {
-        let mut result = SmartString::new("");
-        result.push(self.ch);
+        let start = self.position;
         self.read_char();
 
         while self.ch.is_alphanumeric() || self.ch == '_' || self.ch == '$' {
-            result.push(self.ch);
             self.read_char();
         }
 
-        result
+        self.token_since(start)
     }
 
     /// Read a number (integer or float)
     fn read_number(&mut self) -> SmartString {
-        let mut result = SmartString::new("");
-        result.push(self.ch);
+        let start = self.position;
         self.read_char();
 
         // Read all digits before decimal point
         while self.ch.is_ascii_digit() {
-            result.push(self.ch);
             self.read_char();
         }
 
         // Check for decimal point
         if self.ch == '.' && self.peek_char().is_ascii_digit() {
-            result.push(self.ch);
             self.read_char();
 
             // Read all digits after decimal point
             while self.ch.is_ascii_digit() {
-                result.push(self.ch);
                 self.read_char();
             }
         }
 
         // Check for exponent (E or e)
         if self.ch == 'e' || self.ch == 'E' {
-            result.push(self.ch);
             self.read_char();
 
             // Check for sign after exponent
             if self.ch == '+' || self.ch == '-' {
-                result.push(self.ch);
                 self.read_char();
             }
 
             // Must have at least one digit after exponent
             if !self.ch.is_ascii_digit() {
                 self.last_error = Some("invalid number format: exponent has no digits".to_string());
-                return result;
+                return self.token_since(start);
             }
 
             // Read all digits in exponent
             while self.ch.is_ascii_digit() {
-                result.push(self.ch);
                 self.read_char();
             }
         }
 
-        result
+        self.token_since(start)
     }
 
     /// Read a string literal (single-quoted)
@@ -441,23 +449,39 @@ impl Lexer {
 
     /// Read a quoted identifier (double quotes or backticks)
     fn read_quoted_identifier(&mut self, quote: char) -> SmartString {
-        let mut result = SmartString::new("");
         self.read_char(); // consume opening quote
+        let start = self.position;
+        // Only a doubled quote changes the text, so the body is sliced from the
+        // input unless one turns up, at which point the prefix is copied once
+        // and the rest is appended to that copy.
+        let mut unescaped: Option<String> = None;
 
         while self.ch != '\0' {
             // Handle doubled quotes as escape (e.g., "abc""def" -> abc"def)
             if self.ch == quote && self.peek_char() == quote {
-                result.push(self.ch);
+                let buf = unescaped.get_or_insert_with(|| {
+                    // SAFETY: same char-boundary argument as `token_since`.
+                    unsafe { std::str::from_utf8_unchecked(&self.input[start..self.position]) }
+                        .to_string()
+                });
+                buf.push(quote);
                 self.read_char(); // consume first quote
                 self.read_char(); // consume second quote
             } else if self.ch == quote {
                 // Found closing quote
                 break;
             } else {
-                result.push(self.ch);
+                if let Some(buf) = unescaped.as_mut() {
+                    buf.push(self.ch);
+                }
                 self.read_char();
             }
         }
+
+        let result = match unescaped {
+            Some(buf) => SmartString::from_string(buf),
+            None => self.token_since(start),
+        };
 
         // Consume closing quote if not EOF
         if self.ch == quote {
@@ -478,13 +502,11 @@ impl Lexer {
 
     /// Read a single-line comment (-- or #)
     fn read_line_comment(&mut self) -> SmartString {
-        let mut result = SmartString::new("");
-        result.push(self.ch);
+        let start = self.position;
 
         // Skip the start of comment (-- or #)
         if self.ch == '-' && self.peek_char() == '-' {
             self.read_char(); // first -
-            result.push(self.ch); // second -
             self.read_char(); // move past second -
         } else if self.ch == '#' {
             self.read_char(); // move past #
@@ -492,40 +514,34 @@ impl Lexer {
 
         // Read until end of line or EOF
         while self.ch != '\n' && self.ch != '\0' {
-            result.push(self.ch);
             self.read_char();
         }
 
-        result
+        self.token_since(start)
     }
 
     /// Read a block comment (/* ... */)
     fn read_block_comment(&mut self) -> SmartString {
-        let mut result = SmartString::new("");
+        let start = self.position;
 
-        // Start with the opening /* sequence
-        result.push(self.ch); // /
-        self.read_char();
-        result.push(self.ch); // *
-        self.read_char();
+        // Skip the opening /* sequence
+        self.read_char(); // /
+        self.read_char(); // *
 
         // Read until */ or EOF
         while !(self.ch == '*' && self.peek_char() == '/') && self.ch != '\0' {
-            result.push(self.ch);
             self.read_char();
         }
 
         // Handle closing */
         if self.ch != '\0' {
-            result.push(self.ch); // *
-            self.read_char();
-            result.push(self.ch); // /
-            self.read_char();
+            self.read_char(); // *
+            self.read_char(); // /
         } else {
             self.last_error = Some("unterminated block comment".to_string());
         }
 
-        result
+        self.token_since(start)
     }
 
     /// Read an operator
@@ -560,37 +576,33 @@ impl Lexer {
 
     /// Read a parameter ($1, $2, etc.)
     fn read_parameter(&mut self) -> SmartString {
-        let mut result = SmartString::new("");
-        result.push(self.ch); // $
-        self.read_char();
+        let start = self.position;
+        self.read_char(); // $
 
         // Read all digits
         while self.ch.is_ascii_digit() {
-            result.push(self.ch);
             self.read_char();
         }
 
         // Validate parameter has digits
-        if result.len() == 1 {
+        if self.position - start == 1 {
             self.last_error = Some("parameter number expected after $".to_string());
         }
 
-        result
+        self.token_since(start)
     }
 
     /// Read a named parameter (:name)
     fn read_named_parameter(&mut self) -> SmartString {
-        let mut result = SmartString::new("");
-        result.push(self.ch); // :
-        self.read_char();
+        let start = self.position;
+        self.read_char(); // :
 
         // Read identifier part (alphanumeric + underscore)
         while self.ch.is_alphanumeric() || self.ch == '_' {
-            result.push(self.ch);
             self.read_char();
         }
 
-        result
+        self.token_since(start)
     }
 
     /// Get the last error encountered
@@ -957,6 +969,109 @@ mod tests {
         assert!(tokens.iter().any(|t| t.is_keyword("HAVING")));
         assert!(tokens.iter().any(|t| t.is_keyword("ORDER")));
         assert!(tokens.iter().any(|t| t.is_keyword("LIMIT")));
+    }
+
+    /// The readers slice the input instead of pushing char by char, so the
+    /// byte bounds have to land on character boundaries for multi-byte input
+    /// and the literals have to come out identical for every token shape.
+    #[test]
+    fn test_multibyte_identifiers_are_sliced_whole() {
+        let mut lexer = Lexer::new("SELECT çağ_ü, 日本語 FROM tablo_adı");
+
+        assert_eq!(lexer.next_token().literal, "SELECT");
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Identifier);
+        assert_eq!(token.literal, "çağ_ü");
+        assert_eq!(lexer.next_token().literal, ",");
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Identifier);
+        assert_eq!(token.literal, "日本語");
+        assert_eq!(lexer.next_token().literal, "FROM");
+        assert_eq!(lexer.next_token().literal, "tablo_adı");
+        assert!(lexer.next_token().is_eof());
+    }
+
+    #[test]
+    fn test_long_tokens_keep_their_full_text() {
+        let ident = "a_column_name_well_past_the_inline_buffer";
+        let comment = format!("/* {} */", "x".repeat(300));
+        let sql = format!(
+            "SELECT {} {} FROM t -- trailing until end of input",
+            ident, comment
+        );
+        let mut lexer = Lexer::new(&sql);
+
+        assert_eq!(lexer.next_token().literal, "SELECT");
+        assert_eq!(lexer.next_token().literal, ident);
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Comment);
+        assert_eq!(token.literal, comment);
+        assert_eq!(lexer.next_token().literal, "FROM");
+        assert_eq!(lexer.next_token().literal, "t");
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Comment);
+        assert_eq!(token.literal, "-- trailing until end of input");
+        assert!(lexer.next_token().is_eof());
+    }
+
+    #[test]
+    fn test_hash_comment_keeps_marker_and_stops_at_newline() {
+        let mut lexer = Lexer::new("# note here\n42");
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Comment);
+        assert_eq!(token.literal, "# note here");
+        assert_eq!(lexer.next_token().literal, "42");
+    }
+
+    #[test]
+    fn test_quoted_identifier_slices_unless_escaped() {
+        let mut lexer = Lexer::new("\"plain name\" \"say \"\"hi\"\" now\" `tick``ed`");
+
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Identifier);
+        assert_eq!(token.literal, "plain name");
+        let token = lexer.next_token();
+        assert_eq!(token.literal, "say \"hi\" now");
+        let token = lexer.next_token();
+        assert_eq!(token.literal, "tick`ed");
+        assert!(lexer.next_token().is_eof());
+    }
+
+    #[test]
+    fn test_parameters_are_sliced() {
+        let mut lexer = Lexer::new("$1 $12345 :name :long_named_parameter_x");
+        assert_eq!(lexer.next_token().literal, "$1");
+        assert_eq!(lexer.next_token().literal, "$12345");
+        assert_eq!(lexer.next_token().literal, ":name");
+        assert_eq!(lexer.next_token().literal, ":long_named_parameter_x");
+    }
+
+    /// A malformed number or comment keeps its token type and leaves the
+    /// message in `get_error`; a bad parameter or quoted identifier becomes an
+    /// Error token. Slicing must preserve the partial literal and the report.
+    #[test]
+    fn test_reader_error_paths_still_report() {
+        // exponent without digits: the partial literal is kept
+        let mut lexer = Lexer::new("1e+");
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Float);
+        assert_eq!(token.literal, "1e+");
+        assert!(lexer.get_error().is_some());
+
+        // a bare $ is a parameter without a number: an error token
+        let mut lexer = Lexer::new("$ ");
+        assert_eq!(lexer.next_token().token_type, TokenType::Error);
+
+        // a block comment that never closes keeps everything it saw
+        let mut lexer = Lexer::new("/* never closed");
+        let token = lexer.next_token();
+        assert_eq!(token.token_type, TokenType::Comment);
+        assert_eq!(token.literal, "/* never closed");
+        assert!(lexer.get_error().is_some());
+
+        // a quoted identifier that never closes is an error token
+        let mut lexer = Lexer::new("\"never closed");
+        assert_eq!(lexer.next_token().token_type, TokenType::Error);
     }
 
     #[test]

@@ -335,13 +335,33 @@ impl SmartString {
         *self = Self::from_string(s);
     }
 
+    /// Lowercase copy. An inline ASCII string, which is what nearly every
+    /// identifier is, is folded in the 15-byte buffer without touching the
+    /// heap; Unicode lowercasing of pure ASCII is byte for byte the ASCII
+    /// fold, so the result is the same as the general path.
     #[inline]
     pub fn to_lowercase(&self) -> SmartString {
+        if let Some(len) = self.tag.inline_len() {
+            if self.data[..len].is_ascii() {
+                let mut copy = self.clone();
+                copy.data[..len].make_ascii_lowercase();
+                return copy;
+            }
+        }
         SmartString::from_string(self.as_str().to_lowercase())
     }
 
+    /// Uppercase copy, with the same inline ASCII fast path as
+    /// [`SmartString::to_lowercase`].
     #[inline]
     pub fn to_uppercase(&self) -> SmartString {
+        if let Some(len) = self.tag.inline_len() {
+            if self.data[..len].is_ascii() {
+                let mut copy = self.clone();
+                copy.data[..len].make_ascii_uppercase();
+                return copy;
+            }
+        }
         SmartString::from_string(self.as_str().to_uppercase())
     }
 
@@ -529,6 +549,25 @@ impl From<&str> for SmartString {
     #[inline]
     fn from(s: &str) -> Self {
         SmartString::new(s)
+    }
+}
+
+/// Borrowed `String`s are read straight into the buffer, so a caller that
+/// used to hand `&String` to an `Into<String>` parameter keeps compiling and
+/// no longer pays for a temporary `String` on the way.
+impl From<&String> for SmartString {
+    #[inline]
+    fn from(s: &String) -> Self {
+        SmartString::new(s.as_str())
+    }
+}
+
+/// A borrowed `SmartString` is a clone: a 16-byte copy when inline, a
+/// refcount bump when on the heap.
+impl From<&SmartString> for SmartString {
+    #[inline]
+    fn from(s: &SmartString) -> Self {
+        s.clone()
     }
 }
 
@@ -841,6 +880,56 @@ mod tests {
         let s = SmartString::new("Hello World");
         assert_eq!(s.to_lowercase().as_str(), "hello world");
         assert_eq!(s.to_uppercase().as_str(), "HELLO WORLD");
+    }
+
+    /// The inline fast path only fires for ASCII; anything else must still
+    /// take the Unicode-aware path and produce the same folding it always did.
+    #[test]
+    fn test_case_conversion_non_ascii_inline() {
+        let s = SmartString::new("Ünal Çağ");
+        assert!(s.len() <= MAX_INLINE_LEN);
+        assert_eq!(s.to_lowercase().as_str(), "ünal çağ");
+        assert_eq!(s.to_uppercase().as_str(), "ÜNAL ÇAĞ");
+
+        let s = SmartString::new("İSTANBUL");
+        assert_eq!(s.to_lowercase().as_str(), "İSTANBUL".to_lowercase());
+    }
+
+    #[test]
+    fn test_case_conversion_ascii_stays_inline_and_heap_folds() {
+        let inline = SmartString::new("Hello_World_15");
+        let lowered = inline.to_lowercase();
+        assert_eq!(lowered.as_str(), "hello_world_15");
+        assert!(lowered.tag.is_inline());
+        assert_eq!(inline.to_uppercase().as_str(), "HELLO_WORLD_15");
+
+        let heap = SmartString::new("A_Column_Name_Past_Fifteen_Bytes");
+        assert!(!heap.tag.is_inline());
+        assert_eq!(
+            heap.to_lowercase().as_str(),
+            "a_column_name_past_fifteen_bytes"
+        );
+        assert_eq!(
+            heap.to_uppercase().as_str(),
+            "A_COLUMN_NAME_PAST_FIFTEEN_BYTES"
+        );
+    }
+
+    /// `&String` and `&SmartString` convert without a temporary `String`, so
+    /// callers written against `Into<String>` parameters keep compiling.
+    #[test]
+    fn test_from_borrowed_string_and_smart_string() {
+        let owned = String::from("user_42");
+        let from_ref: SmartString = SmartString::from(&owned);
+        assert_eq!(from_ref.as_str(), "user_42");
+        assert!(from_ref.tag.is_inline());
+
+        let long = String::from("a value past the inline buffer");
+        let from_long: SmartString = SmartString::from(&long);
+        assert_eq!(from_long.as_str(), long);
+
+        let again: SmartString = SmartString::from(&from_long);
+        assert_eq!(again.as_str(), from_long.as_str());
     }
 
     #[test]
