@@ -85,8 +85,8 @@ roaring = "0.11"  # Compressed bitmap indexes (used by Lucene, Druid, Spark)
 lru = "0.16"  # O(1) LRU cache for compiled expression programs
 
 # Optional benchmark dependencies (for comparison benchmarks)
-rusqlite = { version = "0.32", features = ["bundled"], optional = true }
-duckdb = { version = "1.4.3", features = ["bundled"], optional = true }
+rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+duckdb = { version = "1.10501", features = ["bundled"], optional = true }
 
 # Optional ANN benchmark dependencies (download + decompress datasets)
 ureq = { version = "2", optional = true }
