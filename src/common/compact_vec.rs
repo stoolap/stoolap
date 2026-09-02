@@ -31,11 +31,21 @@ use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::ptr::{self, NonNull};
 use std::slice;
 
-// One pointer plus two u32s, and the pointer's niche keeps Option free.
-const _: () = assert!(
-    mem::size_of::<CompactVec<u8>>() == mem::size_of::<usize>() + 2 * mem::size_of::<u32>()
-        && mem::size_of::<Option<CompactVec<u8>>>() == mem::size_of::<CompactVec<u8>>()
-);
+// One pointer plus a packed u64, padded to the larger of their alignments
+// (16 bytes on 64-bit and wasm32, 12 on i686), and the pointer's niche
+// keeps Option free.
+const _: () = {
+    let align = if mem::align_of::<u64>() > mem::align_of::<usize>() {
+        mem::align_of::<u64>()
+    } else {
+        mem::align_of::<usize>()
+    };
+    let expected = (mem::size_of::<usize>() + mem::size_of::<u64>()).next_multiple_of(align);
+    assert!(
+        mem::size_of::<CompactVec<u8>>() == expected
+            && mem::size_of::<Option<CompactVec<u8>>>() == mem::size_of::<CompactVec<u8>>()
+    );
+};
 
 /// A compact vector: one pointer plus two u32s, 16 bytes on 64-bit targets
 /// against Vec's 24. Holds at most u32::MAX elements.
