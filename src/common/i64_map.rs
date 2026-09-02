@@ -311,36 +311,10 @@ impl<V> I64Map<V> {
     }
 
     #[inline(always)]
-    pub fn remove(&mut self, key: i64) -> Option<V> {
-        if key == EMPTY {
-            return self.sentinel_remove();
-        }
-
+    /// Backward-shift deletion: closes the probe chain through `idx` after
+    /// its value has been moved out, so no tombstone is needed.
+    fn shift_back(&mut self, idx: usize) {
         let mask = self.mask;
-        let mut idx = Self::hash(key) & mask;
-
-        // Find the key
-        loop {
-            // SAFETY: idx is always in bounds due to masking with (capacity - 1).
-            let slot = unsafe { self.slots.get_unchecked(idx) };
-
-            if slot.key == EMPTY {
-                return None;
-            }
-
-            if slot.key == key {
-                break;
-            }
-
-            idx = (idx + 1) & mask;
-        }
-
-        // Found - extract value
-        // SAFETY: idx is valid and slot is occupied (we just found the key).
-        let value = unsafe { self.slots.get_unchecked(idx).value.as_ptr().read() };
-        self.len -= 1;
-
-        // Backward shift deletion
         let mut empty_idx = idx;
         let mut next_idx = (idx + 1) & mask;
 
@@ -387,6 +361,38 @@ impl<V> I64Map<V> {
         unsafe {
             self.slots.get_unchecked_mut(empty_idx).key = EMPTY;
         }
+    }
+
+    pub fn remove(&mut self, key: i64) -> Option<V> {
+        if key == EMPTY {
+            return self.sentinel_remove();
+        }
+
+        let mask = self.mask;
+        let mut idx = Self::hash(key) & mask;
+
+        // Find the key
+        loop {
+            // SAFETY: idx is always in bounds due to masking with (capacity - 1).
+            let slot = unsafe { self.slots.get_unchecked(idx) };
+
+            if slot.key == EMPTY {
+                return None;
+            }
+
+            if slot.key == key {
+                break;
+            }
+
+            idx = (idx + 1) & mask;
+        }
+
+        // Found - extract value
+        // SAFETY: idx is valid and slot is occupied (we just found the key).
+        let value = unsafe { self.slots.get_unchecked(idx).value.as_ptr().read() };
+        self.len -= 1;
+
+        self.shift_back(idx);
 
         // Check if we should shrink after removal
         if self.should_shrink() {
@@ -586,25 +592,16 @@ impl<V> I64Map<V> {
 
     /// Drains all entries from the map, returning an iterator over them
     #[inline]
-    pub fn drain(&mut self) -> Drain<V> {
-        // Take slots and replace with fresh minimum-capacity slots
-        let old_slots = std::mem::replace(
-            &mut self.slots,
-            (0..MIN_CAPACITY)
-                .map(|_| Slot {
-                    key: EMPTY,
-                    value: MaybeUninit::uninit(),
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        );
-        self.len = 0;
-        self.mask = MIN_CAPACITY - 1;
-        Drain {
-            slots: old_slots,
-            pos: 0,
-            min_slot: self.min_slot.take(),
-        }
+    /// Move every entry out, leaving the map empty with its table intact.
+    ///
+    /// The iterator borrows the map and empties slots as it yields them, so
+    /// the map's capacity survives the drain. Swapping in a fresh 8-slot
+    /// table, as this used to, meant every pooled transaction map came back
+    /// at minimum size and regrew from scratch on the next transaction. An
+    /// entry the iterator has not reached yet stays in the map, so a leaked
+    /// drain leaves a consistent, merely undrained map behind.
+    pub fn drain(&mut self) -> Drain<'_, V> {
+        Drain { map: self, pos: 0 }
     }
 
     #[inline(always)]
@@ -1010,10 +1007,9 @@ impl<V> IntoIterator for I64Map<V> {
 }
 
 /// Draining iterator over the entries of an I64Map
-pub struct Drain<V> {
-    slots: Box<[Slot<V>]>,
+pub struct Drain<'a, V> {
+    map: &'a mut I64Map<V>,
     pos: usize,
-    min_slot: Option<V>,
 }
 
 // =============================================================================
@@ -1461,37 +1457,46 @@ impl Extend<i64> for I64Set {
     }
 }
 
-impl<V> Iterator for Drain<V> {
+impl<V> Iterator for Drain<'_, V> {
     type Item = (i64, V);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        while self.pos < self.slots.len() {
-            let slot = &mut self.slots[self.pos];
-            self.pos += 1;
-
+        while self.pos < self.map.slots.len() {
+            let slot = &self.map.slots[self.pos];
             if slot.key != EMPTY {
                 let key = slot.key;
-                // SAFETY: slot.key != EMPTY means the value is initialized.
+                // SAFETY: slot.key != EMPTY means the value is initialized; the
+                // shift below empties this slot or refills it from its chain,
+                // so the moved-out value is neither read again nor dropped.
                 let value = unsafe { slot.value.as_ptr().read() };
-                slot.key = EMPTY; // Mark as consumed to prevent double-drop
+                self.map.len -= 1;
+                // Closing the chain on every yield keeps the map valid if the
+                // drain is leaked or its Drop unwinds. The cursor stays put:
+                // a later entry may have shifted into this slot, and every
+                // slot before it is already empty.
+                self.map.shift_back(self.pos);
                 return Some((key, value));
             }
+            self.pos += 1;
         }
         // The side-slot entry drains last
-        self.min_slot.take().map(|v| (EMPTY, v))
+        self.map.min_slot.take().map(|v| (EMPTY, v))
     }
 
+    /// Exact: the map knows how many entries it still holds.
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let pending = usize::from(self.min_slot.is_some());
-        (pending, Some(self.slots.len() - self.pos + pending))
+        let remaining = self.map.len + usize::from(self.map.min_slot.is_some());
+        (remaining, Some(remaining))
     }
 }
 
-impl<V> Drop for Drain<V> {
+impl<V> ExactSizeIterator for Drain<'_, V> {}
+
+impl<V> Drop for Drain<'_, V> {
     fn drop(&mut self) {
-        // Consume remaining elements to ensure they're dropped
+        // Consume remaining elements so they are dropped and the map is empty
         for _ in self.by_ref() {}
     }
 }
@@ -1895,6 +1900,76 @@ mod tests {
         let mut values: Vec<_> = map.values().copied().collect();
         values.sort();
         assert_eq!(values, vec![10, 20, 30]);
+    }
+
+    /// Draining must not throw the table away: the transaction map pools
+    /// hand a drained map back to the next transaction, and a map that came
+    /// back at 8 slots regrew from scratch every time.
+    /// A drain leaked part-way, or cut short by a panicking destructor,
+    /// must leave a valid table: an entry behind the yielded one on the
+    /// same probe chain stays reachable.
+    #[test]
+    fn test_partial_drain_leak_keeps_probe_chains() {
+        let mut map: I64Map<&str> = I64Map::with_capacity(0);
+        assert_eq!(map.capacity(), 8);
+        assert_eq!(I64Map::<&str>::hash(0) & 7, I64Map::<&str>::hash(8) & 7);
+        map.insert(0, "a");
+        map.insert(8, "b");
+
+        let mut drain = map.drain();
+        let (first, _) = drain.next().unwrap();
+        std::mem::forget(drain);
+
+        let other = if first == 0 { 8 } else { 0 };
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(first), None);
+        assert_eq!(
+            map.get(other).copied(),
+            Some(if other == 0 { "a" } else { "b" })
+        );
+        map.insert(first, "c");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(first).copied(), Some("c"));
+    }
+
+    #[test]
+    fn test_drain_keeps_capacity() {
+        let mut map: I64Map<u64> = I64Map::new();
+        for i in 0..1000 {
+            map.insert(i, i as u64);
+        }
+        let before = map.capacity();
+        assert!(before >= 1000);
+        let drained = map.drain().count();
+        assert_eq!(drained, 1000);
+        assert!(map.is_empty());
+        assert_eq!(map.capacity(), before, "drain must keep the table");
+
+        // and the map is fully usable afterwards, without growing
+        for i in 0..1000 {
+            map.insert(i, i as u64);
+        }
+        assert_eq!(map.capacity(), before);
+        assert_eq!(map.len(), 1000);
+    }
+
+    /// `collect()` sizes its allocation from the lower bound, so a drain that
+    /// reported 0 forced a Vec to grow through every doubling.
+    #[test]
+    fn test_drain_size_hint_is_exact() {
+        let mut map: I64Map<u64> = I64Map::new();
+        for i in 0..100 {
+            map.insert(i, i as u64);
+        }
+        map.insert(i64::MIN, 7);
+        let mut drain = map.drain();
+        assert_eq!(drain.size_hint(), (101, Some(101)));
+        assert_eq!(drain.len(), 101);
+        drain.next();
+        assert_eq!(drain.size_hint(), (100, Some(100)));
+        let rest: Vec<(i64, u64)> = drain.collect();
+        assert_eq!(rest.len(), 100);
+        assert!(map.is_empty());
     }
 
     #[test]
