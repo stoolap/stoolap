@@ -32,7 +32,7 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use crate::common::StringMap;
 
 use crate::core::value::NULL_VALUE;
-use crate::core::{DataType, Operator, Row, Value};
+use crate::core::{DataType, Operator, Row, Schema, Value};
 use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
     BetweenExpression, BooleanLiteral, Expression, FloatLiteral, FunctionCall, Identifier,
@@ -125,7 +125,39 @@ pub fn substitute_outer_references(
     outer_row: &FxHashMap<CompactArc<str>, Value>,
 ) -> Expression {
     // Use the internal function that returns Option for copy-on-write semantics
-    substitute_outer_references_inner(expr, outer_row).unwrap_or_else(|| expr.clone())
+    substitute_outer_references_inner(expr, outer_row, None).unwrap_or_else(|| expr.clone())
+}
+
+/// The table a correlated subquery scans. References into it are left
+/// alone: an inner column may share its name with an outer one, and SQL
+/// binds the nearer scope first.
+pub struct InnerScope<'a> {
+    pub table: &'a str,
+    pub alias: Option<&'a str>,
+    pub schema: &'a Schema,
+}
+
+impl InnerScope<'_> {
+    /// With an alias only the alias names the inner table; the table's own
+    /// name may then be an alias in the outer query.
+    fn owns_qualifier(&self, qualifier: &str) -> bool {
+        qualifier == self.alias.unwrap_or(self.table)
+    }
+
+    fn owns_column(&self, column: &str) -> bool {
+        self.schema.column_index_map().contains_key(column)
+    }
+}
+
+/// Like [`substitute_outer_references`], but leaves references to the
+/// subquery's own table untouched so the outer values it does substitute
+/// can drive index and primary key lookups.
+pub fn substitute_outer_references_in_scope(
+    expr: &Expression,
+    outer_row: &FxHashMap<CompactArc<str>, Value>,
+    scope: &InnerScope<'_>,
+) -> Expression {
+    substitute_outer_references_inner(expr, outer_row, Some(scope)).unwrap_or_else(|| expr.clone())
 }
 
 /// Internal helper that returns None if no substitution was made (avoids cloning).
@@ -133,10 +165,14 @@ pub fn substitute_outer_references(
 fn substitute_outer_references_inner(
     expr: &Expression,
     outer_row: &FxHashMap<CompactArc<str>, Value>,
+    scope: Option<&InnerScope<'_>>,
 ) -> Option<Expression> {
     match expr {
         // Check if this is an outer reference
         Expression::QualifiedIdentifier(qid) => {
+            if scope.is_some_and(|s| s.owns_qualifier(&qid.qualifier.value_lower)) {
+                return None;
+            }
             // Try qualified name: "alias.column"
             // Use .as_str() for lookups since map now uses CompactArc<str> keys
             let qualified_name = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
@@ -152,6 +188,9 @@ fn substitute_outer_references_inner(
 
         // Check unqualified identifiers too
         Expression::Identifier(id) => {
+            if scope.is_some_and(|s| s.owns_column(&id.value_lower)) {
+                return None;
+            }
             if let Some(value) = outer_row.get(id.value_lower.as_str()) {
                 return Some(value_to_expression(value));
             }
@@ -160,8 +199,8 @@ fn substitute_outer_references_inner(
 
         // Recursively handle infix expressions (AND, OR, comparisons)
         Expression::Infix(infix) => {
-            let new_left = substitute_outer_references_inner(&infix.left, outer_row);
-            let new_right = substitute_outer_references_inner(&infix.right, outer_row);
+            let new_left = substitute_outer_references_inner(&infix.left, outer_row, scope);
+            let new_right = substitute_outer_references_inner(&infix.right, outer_row, scope);
 
             // Only create new expression if something changed
             if new_left.is_some() || new_right.is_some() {
@@ -178,19 +217,20 @@ fn substitute_outer_references_inner(
         }
 
         // Recursively handle prefix expressions (NOT)
-        Expression::Prefix(prefix) => substitute_outer_references_inner(&prefix.right, outer_row)
-            .map(|new_right| {
+        Expression::Prefix(prefix) => {
+            substitute_outer_references_inner(&prefix.right, outer_row, scope).map(|new_right| {
                 Expression::Prefix(PrefixExpression {
                     token: prefix.token.clone(),
                     operator: prefix.operator.clone(),
                     op_type: prefix.op_type,
                     right: Box::new(new_right),
                 })
-            }),
+            })
+        }
 
         // Handle IN expressions
         Expression::In(in_expr) => {
-            let new_left = substitute_outer_references_inner(&in_expr.left, outer_row);
+            let new_left = substitute_outer_references_inner(&in_expr.left, outer_row, scope);
             let new_right = match &*in_expr.right {
                 Expression::List(list) => {
                     // Check if any element changed
@@ -199,7 +239,7 @@ fn substitute_outer_references_inner(
                         .elements
                         .iter()
                         .map(|e| {
-                            let result = substitute_outer_references_inner(e, outer_row);
+                            let result = substitute_outer_references_inner(e, outer_row, scope);
                             if result.is_some() {
                                 any_changed = true;
                             }
@@ -220,7 +260,7 @@ fn substitute_outer_references_inner(
                         None
                     }
                 }
-                other => substitute_outer_references_inner(other, outer_row),
+                other => substitute_outer_references_inner(other, outer_row, scope),
             };
 
             if new_left.is_some() || new_right.is_some() {
@@ -237,9 +277,9 @@ fn substitute_outer_references_inner(
 
         // Handle BETWEEN expressions
         Expression::Between(between) => {
-            let new_expr = substitute_outer_references_inner(&between.expr, outer_row);
-            let new_lower = substitute_outer_references_inner(&between.lower, outer_row);
-            let new_upper = substitute_outer_references_inner(&between.upper, outer_row);
+            let new_expr = substitute_outer_references_inner(&between.expr, outer_row, scope);
+            let new_lower = substitute_outer_references_inner(&between.lower, outer_row, scope);
+            let new_upper = substitute_outer_references_inner(&between.upper, outer_row, scope);
 
             if new_expr.is_some() || new_lower.is_some() || new_upper.is_some() {
                 Some(Expression::Between(BetweenExpression {
@@ -256,12 +296,12 @@ fn substitute_outer_references_inner(
 
         // Handle LIKE expressions
         Expression::Like(like) => {
-            let new_left = substitute_outer_references_inner(&like.left, outer_row);
-            let new_pattern = substitute_outer_references_inner(&like.pattern, outer_row);
+            let new_left = substitute_outer_references_inner(&like.left, outer_row, scope);
+            let new_pattern = substitute_outer_references_inner(&like.pattern, outer_row, scope);
             let new_escape = like
                 .escape
                 .as_ref()
-                .and_then(|e| substitute_outer_references_inner(e, outer_row));
+                .and_then(|e| substitute_outer_references_inner(e, outer_row, scope));
 
             if new_left.is_some() || new_pattern.is_some() || new_escape.is_some() {
                 Some(Expression::Like(LikeExpression {
@@ -288,7 +328,7 @@ fn substitute_outer_references_inner(
                 .arguments
                 .iter()
                 .map(|arg| {
-                    let result = substitute_outer_references_inner(arg, outer_row);
+                    let result = substitute_outer_references_inner(arg, outer_row, scope);
                     if result.is_some() {
                         any_changed = true;
                     }
@@ -299,7 +339,7 @@ fn substitute_outer_references_inner(
             let new_filter = func
                 .filter
                 .as_ref()
-                .and_then(|f| substitute_outer_references_inner(f, outer_row));
+                .and_then(|f| substitute_outer_references_inner(f, outer_row, scope));
             if new_filter.is_some() {
                 any_changed = true;
             }
@@ -1963,6 +2003,107 @@ pub fn compute_join_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ident(name: &str) -> Expression {
+        Expression::Identifier(Identifier {
+            token: dummy_token_clone(),
+            value: name.into(),
+            value_lower: name.to_lowercase().into(),
+        })
+    }
+
+    fn qualified(qualifier: &str, name: &str) -> Expression {
+        let (Expression::Identifier(q), Expression::Identifier(n)) =
+            (ident(qualifier), ident(name))
+        else {
+            unreachable!()
+        };
+        Expression::QualifiedIdentifier(QualifiedIdentifier {
+            token: dummy_token_clone(),
+            qualifier: Box::new(q),
+            name: Box::new(n),
+        })
+    }
+
+    /// Outer values reach the subquery's WHERE, but names that belong to
+    /// the inner table are left alone even when the outer row has a column
+    /// of the same name.
+    #[test]
+    fn test_substitute_outer_references_respects_inner_scope() {
+        use crate::core::SchemaBuilder;
+
+        let schema = SchemaBuilder::new("parent")
+            .add_primary_key("id", DataType::Integer)
+            .add("Name", DataType::Text)
+            .build();
+        let scope = InnerScope {
+            table: "parent",
+            alias: Some("p"),
+            schema: &schema,
+        };
+        let mut outer: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
+        for (key, value) in [
+            ("c.id", 3),
+            ("id", 3),
+            ("c.pid", 7),
+            ("pid", 7),
+            ("c.name", 9),
+            ("name", 9),
+        ] {
+            outer.insert(CompactArc::from(key), Value::Integer(value));
+        }
+
+        let is_literal = |expr: &Expression, expected: i64| matches!(expr, Expression::IntegerLiteral(l) if l.value == expected);
+
+        // inner references, qualified by the alias or bare
+        for expr in [qualified("p", "id"), ident("id"), ident("name")] {
+            let out = substitute_outer_references_in_scope(&expr, &outer, &scope);
+            assert!(
+                matches!(
+                    out,
+                    Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
+                ),
+                "{expr} must not be substituted"
+            );
+        }
+
+        // outer references, qualified or bare, still become literals
+        assert!(is_literal(
+            &substitute_outer_references_in_scope(&qualified("c", "pid"), &outer, &scope),
+            7
+        ));
+        assert!(is_literal(
+            &substitute_outer_references_in_scope(&qualified("c", "id"), &outer, &scope),
+            3
+        ));
+        assert!(is_literal(
+            &substitute_outer_references_in_scope(&ident("pid"), &outer, &scope),
+            7
+        ));
+
+        // with an alias, the table name is not inner: it may be an outer alias
+        outer.insert(CompactArc::from("parent.id"), Value::Integer(5));
+        outer.insert(CompactArc::from("parent.pid"), Value::Integer(7));
+        assert!(is_literal(
+            &substitute_outer_references_in_scope(&qualified("parent", "id"), &outer, &scope),
+            5
+        ));
+        assert!(is_literal(
+            &substitute_outer_references_in_scope(&qualified("parent", "pid"), &outer, &scope),
+            7
+        ));
+
+        // without an alias, the table name is the inner qualifier
+        let bare = InnerScope {
+            table: "parent",
+            alias: None,
+            schema: &schema,
+        };
+        assert!(matches!(
+            substitute_outer_references_in_scope(&qualified("parent", "id"), &outer, &bare),
+            Expression::QualifiedIdentifier(_)
+        ));
+    }
 
     // ============================================================================
     // Token Creation Tests
