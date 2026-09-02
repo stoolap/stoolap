@@ -10,6 +10,8 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | Iterations | 500 (point queries), 250 (medium), 50 (heavy) |
 | Mode | In-memory |
 | Platform | Apple Silicon |
+| Sampling | best of 10 runs per engine, measured back to back |
+| Measured | 2026-09-02, `main` at 2526f538 |
 | SQLite | rusqlite v0.40.2 |
 | DuckDB | duckdb v1.10501.0 |
 
@@ -267,4 +269,4 @@ cargo build --release --example benchmark --example benchmark_sqlite --example b
 
 ---
 
-*Benchmarks performed on Apple Silicon, in-memory mode, best of 10 runs. Results are point-in-time for v0.4.0; re-run on your hardware and workload for current numbers.*
+*Benchmarks performed on Apple Silicon, in-memory mode, best of 10 runs, all three engines measured back to back on one idle machine. Results are point-in-time for `main` at 2526f538, which is after the v0.4.0 release, not the release itself; re-run on your hardware and workload for current numbers.*
