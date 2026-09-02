@@ -1219,6 +1219,21 @@ impl Executor {
         probe_secondary_index: bool,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>, bool)>> {
         // Extract IN list info: (column_name, values, is_negated, remaining_predicate)
+        // Evaluating the list's literals is the expensive part of the
+        // extraction, so decide on the column first: a secondary-index list
+        // that will not be probed must not pay for values it never uses.
+        let schema = table.schema();
+        let pk_indices = schema.primary_key_indices();
+        let pk_name = if pk_indices.len() == 1 {
+            Some(schema.columns[pk_indices[0]].name_lower.as_str())
+        } else {
+            None
+        };
+        let is_pk_column = pk_name == Self::in_list_column(where_expr);
+        if !is_pk_column && !probe_secondary_index {
+            return Ok(None);
+        }
+
         let (column_name, values, is_negated, remaining_predicate) =
             match Self::extract_in_list_info(where_expr, ctx) {
                 Some(info) => info,
@@ -1231,23 +1246,11 @@ impl Executor {
             return Ok(None);
         }
 
-        // Check if this is a PRIMARY KEY column (O(1) lookup) or has an index
-        let schema = table.schema();
-        let pk_indices = schema.primary_key_indices();
-        let is_pk_column = pk_indices.len() == 1 && {
-            let pk_col_idx = pk_indices[0];
-            schema.columns[pk_col_idx].name_lower == column_name
-        };
-
-        // If not PK, check for index
         // A secondary index probe collects every matching row id for every
         // value before fetching, while the pushed-down range scan streams
         // and stops at LIMIT; so it is only taken when a memory filter is
         // needed anyway. Primary key values are the row ids themselves.
         let index = if !is_pk_column {
-            if !probe_secondary_index {
-                return Ok(None);
-            }
             match table.get_index_on_column(&column_name) {
                 Some(idx) => Some(idx),
                 None => return Ok(None), // No PK, no index, can't optimize
@@ -1438,6 +1441,22 @@ impl Executor {
 
     /// Extract IN list literal information from a WHERE clause.
     /// Returns (column_name, values, is_negated, remaining_predicate)
+    /// The column of the IN list `extract_in_list_info` would pick, found
+    /// without evaluating the list's values.
+    fn in_list_column(expr: &Expression) -> Option<&str> {
+        match expr {
+            Expression::In(in_expr) => match in_expr.left.as_ref() {
+                Expression::Identifier(id) => Some(id.value_lower.as_str()),
+                Expression::QualifiedIdentifier(qid) => Some(qid.name.value_lower.as_str()),
+                _ => None,
+            },
+            Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
+                Self::in_list_column(&infix.left).or_else(|| Self::in_list_column(&infix.right))
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn extract_in_list_info(
         expr: &Expression,
         ctx: &ExecutionContext,
