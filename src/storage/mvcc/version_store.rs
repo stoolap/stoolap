@@ -6073,11 +6073,15 @@ impl VersionStore {
                                         // GROUP BY is the dominant cost of the scan.
             let n_aggs = aggregates.len();
             let mut accums: Vec<Accum> = Vec::new();
-            let new_group = |accums: &mut Vec<Accum>| -> u32 {
-                let ordinal = (accums.len() / n_aggs) as u32;
+            let mut group_count: u32 = 0;
+            // The ordinal is counted, not derived from the pool length: an
+            // empty aggregate list is a valid request and would divide by zero.
+            fn new_group(accums: &mut Vec<Accum>, group_count: &mut u32, n_aggs: usize) -> u32 {
+                let ordinal = *group_count;
+                *group_count += 1;
                 accums.resize_with(accums.len() + n_aggs, Accum::default);
                 ordinal
-            };
+            }
             use crate::common::i64_map::Entry;
             let mut int_groups: I64Map<u32> = I64Map::new();
             // Separate NULL accumulator - avoids creating GroupKey for NULL
@@ -6107,7 +6111,9 @@ impl VersionStore {
                     // NULL - track separately without GroupKey allocation
                     let ordinal = match null_group {
                         Some(ordinal) => ordinal,
-                        None => *null_group.insert(new_group(&mut accums)),
+                        None => {
+                            *null_group.insert(new_group(&mut accums, &mut group_count, n_aggs))
+                        }
                     };
                     let base = ordinal as usize * n_aggs;
                     update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
@@ -6153,7 +6159,9 @@ impl VersionStore {
                         // NULL value in the column - track separately
                         let ordinal = match null_group {
                             Some(ordinal) => ordinal,
-                            None => *null_group.insert(new_group(&mut accums)),
+                            None => {
+                                *null_group.insert(new_group(&mut accums, &mut group_count, n_aggs))
+                            }
                         };
                         let base = ordinal as usize * n_aggs;
                         update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
@@ -6165,13 +6173,15 @@ impl VersionStore {
                 let ordinal = if let Some(key) = i64_key {
                     match int_groups.entry(key) {
                         Entry::Occupied(existing) => *existing.into_mut(),
-                        Entry::Vacant(slot) => *slot.insert(new_group(&mut accums)),
+                        Entry::Vacant(slot) => {
+                            *slot.insert(new_group(&mut accums, &mut group_count, n_aggs))
+                        }
                     }
                 } else {
                     match other_groups.entry(GroupKey::Single(CompactArc::new(val.clone()))) {
                         std::collections::hash_map::Entry::Occupied(existing) => *existing.get(),
                         std::collections::hash_map::Entry::Vacant(slot) => {
-                            *slot.insert(new_group(&mut accums))
+                            *slot.insert(new_group(&mut accums, &mut group_count, n_aggs))
                         }
                     }
                 };
@@ -6220,16 +6230,18 @@ impl VersionStore {
                 });
             }
 
-            // Convert other_groups (strings, etc.)
-            for (group_key, ordinal) in &other_groups {
+            // Convert other_groups (strings, etc.), consuming the map so each
+            // key is released as its values are moved out rather than being
+            // held alongside its clone for the rest of the loop.
+            for (group_key, ordinal) in other_groups {
                 let mut group_values = Vec::with_capacity(row_width);
                 match group_key {
-                    GroupKey::Single(v) => group_values.push((**v).clone()),
+                    GroupKey::Single(v) => group_values.push((*v).clone()),
                     GroupKey::Multi(vs) => group_values.extend(vs.iter().map(|v| (**v).clone())),
                 }
                 results.push(GroupedAggregateResult {
                     group_values,
-                    aggregate_values: compute_aggregate_values(aggregates, slice_of(*ordinal)),
+                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal)),
                 });
             }
 
@@ -7561,6 +7573,71 @@ mod tests {
         fn needs_snapshot_isolation(&self, _txn_id: i64) -> bool {
             true
         }
+    }
+
+    /// A visibility checker that does not force snapshot isolation, so the
+    /// arena-backed grouped aggregation path is reachable.
+    struct ReadCommittedChecker;
+
+    impl VisibilityChecker for ReadCommittedChecker {
+        fn is_visible(&self, version_txn_id: i64, viewing_txn_id: i64) -> bool {
+            version_txn_id <= viewing_txn_id
+        }
+
+        fn get_current_sequence(&self) -> i64 {
+            0
+        }
+
+        fn get_active_transaction_ids(&self) -> Vec<i64> {
+            Vec::new()
+        }
+
+        fn needs_snapshot_isolation(&self, _txn_id: i64) -> bool {
+            false
+        }
+    }
+
+    /// `compute_grouped_aggregates` is public and its signature allows an
+    /// empty aggregate list. The executor never asks for one, but the contract
+    /// does, and it used to answer with a group per distinct key and no
+    /// aggregate values.
+    #[test]
+    fn test_grouped_aggregates_with_no_aggregates() {
+        use crate::core::DataType;
+
+        let schema = crate::core::SchemaBuilder::new("no_aggs")
+            .column("id", DataType::Integer, false, true)
+            .column("k", DataType::Integer, true, false)
+            .build();
+
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "no_aggs".to_string(),
+            schema,
+            Arc::new(ReadCommittedChecker),
+        ));
+
+        let mut txn = TransactionVersionStore::new(Arc::clone(&store), 1);
+        for (id, k) in [(1i64, 10i64), (2, 10), (3, 20)] {
+            txn.put(id, Row::from(vec![Value::from(id), Value::from(k)]), false)
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let results = store
+            .compute_grouped_aggregates(2, &[1], &[])
+            .expect("arena path should handle an empty aggregate list");
+
+        let mut keys: Vec<i64> = results
+            .iter()
+            .map(|r| match r.group_values.first() {
+                Some(Value::Integer(k)) => *k,
+                other => panic!("unexpected group value {other:?}"),
+            })
+            .collect();
+        keys.sort();
+
+        assert_eq!(keys, vec![10, 20]);
+        assert!(results.iter().all(|r| r.aggregate_values.is_empty()));
     }
 
     #[test]
