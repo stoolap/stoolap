@@ -311,36 +311,10 @@ impl<V> I64Map<V> {
     }
 
     #[inline(always)]
-    pub fn remove(&mut self, key: i64) -> Option<V> {
-        if key == EMPTY {
-            return self.sentinel_remove();
-        }
-
+    /// Backward-shift deletion: closes the probe chain through `idx` after
+    /// its value has been moved out, so no tombstone is needed.
+    fn shift_back(&mut self, idx: usize) {
         let mask = self.mask;
-        let mut idx = Self::hash(key) & mask;
-
-        // Find the key
-        loop {
-            // SAFETY: idx is always in bounds due to masking with (capacity - 1).
-            let slot = unsafe { self.slots.get_unchecked(idx) };
-
-            if slot.key == EMPTY {
-                return None;
-            }
-
-            if slot.key == key {
-                break;
-            }
-
-            idx = (idx + 1) & mask;
-        }
-
-        // Found - extract value
-        // SAFETY: idx is valid and slot is occupied (we just found the key).
-        let value = unsafe { self.slots.get_unchecked(idx).value.as_ptr().read() };
-        self.len -= 1;
-
-        // Backward shift deletion
         let mut empty_idx = idx;
         let mut next_idx = (idx + 1) & mask;
 
@@ -387,6 +361,38 @@ impl<V> I64Map<V> {
         unsafe {
             self.slots.get_unchecked_mut(empty_idx).key = EMPTY;
         }
+    }
+
+    pub fn remove(&mut self, key: i64) -> Option<V> {
+        if key == EMPTY {
+            return self.sentinel_remove();
+        }
+
+        let mask = self.mask;
+        let mut idx = Self::hash(key) & mask;
+
+        // Find the key
+        loop {
+            // SAFETY: idx is always in bounds due to masking with (capacity - 1).
+            let slot = unsafe { self.slots.get_unchecked(idx) };
+
+            if slot.key == EMPTY {
+                return None;
+            }
+
+            if slot.key == key {
+                break;
+            }
+
+            idx = (idx + 1) & mask;
+        }
+
+        // Found - extract value
+        // SAFETY: idx is valid and slot is occupied (we just found the key).
+        let value = unsafe { self.slots.get_unchecked(idx).value.as_ptr().read() };
+        self.len -= 1;
+
+        self.shift_back(idx);
 
         // Check if we should shrink after removal
         if self.should_shrink() {
@@ -1457,19 +1463,22 @@ impl<V> Iterator for Drain<'_, V> {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         while self.pos < self.map.slots.len() {
-            let slot = &mut self.map.slots[self.pos];
-            self.pos += 1;
-
+            let slot = &self.map.slots[self.pos];
             if slot.key != EMPTY {
                 let key = slot.key;
-                // SAFETY: slot.key != EMPTY means the value is initialized, and
-                // the slot is marked empty before the value escapes so it can
-                // neither be read again nor dropped by the map.
+                // SAFETY: slot.key != EMPTY means the value is initialized; the
+                // shift below empties this slot or refills it from its chain,
+                // so the moved-out value is neither read again nor dropped.
                 let value = unsafe { slot.value.as_ptr().read() };
-                slot.key = EMPTY;
                 self.map.len -= 1;
+                // Closing the chain on every yield keeps the map valid if the
+                // drain is leaked or its Drop unwinds. The cursor stays put:
+                // a later entry may have shifted into this slot, and every
+                // slot before it is already empty.
+                self.map.shift_back(self.pos);
                 return Some((key, value));
             }
+            self.pos += 1;
         }
         // The side-slot entry drains last
         self.map.min_slot.take().map(|v| (EMPTY, v))
@@ -1896,6 +1905,33 @@ mod tests {
     /// Draining must not throw the table away: the transaction map pools
     /// hand a drained map back to the next transaction, and a map that came
     /// back at 8 slots regrew from scratch every time.
+    /// A drain leaked part-way, or cut short by a panicking destructor,
+    /// must leave a valid table: an entry behind the yielded one on the
+    /// same probe chain stays reachable.
+    #[test]
+    fn test_partial_drain_leak_keeps_probe_chains() {
+        let mut map: I64Map<&str> = I64Map::with_capacity(0);
+        assert_eq!(map.capacity(), 8);
+        assert_eq!(I64Map::<&str>::hash(0) & 7, I64Map::<&str>::hash(8) & 7);
+        map.insert(0, "a");
+        map.insert(8, "b");
+
+        let mut drain = map.drain();
+        let (first, _) = drain.next().unwrap();
+        std::mem::forget(drain);
+
+        let other = if first == 0 { 8 } else { 0 };
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get(first), None);
+        assert_eq!(
+            map.get(other).copied(),
+            Some(if other == 0 { "a" } else { "b" })
+        );
+        map.insert(first, "c");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(first).copied(), Some("c"));
+    }
+
     #[test]
     fn test_drain_keeps_capacity() {
         let mut map: I64Map<u64> = I64Map::new();
