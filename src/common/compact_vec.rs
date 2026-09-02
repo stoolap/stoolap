@@ -195,6 +195,10 @@ impl<T> CompactVec<T> {
     }
 
     /// Reserves capacity for at least `additional` more elements.
+    ///
+    /// Grows geometrically like `Vec::reserve`, so a sequence of small
+    /// reservations costs O(log n) reallocations rather than one per call.
+    /// Use [`CompactVec::reserve_exact`] when the final size is known.
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
         // Unpack once
@@ -203,9 +207,20 @@ impl<T> CompactVec<T> {
         let required = len.saturating_add(additional);
 
         if required > cap {
-            // Calculate new capacity directly, avoid second capacity() call
-            let new_cap = required.min(u32::MAX as usize);
+            let new_cap = required.max(cap.saturating_mul(2)).min(u32::MAX as usize);
             self.realloc(new_cap);
+        }
+    }
+
+    /// Reserves capacity for exactly `additional` more elements.
+    #[inline]
+    pub fn reserve_exact(&mut self, additional: usize) {
+        let len = Self::unpack_len(self.len_cap) as usize;
+        let cap = Self::unpack_cap(self.len_cap) as usize;
+        let required = len.saturating_add(additional);
+
+        if required > cap {
+            self.realloc(required.min(u32::MAX as usize));
         }
     }
 
@@ -1452,6 +1467,32 @@ mod tests {
         // 0 and 1 are dropped with the vector, 2 was dropped above, 3 is leaked
         // by mem::forget. Nothing is dropped twice.
         assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
+    }
+
+    /// Repeated small reservations must grow geometrically, not once per call.
+    #[test]
+    fn test_reserve_amortizes_and_reserve_exact_does_not() {
+        let mut v: CompactVec<u64> = CompactVec::new();
+        let mut reallocations = 0;
+        let mut last_cap = v.capacity();
+        for i in 0..1000u64 {
+            v.reserve(1);
+            v.push(i);
+            if v.capacity() != last_cap {
+                reallocations += 1;
+                last_cap = v.capacity();
+            }
+        }
+        assert!(
+            reallocations <= 12,
+            "reserve(1) x1000 reallocated {reallocations} times"
+        );
+
+        let mut e: CompactVec<u64> = CompactVec::new();
+        e.reserve_exact(37);
+        assert_eq!(e.capacity(), 37);
+        e.reserve_exact(10);
+        assert_eq!(e.capacity(), 37, "already has room, must not grow");
     }
 
     /// Test panic safety in Clone implementation
