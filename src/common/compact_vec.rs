@@ -31,12 +31,14 @@ use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::ptr::{self, NonNull};
 use std::slice;
 
-/// A compact vector that uses 16 bytes instead of Vec's 24 bytes.
-/// Stores length and capacity as u32 (max 4 billion elements).
+// One pointer plus two u32s, and the pointer's niche keeps Option free.
 const _: () = assert!(
-    mem::size_of::<CompactVec<u8>>() == 16 && mem::size_of::<Option<CompactVec<u8>>>() == 16
+    mem::size_of::<CompactVec<u8>>() == mem::size_of::<usize>() + 2 * mem::size_of::<u32>()
+        && mem::size_of::<Option<CompactVec<u8>>>() == mem::size_of::<CompactVec<u8>>()
 );
 
+/// A compact vector: one pointer plus two u32s, 16 bytes on 64-bit targets
+/// against Vec's 24. Holds at most u32::MAX elements.
 pub struct CompactVec<T> {
     ptr: NonNull<T>,
     /// Packed length (low 32 bits) and capacity (high 32 bits)
@@ -215,11 +217,10 @@ impl<T> CompactVec<T> {
         // Unpack once
         let len = Self::unpack_len(self.len_cap) as usize;
         let cap = Self::unpack_cap(self.len_cap) as usize;
-        let required = len.saturating_add(additional);
-        assert!(
-            required <= u32::MAX as usize,
-            "CompactVec capacity overflow"
-        );
+        let required = len
+            .checked_add(additional)
+            .filter(|&required| required <= u32::MAX as usize)
+            .expect("CompactVec capacity overflow");
 
         if required > cap {
             let new_cap = required.max(cap.saturating_mul(2)).min(u32::MAX as usize);
@@ -232,11 +233,10 @@ impl<T> CompactVec<T> {
     pub fn reserve_exact(&mut self, additional: usize) {
         let len = Self::unpack_len(self.len_cap) as usize;
         let cap = Self::unpack_cap(self.len_cap) as usize;
-        let required = len.saturating_add(additional);
-        assert!(
-            required <= u32::MAX as usize,
-            "CompactVec capacity overflow"
-        );
+        let required = len
+            .checked_add(additional)
+            .filter(|&required| required <= u32::MAX as usize)
+            .expect("CompactVec capacity overflow");
 
         if required > cap {
             self.realloc(required);
@@ -1511,7 +1511,8 @@ mod tests {
     #[should_panic(expected = "CompactVec capacity overflow")]
     fn test_reserve_past_u32_panics() {
         let mut v: CompactVec<u8> = CompactVec::new();
-        v.reserve(u32::MAX as usize + 1);
+        v.push(1);
+        v.reserve(u32::MAX as usize);
     }
 
     #[test]
