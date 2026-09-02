@@ -105,14 +105,14 @@ impl fmt::Display for TokenType {
 
 /// Token represents a lexical token
 ///
-/// Uses SmartString for literal to avoid heap allocation for tokens up to 24 bytes
+/// Uses SmartString for literal to avoid heap allocation for tokens up to 15 bytes
 /// (covers most SQL tokens: keywords, operators, short identifiers, numbers).
 /// For error tokens, the literal field contains the error message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {
     /// The type of the token
     pub token_type: TokenType,
-    /// The literal string value (SmartString inlines strings up to 24 bytes)
+    /// The literal string value (SmartString inlines strings up to 15 bytes)
     /// For error tokens, this contains the error message instead.
     pub literal: SmartString,
     /// The position in the source

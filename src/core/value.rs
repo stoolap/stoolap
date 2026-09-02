@@ -141,9 +141,9 @@ impl Value {
         Value::Text(value.into())
     }
 
-    /// Create a text value from Arc<str> (zero-copy for heap strings)
+    /// Create a text value from an `Arc<str>`.
     ///
-    /// Preserves the Arc reference for O(1) clone and sharing.
+    /// The bytes are copied into a `SmartString`; the `Arc` is not kept.
     pub fn text_arc(value: Arc<str>) -> Self {
         Value::Text(SmartString::from(value))
     }

@@ -33,6 +33,10 @@ use std::slice;
 
 /// A compact vector that uses 16 bytes instead of Vec's 24 bytes.
 /// Stores length and capacity as u32 (max 4 billion elements).
+const _: () = assert!(
+    mem::size_of::<CompactVec<u8>>() == 16 && mem::size_of::<Option<CompactVec<u8>>>() == 16
+);
+
 pub struct CompactVec<T> {
     ptr: NonNull<T>,
     /// Packed length (low 32 bits) and capacity (high 32 bits)
@@ -82,6 +86,13 @@ impl<T> CompactVec<T> {
         }
 
         let cap = capacity.min(u32::MAX as usize) as u32;
+
+        if mem::size_of::<T>() == 0 {
+            return Self {
+                ptr: NonNull::dangling(),
+                len_cap: Self::pack(0, cap),
+            };
+        }
 
         // Allocate memory
         let layout = Layout::array::<T>(cap as usize).unwrap();
@@ -205,6 +216,10 @@ impl<T> CompactVec<T> {
         let len = Self::unpack_len(self.len_cap) as usize;
         let cap = Self::unpack_cap(self.len_cap) as usize;
         let required = len.saturating_add(additional);
+        assert!(
+            required <= u32::MAX as usize,
+            "CompactVec capacity overflow"
+        );
 
         if required > cap {
             let new_cap = required.max(cap.saturating_mul(2)).min(u32::MAX as usize);
@@ -218,9 +233,13 @@ impl<T> CompactVec<T> {
         let len = Self::unpack_len(self.len_cap) as usize;
         let cap = Self::unpack_cap(self.len_cap) as usize;
         let required = len.saturating_add(additional);
+        assert!(
+            required <= u32::MAX as usize,
+            "CompactVec capacity overflow"
+        );
 
         if required > cap {
-            self.realloc(required.min(u32::MAX as usize));
+            self.realloc(required);
         }
     }
 
@@ -232,6 +251,7 @@ impl<T> CompactVec<T> {
         } else {
             cap.saturating_mul(2).min(u32::MAX as usize)
         };
+        assert!(new_cap > cap, "CompactVec capacity overflow");
 
         self.realloc(new_cap);
     }
@@ -1470,6 +1490,30 @@ mod tests {
     }
 
     /// Repeated small reservations must grow geometrically, not once per call.
+    /// A zero-sized element type never touches the allocator, with or
+    /// without a requested capacity.
+    #[test]
+    fn test_zero_sized_elements_with_capacity() {
+        let mut v: CompactVec<()> = CompactVec::with_capacity(8);
+        assert_eq!(v.capacity(), 8);
+        for _ in 0..20 {
+            v.push(());
+        }
+        assert_eq!(v.len(), 20);
+        assert_eq!(v.pop(), Some(()));
+        v.clear();
+        assert!(v.is_empty());
+    }
+
+    /// The length and capacity share one u32 each; asking for more is an
+    /// error, not a silent cap that a later push would write past.
+    #[test]
+    #[should_panic(expected = "CompactVec capacity overflow")]
+    fn test_reserve_past_u32_panics() {
+        let mut v: CompactVec<u8> = CompactVec::new();
+        v.reserve(u32::MAX as usize + 1);
+    }
+
     #[test]
     fn test_reserve_amortizes_and_reserve_exact_does_not() {
         let mut v: CompactVec<u64> = CompactVec::new();

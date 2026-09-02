@@ -194,6 +194,8 @@ impl SmartString {
         Self::new(s)
     }
 
+    /// The capacity is not reserved: a `SmartString` decides between its
+    /// inline buffer and the heap on each write, so this is `default()`.
     #[inline]
     pub fn with_capacity(_capacity: usize) -> Self {
         Self::default()

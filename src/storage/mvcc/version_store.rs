@@ -479,7 +479,7 @@ pub struct SealedIndexCleanup {
 pub struct VersionStore {
     /// Row versions indexed by row ID (CowBTree for O(1) snapshot cloning)
     versions: CowBTreeMap<VersionChainEntry>,
-    /// The name of the table this store belongs to (SmartString for inline storage ≤24 bytes)
+    /// The name of the table this store belongs to (SmartString inlines up to 15 bytes)
     table_name: SmartString,
     /// Table schema (Arc for zero-cost cloning on read)
     schema: RwLock<CompactArc<Schema>>,
