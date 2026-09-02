@@ -6067,11 +6067,23 @@ impl VersionStore {
 
             // Track key type: 0=Integer, 1=Float, 2=Boolean, 3=Mixed/Other
             let mut key_type: u8 = 255; // uninitialized
-            let mut int_groups: I64Map<Vec<Accum>> = I64Map::new();
+                                        // Accumulators live in one flat pool, `n_aggs` per group, and the
+                                        // maps hold the group's ordinal into it. A Vec per group would be
+                                        // one allocation per distinct group, which for a high-cardinality
+                                        // GROUP BY is the dominant cost of the scan.
+            let n_aggs = aggregates.len();
+            let mut accums: Vec<Accum> = Vec::new();
+            let new_group = |accums: &mut Vec<Accum>| -> u32 {
+                let ordinal = (accums.len() / n_aggs) as u32;
+                accums.resize_with(accums.len() + n_aggs, Accum::default);
+                ordinal
+            };
+            use crate::common::i64_map::Entry;
+            let mut int_groups: I64Map<u32> = I64Map::new();
             // Separate NULL accumulator - avoids creating GroupKey for NULL
-            let mut null_accums: Option<Vec<Accum>> = None;
+            let mut null_group: Option<u32> = None;
             // Only used for String/other types that can't be mapped to i64
-            let mut other_groups: GroupKeyMap<Vec<Accum>> = GroupKeyMap::default();
+            let mut other_groups: GroupKeyMap<u32> = GroupKeyMap::default();
 
             for (idx, meta) in arena_meta.iter().enumerate() {
                 // Visibility check (standard pattern: check creation, then deletion)
@@ -6093,9 +6105,12 @@ impl VersionStore {
                     &row_slice[col_idx]
                 } else {
                     // NULL - track separately without GroupKey allocation
-                    let accums =
-                        null_accums.get_or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-                    update_accums(accums, aggregates, row_slice);
+                    let ordinal = match null_group {
+                        Some(ordinal) => ordinal,
+                        None => *null_group.insert(new_group(&mut accums)),
+                    };
+                    let base = ordinal as usize * n_aggs;
+                    update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
                     continue;
                 };
 
@@ -6136,64 +6151,85 @@ impl VersionStore {
                     }
                     Value::Null(_) => {
                         // NULL value in the column - track separately
-                        let accums = null_accums
-                            .get_or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-                        update_accums(accums, aggregates, row_slice);
+                        let ordinal = match null_group {
+                            Some(ordinal) => ordinal,
+                            None => *null_group.insert(new_group(&mut accums)),
+                        };
+                        let base = ordinal as usize * n_aggs;
+                        update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
                         continue;
                     }
                     _ => None,
                 };
 
-                if let Some(key) = i64_key {
-                    let accums = int_groups
-                        .entry(key)
-                        .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-                    update_accums(accums, aggregates, row_slice);
+                let ordinal = if let Some(key) = i64_key {
+                    match int_groups.entry(key) {
+                        Entry::Occupied(existing) => *existing.into_mut(),
+                        Entry::Vacant(slot) => *slot.insert(new_group(&mut accums)),
+                    }
                 } else {
-                    let accums = other_groups
-                        .entry(GroupKey::Single(CompactArc::new(val.clone())))
-                        .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-                    update_accums(accums, aggregates, row_slice);
-                }
+                    match other_groups.entry(GroupKey::Single(CompactArc::new(val.clone()))) {
+                        std::collections::hash_map::Entry::Occupied(existing) => *existing.get(),
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            *slot.insert(new_group(&mut accums))
+                        }
+                    }
+                };
+                let base = ordinal as usize * n_aggs;
+                update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
             }
 
             // Convert to results
-            let has_null = null_accums.is_some();
+            let has_null = null_group.is_some();
             let mut results: Vec<GroupedAggregateResult> = Vec::with_capacity(
                 int_groups.len() + other_groups.len() + if has_null { 1 } else { 0 },
             );
 
+            // The caller appends the aggregate values onto the group values to
+            // build the output row, so the key vector is sized for both here
+            // and that append does not reallocate.
+            let row_width = 1 + n_aggs;
+            let slice_of = |ordinal: u32| {
+                let base = ordinal as usize * n_aggs;
+                &accums[base..base + n_aggs]
+            };
+
             // Convert int_groups based on key_type
-            for (key, accums) in int_groups.iter() {
+            for (key, &ordinal) in int_groups.iter() {
                 let group_value = match key_type {
                     0 => Value::Integer(key),             // Integer
                     1 => Value::Float(f64_from_key(key)), // Float
                     2 => Value::Boolean(key != 0),        // Boolean
                     _ => Value::Integer(key),             // Fallback
                 };
+                let mut group_values = Vec::with_capacity(row_width);
+                group_values.push(group_value);
                 results.push(GroupedAggregateResult {
-                    group_values: vec![group_value],
-                    aggregate_values: compute_aggregate_values(aggregates, accums),
+                    group_values,
+                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal)),
                 });
             }
 
             // Add NULL group if present
-            if let Some(accums) = null_accums {
+            if let Some(ordinal) = null_group {
+                let mut group_values = Vec::with_capacity(row_width);
+                group_values.push(Value::Null(DataType::Null));
                 results.push(GroupedAggregateResult {
-                    group_values: vec![Value::Null(DataType::Null)],
-                    aggregate_values: compute_aggregate_values(aggregates, &accums),
+                    group_values,
+                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal)),
                 });
             }
 
             // Convert other_groups (strings, etc.)
-            for (group_key, accums) in other_groups {
-                let group_values = match group_key {
-                    GroupKey::Single(v) => vec![(*v).clone()],
-                    GroupKey::Multi(vs) => vs.iter().map(|v| (**v).clone()).collect(),
-                };
+            for (group_key, ordinal) in &other_groups {
+                let mut group_values = Vec::with_capacity(row_width);
+                match group_key {
+                    GroupKey::Single(v) => group_values.push((**v).clone()),
+                    GroupKey::Multi(vs) => group_values.extend(vs.iter().map(|v| (**v).clone())),
+                }
                 results.push(GroupedAggregateResult {
                     group_values,
-                    aggregate_values: compute_aggregate_values(aggregates, &accums),
+                    aggregate_values: compute_aggregate_values(aggregates, slice_of(*ordinal)),
                 });
             }
 

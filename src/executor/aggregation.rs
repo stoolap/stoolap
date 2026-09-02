@@ -3747,7 +3747,14 @@ impl Executor {
         let has_limit = limit.is_some();
         let mut current_group_count: usize = 0; // Track actual group count for LIMIT optimization
 
-        if all_simple_columns && expr_vm.is_none() {
+        // `all_simple_columns` already means no GROUP BY item is an expression,
+        // so the VM is not needed to build the keys. It was also gated on
+        // `expr_vm.is_none()`, which is false whenever any aggregate carries an
+        // expression, an ORDER BY or a FILTER, and that sent queries like
+        // `SELECT k, SUM(x * 1.1) ... GROUP BY k` down the slow path even
+        // though their keys are plain columns. Aggregates are evaluated later
+        // from the groups, not here.
+        if all_simple_columns {
             // Fast path: extract key values directly from row columns
             let column_indices: Vec<usize> = precomputed_group_by
                 .iter()
