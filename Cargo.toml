@@ -198,6 +198,10 @@ harness = false
 name = "delete_complex"
 harness = false
 
+[[bench]]
+name = "group_by_keys"
+harness = false
+
 [profile.bench]
 lto = "thin"
 codegen-units = 1

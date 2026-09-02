@@ -193,6 +193,14 @@ impl<V> I64Map<V> {
     /// multiplication to break stride patterns while preserving bijectivity.
     /// This maintains 0 collisions for sequential keys while reducing strided
     /// key collisions by ~65% (e.g., stride=1024 goes from 99,872 to 34,464).
+    ///
+    /// The bucket is the low bits of the returned value, and multiplication
+    /// only carries entropy upwards, so only the low bits of the key and the
+    /// 16 above them can reach it. That is what keeps dense keys collision
+    /// free, and it is deliberate: row ids, transaction ids and every other
+    /// counter key their maps this way. The price is that a key carrying its
+    /// entropy higher up has to be mixed before it arrives here, which is
+    /// what [`key_from_f64`] is for.
     #[inline(always)]
     fn hash(key: i64) -> usize {
         let k = key as u64;
@@ -729,6 +737,55 @@ enum EntryTarget<'a, V> {
 enum VacantTarget<'a, V> {
     Slot { map: &'a mut I64Map<V>, idx: usize },
     Sentinel(&'a mut Option<V>),
+}
+
+/// Encode an `f64` as an [`I64Map`] or [`I64Set`] key.
+///
+/// The map takes its bucket from the low bits of the key, so a key whose
+/// entropy sits above them lands in a handful of buckets. Raw `f64::to_bits()`
+/// is exactly that shape: an IEEE-754 double holding a round value carries its
+/// significant bits at the top of the mantissa and leaves the low mantissa
+/// bits zero. Keying a map directly with the bit pattern puts every group of a
+/// `GROUP BY <double column>` into one bucket and turns the scan quadratic, on
+/// data as ordinary as whole numbers or money amounts.
+///
+/// The bit pattern is passed through the SplitMix64 finalizer, whose steps are
+/// each invertible, so the encoding is a bijection: distinct doubles keep
+/// distinct keys and grouping stays exact. [`f64_from_key`] recovers the
+/// original value.
+///
+/// The encoding preserves the bit-level identity of the value, so `0.0` and
+/// `-0.0` remain distinct keys and NaN payloads stay distinguished, exactly as
+/// the raw bit pattern did.
+#[inline]
+pub fn key_from_f64(value: f64) -> i64 {
+    let mut x = value.to_bits();
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    x as i64
+}
+
+/// Recover the `f64` that [`key_from_f64`] encoded.
+///
+/// Each step undoes one step of the finalizer in reverse order. Undoing
+/// `x ^= x >> s` takes the shift applied at `s`, then `2s`, until it reaches
+/// past the width, and the multiplications are undone with the multiplicative
+/// inverses of their constants modulo 2^64.
+#[inline]
+pub fn f64_from_key(key: i64) -> f64 {
+    let mut x = key as u64;
+    x ^= x >> 31;
+    x ^= x >> 62;
+    x = x.wrapping_mul(0x3196_42b2_d24d_8ec3);
+    x ^= x >> 27;
+    x ^= x >> 54;
+    x = x.wrapping_mul(0x96de_1b17_3f11_9089);
+    x ^= x >> 30;
+    x ^= x >> 60;
+    f64::from_bits(x)
 }
 
 pub struct OccupiedEntry<'a, V> {
@@ -1460,6 +1517,169 @@ mod tests {
         fn drop(&mut self) {
             *self.count.borrow_mut() += 1;
         }
+    }
+
+    /// Count how many distinct buckets a set of keys lands in.
+    fn bucket_occupancy(keys: &[i64], cap: usize) -> usize {
+        let mask = cap - 1;
+        let mut seen = vec![false; cap];
+        for &key in keys {
+            seen[I64Map::<u64>::hash(key) & mask] = true;
+        }
+        seen.iter().filter(|&&s| s).count()
+    }
+
+    /// Capacities filled to 3/4, which is the load factor the map grows at.
+    /// One capacity proves nothing on its own: the bucket index is masked, so
+    /// how a key shape behaves depends on the mask width and on how full the
+    /// table is.
+    fn sweep() -> impl Iterator<Item = (usize, usize)> {
+        [1024usize, 4096, 65536]
+            .into_iter()
+            .map(|cap| (cap, cap * 3 / 4))
+    }
+
+    /// The encoding must be exactly reversible, or grouping would report the
+    /// wrong value for every float group.
+    #[test]
+    fn test_float_key_round_trips() {
+        let mut values = vec![
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.1,
+            -0.1,
+            f64::MIN,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            f64::EPSILON,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::from_bits(1),                  // smallest subnormal
+            f64::from_bits(0x7ff8000000000001), // a NaN payload
+        ];
+        // A spread of ordinary values plus a deterministic pseudo-random walk
+        // over raw bit patterns, so exponents and mantissas of every shape are
+        // covered rather than just the friendly ones.
+        for i in 1..2000i64 {
+            values.push(i as f64);
+            values.push(i as f64 * 0.01);
+            values.push(1.0 / i as f64);
+        }
+        let mut x = 0x243f_6a88_85a3_08d3u64;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            values.push(f64::from_bits(x));
+        }
+
+        for value in values {
+            let key = key_from_f64(value);
+            let back = f64_from_key(key);
+            assert_eq!(
+                back.to_bits(),
+                value.to_bits(),
+                "round trip changed the bit pattern of {value:?}"
+            );
+        }
+    }
+
+    /// Distinct doubles must keep distinct keys, or two groups would merge.
+    #[test]
+    fn test_float_key_is_injective() {
+        let mut keys = std::collections::HashSet::new();
+        for i in 0..50_000i64 {
+            assert!(
+                keys.insert(key_from_f64(i as f64 * 0.5)),
+                "two doubles collapsed onto one key"
+            );
+        }
+    }
+
+    /// Float keys must spread across buckets.
+    ///
+    /// A double holding a round value keeps its significant bits at the top of
+    /// the mantissa and its low mantissa bits at zero, and the map's bucket
+    /// comes from the low bits of the key, so feeding the raw bit pattern in
+    /// puts every group into one bucket. The bar here is half the keys landing
+    /// in distinct buckets; an ideal hash reaches about 0.7 * n at this load.
+    #[test]
+    fn test_float_keys_spread_across_buckets() {
+        for (cap, n) in sweep() {
+            type FloatFamily = (&'static str, fn(usize) -> f64);
+            let families: [FloatFamily; 5] = [
+                ("whole", |i| i as f64),
+                ("halves", |i| i as f64 * 0.5),
+                ("money", |i| i as f64 * 0.01),
+                ("irregular", |i| i as f64 * 1.000_000_123_4),
+                ("tiny", |i| i as f64 * 1e-9),
+            ];
+            for (name, f) in families {
+                let keys: Vec<i64> = (1..=n).map(|i| key_from_f64(f(i))).collect();
+                let occupancy = bucket_occupancy(&keys, cap);
+                assert!(
+                    occupancy > n / 2,
+                    "{n} {name} float keys landed in {occupancy} of {cap} buckets"
+                );
+            }
+        }
+    }
+
+    /// A dense key range inside one 2^16 block must never collide.
+    ///
+    /// Row ids, transaction ids and every other counter key their maps this
+    /// way, so this is the property the hot path is built on, and it is
+    /// provable rather than measured: inside such a block `k >> 16` is
+    /// constant, so the pre-mix is `k ^ const`, and both that and the odd
+    /// multiply are permutations of the low bits.
+    ///
+    /// It stops being provable once a range straddles a block boundary, since
+    /// the two halves get different constants. See the test below for what
+    /// actually happens there.
+    #[test]
+    fn test_hash_keeps_dense_keys_collision_free() {
+        // 65536-aligned, so every window below stays inside one block.
+        const HIGH_BLOCK: i64 = 65536 * 15258;
+
+        for (cap, n) in sweep() {
+            let shapes: [(&str, Vec<i64>); 3] = [
+                ("from zero", (0..n as i64).collect()),
+                ("negative", (-(n as i64)..0).collect()),
+                ("high block", (HIGH_BLOCK..HIGH_BLOCK + n as i64).collect()),
+            ];
+            for (name, keys) in &shapes {
+                let occupancy = bucket_occupancy(keys, cap);
+                assert_eq!(
+                    occupancy, n,
+                    "hash collided on {n} dense keys ({name}) in {cap} slots"
+                );
+            }
+        }
+    }
+
+    /// A dense range that straddles a 2^16 block boundary is not collision
+    /// free, and this pins down how far it degrades.
+    ///
+    /// The two halves of such a range are pre-mixed with different constants,
+    /// so their images can overlap. Sliding a 3/4-full window across several
+    /// boundaries, the worst case found is this one: half the keys share a
+    /// bucket with another key, and no key needs more than 6 probes. This is a
+    /// baseline guard rather than an invariant, so that a change to the hash
+    /// cannot quietly make the boundary worse.
+    #[test]
+    fn test_hash_bounds_dense_keys_across_a_block_boundary() {
+        let cap = 1024usize;
+        let n = 768usize;
+        let start = 33_554_048i64; // ends 384 keys past a 2^16 boundary
+        let keys: Vec<i64> = (start..start + n as i64).collect();
+
+        let occupancy = bucket_occupancy(&keys, cap);
+        assert!(
+            occupancy * 2 >= n,
+            "{n} boundary-straddling dense keys landed in {occupancy} of {cap} buckets"
+        );
     }
 
     #[test]
