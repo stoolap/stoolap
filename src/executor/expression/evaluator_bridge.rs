@@ -1641,18 +1641,28 @@ impl<'a> CompiledEvaluator<'a> {
     /// Accepts CompactArc<str> keys directly to avoid conversion overhead.
     #[inline]
     pub fn set_outer_row_owned(&mut self, outer_row: FxHashMap<CompactArc<str>, Value>) {
-        // Collect outer column names for compilation (convert CompactArc<str> to String for outer_columns)
-        let outer_cols: Vec<String> = outer_row.keys().map(|k| k.to_string()).collect();
-        self.outer_row = Some(outer_row);
-        // Also set up outer_columns for compilation so LoadOuterColumn can be emitted
-        if !outer_cols.is_empty() {
-            // Sort for deterministic order
-            let mut sorted_cols = outer_cols;
+        // The compiled programs depend on the outer column *names*, not the
+        // values. A correlated loop hands the same key set back every row, so
+        // when it matches what was compiled against, the values are swapped
+        // in and the cache is kept. Rebuilding the name list and clearing the
+        // cache here recompiled every correlated expression on every row.
+        let same_columns = match &self.outer_columns {
+            Some(cols) => {
+                cols.len() == outer_row.len()
+                    && outer_row
+                        .keys()
+                        .all(|k| cols.binary_search_by(|c| c.as_str().cmp(k)).is_ok())
+            }
+            None => outer_row.is_empty(),
+        };
+        if !same_columns && !outer_row.is_empty() {
+            let mut sorted_cols: Vec<String> = outer_row.keys().map(|k| k.to_string()).collect();
             sorted_cols.sort();
             self.outer_columns = Some(sorted_cols);
             // Invalidate local cache since compilation context changed
             self.local_cache.clear();
         }
+        self.outer_row = Some(outer_row);
     }
 
     /// Compile an expression and return a shared program for parallel use.
@@ -1794,7 +1804,21 @@ impl<'a> CompiledEvaluator<'a> {
             Expression::InHashSet(in_hash) => {
                 in_hash.not.hash(hasher);
                 Self::hash_expression(&in_hash.column, hasher);
+                // The set is part of the program (its members are baked into
+                // the compiled lookup), so two nodes with different members
+                // must not share a cache entry. Hashing only the length let a
+                // correlated IN, which builds a fresh one-element set per
+                // outer row, hand every row the first row's program. Combine
+                // the members commutatively so equal sets hash equal in any
+                // iteration order.
                 in_hash.values.len().hash(hasher);
+                let mut members: u64 = 0;
+                for value in in_hash.values.iter() {
+                    let mut h = FxHasher::default();
+                    value.hash(&mut h);
+                    members = members.wrapping_add(h.finish());
+                }
+                members.hash(hasher);
             }
             Expression::Between(between) => {
                 between.not.hash(hasher);
@@ -2507,6 +2531,38 @@ mod tests {
         assert_eq!(
             eval.evaluate(&make_identifier("z")).unwrap(),
             Value::Integer(7)
+        );
+    }
+
+    /// Two IN-set nodes with different members must not share a compiled
+    /// program, and the same members in any order must. A correlated IN
+    /// builds a fresh one-element set per outer row, so hashing only the
+    /// length handed every row the first row's program.
+    #[test]
+    fn test_expr_hash_distinguishes_in_hash_set_members() {
+        use crate::core::ValueSet;
+        use crate::executor::utils::dummy_token;
+        use crate::parser::ast::InHashSetExpression;
+
+        let node = |members: &[i64]| {
+            let set: ValueSet = members.iter().map(|&v| Value::Integer(v)).collect();
+            Expression::InHashSet(InHashSetExpression {
+                token: dummy_token("IN", TokenType::Keyword),
+                column: Box::new(make_identifier("id")),
+                values: CompactArc::new(set),
+                not: false,
+            })
+        };
+        let eval = CompiledEvaluator::with_defaults();
+
+        assert_ne!(eval.expr_hash(&node(&[1])), eval.expr_hash(&node(&[2])));
+        assert_ne!(
+            eval.expr_hash(&node(&[1, 2])),
+            eval.expr_hash(&node(&[1, 3]))
+        );
+        assert_eq!(
+            eval.expr_hash(&node(&[1, 2, 3])),
+            eval.expr_hash(&node(&[3, 1, 2]))
         );
     }
 

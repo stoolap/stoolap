@@ -145,16 +145,7 @@ impl Executor {
             .iter()
             .map(|c| c.default_expr.clone())
             .collect();
-        let check_exprs: Vec<(usize, String, String)> = schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, c)| {
-                c.check_expr
-                    .as_ref()
-                    .map(|expr| (idx, c.name.clone(), expr.clone()))
-            })
-            .collect();
+        let check_programs = super::dml::compile_check_programs(schema)?;
 
         if stmt.columns.is_empty() {
             column_indices = (0..schema_column_count).collect();
@@ -198,7 +189,7 @@ impl Executor {
                 &all_column_types,
                 &all_vector_dims,
                 &default_exprs,
-                &check_exprs,
+                &check_programs,
                 &fk_schema,
                 schema_column_count,
             )?,
@@ -211,7 +202,7 @@ impl Executor {
                 &all_column_types,
                 &all_vector_dims,
                 &default_exprs,
-                &check_exprs,
+                &check_programs,
                 &fk_schema,
                 schema_column_count,
             )?,
@@ -241,7 +232,7 @@ impl Executor {
         all_column_types: &[DataType],
         all_vector_dims: &[u16],
         default_exprs: &[Option<String>],
-        check_exprs: &[(usize, String, String)],
+        check_programs: &[super::dml::CompiledCheck],
         fk_schema: &Option<CompactArc<Schema>>,
         schema_column_count: usize,
     ) -> Result<i64> {
@@ -285,6 +276,7 @@ impl Executor {
         let default_row =
             build_default_row(self, default_exprs, all_column_types, schema_column_count);
 
+        let mut check_vm = super::expression::ExprVM::new();
         for result in reader.records() {
             let record = result.map_err(|e| {
                 Error::InvalidArgument(format!(
@@ -324,14 +316,14 @@ impl Executor {
                 row_values[col_idx] = value;
             }
 
-            // Validate CHECK constraints
-            for (col_idx, col_name, check_expr) in check_exprs {
-                let col_type = all_column_types[*col_idx];
-                self.validate_check_constraint(
-                    check_expr,
+            // Validate CHECK constraints with the programs compiled once above
+            for (col_idx, col_name, check_expr, program) in check_programs {
+                super::dml::run_check_program(
+                    &mut check_vm,
+                    program,
                     col_name,
+                    check_expr,
                     &row_values[*col_idx],
-                    col_type,
                 )?;
             }
 
@@ -361,7 +353,7 @@ impl Executor {
         all_column_types: &[DataType],
         all_vector_dims: &[u16],
         default_exprs: &[Option<String>],
-        check_exprs: &[(usize, String, String)],
+        check_programs: &[super::dml::CompiledCheck],
         fk_schema: &Option<CompactArc<Schema>>,
         schema_column_count: usize,
     ) -> Result<i64> {
@@ -419,7 +411,7 @@ impl Executor {
                 all_column_types,
                 all_vector_dims,
                 null_str,
-                check_exprs,
+                check_programs,
                 fk_schema,
             )?;
             rows_affected += 1;
@@ -441,7 +433,7 @@ impl Executor {
         all_column_types: &[DataType],
         all_vector_dims: &[u16],
         null_str: Option<&str>,
-        check_exprs: &[(usize, String, String)],
+        check_programs: &[super::dml::CompiledCheck],
         fk_schema: &Option<CompactArc<Schema>>,
     ) -> Result<()> {
         let mut row_values = default_row.to_vec();
@@ -479,9 +471,15 @@ impl Executor {
             }
         }
 
-        for (col_idx, col_name, check_expr) in check_exprs {
-            let col_type = all_column_types[*col_idx];
-            self.validate_check_constraint(check_expr, col_name, &row_values[*col_idx], col_type)?;
+        let mut check_vm = super::expression::ExprVM::new();
+        for (col_idx, col_name, check_expr, program) in check_programs {
+            super::dml::run_check_program(
+                &mut check_vm,
+                program,
+                col_name,
+                check_expr,
+                &row_values[*col_idx],
+            )?;
         }
 
         let row = Row::from_values(row_values);
