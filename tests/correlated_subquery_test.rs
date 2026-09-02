@@ -1524,4 +1524,15 @@ fn test_correlated_inner_scope_shadows_outer_names() {
         count("SELECT COUNT(*) FROM child c WHERE EXISTS (SELECT 1 FROM parent p WHERE p.id = c.pid AND p.id > c.id)"),
         5
     );
+
+    // the outer alias is the inner table's name: with `FROM parent p` only
+    // `p` is inner, so `parent.id` and `parent.pid` are outer values
+    assert_eq!(
+        count("SELECT COUNT(*) FROM child parent WHERE (SELECT p.name FROM parent p WHERE parent.id = 5 AND p.id = parent.pid) = 'p6'"),
+        1
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM child parent WHERE EXISTS (SELECT 1 FROM parent p WHERE parent.id = 5 AND p.id = parent.pid)"),
+        1
+    );
 }

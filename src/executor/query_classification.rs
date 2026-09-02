@@ -851,11 +851,10 @@ impl QueryClassification {
             Expression::Identifier(ident) => {
                 tables.push(ident.value_lower.to_string());
             }
+            // An alias hides the table's own name: with `FROM t t2` only
+            // `t2` qualifies inner columns, and `t` may be an outer alias.
             Expression::Aliased(aliased) => {
-                // Add alias (use value_lower for case-insensitive matching)
                 tables.push(aliased.alias.value_lower.to_string());
-                // Also collect from inner expression
-                Self::collect_tables_recursive(&aliased.expression, tables);
             }
             Expression::JoinSource(join) => {
                 Self::collect_tables_recursive(&join.left, tables);
@@ -868,10 +867,10 @@ impl QueryClassification {
                 }
             }
             Expression::TableSource(table) => {
-                // Add table name and alias if present
-                tables.push(table.name.value_lower.to_string());
                 if let Some(ref alias) = table.alias {
                     tables.push(alias.value_lower.to_string());
+                } else {
+                    tables.push(table.name.value_lower.to_string());
                 }
             }
             Expression::FunctionTableSource(fs) => {
@@ -1420,5 +1419,29 @@ mod tests {
         let c_corr = get_classification(&correlated);
         assert!(!c_local.where_has_correlated_subqueries);
         assert!(c_corr.where_has_correlated_subqueries);
+    }
+
+    /// With `FROM parent p` only `p` names the inner table, so `parent.pid`
+    /// is an outer reference even though the outer alias equals the inner
+    /// table's name. Without an alias the table name is inner.
+    #[test]
+    fn alias_hides_the_inner_table_name() {
+        let parse = |sql: &str| {
+            let mut parser = crate::parser::Parser::new(sql);
+            let mut program = parser.parse_program().unwrap();
+            match program.statements.pop().unwrap() {
+                crate::parser::ast::Statement::Select(s) => s,
+                other => panic!("expected SELECT, got {:?}", other),
+            }
+        };
+        let shadowed = parse(
+            "SELECT * FROM child parent WHERE EXISTS (SELECT 1 FROM parent p WHERE p.id = parent.pid)",
+        );
+        let bare =
+            parse("SELECT * FROM child x WHERE EXISTS (SELECT 1 FROM parent WHERE parent.id = 1)");
+
+        clear_cache();
+        assert!(get_classification(&shadowed).where_has_correlated_subqueries);
+        assert!(!get_classification(&bare).where_has_correlated_subqueries);
     }
 }
