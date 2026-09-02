@@ -1229,16 +1229,14 @@ impl Executor {
         } else {
             None
         };
-        let is_pk_column = pk_name == Self::in_list_column(where_expr);
-        if !is_pk_column && !probe_secondary_index {
-            return Ok(None);
-        }
-
         let (column_name, values, is_negated, remaining_predicate) =
-            match Self::extract_in_list_info(where_expr, ctx) {
+            match Self::extract_in_list_info(where_expr, ctx, &|column| {
+                probe_secondary_index || pk_name == Some(column)
+            }) {
                 Some(info) => info,
                 None => return Ok(None),
             };
+        let is_pk_column = pk_name == Some(column_name.as_str());
 
         // Skip if SELECT columns have correlated subqueries (need per-row context)
         // classification is passed from caller to avoid redundant cache lookups
@@ -1441,25 +1439,10 @@ impl Executor {
 
     /// Extract IN list literal information from a WHERE clause.
     /// Returns (column_name, values, is_negated, remaining_predicate)
-    /// The column of the IN list `extract_in_list_info` would pick, found
-    /// without evaluating the list's values.
-    fn in_list_column(expr: &Expression) -> Option<&str> {
-        match expr {
-            Expression::In(in_expr) => match in_expr.left.as_ref() {
-                Expression::Identifier(id) => Some(id.value_lower.as_str()),
-                Expression::QualifiedIdentifier(qid) => Some(qid.name.value_lower.as_str()),
-                _ => None,
-            },
-            Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
-                Self::in_list_column(&infix.left).or_else(|| Self::in_list_column(&infix.right))
-            }
-            _ => None,
-        }
-    }
-
     pub(crate) fn extract_in_list_info(
         expr: &Expression,
         ctx: &ExecutionContext,
+        accept: &dyn Fn(&str) -> bool,
     ) -> Option<(String, Vec<Value>, bool, Option<Expression>)> {
         match expr {
             // Direct IN list: column IN (v1, v2, ...)
@@ -1470,6 +1453,11 @@ impl Executor {
                     Expression::QualifiedIdentifier(qid) => qid.name.value_lower.to_string(),
                     _ => return None, // Can't optimize complex left expressions
                 };
+                // Decided before the values are evaluated, so a list the
+                // caller would not probe costs nothing here.
+                if !accept(&column_name) {
+                    return None;
+                }
 
                 // Get the values from the right side (must be a literal list, not subquery)
                 let values = match in_expr.right.as_ref() {
@@ -1503,10 +1491,13 @@ impl Executor {
                         None => sibling.clone(),
                     }
                 };
-                if let Some((col, vals, neg, rest)) = Self::extract_in_list_info(&infix.left, ctx) {
+                if let Some((col, vals, neg, rest)) =
+                    Self::extract_in_list_info(&infix.left, ctx, accept)
+                {
                     return Some((col, vals, neg, Some(keep(rest, &infix.right))));
                 }
-                if let Some((col, vals, neg, rest)) = Self::extract_in_list_info(&infix.right, ctx)
+                if let Some((col, vals, neg, rest)) =
+                    Self::extract_in_list_info(&infix.right, ctx, accept)
                 {
                     return Some((col, vals, neg, Some(keep(rest, &infix.left))));
                 }
