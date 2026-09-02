@@ -39,9 +39,8 @@
 //!
 //! ## Known Limitations:
 //!
-//! ### Triple Lock Pattern for Write Operations
-//! The `add` and `remove` methods acquire three RwLock write locks simultaneously:
-//! - `hash_to_rows`: Maps hash -> row IDs for quick lookup
+//! ### Paired Lock Pattern for Write Operations
+//! The `add` and `remove` methods acquire both RwLock write locks simultaneously:
 //! - `row_to_hash`: Maps row_id -> hash for efficient removal
 //! - `hash_to_values`: Maps hash -> values for collision handling
 //!
@@ -54,7 +53,7 @@
 //!
 //! **Alternative considered**: Using a single RwLock<struct> would have similar
 //! contention characteristics. A concurrent map could help for truly concurrent writes
-//! but would complicate atomicity across the three maps.
+//! but would complicate atomicity across the two maps.
 
 use parking_lot::RwLock;
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -112,11 +111,6 @@ pub struct HashIndex {
     is_unique: bool,
     closed: AtomicBool,
 
-    /// Hash -> row IDs mapping
-    /// Uses u64 hash key to avoid storing full values (memory efficient)
-    /// CompactVec<i64> provides 16-byte storage (vs 48 bytes for SmallVec)
-    hash_to_rows: RwLock<FxHashMap<u64, CompactVec<i64>>>,
-
     /// Row ID -> hash mapping for efficient removal
     /// Uses I64Map for fast O(1) lookups (optimized for i64 keys)
     row_to_hash: RwLock<I64Map<u64>>,
@@ -164,11 +158,6 @@ impl HashIndex {
             data_types,
             is_unique,
             closed: AtomicBool::new(false),
-            hash_to_rows: RwLock::new(if expected_rows > 0 {
-                FxHashMap::with_capacity_and_hasher(expected_rows, Default::default())
-            } else {
-                FxHashMap::default()
-            }),
             row_to_hash: RwLock::new(if expected_rows > 0 {
                 I64Map::with_capacity(expected_rows)
             } else {
@@ -282,7 +271,6 @@ impl Index for HashIndex {
         let hash = hash_values(values);
 
         // Acquire all write locks to ensure atomic operation
-        let mut hash_to_rows = self.hash_to_rows.write();
         let mut row_to_hash = self.row_to_hash.write();
         let mut hash_to_values = self.hash_to_values.write();
 
@@ -305,13 +293,6 @@ impl Index for HashIndex {
             }
 
             // Different hash (or same hash with different values) - remove old entry
-            if let Some(rows) = hash_to_rows.get_mut(&old_hash) {
-                rows.retain(|id| *id != row_id);
-                if rows.is_empty() {
-                    hash_to_rows.remove(&old_hash);
-                }
-            }
-
             // Remove from values storage
             if let Some(entries) = hash_to_values.get_mut(&old_hash) {
                 for (_, row_ids) in entries.iter_mut() {
@@ -326,12 +307,6 @@ impl Index for HashIndex {
 
         // Check uniqueness constraint
         self.check_unique_constraint(values, row_id, hash, &hash_to_values)?;
-
-        // Add to hash_to_rows (insert sorted for O(N+M) merge operations)
-        let rows = hash_to_rows.entry(hash).or_default();
-        if let Err(pos) = rows.binary_search(&row_id) {
-            rows.insert(pos, row_id);
-        }
 
         // Add to row_to_hash
         row_to_hash.insert(row_id, hash);
@@ -377,19 +352,8 @@ impl Index for HashIndex {
 
         let hash = hash_values(values);
 
-        let mut hash_to_rows = self.hash_to_rows.write();
         let mut row_to_hash = self.row_to_hash.write();
         let mut hash_to_values = self.hash_to_values.write();
-
-        // Remove from hash_to_rows (row_ids are sorted, use binary search)
-        if let Some(rows) = hash_to_rows.get_mut(&hash) {
-            if let Ok(pos) = rows.binary_search(&row_id) {
-                rows.remove(pos);
-            }
-            if rows.is_empty() {
-                hash_to_rows.remove(&hash);
-            }
-        }
 
         // Remove from row_to_hash
         row_to_hash.remove(row_id);
@@ -436,12 +400,10 @@ impl Index for HashIndex {
         let num_cols = self.column_ids.len();
 
         // Acquire all write locks ONCE for entire batch
-        let mut hash_to_rows = self.hash_to_rows.write();
         let mut row_to_hash = self.row_to_hash.write();
         let mut hash_to_values = self.hash_to_values.write();
 
         // Reserve capacity to reduce reallocations
-        hash_to_rows.reserve(entries.len());
         row_to_hash.reserve(entries.len());
         hash_to_values.reserve(entries.len());
 
@@ -516,13 +478,6 @@ impl Index for HashIndex {
                 }
 
                 // Different hash (or same hash with different values) - remove old entry
-                if let Some(rows) = hash_to_rows.get_mut(&old_hash) {
-                    rows.retain(|id| *id != row_id);
-                    if rows.is_empty() {
-                        hash_to_rows.remove(&old_hash);
-                    }
-                }
-
                 if let Some(val_entries) = hash_to_values.get_mut(&old_hash) {
                     for (_, row_ids) in val_entries.iter_mut() {
                         row_ids.retain(|id| *id != row_id);
@@ -532,12 +487,6 @@ impl Index for HashIndex {
                         hash_to_values.remove(&old_hash);
                     }
                 }
-            }
-
-            // Add to hash_to_rows (sorted insertion)
-            let rows = hash_to_rows.entry(hash).or_default();
-            if let Err(pos) = rows.binary_search(&row_id) {
-                rows.insert(pos, row_id);
             }
 
             // Add to row_to_hash
@@ -580,22 +529,11 @@ impl Index for HashIndex {
         }
 
         // Acquire all write locks ONCE for entire batch
-        let mut hash_to_rows = self.hash_to_rows.write();
         let mut row_to_hash = self.row_to_hash.write();
         let mut hash_to_values = self.hash_to_values.write();
 
         for &(row_id, values) in entries {
             let hash = hash_values(values);
-
-            // Remove from hash_to_rows
-            if let Some(rows) = hash_to_rows.get_mut(&hash) {
-                if let Ok(pos) = rows.binary_search(&row_id) {
-                    rows.remove(pos);
-                }
-                if rows.is_empty() {
-                    hash_to_rows.remove(&hash);
-                }
-            }
 
             // Remove from row_to_hash
             row_to_hash.remove(row_id);
@@ -654,7 +592,6 @@ impl Index for HashIndex {
 
         let hash = hash_values(values);
 
-        // First check hash_to_rows for quick path (no collisions)
         let hash_to_values = self.hash_to_values.read();
 
         if let Some(entries) = hash_to_values.get(&hash) {
@@ -838,7 +775,6 @@ impl Index for HashIndex {
     }
 
     fn clear(&self) -> Result<()> {
-        self.hash_to_rows.write().clear();
         self.row_to_hash.write().clear();
         self.hash_to_values.write().clear();
         Ok(())
