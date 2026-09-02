@@ -586,25 +586,16 @@ impl<V> I64Map<V> {
 
     /// Drains all entries from the map, returning an iterator over them
     #[inline]
-    pub fn drain(&mut self) -> Drain<V> {
-        // Take slots and replace with fresh minimum-capacity slots
-        let old_slots = std::mem::replace(
-            &mut self.slots,
-            (0..MIN_CAPACITY)
-                .map(|_| Slot {
-                    key: EMPTY,
-                    value: MaybeUninit::uninit(),
-                })
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        );
-        self.len = 0;
-        self.mask = MIN_CAPACITY - 1;
-        Drain {
-            slots: old_slots,
-            pos: 0,
-            min_slot: self.min_slot.take(),
-        }
+    /// Move every entry out, leaving the map empty with its table intact.
+    ///
+    /// The iterator borrows the map and empties slots as it yields them, so
+    /// the map's capacity survives the drain. Swapping in a fresh 8-slot
+    /// table, as this used to, meant every pooled transaction map came back
+    /// at minimum size and regrew from scratch on the next transaction. An
+    /// entry the iterator has not reached yet stays in the map, so a leaked
+    /// drain leaves a consistent, merely undrained map behind.
+    pub fn drain(&mut self) -> Drain<'_, V> {
+        Drain { map: self, pos: 0 }
     }
 
     #[inline(always)]
@@ -1010,10 +1001,9 @@ impl<V> IntoIterator for I64Map<V> {
 }
 
 /// Draining iterator over the entries of an I64Map
-pub struct Drain<V> {
-    slots: Box<[Slot<V>]>,
+pub struct Drain<'a, V> {
+    map: &'a mut I64Map<V>,
     pos: usize,
-    min_slot: Option<V>,
 }
 
 // =============================================================================
@@ -1461,37 +1451,43 @@ impl Extend<i64> for I64Set {
     }
 }
 
-impl<V> Iterator for Drain<V> {
+impl<V> Iterator for Drain<'_, V> {
     type Item = (i64, V);
 
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        while self.pos < self.slots.len() {
-            let slot = &mut self.slots[self.pos];
+        while self.pos < self.map.slots.len() {
+            let slot = &mut self.map.slots[self.pos];
             self.pos += 1;
 
             if slot.key != EMPTY {
                 let key = slot.key;
-                // SAFETY: slot.key != EMPTY means the value is initialized.
+                // SAFETY: slot.key != EMPTY means the value is initialized, and
+                // the slot is marked empty before the value escapes so it can
+                // neither be read again nor dropped by the map.
                 let value = unsafe { slot.value.as_ptr().read() };
-                slot.key = EMPTY; // Mark as consumed to prevent double-drop
+                slot.key = EMPTY;
+                self.map.len -= 1;
                 return Some((key, value));
             }
         }
         // The side-slot entry drains last
-        self.min_slot.take().map(|v| (EMPTY, v))
+        self.map.min_slot.take().map(|v| (EMPTY, v))
     }
 
+    /// Exact: the map knows how many entries it still holds.
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let pending = usize::from(self.min_slot.is_some());
-        (pending, Some(self.slots.len() - self.pos + pending))
+        let remaining = self.map.len + usize::from(self.map.min_slot.is_some());
+        (remaining, Some(remaining))
     }
 }
 
-impl<V> Drop for Drain<V> {
+impl<V> ExactSizeIterator for Drain<'_, V> {}
+
+impl<V> Drop for Drain<'_, V> {
     fn drop(&mut self) {
-        // Consume remaining elements to ensure they're dropped
+        // Consume remaining elements so they are dropped and the map is empty
         for _ in self.by_ref() {}
     }
 }
@@ -1895,6 +1891,49 @@ mod tests {
         let mut values: Vec<_> = map.values().copied().collect();
         values.sort();
         assert_eq!(values, vec![10, 20, 30]);
+    }
+
+    /// Draining must not throw the table away: the transaction map pools
+    /// hand a drained map back to the next transaction, and a map that came
+    /// back at 8 slots regrew from scratch every time.
+    #[test]
+    fn test_drain_keeps_capacity() {
+        let mut map: I64Map<u64> = I64Map::new();
+        for i in 0..1000 {
+            map.insert(i, i as u64);
+        }
+        let before = map.capacity();
+        assert!(before >= 1000);
+        let drained = map.drain().count();
+        assert_eq!(drained, 1000);
+        assert!(map.is_empty());
+        assert_eq!(map.capacity(), before, "drain must keep the table");
+
+        // and the map is fully usable afterwards, without growing
+        for i in 0..1000 {
+            map.insert(i, i as u64);
+        }
+        assert_eq!(map.capacity(), before);
+        assert_eq!(map.len(), 1000);
+    }
+
+    /// `collect()` sizes its allocation from the lower bound, so a drain that
+    /// reported 0 forced a Vec to grow through every doubling.
+    #[test]
+    fn test_drain_size_hint_is_exact() {
+        let mut map: I64Map<u64> = I64Map::new();
+        for i in 0..100 {
+            map.insert(i, i as u64);
+        }
+        map.insert(i64::MIN, 7);
+        let mut drain = map.drain();
+        assert_eq!(drain.size_hint(), (101, Some(101)));
+        assert_eq!(drain.len(), 101);
+        drain.next();
+        assert_eq!(drain.size_hint(), (100, Some(100)));
+        let rest: Vec<(i64, u64)> = drain.collect();
+        assert_eq!(rest.len(), 100);
+        assert!(map.is_empty());
     }
 
     #[test]
