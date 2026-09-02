@@ -860,3 +860,40 @@ fn test_in_list_fast_path_keeps_query_semantics() {
         vec![9, 6, 3]
     );
 }
+
+/// The primary-key decision must belong to the IN list that is actually
+/// extracted. A first IN over the key with a subquery on its right is
+/// skipped by the extraction; the values of the next IN, over another
+/// column, must then not be treated as row ids.
+#[test]
+fn test_in_list_pk_decision_follows_the_extracted_list() {
+    let db = Database::open("memory://in_list_pk_decision").expect("Failed to create database");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE INDEX idx_t_age ON t(age)", ()).unwrap();
+    for i in 1..=30i64 {
+        db.execute("INSERT INTO t VALUES ($1, $2)", (i, i * 10))
+            .unwrap();
+    }
+    let ids = |sql: &str| -> Vec<i64> {
+        db.query(sql, ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+
+    // no row has age 7; treating 7 as a row id would return id 7
+    assert_eq!(
+        ids("SELECT id FROM t WHERE id NOT IN (SELECT id FROM t WHERE id < 0) AND age IN (7)"),
+        Vec::<i64>::new()
+    );
+    // age 70 belongs to id 7; treating 70 as a row id would find nothing
+    assert_eq!(
+        ids("SELECT id FROM t WHERE id NOT IN (SELECT id FROM t WHERE id < 0) AND age IN (70)"),
+        vec![7]
+    );
+    assert_eq!(
+        ids("SELECT id FROM t WHERE age IN (70, 80) AND id IN (SELECT id FROM t WHERE id > 7) ORDER BY id"),
+        vec![8]
+    );
+}
