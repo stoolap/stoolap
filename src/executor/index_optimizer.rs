@@ -1298,8 +1298,12 @@ impl Executor {
 
         // EARLY LIMIT OPTIMIZATION: When there's no ORDER BY and no remaining predicate,
         // we can apply LIMIT early to avoid fetching unnecessary rows
+        // LIMIT and OFFSET can be applied here only when nothing runs between
+        // this path and the result: no ORDER BY, and no DISTINCT that would
+        // otherwise see already-truncated rows.
+        let limit_here = stmt.order_by.is_empty() && !stmt.distinct && stmt.distinct_on.is_empty();
         let (early_limit_applied, early_limit, early_offset) =
-            if stmt.order_by.is_empty() && remaining_predicate.is_none() {
+            if limit_here && remaining_predicate.is_none() {
                 let offset = if let Some(ref offset_expr) = stmt.offset {
                     match ExpressionEval::compile(offset_expr, &[])
                         .ok()
@@ -1373,7 +1377,7 @@ impl Executor {
             } else if early_limit < rows.len() {
                 rows.truncate(early_limit);
             }
-        } else if stmt.order_by.is_empty() {
+        } else if limit_here {
             let offset = if let Some(ref offset_expr) = stmt.offset {
                 match ExpressionEval::compile(offset_expr, &[])
                     .ok()
@@ -1420,8 +1424,7 @@ impl Executor {
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
         // Without ORDER BY the LIMIT and OFFSET were applied above; the
         // caller must not apply them a second time.
-        let limit_applied =
-            stmt.order_by.is_empty() && (stmt.limit.is_some() || stmt.offset.is_some());
+        let limit_applied = limit_here && (stmt.limit.is_some() || stmt.offset.is_some());
         Ok(Some((Box::new(result), output_columns, limit_applied)))
     }
 
@@ -1459,13 +1462,26 @@ impl Executor {
 
             // IN list with AND: column IN (...) AND other_condition
             Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
-                // Try left side as IN list
-                if let Some((col, vals, neg, _)) = Self::extract_in_list_info(&infix.left, ctx) {
-                    return Some((col, vals, neg, Some((*infix.right).clone())));
+                // The IN list may sit under further ANDs; whatever those
+                // left over is kept together with this level's sibling.
+                let keep = |rest: Option<Expression>, sibling: &Expression| -> Expression {
+                    match rest {
+                        Some(rest) => Expression::Infix(InfixExpression {
+                            token: infix.token.clone(),
+                            left: Box::new(rest),
+                            operator: infix.operator.clone(),
+                            op_type: infix.op_type,
+                            right: Box::new(sibling.clone()),
+                        }),
+                        None => sibling.clone(),
+                    }
+                };
+                if let Some((col, vals, neg, rest)) = Self::extract_in_list_info(&infix.left, ctx) {
+                    return Some((col, vals, neg, Some(keep(rest, &infix.right))));
                 }
-                // Try right side as IN list
-                if let Some((col, vals, neg, _)) = Self::extract_in_list_info(&infix.right, ctx) {
-                    return Some((col, vals, neg, Some((*infix.left).clone())));
+                if let Some((col, vals, neg, rest)) = Self::extract_in_list_info(&infix.right, ctx)
+                {
+                    return Some((col, vals, neg, Some(keep(rest, &infix.left))));
                 }
                 None
             }

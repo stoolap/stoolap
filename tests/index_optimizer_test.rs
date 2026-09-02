@@ -796,3 +796,67 @@ fn test_spread_pk_in_list_probes_ids() {
         3
     );
 }
+
+/// Shapes the IN-list probe path must either handle or leave to the normal
+/// pipeline: every AND conjunct kept, window functions, DISTINCT before
+/// LIMIT, and an ORDER BY key that is not projected.
+#[test]
+fn test_in_list_fast_path_keeps_query_semantics() {
+    let db =
+        Database::open("memory://in_list_fast_path_semantics").expect("Failed to create database");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    for i in 1..=30i64 {
+        db.execute("INSERT INTO t VALUES ($1, $2, $3)", (i, i % 7, i * 3))
+            .unwrap();
+    }
+    let ids = |sql: &str| -> Vec<i64> {
+        db.query(sql, ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+
+    // three conjuncts: id 1 has grp 1 and v 3, id 8 has grp 1 and v 24
+    assert_eq!(
+        ids("SELECT id FROM t WHERE id IN (1, 8, 15) AND grp = 1 AND v = 3"),
+        vec![1]
+    );
+    assert_eq!(
+        ids("SELECT id FROM t WHERE grp = 1 AND id IN (1, 8, 15) AND v = 24"),
+        vec![8]
+    );
+
+    // window function over the probed rows
+    let numbered: Vec<(i64, i64)> = db
+        .query(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM t WHERE id IN (3, 1, 2) ORDER BY id",
+            (),
+        )
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.get::<i64>(0).unwrap(), r.get::<i64>(1).unwrap())
+        })
+        .collect();
+    assert_eq!(numbered, vec![(1, 1), (2, 2), (3, 3)]);
+
+    // DISTINCT applies before LIMIT: ids 1 and 8 share grp 1, id 16 has grp 2
+    assert_eq!(
+        ids("SELECT DISTINCT grp FROM t WHERE id IN (1, 8, 16) ORDER BY grp LIMIT 2"),
+        vec![1, 2]
+    );
+    assert_eq!(
+        ids("SELECT DISTINCT grp FROM t WHERE id IN (1, 8, 16) LIMIT 2").len(),
+        2
+    );
+
+    // ORDER BY on a column that is not projected
+    assert_eq!(
+        ids("SELECT v FROM t WHERE id IN (1, 2, 3) ORDER BY id DESC"),
+        vec![9, 6, 3]
+    );
+}

@@ -2481,8 +2481,15 @@ impl Executor {
         // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows.
         // Tried even when the IN list pushed down: pushdown turns it into a
         // min..max range, which on spread-out values scans the whole table.
-        // Skip if query has aggregation: projection cannot compile aggregate functions
-        if !has_outer_context && !classification.has_group_by && !classification.has_aggregation {
+        // Left to the normal pipeline: aggregation and window functions
+        // (this projection cannot compile them) and an ORDER BY key that is
+        // not projected (the sorter would not find it afterwards).
+        if !has_outer_context
+            && !classification.has_group_by
+            && !classification.has_aggregation
+            && !classification.has_window_functions
+            && !order_by_needs_extra_columns
+        {
             if let Some(where_expr) = where_to_use {
                 if let Some((result, columns, limit_applied)) = self
                     .try_in_list_index_optimization(
