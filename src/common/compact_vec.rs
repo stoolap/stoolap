@@ -31,8 +31,24 @@ use std::ops::{Deref, DerefMut, Index, IndexMut};
 use std::ptr::{self, NonNull};
 use std::slice;
 
-/// A compact vector that uses 16 bytes instead of Vec's 24 bytes.
-/// Stores length and capacity as u32 (max 4 billion elements).
+// One pointer plus a packed u64, padded to the larger of their alignments
+// (16 bytes on 64-bit and wasm32, 12 on i686), and the pointer's niche
+// keeps Option free.
+const _: () = {
+    let align = if mem::align_of::<u64>() > mem::align_of::<usize>() {
+        mem::align_of::<u64>()
+    } else {
+        mem::align_of::<usize>()
+    };
+    let expected = (mem::size_of::<usize>() + mem::size_of::<u64>()).next_multiple_of(align);
+    assert!(
+        mem::size_of::<CompactVec<u8>>() == expected
+            && mem::size_of::<Option<CompactVec<u8>>>() == mem::size_of::<CompactVec<u8>>()
+    );
+};
+
+/// A compact vector: one pointer plus two u32s, 16 bytes on 64-bit targets
+/// against Vec's 24. Holds at most u32::MAX elements.
 pub struct CompactVec<T> {
     ptr: NonNull<T>,
     /// Packed length (low 32 bits) and capacity (high 32 bits)
@@ -82,6 +98,13 @@ impl<T> CompactVec<T> {
         }
 
         let cap = capacity.min(u32::MAX as usize) as u32;
+
+        if mem::size_of::<T>() == 0 {
+            return Self {
+                ptr: NonNull::dangling(),
+                len_cap: Self::pack(0, cap),
+            };
+        }
 
         // Allocate memory
         let layout = Layout::array::<T>(cap as usize).unwrap();
@@ -204,7 +227,10 @@ impl<T> CompactVec<T> {
         // Unpack once
         let len = Self::unpack_len(self.len_cap) as usize;
         let cap = Self::unpack_cap(self.len_cap) as usize;
-        let required = len.saturating_add(additional);
+        let required = len
+            .checked_add(additional)
+            .filter(|&required| required <= u32::MAX as usize)
+            .expect("CompactVec capacity overflow");
 
         if required > cap {
             let new_cap = required.max(cap.saturating_mul(2)).min(u32::MAX as usize);
@@ -217,10 +243,13 @@ impl<T> CompactVec<T> {
     pub fn reserve_exact(&mut self, additional: usize) {
         let len = Self::unpack_len(self.len_cap) as usize;
         let cap = Self::unpack_cap(self.len_cap) as usize;
-        let required = len.saturating_add(additional);
+        let required = len
+            .checked_add(additional)
+            .filter(|&required| required <= u32::MAX as usize)
+            .expect("CompactVec capacity overflow");
 
         if required > cap {
-            self.realloc(required.min(u32::MAX as usize));
+            self.realloc(required);
         }
     }
 
@@ -232,6 +261,7 @@ impl<T> CompactVec<T> {
         } else {
             cap.saturating_mul(2).min(u32::MAX as usize)
         };
+        assert!(new_cap > cap, "CompactVec capacity overflow");
 
         self.realloc(new_cap);
     }
@@ -1467,6 +1497,31 @@ mod tests {
         // 0 and 1 are dropped with the vector, 2 was dropped above, 3 is leaked
         // by mem::forget. Nothing is dropped twice.
         assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
+    }
+
+    /// A zero-sized element type never touches the allocator, with or
+    /// without a requested capacity.
+    #[test]
+    fn test_zero_sized_elements_with_capacity() {
+        let mut v: CompactVec<()> = CompactVec::with_capacity(8);
+        assert_eq!(v.capacity(), 8);
+        for _ in 0..20 {
+            v.push(());
+        }
+        assert_eq!(v.len(), 20);
+        assert_eq!(v.pop(), Some(()));
+        v.clear();
+        assert!(v.is_empty());
+    }
+
+    /// The length and capacity share one u32 each; asking for more is an
+    /// error, not a silent cap that a later push would write past.
+    #[test]
+    #[should_panic(expected = "CompactVec capacity overflow")]
+    fn test_reserve_past_u32_panics() {
+        let mut v: CompactVec<u8> = CompactVec::new();
+        v.push(1);
+        v.reserve(u32::MAX as usize);
     }
 
     /// Repeated small reservations must grow geometrically, not once per call.

@@ -948,6 +948,7 @@ pub struct IntoIter<V> {
     slots: Box<[Slot<V>]>,
     pos: usize,
     min_slot: Option<V>,
+    remaining: usize,
 }
 
 impl<V> Iterator for IntoIter<V> {
@@ -964,6 +965,7 @@ impl<V> Iterator for IntoIter<V> {
                 // SAFETY: slot.key != EMPTY means the value is initialized.
                 let value = unsafe { slot.value.as_ptr().read() };
                 slot.key = EMPTY; // Mark as consumed to prevent double-drop
+                self.remaining -= 1;
                 return Some((key, value));
             }
         }
@@ -971,12 +973,15 @@ impl<V> Iterator for IntoIter<V> {
         self.min_slot.take().map(|v| (EMPTY, v))
     }
 
+    /// Exact: the entries still in the table plus the pending side slot.
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
-        let pending = usize::from(self.min_slot.is_some());
-        (pending, Some(self.slots.len() - self.pos + pending))
+        let remaining = self.remaining + usize::from(self.min_slot.is_some());
+        (remaining, Some(remaining))
     }
 }
+
+impl<V> ExactSizeIterator for IntoIter<V> {}
 
 impl<V> Drop for IntoIter<V> {
     fn drop(&mut self) {
@@ -1003,11 +1008,13 @@ impl<V> IntoIterator for I64Map<V> {
     fn into_iter(mut self) -> Self::IntoIter {
         let slots = std::mem::take(&mut self.slots);
         let min_slot = self.min_slot.take();
+        let remaining = self.len;
         self.len = 0; // Prevent drop from cleaning up values we're moving out
         IntoIter {
             slots,
             pos: 0,
             min_slot,
+            remaining,
         }
     }
 }
@@ -1996,6 +2003,24 @@ mod tests {
 
     /// `collect()` sizes its allocation from the lower bound, so a drain that
     /// reported 0 forced a Vec to grow through every doubling.
+    #[test]
+    fn test_into_iter_size_hint_is_exact() {
+        let mut map: I64Map<u64> = I64Map::new();
+        for i in 0..100 {
+            map.insert(i, i as u64);
+        }
+        map.insert(i64::MIN, 0);
+        let mut iter = map.into_iter();
+        assert_eq!(iter.len(), 101);
+        for expected in (0..101).rev() {
+            assert_eq!(iter.size_hint(), (expected + 1, Some(expected + 1)));
+            assert!(iter.next().is_some());
+            assert_eq!(iter.len(), expected);
+        }
+        assert!(iter.next().is_none());
+        assert_eq!(iter.size_hint(), (0, Some(0)));
+    }
+
     #[test]
     fn test_drain_size_hint_is_exact() {
         let mut map: I64Map<u64> = I64Map::new();
