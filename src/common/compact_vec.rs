@@ -1499,7 +1499,6 @@ mod tests {
         assert_eq!(DROP_COUNT.load(Ordering::SeqCst), 3);
     }
 
-    /// Repeated small reservations must grow geometrically, not once per call.
     /// A zero-sized element type never touches the allocator, with or
     /// without a requested capacity.
     #[test]
@@ -1525,6 +1524,7 @@ mod tests {
         v.reserve(u32::MAX as usize);
     }
 
+    /// Repeated small reservations must grow geometrically, not once per call.
     #[test]
     fn test_reserve_amortizes_and_reserve_exact_does_not() {
         let mut v: CompactVec<u64> = CompactVec::new();
