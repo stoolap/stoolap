@@ -1888,116 +1888,113 @@ pub fn compute_join_projection(
     outer_columns: &[String],
     inner_columns: &[String],
 ) -> Option<JoinProjectionIndices> {
-    // Build column index maps for fast lookup
     let outer_col_count = outer_columns.len();
-    let combined: Vec<String> = outer_columns
-        .iter()
-        .chain(inner_columns.iter())
-        .cloned()
-        .collect();
-    let col_index_map = build_column_index_map(&combined);
+    // Resolved by scanning the two short column lists instead of building a
+    // map with an owned copy of every name on every execution.
+    let columns_all = || outer_columns.iter().chain(inner_columns.iter());
+    // Duplicate full names resolve to the later column, as the index map
+    // built from these lists always did.
+    let resolve = |name: &str| -> Option<usize> {
+        if let Some((i, _)) = columns_all()
+            .enumerate()
+            .filter(|(_, c)| eq_folded(c, name))
+            .last()
+        {
+            return Some(i);
+        }
+        // "t.val" answers to "val" when no other column has that base name
+        let mut found = None;
+        for (i, c) in columns_all().enumerate() {
+            if let Some(dot) = c.rfind('.') {
+                if eq_folded(&c[dot + 1..], name) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(i);
+                }
+            }
+        }
+        found
+    };
+    let resolve_qualified = |qualifier: &str, name: &str| -> Option<usize> {
+        columns_all()
+            .enumerate()
+            .filter(|(_, c)| eq_folded_qualified(c, qualifier, name))
+            .last()
+            .map(|(i, _)| i)
+            .or_else(|| resolve(name))
+    };
+    let source = |idx: usize| {
+        if idx < outer_col_count {
+            ColumnSource::Outer(idx)
+        } else {
+            ColumnSource::Inner(idx - outer_col_count)
+        }
+    };
 
-    let mut columns = Vec::new();
-    let mut output_columns = Vec::new();
-
+    let mut columns = Vec::with_capacity(select_exprs.len());
+    let mut output_columns = Vec::with_capacity(select_exprs.len());
     for expr in select_exprs {
-        match expr {
-            // SELECT * - cannot push down projection
-            Expression::Star(_) | Expression::QualifiedStar(_) => return None,
-
-            Expression::Identifier(id) => {
-                let col_lower = id.value_lower.as_str();
-                if let Some(&idx) = col_index_map.get(col_lower) {
-                    if idx < outer_col_count {
-                        columns.push(ColumnSource::Outer(idx));
-                    } else {
-                        columns.push(ColumnSource::Inner(idx - outer_col_count));
-                    }
-                    output_columns.push(id.value.to_string());
-                } else {
-                    // Column not found - cannot push down
-                    return None;
-                }
-            }
-
-            Expression::QualifiedIdentifier(qid) => {
-                // Try qualified name first
-                let full_name = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
-                if let Some(&idx) = col_index_map.get(&full_name) {
-                    if idx < outer_col_count {
-                        columns.push(ColumnSource::Outer(idx));
-                    } else {
-                        columns.push(ColumnSource::Inner(idx - outer_col_count));
-                    }
-                    // Output column name is just the column name, not qualified
-                    // (SQL standard: SELECT e.name produces column "name", not "e.name")
-                    output_columns.push(qid.name.value.to_string());
-                } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
-                    // Fall back to unqualified name
-                    if idx < outer_col_count {
-                        columns.push(ColumnSource::Outer(idx));
-                    } else {
-                        columns.push(ColumnSource::Inner(idx - outer_col_count));
-                    }
-                    output_columns.push(qid.name.value.to_string());
-                } else {
-                    // Column not found - cannot push down
-                    return None;
-                }
-            }
-
+        let (idx, name) = match expr {
+            Expression::Identifier(id) => (resolve(&id.value_lower)?, id.value.to_string()),
+            Expression::QualifiedIdentifier(qid) => (
+                resolve_qualified(&qid.qualifier.value_lower, &qid.name.value_lower)?,
+                qid.name.value.to_string(),
+            ),
             Expression::Aliased(aliased) => {
-                // Handle aliased expressions - check if inner is a simple column
-                let alias_name = aliased.alias.value.to_string();
+                let alias = aliased.alias.value.to_string();
                 match &*aliased.expression {
-                    Expression::Identifier(id) => {
-                        let col_lower = id.value_lower.as_str();
-                        if let Some(&idx) = col_index_map.get(col_lower) {
-                            if idx < outer_col_count {
-                                columns.push(ColumnSource::Outer(idx));
-                            } else {
-                                columns.push(ColumnSource::Inner(idx - outer_col_count));
-                            }
-                            output_columns.push(alias_name);
-                        } else {
-                            return None;
-                        }
-                    }
-                    Expression::QualifiedIdentifier(qid) => {
-                        let full_name =
-                            format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
-                        if let Some(&idx) = col_index_map.get(&full_name) {
-                            if idx < outer_col_count {
-                                columns.push(ColumnSource::Outer(idx));
-                            } else {
-                                columns.push(ColumnSource::Inner(idx - outer_col_count));
-                            }
-                            output_columns.push(alias_name);
-                        } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str())
-                        {
-                            if idx < outer_col_count {
-                                columns.push(ColumnSource::Outer(idx));
-                            } else {
-                                columns.push(ColumnSource::Inner(idx - outer_col_count));
-                            }
-                            output_columns.push(alias_name);
-                        } else {
-                            return None;
-                        }
-                    }
+                    Expression::Identifier(id) => (resolve(&id.value_lower)?, alias),
+                    Expression::QualifiedIdentifier(qid) => (
+                        resolve_qualified(&qid.qualifier.value_lower, &qid.name.value_lower)?,
+                        alias,
+                    ),
                     _ => return None, // Complex expression - cannot push down
                 }
             }
-
-            // Any other expression type cannot be pushed down
             _ => return None,
-        }
+        };
+        columns.push(source(idx));
+        output_columns.push(name);
     }
 
     Some(JoinProjectionIndices {
         columns,
         output_columns,
     })
+}
+
+/// Case-insensitive comparison of a column name against an already
+/// lowercased name, folding the Unicode way without allocating.
+#[inline]
+fn eq_folded(column: &str, lower: &str) -> bool {
+    if column.is_ascii() && lower.is_ascii() {
+        column.eq_ignore_ascii_case(lower)
+    } else {
+        column
+            .chars()
+            .flat_map(char::to_lowercase)
+            .eq(lower.chars())
+    }
+}
+
+/// The same for `qualifier.name`, compared as one string so that a dot
+/// inside a quoted qualifier or name is not taken for the separator.
+#[inline]
+fn eq_folded_qualified(column: &str, qualifier: &str, name: &str) -> bool {
+    if column.is_ascii() && qualifier.is_ascii() && name.is_ascii() {
+        let q = qualifier.len();
+        column.len() == q + 1 + name.len()
+            && column.as_bytes()[q] == b'.'
+            && column[..q].eq_ignore_ascii_case(qualifier)
+            && column[q + 1..].eq_ignore_ascii_case(name)
+    } else {
+        let expected = qualifier
+            .chars()
+            .chain(std::iter::once('.'))
+            .chain(name.chars());
+        column.chars().flat_map(char::to_lowercase).eq(expected)
+    }
 }
 
 #[cfg(test)]
@@ -2023,6 +2020,48 @@ mod tests {
             qualifier: Box::new(q),
             name: Box::new(n),
         })
+    }
+
+    /// Column names fold case the Unicode way, and when two columns share
+    /// a name the later one wins, as the column index map always did.
+    #[test]
+    fn test_join_projection_folds_unicode_and_prefers_the_later_duplicate() {
+        let outer = vec!["u.ÄNAME".to_string(), "u.x".to_string()];
+        let inner = vec!["o.x".to_string(), "x".to_string()];
+
+        let proj = compute_join_projection(&[qualified("u", "äname")], &outer, &inner)
+            .expect("Unicode-folded name must resolve");
+        assert!(matches!(proj.columns[0], ColumnSource::Outer(0)));
+
+        // bare `x`: exact matches only the unqualified inner column
+        let proj = compute_join_projection(&[ident("x")], &outer, &inner).unwrap();
+        assert!(matches!(proj.columns[0], ColumnSource::Inner(1)));
+
+        // `s.x` is not a full name; the bare fallback finds the exact `x`
+        let proj = compute_join_projection(&[qualified("s", "x")], &outer, &inner).unwrap();
+        assert!(matches!(proj.columns[0], ColumnSource::Inner(1)));
+        // without an exact `x`, two columns ending in `.x` are ambiguous
+        let two = vec!["u.x".to_string(), "o.x".to_string()];
+        assert!(compute_join_projection(&[ident("x")], &two, &[]).is_none());
+
+        // duplicate full names: the later one wins
+        let dup = vec!["v".to_string(), "v".to_string()];
+        let proj = compute_join_projection(&[ident("v")], &dup, &[]).unwrap();
+        assert!(matches!(proj.columns[0], ColumnSource::Outer(1)));
+    }
+
+    /// A quoted alias may contain a dot; `"a.b".x` must match the column
+    /// `a.b.x` as a whole and not fall back to a bare `x` elsewhere.
+    #[test]
+    fn test_join_projection_keeps_dots_inside_a_qualifier() {
+        let outer = vec!["x".to_string()];
+        let inner = vec!["a.b.id".to_string(), "a.b.x".to_string()];
+        let proj = compute_join_projection(&[qualified("a.b", "x")], &outer, &inner).unwrap();
+        assert!(matches!(proj.columns[0], ColumnSource::Inner(1)));
+
+        let unicode = vec!["Ä.b.x".to_string()];
+        let proj = compute_join_projection(&[qualified("ä.b", "x")], &unicode, &[]).unwrap();
+        assert!(matches!(proj.columns[0], ColumnSource::Outer(0)));
     }
 
     /// Outer values reach the subquery's WHERE, but names that belong to

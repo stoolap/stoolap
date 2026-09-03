@@ -47,7 +47,19 @@ pub enum IndexLookupStrategy {
 }
 
 /// Specifies which side (outer or inner) a projected column comes from.
-#[derive(Clone, Copy)]
+/// A projected value out of a row that is being consumed. A source used
+/// more than once must be cloned every time; moving it would hand the
+/// second use a NULL.
+#[inline]
+fn take_or_clone(row: &mut Row, idx: usize, repeats: bool) -> Value {
+    if repeats {
+        row.as_slice()[idx].clone()
+    } else {
+        row.take_or_clone(idx)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ColumnSource {
     /// Column from outer row at given index
     Outer(usize),
@@ -62,6 +74,8 @@ pub enum ColumnSource {
 pub struct JoinProjection {
     /// Columns to extract, in SELECT order (preserves original column ordering)
     pub columns: Vec<ColumnSource>,
+    /// A source appears more than once, so values are cloned, not moved.
+    pub repeats_source: bool,
 }
 
 /// Index Nested Loop Join Operator.
@@ -178,7 +192,14 @@ impl IndexNestedLoopJoinOperator {
         columns: Vec<ColumnSource>,
         projected_schema: Vec<ColumnInfo>,
     ) -> Self {
-        self.projection = Some(JoinProjection { columns });
+        let repeats_source = columns
+            .iter()
+            .enumerate()
+            .any(|(i, c)| columns[..i].contains(c));
+        self.projection = Some(JoinProjection {
+            columns,
+            repeats_source,
+        });
         self.schema = projected_schema;
         self
     }
@@ -199,30 +220,26 @@ impl IndexNestedLoopJoinOperator {
     /// Uses `get_unchecked` for performance - projection indices are validated
     /// at query planning time against the table schemas.
     #[inline]
-    fn combine_owned_into_buffer(&mut self, outer: Row, inner: Row) {
+    fn combine_owned_into_buffer(&mut self, mut outer: Row, mut inner: Row) {
         match &self.projection {
             Some(proj) => {
                 // Fused projection into buffer - columns are in SELECT order
                 self.row_buffer.clear();
                 self.row_buffer.reserve(proj.columns.len());
 
-                // OPTIMIZATION: Move values instead of cloning (we own both rows)
-                let mut outer_values = outer.into_values();
-                let mut inner_values = inner.into_values();
-
+                // Only the projected values leave the two rows; converting
+                // both rows to Vec<Value> first cloned every column of a
+                // shared row for the one or two that were kept.
+                let repeats = proj.repeats_source;
                 for col_source in &proj.columns {
                     match col_source {
                         ColumnSource::Outer(idx) => {
-                            // SAFETY: indices validated at planning time against outer table schema.
-                            self.row_buffer.push(std::mem::take(unsafe {
-                                outer_values.get_unchecked_mut(*idx)
-                            }));
+                            self.row_buffer
+                                .push(take_or_clone(&mut outer, *idx, repeats));
                         }
                         ColumnSource::Inner(idx) => {
-                            // SAFETY: indices validated at planning time against inner table schema.
-                            self.row_buffer.push(std::mem::take(unsafe {
-                                inner_values.get_unchecked_mut(*idx)
-                            }));
+                            self.row_buffer
+                                .push(take_or_clone(&mut inner, *idx, repeats));
                         }
                     }
                 }
@@ -249,7 +266,7 @@ impl IndexNestedLoopJoinOperator {
     /// Uses `get_unchecked` for performance - projection indices are validated
     /// at query planning time against the table schemas.
     #[inline]
-    fn create_combined_row(&self, outer: &Row, inner: Row) -> Row {
+    fn create_combined_row(&self, outer: &Row, mut inner: Row) -> Row {
         match &self.projection {
             Some(proj) => {
                 // Fused projection: create only the columns we need, in SELECT order
@@ -257,7 +274,6 @@ impl IndexNestedLoopJoinOperator {
 
                 // We need to move from inner but clone from outer (we don't own outer)
                 let outer_slice = outer.as_slice();
-                let mut inner_values = inner.into_values();
 
                 for col_source in &proj.columns {
                     match col_source {
@@ -266,10 +282,7 @@ impl IndexNestedLoopJoinOperator {
                             values.push(unsafe { outer_slice.get_unchecked(*idx) }.clone());
                         }
                         ColumnSource::Inner(idx) => {
-                            // SAFETY: indices validated at planning time against inner table schema.
-                            values.push(std::mem::take(unsafe {
-                                inner_values.get_unchecked_mut(*idx)
-                            }));
+                            values.push(take_or_clone(&mut inner, *idx, proj.repeats_source));
                         }
                     }
                 }
@@ -565,7 +578,14 @@ impl BatchIndexNestedLoopJoinOperator {
         columns: Vec<ColumnSource>,
         projected_schema: Vec<ColumnInfo>,
     ) -> Self {
-        self.projection = Some(JoinProjection { columns });
+        let repeats_source = columns
+            .iter()
+            .enumerate()
+            .any(|(i, c)| columns[..i].contains(c));
+        self.projection = Some(JoinProjection {
+            columns,
+            repeats_source,
+        });
         self.schema = projected_schema;
         self
     }

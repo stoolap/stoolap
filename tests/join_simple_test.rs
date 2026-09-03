@@ -352,3 +352,50 @@ fn test_cross_join() {
         );
     }
 }
+
+/// A column projected twice through the index nested loop join must come
+/// back twice. The fused projection used to move the value out on its
+/// first use and hand back NULL on the second.
+#[test]
+fn test_inl_join_projects_a_repeated_column_twice() {
+    let db = Database::open("memory://inl_repeated_column").expect("Failed to create database");
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount FLOAT)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_orders_user_id ON orders(user_id)", ())
+        .unwrap();
+    for i in 1..=20i64 {
+        db.execute(
+            "INSERT INTO users VALUES ($1, $2)",
+            (i, format!("User_{}", i)),
+        )
+        .unwrap();
+    }
+    for i in 1..=60i64 {
+        db.execute(
+            "INSERT INTO orders VALUES ($1, $2, $3)",
+            (i, (i % 20) + 1, i as f64),
+        )
+        .unwrap();
+    }
+    let rows: Vec<(String, f64, f64, String)> = db
+        .query(
+            "SELECT u.name, o.amount, o.amount, u.name FROM users u INNER JOIN orders o ON u.id = o.user_id LIMIT 5",
+            (),
+        )
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.get(0).unwrap(), r.get(1).unwrap(), r.get(2).unwrap(), r.get(3).unwrap())
+        })
+        .collect();
+    assert_eq!(rows.len(), 5);
+    for (name, a, b, name2) in rows {
+        assert_eq!(a, b, "amount must be projected twice");
+        assert_eq!(name, name2, "name must be projected twice");
+    }
+}
