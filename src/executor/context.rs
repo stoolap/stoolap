@@ -677,6 +677,32 @@ pub fn cache_exists_correlation(
 ///
 /// Note: This struct uses Arc for immutable shared data to make cloning cheap
 /// during correlated subquery processing where context is cloned per row.
+/// A transaction shared by every read of one statement
+#[derive(Clone)]
+pub struct StatementSnapshot(Arc<Mutex<Box<dyn crate::storage::traits::Transaction>>>);
+
+impl StatementSnapshot {
+    pub fn new(transaction: Box<dyn crate::storage::traits::Transaction>) -> Self {
+        Self(Arc::new(Mutex::new(transaction)))
+    }
+
+    pub fn get_table(
+        &self,
+        name: &str,
+    ) -> crate::core::Result<Box<dyn crate::storage::traits::Table>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_table(name)
+    }
+}
+
+impl std::fmt::Debug for StatementSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StatementSnapshot")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutionContext {
     /// Query parameters ($1, $2, etc.) - wrapped in Arc for cheap cloning
@@ -710,6 +736,9 @@ pub struct ExecutionContext {
     cte_data: Option<Arc<CteDataMap>>,
     /// Current transaction ID for CURRENT_TRANSACTION_ID() function
     transaction_id: Option<u64>,
+    /// One transaction for every fetch of a statement that has no explicit
+    /// transaction, so its reads share a snapshot
+    statement_snapshot: Option<StatementSnapshot>,
 }
 
 /// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
@@ -745,6 +774,7 @@ impl ExecutionContext {
             outer_columns: None,
             cte_data: None,
             transaction_id: None,
+            statement_snapshot: None,
         }
     }
 
@@ -905,6 +935,7 @@ impl ExecutionContext {
             outer_columns: self.outer_columns.clone(),
             cte_data: self.cte_data.clone(),
             transaction_id: self.transaction_id,
+            statement_snapshot: self.statement_snapshot.clone(),
         }
     }
 
@@ -925,6 +956,7 @@ impl ExecutionContext {
             outer_columns: self.outer_columns.clone(),
             cte_data: self.cte_data.clone(),
             transaction_id: self.transaction_id,
+            statement_snapshot: self.statement_snapshot.clone(),
         }
     }
 
@@ -960,6 +992,7 @@ impl ExecutionContext {
             outer_columns: Some(outer_columns), // Arc clone = cheap
             cte_data: self.cte_data.clone(),    // Arc clone = cheap
             transaction_id: self.transaction_id,
+            statement_snapshot: self.statement_snapshot.clone(),
         }
     }
 
@@ -1012,6 +1045,7 @@ impl ExecutionContext {
             outer_columns: self.outer_columns.clone(),
             cte_data: Some(cte_data),
             transaction_id: self.transaction_id,
+            statement_snapshot: self.statement_snapshot.clone(),
         }
     }
 
@@ -1026,6 +1060,18 @@ impl ExecutionContext {
     }
 
     /// Create a new context with a transaction ID
+    /// The statement-scoped snapshot, if the statement carries one
+    pub fn statement_snapshot(&self) -> Option<&StatementSnapshot> {
+        self.statement_snapshot.as_ref()
+    }
+
+    /// A copy of this context whose reads go through `snapshot`
+    pub fn with_statement_snapshot(&self, snapshot: StatementSnapshot) -> Self {
+        let mut ctx = self.clone();
+        ctx.statement_snapshot = Some(snapshot);
+        ctx
+    }
+
     pub fn with_transaction_id(&self, txn_id: u64) -> Self {
         Self {
             params: self.params.clone(),
@@ -1041,6 +1087,7 @@ impl ExecutionContext {
             outer_columns: self.outer_columns.clone(),
             cte_data: self.cte_data.clone(),
             transaction_id: Some(txn_id),
+            statement_snapshot: self.statement_snapshot.clone(),
         }
     }
 
