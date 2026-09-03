@@ -197,7 +197,7 @@ struct SemijoinReduction {
 }
 
 /// The left chunk the last reduction pass used; execute_join_source retries
-/// with a larger one when the final rows stop short of the limit
+/// with twice the chunk when the final rows stop short of the limit
 #[derive(Clone, Copy)]
 struct ReductionPass {
     cap: usize,
@@ -3785,7 +3785,7 @@ impl Executor {
             if !short {
                 return Ok((result, columns, flag, deferred));
             }
-            left_cap = Some(pass.cap.saturating_mul(4));
+            left_cap = Some(pass.cap.saturating_mul(2));
         }
     }
 
@@ -8996,8 +8996,9 @@ impl Executor {
     }
 
     /// LIMIT and OFFSET of a GROUP BY + LIMIT join as (initial left chunk, rows
-    /// expected after OFFSET). An INNER JOIN over-fetches its first chunk since
-    /// a left row without a match forms no group
+    /// expected after OFFSET). The first chunk is doubled for an INNER JOIN,
+    /// where a left row without a match forms no group, and doubled again
+    /// under HAVING, which drops groups after the fact
     fn semijoin_caps(stmt: &SelectStatement, is_inner: bool) -> Option<(usize, usize)> {
         let eval = |e: &Expression| {
             ExpressionEval::compile(e, &[])
@@ -9017,11 +9018,13 @@ impl Executor {
             None => 0,
         };
         let want = limit.saturating_add(offset);
-        let cap = if is_inner {
-            want.saturating_mul(2)
-        } else {
-            want
-        };
+        let mut cap = want;
+        if is_inner {
+            cap = cap.saturating_mul(2);
+        }
+        if stmt.having.is_some() {
+            cap = cap.saturating_mul(2);
+        }
         Some((cap, limit))
     }
 
