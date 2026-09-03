@@ -582,12 +582,28 @@ fn test_window_row_number_with_limit() {
         )
         .expect("Failed to query");
 
+    // every returned row must carry its true rank by price, whichever rows
+    // the limit picked
+    let true_rank: std::collections::HashMap<i64, i64> = db
+        .query(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY price) FROM products",
+            (),
+        )
+        .expect("Failed to query")
+        .map(|row| {
+            let row = row.expect("Failed to get row");
+            (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+        })
+        .collect();
+
     let mut count = 0;
     for row in result {
         let row = row.expect("Failed to get row");
+        let id: i64 = row.get(0).unwrap();
         let rn: i64 = row.get(2).unwrap();
         count += 1;
         assert!((1..=5).contains(&rn), "Expected row number 1-5, got {}", rn);
+        assert_eq!(rn, true_rank[&id], "row {id} carries another row's rank");
     }
 
     assert_eq!(count, 5, "Expected 5 rows");
