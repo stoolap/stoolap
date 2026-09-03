@@ -3008,7 +3008,9 @@ impl Executor {
                 let can_early_terminate = !classification.has_order_by
                     && !classification.has_group_by
                     && !classification.has_aggregation
-                    && !classification.has_window_functions;
+                    && !classification.has_window_functions
+                    && !stmt.distinct
+                    && stmt.distinct_on.is_empty();
 
                 let early_termination_target = if can_early_terminate {
                     let offset = stmt

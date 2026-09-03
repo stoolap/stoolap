@@ -554,9 +554,27 @@ impl Executor {
     fn is_expr_window_safe(expr: &Expression) -> bool {
         match expr {
             Expression::Window(window_expr) => {
+                use crate::parser::ast::WindowFrameBound;
                 let func_name = window_expr.function.function.to_uppercase();
-                // These functions depend on total row count - NOT safe
-                !matches!(func_name.as_str(), "NTILE" | "PERCENT_RANK" | "CUME_DIST")
+                // A fetch cut at LIMIT rows is wrong for anything that looks past
+                // the current row: total-count functions, LEAD, a frame that
+                // reaches forward, or a named window whose frame is not visible here
+                let forward = |b: &WindowFrameBound| {
+                    matches!(
+                        b,
+                        WindowFrameBound::Following(_) | WindowFrameBound::UnboundedFollowing
+                    )
+                };
+                let reaches_forward = window_expr.window_ref.is_some()
+                    || window_expr
+                        .frame
+                        .as_ref()
+                        .is_some_and(|f| forward(&f.start) || f.end.as_ref().is_some_and(forward));
+                !reaches_forward
+                    && !matches!(
+                        func_name.as_str(),
+                        "NTILE" | "PERCENT_RANK" | "CUME_DIST" | "LEAD"
+                    )
             }
             Expression::Aliased(aliased) => Self::is_expr_window_safe(&aliased.expression),
             // Recursively check expressions that can contain window functions
@@ -873,6 +891,9 @@ impl Executor {
                 Some(info) => info,
                 None => return Ok(None),
             };
+        // LIMIT and OFFSET can be applied here only when nothing runs on the
+        // rows afterwards: no ORDER BY to sort them and no DISTINCT to merge them
+        let limit_here = stmt.order_by.is_empty() && !stmt.distinct && stmt.distinct_on.is_empty();
 
         // Skip correlated subqueries - they can't be pre-evaluated
         if Self::is_subquery_correlated(&subquery.subquery) {
@@ -1022,9 +1043,7 @@ impl Executor {
 
                 // Stop early only when nothing after this point drops or reorders
                 // rows; the shared tail applies OFFSET and LIMIT once
-                let target = if limit == usize::MAX
-                    || !stmt.order_by.is_empty()
-                    || remaining_predicate.is_some()
+                let target = if limit == usize::MAX || !limit_here || remaining_predicate.is_some()
                 {
                     usize::MAX
                 } else {
@@ -1071,7 +1090,7 @@ impl Executor {
         // EARLY LIMIT OPTIMIZATION: When there's no ORDER BY and no remaining predicate,
         // we can apply LIMIT early to avoid fetching unnecessary rows
         let (early_limit_applied, early_limit, early_offset) =
-            if stmt.order_by.is_empty() && remaining_predicate.is_none() {
+            if limit_here && remaining_predicate.is_none() {
                 let offset = if let Some(ref offset_expr) = stmt.offset {
                     match ExpressionEval::compile(offset_expr, &[])
                         .ok()
@@ -1145,7 +1164,7 @@ impl Executor {
             } else if early_limit < rows.len() {
                 rows.truncate(early_limit);
             }
-        } else if stmt.order_by.is_empty() {
+        } else if limit_here {
             let offset = if let Some(ref offset_expr) = stmt.offset {
                 match ExpressionEval::compile(offset_expr, &[])
                     .ok()
@@ -1191,11 +1210,7 @@ impl Executor {
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
         // OFFSET and LIMIT were applied above unless ORDER BY has to run first
-        Ok(Some((
-            Box::new(result),
-            output_columns,
-            stmt.order_by.is_empty(),
-        )))
+        Ok(Some((Box::new(result), output_columns, limit_here)))
     }
 
     /// IN list literal index optimization
@@ -1588,6 +1603,9 @@ impl Executor {
                 Some(info) => info,
                 None => return Ok(None),
             };
+        // LIMIT and OFFSET can be applied here only when nothing runs on the
+        // rows afterwards: no ORDER BY to sort them and no DISTINCT to merge them
+        let limit_here = stmt.order_by.is_empty() && !stmt.distinct && stmt.distinct_on.is_empty();
 
         // Check if this is a PRIMARY KEY column (O(1) lookup) or has an index
         let schema = table.schema();
@@ -1615,8 +1633,7 @@ impl Executor {
 
         // EARLY LIMIT CHECK: Compute limit+offset before collecting row_ids
         // This allows us to stop collection early when there's no ORDER BY
-        let early_termination_target = if stmt.order_by.is_empty() && remaining_predicate.is_none()
-        {
+        let early_termination_target = if limit_here && remaining_predicate.is_none() {
             let offset = stmt
                 .offset
                 .as_ref()
@@ -1737,7 +1754,7 @@ impl Executor {
         // EARLY LIMIT OPTIMIZATION: When there's no ORDER BY and no remaining predicate,
         // we can apply LIMIT early to avoid fetching unnecessary rows
         let (early_limit_applied, early_limit, early_offset) =
-            if stmt.order_by.is_empty() && remaining_predicate.is_none() {
+            if limit_here && remaining_predicate.is_none() {
                 let offset = if let Some(ref offset_expr) = stmt.offset {
                     match ExpressionEval::compile(offset_expr, &[])
                         .ok()
@@ -1803,7 +1820,7 @@ impl Executor {
             } else if early_limit < rows.len() {
                 rows.truncate(early_limit);
             }
-        } else if stmt.order_by.is_empty() {
+        } else if limit_here {
             let offset = if let Some(ref offset_expr) = stmt.offset {
                 match ExpressionEval::compile(offset_expr, &[])
                     .ok()
@@ -1849,11 +1866,7 @@ impl Executor {
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
         // OFFSET and LIMIT were applied above unless ORDER BY has to run first
-        Ok(Some((
-            Box::new(result),
-            output_columns,
-            stmt.order_by.is_empty(),
-        )))
+        Ok(Some((Box::new(result), output_columns, limit_here)))
     }
 
     /// Extract InHashSet information from a WHERE clause.

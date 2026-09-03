@@ -156,3 +156,43 @@ fn test_subquery_where_offset_is_applied_once() {
         .collect();
     assert_eq!(names, ["U9", "U8", "U7"]);
 }
+
+/// DISTINCT runs after projection, so an early exit must not cut rows before
+/// it, and the paths that apply LIMIT and OFFSET themselves must leave the
+/// pair to the caller when DISTINCT is present.
+#[test]
+fn test_distinct_keeps_limit_and_offset_after_deduplication() {
+    let db = setup("offset_distinct_paths");
+    for (sql, expect) in [
+        ("SELECT DISTINCT user_id FROM orders WHERE amount > 0 LIMIT 10 OFFSET 45", 5),
+        ("SELECT DISTINCT user_id FROM orders WHERE user_id IN (SELECT id FROM users) LIMIT 10 OFFSET 45", 5),
+        ("SELECT DISTINCT u.id % 10 FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.id) LIMIT 3 OFFSET 8", 2),
+        ("SELECT DISTINCT user_id FROM orders WHERE user_id IN (SELECT id FROM users) LIMIT 10", 10),
+    ] {
+        assert_eq!(count(&db, sql), expect, "{sql}");
+    }
+}
+
+/// LEAD looks past the last fetched row, so the index-order window fetch
+/// must not stop at LIMIT + OFFSET rows.
+#[test]
+fn test_lead_sees_the_row_after_the_limit_window() {
+    let db = setup("offset_lead_window");
+    let rows: Vec<(i64, Option<i64>)> = db
+        .query(
+            "SELECT id, LEAD(id) OVER (ORDER BY id) FROM orders LIMIT 10 OFFSET 45",
+            (),
+        )
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (
+                row.get::<i64>(0).unwrap(),
+                row.get::<Option<i64>>(1).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(rows.len(), 10);
+    assert_eq!(rows[0], (46, Some(47)));
+    assert_eq!(rows[9], (55, Some(56)));
+}
