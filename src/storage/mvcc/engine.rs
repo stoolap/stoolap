@@ -492,6 +492,33 @@ fn parse_volume_id(path: &std::path::Path) -> Option<u64> {
         .and_then(|hex| u64::from_str_radix(hex, 16).ok())
 }
 
+/// Get or create a segment manager for a table.
+fn get_or_create_segment_manager(
+    segment_managers: &RwLock<
+        FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>,
+    >,
+    persistence: &Option<PersistenceManager>,
+    table_name: &str,
+) -> Arc<crate::storage::volume::manifest::SegmentManager> {
+    // Fast path: read lock (common case during WAL replay — manager already exists)
+    {
+        let mgrs = segment_managers.read().unwrap();
+        if let Some(mgr) = mgrs.get(table_name) {
+            return Arc::clone(mgr);
+        }
+    }
+    // Slow path: write lock (first access, creates new manager)
+    let mut mgrs = segment_managers.write().unwrap();
+    mgrs.entry(table_name.to_string())
+        .or_insert_with(|| {
+            let vol_dir = persistence.as_ref().map(|pm| pm.path().join("volumes"));
+            Arc::new(crate::storage::volume::manifest::SegmentManager::new(
+                table_name, vol_dir,
+            ))
+        })
+        .clone()
+}
+
 impl MVCCEngine {
     /// Creates a new MVCC engine with the given configuration
     pub fn new(config: Config) -> Self {
@@ -2898,27 +2925,7 @@ impl MVCCEngine {
         &self,
         table_name: &str,
     ) -> Arc<crate::storage::volume::manifest::SegmentManager> {
-        // Fast path: read lock (common case during WAL replay — manager already exists)
-        {
-            let mgrs = self.segment_managers.read().unwrap();
-            if let Some(mgr) = mgrs.get(table_name) {
-                return Arc::clone(mgr);
-            }
-        }
-        // Slow path: write lock (first access, creates new manager)
-        let mut mgrs = self.segment_managers.write().unwrap();
-        mgrs.entry(table_name.to_string())
-            .or_insert_with(|| {
-                let vol_dir = self
-                    .persistence
-                    .as_ref()
-                    .as_ref()
-                    .map(|pm| pm.path().join("volumes"));
-                Arc::new(crate::storage::volume::manifest::SegmentManager::new(
-                    table_name, vol_dir,
-                ))
-            })
-            .clone()
+        get_or_create_segment_manager(&self.segment_managers, &self.persistence, table_name)
     }
 
     /// Clean up stale .dv files from disk left over by previous versions.
@@ -6993,39 +7000,40 @@ impl TransactionEngineOperations for EngineOperations {
             }
         };
 
-        // Create MVCC table with shared transaction version store
-        let mut table = MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
-        if self.persistence.is_some() {
-            table.mark_seal_capable();
-        }
+        let table = MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
 
-        // If segments exist for this table, wrap in SegmentedTable.
-        // For snapshot isolation transactions, pass the begin_seq so tombstone
-        // filtering respects the snapshot's point-in-time view of cold data.
-        let mgrs = self.segment_managers.read().unwrap();
-        if let Some(mgr) = mgrs.get(&*table_name_lower) {
-            if mgr.has_segments() {
-                let mgr = Arc::clone(mgr);
-                drop(mgrs);
-                if self.registry.get_isolation_level(txn_id)
-                    == crate::IsolationLevel::SnapshotIsolation
-                {
-                    let begin_seq = self.registry.get_transaction_begin_sequence(txn_id) as u64;
-                    return Ok(Box::new(
-                        crate::storage::volume::table::SegmentedTable::with_snapshot_seq(
-                            Box::new(table),
-                            mgr,
-                            begin_seq,
-                        ),
-                    ));
-                }
-                return Ok(Box::new(
-                    crate::storage::volume::table::SegmentedTable::new(Box::new(table), mgr),
-                ));
+        // A persistent database may seal rows at any moment, so its tables
+        // always go through the segment-aware wrapper, even before the first
+        // seal. Elsewhere the wrapper is only needed once segments exist.
+        // For snapshot isolation transactions, pass the begin_seq so
+        // tombstone filtering respects the snapshot's point-in-time view of
+        // cold data.
+        let mgr = if self.persistence.is_some() {
+            get_or_create_segment_manager(
+                &self.segment_managers,
+                &self.persistence,
+                &table_name_lower,
+            )
+        } else {
+            let mgrs = self.segment_managers.read().unwrap();
+            match mgrs.get(&*table_name_lower) {
+                Some(mgr) if mgr.has_segments() => Arc::clone(mgr),
+                _ => return Ok(Box::new(table)),
             }
+        };
+        if self.registry.get_isolation_level(txn_id) == crate::IsolationLevel::SnapshotIsolation {
+            let begin_seq = self.registry.get_transaction_begin_sequence(txn_id) as u64;
+            return Ok(Box::new(
+                crate::storage::volume::table::SegmentedTable::with_snapshot_seq(
+                    Box::new(table),
+                    mgr,
+                    begin_seq,
+                ),
+            ));
         }
-
-        Ok(Box::new(table))
+        Ok(Box::new(
+            crate::storage::volume::table::SegmentedTable::new(Box::new(table), mgr),
+        ))
     }
 
     fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn Table>> {
