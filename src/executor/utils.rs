@@ -1892,15 +1892,21 @@ pub fn compute_join_projection(
     // Resolved by scanning the two short column lists instead of building a
     // map with an owned copy of every name on every execution.
     let columns_all = || outer_columns.iter().chain(inner_columns.iter());
+    // Duplicate full names resolve to the later column, as the index map
+    // built from these lists always did.
     let resolve = |name: &str| -> Option<usize> {
-        if let Some(i) = columns_all().position(|c| c.eq_ignore_ascii_case(name)) {
+        if let Some((i, _)) = columns_all()
+            .enumerate()
+            .filter(|(_, c)| eq_folded(c, name))
+            .last()
+        {
             return Some(i);
         }
         // "t.val" answers to "val" when no other column has that base name
         let mut found = None;
         for (i, c) in columns_all().enumerate() {
             if let Some(dot) = c.rfind('.') {
-                if c[dot + 1..].eq_ignore_ascii_case(name) {
+                if eq_folded(&c[dot + 1..], name) {
                     if found.is_some() {
                         return None;
                     }
@@ -1912,12 +1918,13 @@ pub fn compute_join_projection(
     };
     let resolve_qualified = |qualifier: &str, name: &str| -> Option<usize> {
         columns_all()
-            .position(|c| {
-                c.len() == qualifier.len() + 1 + name.len()
-                    && c.as_bytes()[qualifier.len()] == b'.'
-                    && c[..qualifier.len()].eq_ignore_ascii_case(qualifier)
-                    && c[qualifier.len() + 1..].eq_ignore_ascii_case(name)
+            .enumerate()
+            .filter(|(_, c)| {
+                c.split_once('.')
+                    .is_some_and(|(q, n)| eq_folded(q, qualifier) && eq_folded(n, name))
             })
+            .last()
+            .map(|(i, _)| i)
             .or_else(|| resolve(name))
     };
     let source = |idx: usize| {
@@ -1960,6 +1967,20 @@ pub fn compute_join_projection(
     })
 }
 
+/// Case-insensitive comparison of a column name against an already
+/// lowercased name, folding the Unicode way without allocating.
+#[inline]
+fn eq_folded(column: &str, lower: &str) -> bool {
+    if column.is_ascii() && lower.is_ascii() {
+        column.eq_ignore_ascii_case(lower)
+    } else {
+        column
+            .chars()
+            .flat_map(char::to_lowercase)
+            .eq(lower.chars())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1983,6 +2004,34 @@ mod tests {
             qualifier: Box::new(q),
             name: Box::new(n),
         })
+    }
+
+    /// Column names fold case the Unicode way, and when two columns share
+    /// a name the later one wins, as the column index map always did.
+    #[test]
+    fn test_join_projection_folds_unicode_and_prefers_the_later_duplicate() {
+        let outer = vec!["u.ÄNAME".to_string(), "u.x".to_string()];
+        let inner = vec!["o.x".to_string(), "x".to_string()];
+
+        let proj = compute_join_projection(&[qualified("u", "äname")], &outer, &inner)
+            .expect("Unicode-folded name must resolve");
+        assert!(matches!(proj.columns[0], ColumnSource::Outer(0)));
+
+        // bare `x`: exact matches only the unqualified inner column
+        let proj = compute_join_projection(&[ident("x")], &outer, &inner).unwrap();
+        assert!(matches!(proj.columns[0], ColumnSource::Inner(1)));
+
+        // `s.x` is not a full name; the bare fallback finds the exact `x`
+        let proj = compute_join_projection(&[qualified("s", "x")], &outer, &inner).unwrap();
+        assert!(matches!(proj.columns[0], ColumnSource::Inner(1)));
+        // without an exact `x`, two columns ending in `.x` are ambiguous
+        let two = vec!["u.x".to_string(), "o.x".to_string()];
+        assert!(compute_join_projection(&[ident("x")], &two, &[]).is_none());
+
+        // duplicate full names: the later one wins
+        let dup = vec!["v".to_string(), "v".to_string()];
+        let proj = compute_join_projection(&[ident("v")], &dup, &[]).unwrap();
+        assert!(matches!(proj.columns[0], ColumnSource::Outer(1)));
     }
 
     /// Outer values reach the subquery's WHERE, but names that belong to

@@ -47,7 +47,19 @@ pub enum IndexLookupStrategy {
 }
 
 /// Specifies which side (outer or inner) a projected column comes from.
-#[derive(Clone, Copy)]
+/// A projected value out of a row that is being consumed. A source used
+/// more than once must be cloned every time; moving it would hand the
+/// second use a NULL.
+#[inline]
+fn take_or_clone(row: &mut Row, idx: usize, repeats: bool) -> Value {
+    if repeats {
+        row.as_slice()[idx].clone()
+    } else {
+        row.take_or_clone(idx)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ColumnSource {
     /// Column from outer row at given index
     Outer(usize),
@@ -62,6 +74,8 @@ pub enum ColumnSource {
 pub struct JoinProjection {
     /// Columns to extract, in SELECT order (preserves original column ordering)
     pub columns: Vec<ColumnSource>,
+    /// A source appears more than once, so values are cloned, not moved.
+    pub repeats_source: bool,
 }
 
 /// Index Nested Loop Join Operator.
@@ -178,7 +192,14 @@ impl IndexNestedLoopJoinOperator {
         columns: Vec<ColumnSource>,
         projected_schema: Vec<ColumnInfo>,
     ) -> Self {
-        self.projection = Some(JoinProjection { columns });
+        let repeats_source = columns
+            .iter()
+            .enumerate()
+            .any(|(i, c)| columns[..i].contains(c));
+        self.projection = Some(JoinProjection {
+            columns,
+            repeats_source,
+        });
         self.schema = projected_schema;
         self
     }
@@ -209,13 +230,16 @@ impl IndexNestedLoopJoinOperator {
                 // Only the projected values leave the two rows; converting
                 // both rows to Vec<Value> first cloned every column of a
                 // shared row for the one or two that were kept.
+                let repeats = proj.repeats_source;
                 for col_source in &proj.columns {
                     match col_source {
                         ColumnSource::Outer(idx) => {
-                            self.row_buffer.push(outer.take_or_clone(*idx));
+                            self.row_buffer
+                                .push(take_or_clone(&mut outer, *idx, repeats));
                         }
                         ColumnSource::Inner(idx) => {
-                            self.row_buffer.push(inner.take_or_clone(*idx));
+                            self.row_buffer
+                                .push(take_or_clone(&mut inner, *idx, repeats));
                         }
                     }
                 }
@@ -258,7 +282,7 @@ impl IndexNestedLoopJoinOperator {
                             values.push(unsafe { outer_slice.get_unchecked(*idx) }.clone());
                         }
                         ColumnSource::Inner(idx) => {
-                            values.push(inner.take_or_clone(*idx));
+                            values.push(take_or_clone(&mut inner, *idx, proj.repeats_source));
                         }
                     }
                 }
@@ -554,7 +578,14 @@ impl BatchIndexNestedLoopJoinOperator {
         columns: Vec<ColumnSource>,
         projected_schema: Vec<ColumnInfo>,
     ) -> Self {
-        self.projection = Some(JoinProjection { columns });
+        let repeats_source = columns
+            .iter()
+            .enumerate()
+            .any(|(i, c)| columns[..i].contains(c));
+        self.projection = Some(JoinProjection {
+            columns,
+            repeats_source,
+        });
         self.schema = projected_schema;
         self
     }
