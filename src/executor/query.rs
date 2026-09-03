@@ -3504,6 +3504,13 @@ impl Executor {
                     let schema = table.schema();
                     let pk_columns = schema.primary_key_columns();
                     let is_pk = pk_columns.len() == 1 && pk_columns[0].name_lower == col_lower;
+                    // The index orders NULLs its own way, so a fetch cut at LIMIT
+                    // rows is only right for a column that has none
+                    let no_nulls = is_pk
+                        || schema
+                            .columns
+                            .iter()
+                            .any(|c| c.name_lower == col_lower && !c.nullable);
                     let has_index = is_pk || table.get_index_on_column(&col_name).is_some();
 
                     if has_index {
@@ -3515,7 +3522,7 @@ impl Executor {
                         let has_order_by = !stmt.order_by.is_empty();
                         let is_window_safe =
                             Self::is_window_safe_for_limit_pushdown(stmt, &col_name, ascending);
-                        let fetch_limit = if !has_order_by && is_window_safe {
+                        let fetch_limit = if !has_order_by && is_window_safe && no_nulls {
                             Self::literal_fetch_limit(stmt).unwrap_or(usize::MAX)
                         } else {
                             usize::MAX

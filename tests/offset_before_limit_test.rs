@@ -264,3 +264,59 @@ fn test_second_window_with_another_order_keeps_the_full_fetch() {
     // amount 46 is the 55th largest of 100, not the 10th of a 55-row subset
     assert_eq!(row.get::<i64>(2).unwrap(), 55);
 }
+
+/// The index orders NULLs its own way; the window's ORDER BY may not. A cut
+/// fetch over a nullable column could therefore start with the wrong rows,
+/// so the limited result must equal the same slice of the unlimited one.
+#[test]
+fn test_window_limit_over_a_nullable_index_column_matches_the_full_result() {
+    let db = Database::open("memory://offset_nullable_window").unwrap();
+    db.execute(
+        "CREATE TABLE events (id INTEGER PRIMARY KEY, k INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_events_k ON events(k) USING BTREE", ())
+        .unwrap();
+    for i in 1..=20i64 {
+        db.execute("INSERT INTO events VALUES ($1, NULL)", (i,))
+            .unwrap();
+    }
+    for i in 21..=100i64 {
+        db.execute("INSERT INTO events VALUES ($1, $2)", (i, 200 - i))
+            .unwrap();
+    }
+    let read = |sql: &str| -> Vec<(i64, Option<i64>, i64)> {
+        db.query(sql, ())
+            .unwrap()
+            .map(|row| {
+                let row = row.unwrap();
+                (
+                    row.get::<i64>(0).unwrap(),
+                    row.get::<Option<i64>>(1).unwrap(),
+                    row.get::<i64>(2).unwrap(),
+                )
+            })
+            .collect()
+    };
+    for (order, off) in [
+        ("ASC", 0),
+        ("ASC", 15),
+        ("DESC", 0),
+        ("DESC", 75),
+        ("ASC NULLS FIRST", 15),
+        ("DESC NULLS LAST", 75),
+    ] {
+        let full = read(&format!(
+            "SELECT id, k, ROW_NUMBER() OVER (ORDER BY k {order}) AS rn FROM events"
+        ));
+        let cut = read(&format!(
+            "SELECT id, k, ROW_NUMBER() OVER (ORDER BY k {order}) AS rn FROM events LIMIT 10 OFFSET {off}"
+        ));
+        assert_eq!(
+            cut,
+            full[off..off + 10].to_vec(),
+            "ORDER BY k {order} OFFSET {off}"
+        );
+    }
+}
