@@ -99,6 +99,12 @@ pub trait Engine: Send + Sync {
     /// Gets all index objects for a table
     fn get_all_indexes(&self, table_name: &str) -> Result<Vec<std::sync::Arc<dyn Index>>>;
 
+    /// Indexes the executor may probe directly: every visible row of the
+    /// table is in them. Empty for a table with rows outside its indexes.
+    fn get_lookup_indexes(&self, table_name: &str) -> Result<Vec<std::sync::Arc<dyn Index>>> {
+        self.get_all_indexes(table_name)
+    }
+
     /// Gets the current default isolation level
     fn get_isolation_level(&self) -> IsolationLevel;
 

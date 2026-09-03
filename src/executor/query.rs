@@ -9179,7 +9179,7 @@ impl Executor {
         }
 
         // Check if there's a secondary index on the inner column
-        if let Some(index) = table.get_index_on_column(&inner_col_unqualified) {
+        if let Some(index) = table.lookup_index_on_column(&inner_col_unqualified) {
             return Some((
                 table_name,
                 IndexLookupStrategy::SecondaryIndex(index),
@@ -9456,7 +9456,7 @@ impl Executor {
         };
 
         // Check for B-tree or primary key index on GROUP BY column
-        let btree_index = match table.get_index_on_column(&group_col_name) {
+        let btree_index = match table.lookup_index_on_column(&group_col_name) {
             Some(idx)
                 if idx.index_type() == IndexType::BTree
                     || idx.index_type() == IndexType::PrimaryKey =>

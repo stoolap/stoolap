@@ -96,6 +96,18 @@ impl SegmentedTable {
         }
     }
 
+    /// Runs `f` on the hot table while no rows are sealed. The seal fence is
+    /// held across the check and the call, so the first seal cannot remove
+    /// hot rows in between. None once segments exist. Readers that merge hot
+    /// and cold values hold the fence for their whole body instead.
+    fn unsealed<T>(&self, f: impl FnOnce(&dyn Table) -> T) -> Option<T> {
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
+        if self.segment_mgr.has_segments() {
+            return None;
+        }
+        Some(f(&*self.hot))
+    }
+
     /// Get the transaction ID for per-txn tombstone tracking.
     fn txn_id(&self) -> i64 {
         self.hot.txn_id()
@@ -1757,8 +1769,8 @@ impl Table for SegmentedTable {
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
-        if !self.segment_mgr.has_segments() {
-            return self.hot.scan(column_indices, where_expr);
+        if let Some(result) = self.unsealed(|hot| hot.scan(column_indices, where_expr)) {
+            return result;
         }
 
         // Collect hot rows FIRST to get a consistent snapshot of hot row_ids.
@@ -1790,8 +1802,8 @@ impl Table for SegmentedTable {
     }
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
-        if !self.segment_mgr.has_segments() {
-            return self.hot.collect_all_rows(where_expr);
+        if let Some(result) = self.unsealed(|hot| hot.collect_all_rows(where_expr)) {
+            return result;
         }
 
         // Scan hot FIRST to get a consistent snapshot. The skip set is
@@ -1816,8 +1828,8 @@ impl Table for SegmentedTable {
     }
 
     fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
-        if !self.segment_mgr.has_segments() {
-            return self.hot.collect_all_rows_unsorted();
+        if let Some(result) = self.unsealed(|hot| hot.collect_all_rows_unsorted()) {
+            return result;
         }
 
         let hot_rows = self.hot.collect_all_rows_unsorted()?;
@@ -1838,8 +1850,8 @@ impl Table for SegmentedTable {
     }
 
     fn collect_rows_by_ids(&self, row_ids: &[i64]) -> Result<RowVec> {
-        if !self.segment_mgr.has_segments() {
-            return self.hot.collect_rows_by_ids(row_ids);
+        if let Some(result) = self.unsealed(|hot| hot.collect_rows_by_ids(row_ids)) {
+            return result;
         }
 
         let schema = self.hot.schema().clone();
@@ -1896,8 +1908,10 @@ impl Table for SegmentedTable {
         filter: &dyn Expression,
         buffer: &mut RowVec,
     ) -> Result<()> {
-        if !self.segment_mgr.has_segments() {
-            return self.hot.fetch_rows_by_ids_into(row_ids, filter, buffer);
+        if let Some(result) =
+            self.unsealed(|hot| hot.fetch_rows_by_ids_into(row_ids, filter, buffer))
+        {
+            return result;
         }
 
         let mut hot_ids = Vec::new();
@@ -1947,8 +1961,10 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        if !self.segment_mgr.has_segments() {
-            return self.hot.collect_rows_with_limit(where_expr, limit, offset);
+        if let Some(result) =
+            self.unsealed(|hot| hot.collect_rows_with_limit(where_expr, limit, offset))
+        {
+            return result;
         }
 
         let target = limit + offset;
@@ -2058,10 +2074,10 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
-        if !self.segment_mgr.has_segments() {
-            return self
-                .hot
-                .collect_rows_with_limit_unordered(where_expr, limit, offset);
+        if let Some(result) =
+            self.unsealed(|hot| hot.collect_rows_with_limit_unordered(where_expr, limit, offset))
+        {
+            return result;
         }
 
         let target = limit + offset;
@@ -2193,10 +2209,10 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Row>> {
-        if !self.segment_mgr.has_segments() {
-            return self
-                .hot
-                .collect_rows_sorted_with_limit(sort_col_idx, ascending, limit, offset);
+        if let Some(result) = self.unsealed(|hot| {
+            hot.collect_rows_sorted_with_limit(sort_col_idx, ascending, limit, offset)
+        }) {
+            return result;
         }
         // Collect all merged rows, sort, take limit
         let mut rows = self.collect_all_rows(None)?;
@@ -2261,6 +2277,7 @@ impl Table for SegmentedTable {
         // may be off by a few rows during the brief overlap window, but
         // this avoids an O(total_rows) HashSet collection that made ALL
         // queries slow during checkpoint.
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let seg = self.segment_mgr.deduped_row_count();
         let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
         let overlap = self.segment_mgr.seal_overlap();
@@ -2281,6 +2298,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let hot_count = self.hot.fast_row_count()?;
         let seg = self.segment_mgr.deduped_row_count();
         let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
@@ -2301,6 +2319,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let hot_result = self.hot.sum_column(col_idx);
 
         if !self.segment_mgr.has_segments() {
@@ -2430,6 +2449,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let hot_result = self.hot.min_column(col_idx);
 
         if !self.segment_mgr.has_segments() {
@@ -2733,6 +2753,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let hot_result = self.hot.max_column(col_idx);
 
         if !self.segment_mgr.has_segments() {
@@ -3030,6 +3051,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         if !self.segment_mgr.has_segments() {
             return self.hot.get_partition_count(column_name);
         }
@@ -3099,8 +3121,8 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
-        if !self.segment_mgr.has_segments() {
-            return self.hot.get_partition_values(column_name);
+        if let Some(result) = self.unsealed(|hot| hot.get_partition_values(column_name)) {
+            return result;
         }
 
         if self.segment_mgr.seal_overlap() > 0 {
@@ -3286,6 +3308,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         if !self.segment_mgr.has_segments() {
             return self.hot.collect_rows_grouped_by_partition(column_name);
         }
@@ -3367,6 +3390,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         if !self.segment_mgr.has_segments() {
             return self
                 .hot
@@ -3477,10 +3501,10 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Option<RowVec> {
-        if !self.segment_mgr.has_segments() {
-            return self
-                .hot
-                .collect_rows_ordered_by_index(column_name, ascending, limit, offset);
+        if let Some(result) = self.unsealed(|hot| {
+            hot.collect_rows_ordered_by_index(column_name, ascending, limit, offset)
+        }) {
+            return result;
         }
 
         // Snapshot isolation: the merge path doesn't filter by snapshot_seq.
@@ -3692,10 +3716,10 @@ impl Table for SegmentedTable {
         ascending: bool,
         limit: usize,
     ) -> Option<RowVec> {
-        if !self.segment_mgr.has_segments() {
-            return self
-                .hot
-                .collect_rows_pk_keyset(start_after, start_from, ascending, limit);
+        if let Some(result) = self
+            .unsealed(|hot| hot.collect_rows_pk_keyset(start_after, start_from, ascending, limit))
+        {
+            return result;
         }
         // Hot PK index doesn't cover cold data — can't use keyset pagination
         None
@@ -3852,6 +3876,12 @@ impl Table for SegmentedTable {
         self.hot.get_index_on_column(column_name)
     }
 
+    /// The hot index holds ids for unsealed rows only, and the next seal
+    /// can move rows out of it at any moment, so it is never probed directly.
+    fn lookup_index_on_column(&self, _column_name: &str) -> Option<Arc<dyn Index>> {
+        None
+    }
+
     fn get_index(&self, name: &str) -> Option<Arc<dyn Index>> {
         self.hot.get_index(name)
     }
@@ -3916,8 +3946,8 @@ impl Table for SegmentedTable {
     }
 
     fn get_index_min_value(&self, column_name: &str) -> Option<Value> {
-        if !self.segment_mgr.has_segments() {
-            return self.hot.get_index_min_value(column_name);
+        if let Some(result) = self.unsealed(|hot| hot.get_index_min_value(column_name)) {
+            return result;
         }
         let hot_min = self.hot.get_index_min_value(column_name);
         let segments = self.segment_mgr.get_segments_ordered_meta();
@@ -3957,8 +3987,8 @@ impl Table for SegmentedTable {
     }
 
     fn get_index_max_value(&self, column_name: &str) -> Option<Value> {
-        if !self.segment_mgr.has_segments() {
-            return self.hot.get_index_max_value(column_name);
+        if let Some(result) = self.unsealed(|hot| hot.get_index_max_value(column_name)) {
+            return result;
         }
         let hot_max = self.hot.get_index_max_value(column_name);
         let segments = self.segment_mgr.get_segments_ordered_meta();
@@ -4018,8 +4048,8 @@ impl Table for SegmentedTable {
         columns: &[&str],
         expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn QueryResult>> {
-        if !self.segment_mgr.has_segments() {
-            return self.hot.select(columns, expr);
+        if let Some(result) = self.unsealed(|hot| hot.select(columns, expr)) {
+            return result;
         }
         let all_rows = self.collect_all_rows(expr)?;
         let col_names: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
@@ -4034,8 +4064,8 @@ impl Table for SegmentedTable {
         expr: Option<&dyn Expression>,
         aliases: &FxHashMap<String, String>,
     ) -> Result<Box<dyn QueryResult>> {
-        if !self.segment_mgr.has_segments() {
-            return self.hot.select_with_aliases(columns, expr, aliases);
+        if let Some(result) = self.unsealed(|hot| hot.select_with_aliases(columns, expr, aliases)) {
+            return result;
         }
         self.select(columns, expr)
     }
@@ -4047,10 +4077,10 @@ impl Table for SegmentedTable {
         temporal_type: &str,
         temporal_value: i64,
     ) -> Result<Box<dyn QueryResult>> {
-        if !self.segment_mgr.has_segments() {
-            return self
-                .hot
-                .select_as_of(columns, expr, temporal_type, temporal_value);
+        if let Some(result) =
+            self.unsealed(|hot| hot.select_as_of(columns, expr, temporal_type, temporal_value))
+        {
+            return result;
         }
 
         // Historical point-in-time queries on segment-backed tables are not
@@ -4190,6 +4220,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         // Bail out: during seal, hot+cold overlap makes aggregation unreliable
         if self.segment_mgr.seal_overlap() > 0 {
             return None;
@@ -5020,6 +5051,7 @@ impl Table for SegmentedTable {
         if group_by_indices.len() != 1 {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         if !self.segment_mgr.has_segments() {
             return self
                 .hot
