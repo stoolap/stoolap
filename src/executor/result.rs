@@ -400,6 +400,10 @@ impl QueryResult for ExecutorResult {
         self.insert_id
     }
 
+    fn exact_len(&self) -> Option<usize> {
+        self.current_index.is_none().then_some(self.len)
+    }
+
     fn try_into_arc_rows(&mut self) -> Option<CompactArc<Vec<Row>>> {
         // Take ownership of rows and return as Arc
         let rows = std::mem::replace(&mut self.rows, RowStorage::Owned(RowVec::new()));
@@ -827,6 +831,14 @@ impl LimitedResult {
 }
 
 impl QueryResult for LimitedResult {
+    fn exact_len(&self) -> Option<usize> {
+        if self.offset_applied || self.returned_count > 0 {
+            return None;
+        }
+        let inner = self.inner.exact_len()?.saturating_sub(self.offset);
+        Some(self.limit.map_or(inner, |limit| inner.min(limit)))
+    }
+
     fn columns(&self) -> &[String] {
         &self.columns
     }

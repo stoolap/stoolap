@@ -188,6 +188,23 @@ fn partition_where_for_join(
     )
 }
 
+/// A GROUP BY + LIMIT join whose left side is fetched in a limited chunk
+struct SemijoinReduction {
+    cap: usize,
+    limit: usize,
+    left_key_col: String,
+    right_key_col: String,
+}
+
+/// The left chunk the last reduction pass used; execute_join_source retries
+/// with a larger one when the final rows stop short of the limit
+#[derive(Clone, Copy)]
+struct ReductionPass {
+    cap: usize,
+    chunk_full: bool,
+    limit: usize,
+}
+
 impl Executor {
     /// Multi-column ORDER BY comparator over precomputed sort keys, with
     /// NULLS FIRST/LAST semantics (default: NULLS LAST for ASC, FIRST for
@@ -3726,13 +3743,60 @@ impl Executor {
         Ok((Box::new(result), output_columns, false, deferred_proj))
     }
 
-    /// Execute a JOIN source
+    /// Execute a JOIN source. A GROUP BY + LIMIT join fetches its left side in
+    /// a limited chunk; when the final rows stop short of the limit and the
+    /// chunk was full, the join runs again with a larger chunk
     fn execute_join_source(
         &self,
         join_source: &JoinTableSource,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
+    ) -> SelectResult {
+        let reduction = std::cell::Cell::new(None);
+        let mut left_cap = None;
+        loop {
+            let (result, columns, flag, deferred) = self.execute_join_source_capped(
+                join_source,
+                stmt,
+                ctx,
+                classification,
+                left_cap,
+                &reduction,
+            )?;
+            let pass = match reduction.get() {
+                Some(pass) if pass.chunk_full => pass,
+                _ => return Ok((result, columns, flag, deferred)),
+            };
+            let (result, short) = match result.exact_len() {
+                Some(len) => (result, len < pass.limit),
+                None => {
+                    let result_columns = result
+                        .columns_arc()
+                        .unwrap_or_else(|| CompactArc::new(result.columns().to_vec()));
+                    let rows = Self::materialize_result_arc(result)?;
+                    let short = rows.len() < pass.limit;
+                    let result: Box<dyn QueryResult> = Box::new(
+                        ExecutorResult::with_arc_columns_shared_rows(result_columns, rows),
+                    );
+                    (result, short)
+                }
+            };
+            if !short {
+                return Ok((result, columns, flag, deferred));
+            }
+            left_cap = Some(pass.cap.saturating_mul(4));
+        }
+    }
+
+    fn execute_join_source_capped(
+        &self,
+        join_source: &JoinTableSource,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        classification: &std::sync::Arc<QueryClassification>,
+        left_cap_override: Option<usize>,
+        reduction: &std::cell::Cell<Option<ReductionPass>>,
     ) -> SelectResult {
         // classification is passed from caller to avoid redundant cache lookups
 
@@ -3825,30 +3889,39 @@ impl Executor {
         // Pattern: LEFT JOIN + GROUP BY on left columns only + LIMIT N + no ORDER BY
         // Optimization: limit left side first, filter right side with IN clause (uses index)
         // This reduces materialization from O(L + R) to O(N + N*avg_matches)
+        let left_table = match join_source.left.as_ref() {
+            Expression::TableSource(ts) => Some(ts.name.value.as_str()),
+            _ => None,
+        };
         let semijoin_limit = self.get_semijoin_reduction_limit(
             &join_type,
             stmt,
             left_alias.as_deref(),
+            left_table,
             &join_source.condition,
+            classification,
         );
 
-        let (left_rows, left_columns, right_rows, right_columns) = if let Some((
-            limit_n,
-            left_key_col,
-            right_key_col,
-        )) = semijoin_limit
+        let (left_rows, left_columns, right_rows, right_columns) = if let Some(plan) =
+            semijoin_limit
         {
-            // Semi-join reduction for INNER/LEFT JOIN + GROUP BY
-            // Step 1: Execute and materialize left side with limit (pushdown for efficiency)
+            // Semi-join reduction for INNER/LEFT JOIN + GROUP BY: fetch the left
+            // side with the limit, then the right side through an IN filter on
+            // the join key (uses the index)
+            let SemijoinReduction {
+                cap,
+                limit,
+                left_key_col,
+                right_key_col,
+            } = plan;
+            let left_cap = left_cap_override.unwrap_or(cap);
             let (left_result, left_cols) = self.execute_table_expression_with_filter_limit(
                 &join_source.left,
                 ctx,
                 left_filter.as_ref(),
-                Some(limit_n),
+                Some(left_cap),
             )?;
             let left_rows = Self::materialize_result_arc(left_result)?;
-
-            // Step 2: Extract join key values from limited left rows
             let left_key_idx = Self::find_column_index_by_name(&left_key_col, &left_cols);
             let join_key_values: Vec<Value> = if let Some(idx) = left_key_idx {
                 left_rows
@@ -3859,12 +3932,8 @@ impl Executor {
             } else {
                 Vec::new()
             };
-
-            // Step 3: Build combined filter for right side with IN clause
             let right_filter_with_in = if !join_key_values.is_empty() {
-                // Create IN expression: right_key_col IN (v1, v2, ..., vN)
                 let in_expr = self.build_in_filter_expression(&right_key_col, &join_key_values);
-                // Combine with existing right filter if any
                 match (right_filter.clone(), in_expr) {
                     (Some(existing), Some(in_filter)) => {
                         Some(Expression::Infix(InfixExpression::new(
@@ -3880,15 +3949,17 @@ impl Executor {
             } else {
                 right_filter.clone()
             };
-
-            // Step 4: Execute right side with IN filter (uses index on right_key_col)
             let (right_result, right_cols) = self.execute_table_expression_with_filter(
                 &join_source.right,
                 ctx,
                 right_filter_with_in.as_ref(),
             )?;
             let right_rows = Self::materialize_result_arc(right_result)?;
-
+            reduction.set(Some(ReductionPass {
+                cap: left_cap,
+                chunk_full: left_rows.len() == left_cap,
+                limit,
+            }));
             (left_rows, left_cols, right_rows, right_cols)
         } else {
             // Skip Index Nested Loop if query has aggregation or window functions
@@ -4084,10 +4155,9 @@ impl Executor {
                     None
                 };
 
-                // For outer table, use a reasonable limit multiplier
-                // We need enough rows to produce join_limit results, assuming some miss rate
-                // Use 4x multiplier as heuristic (handles up to 75% miss rate)
-                let outer_limit = join_limit.map(|l| (l as usize).saturating_mul(4).max(100));
+                // The outer side is fetched in chunks: the first one is the limit
+                // itself and the join below fetches more when it stops short
+                let mut outer_limit = join_limit.map(|l| (l as usize).max(100));
 
                 // Execute outer side with limit optimization for true early termination
                 let (outer_result, outer_cols) = self.execute_table_expression_with_filter_limit(
@@ -4147,32 +4217,26 @@ impl Executor {
                         all
                     };
 
-                    // Create residual filter from nl_right_filter if present
-                    // This allows early termination during Index Nested Loop
-                    let residual_filter = if let Some(ref rf) = nl_right_filter {
-                        // Re-qualify the filter with inner table alias
-                        let qualified_rf = add_table_qualifier(rf, inner_alias);
-                        JoinFilter::new(
-                            &qualified_rf,
-                            &outer_cols,
-                            &inner_cols,
-                            &self.function_registry,
-                        )
-                        .ok()
-                        .map(|f| f.with_context(ctx))
-                    } else {
-                        None
+                    // Residual filter from nl_right_filter, re-qualified with the
+                    // inner alias; built per pass since the operator owns it
+                    let build_residual_filter = || {
+                        nl_right_filter.as_ref().and_then(|rf| {
+                            let qualified_rf = add_table_qualifier(rf, inner_alias);
+                            JoinFilter::new(
+                                &qualified_rf,
+                                &outer_cols,
+                                &inner_cols,
+                                &self.function_registry,
+                            )
+                            .ok()
+                            .map(|f| f.with_context(ctx))
+                        })
                     };
 
                     // Execute Index Nested Loop Join using operators
                     // Use batch version for NO LIMIT (reduces lock overhead from O(N) to O(1))
                     // Use streaming version for LIMIT queries (supports early termination)
 
-                    // Convert to operator types
-                    let outer_op: Box<dyn Operator> =
-                        Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
-                    let inner_schema_info: Vec<ColumnInfo> =
-                        inner_cols.iter().map(ColumnInfo::new).collect();
                     let op_join_type = OperatorJoinType::parse(&join_type);
 
                     // Try to push projection into the join operator for ~2.3x speedup
@@ -4190,71 +4254,98 @@ impl Executor {
                         None
                     };
 
-                    let mut join_op: Box<dyn Operator> = if join_limit.is_some() {
-                        // Streaming INL for early termination with LIMIT
-                        let op = IndexNestedLoopJoinOperator::new(
-                            outer_op,
-                            inner_table,
-                            inner_schema_info,
-                            op_join_type,
-                            outer_idx,
-                            lookup_strategy.clone(),
-                            residual_filter,
-                        );
-
-                        // Apply projection pushdown if available
-                        if let Some(ref proj) = projection_pushdown {
-                            let projected_schema: Vec<ColumnInfo> =
-                                proj.output_columns.iter().map(ColumnInfo::new).collect();
-                            Box::new(op.with_projection(proj.columns.clone(), projected_schema))
-                        } else {
-                            Box::new(op)
+                    // A cross-table WHERE filter counts toward LIMIT, so it is
+                    // applied per joined row rather than after collection
+                    let cross_row_filter = match cross_filter {
+                        Some(ref cross) => {
+                            Some(RowFilter::new(cross, &all_columns)?.with_context(ctx))
+                        }
+                        None => None,
+                    };
+                    let mut result_rows = RowVec::new();
+                    if join_limit.is_some() {
+                        // Streaming INL for early termination with LIMIT. When the
+                        // joined rows stop short of the limit and the outer chunk
+                        // was full, the next pass fetches a larger chunk
+                        let mut outer_result = outer_result;
+                        let mut inner_table = Some(inner_table);
+                        loop {
+                            let outer_op: Box<dyn Operator> = Box::new(QueryResultOperator::new(
+                                outer_result,
+                                outer_cols.clone(),
+                            ));
+                            let mut op = IndexNestedLoopJoinOperator::new(
+                                outer_op,
+                                match inner_table.take() {
+                                    Some(table) => table,
+                                    None => txn.get_table(&table_name)?,
+                                },
+                                inner_cols.iter().map(ColumnInfo::new).collect(),
+                                op_join_type,
+                                outer_idx,
+                                lookup_strategy.clone(),
+                                build_residual_filter(),
+                            );
+                            if let Some(ref proj) = projection_pushdown {
+                                let projected_schema: Vec<ColumnInfo> =
+                                    proj.output_columns.iter().map(ColumnInfo::new).collect();
+                                op = op.with_projection(proj.columns.clone(), projected_schema);
+                            }
+                            result_rows.clear();
+                            Self::collect_join_rows(
+                                &mut op,
+                                join_limit,
+                                cross_row_filter.as_ref(),
+                                &mut result_rows,
+                            )?;
+                            let short =
+                                join_limit.is_some_and(|lim| result_rows.len() < lim as usize);
+                            let chunk_full =
+                                outer_limit.is_some_and(|cap| op.outer_rows_seen() == cap);
+                            if !(short && chunk_full) {
+                                break;
+                            }
+                            outer_limit = outer_limit.map(|cap| cap.saturating_mul(4));
+                            outer_result = self
+                                .execute_table_expression_with_filter_limit(
+                                    outer_expr,
+                                    ctx,
+                                    nl_left_filter.as_ref(),
+                                    outer_limit,
+                                )?
+                                .0;
                         }
                     } else {
                         // Batch INL for NO LIMIT - single batch fetch, O(1) lock overhead
+                        let outer_op: Box<dyn Operator> =
+                            Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
                         let op = BatchIndexNestedLoopJoinOperator::new(
                             outer_op,
                             inner_table,
-                            inner_schema_info,
+                            inner_cols.iter().map(ColumnInfo::new).collect(),
                             op_join_type,
                             outer_idx,
                             lookup_strategy.clone(),
-                            residual_filter,
+                            build_residual_filter(),
                         );
-
-                        // Apply projection pushdown if available
-                        if let Some(ref proj) = projection_pushdown {
-                            let projected_schema: Vec<ColumnInfo> =
-                                proj.output_columns.iter().map(ColumnInfo::new).collect();
-                            Box::new(op.with_projection(proj.columns.clone(), projected_schema))
-                        } else {
-                            Box::new(op)
-                        }
-                    };
-
-                    // Execute and collect results with synthetic row IDs
-                    join_op.open()?;
-                    let mut result_rows = RowVec::new();
-                    let mut row_id = 0i64;
-                    while let Some(row_ref) = join_op.next()? {
-                        result_rows.push((row_id, row_ref.into_owned()));
-                        row_id += 1;
-                        if let Some(lim) = join_limit {
-                            if result_rows.len() >= lim as usize {
-                                break;
-                            }
-                        }
+                        let mut join_op: Box<dyn Operator> =
+                            if let Some(ref proj) = projection_pushdown {
+                                let projected_schema: Vec<ColumnInfo> =
+                                    proj.output_columns.iter().map(ColumnInfo::new).collect();
+                                Box::new(op.with_projection(proj.columns.clone(), projected_schema))
+                            } else {
+                                Box::new(op)
+                            };
+                        Self::collect_join_rows(
+                            join_op.as_mut(),
+                            None,
+                            cross_row_filter.as_ref(),
+                            &mut result_rows,
+                        )?;
                     }
-                    join_op.close()?;
 
                     // No rotation needed - all_columns matches physical order
                     let mut final_rows = result_rows;
-
-                    // Apply cross-table WHERE filters if any
-                    if let Some(ref cross) = cross_filter {
-                        let filter = RowFilter::new(cross, &all_columns)?.with_context(ctx);
-                        filter.retain_checked(&mut final_rows)?;
-                    }
 
                     // Check for aggregation/window functions that need special handling
                     let has_agg = classification.has_aggregation;
@@ -6212,6 +6303,30 @@ impl Executor {
             return Err(err);
         }
         Ok(rows)
+    }
+
+    /// Runs a join operator to completion or to `limit` rows. The cross-table
+    /// filter is applied per row so filtered rows never count toward the limit.
+    fn collect_join_rows(
+        join_op: &mut dyn Operator,
+        limit: Option<u64>,
+        cross: Option<&RowFilter>,
+        out: &mut RowVec,
+    ) -> Result<()> {
+        join_op.open()?;
+        while let Some(row_ref) = join_op.next()? {
+            let row = row_ref.into_owned();
+            if let Some(filter) = cross {
+                if !filter.matches_checked(&row)? {
+                    continue;
+                }
+            }
+            out.push((out.len() as i64, row));
+            if limit.is_some_and(|lim| out.len() >= lim as usize) {
+                break;
+            }
+        }
+        join_op.close()
     }
 
     /// Materialize a result into an CompactArc<Vec<Row>> for zero-copy sharing with joins
@@ -8880,6 +8995,36 @@ impl Executor {
         }
     }
 
+    /// LIMIT and OFFSET of a GROUP BY + LIMIT join as (initial left chunk, rows
+    /// expected after OFFSET). An INNER JOIN over-fetches its first chunk since
+    /// a left row without a match forms no group
+    fn semijoin_caps(stmt: &SelectStatement, is_inner: bool) -> Option<(usize, usize)> {
+        let eval = |e: &Expression| {
+            ExpressionEval::compile(e, &[])
+                .ok()
+                .and_then(|mut eval| eval.eval_slice(&Row::new()).ok())
+                .and_then(|v| match v {
+                    Value::Integer(n) if n >= 0 => Some(n as usize),
+                    _ => None,
+                })
+        };
+        let limit = eval(stmt.limit.as_ref()?)?;
+        if limit == 0 {
+            return None;
+        }
+        let offset = match &stmt.offset {
+            Some(e) => eval(e)?,
+            None => 0,
+        };
+        let want = limit.saturating_add(offset);
+        let cap = if is_inner {
+            want.saturating_mul(2)
+        } else {
+            want
+        };
+        Some((cap, limit))
+    }
+
     /// Check if semi-join reduction optimization can be applied and return parameters
     /// Returns Some((limit_value, left_key_col, right_key_col)) if applicable, None otherwise
     ///
@@ -8896,8 +9041,10 @@ impl Executor {
         join_type: &str,
         stmt: &SelectStatement,
         left_alias: Option<&str>,
+        left_table: Option<&str>,
         join_condition: &Option<Box<Expression>>,
-    ) -> Option<(usize, String, String)> {
+        classification: &QueryClassification,
+    ) -> Option<SemijoinReduction> {
         // Applies to INNER JOIN and LEFT JOIN (not RIGHT or FULL)
         let is_inner = join_type == "INNER";
         let is_left = join_type.contains("LEFT") && !join_type.contains("FULL");
@@ -8916,8 +9063,32 @@ impl Executor {
             return None;
         }
 
-        // Check that GROUP BY references only left table columns
+        // A window function or DISTINCT runs on the grouped rows afterwards and
+        // needs every group, not a chunk that already meets the limit
+        if classification.has_window_functions || stmt.distinct || !stmt.distinct_on.is_empty() {
+            return None;
+        }
+        let (cap, limit) = Self::semijoin_caps(stmt, is_inner)?;
+        // Each group must come from one left row, or a partial chunk would
+        // give partial aggregates: GROUP BY has to cover the left primary key
         let left_alias = left_alias?;
+        let left_schema = self.engine.get_table_schema(left_table?).ok()?;
+        let pk_columns = left_schema.primary_key_columns();
+        let pk_covered = !pk_columns.is_empty()
+            && pk_columns.iter().all(|pk| {
+                stmt.group_by.columns.iter().any(|col| match col {
+                    Expression::QualifiedIdentifier(qid) => {
+                        qid.qualifier.value.eq_ignore_ascii_case(left_alias)
+                            && qid.name.value.eq_ignore_ascii_case(&pk.name)
+                    }
+                    Expression::Identifier(id) => id.value.eq_ignore_ascii_case(&pk.name),
+                    _ => false,
+                })
+            });
+        if !pk_covered {
+            return None;
+        }
+        // Check that GROUP BY references only left table columns
         for col in &stmt.group_by.columns {
             if !self.column_references_table(col, left_alias) {
                 return None;
@@ -8946,45 +9117,20 @@ impl Executor {
                 return None;
             }
             // Swap the keys
-            let limit_value = stmt.limit.as_ref().and_then(|e| {
-                ExpressionEval::compile(e, &[])
-                    .ok()
-                    .and_then(|mut eval| eval.eval_slice(&Row::new()).ok())
-                    .and_then(|v| match v {
-                        Value::Integer(n) if n > 0 => Some(n as usize),
-                        _ => None,
-                    })
-            })?;
-            // For INNER JOIN, over-fetch to account for rows without matches
-            // Use 2x multiplier as a balance between accuracy and performance
-            let adjusted_limit = if is_inner {
-                limit_value * 2
-            } else {
-                limit_value
-            };
-            return Some((adjusted_limit, right_key_col, left_key_col));
+            return Some(SemijoinReduction {
+                cap,
+                limit,
+                left_key_col: right_key_col,
+                right_key_col: left_key_col,
+            });
         }
 
-        // Get LIMIT value
-        let limit_value = stmt.limit.as_ref().and_then(|e| {
-            ExpressionEval::compile(e, &[])
-                .ok()
-                .and_then(|mut eval| eval.eval_slice(&Row::new()).ok())
-                .and_then(|v| match v {
-                    Value::Integer(n) if n > 0 => Some(n as usize),
-                    _ => None,
-                })
-        })?;
-
-        // For INNER JOIN, over-fetch to account for rows without matches
-        // Use 2x multiplier as a balance between accuracy and performance
-        let adjusted_limit = if is_inner {
-            limit_value * 2
-        } else {
-            limit_value
-        };
-
-        Some((adjusted_limit, left_key_col, right_key_col))
+        Some(SemijoinReduction {
+            cap,
+            limit,
+            left_key_col,
+            right_key_col,
+        })
     }
 
     /// Check if a column expression references a specific table

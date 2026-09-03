@@ -115,6 +115,12 @@ pub trait QueryResult: Send {
         None
     }
 
+    /// The exact number of rows a fresh result will yield, when it is known
+    /// without iterating. Default implementation returns None.
+    fn exact_len(&self) -> Option<usize> {
+        None
+    }
+
     /// Returns a pending error from the last `next()` call, if any.
     ///
     /// When `next()` returns false due to a runtime error (e.g. invalid REGEXP
