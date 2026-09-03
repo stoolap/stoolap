@@ -191,8 +191,11 @@ fn test_inl_join_limit_chunks_neither_repeat_nor_skip_rows() {
 #[test]
 fn test_inl_join_limit_over_a_cte_or_view_outer_never_repeats_rows() {
     let db = setup("join_limit_cte_view_outer", false);
-    db.execute("CREATE VIEW first_orders AS SELECT * FROM orders WHERE id <= 100", ())
-        .unwrap();
+    db.execute(
+        "CREATE VIEW first_orders AS SELECT * FROM orders WHERE id <= 100",
+        (),
+    )
+    .unwrap();
     // exactly 100 outer rows, five of them with a user: the first chunk is
     // consumed and still short of the limit
     for sql in [
@@ -207,4 +210,47 @@ fn test_inl_join_limit_over_a_cte_or_view_outer_never_repeats_rows() {
         ids.sort_unstable();
         assert_eq!(ids, vec![20, 40, 60, 80, 100], "{sql}");
     }
+}
+
+/// A table function on the outer side cannot be fetched again from an
+/// offset, so its first fetch must not be cut at the chunk.
+#[test]
+fn test_inl_join_limit_over_a_table_function_outer_reads_it_whole() {
+    let db = Database::open("memory://join_limit_tvf_outer").unwrap();
+    db.execute("CREATE TABLE sparse (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO sparse VALUES (150)", ()).unwrap();
+    let ids: Vec<i64> = db
+        .query(
+            "SELECT g.value FROM generate_series(1, 200) g INNER JOIN sparse s ON g.value = s.id LIMIT 1",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(ids, vec![150]);
+}
+
+/// A temporal outer source hands back every row, so the join must not take it
+/// for a full chunk and read it again.
+#[test]
+fn test_inl_join_limit_over_a_temporal_outer_never_repeats_rows() {
+    let db = setup("join_limit_temporal_outer", false);
+    db.execute("CREATE TABLE first100 (id INTEGER PRIMARY KEY, user_id INTEGER)", ())
+        .unwrap();
+    for i in 1..=100i64 {
+        let uid = if i % 20 == 0 { i / 20 } else { 100_000 + i };
+        db.execute("INSERT INTO first100 VALUES ($1, $2)", (i, uid))
+            .unwrap();
+    }
+    let mut ids: Vec<i64> = db
+        .query(
+            "SELECT f.id FROM first100 AS OF TIMESTAMP '2099-01-01 00:00:00' f INNER JOIN users u ON f.user_id = u.id LIMIT 10",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![20, 40, 60, 80, 100]);
 }

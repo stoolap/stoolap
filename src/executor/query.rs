@@ -1168,11 +1168,17 @@ impl Executor {
         ctx: &ExecutionContext,
         filter: Option<&Expression>,
         limit: Option<usize>,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
+        offset: usize,
+    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
         // Only push limit to TVF generation when no filter will discard rows afterwards.
         // With a filter, we must generate all rows first, then filter, then let
-        // downstream processing handle the limit.
-        let tvf_limit = if filter.is_some() { None } else { limit };
+        // downstream processing handle the limit. The flag says whether the
+        // limit and offset were applied here.
+        let tvf_limit = if filter.is_some() {
+            None
+        } else {
+            limit.map(|l| l.saturating_add(offset))
+        };
 
         // Extract range bounds from the filter to narrow TVF generation range.
         // This avoids materializing millions of rows when a selective predicate exists.
@@ -1210,9 +1216,15 @@ impl Executor {
             let row_filter = RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
             row_filter.retain_checked(&mut result_rows)?;
         }
+        let bounded = tvf_limit.is_some();
+        if bounded && offset > 0 {
+            let mut rows = result_rows.into_vec();
+            rows.drain(..offset.min(rows.len()));
+            result_rows = RowVec::from_vec(rows);
+        }
 
         let result: Box<dyn QueryResult> = Box::new(ExecutorResult::new(column_names, result_rows));
-        Ok((result, qualified_columns))
+        Ok((result, qualified_columns, bounded))
     }
 
     /// LIMIT + OFFSET when both are integer literals (OFFSET may be absent),
@@ -4210,7 +4222,7 @@ impl Executor {
                 // One snapshot serves every outer fetch and the inner probes
                 let snapshot = match ctx.statement_snapshot() {
                     Some(snapshot) => snapshot.clone(),
-                    None => StatementSnapshot::new(self.engine.begin_transaction()?),
+                    None => self.new_statement_snapshot()?,
                 };
                 let ctx_join = ctx.with_statement_snapshot(snapshot.clone());
                 let ctx = &ctx_join;
@@ -6245,7 +6257,8 @@ impl Executor {
                 Ok((result, columns.to_vec()))
             }
             Expression::FunctionTableSource(tvf_source) => {
-                Self::execute_tvf_for_join(tvf_source, ctx, filter, None)
+                Self::execute_tvf_for_join(tvf_source, ctx, filter, None, 0)
+                    .map(|(result, columns, _)| (result, columns))
             }
             _ => Err(Error::NotSupported(
                 "Unsupported table expression type".to_string(),
@@ -6278,8 +6291,7 @@ impl Executor {
             _ => None,
         };
         if let Some(tvf_source) = tvf_source {
-            return Self::execute_tvf_for_join(tvf_source, ctx, filter, row_limit)
-                .map(|(result, columns)| (result, columns, false));
+            return Self::execute_tvf_for_join(tvf_source, ctx, filter, row_limit, row_offset);
         }
 
         // Extract TableSource from the expression (handles both direct and aliased)
@@ -6355,7 +6367,9 @@ impl Executor {
             };
             // Get classification for the synthetic SELECT statement
             let classification = get_classification(&select_all);
-            let (result, columns, _, _) =
+            // The scan says whether it applied the synthetic LIMIT and OFFSET;
+            // a path that did not (AS OF among them) hands back every row
+            let (result, columns, applied, _) =
                 self.execute_simple_table_scan(ts, &select_all, ctx, &classification)?;
 
             // Prefix column names with table alias (or table name if no alias)
@@ -6372,7 +6386,7 @@ impl Executor {
                 .map(|col| format!("{}.{}", table_alias, col))
                 .collect();
 
-            return Ok((result, qualified_columns, true));
+            return Ok((result, qualified_columns, applied));
         }
 
         // Fall back to standard execution for other cases
@@ -6398,6 +6412,14 @@ impl Executor {
             return Err(err);
         }
         Ok(rows)
+    }
+
+    /// One transaction for every read of a statement, under snapshot isolation
+    /// so a later commit cannot move rows between two of its fetches
+    fn new_statement_snapshot(&self) -> Result<StatementSnapshot> {
+        let mut transaction = self.engine.begin_transaction()?;
+        transaction.set_isolation_level(crate::core::IsolationLevel::SnapshotIsolation)?;
+        Ok(StatementSnapshot::new(transaction))
     }
 
     /// Runs a join operator to completion or to `limit` rows. The cross-table
