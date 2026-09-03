@@ -24,7 +24,7 @@ fn setup_indexed_table(db: &Database) {
         "CREATE TABLE products (
             id INTEGER PRIMARY KEY,
             name TEXT,
-            price FLOAT,
+            price FLOAT NOT NULL,
             category TEXT,
             stock INTEGER
         )",

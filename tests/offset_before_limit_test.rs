@@ -205,7 +205,7 @@ fn test_lead_sees_the_row_after_the_limit_window() {
 fn test_range_frame_peers_survive_the_limit_window() {
     let db = Database::open("memory://offset_range_peers").unwrap();
     db.execute(
-        "CREATE TABLE sales (id INTEGER PRIMARY KEY, category INTEGER, amount FLOAT)",
+        "CREATE TABLE sales (id INTEGER PRIMARY KEY, category INTEGER NOT NULL, amount FLOAT)",
         (),
     )
     .unwrap();
@@ -265,28 +265,33 @@ fn test_second_window_with_another_order_keeps_the_full_fetch() {
     assert_eq!(row.get::<i64>(2).unwrap(), 55);
 }
 
-/// The index orders NULLs its own way; the window's ORDER BY may not. A cut
-/// fetch over a nullable column could therefore start with the wrong rows,
-/// so the limited result must equal the same slice of the unlimited one.
+/// The index orders NULLs its own way; the window's ORDER BY may not. Rows
+/// fetched in index order must not be taken as pre-sorted on a nullable
+/// column, with or without a limit: a table without the index is the oracle.
 #[test]
-fn test_window_limit_over_a_nullable_index_column_matches_the_full_result() {
+fn test_window_over_a_nullable_index_column_matches_the_unindexed_table() {
     let db = Database::open("memory://offset_nullable_window").unwrap();
-    db.execute(
-        "CREATE TABLE events (id INTEGER PRIMARY KEY, k INTEGER)",
-        (),
-    )
-    .unwrap();
+    for table in ["events", "events_plain"] {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, k INTEGER)"),
+            (),
+        )
+        .unwrap();
+        for i in 1..=20i64 {
+            db.execute(&format!("INSERT INTO {table} VALUES ($1, NULL)"), (i,))
+                .unwrap();
+        }
+        for i in 21..=100i64 {
+            db.execute(
+                &format!("INSERT INTO {table} VALUES ($1, $2)"),
+                (i, 200 - i),
+            )
+            .unwrap();
+        }
+    }
     db.execute("CREATE INDEX idx_events_k ON events(k) USING BTREE", ())
         .unwrap();
-    for i in 1..=20i64 {
-        db.execute("INSERT INTO events VALUES ($1, NULL)", (i,))
-            .unwrap();
-    }
-    for i in 21..=100i64 {
-        db.execute("INSERT INTO events VALUES ($1, $2)", (i, 200 - i))
-            .unwrap();
-    }
-    let read = |sql: &str| -> Vec<(i64, Option<i64>, i64)> {
+    let read = |sql: &str| -> Vec<(i64, Option<i64>, Option<i64>)> {
         db.query(sql, ())
             .unwrap()
             .map(|row| {
@@ -294,29 +299,47 @@ fn test_window_limit_over_a_nullable_index_column_matches_the_full_result() {
                 (
                     row.get::<i64>(0).unwrap(),
                     row.get::<Option<i64>>(1).unwrap(),
-                    row.get::<i64>(2).unwrap(),
+                    row.get::<Option<i64>>(2).unwrap(),
                 )
             })
             .collect()
     };
-    for (order, off) in [
-        ("ASC", 0),
-        ("ASC", 15),
-        ("DESC", 0),
-        ("DESC", 75),
-        ("ASC NULLS FIRST", 15),
-        ("DESC NULLS LAST", 75),
-    ] {
+    for order in ["ASC", "DESC", "ASC NULLS FIRST", "DESC NULLS LAST"] {
+        // aggregates take the pre-sorted rows as they come, ranking sorts itself
+        for func in ["ROW_NUMBER()", "COUNT(*)", "SUM(k)"] {
+            let oracle = read(&format!(
+                "SELECT id, k, {func} OVER (ORDER BY k {order}) AS v FROM events_plain ORDER BY id"
+            ));
+            let indexed = read(&format!(
+                "SELECT id, k, {func} OVER (ORDER BY k {order}) AS v FROM events ORDER BY id"
+            ));
+            assert_eq!(indexed, oracle, "{func} OVER (ORDER BY k {order})");
+        }
         let full = read(&format!(
             "SELECT id, k, ROW_NUMBER() OVER (ORDER BY k {order}) AS rn FROM events"
         ));
-        let cut = read(&format!(
-            "SELECT id, k, ROW_NUMBER() OVER (ORDER BY k {order}) AS rn FROM events LIMIT 10 OFFSET {off}"
-        ));
-        assert_eq!(
-            cut,
-            full[off..off + 10].to_vec(),
-            "ORDER BY k {order} OFFSET {off}"
-        );
+        for off in [0, 15, 75] {
+            let cut = read(&format!(
+                "SELECT id, k, ROW_NUMBER() OVER (ORDER BY k {order}) AS rn FROM events LIMIT 10 OFFSET {off}"
+            ));
+            assert_eq!(
+                cut,
+                full[off..off + 10].to_vec(),
+                "ORDER BY k {order} OFFSET {off}"
+            );
+        }
     }
+    // the first NULL row sorts after the 80 non-null rows by default
+    let rn: i64 = db
+        .query(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY k) AS rn FROM events ORDER BY id LIMIT 1",
+            (),
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(1)
+        .unwrap();
+    assert_eq!(rn, 81);
 }
