@@ -4277,7 +4277,7 @@ impl Executor {
 
                 if let Some(outer_idx) = outer_key_idx {
                     // Get inner table for schema and row fetching
-                    let inner_table = snapshot.get_table(&table_name)?;
+                    let inner_table = self.join_table(&snapshot, &table_name)?;
                     let inner_schema = inner_table.schema();
 
                     // Build inner columns list (qualified)
@@ -4364,7 +4364,7 @@ impl Executor {
                                 outer_op,
                                 match inner_table.take() {
                                     Some(table) => table,
-                                    None => snapshot.get_table(&table_name)?,
+                                    None => self.join_table(&snapshot, &table_name)?,
                                 },
                                 inner_cols.iter().map(ColumnInfo::new).collect(),
                                 op_join_type,
@@ -6426,6 +6426,20 @@ impl Executor {
             return Err(err);
         }
         Ok(rows)
+    }
+
+    /// The inner table of a join: from the explicit transaction when one is
+    /// active, so the join sees what the transaction changed, otherwise from
+    /// the statement snapshot the outer side reads through
+    fn join_table(
+        &self,
+        snapshot: &StatementSnapshot,
+        name: &str,
+    ) -> Result<Box<dyn crate::storage::traits::Table>> {
+        if let Some(active) = self.active_transaction.lock().unwrap().as_ref() {
+            return active.transaction.get_table(name);
+        }
+        snapshot.get_table(name)
     }
 
     /// One transaction for every read of a statement, under snapshot isolation

@@ -275,16 +275,16 @@ fn test_inl_join_limit_over_a_correlated_outer_filter_keeps_continuing() {
     assert_eq!(ids, (1..=50).map(|i| i * 20).collect::<Vec<i64>>());
 }
 
-/// Inside an explicit transaction the outer side is fetched whole; the
-/// answer must still be complete.
+/// Inside an explicit transaction the outer side is fetched whole and both
+/// sides read through that transaction, so the join sees the rows it
+/// inserted and misses the ones it deleted before any commit.
 #[test]
 fn test_inl_join_limit_inside_an_explicit_transaction() {
     let db = setup("join_limit_explicit_tx", false);
+    let joined =
+        "SELECT o.amount, u.name FROM orders o INNER JOIN users u ON o.user_id = u.id LIMIT 100";
     db.execute("BEGIN", ()).unwrap();
-    assert_eq!(
-        count(&db, "SELECT o.amount, u.name FROM orders o INNER JOIN users u ON o.user_id = u.id LIMIT 100"),
-        50
-    );
+    assert_eq!(count(&db, joined), 50);
     assert_eq!(
         count(
             &db,
@@ -292,5 +292,19 @@ fn test_inl_join_limit_inside_an_explicit_transaction() {
         ),
         30
     );
-    db.execute("COMMIT", ()).unwrap();
+    // an uncommitted matching pair: the new user is on the inner side
+    db.execute("INSERT INTO users VALUES (101, 'U101')", ())
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (1001, 101, 1001.0)", ())
+        .unwrap();
+    assert_eq!(count(&db, joined), 51);
+    assert_eq!(
+        count(&db, "SELECT o.amount FROM orders o INNER JOIN users u ON o.user_id = u.id WHERE o.id = 1001 LIMIT 10"),
+        1
+    );
+    // an uncommitted delete on the inner side takes its match away
+    db.execute("DELETE FROM users WHERE id = 1", ()).unwrap();
+    assert_eq!(count(&db, joined), 50);
+    db.execute("ROLLBACK", ()).unwrap();
+    assert_eq!(count(&db, joined), 50);
 }
