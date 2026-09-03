@@ -1919,10 +1919,7 @@ pub fn compute_join_projection(
     let resolve_qualified = |qualifier: &str, name: &str| -> Option<usize> {
         columns_all()
             .enumerate()
-            .filter(|(_, c)| {
-                c.split_once('.')
-                    .is_some_and(|(q, n)| eq_folded(q, qualifier) && eq_folded(n, name))
-            })
+            .filter(|(_, c)| eq_folded_qualified(c, qualifier, name))
             .last()
             .map(|(i, _)| i)
             .or_else(|| resolve(name))
@@ -1981,6 +1978,25 @@ fn eq_folded(column: &str, lower: &str) -> bool {
     }
 }
 
+/// The same for `qualifier.name`, compared as one string so that a dot
+/// inside a quoted qualifier or name is not taken for the separator.
+#[inline]
+fn eq_folded_qualified(column: &str, qualifier: &str, name: &str) -> bool {
+    if column.is_ascii() && qualifier.is_ascii() && name.is_ascii() {
+        let q = qualifier.len();
+        column.len() == q + 1 + name.len()
+            && column.as_bytes()[q] == b'.'
+            && column[..q].eq_ignore_ascii_case(qualifier)
+            && column[q + 1..].eq_ignore_ascii_case(name)
+    } else {
+        let expected = qualifier
+            .chars()
+            .chain(std::iter::once('.'))
+            .chain(name.chars());
+        column.chars().flat_map(char::to_lowercase).eq(expected)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2032,6 +2048,20 @@ mod tests {
         let dup = vec!["v".to_string(), "v".to_string()];
         let proj = compute_join_projection(&[ident("v")], &dup, &[]).unwrap();
         assert!(matches!(proj.columns[0], ColumnSource::Outer(1)));
+    }
+
+    /// A quoted alias may contain a dot; `"a.b".x` must match the column
+    /// `a.b.x` as a whole and not fall back to a bare `x` elsewhere.
+    #[test]
+    fn test_join_projection_keeps_dots_inside_a_qualifier() {
+        let outer = vec!["x".to_string()];
+        let inner = vec!["a.b.id".to_string(), "a.b.x".to_string()];
+        let proj = compute_join_projection(&[qualified("a.b", "x")], &outer, &inner).unwrap();
+        assert!(matches!(proj.columns[0], ColumnSource::Inner(1)));
+
+        let unicode = vec!["Ä.b.x".to_string()];
+        let proj = compute_join_projection(&[qualified("ä.b", "x")], &unicode, &[]).unwrap();
+        assert!(matches!(proj.columns[0], ColumnSource::Outer(0)));
     }
 
     /// Outer values reach the subquery's WHERE, but names that belong to
