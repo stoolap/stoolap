@@ -156,3 +156,55 @@ fn test_group_by_limit_reduction_survives_a_huge_limit() {
         50
     );
 }
+
+/// The outer side is fetched chunk by chunk; the rows across the chunk
+/// boundaries must be exactly the matching ones, none repeated or missing.
+#[test]
+fn test_inl_join_limit_chunks_neither_repeat_nor_skip_rows() {
+    let db = setup("join_limit_chunk_boundaries", false);
+    let mut ids: Vec<i64> = db
+        .query(
+            "SELECT o.id FROM orders o INNER JOIN users u ON o.user_id = u.id LIMIT 100",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (1..=50).map(|i| i * 20).collect::<Vec<i64>>());
+    let mut ids: Vec<i64> = db
+        .query(
+            "SELECT o.id FROM orders o INNER JOIN users u ON o.user_id = u.id LIMIT 30",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(ids.len(), 30);
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 30);
+}
+
+/// A CTE or a view on the outer side comes back whole; the join must not
+/// treat it as a chunk and read it again from the start.
+#[test]
+fn test_inl_join_limit_over_a_cte_or_view_outer_never_repeats_rows() {
+    let db = setup("join_limit_cte_view_outer", false);
+    db.execute("CREATE VIEW first_orders AS SELECT * FROM orders WHERE id <= 100", ())
+        .unwrap();
+    // exactly 100 outer rows, five of them with a user: the first chunk is
+    // consumed and still short of the limit
+    for sql in [
+        "WITH w AS (SELECT * FROM orders WHERE id <= 100) SELECT w.id FROM w INNER JOIN users u ON w.user_id = u.id LIMIT 10",
+        "SELECT f.id FROM first_orders f INNER JOIN users u ON f.user_id = u.id LIMIT 10",
+    ] {
+        let mut ids: Vec<i64> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![20, 40, 60, 80, 100], "{sql}");
+    }
+}

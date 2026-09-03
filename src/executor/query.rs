@@ -67,7 +67,7 @@ use super::context::{
     clear_batch_aggregate_cache, clear_batch_aggregate_info_cache, clear_count_counter_cache,
     clear_exists_correlation_cache, clear_exists_fetcher_cache, clear_exists_index_cache,
     clear_exists_pred_key_cache, clear_exists_predicate_cache, clear_exists_schema_cache,
-    ExecutionContext, TimeoutGuard,
+    ExecutionContext, StatementSnapshot, TimeoutGuard,
 };
 use super::expression::{
     compile_expression, CompiledEvaluator, ExecuteContext, ExprVM, ExpressionEval, JoinFilter,
@@ -2042,29 +2042,53 @@ impl Executor {
             (table, None)
         } else {
             drop(active_tx); // Release lock before creating new transaction
-                             // No active transaction - create a standalone transaction
-            let tx = self.engine.begin_transaction()?;
-
-            // Check for AS OF (temporal query)
-            if let Some(ref as_of) = table_source.as_of {
-                return self.execute_temporal_query(
-                    table_name,
-                    as_of,
-                    stmt,
-                    ctx,
-                    &*tx,
-                    classification,
-                );
-            }
-
-            let table = tx.get_table(table_name).map_err(|e| {
-                if matches!(e, Error::TableNotFound(_)) {
-                    Error::TableOrViewNotFound(table_name.to_string())
-                } else {
-                    e
+                             // No active transaction: a statement-scoped snapshot, when the
+                             // statement carries one, keeps every fetch on one transaction;
+                             // otherwise a standalone transaction
+            if let Some(snapshot) = ctx.statement_snapshot() {
+                if let Some(ref as_of) = table_source.as_of {
+                    let tx = self.engine.begin_transaction()?;
+                    return self.execute_temporal_query(
+                        table_name,
+                        as_of,
+                        stmt,
+                        ctx,
+                        &*tx,
+                        classification,
+                    );
                 }
-            })?;
-            (table, Some(tx))
+                let table = snapshot.get_table(table_name).map_err(|e| {
+                    if matches!(e, Error::TableNotFound(_)) {
+                        Error::TableOrViewNotFound(table_name.to_string())
+                    } else {
+                        e
+                    }
+                })?;
+                (table, None)
+            } else {
+                let tx = self.engine.begin_transaction()?;
+
+                // Check for AS OF (temporal query)
+                if let Some(ref as_of) = table_source.as_of {
+                    return self.execute_temporal_query(
+                        table_name,
+                        as_of,
+                        stmt,
+                        ctx,
+                        &*tx,
+                        classification,
+                    );
+                }
+
+                let table = tx.get_table(table_name).map_err(|e| {
+                    if matches!(e, Error::TableNotFound(_)) {
+                        Error::TableOrViewNotFound(table_name.to_string())
+                    } else {
+                        e
+                    }
+                })?;
+                (table, Some(tx))
+            }
         };
 
         // Build column list from schema: refcount bump, not a per-statement
@@ -3936,13 +3960,14 @@ impl Executor {
                 right_key_col,
             } = plan;
             let left_cap = left_cap_override.unwrap_or(cap);
-            let (left_result, left_cols) = self.execute_table_expression_with_filter_limit(
-                &join_source.left,
-                ctx,
-                left_filter.as_ref(),
-                Some(left_cap),
-                0,
-            )?;
+            let (left_result, left_cols, left_bounded) = self
+                .execute_table_expression_with_filter_limit(
+                    &join_source.left,
+                    ctx,
+                    left_filter.as_ref(),
+                    Some(left_cap),
+                    0,
+                )?;
             let left_rows = Self::materialize_result_arc(left_result)?;
             let left_key_idx = Self::find_column_index_by_name(&left_key_col, &left_cols);
             let join_key_values: Vec<Value> = if let Some(idx) = left_key_idx {
@@ -3979,7 +4004,7 @@ impl Executor {
             let right_rows = Self::materialize_result_arc(right_result)?;
             reduction.set(Some(ReductionPass {
                 cap: left_cap,
-                chunk_full: left_rows.len() == left_cap,
+                chunk_full: left_bounded && left_rows.len() == left_cap,
                 limit,
             }));
             (left_rows, left_cols, right_rows, right_cols)
@@ -4178,36 +4203,34 @@ impl Executor {
                 };
 
                 // The outer side is fetched in chunks: the first one is the limit
-                // itself and the join below fetches more when it stops short. Only
-                // a table can be fetched again from an offset; any other source is
-                // fetched whole
-                let outer_source: &Expression = outer_expr;
-                let outer_is_table = match outer_source {
-                    Expression::TableSource(_) => true,
-                    Expression::Aliased(a) => {
-                        matches!(a.expression.as_ref(), Expression::TableSource(_))
-                    }
-                    _ => false,
+                // plus an eighth of slack, so the odd outer row without a match
+                // needs no second fetch, and the join below fetches more when it
+                // stops short. Only a plain table takes the limit and can be
+                // fetched again from an offset; the fetch says whether it did.
+                // One snapshot serves every outer fetch and the inner probes
+                let snapshot = match ctx.statement_snapshot() {
+                    Some(snapshot) => snapshot.clone(),
+                    None => StatementSnapshot::new(self.engine.begin_transaction()?),
                 };
-                // A little slack over the limit covers the odd outer row without a
-                // match, so the common case needs no second fetch
-                let mut outer_limit = if outer_is_table {
-                    join_limit.map(|l| {
-                        let l = l as usize;
-                        l.saturating_add(l / 8).max(100)
-                    })
-                } else {
-                    None
-                };
+                let ctx_join = ctx.with_statement_snapshot(snapshot.clone());
+                let ctx = &ctx_join;
+                let mut outer_limit = join_limit.map(|l| {
+                    let l = l as usize;
+                    l.saturating_add(l / 8).max(100)
+                });
 
                 // Execute outer side with limit optimization for true early termination
-                let (outer_result, outer_cols) = self.execute_table_expression_with_filter_limit(
-                    outer_expr,
-                    ctx,
-                    nl_left_filter.as_ref(),
-                    outer_limit,
-                    0,
-                )?;
+                let (outer_result, outer_cols, outer_bounded) = self
+                    .execute_table_expression_with_filter_limit(
+                        outer_expr,
+                        ctx,
+                        nl_left_filter.as_ref(),
+                        outer_limit,
+                        0,
+                    )?;
+                if !outer_bounded {
+                    outer_limit = None;
+                }
 
                 // Find the outer key index in outer columns
                 // OPTIMIZATION: Pre-compute lowercase column names to avoid per-column to_lowercase()
@@ -4234,8 +4257,7 @@ impl Executor {
 
                 if let Some(outer_idx) = outer_key_idx {
                     // Get inner table for schema and row fetching
-                    let txn = self.engine.begin_transaction()?;
-                    let inner_table = txn.get_table(&table_name)?;
+                    let inner_table = snapshot.get_table(&table_name)?;
                     let inner_schema = inner_table.schema();
 
                     // Build inner columns list (qualified)
@@ -4322,7 +4344,7 @@ impl Executor {
                                 outer_op,
                                 match inner_table.take() {
                                     Some(table) => table,
-                                    None => txn.get_table(&table_name)?,
+                                    None => snapshot.get_table(&table_name)?,
                                 },
                                 inner_cols.iter().map(ColumnInfo::new).collect(),
                                 op_join_type,
@@ -4359,15 +4381,16 @@ impl Executor {
                             };
                             let next = estimate.clamp(32, fetched.saturating_mul(3));
                             outer_limit = Some(next);
-                            outer_result = self
+                            let (more, _, bounded) = self
                                 .execute_table_expression_with_filter_limit(
                                     outer_expr,
                                     ctx,
                                     nl_left_filter.as_ref(),
                                     Some(next),
                                     fetched,
-                                )?
-                                .0;
+                                )?;
+                            debug_assert!(bounded);
+                            outer_result = more;
                         }
                     } else {
                         // Batch INL for NO LIMIT - single batch fetch, O(1) lock overhead
@@ -6231,9 +6254,9 @@ impl Executor {
     }
 
     /// Execute a table expression with optional filter, row limit and row offset.
-    /// For simple table sources, adds LIMIT to enable true early termination.
-    /// This is optimized for Index Nested Loop joins where we need only enough rows
-    /// to produce the requested LIMIT results.
+    /// The flag says whether the limit and offset were applied: only a plain
+    /// table takes them; a CTE, a view, a subquery or a table function comes
+    /// back whole and cannot be fetched again from an offset.
     pub(crate) fn execute_table_expression_with_filter_limit(
         &self,
         expr: &Expression,
@@ -6241,7 +6264,7 @@ impl Executor {
         filter: Option<&Expression>,
         row_limit: Option<usize>,
         row_offset: usize,
-    ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
+    ) -> Result<(Box<dyn QueryResult>, Vec<String>, bool)> {
         // Handle FunctionTableSource with limit passthrough
         let tvf_source = match expr {
             Expression::FunctionTableSource(fts) => Some(fts.as_ref()),
@@ -6255,7 +6278,8 @@ impl Executor {
             _ => None,
         };
         if let Some(tvf_source) = tvf_source {
-            return Self::execute_tvf_for_join(tvf_source, ctx, filter, row_limit);
+            return Self::execute_tvf_for_join(tvf_source, ctx, filter, row_limit)
+                .map(|(result, columns)| (result, columns, false));
         }
 
         // Extract TableSource from the expression (handles both direct and aliased)
@@ -6266,12 +6290,16 @@ impl Executor {
                     (ts, Some(aliased.alias.value.clone()))
                 } else {
                     // Not a table source, fall back to standard execution
-                    return self.execute_table_expression_with_filter(expr, ctx, filter);
+                    return self
+                        .execute_table_expression_with_filter(expr, ctx, filter)
+                        .map(|(result, columns)| (result, columns, false));
                 }
             }
             _ => {
                 // Not a table source, fall back to standard execution
-                return self.execute_table_expression_with_filter(expr, ctx, filter);
+                return self
+                    .execute_table_expression_with_filter(expr, ctx, filter)
+                    .map(|(result, columns)| (result, columns, false));
             }
         };
 
@@ -6281,12 +6309,16 @@ impl Executor {
 
             // Skip if this is a CTE reference - CTEs are already materialized
             if ctx.get_cte_by_lower(table_name).is_some() {
-                return self.execute_table_expression_with_filter(expr, ctx, filter);
+                return self
+                    .execute_table_expression_with_filter(expr, ctx, filter)
+                    .map(|(result, columns)| (result, columns, false));
             }
 
             // Skip if this is a view
             if self.engine.get_view_lowercase(table_name)?.is_some() {
-                return self.execute_table_expression_with_filter(expr, ctx, filter);
+                return self
+                    .execute_table_expression_with_filter(expr, ctx, filter)
+                    .map(|(result, columns)| (result, columns, false));
             }
 
             // Create a SELECT * statement with WHERE clause AND LIMIT
@@ -6340,11 +6372,12 @@ impl Executor {
                 .map(|col| format!("{}.{}", table_alias, col))
                 .collect();
 
-            return Ok((result, qualified_columns));
+            return Ok((result, qualified_columns, true));
         }
 
         // Fall back to standard execution for other cases
         self.execute_table_expression_with_filter(expr, ctx, filter)
+            .map(|(result, columns)| (result, columns, false))
     }
 
     /// Materialize a result into a RowVec
