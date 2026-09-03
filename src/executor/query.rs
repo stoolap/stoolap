@@ -4226,10 +4226,18 @@ impl Executor {
                 };
                 let ctx_join = ctx.with_statement_snapshot(snapshot.clone());
                 let ctx = &ctx_join;
-                let mut outer_limit = join_limit.map(|l| {
-                    let l = l as usize;
-                    l.saturating_add(l / 8).max(100)
-                });
+                // An explicit transaction reads through its own transaction, whose
+                // isolation may let a commit move rows between two fetches, so
+                // the outer side is fetched whole there
+                let in_explicit_transaction = self.active_transaction.lock().unwrap().is_some();
+                let mut outer_limit = if in_explicit_transaction {
+                    None
+                } else {
+                    join_limit.map(|l| {
+                        let l = l as usize;
+                        l.saturating_add(l / 8).max(100)
+                    })
+                };
 
                 // Execute outer side with limit optimization for true early termination
                 let (outer_result, outer_cols, outer_bounded) = self
@@ -6367,10 +6375,16 @@ impl Executor {
             };
             // Get classification for the synthetic SELECT statement
             let classification = get_classification(&select_all);
-            // The scan says whether it applied the synthetic LIMIT and OFFSET;
-            // a path that did not (AS OF among them) hands back every row
+            // The scan says whether it applied the synthetic LIMIT and OFFSET. A
+            // path that did not may still have stopped early at their sum, so
+            // the pair is applied here, as the select layer would
             let (result, columns, applied, _) =
                 self.execute_simple_table_scan(ts, &select_all, ctx, &classification)?;
+            let result: Box<dyn QueryResult> = if applied {
+                result
+            } else {
+                Box::new(LimitedResult::new(result, Some(limit), row_offset))
+            };
 
             // Prefix column names with table alias (or table name if no alias)
             // Use custom_alias from Aliased expression if provided
@@ -6386,7 +6400,7 @@ impl Executor {
                 .map(|col| format!("{}.{}", table_alias, col))
                 .collect();
 
-            return Ok((result, qualified_columns, applied));
+            return Ok((result, qualified_columns, true));
         }
 
         // Fall back to standard execution for other cases

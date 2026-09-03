@@ -236,8 +236,11 @@ fn test_inl_join_limit_over_a_table_function_outer_reads_it_whole() {
 #[test]
 fn test_inl_join_limit_over_a_temporal_outer_never_repeats_rows() {
     let db = setup("join_limit_temporal_outer", false);
-    db.execute("CREATE TABLE first100 (id INTEGER PRIMARY KEY, user_id INTEGER)", ())
-        .unwrap();
+    db.execute(
+        "CREATE TABLE first100 (id INTEGER PRIMARY KEY, user_id INTEGER)",
+        (),
+    )
+    .unwrap();
     for i in 1..=100i64 {
         let uid = if i % 20 == 0 { i / 20 } else { 100_000 + i };
         db.execute("INSERT INTO first100 VALUES ($1, $2)", (i, uid))
@@ -253,4 +256,41 @@ fn test_inl_join_limit_over_a_temporal_outer_never_repeats_rows() {
         .collect();
     ids.sort_unstable();
     assert_eq!(ids, vec![20, 40, 60, 80, 100]);
+}
+
+/// A correlated filter on the outer side takes a scan path that stops early
+/// at the chunk without reporting it; the fetch must still bound and continue.
+#[test]
+fn test_inl_join_limit_over_a_correlated_outer_filter_keeps_continuing() {
+    let db = setup("join_limit_correlated_outer", false);
+    let mut ids: Vec<i64> = db
+        .query(
+            "SELECT o.id FROM orders o INNER JOIN users u ON o.user_id = u.id WHERE o.amount >= (SELECT MIN(o2.amount) FROM orders o2 WHERE o2.user_id = o.user_id) LIMIT 100",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, (1..=50).map(|i| i * 20).collect::<Vec<i64>>());
+}
+
+/// Inside an explicit transaction the outer side is fetched whole; the
+/// answer must still be complete.
+#[test]
+fn test_inl_join_limit_inside_an_explicit_transaction() {
+    let db = setup("join_limit_explicit_tx", false);
+    db.execute("BEGIN", ()).unwrap();
+    assert_eq!(
+        count(&db, "SELECT o.amount, u.name FROM orders o INNER JOIN users u ON o.user_id = u.id LIMIT 100"),
+        50
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT u.name FROM users u INNER JOIN orders o ON u.id = o.user_id LIMIT 30"
+        ),
+        30
+    );
+    db.execute("COMMIT", ()).unwrap();
 }
