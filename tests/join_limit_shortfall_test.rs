@@ -141,3 +141,18 @@ fn test_group_by_limit_reduction_stays_off_under_distinct() {
         5
     );
 }
+
+/// The reduction doubles its left chunk and turns it into a LIMIT literal;
+/// a huge LIMIT must not overflow into a negative one.
+#[test]
+fn test_group_by_limit_reduction_survives_a_huge_limit() {
+    let db = setup("join_limit_huge", true);
+    assert_eq!(
+        count(&db, "SELECT u.name, COUNT(o.id) FROM users u LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name HAVING COUNT(o.id) >= 0 LIMIT 5000000000000000000"),
+        100
+    );
+    assert_eq!(
+        count(&db, "SELECT u.name, COUNT(o.id) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name HAVING COUNT(o.id) >= 1 LIMIT 5000000000000000000"),
+        50
+    );
+}

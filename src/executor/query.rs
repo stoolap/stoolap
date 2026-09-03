@@ -3785,7 +3785,7 @@ impl Executor {
             if !short {
                 return Ok((result, columns, flag, deferred));
             }
-            left_cap = Some(pass.cap.saturating_mul(2));
+            left_cap = Some(pass.cap.saturating_mul(2).min(i64::MAX as usize));
         }
     }
 
@@ -9025,11 +9025,11 @@ impl Executor {
         if stmt.having.is_some() {
             cap = cap.saturating_mul(2);
         }
-        Some((cap, limit))
+        // The chunk becomes a LIMIT literal, which is an i64
+        Some((cap.min(i64::MAX as usize), limit))
     }
 
-    /// Check if semi-join reduction optimization can be applied and return parameters
-    /// Returns Some((limit_value, left_key_col, right_key_col)) if applicable, None otherwise
+    /// Check if semi-join reduction optimization can be applied and return its plan
     ///
     /// Conditions for semi-join reduction:
     /// 1. INNER JOIN or LEFT JOIN (not RIGHT or FULL)
@@ -9037,8 +9037,9 @@ impl Executor {
     /// 3. LIMIT is present with no ORDER BY (for correctness)
     /// 4. Single equality join condition (a.col = b.col)
     ///
-    /// For INNER JOIN, we over-fetch left rows (2x limit) since some may not have matches.
-    /// For LEFT JOIN, exact limit is used since all left rows produce output.
+    /// The first left chunk is the limit, doubled for an INNER JOIN since some
+    /// left rows may not have matches and doubled again under HAVING; the join
+    /// reruns with twice the chunk when the result stops short.
     fn get_semijoin_reduction_limit(
         &self,
         join_type: &str,
