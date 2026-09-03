@@ -193,9 +193,10 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 
 | Feature | Stoolap | SQLite | DuckDB |
 |---------|---------|--------|--------|
-| Storage Model | Row-based | Row-based | Columnar |
+| Storage Model | Hybrid: row-oriented in-memory MVCC arena for hot rows, sealed on checkpoint into immutable columnar volumes (LZ4 row groups, dictionaries, zone maps) | Row-based (B-tree pages) | Columnar (vectorized) |
+| Durability | WAL, checkpoint seals hot rows into volumes | Rollback journal or WAL | WAL with checkpoints |
 | Concurrency | MVCC | WAL/locking | MVCC |
-| Query Optimizer | Cost-based | Rule-based | Cost-based |
+| Query Optimizer | Rule-based rewrites, runtime join and index selection | Cost-based (NGQP) | Cost-based |
 | Parallel Execution | Yes (Rayon) | No | Yes |
 | Language | Pure Rust | C | C++ |
 | Memory Safety | Guaranteed | Manual | Manual |
