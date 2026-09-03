@@ -1215,6 +1215,22 @@ impl Executor {
         Ok((result, qualified_columns))
     }
 
+    /// LIMIT + OFFSET when both are integer literals (OFFSET may be absent),
+    /// for fetch paths that stop early and leave OFFSET to be applied afterwards.
+    fn literal_fetch_limit(stmt: &SelectStatement) -> Option<usize> {
+        let limit = match stmt.limit.as_deref() {
+            Some(Expression::IntegerLiteral(lit)) if lit.value > 0 => lit.value as usize,
+            _ => return None,
+        };
+        match stmt.offset.as_deref() {
+            None => Some(limit),
+            Some(Expression::IntegerLiteral(lit)) if lit.value >= 0 => {
+                Some(limit.saturating_add(lit.value as usize))
+            }
+            Some(_) => None,
+        }
+    }
+
     /// Extract a simple LIMIT value from a SelectStatement, if present and evaluable.
     fn extract_limit_hint(stmt: &SelectStatement, ctx: &ExecutionContext) -> Option<usize> {
         let limit_expr = stmt.limit.as_ref()?;
@@ -2479,16 +2495,18 @@ impl Executor {
             && !classification.has_aggregation
         {
             if let Some(where_expr) = where_to_use {
-                if let Some((result, columns)) = self.try_in_subquery_index_optimization(
-                    stmt,
-                    where_expr,
-                    &*table,
-                    &all_columns,
-                    table_alias.as_deref(),
-                    ctx,
-                    classification,
-                )? {
-                    return Ok((result, columns, false, None));
+                if let Some((result, columns, limit_applied)) = self
+                    .try_in_subquery_index_optimization(
+                        stmt,
+                        where_expr,
+                        &*table,
+                        &all_columns,
+                        table_alias.as_deref(),
+                        ctx,
+                        classification,
+                    )?
+                {
+                    return Ok((result, columns, limit_applied, None));
                 }
             }
         }
@@ -2957,15 +2975,17 @@ impl Executor {
                 && !classification.select_has_correlated_subqueries
             {
                 if let Some(ref where_expr) = processed_where {
-                    if let Some((result, columns)) = self.try_in_hashset_index_optimization(
-                        stmt,
-                        where_expr,
-                        &*table,
-                        &all_columns,
-                        table_alias.as_deref(),
-                        ctx,
-                    )? {
-                        return Ok((result, columns, false, None));
+                    if let Some((result, columns, limit_applied)) = self
+                        .try_in_hashset_index_optimization(
+                            stmt,
+                            where_expr,
+                            &*table,
+                            &all_columns,
+                            table_alias.as_deref(),
+                            ctx,
+                        )?
+                    {
+                        return Ok((result, columns, limit_applied, None));
                     }
                 }
             }
@@ -2988,7 +3008,9 @@ impl Executor {
                 let can_early_terminate = !classification.has_order_by
                     && !classification.has_group_by
                     && !classification.has_aggregation
-                    && !classification.has_window_functions;
+                    && !classification.has_window_functions
+                    && !stmt.distinct
+                    && stmt.distinct_on.is_empty();
 
                 let early_termination_target = if can_early_terminate {
                     let offset = stmt
@@ -3014,7 +3036,7 @@ impl Executor {
                             .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
                             .and_then(|v| {
                                 if let Value::Integer(l) = v {
-                                    Some(offset + l.max(0) as usize)
+                                    Some((offset, l.max(0) as usize))
                                 } else {
                                     None
                                 }
@@ -3025,7 +3047,8 @@ impl Executor {
                 };
 
                 // Use early termination path if we have a target
-                if let Some(target) = early_termination_target {
+                if let Some((early_offset, early_limit)) = early_termination_target {
+                    let target = early_offset.saturating_add(early_limit);
                     // OPTIMIZATION: For memory-filter + LIMIT, use iterative fetching
                     // with early termination. We fetch in batches to avoid loading
                     // all rows when only a few are needed.
@@ -3079,6 +3102,12 @@ impl Executor {
                             table.collect_rows_with_limit(storage_expr.as_deref(), target, 0)?;
                     }
 
+                    // The rows OFFSET skips were collected too; drop them and cut to
+                    // LIMIT here, since this path reports both as applied
+                    let mut trimmed = result_rows.into_vec();
+                    trimmed.drain(..early_offset.min(trimmed.len()));
+                    trimmed.truncate(early_limit);
+                    let result_rows = RowVec::from_vec(trimmed);
                     // Project rows and return early - LIMIT/OFFSET already applied
                     let projected_rows = self.project_rows_with_alias(
                         &stmt.columns,
@@ -3408,28 +3437,22 @@ impl Executor {
                         // because we need all rows to sort before applying LIMIT
                         let has_order_by = !stmt.order_by.is_empty();
                         if !has_order_by {
-                            if let Some(limit_expr) = &stmt.limit {
-                                if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
-                                    if lit.value > 0 {
-                                        let limit_val = lit.value as usize;
-                                        // Use lazy partition fetching - returns early!
-                                        let result = self
-                                            .execute_select_with_window_functions_lazy_partition(
-                                                stmt,
-                                                ctx,
-                                                table.as_ref(),
-                                                &all_columns,
-                                                &partition_col,
-                                                limit_val,
-                                            );
-                                        if let Ok(query_result) = result {
-                                            let columns =
-                                                CompactArc::new(query_result.columns().to_vec());
-                                            return Ok((query_result, columns, false, None));
-                                        }
-                                        // Fall through to regular path if optimization fails
-                                    }
+                            if let Some(limit_val) = Self::literal_fetch_limit(stmt) {
+                                // Use lazy partition fetching - returns early!
+                                let result = self
+                                    .execute_select_with_window_functions_lazy_partition(
+                                        stmt,
+                                        ctx,
+                                        table.as_ref(),
+                                        &all_columns,
+                                        &partition_col,
+                                        limit_val,
+                                    );
+                                if let Ok(query_result) = result {
+                                    let columns = CompactArc::new(query_result.columns().to_vec());
+                                    return Ok((query_result, columns, false, None));
                                 }
+                                // Fall through to regular path if optimization fails
                             }
                         }
 
@@ -3481,7 +3504,16 @@ impl Executor {
                     let schema = table.schema();
                     let pk_columns = schema.primary_key_columns();
                     let is_pk = pk_columns.len() == 1 && pk_columns[0].name_lower == col_lower;
-                    let has_index = is_pk || table.get_index_on_column(&col_name).is_some();
+                    // Rows fetched in index order are taken as sorted, but the index
+                    // orders NULLs its own way, so only a column without NULLs may
+                    // skip the window's own sort
+                    let no_nulls = is_pk
+                        || schema
+                            .columns
+                            .iter()
+                            .any(|c| c.name_lower == col_lower && !c.nullable);
+                    let has_index =
+                        no_nulls && (is_pk || table.get_index_on_column(&col_name).is_some());
 
                     if has_index {
                         // OPTIMIZATION: If we have LIMIT without top-level ORDER BY,
@@ -3490,21 +3522,10 @@ impl Executor {
                         // Safe: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE
                         // Unsafe: NTILE, PERCENT_RANK, CUME_DIST (need total count)
                         let has_order_by = !stmt.order_by.is_empty();
-                        let is_window_safe = Self::is_window_safe_for_limit_pushdown(stmt);
+                        let is_window_safe =
+                            Self::is_window_safe_for_limit_pushdown(stmt, &col_name, ascending);
                         let fetch_limit = if !has_order_by && is_window_safe {
-                            if let Some(limit_expr) = &stmt.limit {
-                                if let Expression::IntegerLiteral(lit) = limit_expr.as_ref() {
-                                    if lit.value > 0 {
-                                        lit.value as usize
-                                    } else {
-                                        usize::MAX
-                                    }
-                                } else {
-                                    usize::MAX
-                                }
-                            } else {
-                                usize::MAX
-                            }
+                            Self::literal_fetch_limit(stmt).unwrap_or(usize::MAX)
                         } else {
                             usize::MAX
                         };
@@ -9733,17 +9754,9 @@ impl Executor {
         let mut result_row_id = 0i64;
         let num_aggs = simple_aggs.len();
 
-        // Parse LIMIT for early termination
-        // With streaming aggregation, we can stop once we have LIMIT groups that pass HAVING
-        let limit_for_early_exit = stmt.limit.as_ref().and_then(|limit_expr| {
-            ExpressionEval::compile(limit_expr, &[])
-                .ok()
-                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
-                .and_then(|v| match v {
-                    Value::Integer(n) if n > 0 => Some(n as usize),
-                    _ => None,
-                })
-        });
+        // With streaming aggregation we can stop once LIMIT + OFFSET groups pass
+        // HAVING; OFFSET is applied by the caller and must find its groups here
+        let limit_for_early_exit = Self::extract_limit_hint(stmt, ctx);
 
         // Use streaming callback to avoid upfront allocation of all groups.
         // This is more efficient because:
@@ -9938,15 +9951,8 @@ impl Executor {
             None => return Ok(None), // Fall back to regular GROUP BY
         }
 
-        // Apply LIMIT if present
-        if let Some(ref limit_expr) = stmt.limit {
-            if let Ok(Value::Integer(n)) = ExpressionEval::compile(limit_expr, &[])
-                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()))
-            {
-                if n >= 0 {
-                    result_rows.truncate(n as usize);
-                }
-            }
+        if let Some(keep) = limit_for_early_exit {
+            result_rows.truncate(keep);
         }
 
         let result_columns = CompactArc::new(result_columns);
