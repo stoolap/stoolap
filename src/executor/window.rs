@@ -1225,11 +1225,14 @@ impl Executor {
                 Expression::Aliased(aliased) => {
                     if let Expression::Window(_) = aliased.expression.as_ref() {
                         // Aliased window function
-                        let alias = aliased.alias.value.to_string();
+                        let key = if wf_idx < window_functions.len() {
+                            window_functions[wf_idx].column_name.to_lowercase()
+                        } else {
+                            aliased.alias.value.to_string().to_lowercase()
+                        };
                         items.push(SelectItem {
-                            output_name: alias.clone(),
-                            // OPTIMIZATION: Store lowercase for O(1) lookup in window_value_map
-                            source: SelectItemSource::WindowFunction(alias.to_lowercase()),
+                            output_name: aliased.alias.value.to_string(),
+                            source: SelectItemSource::WindowFunction(key),
                         });
                         wf_idx += 1;
                     } else if let Expression::Identifier(id) = aliased.expression.as_ref() {
@@ -1474,7 +1477,9 @@ impl Executor {
                     if let Expression::Window(window_expr) = aliased.expression.as_ref() {
                         let mut wf_info =
                             self.extract_window_function_info(window_expr, &stmt.window_defs)?;
-                        wf_info.column_name = aliased.alias.value.to_string();
+                        // The alias is only the output name; the internal name
+                        // cannot collide with an alias or another window
+                        wf_info.column_name = format!("__wf_{}_0", col_idx);
                         window_functions.push(wf_info);
                     } else {
                         // Collect ALL window functions in the expression

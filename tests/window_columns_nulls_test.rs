@@ -64,6 +64,25 @@ fn test_two_windows_with_the_same_function_keep_their_own_columns() {
     assert_eq!(got[99], vec![Some(100), Some(100), Some(1), Some(100)]);
 }
 
+/// An alias is only an output name: it must not collide with the internal
+/// key of another window, and two windows may even share an alias.
+#[test]
+fn test_window_aliases_never_collide_with_internal_keys() {
+    let db = setup("window_alias_keys");
+    let got = rows(
+        &db,
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id), ROW_NUMBER() OVER (ORDER BY amount DESC) AS __wf_1_0 FROM t ORDER BY id",
+    );
+    assert_eq!(got[0], vec![Some(1), Some(1), Some(100)]);
+    assert_eq!(got[99], vec![Some(100), Some(100), Some(1)]);
+    let got = rows(
+        &db,
+        "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS rn, ROW_NUMBER() OVER (ORDER BY amount DESC) AS rn FROM t ORDER BY id",
+    );
+    assert_eq!(got[0], vec![Some(1), Some(1), Some(100)]);
+    assert_eq!(got[99], vec![Some(100), Some(100), Some(1)]);
+}
+
 #[test]
 fn test_window_order_by_honours_nulls_first_and_last() {
     let db = setup("window_nulls_placement");
