@@ -491,6 +491,17 @@ impl Row {
         self.storage.into_vec()
     }
 
+    /// One value out of a row that is being consumed: moved out of owned
+    /// storage, cloned out of shared storage. Avoids converting the whole
+    /// row when only a few columns are wanted.
+    #[inline]
+    pub fn take_or_clone(&mut self, idx: usize) -> Value {
+        match &mut self.storage {
+            RowStorage::Owned(vec) => std::mem::take(&mut vec[idx]),
+            RowStorage::Shared(arc) => arc[idx].clone(),
+        }
+    }
+
     /// Extract the first value, consuming the row
     #[inline]
     pub fn take_first_value(self) -> Option<Value> {

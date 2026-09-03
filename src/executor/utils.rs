@@ -1888,110 +1888,70 @@ pub fn compute_join_projection(
     outer_columns: &[String],
     inner_columns: &[String],
 ) -> Option<JoinProjectionIndices> {
-    // Build column index maps for fast lookup
     let outer_col_count = outer_columns.len();
-    let combined: Vec<String> = outer_columns
-        .iter()
-        .chain(inner_columns.iter())
-        .cloned()
-        .collect();
-    let col_index_map = build_column_index_map(&combined);
+    // Resolved by scanning the two short column lists instead of building a
+    // map with an owned copy of every name on every execution.
+    let columns_all = || outer_columns.iter().chain(inner_columns.iter());
+    let resolve = |name: &str| -> Option<usize> {
+        if let Some(i) = columns_all().position(|c| c.eq_ignore_ascii_case(name)) {
+            return Some(i);
+        }
+        // "t.val" answers to "val" when no other column has that base name
+        let mut found = None;
+        for (i, c) in columns_all().enumerate() {
+            if let Some(dot) = c.rfind('.') {
+                if c[dot + 1..].eq_ignore_ascii_case(name) {
+                    if found.is_some() {
+                        return None;
+                    }
+                    found = Some(i);
+                }
+            }
+        }
+        found
+    };
+    let resolve_qualified = |qualifier: &str, name: &str| -> Option<usize> {
+        columns_all()
+            .position(|c| {
+                c.len() == qualifier.len() + 1 + name.len()
+                    && c.as_bytes()[qualifier.len()] == b'.'
+                    && c[..qualifier.len()].eq_ignore_ascii_case(qualifier)
+                    && c[qualifier.len() + 1..].eq_ignore_ascii_case(name)
+            })
+            .or_else(|| resolve(name))
+    };
+    let source = |idx: usize| {
+        if idx < outer_col_count {
+            ColumnSource::Outer(idx)
+        } else {
+            ColumnSource::Inner(idx - outer_col_count)
+        }
+    };
 
-    let mut columns = Vec::new();
-    let mut output_columns = Vec::new();
-
+    let mut columns = Vec::with_capacity(select_exprs.len());
+    let mut output_columns = Vec::with_capacity(select_exprs.len());
     for expr in select_exprs {
-        match expr {
-            // SELECT * - cannot push down projection
-            Expression::Star(_) | Expression::QualifiedStar(_) => return None,
-
-            Expression::Identifier(id) => {
-                let col_lower = id.value_lower.as_str();
-                if let Some(&idx) = col_index_map.get(col_lower) {
-                    if idx < outer_col_count {
-                        columns.push(ColumnSource::Outer(idx));
-                    } else {
-                        columns.push(ColumnSource::Inner(idx - outer_col_count));
-                    }
-                    output_columns.push(id.value.to_string());
-                } else {
-                    // Column not found - cannot push down
-                    return None;
-                }
-            }
-
-            Expression::QualifiedIdentifier(qid) => {
-                // Try qualified name first
-                let full_name = format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
-                if let Some(&idx) = col_index_map.get(&full_name) {
-                    if idx < outer_col_count {
-                        columns.push(ColumnSource::Outer(idx));
-                    } else {
-                        columns.push(ColumnSource::Inner(idx - outer_col_count));
-                    }
-                    // Output column name is just the column name, not qualified
-                    // (SQL standard: SELECT e.name produces column "name", not "e.name")
-                    output_columns.push(qid.name.value.to_string());
-                } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
-                    // Fall back to unqualified name
-                    if idx < outer_col_count {
-                        columns.push(ColumnSource::Outer(idx));
-                    } else {
-                        columns.push(ColumnSource::Inner(idx - outer_col_count));
-                    }
-                    output_columns.push(qid.name.value.to_string());
-                } else {
-                    // Column not found - cannot push down
-                    return None;
-                }
-            }
-
+        let (idx, name) = match expr {
+            Expression::Identifier(id) => (resolve(&id.value_lower)?, id.value.to_string()),
+            Expression::QualifiedIdentifier(qid) => (
+                resolve_qualified(&qid.qualifier.value_lower, &qid.name.value_lower)?,
+                qid.name.value.to_string(),
+            ),
             Expression::Aliased(aliased) => {
-                // Handle aliased expressions - check if inner is a simple column
-                let alias_name = aliased.alias.value.to_string();
+                let alias = aliased.alias.value.to_string();
                 match &*aliased.expression {
-                    Expression::Identifier(id) => {
-                        let col_lower = id.value_lower.as_str();
-                        if let Some(&idx) = col_index_map.get(col_lower) {
-                            if idx < outer_col_count {
-                                columns.push(ColumnSource::Outer(idx));
-                            } else {
-                                columns.push(ColumnSource::Inner(idx - outer_col_count));
-                            }
-                            output_columns.push(alias_name);
-                        } else {
-                            return None;
-                        }
-                    }
-                    Expression::QualifiedIdentifier(qid) => {
-                        let full_name =
-                            format!("{}.{}", qid.qualifier.value_lower, qid.name.value_lower);
-                        if let Some(&idx) = col_index_map.get(&full_name) {
-                            if idx < outer_col_count {
-                                columns.push(ColumnSource::Outer(idx));
-                            } else {
-                                columns.push(ColumnSource::Inner(idx - outer_col_count));
-                            }
-                            output_columns.push(alias_name);
-                        } else if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str())
-                        {
-                            if idx < outer_col_count {
-                                columns.push(ColumnSource::Outer(idx));
-                            } else {
-                                columns.push(ColumnSource::Inner(idx - outer_col_count));
-                            }
-                            output_columns.push(alias_name);
-                        } else {
-                            return None;
-                        }
-                    }
+                    Expression::Identifier(id) => (resolve(&id.value_lower)?, alias),
+                    Expression::QualifiedIdentifier(qid) => (
+                        resolve_qualified(&qid.qualifier.value_lower, &qid.name.value_lower)?,
+                        alias,
+                    ),
                     _ => return None, // Complex expression - cannot push down
                 }
             }
-
-            // Any other expression type cannot be pushed down
             _ => return None,
-        }
+        };
+        columns.push(source(idx));
+        output_columns.push(name);
     }
 
     Some(JoinProjectionIndices {
