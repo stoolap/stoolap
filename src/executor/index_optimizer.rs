@@ -529,20 +529,16 @@ impl Executor {
         None
     }
 
-    /// Check if all window functions in the statement are safe for LIMIT pushdown.
-    ///
-    /// Safe functions (don't depend on total row count):
-    /// - ROW_NUMBER, RANK, DENSE_RANK
-    /// - LAG, LEAD
-    /// - FIRST_VALUE, LAST_VALUE, NTH_VALUE
-    ///
-    /// Unsafe functions (depend on total row count):
-    /// - NTILE (bucket size depends on total count)
-    /// - PERCENT_RANK (formula: (rank-1)/(total-1))
-    /// - CUME_DIST (formula: rows_up_to_current/total)
-    pub(crate) fn is_window_safe_for_limit_pushdown(stmt: &SelectStatement) -> bool {
+    /// Whether every window function in the statement can run on a fetch cut at
+    /// LIMIT + OFFSET rows in the given index order: each window must follow
+    /// that order exactly and must not look past the current row.
+    pub(crate) fn is_window_safe_for_limit_pushdown(
+        stmt: &SelectStatement,
+        order_col: &str,
+        ascending: bool,
+    ) -> bool {
         for col_expr in &stmt.columns {
-            if !Self::is_expr_window_safe(col_expr) {
+            if !Self::is_expr_window_safe(col_expr, order_col, ascending) {
                 return false;
             }
         }
@@ -551,10 +547,26 @@ impl Executor {
 
     /// Check if a single expression's window function (if any) is safe for LIMIT pushdown
     /// Recursively checks all nested expressions for unsafe window functions
-    fn is_expr_window_safe(expr: &Expression) -> bool {
+    fn is_expr_window_safe(expr: &Expression, order_col: &str, ascending: bool) -> bool {
         match expr {
             Expression::Window(window_expr) => {
                 use crate::parser::ast::{WindowFrameBound, WindowFrameUnit};
+                // The fetch follows one window's ORDER BY; a window that is
+                // partitioned, ordered by anything else or by more than that
+                // key would rank a cut subset
+                let follows_fetch_order = window_expr.partition_by.is_empty()
+                    && window_expr.order_by.len() == 1
+                    && window_expr.order_by[0].ascending == ascending
+                    && match &window_expr.order_by[0].expression {
+                        Expression::Identifier(id) => id.value.eq_ignore_ascii_case(order_col),
+                        Expression::QualifiedIdentifier(qid) => {
+                            qid.name.value.eq_ignore_ascii_case(order_col)
+                        }
+                        _ => false,
+                    };
+                if !follows_fetch_order {
+                    return false;
+                }
                 let func_name = window_expr.function.function.to_uppercase();
                 // A fetch cut at LIMIT rows is wrong for anything that looks past
                 // the current row: total-count functions, LEAD, a frame that
@@ -587,26 +599,32 @@ impl Executor {
                         "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG" | "FIRST_VALUE"
                     )
             }
-            Expression::Aliased(aliased) => Self::is_expr_window_safe(&aliased.expression),
+            Expression::Aliased(aliased) => {
+                Self::is_expr_window_safe(&aliased.expression, order_col, ascending)
+            }
             // Recursively check expressions that can contain window functions
             Expression::Case(case_expr) => {
                 // Check operand if present (simple CASE expression)
                 if let Some(value) = &case_expr.value {
-                    if !Self::is_expr_window_safe(value) {
+                    if !Self::is_expr_window_safe(value, order_col, ascending) {
                         return false;
                     }
                 }
                 // Check all WHEN conditions and results
                 for when_clause in &case_expr.when_clauses {
-                    if !Self::is_expr_window_safe(&when_clause.condition)
-                        || !Self::is_expr_window_safe(&when_clause.then_result)
+                    if !Self::is_expr_window_safe(&when_clause.condition, order_col, ascending)
+                        || !Self::is_expr_window_safe(
+                            &when_clause.then_result,
+                            order_col,
+                            ascending,
+                        )
                     {
                         return false;
                     }
                 }
                 // Check ELSE clause if present
                 if let Some(else_expr) = &case_expr.else_value {
-                    if !Self::is_expr_window_safe(else_expr) {
+                    if !Self::is_expr_window_safe(else_expr, order_col, ascending) {
                         return false;
                     }
                 }
@@ -614,14 +632,19 @@ impl Executor {
             }
             Expression::FunctionCall(func) => {
                 // Check all function arguments
-                func.arguments.iter().all(Self::is_expr_window_safe)
+                func.arguments
+                    .iter()
+                    .all(|e| Self::is_expr_window_safe(e, order_col, ascending))
             }
             Expression::Infix(infix) => {
                 // Check both sides of binary expression (e.g., window_func + 1)
-                Self::is_expr_window_safe(&infix.left) && Self::is_expr_window_safe(&infix.right)
+                Self::is_expr_window_safe(&infix.left, order_col, ascending)
+                    && Self::is_expr_window_safe(&infix.right, order_col, ascending)
             }
-            Expression::Cast(cast) => Self::is_expr_window_safe(&cast.expr),
-            Expression::Prefix(prefix) => Self::is_expr_window_safe(&prefix.right),
+            Expression::Cast(cast) => Self::is_expr_window_safe(&cast.expr, order_col, ascending),
+            Expression::Prefix(prefix) => {
+                Self::is_expr_window_safe(&prefix.right, order_col, ascending)
+            }
             Expression::ScalarSubquery(_) => {
                 // Scalar subqueries have their own evaluation context, their window functions
                 // don't affect the outer query's LIMIT pushdown safety
@@ -629,35 +652,42 @@ impl Executor {
             }
             Expression::In(in_expr) => {
                 // Check the left expression and right expression (which contains the list)
-                Self::is_expr_window_safe(&in_expr.left)
-                    && Self::is_expr_window_safe(&in_expr.right)
+                Self::is_expr_window_safe(&in_expr.left, order_col, ascending)
+                    && Self::is_expr_window_safe(&in_expr.right, order_col, ascending)
             }
             Expression::Between(between) => {
-                Self::is_expr_window_safe(&between.expr)
-                    && Self::is_expr_window_safe(&between.lower)
-                    && Self::is_expr_window_safe(&between.upper)
+                Self::is_expr_window_safe(&between.expr, order_col, ascending)
+                    && Self::is_expr_window_safe(&between.lower, order_col, ascending)
+                    && Self::is_expr_window_safe(&between.upper, order_col, ascending)
             }
             Expression::List(list) => {
                 // Check all expressions in the list
-                list.elements.iter().all(Self::is_expr_window_safe)
+                list.elements
+                    .iter()
+                    .all(|e| Self::is_expr_window_safe(e, order_col, ascending))
             }
             Expression::ExpressionList(expr_list) => {
                 // Check all expressions in the list
-                expr_list.expressions.iter().all(Self::is_expr_window_safe)
+                expr_list
+                    .expressions
+                    .iter()
+                    .all(|e| Self::is_expr_window_safe(e, order_col, ascending))
             }
             Expression::Like(like) => {
-                Self::is_expr_window_safe(&like.left)
-                    && Self::is_expr_window_safe(&like.pattern)
+                Self::is_expr_window_safe(&like.left, order_col, ascending)
+                    && Self::is_expr_window_safe(&like.pattern, order_col, ascending)
                     && like
                         .escape
                         .as_ref()
-                        .is_none_or(|e| Self::is_expr_window_safe(e))
+                        .is_none_or(|e| Self::is_expr_window_safe(e, order_col, ascending))
             }
             Expression::Exists(_) | Expression::AllAny(_) => {
                 // EXISTS and ALL/ANY have their own subquery context
                 true
             }
-            Expression::Distinct(distinct) => Self::is_expr_window_safe(&distinct.expr),
+            Expression::Distinct(distinct) => {
+                Self::is_expr_window_safe(&distinct.expr, order_col, ascending)
+            }
             // Leaf expressions - no nested window functions
             Expression::Identifier(_)
             | Expression::QualifiedIdentifier(_)

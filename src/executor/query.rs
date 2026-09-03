@@ -3513,7 +3513,8 @@ impl Executor {
                         // Safe: ROW_NUMBER, RANK, DENSE_RANK, LAG, LEAD, FIRST_VALUE, LAST_VALUE
                         // Unsafe: NTILE, PERCENT_RANK, CUME_DIST (need total count)
                         let has_order_by = !stmt.order_by.is_empty();
-                        let is_window_safe = Self::is_window_safe_for_limit_pushdown(stmt);
+                        let is_window_safe =
+                            Self::is_window_safe_for_limit_pushdown(stmt, &col_name, ascending);
                         let fetch_limit = if !has_order_by && is_window_safe {
                             Self::literal_fetch_limit(stmt).unwrap_or(usize::MAX)
                         } else {

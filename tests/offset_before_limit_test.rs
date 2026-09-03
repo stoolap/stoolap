@@ -244,3 +244,23 @@ fn test_range_frame_peers_survive_the_limit_window() {
         .unwrap();
     assert_eq!(last, 73.0);
 }
+
+/// The index-order fetch follows one window's ORDER BY; every other window
+/// in the SELECT must order the same way, or it would rank a cut subset.
+#[test]
+fn test_second_window_with_another_order_keeps_the_full_fetch() {
+    let db = setup("offset_second_window_order");
+    let row = db
+        .query(
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY id) AS by_id, ROW_NUMBER() OVER (ORDER BY amount DESC) AS by_amount FROM orders LIMIT 10 OFFSET 45",
+            (),
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 46);
+    assert_eq!(row.get::<i64>(1).unwrap(), 46);
+    // amount 46 is the 55th largest of 100, not the 10th of a 55-row subset
+    assert_eq!(row.get::<i64>(2).unwrap(), 55);
+}
