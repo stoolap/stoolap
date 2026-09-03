@@ -11,7 +11,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | Mode | In-memory |
 | Platform | Apple Silicon |
 | Sampling | best of 30 runs for Stoolap (three sessions), best of 10 for SQLite and DuckDB, measured back to back |
-| Measured | 2026-09-03, `main` at 31364b6f; INNER JOIN and Self JOIN re-measured at 5f811d03 |
+| Measured | 2026-09-03, `main` at 5f811d03 |
 | SQLite | rusqlite v0.40.2 |
 | DuckDB | duckdb v1.10501.0 |
 
@@ -267,4 +267,4 @@ cargo build --release --example benchmark --example benchmark_sqlite --example b
 
 ---
 
-*Benchmarks performed on Apple Silicon, in-memory mode, best of 30 runs for Stoolap and 10 for SQLite and DuckDB, measured back to back on one idle machine. Results are point-in-time for `main` at 31364b6f, which is after the v0.4.0 release, not the release itself; INNER JOIN and Self JOIN come from a later bench-compare run at 5f811d03, after the join work in #81 and #83; re-run on your hardware and workload for current numbers.*
+*Benchmarks performed on Apple Silicon, in-memory mode, best of 30 runs for Stoolap and 10 for SQLite and DuckDB, measured back to back on one idle machine. Results are point-in-time for `main`; re-run on your hardware and workload for current numbers.*
