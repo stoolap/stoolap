@@ -300,6 +300,11 @@ impl IndexNestedLoopJoinOperator {
         self.outer_rows_seen
     }
 
+    /// The outer row the join is on, or ended on
+    pub fn last_outer_row(&self) -> Option<&Row> {
+        self.current_outer_row.as_ref()
+    }
+
     /// Look up matching inner rows for the current outer row.
     /// Uses internal buffers to avoid allocations.
     fn lookup_inner_rows(&mut self, key_value: &Value) -> Result<()> {
