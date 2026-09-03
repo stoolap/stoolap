@@ -418,16 +418,23 @@ impl Executor {
             && stmt.having.is_none()
             && !stmt.distinct;
 
+        // OFFSET is applied after aggregation, so the groups it skips must be
+        // built too: the pushed limit is LIMIT + OFFSET
         let aggregation_limit = if can_push_limit {
-            stmt.limit.as_ref().and_then(|limit_expr| {
-                let mut eval = ExpressionEval::compile(limit_expr, &[])
-                    .ok()?
-                    .with_context(ctx);
+            let eval_usize = |expr: &Expression| {
+                let mut eval = ExpressionEval::compile(expr, &[]).ok()?.with_context(ctx);
                 eval.eval_slice(&Row::new()).ok().and_then(|v| match v {
                     crate::core::Value::Integer(n) if n >= 0 => Some(n as usize),
                     _ => None,
                 })
-            })
+            };
+            let limit = stmt.limit.as_deref().and_then(eval_usize);
+            match stmt.offset.as_deref() {
+                None => limit,
+                Some(offset_expr) => {
+                    limit.and_then(|l| eval_usize(offset_expr).map(|o| l.saturating_add(o)))
+                }
+            }
         } else {
             None
         };

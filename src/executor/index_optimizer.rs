@@ -866,7 +866,7 @@ impl Executor {
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
         classification: &Arc<QueryClassification>,
-    ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
+    ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>, bool)>> {
         // Extract IN subquery info: (column_name, subquery, is_negated, remaining_predicate)
         let (column_name, subquery, is_negated, remaining_predicate) =
             match Self::extract_in_subquery_info(where_expr) {
@@ -961,7 +961,7 @@ impl Executor {
                     CompactArc::clone(&output_columns),
                     RowVec::new(),
                 );
-                return Ok(Some((Box::new(result), output_columns)));
+                return Ok(Some((Box::new(result), output_columns, true)));
             }
         }
 
@@ -1020,7 +1020,12 @@ impl Executor {
                     })
                     .unwrap_or(usize::MAX);
 
-                let target = if limit == usize::MAX {
+                // Stop early only when nothing after this point drops or reorders
+                // rows; the shared tail applies OFFSET and LIMIT once
+                let target = if limit == usize::MAX
+                    || !stmt.order_by.is_empty()
+                    || remaining_predicate.is_some()
+                {
                     usize::MAX
                 } else {
                     offset.saturating_add(limit)
@@ -1036,18 +1041,6 @@ impl Executor {
                             break;
                         }
                     }
-                }
-
-                // Apply offset
-                if offset > 0 && offset < all_row_ids.len() {
-                    all_row_ids = all_row_ids.split_off(offset);
-                } else if offset >= all_row_ids.len() {
-                    all_row_ids.clear();
-                }
-
-                // Apply limit
-                if limit < all_row_ids.len() {
-                    all_row_ids.truncate(limit);
                 }
             } else {
                 // IN: PRIMARY KEY - the value IS the row_id (for INTEGER PK)
@@ -1197,7 +1190,12 @@ impl Executor {
             CompactArc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
-        Ok(Some((Box::new(result), output_columns)))
+        // OFFSET and LIMIT were applied above unless ORDER BY has to run first
+        Ok(Some((
+            Box::new(result),
+            output_columns,
+            stmt.order_by.is_empty(),
+        )))
     }
 
     /// IN list literal index optimization
@@ -1583,7 +1581,7 @@ impl Executor {
         all_columns: &[String],
         table_alias: Option<&str>,
         ctx: &ExecutionContext,
-    ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
+    ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>, bool)>> {
         // Extract InHashSet info: (column_name, values, is_negated, remaining_predicate)
         let (column_name, values, is_negated, remaining_predicate) =
             match Self::extract_in_hashset_info(where_expr) {
@@ -1728,7 +1726,7 @@ impl Executor {
             ));
             let result =
                 ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), RowVec::new());
-            return Ok(Some((Box::new(result), output_columns)));
+            return Ok(Some((Box::new(result), output_columns, true)));
         }
 
         // Sort row_ids for better cache locality during version lookup
@@ -1850,7 +1848,12 @@ impl Executor {
             CompactArc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
-        Ok(Some((Box::new(result), output_columns)))
+        // OFFSET and LIMIT were applied above unless ORDER BY has to run first
+        Ok(Some((
+            Box::new(result),
+            output_columns,
+            stmt.order_by.is_empty(),
+        )))
     }
 
     /// Extract InHashSet information from a WHERE clause.
