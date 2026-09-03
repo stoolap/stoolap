@@ -246,6 +246,9 @@ pub struct ColumnarOrderByValues {
     columns: Vec<Vec<Value>>,
     /// Ascending flags: one per ORDER BY column
     ascending: Vec<bool>,
+    /// Where NULLs sort, one per ORDER BY column: NULLS FIRST / LAST when
+    /// given, otherwise last ascending and first descending
+    nulls_first: Vec<bool>,
     /// Number of rows
     num_rows: usize,
 }
@@ -279,6 +282,15 @@ impl ColumnarOrderByValues {
     #[inline]
     pub fn is_ascending(&self, col_idx: usize) -> bool {
         self.ascending.get(col_idx).copied().unwrap_or(true)
+    }
+
+    /// Whether NULLs sort before non-NULL values in this column
+    #[inline]
+    pub fn nulls_first(&self, col_idx: usize) -> bool {
+        self.nulls_first
+            .get(col_idx)
+            .copied()
+            .unwrap_or_else(|| !self.is_ascending(col_idx))
     }
 
     /// Compare ORDER BY values of two rows for equality (without cloning)
@@ -1198,26 +1210,29 @@ impl Executor {
             match col_expr {
                 Expression::Window(window_expr) => {
                     // Window function - use pre-computed values
-                    let wf_name = if wf_idx < window_functions.len() {
-                        window_functions[wf_idx].column_name.clone()
+                    let output_name = format!("{}()", window_expr.function.function);
+                    let key = if wf_idx < window_functions.len() {
+                        window_functions[wf_idx].column_name.to_lowercase()
                     } else {
-                        format!("{}()", window_expr.function.function)
+                        output_name.to_lowercase()
                     };
                     items.push(SelectItem {
-                        output_name: wf_name.clone(),
-                        // OPTIMIZATION: Store lowercase for O(1) lookup in window_value_map
-                        source: SelectItemSource::WindowFunction(wf_name.to_lowercase()),
+                        output_name,
+                        source: SelectItemSource::WindowFunction(key),
                     });
                     wf_idx += 1;
                 }
                 Expression::Aliased(aliased) => {
                     if let Expression::Window(_) = aliased.expression.as_ref() {
                         // Aliased window function
-                        let alias = aliased.alias.value.to_string();
+                        let key = if wf_idx < window_functions.len() {
+                            window_functions[wf_idx].column_name.to_lowercase()
+                        } else {
+                            aliased.alias.value.to_string().to_lowercase()
+                        };
                         items.push(SelectItem {
-                            output_name: alias.clone(),
-                            // OPTIMIZATION: Store lowercase for O(1) lookup in window_value_map
-                            source: SelectItemSource::WindowFunction(alias.to_lowercase()),
+                            output_name: aliased.alias.value.to_string(),
+                            source: SelectItemSource::WindowFunction(key),
                         });
                         wf_idx += 1;
                     } else if let Expression::Identifier(id) = aliased.expression.as_ref() {
@@ -1449,8 +1464,12 @@ impl Executor {
         for col_expr in &stmt.columns {
             match col_expr {
                 Expression::Window(window_expr) => {
-                    let wf_info =
+                    let mut wf_info =
                         self.extract_window_function_info(window_expr, &stmt.window_defs)?;
+                    // Two unaliased windows of the same function would share a
+                    // name; the internal one is unique, the output keeps the
+                    // function's own
+                    wf_info.column_name = format!("__wf_{}_0", col_idx);
                     window_functions.push(wf_info);
                     col_idx += 1;
                 }
@@ -1458,7 +1477,9 @@ impl Executor {
                     if let Expression::Window(window_expr) = aliased.expression.as_ref() {
                         let mut wf_info =
                             self.extract_window_function_info(window_expr, &stmt.window_defs)?;
-                        wf_info.column_name = aliased.alias.value.to_string();
+                        // The alias is only the output name; the internal name
+                        // cannot collide with an alias or another window
+                        wf_info.column_name = format!("__wf_{}_0", col_idx);
                         window_functions.push(wf_info);
                     } else {
                         // Collect ALL window functions in the expression
@@ -2186,6 +2207,7 @@ impl Executor {
         let empty_order_by = ColumnarOrderByValues {
             columns: vec![],
             ascending: vec![],
+            nulls_first: vec![],
             num_rows: 0,
         };
         let order_by_values = precomputed_order_by.unwrap_or(&empty_order_by);
@@ -2398,6 +2420,7 @@ impl Executor {
         let empty_order_by = ColumnarOrderByValues {
             columns: vec![],
             ascending: vec![],
+            nulls_first: vec![],
             num_rows: 0,
         };
         let order_by_values = precomputed_order_by.unwrap_or(&empty_order_by);
@@ -2603,6 +2626,7 @@ impl Executor {
         let empty_order_by = ColumnarOrderByValues {
             columns: vec![],
             ascending: vec![],
+            nulls_first: vec![],
             num_rows: 0,
         };
         let order_by_values = precomputed_order_by.unwrap_or(&empty_order_by);
@@ -3226,12 +3250,17 @@ impl Executor {
             return ColumnarOrderByValues {
                 columns: vec![],
                 ascending: vec![],
+                nulls_first: vec![],
                 num_rows: 0,
             };
         }
 
         // Extract ascending flags once (not per row!)
         let ascending_flags: Vec<bool> = order_by.iter().map(|ob| ob.ascending).collect();
+        let nulls_first_flags: Vec<bool> = order_by
+            .iter()
+            .map(|ob| ob.nulls_first.unwrap_or(!ob.ascending))
+            .collect();
 
         // Check if any ORDER BY expression is complex (not a simple column reference)
         let has_complex_expr = order_by.iter().any(|ob| {
@@ -3331,6 +3360,7 @@ impl Executor {
         ColumnarOrderByValues {
             columns: result_columns,
             ascending: ascending_flags,
+            nulls_first: nulls_first_flags,
             num_rows,
         }
     }
@@ -3377,6 +3407,7 @@ impl Executor {
         if is_single_order_by {
             // Fast path: single ORDER BY column with type-specific comparison
             let ascending = order_by_values.is_ascending(0);
+            let nulls_first = order_by_values.nulls_first(0);
 
             // Get direct reference to the column for cache-efficient access
             let col = &order_by_values.columns[0];
@@ -3426,19 +3457,29 @@ impl Executor {
 
             match detected {
                 DetectedType::Integer
-                    if Self::sort_by_integer_key_columnar(row_indices, col, ascending) =>
+                    if Self::sort_by_integer_key_columnar(
+                        row_indices,
+                        col,
+                        ascending,
+                        nulls_first,
+                    ) =>
                 {
                     return;
                 }
                 DetectedType::Float
-                    if Self::sort_by_float_key_columnar(row_indices, col, ascending) =>
+                    if Self::sort_by_float_key_columnar(
+                        row_indices,
+                        col,
+                        ascending,
+                        nulls_first,
+                    ) =>
                 {
                     return;
                 }
                 _ => {}
             }
             // Mixed types, unknown, or drift past the sample - generic sort
-            Self::sort_single_column_columnar(row_indices, col, ascending);
+            Self::sort_single_column_columnar(row_indices, col, ascending, nulls_first);
             return;
         }
 
@@ -3469,20 +3510,22 @@ impl Executor {
         b: usize,
     ) -> Ordering {
         for col_idx in 0..order_by_values.num_columns() {
-            let a_val = order_by_values.get(a, col_idx);
-            let b_val = order_by_values.get(b, col_idx);
-
+            let a_val = order_by_values.get(a, col_idx).filter(|v| !v.is_null());
+            let b_val = order_by_values.get(b, col_idx).filter(|v| !v.is_null());
             let cmp = match (a_val, b_val) {
-                (Some(av), Some(bv)) => Self::compare_values_fast(av, bv),
+                (Some(av), Some(bv)) => {
+                    let cmp = Self::compare_values_fast(av, bv);
+                    if order_by_values.is_ascending(col_idx) {
+                        cmp
+                    } else {
+                        cmp.reverse()
+                    }
+                }
                 (None, None) => Ordering::Equal,
+                (None, _) if order_by_values.nulls_first(col_idx) => Ordering::Less,
                 (None, _) => Ordering::Greater,
+                (_, None) if order_by_values.nulls_first(col_idx) => Ordering::Greater,
                 (_, None) => Ordering::Less,
-            };
-
-            let cmp = if !order_by_values.is_ascending(col_idx) {
-                cmp.reverse()
-            } else {
-                cmp
             };
 
             if cmp != Ordering::Equal {
@@ -3540,6 +3583,7 @@ impl Executor {
         row_indices: &mut [usize],
         col: &[Value],
         ascending: bool,
+        nulls_first: bool,
     ) -> bool {
         const PARALLEL_THRESHOLD: usize = 50_000;
 
@@ -3589,11 +3633,11 @@ impl Executor {
             keyed.sort_unstable_by_key(|&(_, key)| std::cmp::Reverse(key));
         }
 
-        // Write back: NULLs strictly last ascending, first descending.
+        // Write back: NULLs strictly first or last, as the ORDER BY places them.
         // For floats this also fixes the old sentinel's misplacement of
         // NULLs before +inf and NaN
         let mut pos = 0;
-        if !ascending {
+        if nulls_first {
             for &idx in &null_indices {
                 row_indices[pos] = idx;
                 pos += 1;
@@ -3603,7 +3647,7 @@ impl Executor {
             row_indices[pos] = idx;
             pos += 1;
         }
-        if ascending {
+        if !nulls_first {
             for &idx in &null_indices {
                 row_indices[pos] = idx;
                 pos += 1;
@@ -3619,6 +3663,7 @@ impl Executor {
         row_indices: &mut [usize],
         col: &[Value],
         ascending: bool,
+        nulls_first: bool,
     ) -> bool {
         const PARALLEL_THRESHOLD: usize = 50_000;
 
@@ -3680,11 +3725,11 @@ impl Executor {
             keyed.sort_unstable_by_key(|&(_, key)| std::cmp::Reverse(key));
         }
 
-        // Write back: NULLs strictly last ascending, first descending.
+        // Write back: NULLs strictly first or last, as the ORDER BY places them.
         // For floats this also fixes the old sentinel's misplacement of
         // NULLs before +inf and NaN
         let mut pos = 0;
-        if !ascending {
+        if nulls_first {
             for &idx in &null_indices {
                 row_indices[pos] = idx;
                 pos += 1;
@@ -3694,7 +3739,7 @@ impl Executor {
             row_indices[pos] = idx;
             pos += 1;
         }
-        if ascending {
+        if !nulls_first {
             for &idx in &null_indices {
                 row_indices[pos] = idx;
                 pos += 1;
@@ -3704,23 +3749,30 @@ impl Executor {
     }
 
     /// Single column generic sort (columnar layout)
-    fn sort_single_column_columnar(row_indices: &mut [usize], col: &[Value], ascending: bool) {
+    fn sort_single_column_columnar(
+        row_indices: &mut [usize],
+        col: &[Value],
+        ascending: bool,
+        nulls_first: bool,
+    ) {
         const PARALLEL_THRESHOLD: usize = 10_000;
-
         let compare = |&a: &usize, &b: &usize| -> Ordering {
-            let a_val = col.get(a);
-            let b_val = col.get(b);
-
-            let cmp = match (a_val, b_val) {
-                (Some(a), Some(b)) => Self::compare_values_fast(a, b),
+            let a_val = col.get(a).filter(|v| !v.is_null());
+            let b_val = col.get(b).filter(|v| !v.is_null());
+            match (a_val, b_val) {
+                (Some(a), Some(b)) => {
+                    let cmp = Self::compare_values_fast(a, b);
+                    if ascending {
+                        cmp
+                    } else {
+                        cmp.reverse()
+                    }
+                }
                 (None, None) => Ordering::Equal,
+                (None, _) if nulls_first => Ordering::Less,
                 (None, _) => Ordering::Greater,
+                (_, None) if nulls_first => Ordering::Greater,
                 (_, None) => Ordering::Less,
-            };
-            if ascending {
-                cmp
-            } else {
-                cmp.reverse()
             }
         };
 
@@ -3781,6 +3833,7 @@ impl Executor {
         let empty_order_by = ColumnarOrderByValues {
             columns: vec![],
             ascending: vec![],
+            nulls_first: vec![],
             num_rows: 0,
         };
         let order_by_values: &ColumnarOrderByValues = cached_order_by.unwrap_or(&empty_order_by);
