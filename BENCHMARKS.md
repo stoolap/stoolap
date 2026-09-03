@@ -11,7 +11,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | Mode | In-memory |
 | Platform | Apple Silicon |
 | Sampling | best of 30 runs for Stoolap (three sessions), best of 10 for SQLite and DuckDB, measured back to back |
-| Measured | 2026-09-03, `main` at 31364b6f |
+| Measured | 2026-09-03, `main` at 31364b6f; INNER JOIN and Self JOIN re-measured at 5f811d03 |
 | SQLite | rusqlite v0.40.2 |
 | DuckDB | duckdb v1.10501.0 |
 
@@ -20,7 +20,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 ```
 +---------------------------------------------------------------+
 |                                                               |
-|   STOOLAP vs SQLite:    46 wins / 7 losses    (87% win rate)  |
+|   STOOLAP vs SQLite:    48 wins / 5 losses    (91% win rate)  |
 |   STOOLAP vs DuckDB:    52 wins / 1 loss     (98% win rate)  |
 |                                                               |
 +---------------------------------------------------------------+
@@ -50,7 +50,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 
 | Operation | Stoolap (us) | SQLite (us) | DuckDB (us) | Best |
 |-----------|-------------|-------------|-------------|------|
-| INNER JOIN | 19.39 | **12.07** | 307.31 | SQLite |
+| INNER JOIN | **11.60** | 12.07 | 307.31 | Stoolap |
 | LEFT JOIN + GROUP BY | **42.80** | 47.74 | 1132.88 | Stoolap |
 | Scalar subquery | **7.91** | 330.70 | 220.47 | Stoolap |
 | IN subquery | **89.11** | 1628.15 | 482.80 | Stoolap |
@@ -81,7 +81,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 | NOT EXISTS subquery | **21.78** | 76.56 | 898.08 | Stoolap |
 | OFFSET pagination (5000) | **11.36** | 21.71 | 440.42 | Stoolap |
 | Multi-col ORDER BY (3) | **136.45** | 359.28 | 289.59 | Stoolap |
-| Self JOIN (same age) | 12.32 | **9.07** | 356.03 | SQLite |
+| Self JOIN (same age) | **6.99** | 9.07 | 356.03 | Stoolap |
 | Multi window funcs (3) | **393.63** | 1559.68 | 661.82 | Stoolap |
 | Nested subquery (3 lvl) | **301.48** | 5530.04 | 766.03 | Stoolap |
 | Multi aggregates (6) | **110.79** | 713.77 | 280.07 | Stoolap |
@@ -173,9 +173,7 @@ Performance comparison between **Stoolap**, **SQLite**, and **DuckDB** using ide
 
 | Operation | SQLite | Stoolap | Factor |
 |-----------|--------|---------|--------|
-| INNER JOIN | 12.07 us | 19.39 us | 1.6x |
 | COALESCE + IS NOT NULL | 2.56 us | 3.52 us | 1.4x |
-| Self JOIN (same age) | 9.07 us | 12.32 us | 1.4x |
 | Multiple CTEs (2) | 14.77 us | 19.73 us | 1.3x |
 | String concat (\|\|) | 4.74 us | 5.86 us | 1.2x |
 | Math expressions | 10.23 us | 11.78 us | 1.2x |
@@ -218,7 +216,6 @@ Stoolap Strengths:
   Aggregations:           ████████████████████  27x vs SQLite
 
 SQLite Strengths:
-  Simple JOINs:           ████████              SQLite ~1.4-1.6x faster
   Simple Expressions:     ██████                SQLite ~1.2-1.4x faster
 
 DuckDB Strengths:
@@ -270,4 +267,4 @@ cargo build --release --example benchmark --example benchmark_sqlite --example b
 
 ---
 
-*Benchmarks performed on Apple Silicon, in-memory mode, best of 30 runs for Stoolap and 10 for SQLite and DuckDB, measured back to back on one idle machine. Results are point-in-time for `main` at 31364b6f, which is after the v0.4.0 release, not the release itself; re-run on your hardware and workload for current numbers.*
+*Benchmarks performed on Apple Silicon, in-memory mode, best of 30 runs for Stoolap and 10 for SQLite and DuckDB, measured back to back on one idle machine. Results are point-in-time for `main` at 31364b6f, which is after the v0.4.0 release, not the release itself; INNER JOIN and Self JOIN come from a later bench-compare run at 5f811d03, after the join work in #81 and #83; re-run on your hardware and workload for current numbers.*
