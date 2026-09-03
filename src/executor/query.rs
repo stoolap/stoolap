@@ -4220,12 +4220,16 @@ impl Executor {
                 // stops short. Only a plain table takes the limit and can be
                 // fetched again from an offset; the fetch says whether it did.
                 // One snapshot serves every outer fetch and the inner probes
-                let snapshot = match ctx.statement_snapshot() {
+                // Read committed is the cheap default; snapshot isolation costs
+                // about two microseconds per join, so it is taken only when a
+                // continuation finds that a commit moved rows under it
+                let mut snapshot = match ctx.statement_snapshot() {
                     Some(snapshot) => snapshot.clone(),
-                    None => self.new_statement_snapshot()?,
+                    None => {
+                        self.new_statement_snapshot(crate::core::IsolationLevel::ReadCommitted)?
+                    }
                 };
-                let ctx_join = ctx.with_statement_snapshot(snapshot.clone());
-                let ctx = &ctx_join;
+                let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
                 // An explicit transaction reads through its own transaction, whose
                 // isolation may let a commit move rows between two fetches, so
                 // the outer side is fetched whole there
@@ -4235,7 +4239,7 @@ impl Executor {
                 } else {
                     join_limit.map(|l| {
                         let l = l as usize;
-                        l.saturating_add(l / 8).max(100)
+                        l.saturating_add(l / 16).max(100)
                     })
                 };
 
@@ -4243,7 +4247,7 @@ impl Executor {
                 let (outer_result, outer_cols, outer_bounded) = self
                     .execute_table_expression_with_filter_limit(
                         outer_expr,
-                        ctx,
+                        &ctx_join,
                         nl_left_filter.as_ref(),
                         outer_limit,
                         0,
@@ -4355,6 +4359,7 @@ impl Executor {
                         let mut outer_result = outer_result;
                         let mut inner_table = Some(inner_table);
                         let mut fetched = 0usize;
+                        let mut consistent = false;
                         loop {
                             let outer_op: Box<dyn Operator> = Box::new(QueryResultOperator::new(
                                 outer_result,
@@ -4391,6 +4396,7 @@ impl Executor {
                             if result_rows.len() >= lim {
                                 break;
                             }
+                            let boundary = op.last_outer_row().cloned();
                             fetched = fetched.saturating_add(cap);
                             let missing = lim - result_rows.len();
                             let rate = result_rows.len() as f64 / fetched as f64;
@@ -4401,16 +4407,58 @@ impl Executor {
                             };
                             let next = estimate.clamp(32, fetched.saturating_mul(3));
                             outer_limit = Some(next);
-                            let (more, _, bounded) = self
+                            if consistent {
+                                let (more, _, bounded) = self
+                                    .execute_table_expression_with_filter_limit(
+                                        outer_expr,
+                                        &ctx_join,
+                                        nl_left_filter.as_ref(),
+                                        Some(next),
+                                        fetched,
+                                    )?;
+                                debug_assert!(bounded);
+                                outer_result = more;
+                                continue;
+                            }
+                            // Under read committed a commit may have moved rows before
+                            // the boundary. Fetch one row of overlap: when it is still
+                            // the row the chunk ended on, the rows after it are the
+                            // continuation; otherwise the join restarts on snapshot
+                            // isolation, where the chunks line up by construction
+                            let (mut more, _, bounded) = self
                                 .execute_table_expression_with_filter_limit(
                                     outer_expr,
-                                    ctx,
+                                    &ctx_join,
                                     nl_left_filter.as_ref(),
-                                    Some(next),
-                                    fetched,
+                                    Some(next + 1),
+                                    fetched - 1,
                                 )?;
                             debug_assert!(bounded);
-                            outer_result = more;
+                            let unmoved = more.next()
+                                && boundary
+                                    .as_ref()
+                                    .is_some_and(|row| row.as_slice() == more.row().as_slice());
+                            if unmoved {
+                                outer_result = more;
+                                continue;
+                            }
+                            snapshot = self.new_statement_snapshot(
+                                crate::core::IsolationLevel::SnapshotIsolation,
+                            )?;
+                            ctx_join = ctx.with_statement_snapshot(snapshot.clone());
+                            consistent = true;
+                            result_rows.clear();
+                            outer_limit = Some(fetched.saturating_add(next));
+                            fetched = 0;
+                            outer_result = self
+                                .execute_table_expression_with_filter_limit(
+                                    outer_expr,
+                                    &ctx_join,
+                                    nl_left_filter.as_ref(),
+                                    outer_limit,
+                                    0,
+                                )?
+                                .0;
                         }
                     } else {
                         // Batch INL for NO LIMIT - single batch fetch, O(1) lock overhead
@@ -6442,11 +6490,15 @@ impl Executor {
         snapshot.get_table(name)
     }
 
-    /// One transaction for every read of a statement, under snapshot isolation
-    /// so a later commit cannot move rows between two of its fetches
-    fn new_statement_snapshot(&self) -> Result<StatementSnapshot> {
+    /// One transaction for every read of a statement
+    fn new_statement_snapshot(
+        &self,
+        isolation: crate::core::IsolationLevel,
+    ) -> Result<StatementSnapshot> {
         let mut transaction = self.engine.begin_transaction()?;
-        transaction.set_isolation_level(crate::core::IsolationLevel::SnapshotIsolation)?;
+        if isolation != crate::core::IsolationLevel::ReadCommitted {
+            transaction.set_isolation_level(isolation)?;
+        }
         Ok(StatementSnapshot::new(transaction))
     }
 
