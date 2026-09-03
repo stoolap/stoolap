@@ -6094,12 +6094,9 @@ impl Engine for MVCCEngine {
     }
 
     fn get_lookup_indexes(&self, table_name: &str) -> Result<Vec<std::sync::Arc<dyn Index>>> {
-        let sealed = {
-            let mgrs = self.segment_managers.read().unwrap();
-            mgrs.get(&table_name.to_lowercase())
-                .is_some_and(|mgr| mgr.has_segments())
-        };
-        if sealed {
+        // A persistent database may seal rows at any moment, so a hot index
+        // handed out now could lose them before the caller probes it.
+        if self.persistence.is_some() {
             return Ok(Vec::new());
         }
         self.get_all_indexes(table_name)
@@ -6997,7 +6994,10 @@ impl TransactionEngineOperations for EngineOperations {
         };
 
         // Create MVCC table with shared transaction version store
-        let table = MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
+        let mut table = MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
+        if self.persistence.is_some() {
+            table.mark_seal_capable();
+        }
 
         // If segments exist for this table, wrap in SegmentedTable.
         // For snapshot isolation transactions, pass the begin_seq so tombstone

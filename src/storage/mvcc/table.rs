@@ -40,6 +40,10 @@ pub struct MVCCTable {
     version_store: Arc<VersionStore>,
     /// Transaction-local version store (shared between multiple MVCCTable instances for same txn+table)
     txn_versions: Arc<RwLock<TransactionVersionStore>>,
+    /// The database persists to disk and may seal rows into volumes, which
+    /// takes them out of the hot indexes; executor probes must not rely on
+    /// those indexes then.
+    seal_capable: bool,
     /// Cached schema for returning references (Arc clone from version_store - O(1) instead of cloning)
     cached_schema: CompactArc<Schema>,
 }
@@ -55,6 +59,7 @@ impl MVCCTable {
         // CompactArc clone - O(1) reference count increment, not full schema clone
         let cached_schema = version_store.schema().clone();
         Self {
+            seal_capable: false,
             txn_id,
             version_store,
             txn_versions: Arc::new(RwLock::new(txn_versions)),
@@ -64,6 +69,11 @@ impl MVCCTable {
 
     /// Creates a new MVCC table with a shared transaction version store
     /// (used by the engine's get_table_for_transaction to share stores)
+    /// Rows of this table can be sealed into volumes; see `seal_capable`.
+    pub fn mark_seal_capable(&mut self) {
+        self.seal_capable = true;
+    }
+
     pub fn new_with_shared_store(
         txn_id: i64,
         version_store: Arc<VersionStore>,
@@ -72,6 +82,7 @@ impl MVCCTable {
         // CompactArc clone - O(1) reference count increment, not full schema clone
         let cached_schema = version_store.schema().clone();
         Self {
+            seal_capable: false,
             txn_id,
             version_store,
             txn_versions,
@@ -3360,6 +3371,13 @@ impl Table for MVCCTable {
     }
 
     fn get_index_on_column(&self, column_name: &str) -> Option<std::sync::Arc<dyn Index>> {
+        self.version_store.get_index_by_column(column_name)
+    }
+
+    fn lookup_index_on_column(&self, column_name: &str) -> Option<std::sync::Arc<dyn Index>> {
+        if self.seal_capable {
+            return None;
+        }
         self.version_store.get_index_by_column(column_name)
     }
 
