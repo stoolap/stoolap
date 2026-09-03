@@ -895,7 +895,7 @@ impl Executor {
 
         // If not PK, check for index
         let index = if !is_pk_column {
-            match table.get_index_on_column(&column_name) {
+            match table.lookup_index_on_column(&column_name) {
                 Some(idx) => Some(idx),
                 None => return Ok(None), // No PK, no index, can't optimize
             }
@@ -1249,7 +1249,7 @@ impl Executor {
         // and stops at LIMIT; so it is only taken when a memory filter is
         // needed anyway. Primary key values are the row ids themselves.
         let index = if !is_pk_column {
-            match table.get_index_on_column(&column_name) {
+            match table.lookup_index_on_column(&column_name) {
                 Some(idx) => Some(idx),
                 None => return Ok(None), // No PK, no index, can't optimize
             }
@@ -1607,7 +1607,7 @@ impl Executor {
 
         // If not PK, check for index (only for non-negated IN)
         let index = if !is_pk_column {
-            match table.get_index_on_column(&column_name) {
+            match table.lookup_index_on_column(&column_name) {
                 Some(idx) => Some(idx),
                 None => return Ok(None), // No PK, no index, can't optimize
             }

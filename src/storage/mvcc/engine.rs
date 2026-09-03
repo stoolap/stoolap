@@ -6093,6 +6093,18 @@ impl Engine for MVCCEngine {
         Ok(store.get_all_indexes().into_vec())
     }
 
+    fn get_lookup_indexes(&self, table_name: &str) -> Result<Vec<std::sync::Arc<dyn Index>>> {
+        let sealed = {
+            let mgrs = self.segment_managers.read().unwrap();
+            mgrs.get(&table_name.to_lowercase())
+                .is_some_and(|mgr| mgr.has_segments())
+        };
+        if sealed {
+            return Ok(Vec::new());
+        }
+        self.get_all_indexes(table_name)
+    }
+
     fn get_isolation_level(&self) -> IsolationLevel {
         self.registry.get_global_isolation_level()
     }

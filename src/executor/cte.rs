@@ -2191,12 +2191,12 @@ impl Executor {
             if schema.columns[pk_idx].name_lower == table_col_lower {
                 // It's a primary key lookup - most efficient!
                 IndexLookupStrategy::PrimaryKey
-            } else if let Some(index) = table.get_index_on_column(&table_col_unqualified) {
+            } else if let Some(index) = table.lookup_index_on_column(&table_col_unqualified) {
                 IndexLookupStrategy::SecondaryIndex(index)
             } else {
                 return Ok(None);
             }
-        } else if let Some(index) = table.get_index_on_column(&table_col_unqualified) {
+        } else if let Some(index) = table.lookup_index_on_column(&table_col_unqualified) {
             IndexLookupStrategy::SecondaryIndex(index)
         } else {
             return Ok(None);

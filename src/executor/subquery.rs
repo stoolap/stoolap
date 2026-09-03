@@ -483,7 +483,7 @@ impl Executor {
             Some(idx) => idx,
             None => {
                 // First time: get index from engine and cache it
-                let indexes = match self.engine.get_all_indexes(&correlation.inner_table) {
+                let indexes = match self.engine.get_lookup_indexes(&correlation.inner_table) {
                     Ok(idxs) => idxs,
                     Err(_) => return Ok(None), // Table not found, fall back
                 };
@@ -828,7 +828,7 @@ impl Executor {
             Some(idx) => idx,
             None => {
                 // First time: get index from engine and cache it
-                let indexes = match self.engine.get_all_indexes(&correlation.inner_table) {
+                let indexes = match self.engine.get_lookup_indexes(&correlation.inner_table) {
                     Ok(idxs) => idxs,
                     Err(_) => return Ok(None), // Table not found, fall back
                 };
@@ -2992,7 +2992,7 @@ impl Executor {
 
                 // Check for index on correlation column
                 if inner_table
-                    .get_index_on_column(&info.inner_column)
+                    .lookup_index_on_column(&info.inner_column)
                     .is_some()
                 {
                     return true;

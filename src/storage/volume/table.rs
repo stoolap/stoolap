@@ -3852,6 +3852,15 @@ impl Table for SegmentedTable {
         self.hot.get_index_on_column(column_name)
     }
 
+    /// The hot index holds ids for unsealed rows only; once rows live in
+    /// sealed segments a direct probe would miss them.
+    fn lookup_index_on_column(&self, column_name: &str) -> Option<Arc<dyn Index>> {
+        if self.segment_mgr.has_segments() {
+            return None;
+        }
+        self.hot.get_index_on_column(column_name)
+    }
+
     fn get_index(&self, name: &str) -> Option<Arc<dyn Index>> {
         self.hot.get_index(name)
     }

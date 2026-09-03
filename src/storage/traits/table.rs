@@ -732,6 +732,14 @@ pub trait Table: Send + Sync {
         None // Default implementation - override in concrete tables
     }
 
+    /// An index on `column_name` whose row ids cover every visible row of
+    /// the table, so the executor may probe it directly. A table that keeps
+    /// part of its rows outside the index returns None and the executor
+    /// scans instead.
+    fn lookup_index_on_column(&self, column_name: &str) -> Option<std::sync::Arc<dyn Index>> {
+        self.get_index_on_column(column_name)
+    }
+
     /// Gets all unique indexes on the table (for constraint checking).
     ///
     /// Returns a list of (index_name, column_names) for each unique index.
