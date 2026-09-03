@@ -114,3 +114,30 @@ fn test_group_by_limit_reduction_grows_the_left_chunk() {
         .unwrap();
     assert_eq!(total, 50);
 }
+
+/// A window function or DISTINCT runs on the grouped rows after the join
+/// produced them, so the reduction must hand over every group.
+#[test]
+fn test_group_by_limit_reduction_stays_off_under_a_window_function() {
+    let db = setup("join_limit_window", true);
+    let totals: Vec<i64> = db
+        .query(
+            "SELECT u.name, COUNT(o.id), COUNT(*) OVER () AS total FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name LIMIT 10",
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(2).unwrap())
+        .collect();
+    assert_eq!(totals.len(), 10);
+    assert!(totals.iter().all(|&t| t == 50), "window saw {totals:?}");
+}
+
+#[test]
+fn test_group_by_limit_reduction_stays_off_under_distinct() {
+    let db = setup("join_limit_distinct", true);
+    // the 50 matched users are 50..=99, so u.id / 10 takes five values
+    assert_eq!(
+        count(&db, "SELECT DISTINCT u.id / 10 FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id, u.name LIMIT 10"),
+        5
+    );
+}

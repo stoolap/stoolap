@@ -3899,6 +3899,7 @@ impl Executor {
             left_alias.as_deref(),
             left_table,
             &join_source.condition,
+            classification,
         );
 
         let (left_rows, left_columns, right_rows, right_columns) = if let Some(plan) =
@@ -9042,6 +9043,7 @@ impl Executor {
         left_alias: Option<&str>,
         left_table: Option<&str>,
         join_condition: &Option<Box<Expression>>,
+        classification: &QueryClassification,
     ) -> Option<SemijoinReduction> {
         // Applies to INNER JOIN and LEFT JOIN (not RIGHT or FULL)
         let is_inner = join_type == "INNER";
@@ -9061,6 +9063,11 @@ impl Executor {
             return None;
         }
 
+        // A window function or DISTINCT runs on the grouped rows afterwards and
+        // needs every group, not a chunk that already meets the limit
+        if classification.has_window_functions || stmt.distinct || !stmt.distinct_on.is_empty() {
+            return None;
+        }
         let (cap, limit) = Self::semijoin_caps(stmt, is_inner)?;
         // Each group must come from one left row, or a partial chunk would
         // give partial aggregates: GROUP BY has to cover the left primary key
