@@ -196,3 +196,51 @@ fn test_lead_sees_the_row_after_the_limit_window() {
     assert_eq!(rows[0], (46, Some(47)));
     assert_eq!(rows[9], (55, Some(56)));
 }
+
+/// With ORDER BY the default window frame is RANGE up to the current row,
+/// which includes the current row's later peers. A fetch cut at LIMIT +
+/// OFFSET rows can split the last peer group, so peer-sensitive functions
+/// must not use it.
+#[test]
+fn test_range_frame_peers_survive_the_limit_window() {
+    let db = Database::open("memory://offset_range_peers").unwrap();
+    db.execute(
+        "CREATE TABLE sales (id INTEGER PRIMARY KEY, category INTEGER, amount FLOAT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE INDEX idx_sales_category ON sales(category) USING BTREE",
+        (),
+    )
+    .unwrap();
+    for i in 1..=100i64 {
+        db.execute(
+            "INSERT INTO sales VALUES ($1, $2, $3)",
+            (i, (i - 1) % 50 + 1, i as f64),
+        )
+        .unwrap();
+    }
+    // row 45 in category order is the first row of category 23; its frame holds
+    // every row of categories 1..=23, including its peer past the 45th row
+    for sql in [
+        "SELECT category, SUM(amount) OVER (ORDER BY category) FROM sales LIMIT 1 OFFSET 44",
+        "SELECT category, SUM(amount) OVER (ORDER BY category RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM sales LIMIT 1 OFFSET 44",
+    ] {
+        let row = db.query(sql, ()).unwrap().next().unwrap().unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 23, "{sql}");
+        assert_eq!(row.get::<f64>(1).unwrap(), 1702.0, "{sql}");
+    }
+    let last: f64 = db
+        .query(
+            "SELECT LAST_VALUE(amount) OVER (ORDER BY category) FROM sales LIMIT 1 OFFSET 44",
+            (),
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(last, 73.0);
+}

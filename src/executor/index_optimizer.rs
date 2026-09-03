@@ -554,7 +554,7 @@ impl Executor {
     fn is_expr_window_safe(expr: &Expression) -> bool {
         match expr {
             Expression::Window(window_expr) => {
-                use crate::parser::ast::WindowFrameBound;
+                use crate::parser::ast::{WindowFrameBound, WindowFrameUnit};
                 let func_name = window_expr.function.function.to_uppercase();
                 // A fetch cut at LIMIT rows is wrong for anything that looks past
                 // the current row: total-count functions, LEAD, a frame that
@@ -565,15 +565,26 @@ impl Executor {
                         WindowFrameBound::Following(_) | WindowFrameBound::UnboundedFollowing
                     )
                 };
+                let frame = window_expr.frame.as_ref();
                 let reaches_forward = window_expr.window_ref.is_some()
-                    || window_expr
-                        .frame
-                        .as_ref()
+                    || frame
                         .is_some_and(|f| forward(&f.start) || f.end.as_ref().is_some_and(forward));
-                !reaches_forward
-                    && !matches!(
+                if reaches_forward
+                    || matches!(
                         func_name.as_str(),
                         "NTILE" | "PERCENT_RANK" | "CUME_DIST" | "LEAD"
+                    )
+                {
+                    return false;
+                }
+                // A ROWS frame ending at the current row never reads past it. Any
+                // other frame, the implicit RANGE one included, also covers the
+                // current row's later peers, which the cut fetch may not hold, so
+                // only functions that ignore the frame end stay safe there
+                frame.is_some_and(|f| f.unit == WindowFrameUnit::Rows)
+                    || matches!(
+                        func_name.as_str(),
+                        "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LAG" | "FIRST_VALUE"
                     )
             }
             Expression::Aliased(aliased) => Self::is_expr_window_safe(&aliased.expression),
