@@ -197,7 +197,7 @@ struct SemijoinReduction {
 }
 
 /// The left chunk the last reduction pass used; execute_join_source retries
-/// with a larger one when the final rows stop short of the limit
+/// with twice the chunk when the final rows stop short of the limit
 #[derive(Clone, Copy)]
 struct ReductionPass {
     cap: usize,
@@ -3806,7 +3806,7 @@ impl Executor {
             if !short {
                 return Ok((result, columns, flag, deferred));
             }
-            left_cap = Some(pass.cap.saturating_mul(4));
+            left_cap = Some(pass.cap.saturating_mul(2).min(i64::MAX as usize));
         }
     }
 
@@ -9017,8 +9017,9 @@ impl Executor {
     }
 
     /// LIMIT and OFFSET of a GROUP BY + LIMIT join as (initial left chunk, rows
-    /// expected after OFFSET). An INNER JOIN over-fetches its first chunk since
-    /// a left row without a match forms no group
+    /// expected after OFFSET). The first chunk is doubled for an INNER JOIN,
+    /// where a left row without a match forms no group, and doubled again
+    /// under HAVING, which drops groups after the fact
     fn semijoin_caps(stmt: &SelectStatement, is_inner: bool) -> Option<(usize, usize)> {
         let eval = |e: &Expression| {
             ExpressionEval::compile(e, &[])
@@ -9038,16 +9039,18 @@ impl Executor {
             None => 0,
         };
         let want = limit.saturating_add(offset);
-        let cap = if is_inner {
-            want.saturating_mul(2)
-        } else {
-            want
-        };
-        Some((cap, limit))
+        let mut cap = want;
+        if is_inner {
+            cap = cap.saturating_mul(2);
+        }
+        if stmt.having.is_some() {
+            cap = cap.saturating_mul(2);
+        }
+        // The chunk becomes a LIMIT literal, which is an i64
+        Some((cap.min(i64::MAX as usize), limit))
     }
 
-    /// Check if semi-join reduction optimization can be applied and return parameters
-    /// Returns Some((limit_value, left_key_col, right_key_col)) if applicable, None otherwise
+    /// Check if semi-join reduction optimization can be applied and return its plan
     ///
     /// Conditions for semi-join reduction:
     /// 1. INNER JOIN or LEFT JOIN (not RIGHT or FULL)
@@ -9055,8 +9058,9 @@ impl Executor {
     /// 3. LIMIT is present with no ORDER BY (for correctness)
     /// 4. Single equality join condition (a.col = b.col)
     ///
-    /// For INNER JOIN, we over-fetch left rows (2x limit) since some may not have matches.
-    /// For LEFT JOIN, exact limit is used since all left rows produce output.
+    /// The first left chunk is the limit, doubled for an INNER JOIN since some
+    /// left rows may not have matches and doubled again under HAVING; the join
+    /// reruns with twice the chunk when the result stops short.
     fn get_semijoin_reduction_limit(
         &self,
         join_type: &str,
