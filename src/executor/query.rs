@@ -3941,6 +3941,7 @@ impl Executor {
                 ctx,
                 left_filter.as_ref(),
                 Some(left_cap),
+                0,
             )?;
             let left_rows = Self::materialize_result_arc(left_result)?;
             let left_key_idx = Self::find_column_index_by_name(&left_key_col, &left_cols);
@@ -4177,8 +4178,27 @@ impl Executor {
                 };
 
                 // The outer side is fetched in chunks: the first one is the limit
-                // itself and the join below fetches more when it stops short
-                let mut outer_limit = join_limit.map(|l| (l as usize).max(100));
+                // itself and the join below fetches more when it stops short. Only
+                // a table can be fetched again from an offset; any other source is
+                // fetched whole
+                let outer_source: &Expression = outer_expr;
+                let outer_is_table = match outer_source {
+                    Expression::TableSource(_) => true,
+                    Expression::Aliased(a) => {
+                        matches!(a.expression.as_ref(), Expression::TableSource(_))
+                    }
+                    _ => false,
+                };
+                // A little slack over the limit covers the odd outer row without a
+                // match, so the common case needs no second fetch
+                let mut outer_limit = if outer_is_table {
+                    join_limit.map(|l| {
+                        let l = l as usize;
+                        l.saturating_add(l / 8).max(100)
+                    })
+                } else {
+                    None
+                };
 
                 // Execute outer side with limit optimization for true early termination
                 let (outer_result, outer_cols) = self.execute_table_expression_with_filter_limit(
@@ -4186,6 +4206,7 @@ impl Executor {
                     ctx,
                     nl_left_filter.as_ref(),
                     outer_limit,
+                    0,
                 )?;
 
                 // Find the outer key index in outer columns
@@ -4287,9 +4308,11 @@ impl Executor {
                     if join_limit.is_some() {
                         // Streaming INL for early termination with LIMIT. When the
                         // joined rows stop short of the limit and the outer chunk
-                        // was full, the next pass fetches a larger chunk
+                        // was full, the next pass continues with the outer rows
+                        // after the chunk, sized from the match rate so far
                         let mut outer_result = outer_result;
                         let mut inner_table = Some(inner_table);
+                        let mut fetched = 0usize;
                         loop {
                             let outer_op: Box<dyn Operator> = Box::new(QueryResultOperator::new(
                                 outer_result,
@@ -4312,27 +4335,37 @@ impl Executor {
                                     proj.output_columns.iter().map(ColumnInfo::new).collect();
                                 op = op.with_projection(proj.columns.clone(), projected_schema);
                             }
-                            result_rows.clear();
                             Self::collect_join_rows(
                                 &mut op,
                                 join_limit,
                                 cross_row_filter.as_ref(),
                                 &mut result_rows,
                             )?;
-                            let short =
-                                join_limit.is_some_and(|lim| result_rows.len() < lim as usize);
-                            let chunk_full =
-                                outer_limit.is_some_and(|cap| op.outer_rows_seen() == cap);
-                            if !(short && chunk_full) {
+                            let lim = join_limit.unwrap_or(0) as usize;
+                            let cap = match outer_limit {
+                                Some(cap) if op.outer_rows_seen() == cap => cap,
+                                _ => break,
+                            };
+                            if result_rows.len() >= lim {
                                 break;
                             }
-                            outer_limit = outer_limit.map(|cap| cap.saturating_mul(4));
+                            fetched = fetched.saturating_add(cap);
+                            let missing = lim - result_rows.len();
+                            let rate = result_rows.len() as f64 / fetched as f64;
+                            let estimate = if rate > 0.0 {
+                                ((missing as f64 / rate) * 2.0).ceil() as usize
+                            } else {
+                                usize::MAX
+                            };
+                            let next = estimate.clamp(32, fetched.saturating_mul(3));
+                            outer_limit = Some(next);
                             outer_result = self
                                 .execute_table_expression_with_filter_limit(
                                     outer_expr,
                                     ctx,
                                     nl_left_filter.as_ref(),
-                                    outer_limit,
+                                    Some(next),
+                                    fetched,
                                 )?
                                 .0;
                         }
@@ -6197,7 +6230,7 @@ impl Executor {
         }
     }
 
-    /// Execute a table expression with optional filter and row limit.
+    /// Execute a table expression with optional filter, row limit and row offset.
     /// For simple table sources, adds LIMIT to enable true early termination.
     /// This is optimized for Index Nested Loop joins where we need only enough rows
     /// to produce the requested LIMIT results.
@@ -6207,6 +6240,7 @@ impl Executor {
         ctx: &ExecutionContext,
         filter: Option<&Expression>,
         row_limit: Option<usize>,
+        row_offset: usize,
     ) -> Result<(Box<dyn QueryResult>, Vec<String>)> {
         // Handle FunctionTableSource with limit passthrough
         let tvf_source = match expr {
@@ -6277,7 +6311,14 @@ impl Executor {
                         value: limit as i64,
                     },
                 ))),
-                offset: None,
+                offset: (row_offset > 0).then(|| {
+                    Box::new(Expression::IntegerLiteral(
+                        crate::parser::ast::IntegerLiteral {
+                            token: dummy_token(&row_offset.to_string(), TokenType::Integer),
+                            value: row_offset as i64,
+                        },
+                    ))
+                }),
                 set_operations: vec![],
             };
             // Get classification for the synthetic SELECT statement
