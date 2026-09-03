@@ -121,6 +121,8 @@ pub struct IndexNestedLoopJoinOperator {
     // State tracking
     opened: bool,
     outer_exhausted: bool,
+    // Outer rows pulled so far; the executor uses it to see a full chunk
+    outer_rows_seen: usize,
 }
 
 impl IndexNestedLoopJoinOperator {
@@ -175,6 +177,7 @@ impl IndexNestedLoopJoinOperator {
             true_expr: ConstBoolExpr::true_expr(),
             opened: false,
             outer_exhausted: false,
+            outer_rows_seen: 0,
         }
     }
 
@@ -293,6 +296,10 @@ impl IndexNestedLoopJoinOperator {
         }
     }
 
+    pub fn outer_rows_seen(&self) -> usize {
+        self.outer_rows_seen
+    }
+
     /// Look up matching inner rows for the current outer row.
     /// Uses internal buffers to avoid allocations.
     fn lookup_inner_rows(&mut self, key_value: &Value) -> Result<()> {
@@ -340,6 +347,7 @@ impl IndexNestedLoopJoinOperator {
         match self.outer.next()? {
             Some(row_ref) => {
                 let outer_row = row_ref.into_owned();
+                self.outer_rows_seen += 1;
 
                 // Get the join key value from the outer row
                 let key_value = match outer_row.get(self.outer_key_idx) {
