@@ -98,7 +98,8 @@ impl SegmentedTable {
 
     /// Runs `f` on the hot table while no rows are sealed. The seal fence is
     /// held across the check and the call, so the first seal cannot remove
-    /// hot rows in between. None once segments exist.
+    /// hot rows in between. None once segments exist. Readers that merge hot
+    /// and cold values hold the fence for their whole body instead.
     fn unsealed<T>(&self, f: impl FnOnce(&dyn Table) -> T) -> Option<T> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
         if self.segment_mgr.has_segments() {
@@ -2276,6 +2277,7 @@ impl Table for SegmentedTable {
         // may be off by a few rows during the brief overlap window, but
         // this avoids an O(total_rows) HashSet collection that made ALL
         // queries slow during checkpoint.
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let seg = self.segment_mgr.deduped_row_count();
         let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
         let overlap = self.segment_mgr.seal_overlap();
@@ -2296,6 +2298,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let hot_count = self.hot.fast_row_count()?;
         let seg = self.segment_mgr.deduped_row_count();
         let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
@@ -2316,6 +2319,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let hot_result = self.hot.sum_column(col_idx);
 
         if !self.segment_mgr.has_segments() {
@@ -2445,6 +2449,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let hot_result = self.hot.min_column(col_idx);
 
         if !self.segment_mgr.has_segments() {
@@ -2748,6 +2753,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         let hot_result = self.hot.max_column(col_idx);
 
         if !self.segment_mgr.has_segments() {
@@ -3045,8 +3051,9 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
-        if let Some(result) = self.unsealed(|hot| hot.get_partition_count(column_name)) {
-            return result;
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
+        if !self.segment_mgr.has_segments() {
+            return self.hot.get_partition_count(column_name);
         }
 
         // During seal, hot+cold overlap — can't reliably count
@@ -3301,10 +3308,9 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
-        if let Some(result) =
-            self.unsealed(|hot| hot.collect_rows_grouped_by_partition(column_name))
-        {
-            return result;
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
+        if !self.segment_mgr.has_segments() {
+            return self.hot.collect_rows_grouped_by_partition(column_name);
         }
 
         if self.segment_mgr.seal_overlap() > 0 {
@@ -3384,10 +3390,11 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
-        if let Some(result) =
-            self.unsealed(|hot| hot.get_rows_for_partition_value(column_name, partition_value))
-        {
-            return result;
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
+        if !self.segment_mgr.has_segments() {
+            return self
+                .hot
+                .get_rows_for_partition_value(column_name, partition_value);
         }
 
         if self.segment_mgr.seal_overlap() > 0 {
@@ -4213,6 +4220,7 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return None;
         }
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
         // Bail out: during seal, hot+cold overlap makes aggregation unreliable
         if self.segment_mgr.seal_overlap() > 0 {
             return None;
@@ -5043,10 +5051,11 @@ impl Table for SegmentedTable {
         if group_by_indices.len() != 1 {
             return None;
         }
-        if let Some(result) =
-            self.unsealed(|hot| hot.compute_grouped_aggregates(group_by_indices, aggregates))
-        {
-            return result;
+        let _seal_guard = self.segment_mgr.acquire_seal_read();
+        if !self.segment_mgr.has_segments() {
+            return self
+                .hot
+                .compute_grouped_aggregates(group_by_indices, aggregates);
         }
 
         // During seal, hot+cold overlap — can't reliably aggregate
