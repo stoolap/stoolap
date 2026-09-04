@@ -129,11 +129,19 @@ impl Executor {
             }
 
             Expression::AllAny(all_any) => {
+                // The left operand may hold a subquery of its own
+                let bound = AllAnyExpression {
+                    token: all_any.token.clone(),
+                    left: Box::new(self.process_where_subqueries(&all_any.left, ctx)?),
+                    operator: all_any.operator.clone(),
+                    all_any_type: all_any.all_any_type,
+                    subquery: all_any.subquery.clone(),
+                };
                 // Execute the subquery to get all values
-                let values = self.execute_in_subquery(&all_any.subquery, ctx)?;
+                let values = self.execute_in_subquery(&bound.subquery, ctx)?;
 
                 // Convert ALL/ANY to an equivalent expression that the evaluator can handle
-                self.convert_all_any_to_expression(all_any, values)
+                self.convert_all_any_to_expression(&bound, values)
             }
 
             Expression::Prefix(prefix) => {
@@ -1616,12 +1624,45 @@ impl Executor {
             };
         }
 
+        // A NULL among the values makes the comparison with it UNKNOWN, so an
+        // ALL that holds on the others and an ANY that fails on the others are
+        // UNKNOWN: the folded predicate carries a NULL beside it
+        let has_null = values.iter().any(|v| v.is_null());
+        let non_null_values: Vec<&crate::core::Value> =
+            values.iter().filter(|v| !v.is_null()).collect();
+        let unknown = || {
+            Expression::NullLiteral(NullLiteral {
+                token: dummy_token("NULL", TokenType::Keyword),
+            })
+        };
+        let with_unknown = |predicate: Expression| -> Expression {
+            if !has_null {
+                return predicate;
+            }
+            let logical = match all_any.all_any_type {
+                AllAnyType::All => "AND",
+                AllAnyType::Any => "OR",
+            };
+            Expression::Infix(InfixExpression::new(
+                all_any.token.clone(),
+                Box::new(predicate),
+                logical.to_string(),
+                Box::new(unknown()),
+            ))
+        };
+        if non_null_values.is_empty() {
+            return Ok(unknown());
+        }
+
         // Convert values to expressions
-        let value_exprs: Vec<Expression> = values.iter().map(value_to_expression).collect();
+        let value_exprs: Vec<Expression> = non_null_values
+            .iter()
+            .map(|v| value_to_expression(v))
+            .collect();
 
         // Special case: = ANY is equivalent to IN
         if op == "=" && matches!(all_any.all_any_type, AllAnyType::Any) {
-            return Ok(Expression::In(InExpression {
+            return Ok(with_unknown(Expression::In(InExpression {
                 token: all_any.token.clone(),
                 left: all_any.left.clone(),
                 right: Box::new(Expression::ExpressionList(Box::new(ExpressionList {
@@ -1629,12 +1670,12 @@ impl Executor {
                     expressions: value_exprs,
                 }))),
                 not: false,
-            }));
+            })));
         }
 
         // Special case: <> ALL is equivalent to NOT IN
         if (op == "<>" || op == "!=") && matches!(all_any.all_any_type, AllAnyType::All) {
-            return Ok(Expression::In(InExpression {
+            return Ok(with_unknown(Expression::In(InExpression {
                 token: all_any.token.clone(),
                 left: all_any.left.clone(),
                 right: Box::new(Expression::ExpressionList(Box::new(ExpressionList {
@@ -1642,7 +1683,7 @@ impl Executor {
                     expressions: value_exprs,
                 }))),
                 not: true,
-            }));
+            })));
         }
 
         // For comparison operators, we can optimize using MIN/MAX:
@@ -1654,19 +1695,6 @@ impl Executor {
         // - x >= ANY (values) → x >= MIN(values)
         // - x < ANY (values) → x < MAX(values)
         // - x <= ANY (values) → x <= MAX(values)
-
-        // Filter out NULL values for comparison
-        let non_null_values: Vec<&crate::core::Value> =
-            values.iter().filter(|v| !v.is_null()).collect();
-
-        // If all values are NULL, result depends on semantics
-        if non_null_values.is_empty() {
-            // Comparison with all NULLs is UNKNOWN, which filters as FALSE
-            return Ok(Expression::BooleanLiteral(BooleanLiteral {
-                token: dummy_token("FALSE", TokenType::Keyword),
-                value: false,
-            }));
-        }
 
         // Find min and max
         let min_val = non_null_values
@@ -1693,12 +1721,12 @@ impl Executor {
 
         if let Some(cmp_val) = comparison_value {
             // Build simple comparison: left op value
-            return Ok(Expression::Infix(InfixExpression::new(
+            return Ok(with_unknown(Expression::Infix(InfixExpression::new(
                 all_any.token.clone(),
                 all_any.left.clone(),
                 op.to_string(),
                 Box::new(value_to_expression(cmp_val)),
-            )));
+            ))));
         }
 
         // Fallback: build compound expression with AND/OR
@@ -1730,12 +1758,12 @@ impl Executor {
             });
         }
 
-        Ok(result_expr.unwrap_or_else(|| {
+        Ok(with_unknown(result_expr.unwrap_or_else(|| {
             Expression::BooleanLiteral(BooleanLiteral {
                 token: dummy_token("TRUE", TokenType::Keyword),
                 value: true,
             })
-        }))
+        })))
     }
 
     /// Execute a scalar subquery and return its single value.
@@ -1948,7 +1976,10 @@ impl Executor {
                     || Self::has_subqueries(&between.upper)
             }
             Expression::Aliased(aliased) => Self::has_subqueries(&aliased.expression),
-            Expression::FunctionCall(func) => func.arguments.iter().any(Self::has_subqueries),
+            Expression::FunctionCall(func) => {
+                func.arguments.iter().any(Self::has_subqueries)
+                    || func.filter.as_deref().is_some_and(Self::has_subqueries)
+            }
             Expression::Case(case) => {
                 case.value.as_deref().is_some_and(Self::has_subqueries)
                     || case.when_clauses.iter().any(|w| {
@@ -2209,7 +2240,10 @@ impl Executor {
             Expression::ScalarSubquery(subquery) => {
                 Self::is_subquery_correlated(&subquery.subquery)
             }
-            Expression::AllAny(all_any) => Self::is_subquery_correlated(&all_any.subquery),
+            Expression::AllAny(all_any) => {
+                Self::is_subquery_correlated(&all_any.subquery)
+                    || Self::has_correlated_subqueries(&all_any.left)
+            }
             Expression::Prefix(prefix) => {
                 // Handle NOT EXISTS
                 if let Expression::Exists(exists) = prefix.right.as_ref() {
@@ -2236,6 +2270,10 @@ impl Executor {
             Expression::Aliased(aliased) => Self::has_correlated_subqueries(&aliased.expression),
             Expression::FunctionCall(func) => {
                 func.arguments.iter().any(Self::has_correlated_subqueries)
+                    || func
+                        .filter
+                        .as_deref()
+                        .is_some_and(Self::has_correlated_subqueries)
             }
             Expression::Case(case) => {
                 case.value
@@ -2536,10 +2574,15 @@ impl Executor {
             Expression::Prefix(prefix) => {
                 Self::references_outer_columns(&prefix.right, subquery_tables)
             }
-            Expression::FunctionCall(func) => func
-                .arguments
-                .iter()
-                .any(|arg| Self::references_outer_columns(arg, subquery_tables)),
+            Expression::FunctionCall(func) => {
+                func.arguments
+                    .iter()
+                    .any(|arg| Self::references_outer_columns(arg, subquery_tables))
+                    || func
+                        .filter
+                        .as_deref()
+                        .is_some_and(|f| Self::references_outer_columns(f, subquery_tables))
+            }
             Expression::In(in_expr) => {
                 Self::references_outer_columns(&in_expr.left, subquery_tables)
                     || Self::references_outer_columns(&in_expr.right, subquery_tables)

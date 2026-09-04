@@ -368,6 +368,16 @@ fn substitute_outer_references_inner(
             }
         }
 
+        Expression::InHashSet(in_set) => {
+            substitute_outer_references_inner(&in_set.column, outer_row, scope).map(|column| {
+                Expression::InHashSet(InHashSetExpression {
+                    token: in_set.token.clone(),
+                    column: Box::new(column),
+                    values: in_set.values.clone(),
+                    not: in_set.not,
+                })
+            })
+        }
         Expression::Cast(cast) => substitute_outer_references_inner(&cast.expr, outer_row, scope)
             .map(|expr| {
                 Expression::Cast(CastExpression {

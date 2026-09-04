@@ -374,8 +374,15 @@ impl QueryClassification {
             Expression::Exists(_) => {
                 *has_exists = true;
             }
-            Expression::AllAny(_) => {
+            Expression::AllAny(all_any) => {
                 *has_all_any = true;
+                Self::analyze_where_expr_recursive(
+                    &all_any.left,
+                    has_exists,
+                    has_in_subquery,
+                    has_scalar_subquery,
+                    has_all_any,
+                );
             }
             Expression::ScalarSubquery(_) => {
                 *has_scalar_subquery = true;
@@ -428,7 +435,7 @@ impl QueryClassification {
                 );
             }
             Expression::FunctionCall(func) => {
-                for arg in &func.arguments {
+                for arg in func.arguments.iter().chain(func.filter.as_deref()) {
                     Self::analyze_where_expr_recursive(
                         arg,
                         has_exists,
@@ -576,10 +583,16 @@ impl QueryClassification {
                     || Self::expression_has_scalar_subquery(&infix.right)
             }
             Expression::Prefix(prefix) => Self::expression_has_scalar_subquery(&prefix.right),
-            Expression::FunctionCall(func) => func
-                .arguments
-                .iter()
-                .any(Self::expression_has_scalar_subquery),
+            Expression::FunctionCall(func) => {
+                func.arguments
+                    .iter()
+                    .any(Self::expression_has_scalar_subquery)
+                    || func
+                        .filter
+                        .as_deref()
+                        .is_some_and(Self::expression_has_scalar_subquery)
+            }
+            Expression::AllAny(all_any) => Self::expression_has_scalar_subquery(&all_any.left),
             Expression::Case(case) => {
                 case.value
                     .as_deref()
@@ -874,7 +887,10 @@ impl QueryClassification {
             Expression::ScalarSubquery(subquery) => {
                 Self::is_subquery_correlated(&subquery.subquery)
             }
-            Expression::AllAny(all_any) => Self::is_subquery_correlated(&all_any.subquery),
+            Expression::AllAny(all_any) => {
+                Self::is_subquery_correlated(&all_any.subquery)
+                    || Self::expression_has_correlated_subqueries(&all_any.left)
+            }
             Expression::Prefix(prefix) => {
                 // Handle NOT EXISTS
                 if let Expression::Exists(exists) = prefix.right.as_ref() {
@@ -901,10 +917,15 @@ impl QueryClassification {
             Expression::Aliased(aliased) => {
                 Self::expression_has_correlated_subqueries(&aliased.expression)
             }
-            Expression::FunctionCall(func) => func
-                .arguments
-                .iter()
-                .any(Self::expression_has_correlated_subqueries),
+            Expression::FunctionCall(func) => {
+                func.arguments
+                    .iter()
+                    .any(Self::expression_has_correlated_subqueries)
+                    || func
+                        .filter
+                        .as_deref()
+                        .is_some_and(Self::expression_has_correlated_subqueries)
+            }
             Expression::Case(case) => {
                 case.value
                     .as_deref()
@@ -1028,10 +1049,15 @@ impl QueryClassification {
             Expression::Prefix(prefix) => {
                 Self::has_outer_column_reference(&prefix.right, inner_tables)
             }
-            Expression::FunctionCall(func) => func
-                .arguments
-                .iter()
-                .any(|a| Self::has_outer_column_reference(a, inner_tables)),
+            Expression::FunctionCall(func) => {
+                func.arguments
+                    .iter()
+                    .any(|a| Self::has_outer_column_reference(a, inner_tables))
+                    || func
+                        .filter
+                        .as_deref()
+                        .is_some_and(|f| Self::has_outer_column_reference(f, inner_tables))
+            }
             Expression::Case(case) => {
                 case.value
                     .as_ref()

@@ -459,3 +459,124 @@ fn test_uncorrelated_next_to_correlated_on_a_derived_side() {
         "table"
     );
 }
+
+/// A column of the query around the join on the left of a correlated IN
+#[test]
+fn test_parent_column_in_a_correlated_in() {
+    let db = setup("where_subquery_parent_in");
+    let expected: Vec<Vec<String>> = (1..=3i64)
+        .map(|user| vec![user.to_string(), "3".to_string()])
+        .collect();
+    assert_eq!(
+        rows(
+            &db,
+            &format!(
+                "SELECT u2.id, (SELECT COUNT(*) FROM {JOIN} WHERE u2.id IN (SELECT x.user_id FROM orders x WHERE x.user_id = u.id)) FROM users u2 WHERE u2.id <= 3 ORDER BY u2.id"
+            )
+        ),
+        expected
+    );
+}
+
+/// ALL and ANY over a set holding a NULL follow three-valued logic
+#[test]
+fn test_all_any_with_a_null_in_the_set() {
+    let db = setup("where_subquery_all_null");
+    db.execute("INSERT INTO orders VALUES (91, 1, NULL)", ())
+        .unwrap();
+    let cases = [
+        (
+            "200 > ALL (SELECT amount FROM orders WHERE user_id = 1)",
+            0,
+            "ALL that holds on every value but sees a NULL",
+        ),
+        (
+            "200 > ALL (SELECT amount FROM orders WHERE user_id = 1 AND amount IS NOT NULL)",
+            30,
+            "ALL without the NULL",
+        ),
+        (
+            "200 > ALL (SELECT amount FROM orders WHERE user_id = 99)",
+            30,
+            "ALL over an empty set",
+        ),
+        (
+            "5 > ANY (SELECT amount FROM orders WHERE user_id = 1)",
+            0,
+            "ANY that fails on every value and sees a NULL",
+        ),
+        (
+            "NOT (5 > ANY (SELECT amount FROM orders WHERE user_id = 1))",
+            0,
+            "NOT of an unknown ANY",
+        ),
+        (
+            "11 > ANY (SELECT amount FROM orders WHERE user_id = 1)",
+            30,
+            "ANY that holds on one value",
+        ),
+        (
+            "10 = ANY (SELECT amount FROM orders WHERE user_id = 1)",
+            30,
+            "= ANY that holds",
+        ),
+        (
+            "NOT (7 = ANY (SELECT amount FROM orders WHERE user_id = 1))",
+            0,
+            "NOT of an unknown = ANY",
+        ),
+        (
+            "7 <> ALL (SELECT amount FROM orders WHERE user_id = 1)",
+            0,
+            "<> ALL that sees a NULL",
+        ),
+    ];
+    for (predicate, expected, label) in cases {
+        assert_eq!(
+            count(
+                &db,
+                &format!("SELECT COUNT(*) FROM users WHERE {predicate}")
+            ),
+            expected,
+            "{label}"
+        );
+    }
+    // The largest order of every user, except the user whose set holds a NULL
+    let predicate =
+        "o.amount > ALL (SELECT amount FROM orders x WHERE x.user_id = u.id AND x.id <> o.id)";
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM {JOIN} WHERE {predicate}")
+        ),
+        29,
+        "correlated ALL"
+    );
+}
+
+/// The left operand of ALL may itself hold a correlated subquery
+#[test]
+fn test_correlated_left_operand_of_all() {
+    let db = setup("where_subquery_all_left");
+    // Users whose largest order tops every order of user 20 (202): users from 21
+    let predicate = "(SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id) > ALL (SELECT amount FROM orders WHERE user_id = 20)";
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM {JOIN} WHERE {predicate}")
+        ),
+        30,
+        "joined rows"
+    );
+    let expected: Vec<Vec<String>> = (21..=30i64)
+        .map(|user| vec![user.to_string(), "3".to_string()])
+        .collect();
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT u.id, COUNT(o.id) FROM {JOIN} WHERE {predicate} GROUP BY u.id ORDER BY u.id")
+        ),
+        expected,
+        "grouped join"
+    );
+}
