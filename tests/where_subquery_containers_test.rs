@@ -1131,3 +1131,139 @@ fn test_fromless_correlated_subquery_in_where() {
         3
     );
 }
+
+/// Two subqueries whose text is the same but whose anonymous parameters are
+/// not each read their own binding, within one statement and across two
+#[test]
+fn test_subqueries_keep_their_own_parameter() {
+    let db = setup("subquery_parameters");
+    // MAX(x.amount) for user n is n * 10 + 2, summed over the 30 users
+    let row = db
+        .query(
+            "SELECT SUM((SELECT MAX(x.amount) FROM orders x WHERE x.user_id = ?)), SUM((SELECT MAX(x.amount) FROM orders x WHERE x.user_id = ?)) FROM users u",
+            (1i64, 2i64),
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()),
+        ("360".to_string(), "660".to_string()),
+        "two anonymous parameters in one statement"
+    );
+
+    let one = "SELECT (SELECT MAX(x.amount) FROM orders x WHERE x.user_id = ?) FROM users LIMIT 1";
+    let read = |p: i64| -> String {
+        db.query(one, (p,))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap()
+    };
+    assert_eq!(
+        (read(1), read(2)),
+        ("12".to_string(), "22".to_string()),
+        "one statement, two executions"
+    );
+}
+
+/// A navigation window function reads its control argument off no row, so a
+/// subquery there stays where it is instead of becoming a column
+#[test]
+fn test_navigation_window_control_argument() {
+    let db = setup("navigation_control_argument");
+    // An unqualified argument, since a qualified one is a separate bug that
+    // predates this branch and shows the same way on main
+    let ids = "WHERE id <= 4 ORDER BY id";
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT id, LAG(id, (SELECT 1)) OVER (ORDER BY id) FROM users {ids}")
+        ),
+        [("1", "NULL"), ("2", "1"), ("3", "2"), ("4", "3")]
+            .iter()
+            .map(|(a, b)| vec![a.to_string(), b.to_string()])
+            .collect::<Vec<_>>(),
+        "LAG offset"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT id, NTILE((SELECT 2)) OVER (ORDER BY id) FROM users {ids}")
+        ),
+        [("1", "1"), ("2", "1"), ("3", "2"), ("4", "2")]
+            .iter()
+            .map(|(a, b)| vec![a.to_string(), b.to_string()])
+            .collect::<Vec<_>>(),
+        "NTILE group count"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT id, NTH_VALUE(id, (SELECT 2)) OVER (ORDER BY id) FROM users {ids}")
+        ),
+        [("1", "NULL"), ("2", "2"), ("3", "2"), ("4", "2")]
+            .iter()
+            .map(|(a, b)| vec![a.to_string(), b.to_string()])
+            .collect::<Vec<_>>(),
+        "NTH_VALUE n"
+    );
+    // A correlated control argument reads no row either, so it keeps the
+    // answer it has always given rather than failing to compile
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT u.id, NTILE((SELECT MAX(x.user_id) FROM orders x WHERE x.user_id = u.id)) OVER (ORDER BY u.id) FROM users u WHERE u.id <= 4 ORDER BY u.id"
+        )
+        .len(),
+        4,
+        "correlated control argument still runs"
+    );
+}
+
+/// An aggregate that orders its own input places NULLs where the query says
+#[test]
+fn test_aggregate_order_by_nulls_placement() {
+    let db = Database::open("memory://aggregate_order_nulls").unwrap();
+    db.execute(
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, k INTEGER, v TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO n VALUES (1, 2, 'x'), (2, NULL, 'y'), (3, 1, 'z')",
+        (),
+    )
+    .unwrap();
+    let first = |sql: &str| -> String { rows(&db, sql)[0][0].clone() };
+    assert_eq!(
+        first("SELECT GROUP_CONCAT(v ORDER BY k NULLS FIRST) FROM n"),
+        "y,z,x"
+    );
+    assert_eq!(
+        first("SELECT GROUP_CONCAT(v ORDER BY k NULLS LAST) FROM n"),
+        "z,x,y"
+    );
+    assert_eq!(
+        first("SELECT GROUP_CONCAT(v ORDER BY k DESC NULLS LAST) FROM n"),
+        "x,z,y"
+    );
+    assert_eq!(
+        first("SELECT GROUP_CONCAT(v ORDER BY k DESC) FROM n"),
+        "y,x,z",
+        "DESC without a NULLS clause puts them first"
+    );
+    assert_eq!(
+        first("SELECT GROUP_CONCAT(v ORDER BY k NULLS FIRST) OVER () FROM n LIMIT 1"),
+        "y,z,x",
+        "the same inside a window"
+    );
+    assert_eq!(
+        first("SELECT GROUP_CONCAT(v ORDER BY k DESC NULLS LAST) OVER () FROM n LIMIT 1"),
+        "x,z,y",
+        "descending inside a window"
+    );
+}

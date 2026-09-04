@@ -4097,8 +4097,7 @@ impl Executor {
                         Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name))
                     })?;
                 if keys.is_some() {
-                    agg_func
-                        .set_order_by(wf_info.call_order_by.iter().map(|o| o.ascending).collect());
+                    agg_func.set_order_by(Self::aggregate_order_keys(&wf_info.call_order_by));
                 }
 
                 // Check if we can use O(n) incremental accumulation instead of O(n²) reset.
@@ -4484,8 +4483,7 @@ impl Executor {
                         Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name))
                     })?;
                 if keys.is_some() {
-                    agg_func
-                        .set_order_by(wf_info.call_order_by.iter().map(|o| o.ascending).collect());
+                    agg_func.set_order_by(Self::aggregate_order_keys(&wf_info.call_order_by));
                 }
 
                 // Accumulate all values in the partition

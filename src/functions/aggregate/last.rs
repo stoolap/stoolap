@@ -35,7 +35,7 @@ struct BestEntry {
 pub struct LastFunction {
     last_value: Option<Value>,
     has_order_by: bool,
-    order_directions: Vec<bool>,
+    order_keys: Vec<crate::functions::AggregateOrder>,
     best_entry: Option<BestEntry>,
 }
 
@@ -53,8 +53,8 @@ impl AggregateFunction for LastFunction {
         )
     }
 
-    fn set_order_by(&mut self, directions: Vec<bool>) {
-        self.order_directions = directions;
+    fn set_order_by(&mut self, keys: Vec<crate::functions::AggregateOrder>) {
+        self.order_keys = keys;
         self.has_order_by = true;
     }
 
@@ -79,7 +79,7 @@ impl AggregateFunction for LastFunction {
         // LAST: keep the entry that would sort last (maximum in sort order).
         // For equal keys, replace (last-seen-wins, matching stable sort behavior).
         let should_replace = self.best_entry.as_ref().is_none_or(|best| {
-            compare_sort_keys(&sort_keys, &best.sort_keys, &self.order_directions)
+            compare_sort_keys(&sort_keys, &best.sort_keys, &self.order_keys)
                 != std::cmp::Ordering::Less
         });
         if should_replace {
@@ -168,7 +168,10 @@ mod tests {
     #[test]
     fn test_last_with_order_by_asc() {
         let mut last = LastFunction::default();
-        last.set_order_by(vec![true]); // ASC
+        last.set_order_by(vec![crate::functions::AggregateOrder {
+            ascending: true,
+            nulls_first: None,
+        }]);
         last.accumulate_with_sort_key(&Value::text("c_val"), vec![Value::Integer(3)], false);
         last.accumulate_with_sort_key(&Value::text("a_val"), vec![Value::Integer(1)], false);
         last.accumulate_with_sort_key(&Value::text("b_val"), vec![Value::Integer(2)], false);
@@ -179,7 +182,10 @@ mod tests {
     #[test]
     fn test_last_with_order_by_desc() {
         let mut last = LastFunction::default();
-        last.set_order_by(vec![false]); // DESC
+        last.set_order_by(vec![crate::functions::AggregateOrder {
+            ascending: false,
+            nulls_first: None,
+        }]);
         last.accumulate_with_sort_key(&Value::text("c_val"), vec![Value::Integer(3)], false);
         last.accumulate_with_sort_key(&Value::text("a_val"), vec![Value::Integer(1)], false);
         last.accumulate_with_sort_key(&Value::text("b_val"), vec![Value::Integer(2)], false);

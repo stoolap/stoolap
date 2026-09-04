@@ -233,7 +233,8 @@ impl Executor {
                             && !Self::is_subquery_correlated(&subquery.subquery)
                             && ctx.transaction_id().is_none();
                         let cached_set = if is_non_correlated {
-                            get_cached_in_subquery_set(&subquery.subquery.to_string())
+                            Self::subquery_cache_key(&subquery.subquery, ctx)
+                                .and_then(|key| get_cached_in_subquery_set(&key))
                         } else {
                             None
                         };
@@ -1783,11 +1784,15 @@ impl Executor {
         // as key; bypassed inside explicit transactions (see
         // execute_in_subquery for the ROLLBACK rationale)
         let cache_key = if is_non_correlated && ctx.transaction_id().is_none() {
-            let key = subquery.to_string();
-            if let Some(cached_value) = get_cached_scalar_subquery(&key) {
-                return Ok(cached_value);
+            match Self::subquery_cache_key(subquery, ctx) {
+                Some(key) => {
+                    if let Some(cached_value) = get_cached_scalar_subquery(&key) {
+                        return Ok(cached_value);
+                    }
+                    Some(key)
+                }
+                None => None,
             }
-            Some(key)
         } else {
             None
         };
@@ -1897,11 +1902,15 @@ impl Executor {
         // entirely: an in-transaction execution sees uncommitted rows, and
         // caching that view would survive a ROLLBACK
         let cache_key = if is_non_correlated && ctx.transaction_id().is_none() {
-            let key = subquery.to_string();
-            if let Some(cached_values) = get_cached_in_subquery(&key) {
-                return Ok(cached_values);
+            match Self::subquery_cache_key(subquery, ctx) {
+                Some(key) => {
+                    if let Some(cached_values) = get_cached_in_subquery(&key) {
+                        return Ok(cached_values);
+                    }
+                    Some(key)
+                }
+                None => None,
             }
-            Some(key)
         } else {
             None
         };
@@ -2769,6 +2778,32 @@ impl Executor {
                 .any(|order| Self::has_subqueries(&order.expression))
     }
 
+    /// The cache key of a subquery that reads no outer row: its text and the
+    /// bindings behind it, since a parameter prints as its marker and one
+    /// text would otherwise answer for two executions. None when the text
+    /// holds an anonymous marker, which two bindings of one statement share
+    pub(crate) fn subquery_cache_key(
+        subquery: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Option<String> {
+        use std::fmt::Write;
+        let mut key = subquery.to_string();
+        if key.contains('?') {
+            return None;
+        }
+        for value in ctx.params() {
+            let _ = write!(key, "\u{1}{value}");
+        }
+        if !ctx.named_params().is_empty() {
+            let mut named: Vec<(&String, &Value)> = ctx.named_params().iter().collect();
+            named.sort_unstable_by_key(|(name, _)| *name);
+            for (name, value) in named {
+                let _ = write!(key, "\u{1}{name}={value}");
+            }
+        }
+        Some(key)
+    }
+
     /// Whether a window function, its OVER clause or a named window holds a subquery
     pub(crate) fn windows_hold_subquery(stmt: &SelectStatement) -> bool {
         stmt.columns.iter().any(Self::has_subqueries)
@@ -2790,8 +2825,12 @@ impl Executor {
         base_columns: &[String],
     ) -> String {
         let text = expr.to_string();
-        if let Some((_, name)) = lifted.iter().find(|(e, _)| e.to_string() == text) {
-            return name.clone();
+        // An anonymous parameter prints as a bare marker, so one text can
+        // stand for two bindings and only a distinct text may be shared
+        if !text.contains('?') {
+            if let Some((_, name)) = lifted.iter().find(|(e, _)| e.to_string() == text) {
+                return name.clone();
+            }
         }
         let mut name = text;
         // A qualifier holds no dot, the name after it may
@@ -2800,7 +2839,10 @@ impl Executor {
                 || column
                     .split_once('.')
                     .is_some_and(|(_, bare)| bare.eq_ignore_ascii_case(&name))
-        }) {
+        }) || lifted
+            .iter()
+            .any(|(_, taken)| taken.eq_ignore_ascii_case(&name))
+        {
             name.push('_');
         }
         lifted.push((expr.clone(), name.clone()));
@@ -2916,6 +2958,22 @@ impl Executor {
         ))
     }
 
+    /// The argument a navigation window function reads once, off no row:
+    /// the offset of LEAD and LAG, the group count of NTILE, the n of
+    /// NTH_VALUE
+    fn window_control_argument(function: &str) -> Option<usize> {
+        if function.eq_ignore_ascii_case("NTILE") {
+            Some(0)
+        } else if function.eq_ignore_ascii_case("LEAD")
+            || function.eq_ignore_ascii_case("LAG")
+            || function.eq_ignore_ascii_case("NTH_VALUE")
+        {
+            Some(1)
+        } else {
+            None
+        }
+    }
+
     fn lift_subqueries_in_call(
         func: &FunctionCall,
         inside_aggregate: bool,
@@ -2925,13 +2983,25 @@ impl Executor {
     ) -> FunctionCall {
         let inside =
             inside_aggregate || (!windows && super::utils::is_aggregate_function(&func.function));
+        // A navigation window function reads its control argument off no row
+        // at all, so a column put there would never resolve
+        let control = windows
+            .then(|| Self::window_control_argument(&func.function))
+            .flatten();
         FunctionCall {
             token: func.token.clone(),
             function: func.function.clone(),
             arguments: func
                 .arguments
                 .iter()
-                .map(|a| Self::lift_subqueries_in(a, inside, windows, lifted, base_columns))
+                .enumerate()
+                .map(|(i, a)| {
+                    if control == Some(i) {
+                        a.clone()
+                    } else {
+                        Self::lift_subqueries_in(a, inside, windows, lifted, base_columns)
+                    }
+                })
                 .collect(),
             is_distinct: func.is_distinct,
             order_by: func

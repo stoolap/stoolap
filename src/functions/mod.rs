@@ -194,6 +194,23 @@ impl FunctionInfo {
 }
 
 /// Trait for aggregate functions
+/// One ORDER BY key of an aggregate that orders its own input
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateOrder {
+    /// true for ASC, false for DESC
+    pub ascending: bool,
+    /// None takes the SQL default: NULLS LAST for ASC, NULLS FIRST for DESC
+    pub nulls_first: Option<bool>,
+}
+
+impl AggregateOrder {
+    /// Where a NULL key goes, with the default the direction implies
+    #[inline]
+    pub fn nulls_first(&self) -> bool {
+        self.nulls_first.unwrap_or(!self.ascending)
+    }
+}
+
 pub trait AggregateFunction: Send + Sync {
     /// Get the function name
     fn name(&self) -> &str;
@@ -214,9 +231,9 @@ pub trait AggregateFunction: Send + Sync {
 
     /// Configure ORDER BY for ordered-set aggregates like ARRAY_AGG, STRING_AGG
     ///
-    /// The `directions` parameter contains true for ASC, false for DESC for each sort key.
+    /// One key per sort expression, in order.
     /// Default implementation ignores ordering.
-    fn set_order_by(&mut self, _directions: Vec<bool>) {
+    fn set_order_by(&mut self, _keys: Vec<AggregateOrder>) {
         // Default: ignore ordering
     }
 

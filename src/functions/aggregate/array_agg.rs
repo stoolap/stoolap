@@ -44,7 +44,7 @@ pub struct ArrayAggFunction {
     /// Values with sort keys (used when ORDER BY is specified)
     ordered_entries: Vec<OrderedEntry>,
     /// Sort directions: true = ASC, false = DESC
-    order_directions: Vec<bool>,
+    order_keys: Vec<crate::functions::AggregateOrder>,
     /// Whether ORDER BY is active
     has_order_by: bool,
     distinct_tracker: Option<DistinctTracker>,
@@ -68,8 +68,8 @@ impl AggregateFunction for ArrayAggFunction {
         // No configuration options
     }
 
-    fn set_order_by(&mut self, directions: Vec<bool>) {
-        self.order_directions = directions;
+    fn set_order_by(&mut self, keys: Vec<crate::functions::AggregateOrder>) {
+        self.order_keys = keys;
         self.has_order_by = true;
     }
 
@@ -125,18 +125,9 @@ impl AggregateFunction for ArrayAggFunction {
         {
             // Sort the entries by their sort keys
             let mut entries: Vec<&OrderedEntry> = self.ordered_entries.iter().collect();
-            let directions = &self.order_directions;
+            let keys = &self.order_keys;
 
-            entries.sort_by(|a, b| {
-                for (i, (key_a, key_b)) in a.sort_keys.iter().zip(b.sort_keys.iter()).enumerate() {
-                    let is_asc = directions.get(i).copied().unwrap_or(true);
-                    let cmp = compare_values(key_a, key_b);
-                    if cmp != std::cmp::Ordering::Equal {
-                        return if is_asc { cmp } else { cmp.reverse() };
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
+            entries.sort_by(|a, b| super::compare_sort_keys(&a.sort_keys, &b.sort_keys, keys));
 
             entries.iter().map(|e| &e.value).collect()
         } else if !self.values.is_empty() {
@@ -184,32 +175,11 @@ impl AggregateFunction for ArrayAggFunction {
         self.values.clear();
         self.ordered_entries.clear();
         self.distinct_tracker = None;
-        // Note: order_directions and has_order_by are kept as they're configuration
+        // Note: order_keys and has_order_by are kept as they're configuration
     }
 
     fn clone_box(&self) -> Box<dyn AggregateFunction> {
         Box::new(ArrayAggFunction::default())
-    }
-}
-
-/// Compare two Values for sorting
-fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
-    match (a, b) {
-        (Value::Null(_), Value::Null(_)) => std::cmp::Ordering::Equal,
-        (Value::Null(_), _) => std::cmp::Ordering::Greater, // NULLs last
-        (_, Value::Null(_)) => std::cmp::Ordering::Less,
-        (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
-        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Integer(a), Value::Float(b)) => (*a as f64)
-            .partial_cmp(b)
-            .unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Float(a), Value::Integer(b)) => a
-            .partial_cmp(&(*b as f64))
-            .unwrap_or(std::cmp::Ordering::Equal),
-        (Value::Text(a), Value::Text(b)) => a.cmp(b),
-        (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
-        (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
-        _ => std::cmp::Ordering::Equal, // Different types compare equal
     }
 }
 

@@ -1298,6 +1298,20 @@ impl Executor {
         None
     }
 
+    /// The ORDER BY of an aggregate that orders its own input, with the
+    /// NULLS placement the query asked for
+    pub(crate) fn aggregate_order_keys(
+        order_by: &[crate::parser::ast::OrderByExpression],
+    ) -> Vec<crate::functions::AggregateOrder> {
+        order_by
+            .iter()
+            .map(|order| crate::functions::AggregateOrder {
+                ascending: order.ascending,
+                nulls_first: order.nulls_first,
+            })
+            .collect()
+    }
+
     /// Aggregate, then run the window functions over the aggregate's output.
     /// A subquery inside an aggregate is resolved per input row first, and
     /// both stages read the same rewritten statement
@@ -2243,12 +2257,7 @@ impl Executor {
                 for (i, agg) in aggregations.iter().enumerate() {
                     if !agg.order_by.is_empty() {
                         if let Some(ref mut func) = agg_funcs[i] {
-                            let directions: Vec<bool> = agg
-                                .order_by
-                                .iter()
-                                .map(|o| o.ascending) // true = ASC, false = DESC
-                                .collect();
-                            func.set_order_by(directions);
+                            func.set_order_by(Self::aggregate_order_keys(&agg.order_by));
                         }
                     }
                 }
@@ -4192,12 +4201,7 @@ impl Executor {
             for (i, agg) in aggregations.iter().enumerate() {
                 if !agg.order_by.is_empty() {
                     if let Some(ref mut func) = agg_funcs[i] {
-                        let directions: Vec<bool> = agg
-                            .order_by
-                            .iter()
-                            .map(|o| o.ascending) // true = ASC, false = DESC
-                            .collect();
-                        func.set_order_by(directions);
+                        func.set_order_by(Self::aggregate_order_keys(&agg.order_by));
                     }
                 }
             }
