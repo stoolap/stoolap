@@ -488,6 +488,69 @@ impl QueryClassification {
                     has_all_any,
                 );
             }
+            Expression::Cast(cast) => {
+                Self::analyze_where_expr_recursive(
+                    &cast.expr,
+                    has_exists,
+                    has_in_subquery,
+                    has_scalar_subquery,
+                    has_all_any,
+                );
+            }
+            Expression::Like(like) => {
+                for part in [Some(&like.left), Some(&like.pattern), like.escape.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    Self::analyze_where_expr_recursive(
+                        part,
+                        has_exists,
+                        has_in_subquery,
+                        has_scalar_subquery,
+                        has_all_any,
+                    );
+                }
+            }
+            Expression::List(list) => {
+                for element in &list.elements {
+                    Self::analyze_where_expr_recursive(
+                        element,
+                        has_exists,
+                        has_in_subquery,
+                        has_scalar_subquery,
+                        has_all_any,
+                    );
+                }
+            }
+            Expression::ExpressionList(list) => {
+                for element in &list.expressions {
+                    Self::analyze_where_expr_recursive(
+                        element,
+                        has_exists,
+                        has_in_subquery,
+                        has_scalar_subquery,
+                        has_all_any,
+                    );
+                }
+            }
+            Expression::Distinct(distinct) => {
+                Self::analyze_where_expr_recursive(
+                    &distinct.expr,
+                    has_exists,
+                    has_in_subquery,
+                    has_scalar_subquery,
+                    has_all_any,
+                );
+            }
+            Expression::Aliased(aliased) => {
+                Self::analyze_where_expr_recursive(
+                    &aliased.expression,
+                    has_exists,
+                    has_in_subquery,
+                    has_scalar_subquery,
+                    has_all_any,
+                );
+            }
             _ => {}
         }
     }
@@ -809,6 +872,26 @@ impl QueryClassification {
                     .else_value
                     .as_ref()
                     .is_some_and(|e| Self::expression_has_correlated_subqueries(e))
+            }
+            Expression::Cast(cast) => Self::expression_has_correlated_subqueries(&cast.expr),
+            Expression::Like(like) => {
+                Self::expression_has_correlated_subqueries(&like.left)
+                    || Self::expression_has_correlated_subqueries(&like.pattern)
+                    || like
+                        .escape
+                        .as_deref()
+                        .is_some_and(Self::expression_has_correlated_subqueries)
+            }
+            Expression::List(list) => list
+                .elements
+                .iter()
+                .any(Self::expression_has_correlated_subqueries),
+            Expression::ExpressionList(list) => list
+                .expressions
+                .iter()
+                .any(Self::expression_has_correlated_subqueries),
+            Expression::Distinct(distinct) => {
+                Self::expression_has_correlated_subqueries(&distinct.expr)
             }
             _ => false,
         }

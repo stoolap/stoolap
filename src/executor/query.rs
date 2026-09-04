@@ -167,7 +167,9 @@ fn partition_where_for_join(
         let refs_left = qualifiers.contains(&left_alias_lower);
         let refs_right = qualifiers.contains(&right_alias_lower);
 
-        if refs_left && refs_right {
+        // The qualifiers inside a subquery are not collected, so a correlated
+        // one may read either side and is evaluated on the joined row
+        if (refs_left && refs_right) || Executor::has_correlated_subqueries(&pred) {
             // References both tables - must be applied post-join
             cross_preds.push(pred);
         } else if refs_left {
@@ -3861,8 +3863,13 @@ impl Executor {
         // classification is passed from caller to avoid redundant cache lookups
 
         // Short-circuit: if WHERE is constant-false (e.g., 1=0), skip all join
-        // materialization and return an empty result immediately.
-        if let Some(ref where_clause) = stmt.where_clause {
+        // materialization and return an empty result immediately. A subquery
+        // has no value in this evaluator, so a WHERE holding one is not judged
+        if let Some(where_clause) = stmt
+            .where_clause
+            .as_ref()
+            .filter(|_| !classification.where_has_subqueries)
+        {
             if let Ok(eval) = ExpressionEval::compile(where_clause, &[]) {
                 if let Ok(Value::Boolean(false)) = eval.with_context(ctx).eval_slice(&Row::new()) {
                     // Derive output column names from SELECT clause
@@ -3900,8 +3907,20 @@ impl Executor {
         // - LEFT JOIN: Can push filters to left (preserved), but NOT to right (may have NULLs)
         // - RIGHT JOIN: Can push filters to right (preserved), but NOT to left
         // - FULL OUTER JOIN: Cannot push filters to either side
+        // Uncorrelated subqueries in the WHERE fold to their values before
+        // the filters are split, so every join path sees a plain predicate. A
+        // correlated one pushed to one side is evaluated per row by that
+        // side's scan; one left after the join is evaluated per joined row
+        let correlated_where = classification.where_has_correlated_subqueries;
+        let where_for_join: Option<Expression> = match &stmt.where_clause {
+            Some(where_clause) if !correlated_where && classification.where_has_subqueries => {
+                Some(self.process_where_subqueries(where_clause, ctx)?)
+            }
+            Some(where_clause) => Some((**where_clause).clone()),
+            None => None,
+        };
         let (left_filter, right_filter, cross_filter) =
-            if let Some(ref where_clause) = stmt.where_clause {
+            if let Some(where_clause) = where_for_join.as_ref() {
                 if let (Some(left_a), Some(right_a)) = (&left_alias, &right_alias) {
                     let (l, r, c) = partition_where_for_join(where_clause, left_a, right_a);
 
@@ -3939,7 +3958,7 @@ impl Executor {
 
                     (safe_left, safe_right, remaining)
                 } else {
-                    (None, None, Some((**where_clause).clone()))
+                    (None, None, Some(where_clause.clone()))
                 }
             } else {
                 (None, None, None)
@@ -3953,14 +3972,18 @@ impl Executor {
             Expression::TableSource(ts) => Some(ts.name.value.as_str()),
             _ => None,
         };
-        let semijoin_limit = self.get_semijoin_reduction_limit(
-            &join_type,
-            stmt,
-            left_alias.as_deref(),
-            left_table,
-            &join_source.condition,
-            classification,
-        );
+        let semijoin_limit = if correlated_where {
+            None
+        } else {
+            self.get_semijoin_reduction_limit(
+                &join_type,
+                stmt,
+                left_alias.as_deref(),
+                left_table,
+                &join_source.condition,
+                classification,
+            )
+        };
 
         let (left_rows, left_columns, right_rows, right_columns) = if let Some(plan) =
             semijoin_limit
@@ -4048,7 +4071,7 @@ impl Executor {
             // This optimization avoids materializing the right side entirely
             // NOTE: Don't use Index NL for aggregation/window queries - they need full results
             // and the current implementation falls through to standard path, causing double execution
-            let index_nl_info = if has_agg || has_window {
+            let index_nl_info = if has_agg || has_window || correlated_where {
                 None
             } else {
                 self.check_index_nested_loop_opportunity(
@@ -4066,6 +4089,7 @@ impl Executor {
             let (index_nl_info, force_swap) = if index_nl_info.is_none()
                 && !has_agg
                 && !has_window
+                && !correlated_where
                 && (join_type == "INNER" || join_type == "LEFT")
                 && !matches!(join_source.right.as_ref(), Expression::TableSource(_))
                 && !matches!(
@@ -4103,6 +4127,7 @@ impl Executor {
                 )
             } else if !has_agg
                     && !has_window
+                    && !correlated_where
                     && join_type == "INNER"
                     && right_filter.is_some()  // Right side has a filter
                     && left_filter.is_none()
@@ -5125,7 +5150,7 @@ impl Executor {
             cross_filter.clone()
         } else {
             // No pushdown - apply full WHERE clause
-            stmt.where_clause.as_ref().map(|wc| (**wc).clone())
+            where_for_join.clone()
         };
 
         let resolved_where_clause = if !alias_map.is_empty() {
@@ -5138,24 +5163,44 @@ impl Executor {
 
         // Apply WHERE clause if present
         let filtered_rows = if let Some(ref where_clause) = resolved_where_clause {
-            // Process subqueries (EXISTS, scalar subqueries) before evaluation
-            // Use cached classification to avoid AST traversal
-            let processed_where = if classification.where_has_subqueries {
-                self.process_where_subqueries(where_clause, ctx)?
-            } else {
-                (**where_clause).clone()
-            };
-
-            // Create RowFilter once and reuse
-            let where_filter = RowFilter::new(&processed_where, &all_columns)?.with_context(ctx);
-
-            let mut filtered = RowVec::with_capacity(result_rows.len());
-            for (id, row) in result_rows {
-                if where_filter.matches_checked(&row)? {
-                    filtered.push((id, row));
+            if correlated_where {
+                // Each joined row is the outer row of the subqueries in the
+                // WHERE, so they are resolved and the predicate compiled per row
+                let keys = ColumnKeyMapping::build_mappings(&all_columns, None);
+                let outer_columns = CompactArc::new(all_columns.clone());
+                let mut filtered = RowVec::with_capacity(result_rows.len());
+                for (id, row) in result_rows {
+                    let mut outer: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
+                    for key in &keys {
+                        if let Some(value) = row.get(key.index) {
+                            if let Some(unqualified) = &key.unqualified_part {
+                                outer.insert(unqualified.clone(), value.clone());
+                            }
+                            outer.insert(key.col_lower.clone(), value.clone());
+                        }
+                    }
+                    let row_ctx = ctx.with_outer_row(outer, outer_columns.clone());
+                    let processed = self.process_correlated_where(where_clause, &row_ctx)?;
+                    ctx.check_cancelled()?;
+                    if RowFilter::new(&processed, &all_columns)?
+                        .with_context(&row_ctx)
+                        .matches_checked(&row)?
+                    {
+                        filtered.push((id, row));
+                    }
                 }
+                filtered
+            } else {
+                // Uncorrelated subqueries were folded before the filters were split
+                let where_filter = RowFilter::new(where_clause, &all_columns)?.with_context(ctx);
+                let mut filtered = RowVec::with_capacity(result_rows.len());
+                for (id, row) in result_rows {
+                    if where_filter.matches_checked(&row)? {
+                        filtered.push((id, row));
+                    }
+                }
+                filtered
             }
-            filtered
         } else {
             result_rows
         };

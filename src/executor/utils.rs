@@ -36,8 +36,9 @@ use crate::core::{DataType, Operator, Row, Schema, Value};
 use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
     BetweenExpression, BooleanLiteral, Expression, FloatLiteral, FunctionCall, Identifier,
-    InExpression, InfixExpression, InfixOperator, IntegerLiteral, LikeExpression, ListExpression,
-    NullLiteral, PrefixExpression, QualifiedIdentifier, StringLiteral, WindowFrameBound,
+    InExpression, InHashSetExpression, InfixExpression, InfixOperator, IntegerLiteral,
+    LikeExpression, ListExpression, NullLiteral, PrefixExpression, QualifiedIdentifier,
+    StringLiteral, WindowFrameBound,
 };
 use crate::parser::token::{Position, Token, TokenType};
 
@@ -990,6 +991,9 @@ fn collect_table_qualifiers_impl(expr: &Expression, qualifiers: &mut FxHashSet<S
                 }
             }
         }
+        Expression::InHashSet(in_set) => {
+            collect_table_qualifiers_impl(&in_set.column, qualifiers);
+        }
         Expression::Between(between) => {
             collect_table_qualifiers_impl(&between.expr, qualifiers);
             collect_table_qualifiers_impl(&between.lower, qualifiers);
@@ -1098,6 +1102,12 @@ pub fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression
                 not: in_expr.not,
             })
         }
+        Expression::InHashSet(in_set) => Expression::InHashSet(InHashSetExpression {
+            token: in_set.token.clone(),
+            column: Box::new(strip_table_qualifier(&in_set.column, table_alias)),
+            values: in_set.values.clone(),
+            not: in_set.not,
+        }),
         Expression::Between(between) => Expression::Between(BetweenExpression {
             token: between.token.clone(),
             expr: Box::new(strip_table_qualifier(&between.expr, table_alias)),
@@ -1182,6 +1192,12 @@ pub fn add_table_qualifier(expr: &Expression, table_alias: &str) -> Expression {
                 not: in_expr.not,
             })
         }
+        Expression::InHashSet(in_set) => Expression::InHashSet(InHashSetExpression {
+            token: in_set.token.clone(),
+            column: Box::new(add_table_qualifier(&in_set.column, table_alias)),
+            values: in_set.values.clone(),
+            not: in_set.not,
+        }),
         Expression::Between(between) => Expression::Between(BetweenExpression {
             token: between.token.clone(),
             expr: Box::new(add_table_qualifier(&between.expr, table_alias)),

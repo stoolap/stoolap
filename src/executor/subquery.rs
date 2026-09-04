@@ -1911,6 +1911,22 @@ impl Executor {
             }
             Expression::Aliased(aliased) => Self::has_subqueries(&aliased.expression),
             Expression::FunctionCall(func) => func.arguments.iter().any(Self::has_subqueries),
+            Expression::Case(case) => {
+                case.value.as_deref().is_some_and(Self::has_subqueries)
+                    || case.when_clauses.iter().any(|w| {
+                        Self::has_subqueries(&w.condition) || Self::has_subqueries(&w.then_result)
+                    })
+                    || case.else_value.as_deref().is_some_and(Self::has_subqueries)
+            }
+            Expression::Cast(cast) => Self::has_subqueries(&cast.expr),
+            Expression::Like(like) => {
+                Self::has_subqueries(&like.left)
+                    || Self::has_subqueries(&like.pattern)
+                    || like.escape.as_deref().is_some_and(Self::has_subqueries)
+            }
+            Expression::List(list) => list.elements.iter().any(Self::has_subqueries),
+            Expression::ExpressionList(list) => list.expressions.iter().any(Self::has_subqueries),
+            Expression::Distinct(distinct) => Self::has_subqueries(&distinct.expr),
             _ => false,
         }
     }
@@ -2181,6 +2197,33 @@ impl Executor {
             Expression::FunctionCall(func) => {
                 func.arguments.iter().any(Self::has_correlated_subqueries)
             }
+            Expression::Case(case) => {
+                case.value
+                    .as_deref()
+                    .is_some_and(Self::has_correlated_subqueries)
+                    || case.when_clauses.iter().any(|w| {
+                        Self::has_correlated_subqueries(&w.condition)
+                            || Self::has_correlated_subqueries(&w.then_result)
+                    })
+                    || case
+                        .else_value
+                        .as_deref()
+                        .is_some_and(Self::has_correlated_subqueries)
+            }
+            Expression::Cast(cast) => Self::has_correlated_subqueries(&cast.expr),
+            Expression::Like(like) => {
+                Self::has_correlated_subqueries(&like.left)
+                    || Self::has_correlated_subqueries(&like.pattern)
+                    || like
+                        .escape
+                        .as_deref()
+                        .is_some_and(Self::has_correlated_subqueries)
+            }
+            Expression::List(list) => list.elements.iter().any(Self::has_correlated_subqueries),
+            Expression::ExpressionList(list) => {
+                list.expressions.iter().any(Self::has_correlated_subqueries)
+            }
+            Expression::Distinct(distinct) => Self::has_correlated_subqueries(&distinct.expr),
             _ => false,
         }
     }
@@ -2594,6 +2637,77 @@ impl Executor {
                     upper: Box::new(processed_upper),
                 }))
             }
+
+            Expression::FunctionCall(func) => {
+                let arguments = func
+                    .arguments
+                    .iter()
+                    .map(|arg| self.process_correlated_where(arg, ctx))
+                    .collect::<Result<Vec<_>>>()?;
+                let filter = match &func.filter {
+                    Some(filter) => Some(Box::new(self.process_correlated_where(filter, ctx)?)),
+                    None => None,
+                };
+                Ok(Expression::FunctionCall(Box::new(FunctionCall {
+                    token: func.token.clone(),
+                    function: func.function.clone(),
+                    arguments,
+                    is_distinct: func.is_distinct,
+                    order_by: func.order_by.clone(),
+                    filter,
+                })))
+            }
+
+            Expression::Case(case) => {
+                let value = match &case.value {
+                    Some(value) => Some(Box::new(self.process_correlated_where(value, ctx)?)),
+                    None => None,
+                };
+                let mut when_clauses = Vec::with_capacity(case.when_clauses.len());
+                for when in &case.when_clauses {
+                    when_clauses.push(WhenClause {
+                        token: when.token.clone(),
+                        condition: self.process_correlated_where(&when.condition, ctx)?,
+                        then_result: self.process_correlated_where(&when.then_result, ctx)?,
+                    });
+                }
+                let else_value = match &case.else_value {
+                    Some(value) => Some(Box::new(self.process_correlated_where(value, ctx)?)),
+                    None => None,
+                };
+                Ok(Expression::Case(Box::new(CaseExpression {
+                    token: case.token.clone(),
+                    value,
+                    when_clauses,
+                    else_value,
+                })))
+            }
+
+            Expression::Cast(cast) => Ok(Expression::Cast(CastExpression {
+                token: cast.token.clone(),
+                expr: Box::new(self.process_correlated_where(&cast.expr, ctx)?),
+                type_name: cast.type_name.clone(),
+            })),
+
+            Expression::Like(like) => {
+                let escape = match &like.escape {
+                    Some(escape) => Some(Box::new(self.process_correlated_where(escape, ctx)?)),
+                    None => None,
+                };
+                Ok(Expression::Like(LikeExpression {
+                    token: like.token.clone(),
+                    left: Box::new(self.process_correlated_where(&like.left, ctx)?),
+                    pattern: Box::new(self.process_correlated_where(&like.pattern, ctx)?),
+                    operator: like.operator.clone(),
+                    escape,
+                }))
+            }
+
+            Expression::Aliased(aliased) => Ok(Expression::Aliased(AliasedExpression {
+                token: aliased.token.clone(),
+                expression: Box::new(self.process_correlated_where(&aliased.expression, ctx)?),
+                alias: aliased.alias.clone(),
+            })),
 
             // For all other expression types, return as-is
             _ => Ok(expr.clone()),
