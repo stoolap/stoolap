@@ -638,3 +638,89 @@ fn test_select_list_subquery_on_the_left_of_all() {
         "aggregate left of ALL"
     );
 }
+
+/// A subquery inside an aggregate's FILTER or argument is resolved before
+/// the aggregates are parsed
+#[test]
+fn test_subquery_inside_an_aggregate() {
+    let db = setup("select_subquery_in_aggregate");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FILTER (WHERE (SELECT 1) = 1) FROM users"
+        ),
+        30,
+        "constant subquery in FILTER"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FILTER (WHERE amount > (SELECT AVG(amount) FROM orders)) FROM orders"
+        ),
+        orders_above_average(),
+        "subquery in FILTER"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT SUM(CASE WHEN amount > (SELECT AVG(amount) FROM orders) THEN 1 ELSE 0 END) FROM orders"
+        ),
+        orders_above_average(),
+        "subquery in an argument"
+    );
+    let avg = average_amount();
+    let expected: Vec<Vec<String>> = (1..=30i64)
+        .map(|user| {
+            let n = (0..3i64).filter(|&k| amount(user, k) > avg).count();
+            vec![user.to_string(), n.to_string()]
+        })
+        .collect();
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT user_id, COUNT(*) FILTER (WHERE amount > (SELECT AVG(amount) FROM orders)) FROM orders GROUP BY user_id ORDER BY user_id"
+        ),
+        expected,
+        "subquery in FILTER, grouped"
+    );
+}
+
+/// ALL, BETWEEN, IN and LIKE in the SELECT list resolve the subqueries
+/// they hold, with and without an outer row
+#[test]
+fn test_select_list_containers_hold_subqueries() {
+    let db = setup("select_subquery_containers");
+    for (select, label) in [
+        (
+            "CASE WHEN (SELECT 1) BETWEEN 0 AND 2 THEN 1 ELSE 0 END",
+            "BETWEEN",
+        ),
+        (
+            "CASE WHEN (SELECT 1) IN (1, 2) THEN 1 ELSE 0 END",
+            "IN list",
+        ),
+        (
+            "CASE WHEN 1 IN ((SELECT 1), 2) THEN 1 ELSE 0 END",
+            "subquery in the IN list",
+        ),
+        (
+            "CASE WHEN (SELECT 'ab') LIKE 'a%' THEN 1 ELSE 0 END",
+            "LIKE",
+        ),
+    ] {
+        assert_eq!(count(&db, &format!("SELECT {select}")), 1, "{label}");
+    }
+    let expected: Vec<Vec<String>> = vec![
+        vec!["1".into(), "1".into(), "1".into()],
+        vec!["2".into(), "1".into(), "1".into()],
+        vec!["3".into(), "1".into(), "0".into()],
+    ];
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT u.id, CASE WHEN (SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id) > ALL (SELECT 0) THEN 1 ELSE 0 END, CASE WHEN (SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id) BETWEEN 10 AND 22 THEN 1 ELSE 0 END FROM users u WHERE u.id <= 3 ORDER BY u.id"
+        ),
+        expected,
+        "correlated ALL and BETWEEN"
+    );
+}

@@ -2244,9 +2244,117 @@ impl Executor {
                 Ok(Some(self.convert_all_any_to_expression(&bound, values)?))
             }
 
+            Expression::In(in_expr) => {
+                // A subquery on the right folds to its values as in a WHERE
+                if matches!(in_expr.right.as_ref(), Expression::ScalarSubquery(_)) {
+                    return Ok(Some(self.process_where_subqueries(expr, ctx)?));
+                }
+                let left = self.try_process_expression_subqueries(&in_expr.left, ctx)?;
+                let right = self.try_process_expression_subqueries(&in_expr.right, ctx)?;
+                if left.is_none() && right.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(Expression::In(InExpression {
+                    token: in_expr.token.clone(),
+                    left: Box::new(left.unwrap_or_else(|| (*in_expr.left).clone())),
+                    right: Box::new(right.unwrap_or_else(|| (*in_expr.right).clone())),
+                    not: in_expr.not,
+                })))
+            }
+
+            Expression::Between(between) => {
+                let expr_p = self.try_process_expression_subqueries(&between.expr, ctx)?;
+                let lower = self.try_process_expression_subqueries(&between.lower, ctx)?;
+                let upper = self.try_process_expression_subqueries(&between.upper, ctx)?;
+                if expr_p.is_none() && lower.is_none() && upper.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(Expression::Between(BetweenExpression {
+                    token: between.token.clone(),
+                    expr: Box::new(expr_p.unwrap_or_else(|| (*between.expr).clone())),
+                    lower: Box::new(lower.unwrap_or_else(|| (*between.lower).clone())),
+                    upper: Box::new(upper.unwrap_or_else(|| (*between.upper).clone())),
+                    not: between.not,
+                })))
+            }
+
+            Expression::Like(like) => {
+                let left = self.try_process_expression_subqueries(&like.left, ctx)?;
+                let pattern = self.try_process_expression_subqueries(&like.pattern, ctx)?;
+                let escape = match &like.escape {
+                    Some(escape) => self.try_process_expression_subqueries(escape, ctx)?,
+                    None => None,
+                };
+                if left.is_none() && pattern.is_none() && escape.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(Expression::Like(LikeExpression {
+                    token: like.token.clone(),
+                    left: Box::new(left.unwrap_or_else(|| (*like.left).clone())),
+                    pattern: Box::new(pattern.unwrap_or_else(|| (*like.pattern).clone())),
+                    operator: like.operator.clone(),
+                    escape: match escape {
+                        Some(escape) => Some(Box::new(escape)),
+                        None => like.escape.clone(),
+                    },
+                })))
+            }
+
+            Expression::List(list) => {
+                let processed = self.try_process_expression_list(&list.elements, ctx)?;
+                Ok(processed.map(|elements| {
+                    Expression::List(Box::new(ListExpression {
+                        token: list.token.clone(),
+                        elements,
+                    }))
+                }))
+            }
+
+            Expression::ExpressionList(list) => {
+                let processed = self.try_process_expression_list(&list.expressions, ctx)?;
+                Ok(processed.map(|expressions| {
+                    Expression::ExpressionList(Box::new(ExpressionList {
+                        token: list.token.clone(),
+                        expressions,
+                    }))
+                }))
+            }
+
+            Expression::Distinct(distinct) => Ok(self
+                .try_process_expression_subqueries(&distinct.expr, ctx)?
+                .map(|inner| {
+                    Expression::Distinct(DistinctExpression {
+                        token: distinct.token.clone(),
+                        expr: Box::new(inner),
+                    })
+                })),
+
             // No subqueries possible in other expression types
             _ => Ok(None),
         }
+    }
+
+    /// The elements of a list with their subqueries resolved, or None when
+    /// none held one
+    fn try_process_expression_list(
+        &self,
+        elements: &[Expression],
+        ctx: &ExecutionContext,
+    ) -> Result<Option<Vec<Expression>>> {
+        let mut processed: Vec<Option<Expression>> = Vec::with_capacity(elements.len());
+        for element in elements {
+            processed.push(self.try_process_expression_subqueries(element, ctx)?);
+        }
+        if processed.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        Ok(Some(
+            processed
+                .into_iter()
+                .zip(elements.iter())
+                .map(|(new, old)| new.unwrap_or_else(|| old.clone()))
+                .collect(),
+        ))
     }
 
     // ============================================================================
@@ -2488,6 +2596,61 @@ impl Executor {
                     type_name: cast.type_name.clone(),
                 }))
             }
+
+            // ALL and ANY run their subquery under this row's context; the
+            // left operand is resolved first
+            Expression::AllAny(all_any) => {
+                let bound = AllAnyExpression {
+                    token: all_any.token.clone(),
+                    left: Box::new(self.process_correlated_expression(&all_any.left, ctx)?),
+                    operator: all_any.operator.clone(),
+                    all_any_type: all_any.all_any_type,
+                    subquery: all_any.subquery.clone(),
+                };
+                let values = self.execute_in_subquery(&bound.subquery, ctx)?;
+                self.convert_all_any_to_expression(&bound, values)
+            }
+
+            Expression::Like(like) => {
+                let escape = match &like.escape {
+                    Some(escape) => {
+                        Some(Box::new(self.process_correlated_expression(escape, ctx)?))
+                    }
+                    None => None,
+                };
+                Ok(Expression::Like(LikeExpression {
+                    token: like.token.clone(),
+                    left: Box::new(self.process_correlated_expression(&like.left, ctx)?),
+                    pattern: Box::new(self.process_correlated_expression(&like.pattern, ctx)?),
+                    operator: like.operator.clone(),
+                    escape,
+                }))
+            }
+
+            Expression::List(list) => Ok(Expression::List(Box::new(ListExpression {
+                token: list.token.clone(),
+                elements: list
+                    .elements
+                    .iter()
+                    .map(|element| self.process_correlated_expression(element, ctx))
+                    .collect::<Result<Vec<_>>>()?,
+            }))),
+
+            Expression::ExpressionList(list) => {
+                Ok(Expression::ExpressionList(Box::new(ExpressionList {
+                    token: list.token.clone(),
+                    expressions: list
+                        .expressions
+                        .iter()
+                        .map(|element| self.process_correlated_expression(element, ctx))
+                        .collect::<Result<Vec<_>>>()?,
+                })))
+            }
+
+            Expression::Distinct(distinct) => Ok(Expression::Distinct(DistinctExpression {
+                token: distinct.token.clone(),
+                expr: Box::new(self.process_correlated_expression(&distinct.expr, ctx)?),
+            })),
 
             // For all other expression types, return as-is
             _ => Ok(expr.clone()),

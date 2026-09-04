@@ -324,6 +324,28 @@ impl Executor {
             None => get_classification(stmt),
         };
 
+        // A subquery inside an aggregate's FILTER or argument is resolved
+        // before the aggregates are parsed, since every aggregation path
+        // reads the statement's own columns
+        let bound_stmt;
+        let stmt = if classification.has_aggregation
+            && classification.select_has_scalar_subqueries
+            && !Self::has_correlated_select_subqueries(&stmt.columns)
+        {
+            match self.try_process_select_subqueries(&stmt.columns, ctx)? {
+                Some(columns) => {
+                    bound_stmt = SelectStatement {
+                        columns,
+                        ..stmt.clone()
+                    };
+                    &bound_stmt
+                }
+                None => stmt,
+            }
+        } else {
+            stmt
+        };
+
         // Evaluate LIMIT/OFFSET early (needed for set operations optimization)
         // Literal fast path: `LIMIT 10` needs no compile/cache/VM round trip
         let limit = if let Some(Expression::IntegerLiteral(lit)) = stmt.limit.as_deref() {
