@@ -2769,33 +2769,65 @@ impl Executor {
                 .any(|order| Self::has_subqueries(&order.expression))
     }
 
+    /// Whether a window function, its OVER clause or a named window holds a subquery
+    pub(crate) fn windows_hold_subquery(stmt: &SelectStatement) -> bool {
+        stmt.columns.iter().any(Self::has_subqueries)
+            || stmt.window_defs.iter().any(|window| {
+                window.partition_by.iter().any(Self::has_subqueries)
+                    || window
+                        .order_by
+                        .iter()
+                        .any(|order| Self::has_subqueries(&order.expression))
+            })
+    }
+
+    /// The column a lifted subquery lands in: its own text, so the result
+    /// column keeps its name, shared by an identical subquery, and never an
+    /// input column's name, qualified or not
+    fn lifted_column_name(
+        expr: &Expression,
+        lifted: &mut Vec<(Expression, String)>,
+        base_columns: &[String],
+    ) -> String {
+        let text = expr.to_string();
+        if let Some((_, name)) = lifted.iter().find(|(e, _)| e.to_string() == text) {
+            return name.clone();
+        }
+        let mut name = text;
+        // A qualifier holds no dot, the name after it may
+        while base_columns.iter().any(|column| {
+            column.eq_ignore_ascii_case(&name)
+                || column
+                    .split_once('.')
+                    .is_some_and(|(_, bare)| bare.eq_ignore_ascii_case(&name))
+        }) {
+            name.push('_');
+        }
+        lifted.push((expr.clone(), name.clone()));
+        name
+    }
+
     /// The statement with every subquery inside an aggregate call, in the
     /// SELECT list, HAVING or ORDER BY, replaced by a column, and the
     /// subqueries taken out in that order. None when no aggregate holds one.
+    /// Window functions are left alone: they run over the aggregate's output
     pub(crate) fn lift_subqueries_in_aggregates(
         stmt: &SelectStatement,
         base_columns: &[String],
     ) -> Option<(SelectStatement, Vec<Expression>, Vec<String>)> {
-        // The lifted columns take a name no input column starts with
-        let mut prefix = String::from("__agg_subquery");
-        while base_columns
-            .iter()
-            .any(|column| column.to_lowercase().starts_with(&prefix))
-        {
-            prefix.push('_');
-        }
         let mut lifted = Vec::new();
         let columns: Vec<Expression> = stmt
             .columns
             .iter()
-            .map(|column| Self::lift_subqueries_in(column, false, &mut lifted, &prefix))
+            .map(|column| Self::lift_subqueries_in(column, false, false, &mut lifted, base_columns))
             .collect();
         let having = stmt.having.as_ref().map(|having| {
             Box::new(Self::lift_subqueries_in(
                 having,
                 false,
+                false,
                 &mut lifted,
-                &prefix,
+                base_columns,
             ))
         });
         let order_by: Vec<OrderByExpression> = stmt
@@ -2805,8 +2837,9 @@ impl Executor {
                 expression: Self::lift_subqueries_in(
                     &order.expression,
                     false,
+                    false,
                     &mut lifted,
-                    &prefix,
+                    base_columns,
                 ),
                 ..order.clone()
             })
@@ -2814,7 +2847,7 @@ impl Executor {
         if lifted.is_empty() {
             return None;
         }
-        let names = (0..lifted.len()).map(|i| format!("{prefix}_{i}")).collect();
+        let (lifted, names) = lifted.into_iter().unzip();
         Some((
             SelectStatement {
                 columns,
@@ -2827,42 +2860,114 @@ impl Executor {
         ))
     }
 
+    /// The statement with every subquery in the SELECT list, the OVER clauses
+    /// and the named windows replaced by a column, and the subqueries taken
+    /// out in that order. None when there is none
+    pub(crate) fn lift_subqueries_in_windows(
+        stmt: &SelectStatement,
+        base_columns: &[String],
+    ) -> Option<(SelectStatement, Vec<Expression>, Vec<String>)> {
+        let mut lifted = Vec::new();
+        // Every SELECT expression beside a window function is read per row
+        let columns: Vec<Expression> = stmt
+            .columns
+            .iter()
+            .map(|column| Self::lift_subqueries_in(column, true, true, &mut lifted, base_columns))
+            .collect();
+        let window_defs: Vec<crate::parser::ast::WindowDefinition> = stmt
+            .window_defs
+            .iter()
+            .map(|window| crate::parser::ast::WindowDefinition {
+                name: window.name.clone(),
+                partition_by: window
+                    .partition_by
+                    .iter()
+                    .map(|e| Self::lift_subqueries_in(e, true, true, &mut lifted, base_columns))
+                    .collect(),
+                order_by: window
+                    .order_by
+                    .iter()
+                    .map(|order| OrderByExpression {
+                        expression: Self::lift_subqueries_in(
+                            &order.expression,
+                            true,
+                            true,
+                            &mut lifted,
+                            base_columns,
+                        ),
+                        ..order.clone()
+                    })
+                    .collect(),
+                frame: window.frame.clone(),
+            })
+            .collect();
+        if lifted.is_empty() {
+            return None;
+        }
+        let (lifted, names) = lifted.into_iter().unzip();
+        Some((
+            SelectStatement {
+                columns,
+                window_defs,
+                ..stmt.clone()
+            },
+            lifted,
+            names,
+        ))
+    }
+
     fn lift_subqueries_in_call(
         func: &FunctionCall,
         inside_aggregate: bool,
-        lifted: &mut Vec<Expression>,
-        prefix: &str,
+        windows: bool,
+        lifted: &mut Vec<(Expression, String)>,
+        base_columns: &[String],
     ) -> FunctionCall {
-        let inside = inside_aggregate || super::utils::is_aggregate_function(&func.function);
+        let inside =
+            inside_aggregate || (!windows && super::utils::is_aggregate_function(&func.function));
         FunctionCall {
             token: func.token.clone(),
             function: func.function.clone(),
             arguments: func
                 .arguments
                 .iter()
-                .map(|a| Self::lift_subqueries_in(a, inside, lifted, prefix))
+                .map(|a| Self::lift_subqueries_in(a, inside, windows, lifted, base_columns))
                 .collect(),
             is_distinct: func.is_distinct,
             order_by: func
                 .order_by
                 .iter()
                 .map(|order| OrderByExpression {
-                    expression: Self::lift_subqueries_in(&order.expression, inside, lifted, prefix),
+                    expression: Self::lift_subqueries_in(
+                        &order.expression,
+                        inside,
+                        windows,
+                        lifted,
+                        base_columns,
+                    ),
                     ..order.clone()
                 })
                 .collect(),
-            filter: func
-                .filter
-                .as_ref()
-                .map(|f| Box::new(Self::lift_subqueries_in(f, inside, lifted, prefix))),
+            filter: func.filter.as_ref().map(|f| {
+                Box::new(Self::lift_subqueries_in(
+                    f,
+                    inside,
+                    windows,
+                    lifted,
+                    base_columns,
+                ))
+            }),
         }
     }
 
+    /// `windows` selects the scope: aggregate calls, or window functions
+    /// with their OVER clauses
     fn lift_subqueries_in(
         expr: &Expression,
         inside_aggregate: bool,
-        lifted: &mut Vec<Expression>,
-        prefix: &str,
+        windows: bool,
+        lifted: &mut Vec<(Expression, String)>,
+        base_columns: &[String],
     ) -> Expression {
         let is_subquery = matches!(
             expr,
@@ -2870,41 +2975,51 @@ impl Executor {
         ) || matches!(expr, Expression::In(in_expr)
             if matches!(in_expr.right.as_ref(), Expression::ScalarSubquery(_)));
         if inside_aggregate && is_subquery {
-            lifted.push(expr.clone());
-            let name = format!("{prefix}_{}", lifted.len() - 1);
+            let name = Self::lifted_column_name(expr, lifted, base_columns);
             return Expression::Identifier(crate::parser::ast::Identifier::new(
                 dummy_token(&name, TokenType::Identifier),
                 name.as_str(),
             ));
         }
-        let lift = |e: &Expression, lifted: &mut Vec<Expression>| {
-            Self::lift_subqueries_in(e, inside_aggregate, lifted, prefix)
+        let lift = |e: &Expression, lifted: &mut Vec<(Expression, String)>| {
+            Self::lift_subqueries_in(e, inside_aggregate, windows, lifted, base_columns)
         };
         match expr {
-            Expression::FunctionCall(func) => Expression::FunctionCall(Box::new(
-                Self::lift_subqueries_in_call(func, inside_aggregate, lifted, prefix),
-            )),
-            // A window aggregate reads its argument per row like any other
+            Expression::FunctionCall(func) => {
+                Expression::FunctionCall(Box::new(Self::lift_subqueries_in_call(
+                    func,
+                    inside_aggregate,
+                    windows,
+                    lifted,
+                    base_columns,
+                )))
+            }
+            Expression::Window(_) if !windows => expr.clone(),
+            // A window function and its OVER clause read every input row
             Expression::Window(window) => {
+                let per_row = |e: &Expression, lifted: &mut Vec<(Expression, String)>| {
+                    Self::lift_subqueries_in(e, true, windows, lifted, base_columns)
+                };
                 Expression::Window(Box::new(crate::parser::ast::WindowExpression {
                     token: window.token.clone(),
                     function: Box::new(Self::lift_subqueries_in_call(
                         &window.function,
                         true,
+                        windows,
                         lifted,
-                        prefix,
+                        base_columns,
                     )),
                     window_ref: window.window_ref.clone(),
                     partition_by: window
                         .partition_by
                         .iter()
-                        .map(|e| lift(e, lifted))
+                        .map(|e| per_row(e, lifted))
                         .collect(),
                     order_by: window
                         .order_by
                         .iter()
                         .map(|order| OrderByExpression {
-                            expression: lift(&order.expression, lifted),
+                            expression: per_row(&order.expression, lifted),
                             ..order.clone()
                         })
                         .collect(),

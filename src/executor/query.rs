@@ -1607,6 +1607,11 @@ impl Executor {
         if let Some(where_clause) = &stmt.where_clause {
             // Pre-process subqueries in WHERE clause (EXISTS, IN, ALL/ANY, scalar subqueries)
             let processed_where = self.process_where_subqueries(where_clause, ctx)?;
+            // A parent row binds the outer references of a FROM-less subquery
+            let processed_where = match ctx.outer_row() {
+                Some(outer) => super::utils::substitute_outer_references(&processed_where, outer),
+                None => processed_where,
+            };
             let where_result = ExpressionEval::compile(&processed_where, &[])?
                 .with_context(ctx)
                 .eval_slice(&Row::new())?;
@@ -1663,8 +1668,11 @@ impl Executor {
             };
             columns.push(col_name);
 
-            // Evaluate expression
-            let value = ExpressionEval::compile(col_expr, &[])?
+            // Evaluate expression, with the parent row binding outer references
+            let bound = ctx
+                .outer_row()
+                .map(|outer| super::utils::substitute_outer_references(col_expr, outer));
+            let value = ExpressionEval::compile(bound.as_ref().unwrap_or(col_expr), &[])?
                 .with_context(ctx)
                 .eval_slice(&Row::new())?;
             values.push(value);
@@ -3501,7 +3509,7 @@ impl Executor {
                         // NOTE: Cannot use this optimization if there's a top-level ORDER BY
                         // because we need all rows to sort before applying LIMIT
                         let has_order_by = !stmt.order_by.is_empty();
-                        if !has_order_by {
+                        if !has_order_by && !Self::windows_hold_subquery(stmt) {
                             if let Some(limit_val) = Self::literal_fetch_limit(stmt) {
                                 // Use lazy partition fetching - returns early!
                                 let result = self
@@ -3661,13 +3669,7 @@ impl Executor {
             // Both aggregation and window functions:
             // 1. First apply GROUP BY aggregation
             // 2. Then apply window functions on the aggregated result
-            let agg_result = self.execute_aggregation_for_window(stmt, ctx, &rows, &all_columns)?;
-            let agg_columns = agg_result.0.clone();
-            let agg_rows = agg_result.1;
-
-            // Apply window functions on aggregated rows
-            let result =
-                self.execute_select_with_window_functions(stmt, ctx, &agg_rows, &agg_columns)?;
+            let result = self.execute_aggregation_then_windows(stmt, ctx, &rows, &all_columns)?;
             let columns = CompactArc::new(result.columns().to_vec());
             return Ok((result, columns, false, None));
         }
@@ -5306,14 +5308,8 @@ impl Executor {
         if has_agg && has_window {
             // 1. First apply GROUP BY aggregation
             // 2. Then apply window functions on the aggregated result
-            let agg_result =
-                self.execute_aggregation_for_window(stmt, ctx, &final_rows, &final_columns)?;
-            let agg_columns = agg_result.0.clone();
-            let agg_rows = agg_result.1;
-
-            // Apply window functions on aggregated rows (agg_rows is already RowVec with IDs)
             let result =
-                self.execute_select_with_window_functions(stmt, ctx, &agg_rows, &agg_columns)?;
+                self.execute_aggregation_then_windows(stmt, ctx, &final_rows, &final_columns)?;
             let columns = CompactArc::new(result.columns().to_vec());
             return Ok((result, columns, false, None));
         }
@@ -5678,12 +5674,8 @@ impl Executor {
 
             if classification.has_aggregation {
                 // Aggregation + window functions: aggregate first, then apply window functions
-                let agg_result =
-                    self.execute_aggregation_for_window(stmt, ctx, &rows, &view_columns)?;
-                let agg_columns = agg_result.0.clone();
-                let agg_rows = agg_result.1;
                 let result =
-                    self.execute_select_with_window_functions(stmt, ctx, &agg_rows, &agg_columns)?;
+                    self.execute_aggregation_then_windows(stmt, ctx, &rows, &view_columns)?;
                 let columns = CompactArc::new(result.columns().to_vec());
                 return Ok((result, columns, false, None));
             }

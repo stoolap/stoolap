@@ -897,26 +897,237 @@ fn test_subquery_inside_an_aggregate_with_a_window() {
     );
 }
 
-/// The column a lifted subquery lands in never takes a user column's name
+/// A lifted subquery keeps its text as the result column's name, an identical
+/// subquery shares its column, and a user column with that very name, bare
+/// or qualified through a join, is never shadowed
 #[test]
-fn test_lifted_column_name_avoids_user_columns() {
-    let db = Database::open("memory://lifted_column_name").unwrap();
+fn test_lifted_column_keeps_the_subquery_text() {
+    let db = setup("lifted_column_name");
+    let result = db
+        .query(
+            "SELECT SUM((SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id)), COUNT((SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id)) FROM users u",
+            (),
+        )
+        .unwrap();
+    let columns: Vec<String> = result.columns().iter().map(|c| c.to_string()).collect();
+    assert_eq!(
+        columns,
+        [
+            "SUM((SELECT MAX(x.amount) FROM orders AS x WHERE (x.user_id = u.id)))",
+            "COUNT((SELECT MAX(x.amount) FROM orders AS x WHERE (x.user_id = u.id)))",
+        ]
+    );
+    let values: Vec<Vec<String>> = result
+        .map(|row| {
+            let row = row.unwrap();
+            (0..row.len())
+                .map(|i| row.get::<String>(i).unwrap())
+                .collect()
+        })
+        .collect();
+    assert_eq!(values, vec![vec!["4710".to_string(), "30".to_string()]]);
+
+    let text = "(SELECT MAX(id) FROM c AS e WHERE (e.id = c.id))";
     db.execute(
-        "CREATE TABLE c (id INTEGER PRIMARY KEY, __agg_subquery_0 INTEGER)",
+        &format!("CREATE TABLE c (id INTEGER PRIMARY KEY, \"{text}\" INTEGER)"),
         (),
     )
     .unwrap();
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
     db.execute("INSERT INTO c VALUES (1, 100), (2, 200)", ())
         .unwrap();
+    db.execute("INSERT INTO d VALUES (1), (2)", ()).unwrap();
     assert_eq!(
-        count(&db, "SELECT SUM((SELECT 1)) + SUM(__agg_subquery_0) FROM c"),
-        302
+        count(
+            &db,
+            &format!(
+                "SELECT SUM((SELECT MAX(id) FROM c e WHERE e.id = c.id)) + SUM(\"{text}\") FROM c"
+            )
+        ),
+        303
     );
     assert_eq!(
         count(
             &db,
-            "SELECT SUM((SELECT MAX(id) FROM c d WHERE d.id = c.id)) + SUM(__agg_subquery_0) FROM c"
+            &format!("SELECT SUM((SELECT MAX(id) FROM c e WHERE e.id = c.id)) + SUM(\"{text}\") FROM c JOIN d ON d.id = c.id")
         ),
         303
+    );
+}
+
+/// A subquery inside an aggregate next to a window function is resolved on
+/// the input rows once, and the window stage reads the rewritten statement
+#[test]
+fn test_aggregate_with_window_lifts_once() {
+    let db = setup("aggregate_window_once");
+    // MAX amount per user is user * 10 + 2: even users 2430, odd users 2280
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT u.id % 2, SUM((SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id)), ROW_NUMBER() OVER (ORDER BY u.id % 2) FROM users u GROUP BY u.id % 2 ORDER BY 1"
+        ),
+        vec![
+            vec!["0".to_string(), "2430".to_string(), "1".to_string()],
+            vec!["1".to_string(), "2280".to_string(), "2".to_string()],
+        ],
+        "grouped aggregate beside a window function"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT SUM((SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id AND u.name <> '')), ROW_NUMBER() OVER () FROM users u"
+        ),
+        vec![vec!["4710".to_string(), "1".to_string()]],
+        "a parent column the aggregate rows do not carry"
+    );
+}
+
+/// A window aggregate honours its FILTER and its own ORDER BY
+#[test]
+fn test_window_aggregate_filter_and_order_by() {
+    let db = setup("window_aggregate_filter");
+    let none = rows(
+        &db,
+        "SELECT COUNT(*) FILTER (WHERE (SELECT 0) = 1) OVER () FROM users",
+    );
+    assert_eq!(none.len(), 30);
+    assert!(none.iter().all(|row| row[0] == "0"), "{none:?}");
+    let sums = rows(
+        &db,
+        "SELECT SUM(id) FILTER (WHERE id > 27) OVER () FROM users",
+    );
+    assert!(sums.iter().all(|row| row[0] == "87"), "{sums:?}");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT COUNT(*) FILTER (WHERE id % 2 = 0) OVER (ORDER BY id) FROM users WHERE id <= 6 ORDER BY id"
+        ),
+        ["0", "1", "1", "2", "2", "3"]
+            .iter()
+            .map(|v| vec![v.to_string()])
+            .collect::<Vec<_>>(),
+        "running filtered count"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT id, COUNT(*) FILTER (WHERE id > 3) OVER (PARTITION BY id % 2) FROM users WHERE id <= 6 ORDER BY id"
+        ),
+        [("1", "1"), ("2", "2"), ("3", "1"), ("4", "2"), ("5", "1"), ("6", "2")]
+            .iter()
+            .map(|(id, n)| vec![id.to_string(), n.to_string()])
+            .collect::<Vec<_>>(),
+        "filtered count per partition"
+    );
+    // Even users 2, 4 and 6 have MAX amounts 22, 42 and 62
+    let correlated = rows(
+        &db,
+        "SELECT SUM((SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id)) FILTER (WHERE u.id % 2 = 0) OVER () FROM users u WHERE u.id <= 6"
+    );
+    assert_eq!(correlated.len(), 6);
+    assert!(
+        correlated.iter().all(|row| row[0] == "126"),
+        "filtered correlated window aggregate: {correlated:?}"
+    );
+    let ordered = rows(
+        &db,
+        "SELECT GROUP_CONCAT(name ORDER BY id DESC) OVER () FROM users WHERE id <= 3",
+    );
+    assert_eq!(ordered.len(), 3);
+    assert!(
+        ordered.iter().all(|row| row[0] == "user3,user2,user1"),
+        "ordered window aggregate: {ordered:?}"
+    );
+}
+
+/// A subquery in an OVER clause or a named window orders and partitions the
+/// rows, and the column it lands in stays out of SELECT *
+#[test]
+fn test_subquery_in_over_clause() {
+    let db = setup("subquery_in_over");
+    let reversed: Vec<Vec<String>> = (1..=6)
+        .map(|id| vec![id.to_string(), (7 - id).to_string()])
+        .collect();
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY (SELECT -u.id)) FROM users u WHERE u.id <= 6 ORDER BY id"
+        ),
+        reversed,
+        "FROM-less subquery in ORDER BY"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY (SELECT -MAX(x.id) FROM users x WHERE x.id = u.id)) FROM users u WHERE u.id <= 6 ORDER BY id"
+        ),
+        reversed,
+        "subquery with a FROM in ORDER BY"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT id, ROW_NUMBER() OVER w FROM users u WHERE u.id <= 6 WINDOW w AS (ORDER BY (SELECT -u.id)) ORDER BY id"
+        ),
+        reversed,
+        "named window"
+    );
+    let counts = rows(
+        &db,
+        "SELECT id, COUNT(*) OVER (PARTITION BY (SELECT u.id % 2)) FROM users u WHERE u.id <= 6 ORDER BY id"
+    );
+    assert_eq!(counts.len(), 6);
+    assert!(
+        counts.iter().all(|row| row[1] == "3"),
+        "subquery in PARTITION BY: {counts:?}"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT *, ROW_NUMBER() OVER (ORDER BY (SELECT -u.id)) FROM users u WHERE u.id <= 2 ORDER BY id"
+        ),
+        vec![
+            vec!["1".to_string(), "user1".to_string(), "2".to_string()],
+            vec!["2".to_string(), "user2".to_string(), "1".to_string()],
+        ],
+        "SELECT * beside a lifted OVER clause"
+    );
+}
+
+/// A correlated subquery beside a window function is read per input row,
+/// also on the indexed partition fetch that LIMIT would take
+#[test]
+fn test_correlated_subquery_beside_a_window_function() {
+    let db = setup("subquery_beside_window");
+    let limited = rows(
+        &db,
+        "SELECT id, COUNT(*) OVER (PARTITION BY id) + (SELECT u.id * 0) FROM users u LIMIT 2",
+    );
+    assert_eq!(limited.len(), 2);
+    assert!(
+        limited.iter().all(|row| row[1] == "1"),
+        "beside a partitioned count with LIMIT: {limited:?}"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT id, SUM((SELECT u.id)) OVER (PARTITION BY id % 2) FROM users u WHERE u.id <= 6 ORDER BY id"
+        ),
+        [("1", "9"), ("2", "12"), ("3", "9"), ("4", "12"), ("5", "9"), ("6", "12")]
+            .iter()
+            .map(|(id, sum)| vec![id.to_string(), sum.to_string()])
+            .collect::<Vec<_>>(),
+        "window aggregate over a FROM-less subquery"
+    );
+}
+
+/// A FROM-less subquery in a WHERE reads the parent row
+#[test]
+fn test_fromless_correlated_subquery_in_where() {
+    let db = setup("fromless_where");
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) FROM users u WHERE (SELECT u.id) > 27"),
+        3
     );
 }

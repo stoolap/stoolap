@@ -1298,17 +1298,16 @@ impl Executor {
         None
     }
 
-    /// Execute GROUP BY aggregation and return raw columns/rows for window function processing
-    /// This is used when both GROUP BY and window functions are present in the query.
-    /// Window functions operate on the aggregated result.
-    pub(crate) fn execute_aggregation_for_window(
+    /// Aggregate, then run the window functions over the aggregate's output.
+    /// A subquery inside an aggregate is resolved per input row first, and
+    /// both stages read the same rewritten statement
+    pub(crate) fn execute_aggregation_then_windows(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
-    ) -> Result<(Vec<String>, RowVec)> {
-        // A subquery inside an aggregate is resolved per input row first
+    ) -> Result<Box<dyn QueryResult>> {
         let lifted_stmt;
         let lifted_rows;
         let lifted_columns;
@@ -1340,7 +1339,21 @@ impl Executor {
             }
             None => (stmt, base_rows, base_columns),
         };
+        let (agg_columns, agg_rows) =
+            self.execute_aggregation_for_window(stmt, ctx, base_rows, base_columns)?;
+        self.execute_select_with_window_functions(stmt, ctx, &agg_rows, &agg_columns)
+    }
 
+    /// Execute GROUP BY aggregation and return raw columns/rows for window function processing
+    /// This is used when both GROUP BY and window functions are present in the query.
+    /// Window functions operate on the aggregated result.
+    fn execute_aggregation_for_window(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        base_rows: &[(i64, Row)],
+        base_columns: &[String],
+    ) -> Result<(Vec<String>, RowVec)> {
         // Parse aggregations and group by columns
         let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt)?;
         let group_by_columns = self.parse_group_by(stmt, base_columns)?;
