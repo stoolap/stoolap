@@ -6794,17 +6794,16 @@ impl Executor {
             None => None,
         };
         // A right-side filter the storage layer takes whole runs inside the
-        // inner fetch; a partial or refused one stays a residual on the joined row
-        let build_inner_filter = |table: &dyn crate::storage::traits::Table| {
-            right_filter.and_then(|rf| {
-                let rf = crate::executor::utils::strip_table_qualifier(rf, inner_alias);
-                match pushdown::try_pushdown(&rf, table.schema(), Some(ctx)) {
-                    (Some(expr), false) => Some(expr),
-                    _ => None,
-                }
-            })
-        };
-        let pushed_inner = build_inner_filter(inner_table.as_ref()).is_some();
+        // inner fetch, built once so every chunk sees the same predicate; a
+        // partial or refused one stays a residual on the joined row
+        let inner_filter = right_filter.and_then(|rf| {
+            let rf = crate::executor::utils::strip_table_qualifier(rf, inner_alias);
+            match pushdown::try_pushdown(&rf, inner_table.schema(), Some(ctx)) {
+                (Some(expr), false) => Some(expr),
+                _ => None,
+            }
+        });
+        let pushed_inner = inner_filter.is_some();
         let build_residual_filter = || {
             if pushed_inner {
                 return None;
@@ -6871,7 +6870,6 @@ impl Executor {
                 Some(table) => table,
                 None => self.join_table(&snapshot, &table_name)?,
             };
-            let inner_filter = build_inner_filter(table.as_ref());
             let mut op = IndexNestedLoopJoinOperator::new(
                 outer_op,
                 table,
@@ -6881,8 +6879,8 @@ impl Executor {
                 lookup_strategy.clone(),
                 build_residual_filter(),
             );
-            if let Some(filter) = inner_filter {
-                op = op.with_inner_filter(filter);
+            if let Some(filter) = &inner_filter {
+                op = op.with_inner_filter(filter.clone());
             }
             if let Some((sources, schema)) = &projection {
                 op = op.with_projection(sources.clone(), schema.clone());

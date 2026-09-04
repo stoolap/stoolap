@@ -231,15 +231,17 @@ impl PushdownRegistry {
         (None, true)
     }
 
-    /// Try to convert an expression, returning only the storage expression
-    /// (for internal use in compound rules)
-    pub(crate) fn convert_expr(
+    /// A child converted whole, for a rule whose result would be wider than
+    /// the predicate with a partial child inside it
+    pub(crate) fn convert_expr_exact(
         &self,
         expr: &ast::Expression,
         ctx: &PushdownContext<'_>,
     ) -> Option<Box<dyn StorageExpr>> {
-        let (storage_expr, _) = self.try_pushdown_with_ctx(expr, ctx);
-        storage_expr
+        match self.try_pushdown_with_ctx(expr, ctx) {
+            (Some(storage_expr), false) => Some(storage_expr),
+            _ => None,
+        }
     }
 }
 

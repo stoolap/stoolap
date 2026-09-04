@@ -356,3 +356,70 @@ fn test_grouped_join_right_filter_typed_literals() {
         assert_eq!(page.len(), 5.min(general.len()), "{from_where}");
     }
 }
+
+#[test]
+fn test_pushdown_or_with_a_partial_child() {
+    let db = Database::open("memory://pushdown_or_partial_child").unwrap();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount FLOAT, status TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_orders_user_id ON orders(user_id)", ())
+        .unwrap();
+    let mut expected_rows = 0i64;
+    let mut expected_groups: Vec<Vec<String>> = Vec::new();
+    let mut id = 0;
+    for user in 1..=30i64 {
+        db.execute(
+            "INSERT INTO users VALUES ($1, $2)",
+            (user, format!("user{user}")),
+        )
+        .unwrap();
+        let mut per_user = 0i64;
+        for k in 0..3i64 {
+            id += 1;
+            let status = if (user + k) % 2 == 0 { "c_1" } else { "cx1" };
+            let amount = (user * 10 + k) as f64 - 15.0;
+            db.execute(
+                "INSERT INTO orders VALUES ($1, $2, $3, $4)",
+                (id, user, amount, status),
+            )
+            .unwrap();
+            if (amount > 10.0 && status == "c_1") || amount < 0.0 {
+                per_user += 1;
+            }
+        }
+        expected_rows += per_user;
+        if per_user > 0 {
+            expected_groups.push(vec![user.to_string(), per_user.to_string()]);
+        }
+    }
+    let scanned: i64 = db
+        .query(
+            "SELECT COUNT(*) FROM orders WHERE (amount > 10 AND status LIKE 'c!_%' ESCAPE '!') OR amount < 0",
+            (),
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(
+        scanned, expected_rows,
+        "scan with the OR of a partial child"
+    );
+    let mut streamed = rows(
+        &db,
+        "SELECT u.id, COUNT(o.id) FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE (o.amount > 10 AND o.status LIKE 'c!_%' ESCAPE '!') OR o.amount < 0 GROUP BY u.id LIMIT 1000",
+    );
+    streamed.sort();
+    expected_groups.sort();
+    assert_eq!(
+        streamed, expected_groups,
+        "grouped stream with the OR of a partial child"
+    );
+}

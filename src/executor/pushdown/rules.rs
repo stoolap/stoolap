@@ -271,8 +271,8 @@ impl PushdownRule for LogicalOrRule {
 
         // For OR: can only push if BOTH sides are fully pushable
         // (partial pushdown of OR would change semantics)
-        let left = registry().convert_expr(&infix.left, ctx);
-        let right = registry().convert_expr(&infix.right, ctx);
+        let left = registry().convert_expr_exact(&infix.left, ctx);
+        let right = registry().convert_expr_exact(&infix.right, ctx);
 
         match (left, right) {
             (Some(mut l), Some(mut r)) => {
@@ -303,7 +303,7 @@ impl PushdownRule for LogicalNotRule {
         };
 
         // NOT requires the inner expression to be fully pushable
-        match registry().convert_expr(&prefix.right, ctx) {
+        match registry().convert_expr_exact(&prefix.right, ctx) {
             Some(mut inner) => {
                 inner.prepare_for_schema(ctx.schema);
                 PushdownResult::Converted(Box::new(NotExpr::new(inner)))
@@ -331,10 +331,10 @@ impl PushdownRule for LogicalXorRule {
         };
 
         // XOR is equivalent to: (A AND NOT B) OR (NOT A AND B)
-        let left1 = registry().convert_expr(&infix.left, ctx);
-        let right1 = registry().convert_expr(&infix.right, ctx);
-        let left2 = registry().convert_expr(&infix.left, ctx);
-        let right2 = registry().convert_expr(&infix.right, ctx);
+        let left1 = registry().convert_expr_exact(&infix.left, ctx);
+        let right1 = registry().convert_expr_exact(&infix.right, ctx);
+        let left2 = registry().convert_expr_exact(&infix.left, ctx);
+        let right2 = registry().convert_expr_exact(&infix.right, ctx);
 
         match (left1, right1, left2, right2) {
             (Some(mut l1), Some(mut r1), Some(mut l2), Some(mut r2)) => {
