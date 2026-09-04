@@ -6793,14 +6793,18 @@ impl Executor {
             Some(cross) => Some(RowFilter::new(cross, &all_columns)?.with_context(ctx)),
             None => None,
         };
-        // A right-side filter the storage layer can evaluate runs inside the
-        // inner fetch; any other stays a residual on the joined row
-        let build_inner_filter = || {
-            right_filter
-                .map(|rf| crate::executor::utils::strip_table_qualifier(rf, inner_alias))
-                .and_then(|rf| crate::executor::expr_converter::convert_ast_to_storage_expr(&rf))
+        // A right-side filter the storage layer takes whole runs inside the
+        // inner fetch; a partial or refused one stays a residual on the joined row
+        let build_inner_filter = |table: &dyn crate::storage::traits::Table| {
+            right_filter.and_then(|rf| {
+                let rf = crate::executor::utils::strip_table_qualifier(rf, inner_alias);
+                match pushdown::try_pushdown(&rf, table.schema(), Some(ctx)) {
+                    (Some(expr), false) => Some(expr),
+                    _ => None,
+                }
+            })
         };
-        let pushed_inner = build_inner_filter().is_some();
+        let pushed_inner = build_inner_filter(inner_table.as_ref()).is_some();
         let build_residual_filter = || {
             if pushed_inner {
                 return None;
@@ -6867,10 +6871,7 @@ impl Executor {
                 Some(table) => table,
                 None => self.join_table(&snapshot, &table_name)?,
             };
-            let inner_filter = build_inner_filter().map(|mut filter| {
-                filter.prepare_for_schema(table.schema());
-                filter
-            });
+            let inner_filter = build_inner_filter(table.as_ref());
             let mut op = IndexNestedLoopJoinOperator::new(
                 outer_op,
                 table,

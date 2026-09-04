@@ -293,3 +293,66 @@ fn test_grouped_join_right_filters() {
         check(&db, "u.name, COUNT(o.id)", &from_where, group, 9);
     }
 }
+
+#[test]
+fn test_grouped_join_right_filter_typed_literals() {
+    let db = Database::open("memory://grouped_join_typed_literals").unwrap();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount FLOAT, status TEXT, created_at TIMESTAMP)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_orders_user_id ON orders(user_id)", ())
+        .unwrap();
+    for user in 1..=30i64 {
+        db.execute(
+            "INSERT INTO users VALUES ($1, $2)",
+            (user, format!("user{user}")),
+        )
+        .unwrap();
+    }
+    let mut id = 0;
+    for user in 1..=30i64 {
+        for k in 0..3i64 {
+            id += 1;
+            let status = if (user + k) % 2 == 0 { "c_1" } else { "cx1" };
+            let created = if k == 0 {
+                "2024-01-15 10:00:00"
+            } else {
+                "2024-08-15 10:00:00"
+            };
+            db.execute(
+                &format!(
+                    "INSERT INTO orders VALUES ({id}, {user}, {}, '{status}', TIMESTAMP '{created}')",
+                    user * 10 + k
+                ),
+                (),
+            )
+            .unwrap();
+        }
+    }
+    for from_where in [
+        "users u INNER JOIN orders o ON u.id = o.user_id WHERE o.status LIKE 'c!_%' ESCAPE '!'",
+        "users u INNER JOIN orders o ON u.id = o.user_id WHERE o.created_at > TIMESTAMP '2024-06-01 00:00:00'",
+    ] {
+        let mut general = rows(
+            &db,
+            &format!("SELECT u.id, COUNT(o.id) FROM {from_where} GROUP BY u.id ORDER BY u.id"),
+        );
+        assert!(!general.is_empty(), "general path returns rows for {from_where}");
+        let mut streamed = rows(
+            &db,
+            &format!("SELECT u.id, COUNT(o.id) FROM {from_where} GROUP BY u.id LIMIT 1000"),
+        );
+        streamed.sort();
+        general.sort();
+        assert_eq!(streamed, general, "{from_where}");
+        let page = rows(
+            &db,
+            &format!("SELECT u.id, COUNT(o.id) FROM {from_where} GROUP BY u.id LIMIT 5"),
+        );
+        assert_eq!(page.len(), 5.min(general.len()), "{from_where}");
+    }
+}
