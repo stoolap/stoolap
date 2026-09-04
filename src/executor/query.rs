@@ -6520,6 +6520,81 @@ impl Executor {
         Ok(StatementSnapshot::new(transaction))
     }
 
+    /// True when a filter carries a subquery anywhere inside it. The grouped
+    /// stream compiles its filters raw, where a subquery has no executor
+    fn filter_has_subquery(expr: &Expression) -> bool {
+        use crate::parser::ast::Expression as E;
+        let any = |exprs: &[Expression]| exprs.iter().any(Self::filter_has_subquery);
+        match expr {
+            E::ScalarSubquery(_) | E::Exists(_) | E::AllAny(_) => true,
+            E::Identifier(_)
+            | E::QualifiedIdentifier(_)
+            | E::IntegerLiteral(_)
+            | E::FloatLiteral(_)
+            | E::StringLiteral(_)
+            | E::BooleanLiteral(_)
+            | E::NullLiteral(_)
+            | E::IntervalLiteral(_)
+            | E::Parameter(_)
+            | E::Star(_)
+            | E::QualifiedStar(_)
+            | E::Default(_) => false,
+            E::Prefix(p) => Self::filter_has_subquery(&p.right),
+            E::Infix(i) => {
+                Self::filter_has_subquery(&i.left) || Self::filter_has_subquery(&i.right)
+            }
+            E::List(l) => any(&l.elements),
+            E::ExpressionList(l) => any(&l.expressions),
+            E::Distinct(d) => Self::filter_has_subquery(&d.expr),
+            E::In(i) => Self::filter_has_subquery(&i.left) || Self::filter_has_subquery(&i.right),
+            E::InHashSet(i) => Self::filter_has_subquery(&i.column),
+            E::Between(b) => {
+                Self::filter_has_subquery(&b.expr)
+                    || Self::filter_has_subquery(&b.lower)
+                    || Self::filter_has_subquery(&b.upper)
+            }
+            E::Like(l) => {
+                Self::filter_has_subquery(&l.left)
+                    || Self::filter_has_subquery(&l.pattern)
+                    || l.escape.as_deref().is_some_and(Self::filter_has_subquery)
+            }
+            E::Case(c) => {
+                c.value.as_deref().is_some_and(Self::filter_has_subquery)
+                    || c.when_clauses.iter().any(|w| {
+                        Self::filter_has_subquery(&w.condition)
+                            || Self::filter_has_subquery(&w.then_result)
+                    })
+                    || c.else_value
+                        .as_deref()
+                        .is_some_and(Self::filter_has_subquery)
+            }
+            E::Cast(c) => Self::filter_has_subquery(&c.expr),
+            E::FunctionCall(f) => Self::function_has_subquery(f),
+            E::Aliased(a) => Self::filter_has_subquery(&a.expression),
+            E::Window(w) => {
+                Self::function_has_subquery(&w.function)
+                    || any(&w.partition_by)
+                    || w.order_by
+                        .iter()
+                        .any(|o| Self::filter_has_subquery(&o.expression))
+            }
+            E::TableSource(_)
+            | E::JoinSource(_)
+            | E::SubquerySource(_)
+            | E::ValuesSource(_)
+            | E::CteReference(_)
+            | E::FunctionTableSource(_) => true,
+        }
+    }
+
+    fn function_has_subquery(f: &crate::parser::ast::FunctionCall) -> bool {
+        f.arguments.iter().any(Self::filter_has_subquery)
+            || f.filter.as_deref().is_some_and(Self::filter_has_subquery)
+            || f.order_by
+                .iter()
+                .any(|o| Self::filter_has_subquery(&o.expression))
+    }
+
     /// A GROUP BY + LIMIT join whose groups are the left rows: the right side
     /// is probed per left row through its index, each group is folded as the
     /// joined rows stream past, HAVING runs on the group at once, and the
@@ -6573,7 +6648,7 @@ impl Executor {
         if [left_filter, right_filter, cross_filter]
             .into_iter()
             .flatten()
-            .any(Self::has_subqueries)
+            .any(Self::filter_has_subquery)
         {
             return Ok(None);
         }

@@ -239,3 +239,20 @@ fn test_limited_join_where_subquery() {
     );
     assert_eq!(page.len(), 7.min(general.len()));
 }
+
+#[test]
+fn test_grouped_join_where_nested_subquery() {
+    let db = setup("grouped_join_where_nested_subquery");
+    for from_where in [
+        "users u INNER JOIN orders o ON u.id = o.user_id WHERE o.amount BETWEEN (SELECT MIN(amount) FROM orders) AND (SELECT AVG(amount) FROM orders)",
+        "users u INNER JOIN orders o ON u.id = o.user_id WHERE o.amount IN (SELECT amount FROM orders WHERE amount > 900)",
+    ] {
+        let general = rows(
+            &db,
+            &format!("SELECT u.id, COUNT(o.id) FROM {from_where} GROUP BY u.id ORDER BY u.id"),
+        );
+        assert!(!general.is_empty(), "general path returns rows for {from_where}");
+        check(&db, "u.id, COUNT(o.id), SUM(o.amount)", from_where, "GROUP BY u.id", 1000);
+        check(&db, "u.id, COUNT(o.id)", from_where, "GROUP BY u.id", 7);
+    }
+}
