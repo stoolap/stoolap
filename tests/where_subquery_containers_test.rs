@@ -812,4 +812,54 @@ fn test_subquery_inside_an_aggregate_over_a_cte() {
         20,
         "recursive CTE"
     );
+    // The subquery inside the aggregate reads the CTE itself: orders above 150
+    assert_eq!(
+        count(
+            &db,
+            "WITH lim AS (SELECT 150 AS v) SELECT COUNT(*) FILTER (WHERE amount > (SELECT v FROM lim)) FROM orders"
+        ),
+        47,
+        "aggregate subquery over the CTE"
+    );
+    // The correlated subquery reads the recursive CTE's column by its name
+    assert_eq!(
+        count(
+            &db,
+            "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM n WHERE v < 3) SELECT SUM((SELECT MAX(x.amount) FROM orders x WHERE x.user_id = n.v)) FROM n"
+        ),
+        66,
+        "qualified CTE column inside the aggregate's subquery"
+    );
+}
+
+/// An aggregate in HAVING or ORDER BY resolves the subquery it holds, and
+/// so does the ORDER BY inside an aggregate call
+#[test]
+fn test_subquery_inside_an_aggregate_in_having_and_order_by() {
+    let db = setup("select_subquery_in_having_order_by");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM (SELECT user_id FROM orders GROUP BY user_id HAVING COUNT(*) FILTER (WHERE EXISTS (SELECT 1)) > 2) t"
+        ),
+        30,
+        "HAVING"
+    );
+    // Users 16 to 30 have all three orders above the average
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT user_id FROM orders GROUP BY user_id ORDER BY COUNT(*) FILTER (WHERE amount > (SELECT AVG(amount) FROM orders)) DESC, user_id LIMIT 2"
+        ),
+        vec![vec!["16".to_string()], vec!["17".to_string()]],
+        "ORDER BY"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT GROUP_CONCAT(name ORDER BY (SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id) DESC) FROM users u WHERE u.id <= 3"
+        ),
+        vec![vec!["user3,user2,user1".to_string()]],
+        "ORDER BY inside the aggregate"
+    );
 }

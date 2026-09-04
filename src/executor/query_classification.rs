@@ -435,7 +435,12 @@ impl QueryClassification {
                 );
             }
             Expression::FunctionCall(func) => {
-                for arg in func.arguments.iter().chain(func.filter.as_deref()) {
+                for arg in func
+                    .arguments
+                    .iter()
+                    .chain(func.filter.as_deref())
+                    .chain(func.order_by.iter().map(|o| &o.expression))
+                {
                     Self::analyze_where_expr_recursive(
                         arg,
                         has_exists,
@@ -591,6 +596,10 @@ impl QueryClassification {
                         .filter
                         .as_deref()
                         .is_some_and(Self::expression_has_scalar_subquery)
+                    || func
+                        .order_by
+                        .iter()
+                        .any(|o| Self::expression_has_scalar_subquery(&o.expression))
             }
             Expression::AllAny(all_any) => Self::expression_has_scalar_subquery(&all_any.left),
             Expression::Case(case) => {
@@ -925,6 +934,10 @@ impl QueryClassification {
                         .filter
                         .as_deref()
                         .is_some_and(Self::expression_has_correlated_subqueries)
+                    || func
+                        .order_by
+                        .iter()
+                        .any(|o| Self::expression_has_correlated_subqueries(&o.expression))
             }
             Expression::Case(case) => {
                 case.value
@@ -1057,6 +1070,10 @@ impl QueryClassification {
                         .filter
                         .as_deref()
                         .is_some_and(|f| Self::has_outer_column_reference(f, inner_tables))
+                    || func
+                        .order_by
+                        .iter()
+                        .any(|o| Self::has_outer_column_reference(&o.expression, inner_tables))
             }
             Expression::Case(case) => {
                 case.value

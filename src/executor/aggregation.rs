@@ -405,20 +405,23 @@ impl Executor {
         // back as a column, since an aggregate cannot resolve one itself
         let lifted_stmt;
         let lifted_columns;
-        let (stmt, base_rows, base_columns) = match stmt
-            .columns
-            .iter()
-            .any(Self::has_subqueries)
-            .then(|| Self::lift_subqueries_in_aggregates(&stmt.columns))
+        let (stmt, base_rows, base_columns) = match Self::aggregates_hold_subquery(stmt)
+            .then(|| Self::lift_subqueries_in_aggregates(stmt))
             .flatten()
         {
-            Some((columns, lifted)) => {
-                let (rows, all_columns) =
-                    self.materialize_lifted_subqueries(&lifted, ctx, base_rows, base_columns)?;
-                lifted_stmt = SelectStatement {
-                    columns,
-                    ..stmt.clone()
-                };
+            Some((rewritten, lifted)) => {
+                let qualifier = stmt
+                    .table_expr
+                    .as_deref()
+                    .and_then(super::utils::get_table_alias_from_expr);
+                let (rows, all_columns) = self.materialize_lifted_subqueries(
+                    &lifted,
+                    ctx,
+                    base_rows,
+                    base_columns,
+                    qualifier.as_deref(),
+                )?;
+                lifted_stmt = rewritten;
                 lifted_columns = all_columns;
                 (&lifted_stmt, rows, lifted_columns.as_slice())
             }
@@ -5221,6 +5224,9 @@ impl Executor {
         classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
         // classification is passed from caller to avoid redundant cache lookups
+        if Self::aggregates_hold_subquery(stmt) {
+            return Ok(None);
+        }
 
         // Quick eligibility checks using cached classification
         if classification.has_where {
@@ -5419,6 +5425,10 @@ impl Executor {
     ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
         use crate::storage::mvcc::version_store::AggregateOp;
 
+        if Self::aggregates_hold_subquery(stmt) {
+            return Ok(None);
+        }
+
         // --- Eligibility checks ---
 
         if !classification.has_where {
@@ -5598,7 +5608,7 @@ impl Executor {
         classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
         // Quick eligibility checks using cached classification
-        if classification.has_where {
+        if classification.has_where || Self::aggregates_hold_subquery(stmt) {
             return Ok(None);
         }
         if classification.has_group_by {
@@ -5963,6 +5973,10 @@ impl Executor {
     ) -> Result<Option<Box<dyn QueryResult>>> {
         use crate::common::SmartString;
         use smallvec::SmallVec;
+
+        if Self::aggregates_hold_subquery(stmt) {
+            return Ok(None);
+        }
 
         // Quick eligibility checks
         if !classification.has_group_by {
@@ -6352,6 +6366,10 @@ impl Executor {
     ) -> Option<Box<dyn QueryResult>> {
         use crate::parser::ast::GroupByModifier;
         use crate::storage::mvcc::version_store::AggregateOp;
+
+        if Self::aggregates_hold_subquery(stmt) {
+            return None;
+        }
 
         // Only for GROUP BY without WHERE or HAVING
         if classification.has_where || !classification.has_group_by || classification.has_having {

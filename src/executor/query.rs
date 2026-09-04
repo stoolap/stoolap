@@ -311,6 +311,12 @@ impl Executor {
             }
         }
 
+        // Check for CTEs (WITH clause). A statement with one keeps every
+        // subquery for the aggregation entry, which runs with the CTEs bound
+        if self.has_cte(stmt) {
+            return self.execute_select_with_ctes(stmt, ctx);
+        }
+
         // OPTIMIZATION: Get cached query classification ONCE at entry point
         // This classification is passed through the call chain to avoid
         // redundant hash computations and cache lookups (was 10+ calls per query)
@@ -341,11 +347,6 @@ impl Executor {
         } else {
             stmt
         };
-
-        // Check for CTEs (WITH clause)
-        if self.has_cte(stmt) {
-            return self.execute_select_with_ctes(stmt, ctx);
-        }
 
         // Evaluate LIMIT/OFFSET early (needed for set operations optimization)
         // Literal fast path: `LIMIT 10` needs no compile/cache/VM round trip
@@ -10388,6 +10389,10 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
         use crate::core::IndexType;
+
+        if Self::aggregates_hold_subquery(stmt) {
+            return Ok(None);
+        }
 
         // Only single-column GROUP BY is supported for now
         if stmt.group_by.columns.len() != 1 {

@@ -1979,6 +1979,10 @@ impl Executor {
             Expression::FunctionCall(func) => {
                 func.arguments.iter().any(Self::has_subqueries)
                     || func.filter.as_deref().is_some_and(Self::has_subqueries)
+                    || func
+                        .order_by
+                        .iter()
+                        .any(|order| Self::has_subqueries(&order.expression))
             }
             Expression::Case(case) => {
                 case.value.as_deref().is_some_and(Self::has_subqueries)
@@ -2404,6 +2408,10 @@ impl Executor {
                         .filter
                         .as_deref()
                         .is_some_and(Self::has_correlated_subqueries)
+                    || func
+                        .order_by
+                        .iter()
+                        .any(|order| Self::has_correlated_subqueries(&order.expression))
             }
             Expression::Case(case) => {
                 case.value
@@ -2657,22 +2665,54 @@ impl Executor {
         }
     }
 
-    /// The SELECT list with every subquery inside an aggregate call replaced
-    /// by a column, and the subqueries taken out, in column order. None
-    /// when no aggregate holds one.
+    /// True when the SELECT list, HAVING or ORDER BY still holds a subquery;
+    /// an aggregation path that reads them raw must leave the statement to
+    /// the general entry, which lifts them
+    pub(crate) fn aggregates_hold_subquery(stmt: &SelectStatement) -> bool {
+        stmt.columns.iter().any(Self::has_subqueries)
+            || stmt.having.as_deref().is_some_and(Self::has_subqueries)
+            || stmt
+                .order_by
+                .iter()
+                .any(|order| Self::has_subqueries(&order.expression))
+    }
+
+    /// The statement with every subquery inside an aggregate call, in the
+    /// SELECT list, HAVING or ORDER BY, replaced by a column, and the
+    /// subqueries taken out in that order. None when no aggregate holds one.
     pub(crate) fn lift_subqueries_in_aggregates(
-        columns: &[Expression],
-    ) -> Option<(Vec<Expression>, Vec<Expression>)> {
+        stmt: &SelectStatement,
+    ) -> Option<(SelectStatement, Vec<Expression>)> {
         let mut lifted = Vec::new();
-        let rewritten: Vec<Expression> = columns
+        let columns: Vec<Expression> = stmt
+            .columns
             .iter()
             .map(|column| Self::lift_subqueries_in(column, false, &mut lifted))
             .collect();
+        let having = stmt
+            .having
+            .as_ref()
+            .map(|having| Box::new(Self::lift_subqueries_in(having, false, &mut lifted)));
+        let order_by: Vec<OrderByExpression> = stmt
+            .order_by
+            .iter()
+            .map(|order| OrderByExpression {
+                expression: Self::lift_subqueries_in(&order.expression, false, &mut lifted),
+                ..order.clone()
+            })
+            .collect();
         if lifted.is_empty() {
-            None
-        } else {
-            Some((rewritten, lifted))
+            return None;
         }
+        Some((
+            SelectStatement {
+                columns,
+                having,
+                order_by,
+                ..stmt.clone()
+            },
+            lifted,
+        ))
     }
 
     fn lifted_column_name(index: usize) -> String {
@@ -2713,7 +2753,14 @@ impl Executor {
                         .map(|a| Self::lift_subqueries_in(a, inside, lifted))
                         .collect(),
                     is_distinct: func.is_distinct,
-                    order_by: func.order_by.clone(),
+                    order_by: func
+                        .order_by
+                        .iter()
+                        .map(|order| OrderByExpression {
+                            expression: Self::lift_subqueries_in(&order.expression, inside, lifted),
+                            ..order.clone()
+                        })
+                        .collect(),
                     filter: func
                         .filter
                         .as_ref()
@@ -2804,15 +2851,21 @@ impl Executor {
         ctx: &ExecutionContext,
         base_rows: crate::core::RowVec,
         base_columns: &[String],
+        qualifier: Option<&str>,
     ) -> Result<(crate::core::RowVec, Vec<String>)> {
+        // Each column under its own name, its bare name when qualified, and
+        // its qualified name when the source's name or alias is known
         let keys: Vec<(CompactArc<str>, Option<CompactArc<str>>)> = base_columns
             .iter()
             .map(|name| {
                 let lower = name.to_lowercase();
-                let short = lower
-                    .rfind('.')
-                    .map(|dot| CompactArc::from(&lower[dot + 1..]));
-                (CompactArc::from(lower.as_str()), short)
+                let other = match lower.rfind('.') {
+                    Some(dot) => Some(CompactArc::from(&lower[dot + 1..])),
+                    None => qualifier.map(|q| {
+                        CompactArc::from(format!("{}.{}", q.to_lowercase(), lower).as_str())
+                    }),
+                };
+                (CompactArc::from(lower.as_str()), other)
             })
             .collect();
         let outer_columns = CompactArc::new(base_columns.to_vec());
@@ -2953,6 +3006,10 @@ impl Executor {
                         .filter
                         .as_deref()
                         .is_some_and(|f| Self::references_outer_columns(f, subquery_tables))
+                    || func
+                        .order_by
+                        .iter()
+                        .any(|o| Self::references_outer_columns(&o.expression, subquery_tables))
             }
             Expression::In(in_expr) => {
                 Self::references_outer_columns(&in_expr.left, subquery_tables)
