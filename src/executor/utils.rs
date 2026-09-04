@@ -35,10 +35,11 @@ use crate::core::value::NULL_VALUE;
 use crate::core::{DataType, Operator, Row, Schema, Value};
 use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
-    BetweenExpression, BooleanLiteral, Expression, FloatLiteral, FunctionCall, Identifier,
-    InExpression, InHashSetExpression, InfixExpression, InfixOperator, IntegerLiteral,
-    LikeExpression, ListExpression, NullLiteral, PrefixExpression, QualifiedIdentifier,
-    StringLiteral, WindowFrameBound,
+    BetweenExpression, BooleanLiteral, CaseExpression, CastExpression, DistinctExpression,
+    Expression, ExpressionList, FloatLiteral, FunctionCall, Identifier, InExpression,
+    InHashSetExpression, InfixExpression, InfixOperator, IntegerLiteral, LikeExpression,
+    ListExpression, NullLiteral, PrefixExpression, QualifiedIdentifier, StringLiteral, WhenClause,
+    WindowFrameBound,
 };
 use crate::parser::token::{Position, Token, TokenType};
 
@@ -365,6 +366,88 @@ fn substitute_outer_references_inner(
             } else {
                 None
             }
+        }
+
+        Expression::Cast(cast) => substitute_outer_references_inner(&cast.expr, outer_row, scope)
+            .map(|expr| {
+                Expression::Cast(CastExpression {
+                    token: cast.token.clone(),
+                    expr: Box::new(expr),
+                    type_name: cast.type_name.clone(),
+                })
+            }),
+        Expression::Distinct(distinct) => {
+            substitute_outer_references_inner(&distinct.expr, outer_row, scope).map(|expr| {
+                Expression::Distinct(DistinctExpression {
+                    token: distinct.token.clone(),
+                    expr: Box::new(expr),
+                })
+            })
+        }
+        Expression::ExpressionList(list) => {
+            let new_items: Vec<Option<Expression>> = list
+                .expressions
+                .iter()
+                .map(|item| substitute_outer_references_inner(item, outer_row, scope))
+                .collect();
+            if new_items.iter().any(Option::is_some) {
+                Some(Expression::ExpressionList(Box::new(ExpressionList {
+                    token: list.token.clone(),
+                    expressions: new_items
+                        .into_iter()
+                        .zip(list.expressions.iter())
+                        .map(|(new, old)| new.unwrap_or_else(|| old.clone()))
+                        .collect(),
+                })))
+            } else {
+                None
+            }
+        }
+        Expression::Case(case) => {
+            let new_value = case
+                .value
+                .as_ref()
+                .and_then(|value| substitute_outer_references_inner(value, outer_row, scope));
+            let new_whens: Vec<(Option<Expression>, Option<Expression>)> = case
+                .when_clauses
+                .iter()
+                .map(|when| {
+                    (
+                        substitute_outer_references_inner(&when.condition, outer_row, scope),
+                        substitute_outer_references_inner(&when.then_result, outer_row, scope),
+                    )
+                })
+                .collect();
+            let new_else = case
+                .else_value
+                .as_ref()
+                .and_then(|value| substitute_outer_references_inner(value, outer_row, scope));
+            let changed = new_value.is_some()
+                || new_else.is_some()
+                || new_whens.iter().any(|(c, t)| c.is_some() || t.is_some());
+            if !changed {
+                return None;
+            }
+            Some(Expression::Case(Box::new(CaseExpression {
+                token: case.token.clone(),
+                value: match new_value {
+                    Some(value) => Some(Box::new(value)),
+                    None => case.value.clone(),
+                },
+                when_clauses: new_whens
+                    .into_iter()
+                    .zip(case.when_clauses.iter())
+                    .map(|((condition, then_result), when)| WhenClause {
+                        token: when.token.clone(),
+                        condition: condition.unwrap_or_else(|| when.condition.clone()),
+                        then_result: then_result.unwrap_or_else(|| when.then_result.clone()),
+                    })
+                    .collect(),
+                else_value: match new_else {
+                    Some(value) => Some(Box::new(value)),
+                    None => case.else_value.clone(),
+                },
+            })))
         }
 
         // Literals and other expressions that don't need substitution

@@ -3913,8 +3913,18 @@ impl Executor {
         // side's scan; one left after the join is evaluated per joined row
         let correlated_where = classification.where_has_correlated_subqueries;
         let where_for_join: Option<Expression> = match &stmt.where_clause {
-            Some(where_clause) if !correlated_where && classification.where_has_subqueries => {
-                Some(self.process_where_subqueries(where_clause, ctx)?)
+            Some(where_clause) if classification.where_has_subqueries => {
+                // Each conjunct folds on its own, so an uncorrelated one folds
+                // next to a correlated one
+                let mut folded = Vec::new();
+                for pred in flatten_and_predicates(where_clause) {
+                    if Self::has_subqueries(&pred) && !Self::has_correlated_subqueries(&pred) {
+                        folded.push(self.process_where_subqueries(&pred, ctx)?);
+                    } else {
+                        folded.push(pred);
+                    }
+                }
+                combine_predicates_with_and(folded)
             }
             Some(where_clause) => Some((**where_clause).clone()),
             None => None,

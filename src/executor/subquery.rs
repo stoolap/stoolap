@@ -1940,8 +1940,7 @@ impl Executor {
                 Self::has_subqueries(&infix.left) || Self::has_subqueries(&infix.right)
             }
             Expression::In(in_expr) => {
-                Self::has_subqueries(&in_expr.left)
-                    || matches!(in_expr.right.as_ref(), Expression::ScalarSubquery(_))
+                Self::has_subqueries(&in_expr.left) || Self::has_subqueries(&in_expr.right)
             }
             Expression::Between(between) => {
                 Self::has_subqueries(&between.expr)
@@ -2227,6 +2226,7 @@ impl Executor {
                     return Self::is_subquery_correlated(&subquery.subquery);
                 }
                 Self::has_correlated_subqueries(&in_expr.left)
+                    || Self::has_correlated_subqueries(&in_expr.right)
             }
             Expression::Between(between) => {
                 Self::has_correlated_subqueries(&between.expr)
@@ -2573,6 +2573,25 @@ impl Executor {
                 Self::references_outer_columns(&aliased.expression, subquery_tables)
             }
             Expression::Cast(cast) => Self::references_outer_columns(&cast.expr, subquery_tables),
+            Expression::Like(like) => {
+                Self::references_outer_columns(&like.left, subquery_tables)
+                    || Self::references_outer_columns(&like.pattern, subquery_tables)
+                    || like
+                        .escape
+                        .as_deref()
+                        .is_some_and(|e| Self::references_outer_columns(e, subquery_tables))
+            }
+            Expression::Distinct(distinct) => {
+                Self::references_outer_columns(&distinct.expr, subquery_tables)
+            }
+            Expression::List(list) => list
+                .elements
+                .iter()
+                .any(|e| Self::references_outer_columns(e, subquery_tables)),
+            Expression::ExpressionList(list) => list
+                .expressions
+                .iter()
+                .any(|e| Self::references_outer_columns(e, subquery_tables)),
             _ => false,
         }
     }

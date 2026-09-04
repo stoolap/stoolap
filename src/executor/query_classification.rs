@@ -593,6 +593,33 @@ impl QueryClassification {
                         .as_ref()
                         .is_some_and(|e| Self::expression_has_scalar_subquery(e))
             }
+            Expression::In(in_expr) => {
+                Self::expression_has_scalar_subquery(&in_expr.left)
+                    || Self::expression_has_scalar_subquery(&in_expr.right)
+            }
+            Expression::Between(between) => {
+                Self::expression_has_scalar_subquery(&between.expr)
+                    || Self::expression_has_scalar_subquery(&between.lower)
+                    || Self::expression_has_scalar_subquery(&between.upper)
+            }
+            Expression::Cast(cast) => Self::expression_has_scalar_subquery(&cast.expr),
+            Expression::Like(like) => {
+                Self::expression_has_scalar_subquery(&like.left)
+                    || Self::expression_has_scalar_subquery(&like.pattern)
+                    || like
+                        .escape
+                        .as_deref()
+                        .is_some_and(Self::expression_has_scalar_subquery)
+            }
+            Expression::List(list) => list
+                .elements
+                .iter()
+                .any(Self::expression_has_scalar_subquery),
+            Expression::ExpressionList(list) => list
+                .expressions
+                .iter()
+                .any(Self::expression_has_scalar_subquery),
+            Expression::Distinct(distinct) => Self::expression_has_scalar_subquery(&distinct.expr),
             _ => false,
         }
     }
@@ -864,6 +891,7 @@ impl QueryClassification {
                     return Self::is_subquery_correlated(&subquery.subquery);
                 }
                 Self::expression_has_correlated_subqueries(&in_expr.left)
+                    || Self::expression_has_correlated_subqueries(&in_expr.right)
             }
             Expression::Between(between) => {
                 Self::expression_has_correlated_subqueries(&between.expr)
@@ -1005,13 +1033,29 @@ impl QueryClassification {
                 .iter()
                 .any(|a| Self::has_outer_column_reference(a, inner_tables)),
             Expression::Case(case) => {
-                case.when_clauses.iter().any(|w| {
-                    Self::has_outer_column_reference(&w.condition, inner_tables)
-                        || Self::has_outer_column_reference(&w.then_result, inner_tables)
-                }) || case
-                    .else_value
+                case.value
                     .as_ref()
-                    .is_some_and(|e| Self::has_outer_column_reference(e, inner_tables))
+                    .is_some_and(|v| Self::has_outer_column_reference(v, inner_tables))
+                    || case.when_clauses.iter().any(|w| {
+                        Self::has_outer_column_reference(&w.condition, inner_tables)
+                            || Self::has_outer_column_reference(&w.then_result, inner_tables)
+                    })
+                    || case
+                        .else_value
+                        .as_ref()
+                        .is_some_and(|e| Self::has_outer_column_reference(e, inner_tables))
+            }
+            Expression::Cast(cast) => Self::has_outer_column_reference(&cast.expr, inner_tables),
+            Expression::Like(like) => {
+                Self::has_outer_column_reference(&like.left, inner_tables)
+                    || Self::has_outer_column_reference(&like.pattern, inner_tables)
+                    || like
+                        .escape
+                        .as_ref()
+                        .is_some_and(|e| Self::has_outer_column_reference(e, inner_tables))
+            }
+            Expression::Distinct(distinct) => {
+                Self::has_outer_column_reference(&distinct.expr, inner_tables)
             }
             Expression::In(in_expr) => {
                 Self::has_outer_column_reference(&in_expr.left, inner_tables)

@@ -356,3 +356,106 @@ fn test_correlated_all_in_join_where() {
         "plain join"
     );
 }
+
+/// A subquery inside an IN list reaches the DML path too
+#[test]
+fn test_in_list_subquery_in_delete() {
+    let db = setup("where_subquery_in_list_delete");
+    db.execute(
+        "DELETE FROM orders WHERE id IN ((SELECT MIN(id) FROM orders), 2)",
+        (),
+    )
+    .unwrap();
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM orders"), 88);
+    assert_eq!(count(&db, "SELECT COUNT(*) FROM orders WHERE id <= 2"), 0);
+}
+
+/// A column of the query around the join may sit inside a CAST or a CASE
+#[test]
+fn test_join_where_reads_the_parent_row_inside_a_container() {
+    let db = setup("where_subquery_parent_row_container");
+    let expected: Vec<Vec<String>> = vec![
+        vec!["1".into(), "90".into()],
+        vec!["2".into(), "87".into()],
+        vec!["3".into(), "84".into()],
+    ];
+    assert_eq!(
+        rows(
+            &db,
+            &format!(
+                "SELECT u2.id, (SELECT COUNT(*) FROM {JOIN} WHERE (SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id) > CAST(u2.id AS FLOAT) * 10) FROM users u2 WHERE u2.id <= 3 ORDER BY u2.id"
+            )
+        ),
+        expected,
+        "CAST"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            &format!(
+                "SELECT u2.id, (SELECT COUNT(*) FROM {JOIN} WHERE (SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id) > CASE WHEN u2.id = 1 THEN 10 WHEN u2.id = 2 THEN 20 ELSE 30 END) FROM users u2 WHERE u2.id <= 3 ORDER BY u2.id"
+            )
+        ),
+        expected,
+        "CASE"
+    );
+}
+
+/// An outer reference wrapped in a CAST still makes the subquery correlated
+#[test]
+fn test_correlated_reference_inside_cast() {
+    let db = setup("where_subquery_cast_reference");
+    let predicate =
+        "EXISTS (SELECT 1 FROM orders x WHERE x.user_id = CAST(u.id AS INTEGER) AND x.amount > 200)";
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM {JOIN} WHERE {predicate}")
+        ),
+        33,
+        "joined rows"
+    );
+    let expected: Vec<Vec<String>> = (20..=30i64)
+        .map(|user| vec![user.to_string(), "3".to_string()])
+        .collect();
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT u.id, COUNT(o.id) FROM {JOIN} WHERE {predicate} GROUP BY u.id ORDER BY u.id")
+        ),
+        expected,
+        "grouped join"
+    );
+}
+
+/// An uncorrelated subquery folds even next to a correlated one, so the
+/// conjunct pushed to a derived table or CTE side is a plain predicate
+#[test]
+fn test_uncorrelated_next_to_correlated_on_a_derived_side() {
+    let db = setup("where_subquery_mixed_derived");
+    let predicate = "EXISTS (SELECT 1 FROM orders x WHERE x.user_id = u.id AND x.amount > 200) AND o.amount > (SELECT AVG(amount) FROM orders)";
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM users u INNER JOIN (SELECT * FROM orders) o ON u.id = o.user_id WHERE {predicate}")
+        ),
+        33,
+        "derived table"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("WITH o AS (SELECT * FROM orders) SELECT COUNT(*) FROM users u INNER JOIN o ON u.id = o.user_id WHERE {predicate}")
+        ),
+        33,
+        "CTE"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM {JOIN} WHERE {predicate}")
+        ),
+        33,
+        "table"
+    );
+}
