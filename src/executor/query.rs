@@ -6567,6 +6567,16 @@ impl Executor {
         }) {
             return Ok(None);
         }
+        if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None {
+            return Ok(None);
+        }
+        if [left_filter, right_filter, cross_filter]
+            .into_iter()
+            .flatten()
+            .any(Self::has_subqueries)
+        {
+            return Ok(None);
+        }
         let group_by = self.parse_group_by(stmt, &[])?;
         let mut group_names = Vec::with_capacity(group_by.len());
         for item in &group_by {
@@ -6580,7 +6590,7 @@ impl Executor {
 
         // One transaction for the outer fetches and the inner probes; inside an
         // explicit transaction the outer side is read whole
-        let snapshot = match ctx.statement_snapshot() {
+        let mut snapshot = match ctx.statement_snapshot() {
             Some(snapshot) => snapshot.clone(),
             None => self.new_statement_snapshot(crate::core::IsolationLevel::ReadCommitted)?,
         };
@@ -6839,10 +6849,10 @@ impl Executor {
                 outer_result = more;
                 continue;
             }
-            let restart =
+            snapshot =
                 self.new_statement_snapshot(crate::core::IsolationLevel::SnapshotIsolation)?;
-            ctx_join = ctx.with_statement_snapshot(restart.clone());
-            inner_table = Some(self.join_table(&restart, &table_name)?);
+            ctx_join = ctx.with_statement_snapshot(snapshot.clone());
+            inner_table = Some(self.join_table(&snapshot, &table_name)?);
             consistent = true;
             groups.clear();
             outer_limit = Some(fetched.saturating_add(next));

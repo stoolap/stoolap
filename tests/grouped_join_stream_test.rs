@@ -182,3 +182,60 @@ fn test_grouped_join_offset_and_limit() {
         assert!(all.contains(row), "unexpected {row:?}");
     }
 }
+
+#[test]
+fn test_grouped_join_rollup_keeps_the_total_row() {
+    let db = setup("grouped_join_rollup");
+    let with_limit = rows(
+        &db,
+        "SELECT u.id, COUNT(o.id) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY ROLLUP(u.id) LIMIT 1000",
+    );
+    let general = rows(
+        &db,
+        "SELECT u.id, COUNT(o.id) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY ROLLUP(u.id) ORDER BY u.id",
+    );
+    let mut with_limit = with_limit;
+    let mut general = general;
+    with_limit.sort();
+    general.sort();
+    assert_eq!(with_limit, general);
+    assert!(
+        general.iter().any(|row| row[0] == "NULL"),
+        "rollup total row"
+    );
+}
+
+#[test]
+fn test_grouped_join_where_subquery() {
+    let db = setup("grouped_join_where_subquery");
+    for from_where in [
+        "users u INNER JOIN orders o ON u.id = o.user_id WHERE o.amount > (SELECT AVG(amount) FROM orders)",
+        "users u INNER JOIN orders o ON u.id = o.user_id WHERE u.id IN (SELECT user_id FROM orders WHERE amount > 500)",
+        "users u INNER JOIN orders o ON u.id = o.user_id WHERE o.amount + u.id > (SELECT AVG(amount) FROM orders)",
+    ] {
+        check(&db, "u.id, COUNT(o.id), SUM(o.amount)", from_where, "GROUP BY u.id", 1000);
+        check(&db, "u.id, COUNT(o.id)", from_where, "GROUP BY u.id", 7);
+    }
+}
+
+#[test]
+fn test_limited_join_where_subquery() {
+    let db = setup("limited_join_where_subquery");
+    let general = rows(
+        &db,
+        "SELECT u.id, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.amount > (SELECT AVG(amount) FROM orders) ORDER BY u.id, o.amount",
+    );
+    let mut limited = rows(
+        &db,
+        "SELECT u.id, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.amount > (SELECT AVG(amount) FROM orders) LIMIT 1000",
+    );
+    limited.sort();
+    let mut general = general;
+    general.sort();
+    assert_eq!(limited, general);
+    let page = rows(
+        &db,
+        "SELECT u.id, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.amount > (SELECT AVG(amount) FROM orders) LIMIT 7",
+    );
+    assert_eq!(page.len(), 7.min(general.len()));
+}
