@@ -401,6 +401,30 @@ impl Executor {
         base_rows: RowVec,
         base_columns: &[String],
     ) -> Result<Box<dyn QueryResult>> {
+        // A subquery inside an aggregate is resolved per input row and read
+        // back as a column, since an aggregate cannot resolve one itself
+        let lifted_stmt;
+        let lifted_columns;
+        let (stmt, base_rows, base_columns) = match stmt
+            .columns
+            .iter()
+            .any(Self::has_subqueries)
+            .then(|| Self::lift_subqueries_in_aggregates(&stmt.columns))
+            .flatten()
+        {
+            Some((columns, lifted)) => {
+                let (rows, all_columns) =
+                    self.materialize_lifted_subqueries(&lifted, ctx, base_rows, base_columns)?;
+                lifted_stmt = SelectStatement {
+                    columns,
+                    ..stmt.clone()
+                };
+                lifted_columns = all_columns;
+                (&lifted_stmt, rows, lifted_columns.as_slice())
+            }
+            None => (stmt, base_rows, base_columns),
+        };
+
         // Parse aggregations and group by columns
         let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt)?;
         let group_by_columns = self.parse_group_by(stmt, base_columns)?;

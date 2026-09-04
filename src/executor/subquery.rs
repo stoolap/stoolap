@@ -2657,6 +2657,192 @@ impl Executor {
         }
     }
 
+    /// The SELECT list with every subquery inside an aggregate call replaced
+    /// by a column, and the subqueries taken out, in column order. None
+    /// when no aggregate holds one.
+    pub(crate) fn lift_subqueries_in_aggregates(
+        columns: &[Expression],
+    ) -> Option<(Vec<Expression>, Vec<Expression>)> {
+        let mut lifted = Vec::new();
+        let rewritten: Vec<Expression> = columns
+            .iter()
+            .map(|column| Self::lift_subqueries_in(column, false, &mut lifted))
+            .collect();
+        if lifted.is_empty() {
+            None
+        } else {
+            Some((rewritten, lifted))
+        }
+    }
+
+    fn lifted_column_name(index: usize) -> String {
+        format!("__agg_subquery_{index}")
+    }
+
+    fn lift_subqueries_in(
+        expr: &Expression,
+        inside_aggregate: bool,
+        lifted: &mut Vec<Expression>,
+    ) -> Expression {
+        let is_subquery = matches!(
+            expr,
+            Expression::ScalarSubquery(_) | Expression::Exists(_) | Expression::AllAny(_)
+        ) || matches!(expr, Expression::In(in_expr)
+            if matches!(in_expr.right.as_ref(), Expression::ScalarSubquery(_)));
+        if inside_aggregate && is_subquery {
+            lifted.push(expr.clone());
+            let name = Self::lifted_column_name(lifted.len() - 1);
+            return Expression::Identifier(crate::parser::ast::Identifier::new(
+                dummy_token(&name, TokenType::Identifier),
+                name.as_str(),
+            ));
+        }
+        let lift = |e: &Expression, lifted: &mut Vec<Expression>| {
+            Self::lift_subqueries_in(e, inside_aggregate, lifted)
+        };
+        match expr {
+            Expression::FunctionCall(func) => {
+                let inside =
+                    inside_aggregate || super::utils::is_aggregate_function(&func.function);
+                Expression::FunctionCall(Box::new(FunctionCall {
+                    token: func.token.clone(),
+                    function: func.function.clone(),
+                    arguments: func
+                        .arguments
+                        .iter()
+                        .map(|a| Self::lift_subqueries_in(a, inside, lifted))
+                        .collect(),
+                    is_distinct: func.is_distinct,
+                    order_by: func.order_by.clone(),
+                    filter: func
+                        .filter
+                        .as_ref()
+                        .map(|f| Box::new(Self::lift_subqueries_in(f, inside, lifted))),
+                }))
+            }
+            Expression::Infix(infix) => Expression::Infix(InfixExpression {
+                token: infix.token.clone(),
+                left: Box::new(lift(&infix.left, lifted)),
+                operator: infix.operator.clone(),
+                op_type: infix.op_type,
+                right: Box::new(lift(&infix.right, lifted)),
+            }),
+            Expression::Prefix(prefix) => Expression::Prefix(PrefixExpression {
+                token: prefix.token.clone(),
+                operator: prefix.operator.clone(),
+                op_type: prefix.op_type,
+                right: Box::new(lift(&prefix.right, lifted)),
+            }),
+            Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
+                token: aliased.token.clone(),
+                expression: Box::new(lift(&aliased.expression, lifted)),
+                alias: aliased.alias.clone(),
+            }),
+            Expression::Cast(cast) => Expression::Cast(CastExpression {
+                token: cast.token.clone(),
+                expr: Box::new(lift(&cast.expr, lifted)),
+                type_name: cast.type_name.clone(),
+            }),
+            Expression::Case(case) => Expression::Case(Box::new(CaseExpression {
+                token: case.token.clone(),
+                value: case.value.as_ref().map(|v| Box::new(lift(v, lifted))),
+                when_clauses: case
+                    .when_clauses
+                    .iter()
+                    .map(|when| WhenClause {
+                        token: when.token.clone(),
+                        condition: lift(&when.condition, lifted),
+                        then_result: lift(&when.then_result, lifted),
+                    })
+                    .collect(),
+                else_value: case.else_value.as_ref().map(|e| Box::new(lift(e, lifted))),
+            })),
+            Expression::In(in_expr) => Expression::In(InExpression {
+                token: in_expr.token.clone(),
+                left: Box::new(lift(&in_expr.left, lifted)),
+                right: Box::new(lift(&in_expr.right, lifted)),
+                not: in_expr.not,
+            }),
+            Expression::Between(between) => Expression::Between(BetweenExpression {
+                token: between.token.clone(),
+                expr: Box::new(lift(&between.expr, lifted)),
+                lower: Box::new(lift(&between.lower, lifted)),
+                upper: Box::new(lift(&between.upper, lifted)),
+                not: between.not,
+            }),
+            Expression::Like(like) => Expression::Like(LikeExpression {
+                token: like.token.clone(),
+                left: Box::new(lift(&like.left, lifted)),
+                pattern: Box::new(lift(&like.pattern, lifted)),
+                operator: like.operator.clone(),
+                escape: like.escape.as_ref().map(|e| Box::new(lift(e, lifted))),
+            }),
+            Expression::List(list) => Expression::List(Box::new(ListExpression {
+                token: list.token.clone(),
+                elements: list.elements.iter().map(|e| lift(e, lifted)).collect(),
+            })),
+            Expression::ExpressionList(list) => {
+                Expression::ExpressionList(Box::new(ExpressionList {
+                    token: list.token.clone(),
+                    expressions: list.expressions.iter().map(|e| lift(e, lifted)).collect(),
+                }))
+            }
+            Expression::Distinct(distinct) => Expression::Distinct(DistinctExpression {
+                token: distinct.token.clone(),
+                expr: Box::new(lift(&distinct.expr, lifted)),
+            }),
+            _ => expr.clone(),
+        }
+    }
+
+    /// Every input row extended with the value of each lifted subquery,
+    /// resolved with that row as the outer row, and the column names to go
+    /// with them
+    pub(crate) fn materialize_lifted_subqueries(
+        &self,
+        lifted: &[Expression],
+        ctx: &ExecutionContext,
+        base_rows: crate::core::RowVec,
+        base_columns: &[String],
+    ) -> Result<(crate::core::RowVec, Vec<String>)> {
+        let keys: Vec<(CompactArc<str>, Option<CompactArc<str>>)> = base_columns
+            .iter()
+            .map(|name| {
+                let lower = name.to_lowercase();
+                let short = lower
+                    .rfind('.')
+                    .map(|dot| CompactArc::from(&lower[dot + 1..]));
+                (CompactArc::from(lower.as_str()), short)
+            })
+            .collect();
+        let outer_columns = CompactArc::new(base_columns.to_vec());
+        let mut rows = crate::core::RowVec::with_capacity(base_rows.len());
+        for (id, row) in base_rows {
+            let mut outer: rustc_hash::FxHashMap<CompactArc<str>, Value> =
+                ctx.outer_row().cloned().unwrap_or_default();
+            for ((full, short), value) in keys.iter().zip(row.as_slice()) {
+                if let Some(short) = short {
+                    outer.insert(short.clone(), value.clone());
+                }
+                outer.insert(full.clone(), value.clone());
+            }
+            let row_ctx = ctx.with_outer_row(outer, outer_columns.clone());
+            let mut values: Vec<Value> = row.as_slice().to_vec();
+            for node in lifted {
+                let bound = self.process_correlated_expression(node, &row_ctx)?;
+                let value = super::expression::ExpressionEval::compile(&bound, base_columns)?
+                    .with_context(&row_ctx)
+                    .eval_slice(&row)?;
+                values.push(value);
+            }
+            ctx.check_cancelled()?;
+            rows.push((id, crate::core::Row::from_values(values)));
+        }
+        let mut columns = base_columns.to_vec();
+        columns.extend((0..lifted.len()).map(Self::lifted_column_name));
+        Ok((rows, columns))
+    }
+
     /// Check if a subquery is correlated (references outer columns)
     pub(crate) fn is_subquery_correlated(subquery: &SelectStatement) -> bool {
         // Get table/alias names defined in the subquery's FROM clause

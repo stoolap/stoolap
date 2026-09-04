@@ -724,3 +724,92 @@ fn test_select_list_containers_hold_subqueries() {
         "correlated ALL and BETWEEN"
     );
 }
+
+/// An EXISTS, an ALL or a correlated subquery inside an aggregate is
+/// resolved per input row before the aggregate runs
+#[test]
+fn test_every_subquery_kind_inside_an_aggregate() {
+    let db = setup("select_subquery_kinds_in_aggregate");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FILTER (WHERE EXISTS (SELECT 1)) FROM users"
+        ),
+        30,
+        "EXISTS in FILTER"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FILTER (WHERE 5 > ALL (SELECT 1)) FROM users"
+        ),
+        30,
+        "ALL in FILTER"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FILTER (WHERE EXISTS (SELECT 1 FROM orders x WHERE x.user_id = u.id AND x.amount > 200)) FROM users u"
+        ),
+        11,
+        "correlated EXISTS in FILTER"
+    );
+    // The largest order of every user, summed: 10 * (1 + ... + 30) + 2 * 30
+    assert_eq!(
+        count(
+            &db,
+            "SELECT SUM((SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id)) FROM users u"
+        ),
+        4710,
+        "correlated scalar as an argument"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT u.id, SUM((SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id)) FROM users u GROUP BY u.id ORDER BY u.id LIMIT 3"
+        ),
+        vec![
+            vec!["1".to_string(), "12".to_string()],
+            vec!["2".to_string(), "22".to_string()],
+            vec!["3".to_string(), "32".to_string()],
+        ],
+        "correlated scalar as an argument, grouped"
+    );
+}
+
+/// The aggregate subquery fix reaches a CTE and a recursive CTE
+#[test]
+fn test_subquery_inside_an_aggregate_over_a_cte() {
+    let db = setup("select_subquery_in_aggregate_cte");
+    assert_eq!(
+        count(
+            &db,
+            "WITH t AS (SELECT * FROM orders) SELECT COUNT(*) FILTER (WHERE amount > (SELECT AVG(amount) FROM orders)) FROM t"
+        ),
+        orders_above_average(),
+        "CTE"
+    );
+    let avg = average_amount();
+    let expected: Vec<Vec<String>> = (1..=30i64)
+        .map(|user| {
+            let n = (0..3i64).filter(|&k| amount(user, k) > avg).count();
+            vec![user.to_string(), n.to_string()]
+        })
+        .collect();
+    assert_eq!(
+        rows(
+            &db,
+            "WITH t AS (SELECT * FROM orders) SELECT user_id, COUNT(*) FILTER (WHERE amount > (SELECT AVG(amount) FROM orders)) FROM t GROUP BY user_id ORDER BY user_id"
+        ),
+        expected,
+        "CTE, grouped"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM n WHERE v < 30) SELECT COUNT(*) FILTER (WHERE v > (SELECT MIN(id) FROM users) + 9) FROM n"
+        ),
+        20,
+        "recursive CTE"
+    );
+}

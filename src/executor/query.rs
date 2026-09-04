@@ -311,11 +311,6 @@ impl Executor {
             }
         }
 
-        // Check for CTEs (WITH clause)
-        if self.has_cte(stmt) {
-            return self.execute_select_with_ctes(stmt, ctx);
-        }
-
         // OPTIMIZATION: Get cached query classification ONCE at entry point
         // This classification is passed through the call chain to avoid
         // redundant hash computations and cache lookups (was 10+ calls per query)
@@ -324,12 +319,13 @@ impl Executor {
             None => get_classification(stmt),
         };
 
-        // A subquery inside an aggregate's FILTER or argument is resolved
-        // before the aggregates are parsed, since every aggregation path
-        // reads the statement's own columns
+        // An uncorrelated subquery inside an aggregate's FILTER or argument
+        // folds before the aggregates are parsed, since every aggregation
+        // path reads the statement's own columns; a correlated one is
+        // resolved per input row at the aggregation entry
         let bound_stmt;
         let stmt = if classification.has_aggregation
-            && classification.select_has_scalar_subqueries
+            && stmt.columns.iter().any(Self::has_subqueries)
             && !Self::has_correlated_select_subqueries(&stmt.columns)
         {
             match self.try_process_select_subqueries(&stmt.columns, ctx)? {
@@ -345,6 +341,11 @@ impl Executor {
         } else {
             stmt
         };
+
+        // Check for CTEs (WITH clause)
+        if self.has_cte(stmt) {
+            return self.execute_select_with_ctes(stmt, ctx);
+        }
 
         // Evaluate LIMIT/OFFSET early (needed for set operations optimization)
         // Literal fast path: `LIMIT 10` needs no compile/cache/VM round trip
