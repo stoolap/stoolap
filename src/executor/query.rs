@@ -56,12 +56,13 @@ type DeferredProjection = (Vec<usize>, Vec<String>);
 /// Type alias for select execution results: (result, column_names, limit_offset_applied, deferred_projection)
 /// Using CompactArc<Vec<String>> for column names enables zero-copy sharing across query execution.
 /// The deferred_projection field is Some when projection should be applied after ORDER BY + LIMIT.
-type SelectResult = Result<(
+type SelectOutput = (
     Box<dyn QueryResult>,
     CompactArc<Vec<String>>,
     bool,
     Option<DeferredProjection>,
-)>;
+);
+type SelectResult = Result<SelectOutput>;
 
 use super::context::{
     clear_batch_aggregate_cache, clear_batch_aggregate_info_cache, clear_count_counter_cache,
@@ -191,6 +192,8 @@ fn partition_where_for_join(
 /// A GROUP BY + LIMIT join whose left side is fetched in a limited chunk
 struct SemijoinReduction {
     cap: usize,
+    want: usize,
+    offset: usize,
     limit: usize,
     left_key_col: String,
     right_key_col: String,
@@ -3962,6 +3965,20 @@ impl Executor {
         let (left_rows, left_columns, right_rows, right_columns) = if let Some(plan) =
             semijoin_limit
         {
+            if let Some(result) = self.try_grouped_index_join(
+                stmt,
+                ctx,
+                join_source,
+                &join_type,
+                left_alias.as_deref(),
+                right_alias.as_deref(),
+                left_filter.as_ref(),
+                right_filter.as_ref(),
+                cross_filter.as_ref(),
+                &plan,
+            )? {
+                return Ok(result);
+            }
             // Semi-join reduction for INNER/LEFT JOIN + GROUP BY: fetch the left
             // side with the limit, then the right side through an IN filter on
             // the join key (uses the index)
@@ -3970,6 +3987,7 @@ impl Executor {
                 limit,
                 left_key_col,
                 right_key_col,
+                ..
             } = plan;
             let left_cap = left_cap_override.unwrap_or(cap);
             let (left_result, left_cols, left_bounded) = self
@@ -4220,12 +4238,16 @@ impl Executor {
                 // stops short. Only a plain table takes the limit and can be
                 // fetched again from an offset; the fetch says whether it did.
                 // One snapshot serves every outer fetch and the inner probes
-                let snapshot = match ctx.statement_snapshot() {
+                // Read committed is the cheap default; snapshot isolation costs
+                // about two microseconds per join, so it is taken only when a
+                // continuation finds that a commit moved rows under it
+                let mut snapshot = match ctx.statement_snapshot() {
                     Some(snapshot) => snapshot.clone(),
-                    None => self.new_statement_snapshot()?,
+                    None => {
+                        self.new_statement_snapshot(crate::core::IsolationLevel::ReadCommitted)?
+                    }
                 };
-                let ctx_join = ctx.with_statement_snapshot(snapshot.clone());
-                let ctx = &ctx_join;
+                let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
                 // An explicit transaction reads through its own transaction, whose
                 // isolation may let a commit move rows between two fetches, so
                 // the outer side is fetched whole there
@@ -4235,7 +4257,7 @@ impl Executor {
                 } else {
                     join_limit.map(|l| {
                         let l = l as usize;
-                        l.saturating_add(l / 8).max(100)
+                        l.saturating_add(l / 16).max(100)
                     })
                 };
 
@@ -4243,7 +4265,7 @@ impl Executor {
                 let (outer_result, outer_cols, outer_bounded) = self
                     .execute_table_expression_with_filter_limit(
                         outer_expr,
-                        ctx,
+                        &ctx_join,
                         nl_left_filter.as_ref(),
                         outer_limit,
                         0,
@@ -4355,6 +4377,7 @@ impl Executor {
                         let mut outer_result = outer_result;
                         let mut inner_table = Some(inner_table);
                         let mut fetched = 0usize;
+                        let mut consistent = false;
                         loop {
                             let outer_op: Box<dyn Operator> = Box::new(QueryResultOperator::new(
                                 outer_result,
@@ -4391,6 +4414,7 @@ impl Executor {
                             if result_rows.len() >= lim {
                                 break;
                             }
+                            let boundary = op.last_outer_row().cloned();
                             fetched = fetched.saturating_add(cap);
                             let missing = lim - result_rows.len();
                             let rate = result_rows.len() as f64 / fetched as f64;
@@ -4401,16 +4425,58 @@ impl Executor {
                             };
                             let next = estimate.clamp(32, fetched.saturating_mul(3));
                             outer_limit = Some(next);
-                            let (more, _, bounded) = self
+                            if consistent {
+                                let (more, _, bounded) = self
+                                    .execute_table_expression_with_filter_limit(
+                                        outer_expr,
+                                        &ctx_join,
+                                        nl_left_filter.as_ref(),
+                                        Some(next),
+                                        fetched,
+                                    )?;
+                                debug_assert!(bounded);
+                                outer_result = more;
+                                continue;
+                            }
+                            // Under read committed a commit may have moved rows before
+                            // the boundary. Fetch one row of overlap: when it is still
+                            // the row the chunk ended on, the rows after it are the
+                            // continuation; otherwise the join restarts on snapshot
+                            // isolation, where the chunks line up by construction
+                            let (mut more, _, bounded) = self
                                 .execute_table_expression_with_filter_limit(
                                     outer_expr,
-                                    ctx,
+                                    &ctx_join,
                                     nl_left_filter.as_ref(),
-                                    Some(next),
-                                    fetched,
+                                    Some(next + 1),
+                                    fetched - 1,
                                 )?;
                             debug_assert!(bounded);
-                            outer_result = more;
+                            let unmoved = more.next()
+                                && boundary
+                                    .as_ref()
+                                    .is_some_and(|row| row.as_slice() == more.row().as_slice());
+                            if unmoved {
+                                outer_result = more;
+                                continue;
+                            }
+                            snapshot = self.new_statement_snapshot(
+                                crate::core::IsolationLevel::SnapshotIsolation,
+                            )?;
+                            ctx_join = ctx.with_statement_snapshot(snapshot.clone());
+                            consistent = true;
+                            result_rows.clear();
+                            outer_limit = Some(fetched.saturating_add(next));
+                            fetched = 0;
+                            outer_result = self
+                                .execute_table_expression_with_filter_limit(
+                                    outer_expr,
+                                    &ctx_join,
+                                    nl_left_filter.as_ref(),
+                                    outer_limit,
+                                    0,
+                                )?
+                                .0;
                         }
                     } else {
                         // Batch INL for NO LIMIT - single batch fetch, O(1) lock overhead
@@ -6442,12 +6508,450 @@ impl Executor {
         snapshot.get_table(name)
     }
 
-    /// One transaction for every read of a statement, under snapshot isolation
-    /// so a later commit cannot move rows between two of its fetches
-    fn new_statement_snapshot(&self) -> Result<StatementSnapshot> {
+    /// One transaction for every read of a statement
+    fn new_statement_snapshot(
+        &self,
+        isolation: crate::core::IsolationLevel,
+    ) -> Result<StatementSnapshot> {
         let mut transaction = self.engine.begin_transaction()?;
-        transaction.set_isolation_level(crate::core::IsolationLevel::SnapshotIsolation)?;
+        if isolation != crate::core::IsolationLevel::ReadCommitted {
+            transaction.set_isolation_level(isolation)?;
+        }
         Ok(StatementSnapshot::new(transaction))
+    }
+
+    /// True when a filter carries a subquery anywhere inside it. The grouped
+    /// stream compiles its filters raw, where a subquery has no executor
+    fn filter_has_subquery(expr: &Expression) -> bool {
+        use crate::parser::ast::Expression as E;
+        let any = |exprs: &[Expression]| exprs.iter().any(Self::filter_has_subquery);
+        match expr {
+            E::ScalarSubquery(_) | E::Exists(_) | E::AllAny(_) => true,
+            E::Identifier(_)
+            | E::QualifiedIdentifier(_)
+            | E::IntegerLiteral(_)
+            | E::FloatLiteral(_)
+            | E::StringLiteral(_)
+            | E::BooleanLiteral(_)
+            | E::NullLiteral(_)
+            | E::IntervalLiteral(_)
+            | E::Parameter(_)
+            | E::Star(_)
+            | E::QualifiedStar(_)
+            | E::Default(_) => false,
+            E::Prefix(p) => Self::filter_has_subquery(&p.right),
+            E::Infix(i) => {
+                Self::filter_has_subquery(&i.left) || Self::filter_has_subquery(&i.right)
+            }
+            E::List(l) => any(&l.elements),
+            E::ExpressionList(l) => any(&l.expressions),
+            E::Distinct(d) => Self::filter_has_subquery(&d.expr),
+            E::In(i) => Self::filter_has_subquery(&i.left) || Self::filter_has_subquery(&i.right),
+            E::InHashSet(i) => Self::filter_has_subquery(&i.column),
+            E::Between(b) => {
+                Self::filter_has_subquery(&b.expr)
+                    || Self::filter_has_subquery(&b.lower)
+                    || Self::filter_has_subquery(&b.upper)
+            }
+            E::Like(l) => {
+                Self::filter_has_subquery(&l.left)
+                    || Self::filter_has_subquery(&l.pattern)
+                    || l.escape.as_deref().is_some_and(Self::filter_has_subquery)
+            }
+            E::Case(c) => {
+                c.value.as_deref().is_some_and(Self::filter_has_subquery)
+                    || c.when_clauses.iter().any(|w| {
+                        Self::filter_has_subquery(&w.condition)
+                            || Self::filter_has_subquery(&w.then_result)
+                    })
+                    || c.else_value
+                        .as_deref()
+                        .is_some_and(Self::filter_has_subquery)
+            }
+            E::Cast(c) => Self::filter_has_subquery(&c.expr),
+            E::FunctionCall(f) => Self::function_has_subquery(f),
+            E::Aliased(a) => Self::filter_has_subquery(&a.expression),
+            E::Window(w) => {
+                Self::function_has_subquery(&w.function)
+                    || any(&w.partition_by)
+                    || w.order_by
+                        .iter()
+                        .any(|o| Self::filter_has_subquery(&o.expression))
+            }
+            E::TableSource(_)
+            | E::JoinSource(_)
+            | E::SubquerySource(_)
+            | E::ValuesSource(_)
+            | E::CteReference(_)
+            | E::FunctionTableSource(_) => true,
+        }
+    }
+
+    fn function_has_subquery(f: &crate::parser::ast::FunctionCall) -> bool {
+        f.arguments.iter().any(Self::filter_has_subquery)
+            || f.filter.as_deref().is_some_and(Self::filter_has_subquery)
+            || f.order_by
+                .iter()
+                .any(|o| Self::filter_has_subquery(&o.expression))
+    }
+
+    /// A GROUP BY + LIMIT join whose groups are the left rows: the right side
+    /// is probed per left row through its index, each group is folded as the
+    /// joined rows stream past, HAVING runs on the group at once, and the
+    /// scan stops after LIMIT + OFFSET groups. Nothing is materialised or
+    /// hashed and the answer is complete by construction. None when the shape
+    /// needs something this path does not do; the caller then reduces and
+    /// hashes as before.
+    #[allow(clippy::too_many_arguments)]
+    fn try_grouped_index_join(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        join_source: &JoinTableSource,
+        join_type: &str,
+        left_alias: Option<&str>,
+        right_alias: Option<&str>,
+        left_filter: Option<&Expression>,
+        right_filter: Option<&Expression>,
+        cross_filter: Option<&Expression>,
+        plan: &SemijoinReduction,
+    ) -> Result<Option<SelectOutput>> {
+        // A right-side filter on a LEFT JOIN changes what an unmatched left row
+        // means; the reduction handles that shape
+        if join_type != "INNER" && right_filter.is_some() {
+            return Ok(None);
+        }
+        let Some((table_name, lookup_strategy, _inner_key_col, outer_key_col)) = self
+            .check_index_nested_loop_opportunity(
+                &join_source.right,
+                join_source.condition.as_deref(),
+                join_type,
+                left_alias,
+                right_alias,
+            )
+        else {
+            return Ok(None);
+        };
+        let (aggregations, _) = self.parse_aggregations(stmt)?;
+        if aggregations.iter().any(|agg| {
+            agg.expression.is_some()
+                || agg.filter.is_some()
+                || !agg.order_by.is_empty()
+                || agg.hidden
+                || self.function_registry.get_aggregate(&agg.name).is_none()
+        }) {
+            return Ok(None);
+        }
+        if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None {
+            return Ok(None);
+        }
+        if [left_filter, right_filter, cross_filter]
+            .into_iter()
+            .flatten()
+            .any(Self::filter_has_subquery)
+        {
+            return Ok(None);
+        }
+        let group_by = self.parse_group_by(stmt, &[])?;
+        let mut group_names = Vec::with_capacity(group_by.len());
+        for item in &group_by {
+            match item {
+                crate::executor::aggregation::GroupByItem::Column(name) => {
+                    group_names.push(name.clone())
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        // One transaction for the outer fetches and the inner probes; inside an
+        // explicit transaction the outer side is read whole
+        let mut snapshot = match ctx.statement_snapshot() {
+            Some(snapshot) => snapshot.clone(),
+            None => self.new_statement_snapshot(crate::core::IsolationLevel::ReadCommitted)?,
+        };
+        let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
+        let in_explicit_transaction = self.active_transaction.lock().unwrap().is_some();
+        let mut outer_limit = if in_explicit_transaction {
+            None
+        } else {
+            Some(plan.cap)
+        };
+        let (outer_result, outer_cols, outer_bounded) = self
+            .execute_table_expression_with_filter_limit(
+                &join_source.left,
+                &ctx_join,
+                left_filter,
+                outer_limit,
+                0,
+            )?;
+        if !outer_bounded {
+            outer_limit = None;
+        }
+        let unqualified = |name: &str| name.rfind('.').map_or(name, |p| &name[p + 1..]).to_string();
+        let outer_key_lower = outer_key_col.to_lowercase();
+        let outer_key_unqualified = unqualified(&outer_key_lower);
+        let Some(outer_key_idx) = outer_cols
+            .iter()
+            .position(|c| c.to_lowercase() == outer_key_lower)
+            .or_else(|| {
+                outer_cols
+                    .iter()
+                    .position(|c| unqualified(&c.to_lowercase()) == outer_key_unqualified)
+            })
+        else {
+            return Ok(None);
+        };
+        let inner_table = self.join_table(&snapshot, &table_name)?;
+        let inner_alias = right_alias.unwrap_or(&table_name);
+        let inner_cols: Vec<String> = inner_table
+            .schema()
+            .columns
+            .iter()
+            .map(|col| format!("{}.{}", inner_alias, col.name))
+            .collect();
+        let all_columns: Vec<String> = outer_cols
+            .iter()
+            .chain(inner_cols.iter())
+            .cloned()
+            .collect();
+
+        // Where each group column and aggregate argument lives in the joined row
+        let mut group_idx = Vec::with_capacity(group_names.len());
+        for name in &group_names {
+            match Self::find_column_index_by_name(name, &all_columns) {
+                Some(idx) => group_idx.push(idx),
+                None => return Ok(None),
+            }
+        }
+        let mut agg_idx = Vec::with_capacity(aggregations.len());
+        for agg in &aggregations {
+            if agg.column == "*" {
+                agg_idx.push(None);
+            } else {
+                match Self::find_column_index_by_name(&agg.column, &all_columns) {
+                    Some(idx) => agg_idx.push(Some(idx)),
+                    None => return Ok(None),
+                }
+            }
+        }
+        let mut result_columns: Vec<String> = group_names.clone();
+        for agg in &aggregations {
+            result_columns.push(
+                agg.alias
+                    .clone()
+                    .unwrap_or_else(|| agg.get_expression_name()),
+            );
+        }
+        let having = match &stmt.having {
+            Some(having) => {
+                let processed = self.process_where_subqueries(having, ctx)?;
+                let agg_aliases: Vec<(String, usize)> = aggregations
+                    .iter()
+                    .enumerate()
+                    .map(|(i, agg)| (agg.get_expression_name(), group_names.len() + i))
+                    .collect();
+                Some(
+                    RowFilter::with_aliases(&processed, &result_columns, &agg_aliases)?
+                        .with_context(ctx),
+                )
+            }
+            None => None,
+        };
+        let cross = match cross_filter {
+            Some(cross) => Some(RowFilter::new(cross, &all_columns)?.with_context(ctx)),
+            None => None,
+        };
+        let build_residual_filter = || {
+            right_filter.and_then(|rf| {
+                let qualified_rf = add_table_qualifier(rf, inner_alias);
+                JoinFilter::new(
+                    &qualified_rf,
+                    &outer_cols,
+                    &inner_cols,
+                    &self.function_registry,
+                )
+                .ok()
+                .map(|f| f.with_context(ctx))
+            })
+        };
+        let mut funcs: Vec<Box<dyn crate::functions::AggregateFunction>> =
+            Vec::with_capacity(aggregations.len());
+        for agg in &aggregations {
+            let mut func = self
+                .function_registry
+                .get_aggregate(&agg.name)
+                .ok_or_else(|| Error::internal(format!("aggregate {} vanished", agg.name)))?;
+            if !agg.extra_args.is_empty() {
+                func.configure(&agg.extra_args);
+            }
+            funcs.push(func);
+        }
+        let count_star = Value::Integer(1);
+        let op_join_type = OperatorJoinType::parse(join_type);
+        let want = plan.want;
+
+        // Fold one finished group into an output row; true when HAVING kept it
+        let finish = |first: &Row,
+                      funcs: &mut [Box<dyn crate::functions::AggregateFunction>],
+                      groups: &mut RowVec|
+         -> Result<bool> {
+            let mut values = Vec::with_capacity(result_columns.len());
+            for &idx in &group_idx {
+                values.push(first.get(idx).cloned().unwrap_or_else(Value::null_unknown));
+            }
+            for func in funcs.iter() {
+                values.push(func.result());
+            }
+            let row = Row::from_values(values);
+            if let Some(having) = &having {
+                if !having.matches_checked(&row)? {
+                    return Ok(false);
+                }
+            }
+            groups.push((groups.len() as i64, row));
+            Ok(true)
+        };
+
+        let mut groups = RowVec::new();
+        let mut outer_result = outer_result;
+        let mut inner_table = Some(inner_table);
+        let mut fetched = 0usize;
+        let mut consistent = false;
+        loop {
+            let outer_op: Box<dyn Operator> =
+                Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
+            let mut op = IndexNestedLoopJoinOperator::new(
+                outer_op,
+                match inner_table.take() {
+                    Some(table) => table,
+                    None => self.join_table(&snapshot, &table_name)?,
+                },
+                inner_cols.iter().map(ColumnInfo::new).collect(),
+                op_join_type,
+                outer_key_idx,
+                lookup_strategy.clone(),
+                build_residual_filter(),
+            );
+            op.open()?;
+            // The group columns cover the left primary key, so a change in them
+            // is a new left row
+            let mut current: Option<Row> = None;
+            let mut enough = false;
+            while let Some(row_ref) = op.next()? {
+                let row = row_ref.into_owned();
+                if let Some(cross) = &cross {
+                    if !cross.matches_checked(&row)? {
+                        continue;
+                    }
+                }
+                let new_group = match &current {
+                    Some(first) => group_idx.iter().any(|&idx| first.get(idx) != row.get(idx)),
+                    None => true,
+                };
+                if new_group {
+                    if let Some(first) = current.take() {
+                        if finish(&first, &mut funcs, &mut groups)? && groups.len() >= want {
+                            enough = true;
+                            break;
+                        }
+                    }
+                    for func in funcs.iter_mut() {
+                        func.reset();
+                    }
+                    current = Some(row.clone());
+                }
+                for (i, agg) in aggregations.iter().enumerate() {
+                    let value = match agg_idx[i] {
+                        Some(idx) => row.get(idx),
+                        None => Some(&count_star),
+                    };
+                    if let Some(value) = value {
+                        funcs[i].accumulate(value, agg.distinct);
+                    }
+                }
+            }
+            if !enough {
+                if let Some(first) = current.take() {
+                    finish(&first, &mut funcs, &mut groups)?;
+                }
+            }
+            op.close()?;
+            if enough || groups.len() >= want {
+                break;
+            }
+            let cap = match outer_limit {
+                Some(cap) if op.outer_rows_seen() == cap => cap,
+                _ => break,
+            };
+            let boundary = op.last_outer_row().cloned();
+            fetched = fetched.saturating_add(cap);
+            let missing = want - groups.len();
+            let rate = groups.len() as f64 / fetched as f64;
+            let estimate = if rate > 0.0 {
+                ((missing as f64 / rate) * 2.0).ceil() as usize
+            } else {
+                usize::MAX
+            };
+            let next = estimate.clamp(32, fetched.saturating_mul(3).max(32));
+            outer_limit = Some(next);
+            if consistent {
+                let (more, _, bounded) = self.execute_table_expression_with_filter_limit(
+                    &join_source.left,
+                    &ctx_join,
+                    left_filter,
+                    Some(next),
+                    fetched,
+                )?;
+                debug_assert!(bounded);
+                outer_result = more;
+                continue;
+            }
+            // Read committed: one row of overlap tells whether a commit moved the
+            // boundary; if it did, restart on snapshot isolation
+            let (mut more, _, bounded) = self.execute_table_expression_with_filter_limit(
+                &join_source.left,
+                &ctx_join,
+                left_filter,
+                Some(next + 1),
+                fetched - 1,
+            )?;
+            debug_assert!(bounded);
+            let unmoved = more.next()
+                && boundary
+                    .as_ref()
+                    .is_some_and(|row| row.as_slice() == more.row().as_slice());
+            if unmoved {
+                outer_result = more;
+                continue;
+            }
+            snapshot =
+                self.new_statement_snapshot(crate::core::IsolationLevel::SnapshotIsolation)?;
+            ctx_join = ctx.with_statement_snapshot(snapshot.clone());
+            inner_table = Some(self.join_table(&snapshot, &table_name)?);
+            consistent = true;
+            groups.clear();
+            outer_limit = Some(fetched.saturating_add(next));
+            fetched = 0;
+            outer_result = self
+                .execute_table_expression_with_filter_limit(
+                    &join_source.left,
+                    &ctx_join,
+                    left_filter,
+                    outer_limit,
+                    0,
+                )?
+                .0;
+        }
+
+        let (final_columns, final_rows) =
+            self.apply_post_aggregation_expressions(stmt, ctx, result_columns, groups)?;
+        let mut rows = final_rows.into_vec();
+        rows.drain(..plan.offset.min(rows.len()));
+        rows.truncate(plan.limit);
+        let columns = CompactArc::new(final_columns);
+        let result =
+            ExecutorResult::with_arc_columns(CompactArc::clone(&columns), RowVec::from_vec(rows));
+        Ok(Some((Box::new(result), columns, true, None)))
     }
 
     /// Runs a join operator to completion or to `limit` rows. The cross-table
@@ -9144,7 +9648,10 @@ impl Executor {
     /// expected after OFFSET). The first chunk is doubled for an INNER JOIN,
     /// where a left row without a match forms no group, and doubled again
     /// under HAVING, which drops groups after the fact
-    fn semijoin_caps(stmt: &SelectStatement, is_inner: bool) -> Option<(usize, usize)> {
+    fn semijoin_caps(
+        stmt: &SelectStatement,
+        is_inner: bool,
+    ) -> Option<(usize, usize, usize, usize)> {
         let eval = |e: &Expression| {
             ExpressionEval::compile(e, &[])
                 .ok()
@@ -9171,7 +9678,7 @@ impl Executor {
             cap = cap.saturating_mul(2);
         }
         // The chunk becomes a LIMIT literal, which is an i64
-        Some((cap.min(i64::MAX as usize), limit))
+        Some((cap.min(i64::MAX as usize), want, offset, limit))
     }
 
     /// Check if semi-join reduction optimization can be applied and return its plan
@@ -9217,7 +9724,7 @@ impl Executor {
         if classification.has_window_functions || stmt.distinct || !stmt.distinct_on.is_empty() {
             return None;
         }
-        let (cap, limit) = Self::semijoin_caps(stmt, is_inner)?;
+        let (cap, want, offset, limit) = Self::semijoin_caps(stmt, is_inner)?;
         // Each group must come from one left row, or a partial chunk would
         // give partial aggregates: GROUP BY has to cover the left primary key
         let left_alias = left_alias?;
@@ -9268,6 +9775,8 @@ impl Executor {
             // Swap the keys
             return Some(SemijoinReduction {
                 cap,
+                want,
+                offset,
                 limit,
                 left_key_col: right_key_col,
                 right_key_col: left_key_col,
@@ -9276,6 +9785,8 @@ impl Executor {
 
         Some(SemijoinReduction {
             cap,
+            want,
+            offset,
             limit,
             left_key_col,
             right_key_col,
