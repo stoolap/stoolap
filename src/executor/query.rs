@@ -5170,7 +5170,9 @@ impl Executor {
                 let outer_columns = CompactArc::new(all_columns.clone());
                 let mut filtered = RowVec::with_capacity(result_rows.len());
                 for (id, row) in result_rows {
-                    let mut outer: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
+                    // The row of a query around this one stays visible to the subqueries
+                    let mut outer: FxHashMap<CompactArc<str>, Value> =
+                        ctx.outer_row().cloned().unwrap_or_default();
                     for key in &keys {
                         if let Some(value) = row.get(key.index) {
                             if let Some(unqualified) = &key.unqualified_part {
@@ -5182,7 +5184,13 @@ impl Executor {
                     let row_ctx = ctx.with_outer_row(outer, outer_columns.clone());
                     let processed = self.process_correlated_where(where_clause, &row_ctx)?;
                     ctx.check_cancelled()?;
-                    if RowFilter::new(&processed, &all_columns)?
+                    // A column of the query around this one is not in the joined
+                    // row, so every reference takes its value from the context
+                    let bound = match row_ctx.outer_row() {
+                        Some(outer) => super::utils::substitute_outer_references(&processed, outer),
+                        None => processed,
+                    };
+                    if RowFilter::new(&bound, &all_columns)?
                         .with_context(&row_ctx)
                         .matches_checked(&row)?
                     {

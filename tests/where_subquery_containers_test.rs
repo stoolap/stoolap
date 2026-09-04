@@ -246,3 +246,113 @@ fn test_correlated_subquery_over_both_sides() {
     );
     assert_eq!(limited.len(), 10, "plain join with LIMIT");
 }
+
+/// A join inside a scalar subquery: the join's WHERE reads the row of the
+/// query around it as well as its own rows
+#[test]
+fn test_join_where_reads_the_parent_row() {
+    let db = setup("where_subquery_parent_row");
+    // Users whose largest order is above u2.id * 10: every user for 1, users from 2 for 2, from 3 for 3
+    let expected: Vec<Vec<String>> = vec![
+        vec!["1".into(), "90".into()],
+        vec!["2".into(), "87".into()],
+        vec!["3".into(), "84".into()],
+    ];
+    assert_eq!(
+        rows(
+            &db,
+            &format!(
+                "SELECT u2.id, (SELECT COUNT(*) FROM {JOIN} WHERE (SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id) > u2.id * 10) FROM users u2 WHERE u2.id <= 3 ORDER BY u2.id"
+            )
+        ),
+        expected
+    );
+}
+
+/// A subquery inside LIKE or inside an IN list is resolved like a bare one
+#[test]
+fn test_subquery_inside_like_and_in_list() {
+    let db = setup("where_subquery_like_list");
+    // user1 and user10 to user19
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM users u WHERE u.name LIKE (SELECT name FROM users WHERE id = 1) || '%'"
+        ),
+        11,
+        "LIKE over a subquery, scan"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM {JOIN} WHERE u.name LIKE (SELECT name FROM users WHERE id = 1) || '%'")
+        ),
+        33,
+        "LIKE over a subquery, join"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM users u WHERE u.id IN ((SELECT MIN(id) FROM users), 2)"
+        ),
+        2,
+        "IN list holding a subquery, scan"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM {JOIN} WHERE u.id IN ((SELECT MIN(id) FROM users), 2)")
+        ),
+        6,
+        "IN list holding a subquery, join"
+    );
+}
+
+/// The operand of a simple CASE may be a subquery
+#[test]
+fn test_subquery_as_case_operand() {
+    let db = setup("where_subquery_case_operand");
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM {JOIN} WHERE CASE (SELECT MIN(id) FROM users) WHEN u.id THEN 1 ELSE 0 END = 1")
+        ),
+        3,
+        "uncorrelated operand"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT u.id, COUNT(o.id) FROM {JOIN} WHERE CASE (SELECT MAX(amount) FROM orders x WHERE x.user_id = u.id) WHEN 302 THEN 1 ELSE 0 END = 1 GROUP BY u.id ORDER BY u.id")
+        ),
+        vec![vec!["30".to_string(), "3".to_string()]],
+        "correlated operand"
+    );
+}
+
+/// A correlated ALL in a join's WHERE: the largest order of every user
+#[test]
+fn test_correlated_all_in_join_where() {
+    let db = setup("where_subquery_all_join");
+    let predicate =
+        "o.amount > ALL (SELECT amount FROM orders x WHERE x.user_id = u.id AND x.id <> o.id)";
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM {JOIN} WHERE {predicate}")
+        ),
+        30,
+        "joined rows"
+    );
+    let expected: Vec<Vec<String>> = (1..=30i64)
+        .map(|user| vec![user.to_string(), amount(user, 2).to_string()])
+        .collect();
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT u.id, o.amount FROM {JOIN} WHERE {predicate} ORDER BY u.id")
+        ),
+        expected,
+        "plain join"
+    );
+}

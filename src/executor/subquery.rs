@@ -247,11 +247,11 @@ impl Executor {
                     }
                 }
 
-                // If not a subquery, just return the original with processed left
+                // Not a subquery on the right: a list may still hold one
                 Ok(Expression::In(InExpression {
                     token: in_expr.token.clone(),
                     left: Box::new(processed_left),
-                    right: in_expr.right.clone(),
+                    right: Box::new(self.process_where_subqueries(&in_expr.right, ctx)?),
                     not: in_expr.not,
                 }))
             }
@@ -372,6 +372,45 @@ impl Executor {
                     filter: func.filter.clone(),
                 })))
             }
+
+            Expression::Like(like) => {
+                let escape = match &like.escape {
+                    Some(escape) => Some(Box::new(self.process_where_subqueries(escape, ctx)?)),
+                    None => None,
+                };
+                Ok(Expression::Like(LikeExpression {
+                    token: like.token.clone(),
+                    left: Box::new(self.process_where_subqueries(&like.left, ctx)?),
+                    pattern: Box::new(self.process_where_subqueries(&like.pattern, ctx)?),
+                    operator: like.operator.clone(),
+                    escape,
+                }))
+            }
+
+            Expression::List(list) => Ok(Expression::List(Box::new(ListExpression {
+                token: list.token.clone(),
+                elements: list
+                    .elements
+                    .iter()
+                    .map(|element| self.process_where_subqueries(element, ctx))
+                    .collect::<Result<Vec<_>>>()?,
+            }))),
+
+            Expression::ExpressionList(list) => {
+                Ok(Expression::ExpressionList(Box::new(ExpressionList {
+                    token: list.token.clone(),
+                    expressions: list
+                        .expressions
+                        .iter()
+                        .map(|element| self.process_where_subqueries(element, ctx))
+                        .collect::<Result<Vec<_>>>()?,
+                })))
+            }
+
+            Expression::Distinct(distinct) => Ok(Expression::Distinct(DistinctExpression {
+                token: distinct.token.clone(),
+                expr: Box::new(self.process_where_subqueries(&distinct.expr, ctx)?),
+            })),
 
             // For all other expression types, return as-is
             _ => Ok(expr.clone()),
@@ -2171,6 +2210,7 @@ impl Executor {
             Expression::ScalarSubquery(subquery) => {
                 Self::is_subquery_correlated(&subquery.subquery)
             }
+            Expression::AllAny(all_any) => Self::is_subquery_correlated(&all_any.subquery),
             Expression::Prefix(prefix) => {
                 // Handle NOT EXISTS
                 if let Expression::Exists(exists) = prefix.right.as_ref() {
@@ -2619,7 +2659,7 @@ impl Executor {
                 Ok(Expression::In(InExpression {
                     token: in_expr.token.clone(),
                     left: Box::new(processed_left),
-                    right: in_expr.right.clone(),
+                    right: Box::new(self.process_correlated_where(&in_expr.right, ctx)?),
                     not: in_expr.not,
                 }))
             }
@@ -2707,6 +2747,35 @@ impl Executor {
                 token: aliased.token.clone(),
                 expression: Box::new(self.process_correlated_where(&aliased.expression, ctx)?),
                 alias: aliased.alias.clone(),
+            })),
+
+            // ALL and ANY run their subquery under this row's context and
+            // fold to a plain comparison
+            Expression::AllAny(_) => self.process_where_subqueries(expr, ctx),
+
+            Expression::List(list) => Ok(Expression::List(Box::new(ListExpression {
+                token: list.token.clone(),
+                elements: list
+                    .elements
+                    .iter()
+                    .map(|element| self.process_correlated_where(element, ctx))
+                    .collect::<Result<Vec<_>>>()?,
+            }))),
+
+            Expression::ExpressionList(list) => {
+                Ok(Expression::ExpressionList(Box::new(ExpressionList {
+                    token: list.token.clone(),
+                    expressions: list
+                        .expressions
+                        .iter()
+                        .map(|element| self.process_correlated_where(element, ctx))
+                        .collect::<Result<Vec<_>>>()?,
+                })))
+            }
+
+            Expression::Distinct(distinct) => Ok(Expression::Distinct(DistinctExpression {
+                token: distinct.token.clone(),
+                expr: Box::new(self.process_correlated_where(&distinct.expr, ctx)?),
             })),
 
             // For all other expression types, return as-is

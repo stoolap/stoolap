@@ -439,6 +439,15 @@ impl QueryClassification {
                 }
             }
             Expression::Case(case) => {
+                if let Some(ref value) = case.value {
+                    Self::analyze_where_expr_recursive(
+                        value,
+                        has_exists,
+                        has_in_subquery,
+                        has_scalar_subquery,
+                        has_all_any,
+                    );
+                }
                 for wc in &case.when_clauses {
                     Self::analyze_where_expr_recursive(
                         &wc.condition,
@@ -572,13 +581,17 @@ impl QueryClassification {
                 .iter()
                 .any(Self::expression_has_scalar_subquery),
             Expression::Case(case) => {
-                case.when_clauses.iter().any(|w| {
-                    Self::expression_has_scalar_subquery(&w.condition)
-                        || Self::expression_has_scalar_subquery(&w.then_result)
-                }) || case
-                    .else_value
-                    .as_ref()
-                    .is_some_and(|e| Self::expression_has_scalar_subquery(e))
+                case.value
+                    .as_deref()
+                    .is_some_and(Self::expression_has_scalar_subquery)
+                    || case.when_clauses.iter().any(|w| {
+                        Self::expression_has_scalar_subquery(&w.condition)
+                            || Self::expression_has_scalar_subquery(&w.then_result)
+                    })
+                    || case
+                        .else_value
+                        .as_ref()
+                        .is_some_and(|e| Self::expression_has_scalar_subquery(e))
             }
             _ => false,
         }
@@ -865,13 +878,17 @@ impl QueryClassification {
                 .iter()
                 .any(Self::expression_has_correlated_subqueries),
             Expression::Case(case) => {
-                case.when_clauses.iter().any(|w| {
-                    Self::expression_has_correlated_subqueries(&w.condition)
-                        || Self::expression_has_correlated_subqueries(&w.then_result)
-                }) || case
-                    .else_value
-                    .as_ref()
-                    .is_some_and(|e| Self::expression_has_correlated_subqueries(e))
+                case.value
+                    .as_deref()
+                    .is_some_and(Self::expression_has_correlated_subqueries)
+                    || case.when_clauses.iter().any(|w| {
+                        Self::expression_has_correlated_subqueries(&w.condition)
+                            || Self::expression_has_correlated_subqueries(&w.then_result)
+                    })
+                    || case
+                        .else_value
+                        .as_ref()
+                        .is_some_and(|e| Self::expression_has_correlated_subqueries(e))
             }
             Expression::Cast(cast) => Self::expression_has_correlated_subqueries(&cast.expr),
             Expression::Like(like) => {
