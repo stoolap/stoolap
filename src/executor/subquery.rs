@@ -1784,18 +1784,15 @@ impl Executor {
         // as key; bypassed inside explicit transactions (see
         // execute_in_subquery for the ROLLBACK rationale)
         let cache_key = if is_non_correlated && ctx.transaction_id().is_none() {
-            match Self::subquery_cache_key(subquery, ctx) {
-                Some(key) => {
-                    if let Some(cached_value) = get_cached_scalar_subquery(&key) {
-                        return Ok(cached_value);
-                    }
-                    Some(key)
-                }
-                None => None,
-            }
+            Self::subquery_cache_key(subquery, ctx)
         } else {
             None
         };
+        if let Some(key) = &cache_key {
+            if let Some(cached_value) = get_cached_scalar_subquery(key) {
+                return Ok(cached_value);
+            }
+        }
 
         // OPTIMIZATION: For correlated scalar subqueries with LIMIT, index-based is faster
         // because it only checks rows for the limited outer rows.
@@ -1902,18 +1899,15 @@ impl Executor {
         // entirely: an in-transaction execution sees uncommitted rows, and
         // caching that view would survive a ROLLBACK
         let cache_key = if is_non_correlated && ctx.transaction_id().is_none() {
-            match Self::subquery_cache_key(subquery, ctx) {
-                Some(key) => {
-                    if let Some(cached_values) = get_cached_in_subquery(&key) {
-                        return Ok(cached_values);
-                    }
-                    Some(key)
-                }
-                None => None,
-            }
+            Self::subquery_cache_key(subquery, ctx)
         } else {
             None
         };
+        if let Some(key) = &cache_key {
+            if let Some(cached_values) = get_cached_in_subquery(key) {
+                return Ok(cached_values);
+            }
+        }
 
         // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
