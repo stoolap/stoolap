@@ -2118,6 +2118,14 @@ impl Executor {
                     }
                     processed_args.push(processed);
                 }
+                // The FILTER of an aggregate may hold a subquery as well
+                let processed_filter = match &func.filter {
+                    Some(filter) => self.try_process_expression_subqueries(filter, ctx)?,
+                    None => None,
+                };
+                if processed_filter.is_some() {
+                    any_changed = true;
+                }
 
                 if any_changed {
                     let final_args: Vec<Expression> = func
@@ -2133,7 +2141,10 @@ impl Executor {
                         arguments: final_args,
                         is_distinct: func.is_distinct,
                         order_by: func.order_by.clone(),
-                        filter: func.filter.clone(),
+                        filter: match processed_filter {
+                            Some(filter) => Some(Box::new(filter)),
+                            None => func.filter.clone(),
+                        },
                     }))))
                 } else {
                     Ok(None)
@@ -2215,11 +2226,22 @@ impl Executor {
             }
 
             Expression::AllAny(all_any) => {
+                // The left operand may hold a subquery of its own
+                let left = self
+                    .try_process_expression_subqueries(&all_any.left, ctx)?
+                    .unwrap_or_else(|| (*all_any.left).clone());
+                let bound = AllAnyExpression {
+                    token: all_any.token.clone(),
+                    left: Box::new(left),
+                    operator: all_any.operator.clone(),
+                    all_any_type: all_any.all_any_type,
+                    subquery: all_any.subquery.clone(),
+                };
                 // Execute the subquery to get all values
-                let values = self.execute_in_subquery(&all_any.subquery, ctx)?;
+                let values = self.execute_in_subquery(&bound.subquery, ctx)?;
 
                 // Convert ALL/ANY to an equivalent expression that the evaluator can handle
-                Ok(Some(self.convert_all_any_to_expression(all_any, values)?))
+                Ok(Some(self.convert_all_any_to_expression(&bound, values)?))
             }
 
             // No subqueries possible in other expression types
@@ -2614,6 +2636,9 @@ impl Executor {
             }
             Expression::Aliased(aliased) => {
                 Self::references_outer_columns(&aliased.expression, subquery_tables)
+            }
+            Expression::AllAny(all_any) => {
+                Self::references_outer_columns(&all_any.left, subquery_tables)
             }
             Expression::Cast(cast) => Self::references_outer_columns(&cast.expr, subquery_tables),
             Expression::Like(like) => {

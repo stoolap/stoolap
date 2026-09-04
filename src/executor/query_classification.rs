@@ -1071,6 +1071,9 @@ impl QueryClassification {
                         .as_ref()
                         .is_some_and(|e| Self::has_outer_column_reference(e, inner_tables))
             }
+            Expression::AllAny(all_any) => {
+                Self::has_outer_column_reference(&all_any.left, inner_tables)
+            }
             Expression::Cast(cast) => Self::has_outer_column_reference(&cast.expr, inner_tables),
             Expression::Like(like) => {
                 Self::has_outer_column_reference(&like.left, inner_tables)

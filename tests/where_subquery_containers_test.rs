@@ -580,3 +580,61 @@ fn test_correlated_left_operand_of_all() {
         "grouped join"
     );
 }
+
+/// An outer column on the left of ALL is the only correlation of the
+/// subquery: users from 21 clear every order of user 20
+#[test]
+fn test_outer_column_on_the_left_of_all_inside_a_subquery() {
+    let db = setup("where_subquery_all_left_outer");
+    let predicate = "EXISTS (SELECT 1 FROM orders x WHERE u.id * 10 > ALL (SELECT amount FROM orders WHERE user_id = 20) AND x.user_id = 25)";
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM users u WHERE {predicate}")
+        ),
+        10,
+        "single table"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!("SELECT COUNT(*) FROM {JOIN} WHERE {predicate}")
+        ),
+        30,
+        "joined rows"
+    );
+    let expected: Vec<Vec<String>> = (21..=30i64)
+        .map(|user| vec![user.to_string(), "3".to_string()])
+        .collect();
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT u.id, COUNT(o.id) FROM {JOIN} WHERE {predicate} GROUP BY u.id ORDER BY u.id")
+        ),
+        expected,
+        "grouped join"
+    );
+}
+
+/// A subquery on the left of ALL in the SELECT list is resolved before the
+/// expression compiles
+#[test]
+fn test_select_list_subquery_on_the_left_of_all() {
+    let db = setup("select_subquery_all_left");
+    assert_eq!(
+        count(
+            &db,
+            "SELECT CASE WHEN (SELECT 2) > ALL (SELECT 1) THEN 1 ELSE 0 END"
+        ),
+        1,
+        "scalar left of ALL"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT CASE WHEN (SELECT MAX(amount) FROM orders) > ALL (SELECT amount FROM orders WHERE user_id = 20) THEN 1 ELSE 0 END"
+        ),
+        1,
+        "aggregate left of ALL"
+    );
+}
