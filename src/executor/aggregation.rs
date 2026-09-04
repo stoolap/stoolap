@@ -742,7 +742,7 @@ impl Executor {
 
     /// Apply post-aggregation expressions to the result
     /// This handles expressions like `CASE WHEN SUM(x) > 100 THEN 'big' ELSE 'small' END`
-    fn apply_post_aggregation_expressions(
+    pub(crate) fn apply_post_aggregation_expressions(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
@@ -1358,7 +1358,7 @@ impl Executor {
 
     /// Parse aggregate functions from SELECT list
     /// Returns: (aggregations, non_agg_columns, post_agg_expressions)
-    fn parse_aggregations(
+    pub(crate) fn parse_aggregations(
         &self,
         stmt: &SelectStatement,
     ) -> Result<(Vec<SqlAggregateFunction>, Vec<String>)> {
@@ -1643,7 +1643,7 @@ impl Executor {
     }
 
     /// Parse GROUP BY clause
-    fn parse_group_by(
+    pub(crate) fn parse_group_by(
         &self,
         stmt: &SelectStatement,
         _base_columns: &[String],
