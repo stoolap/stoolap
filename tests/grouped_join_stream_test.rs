@@ -370,6 +370,7 @@ fn test_pushdown_or_with_a_partial_child() {
     db.execute("CREATE INDEX idx_orders_user_id ON orders(user_id)", ())
         .unwrap();
     let mut expected_rows = 0i64;
+    let mut expected_xor = 0i64;
     let mut expected_groups: Vec<Vec<String>> = Vec::new();
     let mut id = 0;
     for user in 1..=30i64 {
@@ -390,6 +391,9 @@ fn test_pushdown_or_with_a_partial_child() {
             .unwrap();
             if (amount > 10.0 && status == "c_1") || amount < 0.0 {
                 per_user += 1;
+            }
+            if (amount > 10.0 && status == "c_1") ^ (amount < 0.0) {
+                expected_xor += 1;
             }
         }
         expected_rows += per_user;
@@ -412,6 +416,18 @@ fn test_pushdown_or_with_a_partial_child() {
         scanned, expected_rows,
         "scan with the OR of a partial child"
     );
+    let xor: i64 = db
+        .query(
+            "SELECT COUNT(*) FROM orders WHERE (amount > 10 AND status LIKE 'c!_%' ESCAPE '!') XOR amount < 0",
+            (),
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(xor, expected_xor, "scan with the XOR of a partial child");
     let mut streamed = rows(
         &db,
         "SELECT u.id, COUNT(o.id) FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE (o.amount > 10 AND o.status LIKE 'c!_%' ESCAPE '!') OR o.amount < 0 GROUP BY u.id LIMIT 1000",
