@@ -256,3 +256,40 @@ fn test_grouped_join_where_nested_subquery() {
         check(&db, "u.id, COUNT(o.id)", from_where, "GROUP BY u.id", 7);
     }
 }
+
+#[test]
+fn test_grouped_join_right_filters() {
+    let db = setup("grouped_join_right_filters");
+    let inner = "users u INNER JOIN orders o ON u.id = o.user_id";
+    for (from_where, group) in [
+        (
+            format!("{inner} WHERE o.status IN ('completed', 'shipped') AND o.amount > 300"),
+            "GROUP BY u.id, u.name HAVING COUNT(o.id) > 1",
+        ),
+        (
+            format!("{inner} WHERE LENGTH(o.status) > 7"),
+            "GROUP BY u.id, u.name",
+        ),
+        (
+            format!("{inner} WHERE o.status = 'completed' AND o.amount > u.id * 10 + 1"),
+            "GROUP BY u.id, u.name",
+        ),
+        (
+            format!("{inner} WHERE o.status LIKE 'c%' AND u.id > 20"),
+            "GROUP BY u.id",
+        ),
+        (
+            format!("{inner} WHERE o.status <> 'shipped' OR o.amount < 100"),
+            "GROUP BY u.id",
+        ),
+    ] {
+        check(
+            &db,
+            "u.name, COUNT(o.id), SUM(o.amount)",
+            &from_where,
+            group,
+            1000,
+        );
+        check(&db, "u.name, COUNT(o.id)", &from_where, group, 9);
+    }
+}

@@ -6734,6 +6734,38 @@ impl Executor {
                 }
             }
         }
+        // Without a cross filter the operator builds only the columns the
+        // groups and aggregates read
+        let projection = if cross_filter.is_none() {
+            use crate::executor::operators::index_nested_loop::ColumnSource;
+            let mut sources: Vec<ColumnSource> = Vec::new();
+            let mut names: Vec<String> = Vec::new();
+            let mut place = |idx: usize| -> usize {
+                let source = if idx < outer_cols.len() {
+                    ColumnSource::Outer(idx)
+                } else {
+                    ColumnSource::Inner(idx - outer_cols.len())
+                };
+                match sources.iter().position(|s| *s == source) {
+                    Some(at) => at,
+                    None => {
+                        sources.push(source);
+                        names.push(all_columns[idx].clone());
+                        sources.len() - 1
+                    }
+                }
+            };
+            for idx in group_idx.iter_mut() {
+                *idx = place(*idx);
+            }
+            for idx in agg_idx.iter_mut().flatten() {
+                *idx = place(*idx);
+            }
+            let schema: Vec<ColumnInfo> = names.iter().map(ColumnInfo::new).collect();
+            Some((sources, schema))
+        } else {
+            None
+        };
         let mut result_columns: Vec<String> = group_names.clone();
         for agg in &aggregations {
             result_columns.push(
@@ -6761,7 +6793,18 @@ impl Executor {
             Some(cross) => Some(RowFilter::new(cross, &all_columns)?.with_context(ctx)),
             None => None,
         };
+        // A right-side filter the storage layer can evaluate runs inside the
+        // inner fetch; any other stays a residual on the joined row
+        let build_inner_filter = || {
+            right_filter
+                .map(|rf| crate::executor::utils::strip_table_qualifier(rf, inner_alias))
+                .and_then(|rf| crate::executor::expr_converter::convert_ast_to_storage_expr(&rf))
+        };
+        let pushed_inner = build_inner_filter().is_some();
         let build_residual_filter = || {
+            if pushed_inner {
+                return None;
+            }
             right_filter.and_then(|rf| {
                 let qualified_rf = add_table_qualifier(rf, inner_alias);
                 JoinFilter::new(
@@ -6820,18 +6863,29 @@ impl Executor {
         loop {
             let outer_op: Box<dyn Operator> =
                 Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
+            let table = match inner_table.take() {
+                Some(table) => table,
+                None => self.join_table(&snapshot, &table_name)?,
+            };
+            let inner_filter = build_inner_filter().map(|mut filter| {
+                filter.prepare_for_schema(table.schema());
+                filter
+            });
             let mut op = IndexNestedLoopJoinOperator::new(
                 outer_op,
-                match inner_table.take() {
-                    Some(table) => table,
-                    None => self.join_table(&snapshot, &table_name)?,
-                },
+                table,
                 inner_cols.iter().map(ColumnInfo::new).collect(),
                 op_join_type,
                 outer_key_idx,
                 lookup_strategy.clone(),
                 build_residual_filter(),
             );
+            if let Some(filter) = inner_filter {
+                op = op.with_inner_filter(filter);
+            }
+            if let Some((sources, schema)) = &projection {
+                op = op.with_projection(sources.clone(), schema.clone());
+            }
             op.open()?;
             // The group columns cover the left primary key, so a change in them
             // is a new left row

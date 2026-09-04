@@ -29,7 +29,7 @@ use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row, RowVec, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
-use crate::storage::expression::ConstBoolExpr;
+use crate::storage::expression::{ConstBoolExpr, Expression};
 use crate::storage::traits::{Index, Table};
 use smallvec::SmallVec;
 
@@ -117,6 +117,8 @@ pub struct IndexNestedLoopJoinOperator {
 
     // Expression for fetching rows (always true - we apply residual separately)
     true_expr: ConstBoolExpr,
+    // A predicate on inner columns the fetch applies instead of the residual
+    inner_filter: Option<Box<dyn Expression>>,
 
     // State tracking
     opened: bool,
@@ -175,6 +177,7 @@ impl IndexNestedLoopJoinOperator {
             // Pre-allocate row buffer to avoid per-row allocation
             row_buffer: Row::with_capacity(total_cols),
             true_expr: ConstBoolExpr::true_expr(),
+            inner_filter: None,
             opened: false,
             outer_exhausted: false,
             outer_rows_seen: 0,
@@ -204,6 +207,13 @@ impl IndexNestedLoopJoinOperator {
             repeats_source,
         });
         self.schema = projected_schema;
+        self
+    }
+
+    /// A filter the inner fetch applies to each candidate row, for a
+    /// predicate on inner columns only
+    pub fn with_inner_filter(mut self, filter: Box<dyn Expression>) -> Self {
+        self.inner_filter = Some(filter);
         self
     }
 
@@ -340,9 +350,13 @@ impl IndexNestedLoopJoinOperator {
         }
 
         // Fetch matching rows directly into inner_rows buffer
+        let filter: &dyn Expression = match &self.inner_filter {
+            Some(filter) => filter.as_ref(),
+            None => &self.true_expr,
+        };
         self.inner_table.fetch_rows_by_ids_into(
             &self.row_id_buffer,
-            &self.true_expr,
+            filter,
             &mut self.current_inner_rows,
         )
     }
