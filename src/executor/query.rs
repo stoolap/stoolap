@@ -330,7 +330,7 @@ impl Executor {
         // path reads the statement's own columns; a correlated one is
         // resolved per input row at the aggregation entry
         let bound_stmt;
-        let stmt = if classification.has_aggregation
+        let stmt = if (classification.has_aggregation || classification.has_window_functions)
             && stmt.columns.iter().any(Self::has_subqueries)
             && !Self::has_correlated_select_subqueries(&stmt.columns)
         {

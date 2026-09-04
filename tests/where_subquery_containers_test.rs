@@ -863,3 +863,60 @@ fn test_subquery_inside_an_aggregate_in_having_and_order_by() {
         "ORDER BY inside the aggregate"
     );
 }
+
+/// A subquery inside an aggregate next to a window function, and inside a
+/// window aggregate, is resolved before either runs
+#[test]
+fn test_subquery_inside_an_aggregate_with_a_window() {
+    let db = setup("select_subquery_window");
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT SUM((SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id)), ROW_NUMBER() OVER () FROM users u"
+        ),
+        vec![vec!["4710".to_string(), "1".to_string()]],
+        "aggregate beside a window function"
+    );
+    let windowed = rows(&db, "SELECT SUM((SELECT 1)) OVER () FROM users");
+    assert_eq!(windowed.len(), 30, "window aggregate rows");
+    assert!(
+        windowed.iter().all(|row| row[0] == "30"),
+        "window aggregate over a constant subquery: {windowed:?}"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT u.id, SUM((SELECT MAX(x.amount) FROM orders x WHERE x.user_id = u.id)) OVER () FROM users u WHERE u.id <= 3 ORDER BY u.id"
+        ),
+        vec![
+            vec!["1".to_string(), "66".to_string()],
+            vec!["2".to_string(), "66".to_string()],
+            vec!["3".to_string(), "66".to_string()],
+        ],
+        "window aggregate over a correlated subquery"
+    );
+}
+
+/// The column a lifted subquery lands in never takes a user column's name
+#[test]
+fn test_lifted_column_name_avoids_user_columns() {
+    let db = Database::open("memory://lifted_column_name").unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, __agg_subquery_0 INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO c VALUES (1, 100), (2, 200)", ())
+        .unwrap();
+    assert_eq!(
+        count(&db, "SELECT SUM((SELECT 1)) + SUM(__agg_subquery_0) FROM c"),
+        302
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT SUM((SELECT MAX(id) FROM c d WHERE d.id = c.id)) + SUM(__agg_subquery_0) FROM c"
+        ),
+        303
+    );
+}

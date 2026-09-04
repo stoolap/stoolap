@@ -2000,6 +2000,15 @@ impl Executor {
             Expression::List(list) => list.elements.iter().any(Self::has_subqueries),
             Expression::ExpressionList(list) => list.expressions.iter().any(Self::has_subqueries),
             Expression::Distinct(distinct) => Self::has_subqueries(&distinct.expr),
+            Expression::Window(window) => window
+                .function
+                .arguments
+                .iter()
+                .chain(window.function.filter.as_deref())
+                .chain(window.function.order_by.iter().map(|o| &o.expression))
+                .chain(window.partition_by.iter())
+                .chain(window.order_by.iter().map(|o| &o.expression))
+                .any(Self::has_subqueries),
             _ => false,
         }
     }
@@ -2333,6 +2342,46 @@ impl Executor {
                     })
                 })),
 
+            Expression::Window(window) => {
+                let function = match self.try_process_expression_subqueries(
+                    &Expression::FunctionCall(window.function.clone()),
+                    ctx,
+                )? {
+                    Some(Expression::FunctionCall(function)) => Some(function),
+                    _ => None,
+                };
+                let partition_by = self.try_process_expression_list(&window.partition_by, ctx)?;
+                let order_exprs: Vec<Expression> = window
+                    .order_by
+                    .iter()
+                    .map(|o| o.expression.clone())
+                    .collect();
+                let order_by = self.try_process_expression_list(&order_exprs, ctx)?;
+                if function.is_none() && partition_by.is_none() && order_by.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(Expression::Window(Box::new(
+                    crate::parser::ast::WindowExpression {
+                        token: window.token.clone(),
+                        function: function.unwrap_or_else(|| window.function.clone()),
+                        window_ref: window.window_ref.clone(),
+                        partition_by: partition_by.unwrap_or_else(|| window.partition_by.clone()),
+                        order_by: match order_by {
+                            Some(expressions) => expressions
+                                .into_iter()
+                                .zip(window.order_by.iter())
+                                .map(|(expression, order)| OrderByExpression {
+                                    expression,
+                                    ..order.clone()
+                                })
+                                .collect(),
+                            None => window.order_by.clone(),
+                        },
+                        frame: window.frame.clone(),
+                    },
+                ))))
+            }
+
             // No subqueries possible in other expression types
             _ => Ok(None),
         }
@@ -2440,6 +2489,15 @@ impl Executor {
                 list.expressions.iter().any(Self::has_correlated_subqueries)
             }
             Expression::Distinct(distinct) => Self::has_correlated_subqueries(&distinct.expr),
+            Expression::Window(window) => window
+                .function
+                .arguments
+                .iter()
+                .chain(window.function.filter.as_deref())
+                .chain(window.function.order_by.iter().map(|o| &o.expression))
+                .chain(window.partition_by.iter())
+                .chain(window.order_by.iter().map(|o| &o.expression))
+                .any(Self::has_correlated_subqueries),
             _ => false,
         }
     }
@@ -2661,6 +2719,40 @@ impl Executor {
             })),
 
             // For all other expression types, return as-is
+            Expression::Window(window) => {
+                let function = match self.process_correlated_expression(
+                    &Expression::FunctionCall(window.function.clone()),
+                    ctx,
+                )? {
+                    Expression::FunctionCall(function) => function,
+                    _ => window.function.clone(),
+                };
+                Ok(Expression::Window(Box::new(
+                    crate::parser::ast::WindowExpression {
+                        token: window.token.clone(),
+                        function,
+                        window_ref: window.window_ref.clone(),
+                        partition_by: window
+                            .partition_by
+                            .iter()
+                            .map(|e| self.process_correlated_expression(e, ctx))
+                            .collect::<Result<Vec<_>>>()?,
+                        order_by: window
+                            .order_by
+                            .iter()
+                            .map(|order| {
+                                Ok(OrderByExpression {
+                                    expression: self
+                                        .process_correlated_expression(&order.expression, ctx)?,
+                                    ..order.clone()
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                        frame: window.frame.clone(),
+                    },
+                )))
+            }
+
             _ => Ok(expr.clone()),
         }
     }
@@ -2682,28 +2774,47 @@ impl Executor {
     /// subqueries taken out in that order. None when no aggregate holds one.
     pub(crate) fn lift_subqueries_in_aggregates(
         stmt: &SelectStatement,
-    ) -> Option<(SelectStatement, Vec<Expression>)> {
+        base_columns: &[String],
+    ) -> Option<(SelectStatement, Vec<Expression>, Vec<String>)> {
+        // The lifted columns take a name no input column starts with
+        let mut prefix = String::from("__agg_subquery");
+        while base_columns
+            .iter()
+            .any(|column| column.to_lowercase().starts_with(&prefix))
+        {
+            prefix.push('_');
+        }
         let mut lifted = Vec::new();
         let columns: Vec<Expression> = stmt
             .columns
             .iter()
-            .map(|column| Self::lift_subqueries_in(column, false, &mut lifted))
+            .map(|column| Self::lift_subqueries_in(column, false, &mut lifted, &prefix))
             .collect();
-        let having = stmt
-            .having
-            .as_ref()
-            .map(|having| Box::new(Self::lift_subqueries_in(having, false, &mut lifted)));
+        let having = stmt.having.as_ref().map(|having| {
+            Box::new(Self::lift_subqueries_in(
+                having,
+                false,
+                &mut lifted,
+                &prefix,
+            ))
+        });
         let order_by: Vec<OrderByExpression> = stmt
             .order_by
             .iter()
             .map(|order| OrderByExpression {
-                expression: Self::lift_subqueries_in(&order.expression, false, &mut lifted),
+                expression: Self::lift_subqueries_in(
+                    &order.expression,
+                    false,
+                    &mut lifted,
+                    &prefix,
+                ),
                 ..order.clone()
             })
             .collect();
         if lifted.is_empty() {
             return None;
         }
+        let names = (0..lifted.len()).map(|i| format!("{prefix}_{i}")).collect();
         Some((
             SelectStatement {
                 columns,
@@ -2712,17 +2823,46 @@ impl Executor {
                 ..stmt.clone()
             },
             lifted,
+            names,
         ))
     }
 
-    fn lifted_column_name(index: usize) -> String {
-        format!("__agg_subquery_{index}")
+    fn lift_subqueries_in_call(
+        func: &FunctionCall,
+        inside_aggregate: bool,
+        lifted: &mut Vec<Expression>,
+        prefix: &str,
+    ) -> FunctionCall {
+        let inside = inside_aggregate || super::utils::is_aggregate_function(&func.function);
+        FunctionCall {
+            token: func.token.clone(),
+            function: func.function.clone(),
+            arguments: func
+                .arguments
+                .iter()
+                .map(|a| Self::lift_subqueries_in(a, inside, lifted, prefix))
+                .collect(),
+            is_distinct: func.is_distinct,
+            order_by: func
+                .order_by
+                .iter()
+                .map(|order| OrderByExpression {
+                    expression: Self::lift_subqueries_in(&order.expression, inside, lifted, prefix),
+                    ..order.clone()
+                })
+                .collect(),
+            filter: func
+                .filter
+                .as_ref()
+                .map(|f| Box::new(Self::lift_subqueries_in(f, inside, lifted, prefix))),
+        }
     }
 
     fn lift_subqueries_in(
         expr: &Expression,
         inside_aggregate: bool,
         lifted: &mut Vec<Expression>,
+        prefix: &str,
     ) -> Expression {
         let is_subquery = matches!(
             expr,
@@ -2731,40 +2871,44 @@ impl Executor {
             if matches!(in_expr.right.as_ref(), Expression::ScalarSubquery(_)));
         if inside_aggregate && is_subquery {
             lifted.push(expr.clone());
-            let name = Self::lifted_column_name(lifted.len() - 1);
+            let name = format!("{prefix}_{}", lifted.len() - 1);
             return Expression::Identifier(crate::parser::ast::Identifier::new(
                 dummy_token(&name, TokenType::Identifier),
                 name.as_str(),
             ));
         }
         let lift = |e: &Expression, lifted: &mut Vec<Expression>| {
-            Self::lift_subqueries_in(e, inside_aggregate, lifted)
+            Self::lift_subqueries_in(e, inside_aggregate, lifted, prefix)
         };
         match expr {
-            Expression::FunctionCall(func) => {
-                let inside =
-                    inside_aggregate || super::utils::is_aggregate_function(&func.function);
-                Expression::FunctionCall(Box::new(FunctionCall {
-                    token: func.token.clone(),
-                    function: func.function.clone(),
-                    arguments: func
-                        .arguments
+            Expression::FunctionCall(func) => Expression::FunctionCall(Box::new(
+                Self::lift_subqueries_in_call(func, inside_aggregate, lifted, prefix),
+            )),
+            // A window aggregate reads its argument per row like any other
+            Expression::Window(window) => {
+                Expression::Window(Box::new(crate::parser::ast::WindowExpression {
+                    token: window.token.clone(),
+                    function: Box::new(Self::lift_subqueries_in_call(
+                        &window.function,
+                        true,
+                        lifted,
+                        prefix,
+                    )),
+                    window_ref: window.window_ref.clone(),
+                    partition_by: window
+                        .partition_by
                         .iter()
-                        .map(|a| Self::lift_subqueries_in(a, inside, lifted))
+                        .map(|e| lift(e, lifted))
                         .collect(),
-                    is_distinct: func.is_distinct,
-                    order_by: func
+                    order_by: window
                         .order_by
                         .iter()
                         .map(|order| OrderByExpression {
-                            expression: Self::lift_subqueries_in(&order.expression, inside, lifted),
+                            expression: lift(&order.expression, lifted),
                             ..order.clone()
                         })
                         .collect(),
-                    filter: func
-                        .filter
-                        .as_ref()
-                        .map(|f| Box::new(Self::lift_subqueries_in(f, inside, lifted))),
+                    frame: window.frame.clone(),
                 }))
             }
             Expression::Infix(infix) => Expression::Infix(InfixExpression {
@@ -2848,8 +2992,9 @@ impl Executor {
     pub(crate) fn materialize_lifted_subqueries(
         &self,
         lifted: &[Expression],
+        names: &[String],
         ctx: &ExecutionContext,
-        base_rows: crate::core::RowVec,
+        base_rows: &[(i64, crate::core::Row)],
         base_columns: &[String],
         qualifier: Option<&str>,
     ) -> Result<(crate::core::RowVec, Vec<String>)> {
@@ -2885,14 +3030,14 @@ impl Executor {
                 let bound = self.process_correlated_expression(node, &row_ctx)?;
                 let value = super::expression::ExpressionEval::compile(&bound, base_columns)?
                     .with_context(&row_ctx)
-                    .eval_slice(&row)?;
+                    .eval_slice(row)?;
                 values.push(value);
             }
             ctx.check_cancelled()?;
-            rows.push((id, crate::core::Row::from_values(values)));
+            rows.push((*id, crate::core::Row::from_values(values)));
         }
         let mut columns = base_columns.to_vec();
-        columns.extend((0..lifted.len()).map(Self::lifted_column_name));
+        columns.extend(names.iter().cloned());
         Ok((rows, columns))
     }
 
@@ -3065,6 +3210,15 @@ impl Executor {
             Expression::ExpressionList(list) => list
                 .expressions
                 .iter()
+                .any(|e| Self::references_outer_columns(e, subquery_tables)),
+            Expression::Window(window) => window
+                .function
+                .arguments
+                .iter()
+                .chain(window.function.filter.as_deref())
+                .chain(window.function.order_by.iter().map(|o| &o.expression))
+                .chain(window.partition_by.iter())
+                .chain(window.order_by.iter().map(|o| &o.expression))
                 .any(|e| Self::references_outer_columns(e, subquery_tables)),
             _ => false,
         }

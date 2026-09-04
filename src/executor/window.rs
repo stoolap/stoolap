@@ -392,6 +392,39 @@ impl Executor {
         pre_sorted: Option<WindowPreSortedState>,
         pre_grouped: Option<WindowPreGroupedState>,
     ) -> Result<Box<dyn QueryResult>> {
+        // A subquery inside a window function is resolved per input row first
+        let lifted_stmt;
+        let lifted_rows;
+        let lifted_columns;
+        let (stmt, base_rows, base_columns) = match Self::aggregates_hold_subquery(stmt)
+            .then(|| Self::lift_subqueries_in_aggregates(stmt, base_columns))
+            .flatten()
+        {
+            Some((rewritten, lifted, names)) => {
+                let qualifier = stmt
+                    .table_expr
+                    .as_deref()
+                    .and_then(super::utils::get_table_alias_from_expr);
+                let (rows, all_columns) = self.materialize_lifted_subqueries(
+                    &lifted,
+                    &names,
+                    ctx,
+                    base_rows,
+                    base_columns,
+                    qualifier.as_deref(),
+                )?;
+                lifted_stmt = rewritten;
+                lifted_rows = rows;
+                lifted_columns = all_columns;
+                (
+                    &lifted_stmt,
+                    lifted_rows.as_slice(),
+                    lifted_columns.as_slice(),
+                )
+            }
+            None => (stmt, base_rows, base_columns),
+        };
+
         // Parse window functions from the SELECT list
         let window_functions = self.parse_window_functions(stmt, base_columns)?;
 

@@ -642,6 +642,15 @@ impl QueryClassification {
                 .iter()
                 .any(Self::expression_has_scalar_subquery),
             Expression::Distinct(distinct) => Self::expression_has_scalar_subquery(&distinct.expr),
+            Expression::Window(window) => window
+                .function
+                .arguments
+                .iter()
+                .chain(window.function.filter.as_deref())
+                .chain(window.function.order_by.iter().map(|o| &o.expression))
+                .chain(window.partition_by.iter())
+                .chain(window.order_by.iter().map(|o| &o.expression))
+                .any(Self::expression_has_scalar_subquery),
             _ => false,
         }
     }
@@ -972,6 +981,15 @@ impl QueryClassification {
             Expression::Distinct(distinct) => {
                 Self::expression_has_correlated_subqueries(&distinct.expr)
             }
+            Expression::Window(window) => window
+                .function
+                .arguments
+                .iter()
+                .chain(window.function.filter.as_deref())
+                .chain(window.function.order_by.iter().map(|o| &o.expression))
+                .chain(window.partition_by.iter())
+                .chain(window.order_by.iter().map(|o| &o.expression))
+                .any(Self::expression_has_correlated_subqueries),
             _ => false,
         }
     }
@@ -1122,6 +1140,15 @@ impl QueryClassification {
             Expression::ExpressionList(list) => list
                 .expressions
                 .iter()
+                .any(|e| Self::has_outer_column_reference(e, inner_tables)),
+            Expression::Window(window) => window
+                .function
+                .arguments
+                .iter()
+                .chain(window.function.filter.as_deref())
+                .chain(window.function.order_by.iter().map(|o| &o.expression))
+                .chain(window.partition_by.iter())
+                .chain(window.order_by.iter().map(|o| &o.expression))
                 .any(|e| Self::has_outer_column_reference(e, inner_tables)),
             _ => false,
         }
