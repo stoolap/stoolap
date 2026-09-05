@@ -2315,8 +2315,7 @@ impl Executor {
 
         // OPTIMIZATION: Pre-compute column index for function argument
         let arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() {
-            self.extract_column_from_arg(&wf_info.arguments[0])
-                .and_then(|col_name| col_index_map.get(&col_name.to_lowercase()).copied())
+            self.resolve_column_index(&wf_info.arguments[0], col_index_map)
         } else {
             None
         };
@@ -2529,8 +2528,7 @@ impl Executor {
 
         // Pre-compute column index for function argument
         let arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() {
-            self.extract_column_from_arg(&wf_info.arguments[0])
-                .and_then(|col_name| col_index_map.get(&col_name.to_lowercase()).copied())
+            self.resolve_column_index(&wf_info.arguments[0], col_index_map)
         } else {
             None
         };
@@ -2735,8 +2733,7 @@ impl Executor {
 
         // Pre-compute column index for function argument
         let arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() {
-            self.extract_column_from_arg(&wf_info.arguments[0])
-                .and_then(|col_name| col_index_map.get(&col_name.to_lowercase()).copied())
+            self.resolve_column_index(&wf_info.arguments[0], col_index_map)
         } else {
             None
         };
@@ -3257,23 +3254,6 @@ impl Executor {
                 (0, peer_group_end)
             }
         }
-    }
-
-    /// Extract column name from expression
-    fn extract_column_from_expr(&self, expr: &Expression) -> Option<String> {
-        match expr {
-            Expression::Identifier(id) => Some(id.value.to_string()),
-            Expression::QualifiedIdentifier(qid) => {
-                // Return fully qualified name "qualifier.column" for JOIN results
-                Some(format!("{}.{}", qid.qualifier.value, qid.name.value))
-            }
-            _ => None,
-        }
-    }
-
-    /// Extract column name from function argument
-    fn extract_column_from_arg(&self, arg: &Expression) -> Option<String> {
-        self.extract_column_from_expr(arg)
     }
 
     /// Resolve column index from expression, trying both qualified and unqualified names
