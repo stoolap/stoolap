@@ -2388,10 +2388,10 @@ impl Executor {
                 // Example: WHERE o.user_id = u.id -> WHERE o.user_id = 42
                 if let Some(outer_row) = ctx.outer_row() {
                     let schema = table.schema();
+                    let inner = [table_alias.as_deref().unwrap_or(table_name)];
                     let scope = super::utils::InnerScope {
-                        table: table_name,
-                        alias: table_alias.as_deref(),
-                        schema,
+                        tables: &inner,
+                        schema: Some(schema),
                     };
                     let substituted_expr = super::utils::substitute_outer_references_in_scope(
                         where_expr, outer_row, &scope,

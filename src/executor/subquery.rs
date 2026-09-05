@@ -1780,6 +1780,17 @@ impl Executor {
         let is_non_correlated =
             ctx.outer_row().is_none() && !Self::is_subquery_correlated(subquery);
 
+        // A correlated subquery reads the parent row in what it selects and
+        // in its HAVING, not only in its WHERE
+        let bound;
+        let subquery = match Self::bind_outer_references(subquery, ctx) {
+            Some(rewritten) => {
+                bound = rewritten;
+                &bound
+            }
+            None => subquery,
+        };
+
         // For non-correlated subqueries, check cache first using SQL string
         // as key; bypassed inside explicit transactions (see
         // execute_in_subquery for the ROLLBACK rationale)
@@ -3267,7 +3278,57 @@ impl Executor {
             }
         }
 
+        // A HAVING reads the parent row the same way a WHERE does
+        if let Some(ref having) = subquery.having {
+            if Self::references_outer_columns(having, &subquery_tables) {
+                return true;
+            }
+        }
+
         false
+    }
+
+    /// The subquery with the parent row's values in place of the outer
+    /// references its own expressions carry. Its WHERE is bound where the
+    /// scan reads it; what it selects and its HAVING are bound here, since
+    /// a name the FROM does not define would otherwise fall back to an
+    /// inner column that happens to share it. None when it reads no
+    /// parent row or carries no outer reference
+    fn bind_outer_references(
+        subquery: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Option<SelectStatement> {
+        let outer_row = ctx.outer_row()?;
+        // With no table to own it, every qualified name reads as an outer
+        // one, so this asks whether there is anything at all to bind before
+        // the FROM's names are collected
+        if !subquery
+            .columns
+            .iter()
+            .chain(subquery.having.as_deref())
+            .any(|expr| Self::references_outer_columns(expr, &[]))
+        {
+            return None;
+        }
+        let tables = Self::collect_subquery_table_columns(subquery);
+        let tables: Vec<&str> = tables.iter().map(|table| table.as_str()).collect();
+        let scope = super::utils::InnerScope {
+            tables: &tables,
+            schema: None,
+        };
+        let bind = |expr: &Expression| {
+            super::utils::substitute_outer_references_in_scope(expr, outer_row, &scope)
+        };
+        let columns: Vec<Expression> = subquery.columns.iter().map(&bind).collect();
+        let having = subquery.having.as_deref().map(&bind);
+        if columns == subquery.columns && having.as_ref() == subquery.having.as_deref() {
+            return None;
+        }
+        Some(SelectStatement {
+            columns,
+            having: having.map(Box::new),
+            ..subquery.clone()
+        })
     }
 
     /// Collect table/alias names from a subquery's FROM clause
