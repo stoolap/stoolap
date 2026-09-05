@@ -916,7 +916,8 @@ impl Executor {
                     Expression::FunctionCall(func) if is_aggregate_function(&func.function) => {
                         self.get_aggregate_column_name(func).to_lowercase()
                     }
-                    _ => continue, // Can't easily compare, assume mismatch
+                    // Anything else matches only as a GROUP BY expression column
+                    _ => self.expression_to_string(col_expr).to_lowercase(),
                 };
                 if i >= agg_columns.len() || agg_columns[i].to_lowercase() != expected_name {
                     columns_match = false;
@@ -993,9 +994,15 @@ impl Executor {
                             )));
                         }
                     } else {
-                        // Non-aggregate function - evaluate it
+                        // Non-aggregate function: a GROUP BY expression column is
+                        // read as it is, anything else is evaluated
+                        let expr_lower = self.expression_to_string(col_expr).to_lowercase();
                         final_columns.push(format!("{}(...)", func.function));
-                        column_sources.push(make_source(col_expr, is_correlated));
+                        if agg_col_index_map.contains_key(&expr_lower) && !is_correlated {
+                            column_sources.push(ColumnSource::AggColumn(expr_lower));
+                        } else {
+                            column_sources.push(make_source(col_expr, is_correlated));
+                        }
                     }
                 }
                 Expression::Aliased(aliased) => {
