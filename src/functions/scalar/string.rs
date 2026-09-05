@@ -443,20 +443,31 @@ impl ScalarFunction for TrimFunction {
         FunctionInfo::new(
             "TRIM",
             FunctionType::Scalar,
-            "Removes leading and trailing whitespace from a string",
-            FunctionSignature::new(FunctionDataType::String, vec![FunctionDataType::Any], 1, 1),
+            "Removes leading and trailing whitespace, or the given characters, from a string",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![FunctionDataType::Any, FunctionDataType::String],
+                1,
+                2,
+            ),
         )
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        validate_arg_count!(args, "TRIM", 1);
+        validate_arg_count!(args, "TRIM", 1, 2);
 
-        if args[0].is_null() {
+        if args[0].is_null() || args.get(1).is_some_and(Value::is_null) {
             return Ok(Value::null_unknown());
         }
 
         let s = value_to_string(&args[0]);
-        Ok(Value::Text(SmartString::from(s.trim())))
+        Ok(Value::Text(SmartString::from(match args.get(1) {
+            Some(chars) => {
+                let chars = value_to_string(chars);
+                s.trim_matches(|c| chars.contains(c))
+            }
+            None => s.trim(),
+        })))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -481,20 +492,31 @@ impl ScalarFunction for LtrimFunction {
         FunctionInfo::new(
             "LTRIM",
             FunctionType::Scalar,
-            "Removes leading whitespace from a string",
-            FunctionSignature::new(FunctionDataType::String, vec![FunctionDataType::Any], 1, 1),
+            "Removes leading whitespace, or the given characters, from a string",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![FunctionDataType::Any, FunctionDataType::String],
+                1,
+                2,
+            ),
         )
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        validate_arg_count!(args, "LTRIM", 1);
+        validate_arg_count!(args, "LTRIM", 1, 2);
 
-        if args[0].is_null() {
+        if args[0].is_null() || args.get(1).is_some_and(Value::is_null) {
             return Ok(Value::null_unknown());
         }
 
         let s = value_to_string(&args[0]);
-        Ok(Value::Text(SmartString::from(s.trim_start())))
+        Ok(Value::Text(SmartString::from(match args.get(1) {
+            Some(chars) => {
+                let chars = value_to_string(chars);
+                s.trim_start_matches(|c| chars.contains(c))
+            }
+            None => s.trim_start(),
+        })))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -519,20 +541,31 @@ impl ScalarFunction for RtrimFunction {
         FunctionInfo::new(
             "RTRIM",
             FunctionType::Scalar,
-            "Removes trailing whitespace from a string",
-            FunctionSignature::new(FunctionDataType::String, vec![FunctionDataType::Any], 1, 1),
+            "Removes trailing whitespace, or the given characters, from a string",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![FunctionDataType::Any, FunctionDataType::String],
+                1,
+                2,
+            ),
         )
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        validate_arg_count!(args, "RTRIM", 1);
+        validate_arg_count!(args, "RTRIM", 1, 2);
 
-        if args[0].is_null() {
+        if args[0].is_null() || args.get(1).is_some_and(Value::is_null) {
             return Ok(Value::null_unknown());
         }
 
         let s = value_to_string(&args[0]);
-        Ok(Value::Text(SmartString::from(s.trim_end())))
+        Ok(Value::Text(SmartString::from(match args.get(1) {
+            Some(chars) => {
+                let chars = value_to_string(chars);
+                s.trim_end_matches(|c| chars.contains(c))
+            }
+            None => s.trim_end(),
+        })))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
