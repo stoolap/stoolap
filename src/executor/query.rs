@@ -465,8 +465,21 @@ impl Executor {
             limit_offset_applied = all_union_all && set_limit.is_some();
         }
 
-        // Count expected SELECT columns (before any extra ORDER BY columns)
-        let expected_columns = self.count_select_columns(stmt);
+        // Count expected SELECT columns (before any extra ORDER BY columns).
+        // Beside a star the count is unknown, but the only columns past
+        // the visible ones are then the window functions ORDER BY had
+        // computed for it, so those are counted off the end
+        let expected_columns = match self.count_select_columns(stmt) {
+            0 if classification.has_window_functions => {
+                let hidden = Self::hidden_order_by_windows(stmt).len();
+                if hidden > 0 {
+                    columns.len().saturating_sub(hidden)
+                } else {
+                    0
+                }
+            }
+            counted => counted,
+        };
 
         // Apply DISTINCT (skip for DISTINCT ON — it's applied after ORDER BY)
         // When ORDER BY references columns not in SELECT, we add extra columns for sorting.

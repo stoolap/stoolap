@@ -699,11 +699,12 @@ impl QueryClassification {
     fn check_has_window_functions(stmt: &SelectStatement) -> bool {
         stmt.columns
             .iter()
+            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
             .any(Self::expression_has_window_function)
     }
 
     /// Check if an expression contains window functions
-    fn expression_has_window_function(expr: &Expression) -> bool {
+    pub(crate) fn expression_has_window_function(expr: &Expression) -> bool {
         match expr {
             Expression::Window(_) => true,
             Expression::Aliased(aliased) => {
