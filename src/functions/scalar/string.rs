@@ -339,31 +339,37 @@ impl ScalarFunction for SubstringFunction {
         let s = value_to_string(&args[0]);
         let chars: Vec<char> = s.chars().collect();
 
-        // SQL SUBSTRING uses 1-based indexing
+        // SQL SUBSTRING counts from one. A start below one names a
+        // position before the string, and a negative one counts back from
+        // the end, so the window it opens may reach in from either side
         let start = value_to_i64(&args[1]).ok_or_else(|| {
             Error::invalid_argument("SUBSTRING start position must be an integer")
         })?;
+        let len = chars.len() as i64;
+        let start = if start < 0 { len + start + 1 } else { start };
 
-        // Convert to 0-based index, handling negative values
-        let start_idx = if start < 1 { 0 } else { (start - 1) as usize };
-
-        if start_idx >= chars.len() {
+        // The window runs from the start for a length, or back from it for
+        // a negative one, and only the part inside the string is returned
+        let (from, to) = if args.len() == 3 {
+            let length = value_to_i64(&args[2])
+                .ok_or_else(|| Error::invalid_argument("SUBSTRING length must be an integer"))?;
+            if length < 0 {
+                (start + length, start)
+            } else {
+                (start, start + length)
+            }
+        } else {
+            (start, len + 1)
+        };
+        let from = from.max(1);
+        let to = to.min(len + 1);
+        if to <= from {
             return Ok(Value::Text(SmartString::from("")));
         }
 
-        let result: String = if args.len() == 3 {
-            let length = value_to_i64(&args[2])
-                .ok_or_else(|| Error::invalid_argument("SUBSTRING length must be an integer"))?;
-
-            if length < 0 {
-                return Ok(Value::Text(SmartString::from("")));
-            }
-
-            let end_idx = std::cmp::min(start_idx + length as usize, chars.len());
-            chars[start_idx..end_idx].iter().collect()
-        } else {
-            chars[start_idx..].iter().collect()
-        };
+        let result: String = chars[(from - 1) as usize..(to - 1) as usize]
+            .iter()
+            .collect();
 
         Ok(Value::Text(SmartString::from_string(result)))
     }

@@ -632,7 +632,11 @@ impl Executor {
                                 }
                             }
                         }
-                        None
+                        // The projection puts an expression the SELECT list
+                        // leaves out in a column named after it
+                        columns
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(&order_expr_str))
                     }
                 }
             };
@@ -1813,6 +1817,25 @@ impl Executor {
                                 || c.eq_ignore_ascii_case(qi.name.value_lower.as_str())
                         })
                     {
+                        return true;
+                    }
+                }
+                Expression::IntegerLiteral(_) => {}
+                // An expression is read from a column of its own, unless the
+                // SELECT list already has it under a name. A subquery reads
+                // the parent row per row, which the sort does for itself
+                other
+                    if !matches!(
+                        other,
+                        Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
+                    ) && !Self::has_subqueries(other) =>
+                {
+                    let name = other.to_string();
+                    let aliased = stmt.columns.iter().any(|expr| match expr {
+                        Expression::Aliased(a) => a.expression.to_string() == name,
+                        _ => false,
+                    });
+                    if !aliased && !select_columns.contains(name.to_lowercase().as_str()) {
                         return true;
                     }
                 }
@@ -3725,7 +3748,7 @@ impl Executor {
             // 1. Include those columns in the output (appended at end)
             // 2. Sort will happen in execute_select
             // 3. Extra columns will be projected out after sorting
-            let (projected_rows, _) = self.project_rows_with_order_by(
+            let (projected_rows, extra_names) = self.project_rows_with_order_by(
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
@@ -3733,69 +3756,11 @@ impl Executor {
                 &all_columns,
                 ctx,
             )?;
-            // Get base column names
+            // Get base column names, then the ones the projection appended,
+            // which it names in the order it appends them
             let mut output_columns =
                 self.get_output_column_names(&stmt.columns, &all_columns, table_alias.as_deref());
-            // Append ORDER BY columns not in SELECT. A qualified one is
-            // appended to the rows the same way, so it needs a name here or
-            // the sort key rides out with them
-            // OPTIMIZATION: Use eq_ignore_ascii_case to avoid allocations
-            for ob in &stmt.order_by {
-                match &ob.expression {
-                    Expression::Identifier(id)
-                        if !output_columns
-                            .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&id.value_lower)) =>
-                    {
-                        output_columns.push(id.value.to_string());
-                    }
-                    Expression::QualifiedIdentifier(qi) => {
-                        let full = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
-                        if !output_columns.iter().any(|c| {
-                            c.eq_ignore_ascii_case(&full)
-                                || c.eq_ignore_ascii_case(&qi.name.value_lower)
-                        }) {
-                            output_columns
-                                .push(format!("{}.{}", qi.qualifier.value, qi.name.value));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Append DISTINCT ON columns not already in output
-            for expr in &stmt.distinct_on {
-                match expr {
-                    Expression::Identifier(id)
-                        if !output_columns
-                            .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&id.value_lower)) =>
-                    {
-                        output_columns.push(id.value.to_string());
-                    }
-                    Expression::QualifiedIdentifier(qi) => {
-                        let full_name =
-                            format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
-                        // Only match full qualified name to avoid ambiguity
-                        if !output_columns
-                            .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&full_name))
-                        {
-                            output_columns
-                                .push(format!("{}.{}", qi.qualifier.value, qi.name.value));
-                        }
-                    }
-                    _ => {
-                        // Computed expression — use Display representation as column name
-                        let expr_name = expr.to_string();
-                        if !output_columns
-                            .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&expr_name))
-                        {
-                            output_columns.push(expr_name);
-                        }
-                    }
-                }
-            }
+            output_columns.extend(extra_names);
             (projected_rows, output_columns, None)
         } else if let Some((col_indices, output_names)) = deferred_projection_info {
             // DEFERRED PROJECTION: Skip projection now, do it after ORDER BY + LIMIT
@@ -5350,7 +5315,7 @@ impl Executor {
         // Project rows according to SELECT expressions
         let (projected_rows, output_columns) = if join_needs_extra_columns {
             // Use projection that preserves extra ORDER BY / DISTINCT ON columns
-            let (projected_rows, _) = self.project_rows_with_order_by(
+            let (projected_rows, extra_names) = self.project_rows_with_order_by(
                 &stmt.columns,
                 &stmt.order_by,
                 &stmt.distinct_on,
@@ -5360,83 +5325,7 @@ impl Executor {
             )?;
             let mut output_columns =
                 self.get_output_column_names(&stmt.columns, &final_columns, None);
-            // Build a set of qualified names from SELECT for accurate "already present" checks.
-            // This mirrors the select_column_names logic in project_rows_with_order_by.
-            let mut select_qualified_names: Vec<String> = Vec::new();
-            for expr in &stmt.columns {
-                match expr {
-                    Expression::QualifiedIdentifier(qi) => {
-                        select_qualified_names.push(format!(
-                            "{}.{}",
-                            qi.qualifier.value_lower, qi.name.value_lower
-                        ));
-                    }
-                    Expression::Aliased(a) => {
-                        if let Expression::QualifiedIdentifier(qi) = &*a.expression {
-                            select_qualified_names.push(format!(
-                                "{}.{}",
-                                qi.qualifier.value_lower, qi.name.value_lower
-                            ));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Append extra ORDER BY columns not in SELECT
-            for ob in &stmt.order_by {
-                match &ob.expression {
-                    Expression::Identifier(id)
-                        if !output_columns
-                            .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&id.value_lower)) =>
-                    {
-                        output_columns.push(id.value.to_string());
-                    }
-                    Expression::QualifiedIdentifier(qi) => {
-                        let full = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
-                        // Check both output_columns and select qualified names
-                        if !output_columns.iter().any(|c| c.eq_ignore_ascii_case(&full))
-                            && !select_qualified_names.contains(&full)
-                        {
-                            output_columns
-                                .push(format!("{}.{}", qi.qualifier.value, qi.name.value));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // Append extra DISTINCT ON columns not in SELECT
-            for expr in &stmt.distinct_on {
-                match expr {
-                    Expression::Identifier(id) => {
-                        if !output_columns
-                            .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&id.value_lower))
-                        {
-                            output_columns.push(id.value.to_string());
-                        }
-                    }
-                    Expression::QualifiedIdentifier(qi) => {
-                        let full = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
-                        // Check both output_columns and select qualified names
-                        if !output_columns.iter().any(|c| c.eq_ignore_ascii_case(&full))
-                            && !select_qualified_names.contains(&full)
-                        {
-                            output_columns
-                                .push(format!("{}.{}", qi.qualifier.value, qi.name.value));
-                        }
-                    }
-                    _ => {
-                        let expr_name = expr.to_string();
-                        if !output_columns
-                            .iter()
-                            .any(|c| c.eq_ignore_ascii_case(&expr_name))
-                        {
-                            output_columns.push(expr_name);
-                        }
-                    }
-                }
-            }
+            output_columns.extend(extra_names);
             (projected_rows, CompactArc::new(output_columns))
         } else {
             let projected_rows = self.project_rows_with_alias(
@@ -8340,6 +8229,9 @@ impl Executor {
 
         // Find ORDER BY columns not in SELECT
         let mut extra_order_indices: Vec<usize> = Vec::new();
+        // An ORDER BY expression is read from a column of its own, so the
+        // sort has something to read once the projection has run
+        let mut computed_order_by: Vec<&Expression> = Vec::new();
         for ob in order_by {
             match &ob.expression {
                 Expression::Identifier(id)
@@ -8366,6 +8258,23 @@ impl Executor {
                                 extra_order_indices.push(idx);
                             }
                         }
+                    }
+                }
+                // A subquery is read per row against the parent, which the
+                // sort does for itself, so it is not read from a column here
+                other
+                    if !matches!(
+                        other,
+                        Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
+                    ) && !Self::has_subqueries(other) =>
+                {
+                    let name = other.to_string();
+                    if !select_column_names
+                        .iter()
+                        .any(|s| s.eq_ignore_ascii_case(&name))
+                        && !computed_order_by.iter().any(|e| e.to_string() == name)
+                    {
+                        computed_order_by.push(other);
                     }
                 }
                 _ => {}
@@ -8451,9 +8360,19 @@ impl Executor {
             }
         }
 
+        // The names of the columns appended below, in the order they are
+        // appended, so the caller can put them on the end of its own list
+        let mut extra_names: Vec<String> = extra_order_indices
+            .iter()
+            .map(|idx| all_columns[*idx].clone())
+            .collect();
+        extra_names.extend(computed_order_by.iter().map(|expr| expr.to_string()));
+        extra_names.extend(computed_distinct_on.iter().map(|expr| expr.to_string()));
+
         // Check if we can use fast path (all simple column refs, no computed DISTINCT ON)
         let all_simple = select_column_indices.iter().all(|idx| idx.is_some())
-            && computed_distinct_on.is_empty();
+            && computed_distinct_on.is_empty()
+            && computed_order_by.is_empty();
 
         if all_simple {
             // Fast path
@@ -8479,7 +8398,7 @@ impl Executor {
             }
 
             // Output column names will be computed in caller
-            Ok((projected, vec![]))
+            Ok((projected, extra_names))
         } else {
             // Slow path: Use Evaluator for complex expressions
             let mut projected = RowVec::with_capacity(rows.len());
@@ -8489,7 +8408,8 @@ impl Executor {
             evaluator = evaluator.with_context(ctx);
             evaluator.init_columns(all_columns);
 
-            let total_extra = extra_order_indices.len() + computed_distinct_on.len();
+            let total_extra =
+                extra_order_indices.len() + computed_order_by.len() + computed_distinct_on.len();
 
             // OPTIMIZATION: Reuse col_index_map_lower for O(1) lookup
             for (row_id, row) in rows.drain_rows().enumerate() {
@@ -8513,6 +8433,14 @@ impl Executor {
                     values.push(row.get(idx).cloned().unwrap_or(Value::null_unknown()));
                 }
 
+                // Evaluate computed ORDER BY expressions
+                for expr in &computed_order_by {
+                    let value = evaluator
+                        .evaluate(expr)
+                        .unwrap_or_else(|_| Value::null_unknown());
+                    values.push(value);
+                }
+
                 // Evaluate computed DISTINCT ON expressions
                 for expr in &computed_distinct_on {
                     let value = evaluator
@@ -8524,7 +8452,7 @@ impl Executor {
                 projected.push((row_id as i64, Row::from_values(values)));
             }
 
-            Ok((projected, vec![]))
+            Ok((projected, extra_names))
         }
     }
 

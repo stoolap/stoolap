@@ -96,3 +96,86 @@ fn test_sorting_by_a_column_the_select_leaves_out() {
         ["b", "a", "b", "a"]
     );
 }
+
+/// Sorting by an expression the SELECT leaves out sorts by it
+#[test]
+fn test_sorting_by_an_expression() {
+    let db = Database::open("memory://order_by_expression").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER, f FLOAT, s TEXT)",
+        (),
+    )
+    .unwrap();
+    for (id, n, f, s) in [
+        (1i64, 10i64, 1.25f64, "b"),
+        (2, 20, -2.5, "a"),
+        (3, 30, 0.0, "c"),
+        (4, 40, 10.0, "d"),
+        (5, 50, -0.5, "e"),
+    ] {
+        db.execute("INSERT INTO t VALUES ($1, $2, $3, $4)", (id, n, f, s))
+            .unwrap();
+    }
+    assert_eq!(
+        values(&db, "SELECT id FROM t ORDER BY ABS(f)"),
+        ["3", "5", "1", "2", "4"],
+        "a function of a column the SELECT leaves out"
+    );
+    assert_eq!(
+        values(&db, "SELECT id FROM t ORDER BY n * -1"),
+        ["5", "4", "3", "2", "1"],
+        "arithmetic"
+    );
+    assert_eq!(
+        values(&db, "SELECT id FROM t ORDER BY -n"),
+        ["5", "4", "3", "2", "1"],
+        "a negation"
+    );
+    assert_eq!(
+        values(&db, "SELECT id FROM t ORDER BY s || ''"),
+        ["2", "1", "3", "4", "5"],
+        "a text expression"
+    );
+    assert_eq!(
+        values(&db, "SELECT id FROM t ORDER BY ABS(f) LIMIT 3"),
+        ["3", "5", "1"],
+        "with a limit"
+    );
+    let (columns, row_widths) = widths(&db, "SELECT id FROM t ORDER BY ABS(f)");
+    assert!(
+        row_widths.iter().all(|width| *width == columns),
+        "the expression stays out of the rows: {columns} columns, rows {row_widths:?}"
+    );
+}
+
+/// A subquery in the ORDER BY reads the row it sorts, not one value for all
+#[test]
+fn test_sorting_by_a_correlated_subquery() {
+    let db = Database::open("memory://order_by_subquery").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)", ())
+        .unwrap();
+    for id in 1..=5i64 {
+        db.execute("INSERT INTO a VALUES ($1)", (id,)).unwrap();
+    }
+    for (id, a_id) in [(1i64, 1i64), (2, 1), (3, 2), (4, 4)] {
+        db.execute("INSERT INTO b VALUES ($1, $2)", (id, a_id))
+            .unwrap();
+    }
+    assert_eq!(
+        values(
+            &db,
+            "SELECT id FROM a ORDER BY (SELECT COUNT(*) FROM b WHERE b.a_id = a.id) DESC, id"
+        ),
+        ["1", "2", "4", "3", "5"]
+    );
+    assert_eq!(
+        values(
+            &db,
+            "SELECT id, (SELECT COUNT(*) FROM b WHERE b.a_id = a.id) AS c FROM a ORDER BY c DESC, id"
+        )
+        .len(),
+        5
+    );
+}

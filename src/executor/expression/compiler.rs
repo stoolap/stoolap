@@ -1334,19 +1334,18 @@ impl<'a> ExprCompiler<'a> {
 
         while let Some(c) = chars.next() {
             if c == escape {
-                // Next character should be treated literally
-                if let Some(&next) = chars.peek() {
-                    if next == '%' || next == '_' || next == escape {
-                        // Escape the wildcard - use regex escape sequence
-                        result.push('\\');
-                        result.push(chars.next().unwrap());
-                    } else {
-                        // Not escaping a special character, keep the escape char
-                        result.push(c);
+                // Whatever follows stands for itself. A wildcard and the
+                // backslash the pattern reads as its own marker keep that
+                // marker in front of them; anything else is already itself
+                match chars.next() {
+                    Some(next) => {
+                        if next == '%' || next == '_' || next == '\\' {
+                            result.push('\\');
+                        }
+                        result.push(next);
                     }
-                } else {
-                    // Escape at end of pattern
-                    result.push(c);
+                    // Nothing follows, so the escape stands for itself
+                    None => result.push(c),
                 }
             } else {
                 result.push(c);
