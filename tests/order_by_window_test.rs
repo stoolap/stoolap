@@ -100,3 +100,15 @@ fn test_the_hidden_window_column_is_dropped_beside_a_star() {
         ]
     );
 }
+
+#[test]
+fn test_a_subquery_inside_an_order_by_window_is_read() {
+    let db = setup("order_by_window_subquery");
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM hx ORDER BY RANK() OVER (ORDER BY (SELECT -hx.id)), id"
+        ),
+        [6, 5, 4, 3, 2, 1]
+    );
+}

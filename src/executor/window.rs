@@ -470,6 +470,23 @@ impl Executor {
         pre_sorted: Option<WindowPreSortedState>,
         pre_grouped: Option<WindowPreGroupedState>,
     ) -> Result<Box<dyn QueryResult>> {
+        // A window function in ORDER BY that the select list does not carry
+        // is computed into a column of its own, named after it, which the
+        // sort reads and the projection then drops. It goes in before the
+        // subqueries are lifted, so one inside it is lifted with the rest
+        let extended_stmt;
+        let stmt = {
+            let hidden = Self::hidden_order_by_windows(stmt);
+            if hidden.is_empty() {
+                stmt
+            } else {
+                let mut extended = stmt.clone();
+                extended.columns.extend(hidden);
+                extended_stmt = extended;
+                &extended_stmt
+            }
+        };
+
         // A subquery inside a window function or its OVER clause is resolved
         // per input row first; the columns it adds stay out of SELECT *
         let visible_columns = base_columns.len();
@@ -503,23 +520,6 @@ impl Executor {
                 )
             }
             None => (stmt, base_rows, base_columns),
-        };
-
-        // A window function in ORDER BY that the select list does not carry
-        // is computed into a column of its own, named after it, which the
-        // sort reads and the projection then drops. Beside a star nothing
-        // is dropped, so there the select list stays as written
-        let extended_stmt;
-        let stmt = {
-            let hidden = Self::hidden_order_by_windows(stmt);
-            if hidden.is_empty() {
-                stmt
-            } else {
-                let mut extended = stmt.clone();
-                extended.columns.extend(hidden);
-                extended_stmt = extended;
-                &extended_stmt
-            }
         };
 
         // Parse window functions from the SELECT list
