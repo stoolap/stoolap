@@ -2352,7 +2352,15 @@ impl Table for SegmentedTable {
         // overlapping row_ids between volumes. After UPDATE + seal, tombstones
         // are cleared but overlap remains (two volumes share the same row_id).
         // Compare raw vs deduped count to detect this (cached, O(1)).
-        let can_use_stats = self.segment_mgr.is_tombstone_set_empty()
+        // A boolean column is read by scanning: volumes sealed before
+        // booleans counted as one or nought carry zeros for it in their
+        // stats, and there is no telling them from volumes sealed since
+        let is_boolean_column = schema
+            .columns
+            .get(col_idx)
+            .is_some_and(|c| c.data_type == crate::core::DataType::Boolean);
+        let can_use_stats = !is_boolean_column
+            && self.segment_mgr.is_tombstone_set_empty()
             && !self.segment_mgr.has_pending_tombstones(self.txn_id())
             && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count();
 
@@ -4384,6 +4392,10 @@ impl Table for SegmentedTable {
                                     acc.count += 1;
                                     acc.is_int_agg = false;
                                 }
+                                Value::Boolean(b) => {
+                                    acc.int_sum += *b as i128;
+                                    acc.count += 1;
+                                }
                                 _ => {}
                             }
                         }
@@ -4537,6 +4549,10 @@ impl Table for SegmentedTable {
                                             acc.is_int_agg = false;
                                         }
                                     }
+                                    DataType::Boolean => {
+                                        acc.int_sum += col.get_bool(i) as i128;
+                                        acc.count += 1;
+                                    }
                                     _ => {}
                                 }
                             }
@@ -4550,6 +4566,10 @@ impl Table for SegmentedTable {
                                     acc.float_sum += *f;
                                     acc.count += 1;
                                     acc.is_int_agg = false;
+                                }
+                                Value::Boolean(b) => {
+                                    acc.int_sum += *b as i128;
+                                    acc.count += 1;
                                 }
                                 _ => {}
                             }
@@ -5248,6 +5268,10 @@ impl Table for SegmentedTable {
                                     accum.count += 1;
                                     accum.is_int_agg = false;
                                 }
+                                Value::Boolean(b) => {
+                                    accum.int_sum += *b as i128;
+                                    accum.count += 1;
+                                }
                                 _ => {}
                             }
                         }
@@ -5406,6 +5430,10 @@ impl Table for SegmentedTable {
                                             acc.is_int_agg = false;
                                         }
                                     }
+                                    DataType::Boolean => {
+                                        acc.int_sum += col.get_bool(i) as i128;
+                                        acc.count += 1;
+                                    }
                                     _ => {}
                                 }
                             }
@@ -5419,6 +5447,10 @@ impl Table for SegmentedTable {
                                     acc.float_sum += *f;
                                     acc.count += 1;
                                     acc.is_int_agg = false;
+                                }
+                                Value::Boolean(b) => {
+                                    acc.int_sum += *b as i128;
+                                    acc.count += 1;
                                 }
                                 _ => {}
                             }

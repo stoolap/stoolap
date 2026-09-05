@@ -6310,6 +6310,11 @@ impl Executor {
                                             state.agg_has_value[i] = true;
                                             state.counts[i] += 1;
                                         }
+                                        Value::Boolean(v) => {
+                                            state.agg_values[i] += *v as i64 as f64;
+                                            state.agg_has_value[i] = true;
+                                            state.counts[i] += 1;
+                                        }
                                         _ => {}
                                     }
                                 }

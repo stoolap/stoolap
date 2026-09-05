@@ -81,3 +81,104 @@ fn test_a_null_boolean_is_left_out() {
     assert_eq!(one(&db, "SELECT SUM(b) FROM t WHERE id = 3"), "NULL");
     assert_eq!(one(&db, "SELECT COUNT(b) FROM t"), "3");
 }
+
+fn int(db: &Database, sql: &str) -> i64 {
+    db.query(sql, ())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap()
+}
+
+#[test]
+fn test_summing_distinct_booleans() {
+    let db = setup("boolean_sum_distinct");
+    assert_eq!(int(&db, "SELECT SUM(DISTINCT b) FROM t"), 1);
+    assert_eq!(int(&db, "SELECT SUM(DISTINCT b) FROM t WHERE NOT b"), 0);
+}
+
+#[test]
+fn test_boolean_sums_over_many_rows_and_groups() {
+    let db = Database::open("memory://boolean_sum_many").unwrap();
+    db.execute(
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, k INTEGER, b BOOLEAN)",
+        (),
+    )
+    .unwrap();
+    // per k: (count of TRUE, count of non-NULL)
+    let mut expect = [(0i64, 0i64); 4];
+    let mut values = String::new();
+    for id in 1..=20_000i64 {
+        let k = (id % 4) as usize;
+        let b = if id % 7 == 0 {
+            "NULL"
+        } else if id % 3 == 0 {
+            expect[k].0 += 1;
+            "TRUE"
+        } else {
+            "FALSE"
+        };
+        if b != "NULL" {
+            expect[k].1 += 1;
+        }
+        if !values.is_empty() {
+            values.push(',');
+        }
+        values.push_str(&format!("({id}, {k}, {b})"));
+        if id % 500 == 0 {
+            db.execute(&format!("INSERT INTO m VALUES {values}"), ())
+                .unwrap();
+            values.clear();
+        }
+    }
+    let total: i64 = expect.iter().map(|e| e.0).sum();
+    assert_eq!(int(&db, "SELECT SUM(b) FROM m"), total);
+    assert_eq!(int(&db, "SELECT SUM(b) FROM m WHERE k = 1"), expect[1].0);
+
+    let grouped = |sql: &str| -> Vec<(i64, i64, f64)> {
+        db.query(sql, ())
+            .unwrap()
+            .map(|r| {
+                let r = r.unwrap();
+                (
+                    r.get::<i64>(0).unwrap(),
+                    r.get::<i64>(1).unwrap(),
+                    r.get::<f64>(2).unwrap(),
+                )
+            })
+            .collect()
+    };
+    let rows = grouped("SELECT k, SUM(b), AVG(b) FROM m GROUP BY k ORDER BY k");
+    assert_eq!(rows.len(), 4);
+    for (k, sum, avg) in rows {
+        let (ones, seen) = expect[k as usize];
+        assert_eq!(sum, ones, "k {k}");
+        assert!(
+            (avg - ones as f64 / seen as f64).abs() < 1e-9,
+            "k {k}: {avg}"
+        );
+    }
+
+    // tombstones send the sum down the scanning path
+    db.execute("DELETE FROM m WHERE id % 5 = 0", ()).unwrap();
+    let mut kept = [(0i64, 0i64); 4];
+    for id in (1..=20_000i64).filter(|id| id % 5 != 0 && id % 7 != 0) {
+        let k = (id % 4) as usize;
+        kept[k].1 += 1;
+        if id % 3 == 0 {
+            kept[k].0 += 1;
+        }
+    }
+    let total: i64 = kept.iter().map(|e| e.0).sum();
+    assert_eq!(int(&db, "SELECT SUM(b) FROM m"), total);
+    for (k, sum, avg) in grouped("SELECT k, SUM(b), AVG(b) FROM m GROUP BY k ORDER BY k") {
+        let (ones, seen) = kept[k as usize];
+        assert_eq!(sum, ones, "after delete, k {k}");
+        assert!(
+            (avg - ones as f64 / seen as f64).abs() < 1e-9,
+            "after delete, k {k}: {avg}"
+        );
+    }
+}
