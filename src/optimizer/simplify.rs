@@ -335,14 +335,6 @@ impl ExpressionSimplifier {
         if self.is_one(left) {
             return Some(right.clone());
         }
-        // x * 0 → 0
-        if self.is_zero(right) {
-            return Some(self.make_int(0));
-        }
-        // 0 * x → 0
-        if self.is_zero(left) {
-            return Some(self.make_int(0));
-        }
         // Constant folding
         self.try_eval_arithmetic(left, right, InfixOperator::Multiply)
     }
@@ -866,14 +858,10 @@ mod tests {
         let result = simplify_expression(&expr);
         assert!(matches!(result, Expression::Identifier(_)));
 
-        // x * 0 → 0
+        // x * 0 is NULL for a NULL x, so it is left alone
         let expr = make_infix(x.clone(), InfixOperator::Multiply, make_int_lit(0));
         let result = simplify_expression(&expr);
-        if let Expression::IntegerLiteral(lit) = result {
-            assert_eq!(lit.value, 0);
-        } else {
-            panic!("Expected IntegerLiteral(0)");
-        }
+        assert!(matches!(result, Expression::Infix(_)));
     }
 
     #[test]
