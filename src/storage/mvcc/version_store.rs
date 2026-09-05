@@ -3834,6 +3834,11 @@ impl VersionStore {
                     *float_sum += *f;
                     *count += 1;
                 }
+                // A boolean counts as one or nought, as SUM reads it
+                Value::Boolean(b) => {
+                    *int_sum += *b as i128;
+                    *count += 1;
+                }
                 _ => {} // NULL or non-numeric
             }
         }

@@ -75,6 +75,17 @@ impl AggregateFunction for SumFunction {
             }
         }
 
+        // A boolean counts as one or nought, so SUM(v > 100) counts the
+        // rows the condition holds for, the way both reference engines
+        // read it, rather than adding nothing and answering NULL
+        let promoted;
+        let value = if let Value::Boolean(b) = value {
+            promoted = Value::Integer(*b as i64);
+            &promoted
+        } else {
+            value
+        };
+
         // Extract numeric value
         match value {
             Value::Integer(i) => match &mut self.state {

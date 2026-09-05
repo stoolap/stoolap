@@ -557,6 +557,8 @@ impl CompiledAggregate {
         match value {
             Value::Integer(i) => Some(*i as f64),
             Value::Float(f) => Some(*f),
+            // A boolean counts as one or nought, as the aggregate reads it
+            Value::Boolean(b) => Some(*b as i64 as f64),
             _ => None,
         }
     }

@@ -2339,6 +2339,8 @@ impl Table for SegmentedTable {
         let default_f64 = match &default_val {
             Value::Integer(v) => Some(*v as f64),
             Value::Float(v) => Some(*v),
+            // A boolean counts as one or nought, as SUM reads it
+            Value::Boolean(b) => Some(*b as i64 as f64),
             _ => None, // NULL or non-numeric default → no contribution
         };
 

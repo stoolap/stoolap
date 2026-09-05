@@ -3071,18 +3071,17 @@ impl Executor {
                         }
                         SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                             if let Some(value) = row.get(*sum_col_idx) {
-                                match value {
-                                    Value::Integer(v) => {
-                                        state.agg_values[i] += *v as f64;
-                                        state.agg_has_value[i] = true;
-                                        state.counts[i] += 1;
-                                    }
-                                    Value::Float(v) => {
-                                        state.agg_values[i] += v;
-                                        state.agg_has_value[i] = true;
-                                        state.counts[i] += 1;
-                                    }
-                                    _ => {}
+                                // A boolean counts as one or nought
+                                let numeric = match value {
+                                    Value::Integer(v) => Some(*v as f64),
+                                    Value::Float(v) => Some(*v),
+                                    Value::Boolean(b) => Some(*b as i64 as f64),
+                                    _ => None,
+                                };
+                                if let Some(v) = numeric {
+                                    state.agg_values[i] += v;
+                                    state.agg_has_value[i] = true;
+                                    state.counts[i] += 1;
                                 }
                             }
                         }
@@ -3319,18 +3318,17 @@ impl Executor {
                         }
                         SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                             if let Some(value) = row.get(*sum_col_idx) {
-                                match value {
-                                    Value::Integer(v) => {
-                                        state.agg_values[i] += *v as f64;
-                                        state.agg_has_value[i] = true;
-                                        state.counts[i] += 1;
-                                    }
-                                    Value::Float(v) => {
-                                        state.agg_values[i] += v;
-                                        state.agg_has_value[i] = true;
-                                        state.counts[i] += 1;
-                                    }
-                                    _ => {}
+                                // A boolean counts as one or nought
+                                let numeric = match value {
+                                    Value::Integer(v) => Some(*v as f64),
+                                    Value::Float(v) => Some(*v),
+                                    Value::Boolean(b) => Some(*b as i64 as f64),
+                                    _ => None,
+                                };
+                                if let Some(v) = numeric {
+                                    state.agg_values[i] += v;
+                                    state.agg_has_value[i] = true;
+                                    state.counts[i] += 1;
                                 }
                             }
                         }
@@ -3546,18 +3544,17 @@ impl Executor {
                     }
                     SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                         if let Some(value) = row.get(*sum_col_idx) {
-                            match value {
-                                Value::Integer(v) => {
-                                    state.agg_values[i] += *v as f64;
-                                    state.agg_has_value[i] = true;
-                                    state.counts[i] += 1;
-                                }
-                                Value::Float(v) => {
-                                    state.agg_values[i] += v;
-                                    state.agg_has_value[i] = true;
-                                    state.counts[i] += 1;
-                                }
-                                _ => {}
+                            // A boolean counts as one or nought
+                            let numeric = match value {
+                                Value::Integer(v) => Some(*v as f64),
+                                Value::Float(v) => Some(*v),
+                                Value::Boolean(b) => Some(*b as i64 as f64),
+                                _ => None,
+                            };
+                            if let Some(v) = numeric {
+                                state.agg_values[i] += v;
+                                state.agg_has_value[i] = true;
+                                state.counts[i] += 1;
                             }
                         }
                     }
@@ -5007,6 +5004,15 @@ impl Executor {
                                 sum_int += i;
                             }
                         }
+                        // A boolean counts as one or nought
+                        Value::Boolean(b) => {
+                            has_value = true;
+                            if has_float {
+                                sum_float += *b as i64 as f64;
+                            } else {
+                                sum_int += *b as i64;
+                            }
+                        }
                         Value::Float(f) => {
                             has_value = true;
                             if !has_float {
@@ -5031,6 +5037,14 @@ impl Executor {
                             sum_float += *i as f64;
                         } else {
                             sum_int += i;
+                        }
+                    }
+                    Value::Boolean(b) => {
+                        has_value = true;
+                        if has_float {
+                            sum_float += *b as i64 as f64;
+                        } else {
+                            sum_int += *b as i64;
                         }
                     }
                     Value::Float(f) => {
@@ -5079,6 +5093,14 @@ impl Executor {
                                     sum_float += *i as f64;
                                 } else {
                                     sum_int += i;
+                                }
+                            }
+                            Value::Boolean(b) => {
+                                has_value = true;
+                                if has_float {
+                                    sum_float += *b as i64 as f64;
+                                } else {
+                                    sum_int += *b as i64;
                                 }
                             }
                             Value::Float(f) => {
@@ -5161,6 +5183,11 @@ impl Executor {
                         sum += f;
                         count += 1;
                     }
+                    // A boolean counts as one or nought
+                    Value::Boolean(b) => {
+                        sum += *b as i64 as f64;
+                        count += 1;
+                    }
                     _ => {}
                 }
             }
@@ -5195,6 +5222,10 @@ impl Executor {
                             }
                             Value::Float(f) => {
                                 sum += f;
+                                count += 1;
+                            }
+                            Value::Boolean(b) => {
+                                sum += *b as i64 as f64;
                                 count += 1;
                             }
                             _ => {}
@@ -5909,6 +5940,8 @@ impl Executor {
                         let num = match value {
                             Value::Integer(i) => *i as f64,
                             Value::Float(f) => *f,
+                            // A boolean counts as one or nought
+                            Value::Boolean(b) => *b as i64 as f64,
                             _ => continue,
                         };
                         state.sum += num;

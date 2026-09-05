@@ -10676,18 +10676,18 @@ impl Executor {
                                 }
                                 StreamingAgg::Sum(col_idx) | StreamingAgg::Avg(col_idx) => {
                                     if let Some(value) = row.get(*col_idx) {
-                                        match value {
-                                            Value::Integer(v) => {
-                                                agg_sums[i] += *v as f64;
-                                                counts[i] += 1;
-                                                agg_has_value[i] = true;
-                                            }
-                                            Value::Float(v) => {
-                                                agg_sums[i] += v;
-                                                counts[i] += 1;
-                                                agg_has_value[i] = true;
-                                            }
-                                            _ => {}
+                                        // A boolean counts as one or nought,
+                                        // as the aggregate itself reads it
+                                        let numeric = match value {
+                                            Value::Integer(v) => Some(*v as f64),
+                                            Value::Float(v) => Some(*v),
+                                            Value::Boolean(b) => Some(*b as i64 as f64),
+                                            _ => None,
+                                        };
+                                        if let Some(v) = numeric {
+                                            agg_sums[i] += v;
+                                            counts[i] += 1;
+                                            agg_has_value[i] = true;
                                         }
                                     }
                                 }
