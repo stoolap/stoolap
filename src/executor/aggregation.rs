@@ -4990,10 +4990,7 @@ impl Executor {
         let mut has_value = false;
 
         // Unroll loop by 4 for better CPU pipelining.
-        // as_chunks needs Rust 1.88; the documented MSRV is 1.70.
-        #[allow(clippy::chunks_exact_to_as_chunks)]
-        let chunks = rows.chunks_exact(4);
-        let remainder = chunks.remainder();
+        let (chunks, remainder) = rows.as_chunks::<4>();
 
         for chunk in chunks {
             for (_, row) in chunk {
