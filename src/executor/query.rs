@@ -440,8 +440,22 @@ impl Executor {
         // Execute the main query
         // The third return value indicates if LIMIT/OFFSET was already applied (by storage-level pushdown)
         // The fourth return value contains deferred projection info if applicable
+        // ORDER BY, LIMIT and OFFSET belong to the whole set operation, so
+        // the first branch runs without them
+        let branch_stmt;
+        let branch = if stmt.set_operations.is_empty() {
+            stmt
+        } else {
+            branch_stmt = SelectStatement {
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
+                ..stmt.clone()
+            };
+            &branch_stmt
+        };
         let (mut result, columns, limit_offset_applied, deferred_projection) =
-            self.execute_select_internal(stmt, ctx, &classification)?;
+            self.execute_select_internal(branch, ctx, &classification)?;
 
         // Apply set operations (UNION, INTERSECT, EXCEPT)
         // Pass limit+offset to enable early termination for UNION ALL
@@ -460,9 +474,9 @@ impl Executor {
             };
             result = self.execute_set_operations(result, &stmt.set_operations, ctx, set_limit)?;
 
-            // After set operations, reset limit_offset_applied since we have a new result
-            // For UNION ALL with limit, we've already incorporated the limit
-            limit_offset_applied = all_union_all && set_limit.is_some();
+            // The set operation gathers LIMIT + OFFSET rows at most; the
+            // OFFSET is skipped and the LIMIT cut below, on the whole
+            limit_offset_applied = false;
         }
 
         // Count expected SELECT columns (before any extra ORDER BY columns).
