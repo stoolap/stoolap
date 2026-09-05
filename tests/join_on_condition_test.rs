@@ -271,3 +271,95 @@ fn test_sorted_inputs_honour_the_condition() {
         "the rows the condition turned away are kept without a right side"
     );
 }
+
+/// A subquery in the ON clause is read once and the join compares each pair
+/// against what it returned
+#[test]
+fn test_a_subquery_in_the_join_condition() {
+    let db = Database::open("memory://join_on_subquery").unwrap();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, p_id INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO p VALUES (1), (2), (3)", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO r VALUES (1,1,100), (2,1,200), (3,2,300), (4,3,400), (5,3,500)",
+        (),
+    )
+    .unwrap();
+
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM p JOIN r ON r.p_id = p.id AND r.v > (SELECT AVG(v) FROM r)"
+        ),
+        2
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM p LEFT JOIN r ON r.p_id = p.id AND r.v > (SELECT AVG(v) FROM r)"
+        ),
+        4,
+        "two matches and two rows the condition turned away"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM p JOIN r ON r.p_id = p.id WHERE r.v > (SELECT AVG(v) FROM r)"
+        ),
+        2,
+        "the same condition in the WHERE clause"
+    );
+}
+
+/// A LEFT JOIN keeps its left rows whatever the right side is read from
+#[test]
+fn test_left_join_against_a_derived_table() {
+    let db = Database::open("memory://join_left_derived").unwrap();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, n INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, p_id INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO p VALUES (1,10),(2,20),(3,30)", ())
+        .unwrap();
+    db.execute("INSERT INTO r VALUES (1,1,100),(2,2,200)", ())
+        .unwrap();
+
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT p.id, s.t FROM p LEFT JOIN (SELECT p_id, SUM(v) AS t FROM r GROUP BY p_id) s ON s.p_id = p.id ORDER BY p.id"
+        ),
+        ["1,100", "2,200", "3,NULL"]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT p.id, s.v FROM p LEFT JOIN (SELECT p_id, v FROM r) s ON s.p_id = p.id ORDER BY p.id"
+        ),
+        ["1,100", "2,200", "3,NULL"]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "WITH s AS (SELECT p_id, SUM(v) AS t FROM r GROUP BY p_id) SELECT p.id, s.t FROM p LEFT JOIN s ON s.p_id = p.id ORDER BY p.id"
+        ),
+        ["1,100", "2,200", "3,NULL"]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT * FROM p LEFT JOIN (SELECT p_id, v FROM r) s ON s.p_id = p.id ORDER BY p.id"
+        ),
+        ["1,10,1,100", "2,20,2,200", "3,30,NULL,NULL"],
+        "the left side comes first"
+    );
+}

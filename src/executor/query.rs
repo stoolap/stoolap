@@ -1948,8 +1948,10 @@ impl Executor {
             return None;
         }
 
-        // No DISTINCT ON — deferred projection would bypass the DISTINCT ON step
-        if classification.has_distinct_on {
+        // No DISTINCT — it reads the columns the SELECT asked for, and
+        // deferring the projection would leave it reading the whole source
+        // row, where rows that project alike are still telling apart
+        if classification.has_distinct_on || classification.has_distinct {
             return None;
         }
 
@@ -4157,7 +4159,10 @@ impl Executor {
                 && !has_agg
                 && !has_window
                 && !correlated_where
-                && (join_type == "INNER" || join_type == "LEFT")
+                // Only an INNER join reads the same with its sides
+                // exchanged; a LEFT join would go on preserving the side it
+                // was given, which after the swap is the wrong one
+                && join_type == "INNER"
                 && !matches!(join_source.right.as_ref(), Expression::TableSource(_))
                 && !matches!(
                     join_source.right.as_ref(),
@@ -5114,6 +5119,16 @@ impl Executor {
         let effective_condition = natural_join_cond
             .as_ref()
             .or(join_source.condition.as_ref().map(|c| c.as_ref()));
+
+        // A subquery in the ON clause is read once, the way the WHERE clause
+        // reads one, so the join has a value to compare each pair against
+        let processed_join_cond: Option<Expression> = match effective_condition {
+            Some(cond) if Self::has_subqueries(cond) && !Self::has_correlated_subqueries(cond) => {
+                Some(self.process_where_subqueries(cond, ctx)?)
+            }
+            _ => None,
+        };
+        let effective_condition = processed_join_cond.as_ref().or(effective_condition);
 
         // =================================================================
         // Execute JOIN using streaming JoinExecutor
