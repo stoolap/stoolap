@@ -806,12 +806,7 @@ impl Executor {
             return Ok(None);
         }
 
-        let is_count = match &subquery.columns[0] {
-            Expression::Aliased(a) => Self::is_count_expression(&a.expression),
-            expr => Self::is_count_expression(expr),
-        };
-
-        if !is_count {
+        if !Self::is_count_star_probe(&subquery.columns[0]) {
             return Ok(None);
         }
 
@@ -937,6 +932,38 @@ impl Executor {
         Ok(None)
     }
 
+    /// Whether the parent row is read anywhere but the correlation
+    /// predicate. One pass over the table answers every parent row at once
+    /// only while it is not: read anywhere else, the pass would carry one
+    /// parent's value into all of them
+    fn aggregate_reads_parent_row(
+        subquery: &SelectStatement,
+        beside_correlation: Option<&Expression>,
+    ) -> bool {
+        let tables = Self::collect_subquery_table_columns(subquery);
+        let reads = |expr: &Expression| Self::references_outer_columns(expr, &tables);
+        subquery.columns.iter().any(&reads)
+            || subquery.having.as_deref().is_some_and(&reads)
+            || beside_correlation.is_some_and(&reads)
+    }
+
+    /// A COUNT one probe of an index answers: the probe counts rows, so it
+    /// must count rows, not the values of a column that may be NULL, and
+    /// neither a FILTER nor DISTINCT may narrow what it counts
+    fn is_count_star_probe(expr: &Expression) -> bool {
+        match expr {
+            Expression::Aliased(aliased) => Self::is_count_star_probe(&aliased.expression),
+            Expression::FunctionCall(func) => {
+                func.function.eq_ignore_ascii_case("COUNT")
+                    && func.filter.is_none()
+                    && !func.is_distinct
+                    && (func.arguments.is_empty()
+                        || matches!(func.arguments.first(), Some(Expression::Star(_))))
+            }
+            _ => false,
+        }
+    }
+
     /// Check if an expression is a COUNT aggregate function.
     fn is_count_expression(expr: &Expression) -> bool {
         match expr {
@@ -1030,18 +1057,7 @@ impl Executor {
         // Extract correlation info
         let correlation = Self::extract_index_nested_loop_info(subquery)?;
 
-        // One pass over the table answers every outer row at once, which
-        // holds only while the correlation predicate is the one place the
-        // parent row is read: anywhere else it would differ per row
-        let tables = Self::collect_subquery_table_columns(subquery);
-        let reads_parent_row = |expr: &Expression| Self::references_outer_columns(expr, &tables);
-        if subquery.columns.iter().any(&reads_parent_row)
-            || subquery.having.as_deref().is_some_and(&reads_parent_row)
-            || correlation
-                .additional_predicate
-                .as_ref()
-                .is_some_and(&reads_parent_row)
-        {
+        if Self::aggregate_reads_parent_row(subquery, correlation.additional_predicate.as_ref()) {
             return None;
         }
 
@@ -1124,6 +1140,10 @@ impl Executor {
             Some(c) => c,
             None => return Ok(None),
         };
+
+        if Self::aggregate_reads_parent_row(subquery, correlation.additional_predicate.as_ref()) {
+            return Ok(None);
+        }
 
         // Build cache key (includes additional predicate in key for uniqueness)
         let cache_key = match Self::build_batch_aggregate_key(subquery) {

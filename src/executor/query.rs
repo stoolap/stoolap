@@ -10317,6 +10317,19 @@ impl Executor {
         let mut result = Vec::new();
 
         for col in &stmt.columns {
+            // A FILTER or DISTINCT narrows what the aggregate reads, and the
+            // streaming path below reads the column whole
+            let call = match col {
+                Expression::FunctionCall(fc) => Some(fc),
+                Expression::Aliased(aliased) => match aliased.expression.as_ref() {
+                    Expression::FunctionCall(fc) => Some(fc),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if call.is_some_and(|fc| fc.filter.is_some() || fc.is_distinct) {
+                return Vec::new();
+            }
             match col {
                 Expression::FunctionCall(fc) => {
                     let func_upper = fc.function.to_uppercase();

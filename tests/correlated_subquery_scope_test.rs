@@ -252,3 +252,103 @@ fn test_two_subqueries_keep_their_own_answers() {
         ]
     );
 }
+
+/// A COUNT that reads the parent row, or narrows what it counts, is not
+/// answered by one pass over the table or one probe of an index
+#[test]
+fn test_count_that_narrows_or_reads_the_parent() {
+    let db = setup("correlated_scope_count_paths");
+    for indexed in [false, true] {
+        if indexed {
+            db.execute("CREATE INDEX idx_orders_user ON orders(user_id)", ())
+                .unwrap();
+        }
+        let where_it = "FROM orders x WHERE x.user_id = u.id) FROM users u ORDER BY u.id";
+        // Amounts of user n are 10n, 10n+1, 10n+2, so two clear ten times n
+        assert_eq!(
+            answers(
+                &db,
+                &format!(
+                    "SELECT u.id, (SELECT COUNT(*) FILTER (WHERE x.amount > u.id * 10) {where_it}"
+                )
+            ),
+            ["2", "2", "2", "2"],
+            "a FILTER reading the parent, indexed: {indexed}"
+        );
+        assert_eq!(
+            answers(
+                &db,
+                &format!(
+                    "SELECT u.id, (SELECT COUNT(*) FILTER (WHERE x.amount % 10 > 0) {where_it}"
+                )
+            ),
+            ["2", "2", "2", "2"],
+            "a FILTER of its own, indexed: {indexed}"
+        );
+        assert_eq!(
+            answers(
+                &db,
+                &format!("SELECT u.id, (SELECT COUNT(DISTINCT x.user_id) {where_it}")
+            ),
+            ["1", "1", "1", "1"],
+            "DISTINCT, indexed: {indexed}"
+        );
+        assert_eq!(
+            answers(&db, &format!("SELECT u.id, (SELECT COUNT(u.id) {where_it}")),
+            ["3", "3", "3", "3"],
+            "counting the parent's column, indexed: {indexed}"
+        );
+        assert_eq!(
+            answers(&db, &format!("SELECT u.id, (SELECT COUNT(*) {where_it}")),
+            ["3", "3", "3", "3"],
+            "the plain count still takes the short way, indexed: {indexed}"
+        );
+    }
+}
+
+/// A COUNT of a column counts the values it has, not the rows it sits in
+#[test]
+fn test_count_of_a_column_skips_nulls() {
+    let db = Database::open("memory://correlated_scope_count_nulls").unwrap();
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_orders_user ON orders(user_id)", ())
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1), (2)", ()).unwrap();
+    db.execute(
+        "INSERT INTO orders VALUES (1, 1, 10), (2, 1, NULL), (3, 2, 20)",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        answers(
+            &db,
+            "SELECT u.id, (SELECT COUNT(x.amount) FROM orders x WHERE x.user_id = u.id) FROM users u ORDER BY u.id"
+        ),
+        ["1", "1"]
+    );
+}
+
+/// A grouped aggregate reads what its FILTER and DISTINCT leave it, however
+/// its columns are written
+#[test]
+fn test_grouped_aggregate_honours_filter_and_distinct() {
+    let db = setup("correlated_scope_grouped_filter");
+    let mut filtered = answers(
+        &db,
+        "SELECT user_id, COUNT(*) FILTER (WHERE amount % 10 > 0) FROM orders GROUP BY user_id",
+    );
+    filtered.sort();
+    assert_eq!(filtered, ["2", "2", "2", "2"]);
+    let mut distinct = answers(
+        &db,
+        "SELECT user_id, COUNT(DISTINCT user_id) FROM orders GROUP BY user_id",
+    );
+    distinct.sort();
+    assert_eq!(distinct, ["1", "1", "1", "1"]);
+}
