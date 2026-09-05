@@ -3497,6 +3497,7 @@ impl Executor {
             }
             Expression::AllAny(all_any) => {
                 Self::references_outer_columns(&all_any.left, subquery_tables)
+                    || Self::nested_reads_outer_columns(&all_any.subquery, subquery_tables)
             }
             Expression::Cast(cast) => Self::references_outer_columns(&cast.expr, subquery_tables),
             Expression::Like(like) => {
@@ -3527,8 +3528,35 @@ impl Executor {
                 .chain(window.partition_by.iter())
                 .chain(window.order_by.iter().map(|o| &o.expression))
                 .any(|e| Self::references_outer_columns(e, subquery_tables)),
+            // A subquery nested in this one may read a column from further
+            // out than either of them, which this one has to carry in
+            Expression::Exists(exists) => {
+                Self::nested_reads_outer_columns(&exists.subquery, subquery_tables)
+            }
+            Expression::ScalarSubquery(subquery) => {
+                Self::nested_reads_outer_columns(&subquery.subquery, subquery_tables)
+            }
             _ => false,
         }
+    }
+
+    /// Whether a subquery nested inside another reads a column that neither
+    /// of them defines
+    fn nested_reads_outer_columns(nested: &SelectStatement, subquery_tables: &[String]) -> bool {
+        let mut tables = subquery_tables.to_vec();
+        tables.extend(Self::collect_subquery_table_columns(nested));
+        nested
+            .where_clause
+            .as_deref()
+            .is_some_and(|where_clause| Self::references_outer_columns(where_clause, &tables))
+            || nested
+                .columns
+                .iter()
+                .any(|column| Self::references_outer_columns(column, &tables))
+            || nested
+                .having
+                .as_deref()
+                .is_some_and(|having| Self::references_outer_columns(having, &tables))
     }
 
     /// Process WHERE clause with correlated subqueries for a specific outer row.
@@ -3940,9 +3968,11 @@ impl Executor {
             Expression::QualifiedIdentifier(qid) => {
                 // Use pre-computed value_lower to avoid allocation
                 let table = &qid.qualifier.value_lower;
-                // References outer if it's in outer_tables and NOT in inner_tables
-                outer_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
-                    && !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
+                // One pass over the inner table answers every outer row, so
+                // any name the inner table does not own has to be read per
+                // row, whether it belongs to the query above or one further
+                let _ = outer_tables;
+                !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
             }
             Expression::Infix(infix) => {
                 Self::expression_references_outer_tables(&infix.left, outer_tables, inner_tables)

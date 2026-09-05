@@ -294,9 +294,12 @@ fn test_count_that_narrows_or_reads_the_parent() {
             "DISTINCT, indexed: {indexed}"
         );
         assert_eq!(
-            answers(&db, &format!("SELECT u.id, (SELECT COUNT(u.id) {where_it}")),
+            answers(
+                &db,
+                &format!("SELECT u.id, (SELECT COUNT(u.id + x.id) {where_it}")
+            ),
             ["3", "3", "3", "3"],
-            "counting the parent's column, indexed: {indexed}"
+            "counting what reads the parent, indexed: {indexed}"
         );
         assert_eq!(
             answers(&db, &format!("SELECT u.id, (SELECT COUNT(*) {where_it}")),
@@ -351,4 +354,43 @@ fn test_grouped_aggregate_honours_filter_and_distinct() {
     );
     distinct.sort();
     assert_eq!(distinct, ["1", "1", "1", "1"]);
+}
+
+/// A subquery two levels in reads the row its grandparent sits on
+#[test]
+fn test_grandparent_row_reaches_a_nested_subquery() {
+    let db = setup("correlated_scope_two_levels");
+    // Users whose largest order clears ten times the grandparent's id
+    assert_eq!(
+        answers(
+            &db,
+            "SELECT u.id, (SELECT COUNT(*) FROM users v WHERE EXISTS (SELECT 1 FROM orders x WHERE x.user_id = v.id AND x.amount > u.id * 10)) FROM users u ORDER BY u.id"
+        ),
+        ["4", "3", "2", "1"],
+        "through EXISTS"
+    );
+    assert_eq!(
+        answers(
+            &db,
+            "SELECT u.id, (SELECT COUNT(*) FROM users v WHERE v.id IN (SELECT x.user_id FROM orders x WHERE x.amount > u.id * 10)) FROM users u ORDER BY u.id"
+        ),
+        ["4", "3", "2", "1"],
+        "through IN"
+    );
+    assert_eq!(
+        answers(
+            &db,
+            "SELECT u.id, (SELECT (SELECT u.id) FROM users v LIMIT 1) FROM users u ORDER BY u.id"
+        ),
+        ["1", "2", "3", "4"],
+        "a scalar subquery inside a scalar subquery"
+    );
+    assert_eq!(
+        answers(
+            &db,
+            "SELECT u.id, (SELECT COUNT(*) FROM users v WHERE EXISTS (SELECT 1 FROM orders x WHERE x.user_id = v.id)) FROM users u ORDER BY u.id"
+        ),
+        ["4", "4", "4", "4"],
+        "a nested subquery that reads no grandparent is unchanged"
+    );
 }

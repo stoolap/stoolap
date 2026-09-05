@@ -109,6 +109,7 @@ use crate::executor::planner::{RuntimeJoinAlgorithm, RuntimeJoinDecision};
 use crate::executor::utils::{extract_join_keys_and_residual, is_sorted_on_keys};
 use crate::optimizer::bloom::RuntimeBloomFilter;
 use crate::parser::ast::Expression;
+use ahash::AHashSet as HashSet;
 
 /// LIMIT threshold below which streaming execution is preferred over parallel.
 ///
@@ -967,7 +968,7 @@ impl JoinExecutor {
     #[allow(clippy::too_many_arguments)]
     fn apply_residual_post_join(
         &self,
-        mut rows: RowVec,
+        rows: RowVec,
         residual: &[Expression],
         all_columns: &[String],
         join_type: &str,
@@ -975,49 +976,72 @@ impl JoinExecutor {
         right_col_count: usize,
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
-        let is_left_outer = join_type.contains("LEFT");
-        let is_right_outer = join_type.contains("RIGHT");
-        let is_full_outer = join_type.contains("FULL");
+        let is_left_outer = join_type.contains("LEFT") || join_type.contains("FULL");
+        let is_right_outer = join_type.contains("RIGHT") || join_type.contains("FULL");
 
+        let mut filters = Vec::with_capacity(residual.len());
         for cond in residual {
-            let filter = RowFilter::new(cond, all_columns)?.with_context(ctx);
+            filters.push(RowFilter::new(cond, all_columns)?.with_context(ctx));
+        }
 
-            if is_left_outer || is_right_outer || is_full_outer {
-                // For OUTER joins, replace non-matching rows with NULL-padded versions
-                let mut new_rows = RowVec::with_capacity(rows.len());
-                for (row_id, row) in rows {
-                    if filter.matches_checked(&row)? {
-                        new_rows.push((row_id, row));
-                    } else {
-                        // Convert to NULL-padded row
-                        if is_left_outer {
-                            // Keep left, NULL right
-                            let mut new_values: CompactVec<Value> =
-                                CompactVec::with_capacity(left_col_count + right_col_count);
-                            new_values.extend(row.iter().take(left_col_count).cloned());
-                            new_values.extend(std::iter::repeat_n(NULL_VALUE, right_col_count));
-                            new_rows.push((row_id, Row::from_compact_vec(new_values)));
-                        } else if is_right_outer {
-                            // NULL left, keep right
-                            let mut new_values: CompactVec<Value> =
-                                CompactVec::with_capacity(left_col_count + right_col_count);
-                            new_values.extend(std::iter::repeat_n(NULL_VALUE, left_col_count));
-                            new_values.extend(row.iter().skip(left_col_count).cloned());
-                            new_rows.push((row_id, Row::from_compact_vec(new_values)));
-                        } else {
-                            // FULL OUTER - keep original for now
-                            new_rows.push((row_id, row));
-                        }
-                    }
+        // A row the condition rejects is not a row of the join. The side the
+        // join preserves keeps a row of its own only where the whole
+        // condition matched nothing for it, and one row however many pairs
+        // it rejected
+        let mut kept = RowVec::with_capacity(rows.len());
+        let mut matched_left: HashSet<Vec<Value>> = HashSet::default();
+        let mut matched_right: HashSet<Vec<Value>> = HashSet::default();
+        let mut rejected: Vec<Row> = Vec::new();
+        for (row_id, row) in rows {
+            let mut passes = true;
+            for filter in &filters {
+                if !filter.matches_checked(&row)? {
+                    passes = false;
+                    break;
                 }
-                rows = new_rows;
+            }
+            if passes {
+                if is_left_outer {
+                    matched_left.insert(row.iter().take(left_col_count).cloned().collect());
+                }
+                if is_right_outer {
+                    matched_right.insert(row.iter().skip(left_col_count).cloned().collect());
+                }
+                kept.push((row_id, row));
             } else {
-                // INNER join - just filter
-                filter.retain_checked(&mut rows)?;
+                rejected.push(row);
             }
         }
 
-        Ok(rows)
+        let mut next_row_id = kept.len() as i64;
+        let mut seen_left: HashSet<Vec<Value>> = HashSet::default();
+        let mut seen_right: HashSet<Vec<Value>> = HashSet::default();
+        for row in rejected {
+            if is_left_outer {
+                let left: Vec<Value> = row.iter().take(left_col_count).cloned().collect();
+                if !matched_left.contains(&left) && seen_left.insert(left.clone()) {
+                    let mut values: CompactVec<Value> =
+                        CompactVec::with_capacity(left_col_count + right_col_count);
+                    values.extend(left);
+                    values.extend(std::iter::repeat_n(NULL_VALUE, right_col_count));
+                    kept.push((next_row_id, Row::from_compact_vec(values)));
+                    next_row_id += 1;
+                }
+            }
+            if is_right_outer {
+                let right: Vec<Value> = row.iter().skip(left_col_count).cloned().collect();
+                if !matched_right.contains(&right) && seen_right.insert(right.clone()) {
+                    let mut values: CompactVec<Value> =
+                        CompactVec::with_capacity(left_col_count + right_col_count);
+                    values.extend(std::iter::repeat_n(NULL_VALUE, left_col_count));
+                    values.extend(right);
+                    kept.push((next_row_id, Row::from_compact_vec(values)));
+                    next_row_id += 1;
+                }
+            }
+        }
+
+        Ok(kept)
     }
 }
 

@@ -3736,16 +3736,30 @@ impl Executor {
             // Get base column names
             let mut output_columns =
                 self.get_output_column_names(&stmt.columns, &all_columns, table_alias.as_deref());
-            // Append ORDER BY columns not in SELECT
+            // Append ORDER BY columns not in SELECT. A qualified one is
+            // appended to the rows the same way, so it needs a name here or
+            // the sort key rides out with them
             // OPTIMIZATION: Use eq_ignore_ascii_case to avoid allocations
             for ob in &stmt.order_by {
-                if let Expression::Identifier(id) = &ob.expression {
-                    if !output_columns
-                        .iter()
-                        .any(|c| c.eq_ignore_ascii_case(&id.value_lower))
+                match &ob.expression {
+                    Expression::Identifier(id)
+                        if !output_columns
+                            .iter()
+                            .any(|c| c.eq_ignore_ascii_case(&id.value_lower)) =>
                     {
                         output_columns.push(id.value.to_string());
                     }
+                    Expression::QualifiedIdentifier(qi) => {
+                        let full = format!("{}.{}", qi.qualifier.value_lower, qi.name.value_lower);
+                        if !output_columns.iter().any(|c| {
+                            c.eq_ignore_ascii_case(&full)
+                                || c.eq_ignore_ascii_case(&qi.name.value_lower)
+                        }) {
+                            output_columns
+                                .push(format!("{}.{}", qi.qualifier.value, qi.name.value));
+                        }
+                    }
+                    _ => {}
                 }
             }
             // Append DISTINCT ON columns not already in output
