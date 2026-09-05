@@ -1691,6 +1691,36 @@ impl Executor {
     }
 
     /// Execute an UPDATE statement
+    /// The expression a column's DEFAULT stands for in an UPDATE: its
+    /// default value, else its default expression, else NULL
+    fn column_default_expression(schema: &crate::core::Schema, name: &str) -> Result<Expression> {
+        let column = schema
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
+        if let Some(value) = &column.default_value {
+            return Ok(super::utils::value_to_expression(value));
+        }
+        match &column.default_expr {
+            Some(text) => {
+                let statements = crate::parser::parse_sql(&format!("SELECT {}", text))
+                    .map_err(|e| Error::parse(e.to_string()))?;
+                match statements.into_iter().next() {
+                    Some(Statement::Select(select)) => select
+                        .columns
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| Error::parse(format!("the default of {name} is empty"))),
+                    _ => Err(Error::parse(format!(
+                        "the default of {name} is not an expression"
+                    ))),
+                }
+            }
+            None => Ok(super::utils::value_to_expression(&Value::null_unknown())),
+        }
+    }
+
     pub(crate) fn execute_update(
         &self,
         stmt: &UpdateStatement,
@@ -1742,6 +1772,29 @@ impl Executor {
 
         // Pre-compute column names and indices to avoid schema borrow conflicts
         let schema = table.schema();
+
+        // SET col = DEFAULT reads the column's default
+        let defaulted_stmt;
+        let stmt = if stmt
+            .updates
+            .values()
+            .any(|e| matches!(e, Expression::Default(_)))
+        {
+            let mut updates = stmt.updates.clone();
+            for (name, expr) in updates.iter_mut() {
+                if matches!(expr, Expression::Default(_)) {
+                    *expr = Self::column_default_expression(schema, name.as_str())?;
+                }
+            }
+            defaulted_stmt = UpdateStatement {
+                updates,
+                ..stmt.clone()
+            };
+            &defaulted_stmt
+        } else {
+            stmt
+        };
+
         // OPTIMIZATION: Use CompactArc<Vec<String>> to share column names without cloning
         let column_names = schema.column_names_arc();
 
