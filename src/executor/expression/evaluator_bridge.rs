@@ -812,6 +812,8 @@ pub struct JoinFilter {
     params: CompactArc<ParamVec>,
     /// Named parameters (shared Arc to avoid cloning)
     named_params: Arc<FxHashMap<String, Value>>,
+    /// Transaction ID for CURRENT_TRANSACTION_ID()
+    transaction_id: Option<u64>,
 }
 
 impl JoinFilter {
@@ -837,15 +839,18 @@ impl JoinFilter {
             program: CompactArc::new(program),
             params: EMPTY_PARAMS.clone(),
             named_params: EMPTY_NAMED_PARAMS.clone(),
+            transaction_id: None,
         })
     }
 
-    /// Set parameters from execution context.
-    /// This is required when the join condition contains parameter placeholders ($1, $2, etc.).
+    /// Set parameters and the transaction from the execution context.
+    /// Required when the join condition holds parameter placeholders
+    /// ($1, $2, ...) or reads CURRENT_TRANSACTION_ID().
     #[inline]
     pub fn with_context(mut self, ctx: &ExecutionContext) -> Self {
         self.params = CompactArc::clone(ctx.params_arc());
         self.named_params = Arc::clone(ctx.named_params_arc());
+        self.transaction_id = ctx.transaction_id();
         self
     }
 
@@ -866,6 +871,7 @@ impl JoinFilter {
             if !self.named_params.is_empty() {
                 ctx = ctx.with_named_params(&self.named_params);
             }
+            ctx = ctx.with_transaction_id(self.transaction_id);
 
             // Use try_borrow_mut to avoid panic on recursive calls (e.g., nested subqueries).
             // If the VM is already borrowed, create a temporary one for this call.
@@ -1821,8 +1827,16 @@ impl<'a> CompiledEvaluator<'a> {
                 // order, so each of the two independent keys sees the members
                 // themselves. Folding them into one 64-bit value first would
                 // hand both keys the same collision.
-                let mut members: Vec<&Value> = in_hash.values.iter().collect();
-                members.sort_unstable();
+                // Sorted through Ord, which puts a NULL first and is total.
+                // The plain sort clippy asks for reads PartialOrd, whose
+                // NULL is neither below nor above anything, and the sort
+                // trips on the broken order once the set is large enough
+                #[allow(clippy::unnecessary_sort_by)]
+                let members = {
+                    let mut members: Vec<&Value> = in_hash.values.iter().collect();
+                    members.sort_unstable_by(|a, b| a.cmp(b));
+                    members
+                };
                 for value in members {
                     value.hash(hasher);
                 }

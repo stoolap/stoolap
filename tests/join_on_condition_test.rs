@@ -426,3 +426,37 @@ fn test_the_condition_holds_when_an_index_answers_the_key() {
         );
     }
 }
+
+/// The ON clause reads the transaction it runs in, whether or not an index
+/// answers the key
+#[test]
+fn test_the_condition_sees_the_transaction() {
+    for indexed in [false, true] {
+        let db = Database::open(&format!(
+            "memory://join_on_txn_{}",
+            if indexed { "yes" } else { "no" }
+        ))
+        .unwrap();
+        db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, p_id INTEGER)", ())
+            .unwrap();
+        db.execute("INSERT INTO p VALUES (1), (2)", ()).unwrap();
+        db.execute("INSERT INTO r VALUES (1, 1), (2, 2)", ())
+            .unwrap();
+        if indexed {
+            db.execute("CREATE INDEX rp ON r (p_id)", ()).unwrap();
+        }
+
+        db.execute("BEGIN", ()).unwrap();
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT p.id FROM p JOIN r ON r.p_id = p.id AND CURRENT_TRANSACTION_ID() IS NOT NULL ORDER BY p.id"
+            ),
+            ["1", "2"],
+            "indexed: {indexed}"
+        );
+        db.execute("ROLLBACK", ()).unwrap();
+    }
+}

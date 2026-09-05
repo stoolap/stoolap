@@ -149,3 +149,44 @@ fn test_in_and_not_in_over_an_empty_set() {
         2
     );
 }
+
+/// The members of a set are put in order to name it; a NULL among them is
+/// ordered too, rather than tripping the sort
+#[test]
+fn test_a_set_holding_a_null_among_many_members() {
+    let db = Database::open("memory://null_cmp_set_sort").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    // The shape is the one the sort was seen to trip on: enough members
+    // that the sort splits the set, with a NULL landing among them
+    let mut rows = Vec::new();
+    for i in 1..=3000i64 {
+        let k = if i % 47 == 0 {
+            "NULL".to_string()
+        } else {
+            (i % 200).to_string()
+        };
+        let v = if i % 31 == 0 {
+            "NULL".to_string()
+        } else {
+            (i % 90).to_string()
+        };
+        rows.push(format!("({i}, {k}, {v})"));
+    }
+    for chunk in rows.chunks(500) {
+        db.execute(&format!("INSERT INTO t VALUES {}", chunk.join(", ")), ())
+            .unwrap();
+    }
+    let matching = count(
+        &db,
+        "SELECT COUNT(*) FROM t WHERE k IN (SELECT k FROM t WHERE v = 5)",
+    );
+    assert_eq!(matching, 294);
+    let removed = db
+        .execute("DELETE FROM t WHERE k IN (SELECT k FROM t WHERE v = 5)", ())
+        .unwrap();
+    assert_eq!(removed, matching);
+}
