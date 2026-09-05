@@ -2584,11 +2584,15 @@ impl Executor {
         // FAST PATH: IN subquery index optimization
         // For queries like `SELECT * FROM table WHERE id IN (SELECT col FROM other_table WHERE ...)`
         // where 'id' has an index or is PRIMARY KEY, probe directly instead of scanning all rows
-        // Skip if query has aggregation: projection cannot compile aggregate functions
+        // Left to the normal pipeline: aggregation and window functions (this
+        // projection cannot compile them) and an ORDER BY key that is not
+        // projected (the sorter would not find it).
         if needs_memory_filter
             && !has_outer_context
             && !classification.has_group_by
             && !classification.has_aggregation
+            && !classification.has_window_functions
+            && !order_by_needs_extra_columns
         {
             if let Some(where_expr) = where_to_use {
                 if let Some((result, columns, limit_applied)) = self
@@ -2939,7 +2943,19 @@ impl Executor {
                         // For LIMIT queries, the streaming InHashSet path is faster due to early termination
                         let has_limit = outer_limit.is_some()
                             && outer_limit.unwrap() < ANTI_JOIN_LIMIT_THRESHOLD;
-                        let use_anti_join = is_pure_not_exists && !has_limit;
+
+                        // This path projects the anti-join rows and returns
+                        // them, so it can only answer a plain projection:
+                        // anything that shapes the result afterwards belongs
+                        // to the general path
+                        let is_plain_projection = !classification.has_aggregation
+                            && !classification.has_window_functions
+                            && !classification.has_group_by
+                            && !classification.has_having
+                            && !classification.has_order_by
+                            && !classification.has_distinct
+                            && !classification.has_distinct_on;
+                        let use_anti_join = is_pure_not_exists && !has_limit && is_plain_projection;
 
                         if use_anti_join {
                             // Materialize outer table rows
@@ -3068,7 +3084,9 @@ impl Executor {
             if !has_correlated
                 && !classification.has_group_by
                 && !classification.has_aggregation
+                && !classification.has_window_functions
                 && !classification.select_has_correlated_subqueries
+                && !self.order_by_needs_extra_columns(stmt, &all_columns)
             {
                 if let Some(ref where_expr) = processed_where {
                     if let Some((result, columns, limit_applied)) = self
