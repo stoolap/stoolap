@@ -688,6 +688,23 @@ impl Executor {
                 // This avoids O(n * row_size) cloning overhead.
                 let num_order_cols = stmt.order_by.len();
 
+                // A subquery that reads nothing of the row is run once here:
+                // its compiled placeholder cannot run on its own
+                let order_exprs: Vec<std::borrow::Cow<Expression>> = stmt
+                    .order_by
+                    .iter()
+                    .map(|ob| {
+                        if Self::has_subqueries(&ob.expression)
+                            && !Self::has_correlated_subqueries(&ob.expression)
+                        {
+                            self.process_where_subqueries(&ob.expression, ctx)
+                                .map(std::borrow::Cow::Owned)
+                        } else {
+                            Ok(std::borrow::Cow::Borrowed(&ob.expression))
+                        }
+                    })
+                    .collect::<Result<_>>()?;
+
                 // Compute sort keys for each row: Vec<Vec<Value>>
                 // Each inner Vec contains the evaluated ORDER BY expressions for that row
                 let sort_keys: Vec<Vec<Value>> = if has_correlated_order_by {
@@ -747,7 +764,8 @@ impl Executor {
                             evaluator.set_row_array(row);
                             stmt.order_by
                                 .iter()
-                                .map(|ob| {
+                                .zip(order_exprs.iter())
+                                .map(|(ob, order_expr)| {
                                     // A key the projection already put in a
                                     // column is read from it
                                     if let Some(idx) = try_map_to_column(ob) {
@@ -776,7 +794,7 @@ impl Executor {
                                         }
                                     } else {
                                         evaluator
-                                            .evaluate(&ob.expression)
+                                            .evaluate(order_expr)
                                             .unwrap_or_else(|_| Value::null_unknown())
                                     }
                                 })
@@ -795,9 +813,10 @@ impl Executor {
                     )> = stmt
                         .order_by
                         .iter()
-                        .map(|ob| match try_map_to_column(ob) {
+                        .zip(order_exprs.iter())
+                        .map(|(ob, order_expr)| match try_map_to_column(ob) {
                             Some(idx) => (Some(idx), None),
-                            None => (None, evaluator.compile_cached(&ob.expression).ok()),
+                            None => (None, evaluator.compile_cached(order_expr).ok()),
                         })
                         .collect();
                     rows.iter()
@@ -1830,6 +1849,16 @@ impl Executor {
                 }
                 _ => {}
             }
+        }
+
+        // A correlated subquery in ORDER BY reads the parent row, all of
+        // it, so every column is carried until the sort has run
+        if stmt
+            .order_by
+            .iter()
+            .any(|ob| Self::has_correlated_subqueries(&ob.expression))
+        {
+            return true;
         }
 
         // Check if any ORDER BY column is not in SELECT
@@ -8444,6 +8473,19 @@ impl Executor {
                     }
                 }
                 _ => {}
+            }
+        }
+
+        // A correlated subquery in ORDER BY reads the parent row, so every
+        // column rides along until the sort has run
+        if order_by
+            .iter()
+            .any(|ob| Self::has_correlated_subqueries(&ob.expression))
+        {
+            for idx in 0..all_columns.len() {
+                if !extra_order_indices.contains(&idx) {
+                    extra_order_indices.push(idx);
+                }
             }
         }
 
