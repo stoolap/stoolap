@@ -1919,10 +1919,16 @@ impl Executor {
                 .iter()
                 .find(|wd| wd.name.eq_ignore_ascii_case(win_ref))
                 .ok_or_else(|| Error::NotSupported(format!("Unknown window name: {}", win_ref)))?;
+            // OVER (w ...) adds its own ORDER BY, where the named window
+            // has none, and its own frame on top of the named window
             (
                 win_def.partition_by.clone(),
-                win_def.order_by.clone(),
-                win_def.frame.clone(),
+                if window_expr.order_by.is_empty() {
+                    win_def.order_by.clone()
+                } else {
+                    window_expr.order_by.clone()
+                },
+                window_expr.frame.clone().or_else(|| win_def.frame.clone()),
             )
         } else {
             (
