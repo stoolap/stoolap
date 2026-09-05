@@ -237,3 +237,54 @@ fn test_sorting_by_a_function_of_an_expression() {
     assert_eq!(columns, 1);
     assert!(widths.iter().all(|w| *w == 1), "{widths:?}");
 }
+
+/// A key the sort has to work out for itself does not cost the keys that
+/// already have a column
+#[test]
+fn test_a_deferred_key_beside_a_computed_one() {
+    let db = setup("order_by_mixed_keys");
+    assert_eq!(
+        values(&db, "SELECT n AS x FROM t ORDER BY ABS(n - 20), x + 0"),
+        ["20", "10", "30", "40"],
+        "the first key still reads its column"
+    );
+    assert_eq!(
+        values(&db, "SELECT n AS x FROM t ORDER BY ABS(n - 20)"),
+        ["20", "30", "10", "40"]
+    );
+    assert_eq!(
+        values(&db, "SELECT n AS x FROM t ORDER BY id DESC, x + 0"),
+        ["40", "20", "10", "30"]
+    );
+}
+
+/// Two expressions that differ only in the case of a string literal are two
+/// expressions, and each reads its own column
+#[test]
+fn test_keys_differing_only_in_the_case_of_a_literal() {
+    let db = Database::open("memory://order_by_literal_case").unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, g TEXT)", ())
+        .unwrap();
+    for (id, g) in [(1i64, "A"), (2, "a"), (3, "B")] {
+        db.execute("INSERT INTO u VALUES ($1, $2)", (id, g))
+            .unwrap();
+    }
+    let ids = |sql: &str| -> Vec<String> {
+        db.query(sql, ())
+            .unwrap()
+            .map(|row| row.unwrap().get::<i64>(0).unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        ids("SELECT id FROM u ORDER BY INSTR(g, 'a'), INSTR(g, 'A'), id"),
+        ["3", "1", "2"]
+    );
+    assert_eq!(
+        ids("SELECT id FROM u ORDER BY INSTR(g, 'a'), id"),
+        ["1", "3", "2"]
+    );
+    assert_eq!(
+        ids("SELECT id FROM u ORDER BY INSTR(g, 'A'), id"),
+        ["2", "3", "1"]
+    );
+}

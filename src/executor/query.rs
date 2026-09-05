@@ -503,6 +503,19 @@ impl Executor {
                 }
             };
 
+            // The projection names a column after the whole expression it
+            // holds. Identifiers inside it are matched whatever their case,
+            // but a string literal is not, so an exact name wins over one
+            // that only reads the same: ABS(g, 'a') and ABS(g, 'A') are two
+            // expressions and get two columns
+            let find_column_named_after = |expr: &Expression| -> Option<usize> {
+                let name = expr.to_string();
+                columns
+                    .iter()
+                    .position(|c| *c == name)
+                    .or_else(|| columns.iter().position(|c| c.eq_ignore_ascii_case(&name)))
+            };
+
             // Check if ORDER BY expression can be mapped to existing column (handles aggregates)
             let try_map_to_column = |ob: &crate::parser::ast::OrderByExpression| -> Option<usize> {
                 match &ob.expression {
@@ -619,10 +632,7 @@ impl Executor {
                         // A function of anything but a bare column is named
                         // after the whole call, the way the projection names
                         // the column it puts an unselected expression in
-                        let order_expr_str = ob.expression.to_string();
-                        columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(&order_expr_str))
+                        find_column_named_after(&ob.expression)
                     }
                     _ => {
                         // For any other expression (Infix, Prefix, Cast, etc.),
@@ -640,9 +650,7 @@ impl Executor {
                         }
                         // The projection puts an expression the SELECT list
                         // leaves out in a column named after it
-                        columns
-                            .iter()
-                            .position(|c| c.eq_ignore_ascii_case(&order_expr_str))
+                        find_column_named_after(&ob.expression)
                     }
                 }
             };
@@ -740,6 +748,14 @@ impl Executor {
                             stmt.order_by
                                 .iter()
                                 .map(|ob| {
+                                    // A key the projection already put in a
+                                    // column is read from it
+                                    if let Some(idx) = try_map_to_column(ob) {
+                                        return row
+                                            .get(idx)
+                                            .cloned()
+                                            .unwrap_or_else(Value::null_unknown);
+                                    }
                                     // Try processing correlated subqueries first
                                     if Self::has_correlated_subqueries(&ob.expression) {
                                         match self.process_correlated_expression(
@@ -768,22 +784,34 @@ impl Executor {
                         })
                         .collect()
                 } else {
-                    // Pre-compile each ORDER BY expression once; per row
+                    // A key the projection already put in a column is read
+                    // from it: the row no longer carries what it was
+                    // computed from. The rest are compiled once, so per row
                     // only the VM runs (no row clone, no expression re-hash)
-                    let programs: Vec<Option<super::expression::SharedProgram>> = stmt
+                    #[allow(clippy::type_complexity)]
+                    let key_sources: Vec<(
+                        Option<usize>,
+                        Option<super::expression::SharedProgram>,
+                    )> = stmt
                         .order_by
                         .iter()
-                        .map(|ob| evaluator.compile_cached(&ob.expression).ok())
+                        .map(|ob| match try_map_to_column(ob) {
+                            Some(idx) => (Some(idx), None),
+                            None => (None, evaluator.compile_cached(&ob.expression).ok()),
+                        })
                         .collect();
                     rows.iter()
                         .map(|(_, row)| {
-                            programs
+                            key_sources
                                 .iter()
-                                .map(|p| match p {
-                                    Some(p) => evaluator
+                                .map(|source| match source {
+                                    (Some(idx), _) => {
+                                        row.get(*idx).cloned().unwrap_or_else(Value::null_unknown)
+                                    }
+                                    (None, Some(p)) => evaluator
                                         .evaluate_program(p, row)
                                         .unwrap_or_else(|_| Value::null_unknown()),
-                                    None => Value::null_unknown(),
+                                    (None, None) => Value::null_unknown(),
                                 })
                                 .collect()
                         })
