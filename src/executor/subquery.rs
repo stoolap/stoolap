@@ -1030,6 +1030,21 @@ impl Executor {
         // Extract correlation info
         let correlation = Self::extract_index_nested_loop_info(subquery)?;
 
+        // One pass over the table answers every outer row at once, which
+        // holds only while the correlation predicate is the one place the
+        // parent row is read: anywhere else it would differ per row
+        let tables = Self::collect_subquery_table_columns(subquery);
+        let reads_parent_row = |expr: &Expression| Self::references_outer_columns(expr, &tables);
+        if subquery.columns.iter().any(&reads_parent_row)
+            || subquery.having.as_deref().is_some_and(&reads_parent_row)
+            || correlation
+                .additional_predicate
+                .as_ref()
+                .is_some_and(&reads_parent_row)
+        {
+            return None;
+        }
+
         // Pre-compute lowercase column names
         let outer_column_lower = correlation.outer_column.to_lowercase();
         let outer_qualified_lower = correlation
@@ -1065,11 +1080,14 @@ impl Executor {
         // Extract correlation column
         let correlation = Self::extract_index_nested_loop_info(subquery)?;
 
+        // The aggregate's own text, since two aggregates of one name over
+        // one table and one correlation column read different columns
         Some(format!(
-            "batch_agg:{}:{}:{}",
+            "batch_agg:{}:{}:{}:{}",
             table_name.to_lowercase(),
             correlation.inner_column.to_lowercase(),
-            agg_func
+            agg_func,
+            subquery.columns[0]
         ))
     }
 
@@ -1780,17 +1798,6 @@ impl Executor {
         let is_non_correlated =
             ctx.outer_row().is_none() && !Self::is_subquery_correlated(subquery);
 
-        // A correlated subquery reads the parent row in what it selects and
-        // in its HAVING, not only in its WHERE
-        let bound;
-        let subquery = match Self::bind_outer_references(subquery, ctx) {
-            Some(rewritten) => {
-                bound = rewritten;
-                &bound
-            }
-            None => subquery,
-        };
-
         // For non-correlated subqueries, check cache first using SQL string
         // as key; bypassed inside explicit transactions (see
         // execute_in_subquery for the ROLLBACK rationale)
@@ -1830,6 +1837,18 @@ impl Executor {
                 drop(batch_cache);
             }
         }
+
+        // A correlated subquery reads the parent row in what it selects and
+        // in its HAVING, not only in its WHERE. The paths above read the
+        // statement as written, and one of them keys a cache on its address
+        let bound;
+        let subquery = match Self::bind_outer_references(subquery, ctx) {
+            Some(rewritten) => {
+                bound = rewritten;
+                &bound
+            }
+            None => subquery,
+        };
 
         // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();

@@ -35,11 +35,11 @@ use crate::core::value::NULL_VALUE;
 use crate::core::{DataType, Operator, Row, Schema, Value};
 use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
-    BetweenExpression, BooleanLiteral, CaseExpression, CastExpression, DistinctExpression,
-    Expression, ExpressionList, FloatLiteral, FunctionCall, Identifier, InExpression,
-    InHashSetExpression, InfixExpression, InfixOperator, IntegerLiteral, LikeExpression,
-    ListExpression, NullLiteral, PrefixExpression, QualifiedIdentifier, StringLiteral, WhenClause,
-    WindowFrameBound,
+    AliasedExpression, BetweenExpression, BooleanLiteral, CaseExpression, CastExpression,
+    DistinctExpression, Expression, ExpressionList, FloatLiteral, FunctionCall, Identifier,
+    InExpression, InHashSetExpression, InfixExpression, InfixOperator, IntegerLiteral,
+    LikeExpression, ListExpression, NullLiteral, PrefixExpression, QualifiedIdentifier,
+    StringLiteral, WhenClause, WindowFrameBound,
 };
 use crate::parser::token::{Position, Token, TokenType};
 
@@ -391,6 +391,15 @@ fn substitute_outer_references_inner(
                     type_name: cast.type_name.clone(),
                 })
             }),
+        Expression::Aliased(aliased) => {
+            substitute_outer_references_inner(&aliased.expression, outer_row, scope).map(|expr| {
+                Expression::Aliased(AliasedExpression {
+                    token: aliased.token.clone(),
+                    expression: Box::new(expr),
+                    alias: aliased.alias.clone(),
+                })
+            })
+        }
         Expression::Distinct(distinct) => {
             substitute_outer_references_inner(&distinct.expr, outer_row, scope).map(|expr| {
                 Expression::Distinct(DistinctExpression {

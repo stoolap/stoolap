@@ -162,3 +162,93 @@ fn test_outer_reference_in_where_still_works() {
         "orders above ten times the parent id"
     );
 }
+
+/// An aggregate that reads the parent row is answered per parent row, not
+/// once for the whole table with the first row's value inside it
+#[test]
+fn test_outer_reference_inside_an_aggregate_with_a_correlation() {
+    let db = setup("correlated_scope_batch");
+    // User n has three orders, each carrying user_id n
+    assert_eq!(
+        answers(
+            &db,
+            "SELECT u.id, (SELECT SUM(x.user_id * u.id) FROM orders x WHERE x.user_id = u.id) FROM users u ORDER BY u.id"
+        ),
+        ["3", "12", "27", "48"]
+    );
+    // Amounts of user n sum to 30n + 3, plus the parent id once per order
+    assert_eq!(
+        answers(
+            &db,
+            "SELECT u.id, (SELECT SUM(x.amount + u.id) FROM orders x WHERE x.user_id = u.id) FROM users u ORDER BY u.id"
+        ),
+        ["36", "69", "102", "135"]
+    );
+}
+
+/// An alias over the parent's column keeps the alias and the parent's value
+#[test]
+fn test_outer_reference_under_an_alias() {
+    let db = setup("correlated_scope_alias");
+    assert_eq!(
+        answers(
+            &db,
+            "SELECT u.id, (SELECT u.id AS parent_id FROM orders x LIMIT 1) FROM users u ORDER BY u.id"
+        ),
+        ["1", "2", "3", "4"]
+    );
+}
+
+/// Two aggregates of one name over one table and one correlation column
+/// read the columns they name, not one another's
+#[test]
+fn test_two_aggregates_over_one_correlation_column() {
+    let db = setup("correlated_scope_two_aggregates");
+    let rows: Vec<Vec<String>> = db
+        .query(
+            "SELECT u.id, (SELECT SUM(x.amount) FROM orders x WHERE x.user_id = u.id), (SELECT SUM(x.id) FROM orders x WHERE x.user_id = u.id) FROM users u ORDER BY u.id",
+            (),
+        )
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (0..3).map(|i| row.get::<String>(i).unwrap()).collect()
+        })
+        .collect();
+    // Amounts of user n are 10n, 10n+1, 10n+2; its order ids are 3n-2, 3n-1, 3n
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1", "33", "6"],
+            vec!["2", "63", "15"],
+            vec!["3", "93", "24"],
+            vec!["4", "123", "33"],
+        ]
+    );
+}
+
+/// A subquery that reads the parent row does not answer for the one beside it
+#[test]
+fn test_two_subqueries_keep_their_own_answers() {
+    let db = setup("correlated_scope_neighbours");
+    let rows: Vec<Vec<String>> = db
+        .query(
+            "SELECT u.id, (SELECT SUM(x.user_id * u.id) FROM orders x WHERE x.user_id = u.id), (SELECT u.id FROM orders x LIMIT 1) FROM users u ORDER BY u.id",
+            (),
+        )
+        .unwrap()
+        .map(|row| {
+            let row = row.unwrap();
+            (0..3).map(|i| row.get::<String>(i).unwrap()).collect()
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            vec!["1", "3", "1"],
+            vec!["2", "12", "2"],
+            vec!["3", "27", "3"],
+            vec!["4", "48", "4"],
+        ]
+    );
+}
