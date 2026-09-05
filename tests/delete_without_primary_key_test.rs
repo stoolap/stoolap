@@ -107,3 +107,54 @@ fn test_rows_that_hold_the_same_values() {
     assert_eq!(removed, 2, "both rows holding a 1");
     assert_eq!(ids(&db, "SELECT n FROM t"), [2]);
 }
+
+/// A key that names a column of a table without a primary key is enforced
+/// the same way, since the rows are still read before they go
+#[test]
+fn test_foreign_keys_on_a_parent_without_a_primary_key() {
+    let db = Database::open("memory://delete_no_pk_restrict").unwrap();
+    db.execute("CREATE TABLE par (code INTEGER UNIQUE, name TEXT)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE ch (id INTEGER PRIMARY KEY, code INTEGER REFERENCES par(code) ON DELETE RESTRICT)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO par VALUES (1, 'a'), (2, 'b')", ())
+        .unwrap();
+    db.execute("INSERT INTO ch VALUES (1, 1)", ()).unwrap();
+
+    assert!(
+        db.execute("DELETE FROM par WHERE code IN (SELECT 1)", ())
+            .is_err(),
+        "the child still references it"
+    );
+    assert_eq!(ids(&db, "SELECT code FROM par ORDER BY code"), [1, 2]);
+    assert_eq!(ids(&db, "SELECT id FROM ch"), [1]);
+
+    let removed = db
+        .execute("DELETE FROM par WHERE code IN (SELECT 2)", ())
+        .unwrap();
+    assert_eq!(removed, 1, "the row nothing references goes");
+    assert_eq!(ids(&db, "SELECT code FROM par"), [1]);
+}
+
+#[test]
+fn test_cascade_on_a_parent_without_a_primary_key() {
+    let db = Database::open("memory://delete_no_pk_cascade").unwrap();
+    db.execute("CREATE TABLE par (code INTEGER UNIQUE)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE ch (id INTEGER PRIMARY KEY, code INTEGER REFERENCES par(code) ON DELETE CASCADE)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO par VALUES (1), (2)", ()).unwrap();
+    db.execute("INSERT INTO ch VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+
+    db.execute("DELETE FROM par WHERE code IN (SELECT 1)", ())
+        .unwrap();
+    assert_eq!(ids(&db, "SELECT code FROM par"), [2]);
+    assert_eq!(ids(&db, "SELECT id FROM ch"), [2], "the child went with it");
+}

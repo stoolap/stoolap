@@ -2839,7 +2839,10 @@ impl Executor {
                 };
 
                 if matches {
-                    let row_data = if has_returning {
+                    // Without a primary key the row itself is what the
+                    // foreign keys are read from, so it is kept for them too
+                    let row_data = if has_returning || (has_referencing_fks && pk_col_idx.is_none())
+                    {
                         Some(row.clone())
                     } else {
                         None
@@ -2868,6 +2871,31 @@ impl Executor {
                     rows_to_delete.iter().map(|(pk, _)| pk),
                     &referencing_fks,
                 )?;
+            }
+            // Without a primary key each key is read from the column it
+            // names, which is why the rows were kept
+            if has_referencing_fks && !rows_to_delete_by_row_id.is_empty() {
+                for fk_entry in referencing_fks.iter() {
+                    let referenced = fk_entry.1.referenced_column.to_lowercase();
+                    let Some(idx) = schema_arc
+                        .columns
+                        .iter()
+                        .position(|c| c.name_lower == referenced)
+                    else {
+                        continue;
+                    };
+                    let values: Vec<Value> = rows_to_delete_by_row_id
+                        .iter()
+                        .filter_map(|(_, row)| row.as_ref().and_then(|r| r.get(idx).cloned()))
+                        .collect();
+                    super::foreign_key::enforce_delete_actions_iter(
+                        &self.engine,
+                        table.txn_id(),
+                        table_name,
+                        values.iter(),
+                        std::slice::from_ref(fk_entry),
+                    )?;
+                }
             }
 
             // Delete matching rows by primary key
