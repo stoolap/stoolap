@@ -1108,6 +1108,7 @@ impl QueryClassification {
             }
             Expression::AllAny(all_any) => {
                 Self::has_outer_column_reference(&all_any.left, inner_tables)
+                    || Self::nested_has_outer_reference(&all_any.subquery, inner_tables)
             }
             Expression::Cast(cast) => Self::has_outer_column_reference(&cast.expr, inner_tables),
             Expression::Like(like) => {
@@ -1150,8 +1151,35 @@ impl QueryClassification {
                 .chain(window.partition_by.iter())
                 .chain(window.order_by.iter().map(|o| &o.expression))
                 .any(|e| Self::has_outer_column_reference(e, inner_tables)),
+            // A subquery nested in this one may read a column from further
+            // out than either of them, which this one has to carry in
+            Expression::Exists(exists) => {
+                Self::nested_has_outer_reference(&exists.subquery, inner_tables)
+            }
+            Expression::ScalarSubquery(subquery) => {
+                Self::nested_has_outer_reference(&subquery.subquery, inner_tables)
+            }
             _ => false,
         }
+    }
+
+    /// Whether a subquery nested inside another reads a column that neither
+    /// of them defines
+    fn nested_has_outer_reference(nested: &SelectStatement, inner_tables: &[String]) -> bool {
+        let mut tables = inner_tables.to_vec();
+        tables.extend(Self::collect_subquery_tables(&nested.table_expr));
+        nested
+            .where_clause
+            .as_deref()
+            .is_some_and(|where_clause| Self::has_outer_column_reference(where_clause, &tables))
+            || nested
+                .columns
+                .iter()
+                .any(|column| Self::has_outer_column_reference(column, &tables))
+            || nested
+                .having
+                .as_deref()
+                .is_some_and(|having| Self::has_outer_column_reference(having, &tables))
     }
 }
 
