@@ -114,3 +114,13 @@ fn test_a_window_at_the_limits_of_the_type() {
         assert_eq!(text(&db, sql), expected, "{sql}");
     }
 }
+
+/// There is nothing to find in a string that holds no characters
+#[test]
+fn test_replacing_a_string_that_holds_nothing() {
+    let db = Database::open("memory://string_boundary_replace").unwrap();
+    assert_eq!(text(&db, "SELECT REPLACE('abc', '', 'x')"), "abc");
+    assert_eq!(text(&db, "SELECT REPLACE('', '', 'x')"), "");
+    assert_eq!(text(&db, "SELECT REPLACE('aaa', 'a', '')"), "");
+    assert_eq!(text(&db, "SELECT REPLACE('abc', 'b', 'xy')"), "axyc");
+}

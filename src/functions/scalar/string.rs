@@ -583,6 +583,12 @@ impl ScalarFunction for ReplaceFunction {
         let from = value_to_string(&args[1]);
         let to = value_to_string(&args[2]);
 
+        // There is nothing to find in a string that holds no characters,
+        // so the subject is returned as it stands
+        if from.is_empty() {
+            return Ok(Value::Text(SmartString::from_string(s)));
+        }
+
         Ok(Value::Text(SmartString::from_string(s.replace(&from, &to))))
     }
 
