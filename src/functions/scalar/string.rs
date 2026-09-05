@@ -346,17 +346,23 @@ impl ScalarFunction for SubstringFunction {
             Error::invalid_argument("SUBSTRING start position must be an integer")
         })?;
         let len = chars.len() as i64;
-        let start = if start < 0 { len + start + 1 } else { start };
+        let start = if start < 0 {
+            len.saturating_add(start).saturating_add(1)
+        } else {
+            start
+        };
 
         // The window runs from the start for a length, or back from it for
         // a negative one, and only the part inside the string is returned
         let (from, to) = if args.len() == 3 {
             let length = value_to_i64(&args[2])
                 .ok_or_else(|| Error::invalid_argument("SUBSTRING length must be an integer"))?;
+            // A length near the limits runs past either end of the string,
+            // which the clamp below turns into that end
             if length < 0 {
-                (start + length, start)
+                (start.saturating_add(length), start)
             } else {
-                (start, start + length)
+                (start, start.saturating_add(length))
             }
         } else {
             (start, len + 1)

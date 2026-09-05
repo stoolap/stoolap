@@ -85,3 +85,32 @@ fn test_like_escape_reads_the_next_character_as_itself() {
         assert_eq!(count(&db, sql), expected, "{sql}");
     }
 }
+
+/// A start or a length at the limits of the type runs past an end of the
+/// string, which is the same as reaching that end
+#[test]
+fn test_a_window_at_the_limits_of_the_type() {
+    let db = Database::open("memory://string_boundary_limits").unwrap();
+    for (sql, expected) in [
+        ("SELECT SUBSTR('abc', 1, 9223372036854775807)", "abc"),
+        (
+            "SELECT '[' || SUBSTR('abc', 9223372036854775807, 2) || ']'",
+            "[]",
+        ),
+        (
+            "SELECT '[' || SUBSTR('abc', 3, -9223372036854775808) || ']'",
+            "[ab]",
+        ),
+        ("SELECT SUBSTR('abc', -2, 9223372036854775807)", "bc"),
+        (
+            "SELECT '[' || SUBSTR('abc', -9223372036854775808, 3) || ']'",
+            "[]",
+        ),
+        (
+            "SELECT '[' || SUBSTR('abc', -9223372036854775807, 9223372036854775807) || ']'",
+            "[abc]",
+        ),
+    ] {
+        assert_eq!(text(&db, sql), expected, "{sql}");
+    }
+}
