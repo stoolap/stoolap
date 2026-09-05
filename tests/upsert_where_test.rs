@@ -56,3 +56,44 @@ fn test_do_update_where_holds_back_the_rows_it_does_not_cover() {
     .unwrap();
     assert_eq!(rows(&db), [(3, Some(39)), (4, Some(7)), (5, Some(1))]);
 }
+
+#[test]
+fn test_a_row_the_condition_leaves_alone_is_not_an_affected_row() {
+    let db = Database::open("memory://upsert_where_count").unwrap();
+    db.execute("CREATE TABLE u (k INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 10)", ()).unwrap();
+    let skipped = db
+        .execute(
+            "INSERT INTO u VALUES (1, 99) ON CONFLICT (k) DO UPDATE SET v = excluded.v WHERE FALSE",
+            (),
+        )
+        .unwrap();
+    assert_eq!(skipped, 0);
+    let taken = db
+        .execute(
+            "INSERT INTO u VALUES (1, 99), (2, 20) ON CONFLICT (k) DO UPDATE SET v = excluded.v WHERE u.v < 50",
+            (),
+        )
+        .unwrap();
+    assert_eq!(taken, 2);
+    assert_eq!(rows(&db), [(1, Some(99)), (2, Some(20))]);
+}
+
+#[test]
+fn test_the_condition_sees_the_transaction() {
+    let db = Database::open("memory://upsert_where_transaction").unwrap();
+    db.execute("CREATE TABLE u (k INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 10)", ()).unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    let taken = db
+        .execute(
+            "INSERT INTO u VALUES (1, 99) ON CONFLICT (k) DO UPDATE SET v = excluded.v WHERE CURRENT_TRANSACTION_ID() IS NOT NULL",
+            (),
+        )
+        .unwrap();
+    assert_eq!(taken, 1);
+    db.execute("COMMIT", ()).unwrap();
+    assert_eq!(rows(&db), [(1, Some(99))]);
+}

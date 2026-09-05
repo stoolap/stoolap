@@ -775,12 +775,13 @@ impl Executor {
                                 ctx,
                                 has_returning,
                             ) {
-                                Ok(Some(updated_row)) => {
-                                    returning_rows.push(updated_row);
-                                    rows_affected += 1;
-                                }
-                                Ok(None) => {
-                                    rows_affected += 1;
+                                Ok((updated, returned)) => {
+                                    if let Some(updated_row) = returned {
+                                        returning_rows.push(updated_row);
+                                    }
+                                    if updated {
+                                        rows_affected += 1;
+                                    }
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -824,12 +825,13 @@ impl Executor {
                                         ctx,
                                         has_returning,
                                     ) {
-                                        Ok(Some(updated_row)) => {
-                                            returning_rows.push(updated_row);
-                                            rows_affected += 1;
-                                        }
-                                        Ok(None) => {
-                                            rows_affected += 1;
+                                        Ok((updated, returned)) => {
+                                            if let Some(updated_row) = returned {
+                                                returning_rows.push(updated_row);
+                                            }
+                                            if updated {
+                                                rows_affected += 1;
+                                            }
                                         }
                                         Err(e) => return Err(e),
                                     }
@@ -1054,12 +1056,13 @@ impl Executor {
                                 ctx,
                                 has_returning,
                             ) {
-                                Ok(Some(updated_row)) => {
-                                    returning_rows.push(updated_row);
-                                    rows_affected += 1;
-                                }
-                                Ok(None) => {
-                                    rows_affected += 1;
+                                Ok((updated, returned)) => {
+                                    if let Some(updated_row) = returned {
+                                        returning_rows.push(updated_row);
+                                    }
+                                    if updated {
+                                        rows_affected += 1;
+                                    }
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -1104,12 +1107,13 @@ impl Executor {
                                         ctx,
                                         has_returning,
                                     ) {
-                                        Ok(Some(updated_row)) => {
-                                            returning_rows.push(updated_row);
-                                            rows_affected += 1;
-                                        }
-                                        Ok(None) => {
-                                            rows_affected += 1;
+                                        Ok((updated, returned)) => {
+                                            if let Some(updated_row) = returned {
+                                                returning_rows.push(updated_row);
+                                            }
+                                            if updated {
+                                                rows_affected += 1;
+                                            }
                                         }
                                         Err(e) => return Err(e),
                                     }
@@ -3323,7 +3327,7 @@ impl Executor {
         compiled: Option<&CompiledUpsert>,
         ctx: &ExecutionContext,
         capture_row: bool,
-    ) -> Result<Option<Row>> {
+    ) -> Result<(bool, Option<Row>)> {
         // Build a WHERE clause to find the specific row
         // Use schema's cached pk_column_index for O(1) lookup
         let pk_col = schema
@@ -3490,13 +3494,14 @@ impl Executor {
         // Prefer direct row_id lookup when we have a concrete conflicting row_id.
         // This avoids a second scan on non-PK upserts after conflict resolution.
         // row_id < 0 means "unknown" (sentinel from UniqueConstraint error).
-        if row_id >= 0 {
-            table.update_by_row_ids(&[row_id], &mut setter)?;
+        // A row DO UPDATE ... WHERE left alone is not an updated row
+        let updated = if row_id >= 0 {
+            table.update_by_row_ids(&[row_id], &mut setter)?
         } else {
-            table.update(where_expr.as_deref(), &mut setter)?;
-        }
+            table.update(where_expr.as_deref(), &mut setter)?
+        };
 
-        Ok(captured_row)
+        Ok((updated > 0, captured_row))
     }
 
     /// Find a row by unique index value (supports single and composite unique constraints).
