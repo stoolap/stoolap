@@ -183,6 +183,13 @@ impl Executor {
         // Collect columns with UNIQUE constraints to create indexes after table creation
         let mut unique_columns: Vec<String> = Vec::new();
 
+        // PRIMARY KEY (col) at table level names the key column the way the
+        // column's own constraint would
+        let table_level_pk: Option<&str> = stmt.table_constraints.iter().find_map(|c| match c {
+            TableConstraint::PrimaryKey(cols) if cols.len() == 1 => Some(cols[0].value.as_str()),
+            _ => None,
+        });
+
         for col_def in &stmt.columns {
             let col_name = &col_def.name.value;
             let data_type = self.parse_data_type(&col_def.data_type)?;
@@ -193,7 +200,8 @@ impl Executor {
             let is_primary_key = col_def
                 .constraints
                 .iter()
-                .any(|c| matches!(c, ColumnConstraint::PrimaryKey));
+                .any(|c| matches!(c, ColumnConstraint::PrimaryKey))
+                || table_level_pk.is_some_and(|pk| pk.eq_ignore_ascii_case(col_name));
 
             // Validate PRIMARY KEY type - only INTEGER is supported
             if is_primary_key && data_type != DataType::Integer {
@@ -287,6 +295,12 @@ impl Executor {
         for constraint in &stmt.table_constraints {
             match constraint {
                 TableConstraint::Unique(cols) => {
+                    let col_names: Vec<String> = cols.iter().map(|c| c.value.to_string()).collect();
+                    table_unique_constraints.push(col_names);
+                }
+                // A composite PRIMARY KEY is kept unique the way a composite
+                // UNIQUE is; the row id stays the table's own
+                TableConstraint::PrimaryKey(cols) if cols.len() > 1 => {
                     let col_names: Vec<String> = cols.iter().map(|c| c.value.to_string()).collect();
                     table_unique_constraints.push(col_names);
                 }
