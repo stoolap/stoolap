@@ -5562,17 +5562,43 @@ impl Executor {
             return Ok((result, out_columns, false, None));
         }
 
-        // Project rows according to SELECT expressions
-        let projected_rows =
-            self.project_rows_with_alias(&stmt.columns, filtered_rows, &columns, None, ctx, None)?;
-
-        // Determine output column names
         let subquery_alias = subquery_source
             .alias
             .as_ref()
             .map(|a| a.value_lower.as_str());
-        let output_columns =
-            CompactArc::new(self.get_output_column_names(&stmt.columns, &columns, subquery_alias));
+
+        // Project rows according to SELECT expressions; a column ORDER BY
+        // or DISTINCT ON reads that the select list leaves out rides along
+        let (projected_rows, output_columns) = if self.order_by_needs_extra_columns(stmt, &columns)
+        {
+            let (projected_rows, extra_names) = self.project_rows_with_order_by(
+                &stmt.columns,
+                &stmt.order_by,
+                &stmt.distinct_on,
+                filtered_rows,
+                &columns,
+                ctx,
+            )?;
+            let mut output_columns =
+                self.get_output_column_names(&stmt.columns, &columns, subquery_alias);
+            output_columns.extend(extra_names);
+            (projected_rows, CompactArc::new(output_columns))
+        } else {
+            let projected_rows = self.project_rows_with_alias(
+                &stmt.columns,
+                filtered_rows,
+                &columns,
+                None,
+                ctx,
+                None,
+            )?;
+            let output_columns = CompactArc::new(self.get_output_column_names(
+                &stmt.columns,
+                &columns,
+                subquery_alias,
+            ));
+            (projected_rows, output_columns)
+        };
 
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
@@ -5721,6 +5747,38 @@ impl Executor {
             // For SELECT *, just return the view result with WHERE applied
             // DISTINCT, ORDER BY, LIMIT/OFFSET are handled by execute_select
             return Ok((result, CompactArc::new(view_columns), false, None));
+        }
+
+        // A column ORDER BY or DISTINCT ON reads that the select list leaves
+        // out rides along, the way it does for a derived table
+        if self.order_by_needs_extra_columns(stmt, &view_columns) {
+            let mut result = result;
+            let mut rows = RowVec::new();
+            let mut row_id = 0i64;
+            while result.next() {
+                rows.push((row_id, result.take_row()));
+                row_id += 1;
+            }
+            if let Some(err) = result.last_error() {
+                return Err(err);
+            }
+            let (projected_rows, extra_names) = self.project_rows_with_order_by(
+                &stmt.columns,
+                &stmt.order_by,
+                &stmt.distinct_on,
+                rows,
+                &view_columns,
+                ctx,
+            )?;
+            let mut output_columns =
+                self.get_output_column_names(&stmt.columns, &view_columns, None);
+            output_columns.extend(extra_names);
+            let output_columns = CompactArc::new(output_columns);
+            let result = ExecutorResult::with_arc_columns(
+                CompactArc::clone(&output_columns),
+                projected_rows,
+            );
+            return Ok((Box::new(result), output_columns, false, None));
         }
 
         // Determine if we have any complex expressions (not just column references)
