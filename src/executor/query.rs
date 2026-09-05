@@ -5359,7 +5359,13 @@ impl Executor {
 
                 (filtered_columns, filtered_rows)
             } else {
-                (all_columns.clone(), filtered_rows)
+                // An explicit select list finds the join column by its
+                // bare name too, as `a` or as `x.a`
+                let mut renamed = all_columns.clone();
+                for (idx, base_name) in &join_col_renames {
+                    renamed[*idx] = base_name.clone();
+                }
+                (renamed, filtered_rows)
             }
         } else {
             (all_columns.clone(), filtered_rows)
