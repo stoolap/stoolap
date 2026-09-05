@@ -465,6 +465,15 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Option<bool>> {
+        // Probing the index answers whether a matching row is there, which
+        // is the whole question EXISTS asks only when the WHERE decides the
+        // rows. The extractor below is shared with the paths that read a
+        // correlated aggregate, where an aggregate without a GROUP BY is the
+        // very shape they are for, so the check belongs here
+        if Self::exists_subquery_is_more_than_its_where(subquery) {
+            return Ok(None);
+        }
+
         // Need outer row context for correlated subquery
         let outer_row = match ctx.outer_row() {
             Some(row) => row,
@@ -717,12 +726,6 @@ impl Executor {
     /// Looks for patterns like:
     /// SELECT 1 FROM orders WHERE orders.user_id = u.id [AND additional_predicates]
     fn extract_index_nested_loop_info(subquery: &SelectStatement) -> Option<IndexNestedLoopInfo> {
-        // Probing the index answers whether a matching row is there, which
-        // is the whole question only when the WHERE decides the rows
-        if Self::exists_subquery_is_more_than_its_where(subquery) {
-            return None;
-        }
-
         // Must have a simple table source
         let (inner_table, inner_alias) = match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
             Some(Expression::TableSource(ts)) => {
