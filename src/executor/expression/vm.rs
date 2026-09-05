@@ -431,13 +431,7 @@ impl ExprVM {
                         (Value::Float(x), Value::Integer(y)) => {
                             Value::Boolean(crate::core::value::i64_ge_f64(*y, *x))
                         }
-                        _ => match a.partial_cmp(&b) {
-                            Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
-                                Value::Boolean(true)
-                            }
-                            Some(std::cmp::Ordering::Greater) => Value::Boolean(false),
-                            None => Value::Null(DataType::Boolean),
-                        },
+                        _ => self.compare_values_or_equal(&a, &b, std::cmp::Ordering::Less),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -475,13 +469,7 @@ impl ExprVM {
                         (Value::Float(x), Value::Integer(y)) => {
                             Value::Boolean(crate::core::value::i64_le_f64(*y, *x))
                         }
-                        _ => match a.partial_cmp(&b) {
-                            Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
-                                Value::Boolean(true)
-                            }
-                            Some(std::cmp::Ordering::Less) => Value::Boolean(false),
-                            None => Value::Null(DataType::Boolean),
-                        },
+                        _ => self.compare_values_or_equal(&a, &b, std::cmp::Ordering::Greater),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -605,13 +593,7 @@ impl ExprVM {
                     let result = match val {
                         Value::Integer(threshold) => Self::le_int(col_val, *threshold),
                         Value::Float(threshold) => Self::le_float(col_val, *threshold),
-                        _ => match col_val.partial_cmp(val) {
-                            Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
-                                Value::Boolean(true)
-                            }
-                            Some(std::cmp::Ordering::Greater) => Value::Boolean(false),
-                            None => Value::Null(DataType::Boolean),
-                        },
+                        _ => self.compare_values_or_equal(col_val, val, std::cmp::Ordering::Less),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -641,13 +623,9 @@ impl ExprVM {
                     let result = match val {
                         Value::Integer(threshold) => Self::ge_int(col_val, *threshold),
                         Value::Float(threshold) => Self::ge_float(col_val, *threshold),
-                        _ => match col_val.partial_cmp(val) {
-                            Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
-                                Value::Boolean(true)
-                            }
-                            Some(std::cmp::Ordering::Less) => Value::Boolean(false),
-                            None => Value::Null(DataType::Boolean),
-                        },
+                        _ => {
+                            self.compare_values_or_equal(col_val, val, std::cmp::Ordering::Greater)
+                        }
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -690,7 +668,11 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    let result = if col_val.is_null() {
+                    // A set holding nothing matches nothing, whatever it is
+                    // asked about, so NOT IN over it holds for every row
+                    let result = if set.is_empty() && !*has_null {
+                        Value::Boolean(false)
+                    } else if col_val.is_null() {
                         Value::Null(DataType::Boolean)
                     } else if set.contains(col_val) {
                         Value::Boolean(true)
@@ -1357,7 +1339,11 @@ impl ExprVM {
                 // =============================================================
                 Op::InSet(set, has_null) => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if v.is_null() {
+                    // A set holding nothing matches nothing, whatever it is
+                    // asked about, so NOT IN over it holds for every row
+                    let result = if set.is_empty() && !*has_null {
+                        Value::Boolean(false)
+                    } else if v.is_null() {
                         Value::Null(DataType::Boolean)
                     } else if set.contains(&v) {
                         Value::Boolean(true)
@@ -1372,7 +1358,9 @@ impl ExprVM {
 
                 Op::NotInSet(set, has_null) => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if v.is_null() {
+                    let result = if set.is_empty() && !*has_null {
+                        Value::Boolean(true)
+                    } else if v.is_null() {
                         Value::Null(DataType::Boolean)
                     } else if set.contains(&v) {
                         Value::Boolean(false)
@@ -2183,13 +2171,7 @@ impl ExprVM {
                         (Value::Float(x), Value::Integer(y)) => {
                             Value::Boolean(crate::core::value::i64_ge_f64(*y, *x))
                         }
-                        _ => match (*a).partial_cmp(&*b) {
-                            Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
-                                Value::Boolean(true)
-                            }
-                            Some(std::cmp::Ordering::Greater) => Value::Boolean(false),
-                            None => Value::Null(DataType::Boolean),
-                        },
+                        _ => self.compare_values_or_equal(&a, &b, std::cmp::Ordering::Less),
                     };
                     stack.push(Cow::Owned(result));
                     pc += 1;
@@ -2225,13 +2207,7 @@ impl ExprVM {
                         (Value::Float(x), Value::Integer(y)) => {
                             Value::Boolean(crate::core::value::i64_le_f64(*y, *x))
                         }
-                        _ => match (*a).partial_cmp(&*b) {
-                            Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
-                                Value::Boolean(true)
-                            }
-                            Some(std::cmp::Ordering::Less) => Value::Boolean(false),
-                            None => Value::Null(DataType::Boolean),
-                        },
+                        _ => self.compare_values_or_equal(&a, &b, std::cmp::Ordering::Greater),
                     };
                     stack.push(Cow::Owned(result));
                     pc += 1;
@@ -2748,13 +2724,18 @@ impl ExprVM {
         // Pattern: [GtColumnConst(idx, val), Return]
         if ops.len() == 2 {
             if let Op::Return = &ops[1] {
-                return Self::eval_single_op_bool(&ops[0], ctx);
+                if Self::is_single_op_predicate(&ops[0]) {
+                    return Self::eval_single_op_bool(&ops[0], ctx);
+                }
             }
         }
 
         // Fast path: Two comparisons with AND (range filter)
         // Pattern: [Compare1, And(_), Compare2, AndFinalize, Return]
-        if ops.len() == 5 {
+        if ops.len() == 5
+            && Self::is_single_op_predicate(&ops[0])
+            && Self::is_single_op_predicate(&ops[2])
+        {
             if let (Op::And(_), Op::AndFinalize, Op::Return) = (&ops[1], &ops[3], &ops[4]) {
                 let a = Self::eval_single_op_tribool(&ops[0], ctx);
                 // Short-circuit: if first is false, result is false
@@ -2802,12 +2783,17 @@ impl ExprVM {
         // Fast path: Single comparison + Return (most common filter)
         if ops.len() == 2 {
             if let Op::Return = &ops[1] {
-                return Ok(Self::eval_single_op_bool(&ops[0], ctx));
+                if Self::is_single_op_predicate(&ops[0]) {
+                    return Ok(Self::eval_single_op_bool(&ops[0], ctx));
+                }
             }
         }
 
         // Fast path: Two comparisons with AND/OR
-        if ops.len() == 5 {
+        if ops.len() == 5
+            && Self::is_single_op_predicate(&ops[0])
+            && Self::is_single_op_predicate(&ops[2])
+        {
             if let (Op::And(_), Op::AndFinalize, Op::Return) = (&ops[1], &ops[3], &ops[4]) {
                 let a = Self::eval_single_op_tribool(&ops[0], ctx);
                 if a == Some(false) {
@@ -2834,6 +2820,30 @@ impl ExprVM {
             Ok(_) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// The ops the two single-op paths below answer for themselves. They
+    /// report a NULL as false, which is what a filter wants, so an op they
+    /// do not know has to go to the full VM rather than be read the same
+    /// way: a bare column load is a value to be read as a condition, not a
+    /// comparison that came out unknown.
+    #[inline]
+    fn is_single_op_predicate(op: &Op) -> bool {
+        matches!(
+            op,
+            Op::GtColumnConst(..)
+                | Op::LtColumnConst(..)
+                | Op::GeColumnConst(..)
+                | Op::LeColumnConst(..)
+                | Op::EqColumnConst(..)
+                | Op::NeColumnConst(..)
+                | Op::IsNullColumn(..)
+                | Op::IsNotNullColumn(..)
+                | Op::BetweenColumnConst(..)
+                | Op::InSetColumn(..)
+                | Op::LikeColumn(..)
+                | Op::LoadConst(..)
+        )
     }
 
     /// Evaluate a single comparison op and return bool (for fast path)
@@ -3121,6 +3131,11 @@ impl ExprVM {
                 None => None,
             },
             Op::InSetColumn(idx, set, has_null) => {
+                // A set holding nothing matches nothing, whatever it is
+                // asked about
+                if set.is_empty() && !*has_null {
+                    return Some(false);
+                }
                 match ctx.row.get(*idx as usize) {
                     Some(v) if v.is_null() => None, // NULL IN set -> NULL
                     Some(v) if set.contains(v) => Some(true),
@@ -3237,8 +3252,28 @@ impl ExprVM {
 
     #[inline]
     fn compare_values(&self, a: &Value, b: &Value, expected: std::cmp::Ordering) -> Value {
+        // Two NULLs order equal so an index can hold them; asked whether one
+        // is below or above the other, SQL answers that it does not know
+        if a.is_null() || b.is_null() {
+            return Value::Null(DataType::Boolean);
+        }
         match a.partial_cmp(b) {
             Some(ord) if ord == expected => Value::Boolean(true),
+            Some(_) => Value::Boolean(false),
+            None => Value::Null(DataType::Boolean),
+        }
+    }
+
+    /// Answer `<=` or `>=`: `expected` is the strict half of the operator.
+    #[inline]
+    fn compare_values_or_equal(&self, a: &Value, b: &Value, expected: std::cmp::Ordering) -> Value {
+        if a.is_null() || b.is_null() {
+            return Value::Null(DataType::Boolean);
+        }
+        match a.partial_cmp(b) {
+            Some(ord) if ord == expected || ord == std::cmp::Ordering::Equal => {
+                Value::Boolean(true)
+            }
             Some(_) => Value::Boolean(false),
             None => Value::Null(DataType::Boolean),
         }

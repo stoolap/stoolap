@@ -35,11 +35,11 @@ use crate::core::value::NULL_VALUE;
 use crate::core::{DataType, Operator, Row, Schema, Value};
 use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
-    BetweenExpression, BooleanLiteral, CaseExpression, CastExpression, DistinctExpression,
-    Expression, ExpressionList, FloatLiteral, FunctionCall, Identifier, InExpression,
-    InHashSetExpression, InfixExpression, InfixOperator, IntegerLiteral, LikeExpression,
-    ListExpression, NullLiteral, PrefixExpression, QualifiedIdentifier, StringLiteral, WhenClause,
-    WindowFrameBound,
+    AliasedExpression, BetweenExpression, BooleanLiteral, CaseExpression, CastExpression,
+    DistinctExpression, Expression, ExpressionList, FloatLiteral, FunctionCall, Identifier,
+    InExpression, InHashSetExpression, InfixExpression, InfixOperator, IntegerLiteral,
+    LikeExpression, ListExpression, NullLiteral, PrefixExpression, QualifiedIdentifier,
+    StringLiteral, WhenClause, WindowFrameBound,
 };
 use crate::parser::token::{Position, Token, TokenType};
 
@@ -134,20 +134,25 @@ pub fn substitute_outer_references(
 /// alone: an inner column may share its name with an outer one, and SQL
 /// binds the nearer scope first.
 pub struct InnerScope<'a> {
-    pub table: &'a str,
-    pub alias: Option<&'a str>,
-    pub schema: &'a Schema,
+    /// The names the subquery's own FROM defines. With an alias only the
+    /// alias names the table; the table's own name may then be an alias in
+    /// the outer query.
+    pub tables: &'a [&'a str],
+    /// The scanned table's schema, where there is one table to have it.
+    /// Without it a bare name is left alone: it can only mean the inner one
+    pub schema: Option<&'a Schema>,
 }
 
 impl InnerScope<'_> {
-    /// With an alias only the alias names the inner table; the table's own
-    /// name may then be an alias in the outer query.
     fn owns_qualifier(&self, qualifier: &str) -> bool {
-        qualifier == self.alias.unwrap_or(self.table)
+        self.tables.contains(&qualifier)
     }
 
     fn owns_column(&self, column: &str) -> bool {
-        self.schema.column_index_map().contains_key(column)
+        match self.schema {
+            Some(schema) => schema.column_index_map().contains_key(column),
+            None => true,
+        }
     }
 }
 
@@ -386,6 +391,15 @@ fn substitute_outer_references_inner(
                     type_name: cast.type_name.clone(),
                 })
             }),
+        Expression::Aliased(aliased) => {
+            substitute_outer_references_inner(&aliased.expression, outer_row, scope).map(|expr| {
+                Expression::Aliased(AliasedExpression {
+                    token: aliased.token.clone(),
+                    expression: Box::new(expr),
+                    alias: aliased.alias.clone(),
+                })
+            })
+        }
         Expression::Distinct(distinct) => {
             substitute_outer_references_inner(&distinct.expr, outer_row, scope).map(|expr| {
                 Expression::Distinct(DistinctExpression {
@@ -2185,9 +2199,8 @@ mod tests {
             .add("Name", DataType::Text)
             .build();
         let scope = InnerScope {
-            table: "parent",
-            alias: Some("p"),
-            schema: &schema,
+            tables: &["p"],
+            schema: Some(&schema),
         };
         let mut outer: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
         for (key, value) in [
@@ -2243,9 +2256,8 @@ mod tests {
 
         // without an alias, the table name is the inner qualifier
         let bare = InnerScope {
-            table: "parent",
-            alias: None,
-            schema: &schema,
+            tables: &["parent"],
+            schema: Some(&schema),
         };
         assert!(matches!(
             substitute_outer_references_in_scope(&qualified("parent", "id"), &outer, &bare),

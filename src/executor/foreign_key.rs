@@ -185,28 +185,164 @@ pub(crate) fn enforce_delete_actions_iter<'a>(
         return Ok(0);
     }
 
-    let mut total_affected = 0i32;
+    let values: Vec<&Value> = deleted_pk_values.collect();
+    pre_check_delete_keys(engine, txn_id, parent_table, &values, referencing_fks)?;
+    apply_delete_actions(engine, txn_id, parent_table, &values, referencing_fks)
+}
 
-    for pk_value in deleted_pk_values {
-        for (child_table_name, fk) in referencing_fks {
-            let action = fk.on_delete;
+/// Ask every key that can refuse the delete before the first change is
+/// made, so a refusal leaves the statement having written nothing.
+///
+/// The walk follows CASCADE and SET NULL down to the keys beneath them: a
+/// RESTRICT on a grandchild refuses the delete just as one on a child does,
+/// and asking only the children would let the first parent's child go
+/// before the second parent's grandchild refused. The walk is skipped when
+/// the tree holds nothing that can refuse.
+pub(crate) fn pre_check_delete_keys(
+    engine: &MVCCEngine,
+    txn_id: i64,
+    parent_table: &str,
+    values: &[&Value],
+    referencing_fks: &[(String, ForeignKeyConstraint)],
+) -> Result<()> {
+    if !fk_tree_can_refuse_delete(engine, referencing_fks, 0) {
+        return Ok(());
+    }
+    for pk_value in values {
+        pre_check_delete_recursive(engine, txn_id, parent_table, pk_value, referencing_fks, 0)?;
+    }
+    Ok(())
+}
 
-            match action {
-                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
-                    // Check if any child rows reference this PK value
-                    if child_rows_exist(engine, txn_id, child_table_name, fk, pk_value)? {
-                        return Err(Error::foreign_key_violation(
-                            child_table_name,
-                            &fk.column_name,
-                            parent_table,
-                            &fk.referenced_column,
-                            format!(
-                                "cannot delete row with {} = {} — still referenced by table '{}'",
-                                fk.referenced_column, pk_value, child_table_name
-                            ),
-                        ));
+/// Whether a delete of a row this tree points at can be refused anywhere
+/// in it: a key that restricts, at any depth below the keys that cascade,
+/// or a cascade deep enough to hit the depth limit. Reads the metadata
+/// only, so a tree of nothing but CASCADE and SET NULL skips the row walk.
+fn fk_tree_can_refuse_delete(
+    engine: &MVCCEngine,
+    referencing_fks: &[(String, ForeignKeyConstraint)],
+    depth: usize,
+) -> bool {
+    if depth >= MAX_CASCADE_DEPTH {
+        return true;
+    }
+    for (child_table_name, fk) in referencing_fks {
+        match fk.on_delete {
+            ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => return true,
+            // A cascade removes whole child rows, so every key pointing at
+            // the child table is asked, the way the cascade itself asks them
+            ForeignKeyAction::Cascade => {
+                let grandchild_fks = find_referencing_fks(engine, child_table_name);
+                if fk_tree_can_refuse_delete(engine, &grandchild_fks[..], depth + 1) {
+                    return true;
+                }
+            }
+            // The child rows stay, so nothing below them changes
+            ForeignKeyAction::SetNull => {}
+        }
+    }
+    false
+}
+
+/// Walk the keys a delete of `value` would set off, the way the cascade
+/// walks them, and refuse at the first key that refuses. Nothing is
+/// written, so the caller can ask this of every value before acting.
+fn pre_check_delete_recursive(
+    engine: &MVCCEngine,
+    txn_id: i64,
+    parent_table: &str,
+    value: &Value,
+    referencing_fks: &[(String, ForeignKeyConstraint)],
+    depth: usize,
+) -> Result<()> {
+    for (child_table_name, fk) in referencing_fks {
+        match fk.on_delete {
+            ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
+                if child_rows_exist(engine, txn_id, child_table_name, fk, value)? {
+                    return Err(Error::foreign_key_violation(
+                        child_table_name,
+                        &fk.column_name,
+                        parent_table,
+                        &fk.referenced_column,
+                        format!(
+                            "cannot delete row with {} = {} — still referenced by table '{}'",
+                            fk.referenced_column, value, child_table_name
+                        ),
+                    ));
+                }
+            }
+            ForeignKeyAction::Cascade => {
+                if depth >= MAX_CASCADE_DEPTH {
+                    return Err(Error::internal(format!(
+                        "foreign key CASCADE depth limit ({}) exceeded — possible circular reference",
+                        MAX_CASCADE_DEPTH
+                    )));
+                }
+                let grandchild_fks = find_referencing_fks(engine, child_table_name);
+                if grandchild_fks.is_empty() {
+                    continue;
+                }
+                // Each key beneath the child names the column it points at,
+                // and the child rows that would go are read through that
+                // column, whether or not it is the child's primary key
+                let child_schema = engine.get_table_schema(child_table_name)?;
+                let child_handle = engine.get_table_for_txn(txn_id, child_table_name)?;
+                let col_name = &child_schema.columns[fk.column_index].name;
+                let mut filter = crate::storage::expression::ComparisonExpr::new(
+                    col_name.as_str(),
+                    crate::core::Operator::Eq,
+                    value.clone(),
+                );
+                filter.prepare_for_schema(&child_schema);
+                let rows = child_handle.collect_all_rows(Some(&filter))?;
+                for gfk_entry in grandchild_fks.iter() {
+                    let referenced = gfk_entry.1.referenced_column.to_lowercase();
+                    let Some(ref_idx) = child_schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name_lower == referenced)
+                    else {
+                        continue;
+                    };
+                    for (_, row) in rows.iter() {
+                        if let Some(child_value) = row.get(ref_idx) {
+                            if child_value.is_null() {
+                                continue;
+                            }
+                            pre_check_delete_recursive(
+                                engine,
+                                txn_id,
+                                child_table_name,
+                                child_value,
+                                std::slice::from_ref(gfk_entry),
+                                depth + 1,
+                            )?;
+                        }
                     }
                 }
+            }
+            ForeignKeyAction::SetNull => {}
+        }
+    }
+    Ok(())
+}
+
+/// Carry out the CASCADE and SET NULL keys for rows already found free to
+/// go. Run after `pre_check_delete_keys` for every key of the table.
+pub(crate) fn apply_delete_actions(
+    engine: &MVCCEngine,
+    txn_id: i64,
+    _parent_table: &str,
+    values: &[&Value],
+    referencing_fks: &[(String, ForeignKeyConstraint)],
+) -> Result<i32> {
+    let mut total_affected = 0i32;
+
+    for pk_value in values {
+        for (child_table_name, fk) in referencing_fks {
+            match fk.on_delete {
+                // Asked above, before anything was written
+                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {}
                 ForeignKeyAction::Cascade => {
                     // Delete matching child rows within the caller's transaction
                     let affected = cascade_delete(engine, txn_id, child_table_name, fk, pk_value)?;
@@ -448,29 +584,40 @@ fn cascade_delete_recursive(
         )));
     }
 
-    // Before deleting child rows, collect their PK values for recursive CASCADE.
-    // This is needed because the child table may itself be a parent with CASCADE children.
+    // Before deleting child rows, read what the keys beneath the child point
+    // at. Each such key names a column of the child, its primary key or
+    // any other, so the child rows about to go are read through that
+    // column, once per key
     let grandchild_fks = find_referencing_fks(engine, child_table);
-    let mut deleted_child_pks: Vec<Value> = Vec::new();
+    let mut deleted_child_keys: Vec<(usize, Vec<Value>)> = Vec::new();
 
     if !grandchild_fks.is_empty() {
-        // Need to collect PK values of rows about to be deleted
         let child_schema = engine.get_table_schema(child_table)?;
-        if let Some(pk_idx) = child_schema.pk_column_index() {
-            let child_handle = engine.get_table_for_txn(txn_id, child_table)?;
-            // Use filtered scan instead of full table scan
-            let col_name = &child_schema.columns[fk.column_index].name;
-            let mut filter = crate::storage::expression::ComparisonExpr::new(
-                col_name.as_str(),
-                crate::core::Operator::Eq,
-                parent_pk_value.clone(),
-            );
-            filter.prepare_for_schema(&child_schema);
-            let rows = child_handle.collect_all_rows(Some(&filter))?;
-            for (_, row) in rows.iter() {
-                if let Some(pk_val) = row.get(pk_idx) {
-                    deleted_child_pks.push(pk_val.clone());
-                }
+        let child_handle = engine.get_table_for_txn(txn_id, child_table)?;
+        // Use filtered scan instead of full table scan
+        let col_name = &child_schema.columns[fk.column_index].name;
+        let mut filter = crate::storage::expression::ComparisonExpr::new(
+            col_name.as_str(),
+            crate::core::Operator::Eq,
+            parent_pk_value.clone(),
+        );
+        filter.prepare_for_schema(&child_schema);
+        let rows = child_handle.collect_all_rows(Some(&filter))?;
+        for (gfk_idx, (_, grandchild_fk)) in grandchild_fks.iter().enumerate() {
+            let referenced = grandchild_fk.referenced_column.to_lowercase();
+            let Some(ref_idx) = child_schema
+                .columns
+                .iter()
+                .position(|c| c.name_lower == referenced)
+            else {
+                continue;
+            };
+            let values: Vec<Value> = rows
+                .iter()
+                .filter_map(|(_, row)| row.get(ref_idx).filter(|v| !v.is_null()).cloned())
+                .collect();
+            if !values.is_empty() {
+                deleted_child_keys.push((gfk_idx, values));
             }
         }
     }
@@ -478,25 +625,26 @@ fn cascade_delete_recursive(
     // Pre-check: verify grandchild RESTRICT constraints BEFORE deleting child rows.
     // If we deleted children first and a grandchild RESTRICT check fails, the child
     // deletions would remain in the transaction state (orphaning data in explicit txns).
-    if !grandchild_fks.is_empty() && !deleted_child_pks.is_empty() {
-        for child_pk in &deleted_child_pks {
-            for (grandchild_table, grandchild_fk) in grandchild_fks.iter() {
-                if matches!(
-                    grandchild_fk.on_delete,
-                    ForeignKeyAction::Restrict | ForeignKeyAction::NoAction
-                ) && child_rows_exist(engine, txn_id, grandchild_table, grandchild_fk, child_pk)?
-                {
-                    return Err(Error::foreign_key_violation(
-                        grandchild_table,
-                        &grandchild_fk.column_name,
-                        child_table,
-                        &grandchild_fk.referenced_column,
-                        format!(
-                            "cannot cascade-delete row with {} = {} — still referenced by table '{}'",
-                            grandchild_fk.referenced_column, child_pk, grandchild_table
-                        ),
-                    ));
-                }
+    for (gfk_idx, values) in &deleted_child_keys {
+        let (grandchild_table, grandchild_fk) = &grandchild_fks[*gfk_idx];
+        if !matches!(
+            grandchild_fk.on_delete,
+            ForeignKeyAction::Restrict | ForeignKeyAction::NoAction
+        ) {
+            continue;
+        }
+        for child_value in values {
+            if child_rows_exist(engine, txn_id, grandchild_table, grandchild_fk, child_value)? {
+                return Err(Error::foreign_key_violation(
+                    grandchild_table,
+                    &grandchild_fk.column_name,
+                    child_table,
+                    &grandchild_fk.referenced_column,
+                    format!(
+                        "cannot cascade-delete row with {} = {} — still referenced by table '{}'",
+                        grandchild_fk.referenced_column, child_value, grandchild_table
+                    ),
+                ));
             }
         }
     }
@@ -519,34 +667,33 @@ fn cascade_delete_recursive(
     let mut total = count;
 
     // Recursively enforce CASCADE/SET NULL on grandchild tables (RESTRICT already checked above)
-    if !grandchild_fks.is_empty() && !deleted_child_pks.is_empty() {
-        for child_pk in &deleted_child_pks {
-            for (grandchild_table, grandchild_fk) in grandchild_fks.iter() {
-                match grandchild_fk.on_delete {
-                    ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
-                        // Already checked above — skip
-                    }
-                    ForeignKeyAction::Cascade => {
-                        let affected = cascade_delete_recursive(
-                            engine,
-                            txn_id,
-                            grandchild_table,
-                            grandchild_fk,
-                            child_pk,
-                            depth + 1,
-                        )?;
-                        total = total.saturating_add(affected);
-                    }
-                    ForeignKeyAction::SetNull => {
-                        let affected = set_null_on_delete(
-                            engine,
-                            txn_id,
-                            grandchild_table,
-                            grandchild_fk,
-                            child_pk,
-                        )?;
-                        total = total.saturating_add(affected);
-                    }
+    for (gfk_idx, values) in &deleted_child_keys {
+        let (grandchild_table, grandchild_fk) = &grandchild_fks[*gfk_idx];
+        for child_value in values {
+            match grandchild_fk.on_delete {
+                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
+                    // Already checked above — skip
+                }
+                ForeignKeyAction::Cascade => {
+                    let affected = cascade_delete_recursive(
+                        engine,
+                        txn_id,
+                        grandchild_table,
+                        grandchild_fk,
+                        child_value,
+                        depth + 1,
+                    )?;
+                    total = total.saturating_add(affected);
+                }
+                ForeignKeyAction::SetNull => {
+                    let affected = set_null_on_delete(
+                        engine,
+                        txn_id,
+                        grandchild_table,
+                        grandchild_fk,
+                        child_value,
+                    )?;
+                    total = total.saturating_add(affected);
                 }
             }
         }

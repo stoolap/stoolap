@@ -361,6 +361,46 @@ pub struct WindowPreGroupedState {
 impl Executor {
     /// Execute SELECT with window functions
     /// Accepts &[(i64, Row)] to allow RowVec to be passed directly via deref
+    /// The window functions ORDER BY reads that no select column is named
+    /// for, each as a column aliased to its own text, so the sort finds it
+    /// by name and the projection drops it afterwards
+    pub(crate) fn hidden_order_by_windows(stmt: &SelectStatement) -> Vec<Expression> {
+        let mut names: Vec<String> = Vec::new();
+        stmt.order_by
+            .iter()
+            .map(|ob| &ob.expression)
+            .filter(|expr| {
+                super::query_classification::QueryClassification::expression_has_window_function(
+                    expr,
+                )
+            })
+            .filter_map(|expr| {
+                let name = expr.to_string();
+                let carried = names.contains(&name)
+                    || stmt.columns.iter().any(|c| match c {
+                        Expression::Aliased(a) => {
+                            a.alias.value.as_str() == name || a.expression.to_string() == name
+                        }
+                        _ => false,
+                    });
+                if carried {
+                    return None;
+                }
+                names.push(name.clone());
+                let token = crate::parser::token::Token::new(
+                    crate::parser::token::TokenType::Identifier,
+                    name.clone(),
+                    crate::parser::token::Position::default(),
+                );
+                Some(Expression::Aliased(crate::parser::ast::AliasedExpression {
+                    token: token.clone(),
+                    expression: Box::new(expr.clone()),
+                    alias: crate::parser::ast::Identifier::new(token, name),
+                }))
+            })
+            .collect()
+    }
+
     pub(crate) fn execute_select_with_window_functions(
         &self,
         stmt: &SelectStatement,
@@ -463,6 +503,23 @@ impl Executor {
                 )
             }
             None => (stmt, base_rows, base_columns),
+        };
+
+        // A window function in ORDER BY that the select list does not carry
+        // is computed into a column of its own, named after it, which the
+        // sort reads and the projection then drops. Beside a star nothing
+        // is dropped, so there the select list stays as written
+        let extended_stmt;
+        let stmt = {
+            let hidden = Self::hidden_order_by_windows(stmt);
+            if hidden.is_empty() {
+                stmt
+            } else {
+                let mut extended = stmt.clone();
+                extended.columns.extend(hidden);
+                extended_stmt = extended;
+                &extended_stmt
+            }
         };
 
         // Parse window functions from the SELECT list
@@ -1862,10 +1919,16 @@ impl Executor {
                 .iter()
                 .find(|wd| wd.name.eq_ignore_ascii_case(win_ref))
                 .ok_or_else(|| Error::NotSupported(format!("Unknown window name: {}", win_ref)))?;
+            // OVER (w ...) adds its own ORDER BY, where the named window
+            // has none, and its own frame on top of the named window
             (
                 win_def.partition_by.clone(),
-                win_def.order_by.clone(),
-                win_def.frame.clone(),
+                if window_expr.order_by.is_empty() {
+                    win_def.order_by.clone()
+                } else {
+                    window_expr.order_by.clone()
+                },
+                window_expr.frame.clone().or_else(|| win_def.frame.clone()),
             )
         } else {
             (
@@ -4273,7 +4336,9 @@ impl Executor {
                                                 }
                                                 start_idx
                                             } else {
-                                                0
+                                                // No offset measures against a NULL
+                                                // key: the row frames to its peers
+                                                peer_groups[i].0
                                             }
                                         } else {
                                             0
@@ -4309,7 +4374,7 @@ impl Executor {
                                                 }
                                                 start_idx
                                             } else {
-                                                i
+                                                peer_groups[i].0
                                             }
                                         } else {
                                             i
@@ -4361,7 +4426,7 @@ impl Executor {
                                                     }
                                                     end_idx
                                                 } else {
-                                                    partition_len
+                                                    peer_groups[i].1
                                                 }
                                             } else {
                                                 partition_len
@@ -4398,7 +4463,7 @@ impl Executor {
                                                     }
                                                     end_idx
                                                 } else {
-                                                    i + 1
+                                                    peer_groups[i].1
                                                 }
                                             } else {
                                                 i + 1

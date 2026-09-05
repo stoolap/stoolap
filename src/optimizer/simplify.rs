@@ -18,7 +18,7 @@
 //! It handles:
 //! - Constant folding (1 + 1 → 2)
 //! - Boolean simplification (TRUE AND x → x, FALSE OR x → x)
-//! - Tautology elimination (1 = 1 → TRUE, x = x → TRUE for NOT NULL cols)
+//! - Tautology elimination (1 = 1 → TRUE)
 //! - Contradiction detection (1 = 2 → FALSE)
 //! - Range predicate merging (a > 5 AND a > 3 → a > 5)
 //! - De Morgan's law application where beneficial
@@ -258,10 +258,6 @@ impl ExpressionSimplifier {
         if let Some(result) = self.try_eval_comparison(left, right, InfixOperator::Equal) {
             return Some(self.make_bool(result));
         }
-        // x = x → TRUE (for deterministic expressions)
-        if self.is_deterministic(left) && self.expr_equals(left, right) {
-            return Some(self.make_bool(true));
-        }
         None
     }
 
@@ -269,10 +265,6 @@ impl ExpressionSimplifier {
     fn simplify_not_equal(&self, left: &Expression, right: &Expression) -> Option<Expression> {
         if let Some(result) = self.try_eval_comparison(left, right, InfixOperator::NotEqual) {
             return Some(self.make_bool(result));
-        }
-        // x <> x → FALSE (for deterministic expressions)
-        if self.is_deterministic(left) && self.expr_equals(left, right) {
-            return Some(self.make_bool(false));
         }
         None
     }
@@ -282,10 +274,6 @@ impl ExpressionSimplifier {
         if let Some(result) = self.try_eval_comparison(left, right, InfixOperator::LessThan) {
             return Some(self.make_bool(result));
         }
-        // x < x → FALSE
-        if self.is_deterministic(left) && self.expr_equals(left, right) {
-            return Some(self.make_bool(false));
-        }
         None
     }
 
@@ -293,10 +281,6 @@ impl ExpressionSimplifier {
     fn simplify_less_equal(&self, left: &Expression, right: &Expression) -> Option<Expression> {
         if let Some(result) = self.try_eval_comparison(left, right, InfixOperator::LessEqual) {
             return Some(self.make_bool(result));
-        }
-        // x <= x → TRUE
-        if self.is_deterministic(left) && self.expr_equals(left, right) {
-            return Some(self.make_bool(true));
         }
         None
     }
@@ -306,10 +290,6 @@ impl ExpressionSimplifier {
         if let Some(result) = self.try_eval_comparison(left, right, InfixOperator::GreaterThan) {
             return Some(self.make_bool(result));
         }
-        // x > x → FALSE
-        if self.is_deterministic(left) && self.expr_equals(left, right) {
-            return Some(self.make_bool(false));
-        }
         None
     }
 
@@ -317,10 +297,6 @@ impl ExpressionSimplifier {
     fn simplify_greater_equal(&self, left: &Expression, right: &Expression) -> Option<Expression> {
         if let Some(result) = self.try_eval_comparison(left, right, InfixOperator::GreaterEqual) {
             return Some(self.make_bool(result));
-        }
-        // x >= x → TRUE
-        if self.is_deterministic(left) && self.expr_equals(left, right) {
-            return Some(self.make_bool(true));
         }
         None
     }
@@ -345,10 +321,6 @@ impl ExpressionSimplifier {
         if self.is_zero(right) {
             return Some(left.clone());
         }
-        // x - x → 0
-        if self.is_deterministic(left) && self.expr_equals(left, right) {
-            return Some(self.make_int(0));
-        }
         // Constant folding
         self.try_eval_arithmetic(left, right, InfixOperator::Subtract)
     }
@@ -362,14 +334,6 @@ impl ExpressionSimplifier {
         // 1 * x → x
         if self.is_one(left) {
             return Some(right.clone());
-        }
-        // x * 0 → 0
-        if self.is_zero(right) {
-            return Some(self.make_int(0));
-        }
-        // 0 * x → 0
-        if self.is_zero(left) {
-            return Some(self.make_int(0));
         }
         // Constant folding
         self.try_eval_arithmetic(left, right, InfixOperator::Multiply)
@@ -458,14 +422,12 @@ impl ExpressionSimplifier {
         match expr {
             Expression::BooleanLiteral(b) => b.value,
             Expression::Infix(infix) => {
-                // 1 = 1 is always true
-                if infix.op_type == InfixOperator::Equal
+                // 1 = 1 is always true. A column compared with itself is not:
+                // wherever the column is NULL the answer is unknown, and NULL
+                // = NULL is unknown too
+                infix.op_type == InfixOperator::Equal
+                    && Self::is_non_null_literal(&infix.left)
                     && self.expr_equals(&infix.left, &infix.right)
-                    && self.is_deterministic(&infix.left)
-                {
-                    return true;
-                }
-                false
             }
             _ => false,
         }
@@ -490,33 +452,15 @@ impl ExpressionSimplifier {
         }
     }
 
-    /// Check if expression is deterministic (same input → same output)
-    fn is_deterministic(&self, expr: &Expression) -> bool {
-        match expr {
-            Expression::Identifier(_)
-            | Expression::QualifiedIdentifier(_)
-            | Expression::IntegerLiteral(_)
-            | Expression::FloatLiteral(_)
-            | Expression::StringLiteral(_)
-            | Expression::BooleanLiteral(_)
-            | Expression::NullLiteral(_) => true,
-            Expression::Infix(infix) => {
-                self.is_deterministic(&infix.left) && self.is_deterministic(&infix.right)
-            }
-            Expression::Prefix(prefix) => self.is_deterministic(&prefix.right),
-            Expression::FunctionCall(func) => {
-                // Most functions are deterministic, but not RANDOM(), NOW(), etc.
-                let name = func.function.to_uppercase();
-                if matches!(
-                    name.as_str(),
-                    "RANDOM" | "NOW" | "CURRENT_TIMESTAMP" | "UUID"
-                ) {
-                    return false;
-                }
-                func.arguments.iter().all(|a| self.is_deterministic(a))
-            }
-            _ => false,
-        }
+    /// Check if expression is a literal that can never be NULL
+    fn is_non_null_literal(expr: &Expression) -> bool {
+        matches!(
+            expr,
+            Expression::IntegerLiteral(_)
+                | Expression::FloatLiteral(_)
+                | Expression::StringLiteral(_)
+                | Expression::BooleanLiteral(_)
+        )
     }
 
     /// Check if two expressions are structurally equal
@@ -914,14 +858,10 @@ mod tests {
         let result = simplify_expression(&expr);
         assert!(matches!(result, Expression::Identifier(_)));
 
-        // x * 0 → 0
+        // x * 0 is NULL for a NULL x, so it is left alone
         let expr = make_infix(x.clone(), InfixOperator::Multiply, make_int_lit(0));
         let result = simplify_expression(&expr);
-        if let Expression::IntegerLiteral(lit) = result {
-            assert_eq!(lit.value, 0);
-        } else {
-            panic!("Expected IntegerLiteral(0)");
-        }
+        assert!(matches!(result, Expression::Infix(_)));
     }
 
     #[test]
@@ -970,37 +910,29 @@ mod tests {
     fn test_self_comparison() {
         let x = make_identifier("x");
 
-        // x = x → TRUE (for deterministic x)
+        // x = x is unknown wherever x is NULL, so it stands as written
         let expr = make_infix(x.clone(), InfixOperator::Equal, x.clone());
-        let result = simplify_expression(&expr);
-        if let Expression::BooleanLiteral(lit) = result {
-            assert!(lit.value);
-        } else {
-            panic!("Expected BooleanLiteral(true)");
-        }
+        assert!(matches!(simplify_expression(&expr), Expression::Infix(_)));
 
-        // x < x → FALSE
+        // x < x reads the same way
         let expr = make_infix(x.clone(), InfixOperator::LessThan, x.clone());
-        let result = simplify_expression(&expr);
-        if let Expression::BooleanLiteral(lit) = result {
-            assert!(!lit.value);
-        } else {
-            panic!("Expected BooleanLiteral(false)");
-        }
+        assert!(matches!(simplify_expression(&expr), Expression::Infix(_)));
     }
 
     #[test]
     fn test_subtraction_identity() {
         let x = make_identifier("x");
 
-        // x - x → 0
+        // x - x is NULL wherever x is, so it stands as written
         let expr = make_infix(x.clone(), InfixOperator::Subtract, x.clone());
-        let result = simplify_expression(&expr);
-        if let Expression::IntegerLiteral(lit) = result {
-            assert_eq!(lit.value, 0);
-        } else {
-            panic!("Expected IntegerLiteral(0)");
-        }
+        assert!(matches!(simplify_expression(&expr), Expression::Infix(_)));
+
+        // x - 0 → x still holds
+        let expr = make_infix(x.clone(), InfixOperator::Subtract, make_int_lit(0));
+        assert!(matches!(
+            simplify_expression(&expr),
+            Expression::Identifier(_)
+        ));
     }
 
     #[test]

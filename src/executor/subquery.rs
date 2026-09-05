@@ -465,6 +465,15 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Option<bool>> {
+        // Probing the index answers whether a matching row is there, which
+        // is the whole question EXISTS asks only when the WHERE decides the
+        // rows. The extractor below is shared with the paths that read a
+        // correlated aggregate, where an aggregate without a GROUP BY is the
+        // very shape they are for, so the check belongs here
+        if Self::exists_subquery_is_more_than_its_where(subquery) {
+            return Ok(None);
+        }
+
         // Need outer row context for correlated subquery
         let outer_row = match ctx.outer_row() {
             Some(row) => row,
@@ -691,6 +700,27 @@ impl Executor {
         Ok(Some(false))
     }
 
+    /// True when the rows an EXISTS subquery returns are not decided by its
+    /// WHERE clause alone. Neither a semi-join nor an index probe can stand
+    /// in for running such a subquery: a HAVING keeps only some of the
+    /// groups, a row count keeps only some of the rows, and a bare aggregate
+    /// returns its one row whether or not anything matched. Grouping on its
+    /// own is not among them, since a group is there exactly where a row is.
+    fn exists_subquery_is_more_than_its_where(subquery: &SelectStatement) -> bool {
+        if subquery.having.is_some()
+            || subquery.limit.is_some()
+            || subquery.offset.is_some()
+            || !subquery.set_operations.is_empty()
+        {
+            return true;
+        }
+        subquery.group_by.columns.is_empty()
+            && subquery
+                .columns
+                .iter()
+                .any(crate::executor::utils::expression_contains_aggregate)
+    }
+
     /// Extract index-nested-loop correlation info from a subquery.
     ///
     /// Looks for patterns like:
@@ -806,12 +836,7 @@ impl Executor {
             return Ok(None);
         }
 
-        let is_count = match &subquery.columns[0] {
-            Expression::Aliased(a) => Self::is_count_expression(&a.expression),
-            expr => Self::is_count_expression(expr),
-        };
-
-        if !is_count {
+        if !Self::is_count_star_probe(&subquery.columns[0]) {
             return Ok(None);
         }
 
@@ -937,6 +962,38 @@ impl Executor {
         Ok(None)
     }
 
+    /// Whether the parent row is read anywhere but the correlation
+    /// predicate. One pass over the table answers every parent row at once
+    /// only while it is not: read anywhere else, the pass would carry one
+    /// parent's value into all of them
+    fn aggregate_reads_parent_row(
+        subquery: &SelectStatement,
+        beside_correlation: Option<&Expression>,
+    ) -> bool {
+        let tables = Self::collect_subquery_table_columns(subquery);
+        let reads = |expr: &Expression| Self::references_outer_columns(expr, &tables);
+        subquery.columns.iter().any(&reads)
+            || subquery.having.as_deref().is_some_and(&reads)
+            || beside_correlation.is_some_and(&reads)
+    }
+
+    /// A COUNT one probe of an index answers: the probe counts rows, so it
+    /// must count rows, not the values of a column that may be NULL, and
+    /// neither a FILTER nor DISTINCT may narrow what it counts
+    fn is_count_star_probe(expr: &Expression) -> bool {
+        match expr {
+            Expression::Aliased(aliased) => Self::is_count_star_probe(&aliased.expression),
+            Expression::FunctionCall(func) => {
+                func.function.eq_ignore_ascii_case("COUNT")
+                    && func.filter.is_none()
+                    && !func.is_distinct
+                    && (func.arguments.is_empty()
+                        || matches!(func.arguments.first(), Some(Expression::Star(_))))
+            }
+            _ => false,
+        }
+    }
+
     /// Check if an expression is a COUNT aggregate function.
     fn is_count_expression(expr: &Expression) -> bool {
         match expr {
@@ -1030,6 +1087,10 @@ impl Executor {
         // Extract correlation info
         let correlation = Self::extract_index_nested_loop_info(subquery)?;
 
+        if Self::aggregate_reads_parent_row(subquery, correlation.additional_predicate.as_ref()) {
+            return None;
+        }
+
         // Pre-compute lowercase column names
         let outer_column_lower = correlation.outer_column.to_lowercase();
         let outer_qualified_lower = correlation
@@ -1065,11 +1126,14 @@ impl Executor {
         // Extract correlation column
         let correlation = Self::extract_index_nested_loop_info(subquery)?;
 
+        // The aggregate's own text, since two aggregates of one name over
+        // one table and one correlation column read different columns
         Some(format!(
-            "batch_agg:{}:{}:{}",
+            "batch_agg:{}:{}:{}:{}",
             table_name.to_lowercase(),
             correlation.inner_column.to_lowercase(),
-            agg_func
+            agg_func,
+            subquery.columns[0]
         ))
     }
 
@@ -1106,6 +1170,10 @@ impl Executor {
             Some(c) => c,
             None => return Ok(None),
         };
+
+        if Self::aggregate_reads_parent_row(subquery, correlation.additional_predicate.as_ref()) {
+            return Ok(None);
+        }
 
         // Build cache key (includes additional predicate in key for uniqueness)
         let cache_key = match Self::build_batch_aggregate_key(subquery) {
@@ -1819,6 +1887,18 @@ impl Executor {
                 drop(batch_cache);
             }
         }
+
+        // A correlated subquery reads the parent row in what it selects and
+        // in its HAVING, not only in its WHERE. The paths above read the
+        // statement as written, and one of them keys a cache on its address
+        let bound;
+        let subquery = match Self::bind_outer_references(subquery, ctx) {
+            Some(rewritten) => {
+                bound = rewritten;
+                &bound
+            }
+            None => subquery,
+        };
 
         // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
@@ -3267,7 +3347,57 @@ impl Executor {
             }
         }
 
+        // A HAVING reads the parent row the same way a WHERE does
+        if let Some(ref having) = subquery.having {
+            if Self::references_outer_columns(having, &subquery_tables) {
+                return true;
+            }
+        }
+
         false
+    }
+
+    /// The subquery with the parent row's values in place of the outer
+    /// references its own expressions carry. Its WHERE is bound where the
+    /// scan reads it; what it selects and its HAVING are bound here, since
+    /// a name the FROM does not define would otherwise fall back to an
+    /// inner column that happens to share it. None when it reads no
+    /// parent row or carries no outer reference
+    fn bind_outer_references(
+        subquery: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Option<SelectStatement> {
+        let outer_row = ctx.outer_row()?;
+        // With no table to own it, every qualified name reads as an outer
+        // one, so this asks whether there is anything at all to bind before
+        // the FROM's names are collected
+        if !subquery
+            .columns
+            .iter()
+            .chain(subquery.having.as_deref())
+            .any(|expr| Self::references_outer_columns(expr, &[]))
+        {
+            return None;
+        }
+        let tables = Self::collect_subquery_table_columns(subquery);
+        let tables: Vec<&str> = tables.iter().map(|table| table.as_str()).collect();
+        let scope = super::utils::InnerScope {
+            tables: &tables,
+            schema: None,
+        };
+        let bind = |expr: &Expression| {
+            super::utils::substitute_outer_references_in_scope(expr, outer_row, &scope)
+        };
+        let columns: Vec<Expression> = subquery.columns.iter().map(&bind).collect();
+        let having = subquery.having.as_deref().map(&bind);
+        if columns == subquery.columns && having.as_ref() == subquery.having.as_deref() {
+            return None;
+        }
+        Some(SelectStatement {
+            columns,
+            having: having.map(Box::new),
+            ..subquery.clone()
+        })
     }
 
     /// Collect table/alias names from a subquery's FROM clause
@@ -3397,6 +3527,7 @@ impl Executor {
             }
             Expression::AllAny(all_any) => {
                 Self::references_outer_columns(&all_any.left, subquery_tables)
+                    || Self::nested_reads_outer_columns(&all_any.subquery, subquery_tables)
             }
             Expression::Cast(cast) => Self::references_outer_columns(&cast.expr, subquery_tables),
             Expression::Like(like) => {
@@ -3427,8 +3558,35 @@ impl Executor {
                 .chain(window.partition_by.iter())
                 .chain(window.order_by.iter().map(|o| &o.expression))
                 .any(|e| Self::references_outer_columns(e, subquery_tables)),
+            // A subquery nested in this one may read a column from further
+            // out than either of them, which this one has to carry in
+            Expression::Exists(exists) => {
+                Self::nested_reads_outer_columns(&exists.subquery, subquery_tables)
+            }
+            Expression::ScalarSubquery(subquery) => {
+                Self::nested_reads_outer_columns(&subquery.subquery, subquery_tables)
+            }
             _ => false,
         }
+    }
+
+    /// Whether a subquery nested inside another reads a column that neither
+    /// of them defines
+    fn nested_reads_outer_columns(nested: &SelectStatement, subquery_tables: &[String]) -> bool {
+        let mut tables = subquery_tables.to_vec();
+        tables.extend(Self::collect_subquery_table_columns(nested));
+        nested
+            .where_clause
+            .as_deref()
+            .is_some_and(|where_clause| Self::references_outer_columns(where_clause, &tables))
+            || nested
+                .columns
+                .iter()
+                .any(|column| Self::references_outer_columns(column, &tables))
+            || nested
+                .having
+                .as_deref()
+                .is_some_and(|having| Self::references_outer_columns(having, &tables))
     }
 
     /// Process WHERE clause with correlated subqueries for a specific outer row.
@@ -3656,6 +3814,11 @@ impl Executor {
     ) -> Option<SemiJoinInfo> {
         let subquery = &exists.subquery;
 
+        // 0. A semi-join answers whether the inner table holds a matching row
+        if Self::exists_subquery_is_more_than_its_where(subquery) {
+            return None;
+        }
+
         // 1. Check for simple table source (not a join)
         let (inner_table, inner_alias): (String, Option<String>) =
             match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
@@ -3840,9 +4003,11 @@ impl Executor {
             Expression::QualifiedIdentifier(qid) => {
                 // Use pre-computed value_lower to avoid allocation
                 let table = &qid.qualifier.value_lower;
-                // References outer if it's in outer_tables and NOT in inner_tables
-                outer_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
-                    && !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
+                // One pass over the inner table answers every outer row, so
+                // any name the inner table does not own has to be read per
+                // row, whether it belongs to the query above or one further
+                let _ = outer_tables;
+                !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
             }
             Expression::Infix(infix) => {
                 Self::expression_references_outer_tables(&infix.left, outer_tables, inner_tables)
@@ -4366,13 +4531,52 @@ impl Executor {
             ))
         };
 
+        // EXISTS asks whether an inner row equals the outer value, and a
+        // NULL on either side equals nothing. IN reads it differently: a
+        // NULL outer value, or a NULL among the members, leaves the answer
+        // unknown. For EXISTS the unknown is the same as false in a filter;
+        // for NOT EXISTS it is not, since the answer there is true. So the
+        // negated set is asked without its NULLs, and an outer NULL, which
+        // no inner row can match, is kept alongside
+        let (hash_set, not) = if info.is_negated && hash_set.iter().any(|v| v.is_null()) {
+            let without_nulls: ValueSet =
+                hash_set.iter().filter(|v| !v.is_null()).cloned().collect();
+            if without_nulls.is_empty() {
+                return Expression::BooleanLiteral(BooleanLiteral {
+                    token: dummy_token_clone(),
+                    value: true,
+                });
+            }
+            (CompactArc::new(without_nulls), true)
+        } else {
+            (hash_set, info.is_negated)
+        };
+
         // Use InHashSet with Arc for O(1) lookup and cheap cloning in parallel execution
-        Expression::InHashSet(InHashSetExpression {
+        let membership = Expression::InHashSet(InHashSetExpression {
             token: dummy_token_clone(),
-            column: Box::new(outer_col_expr),
+            column: Box::new(outer_col_expr.clone()),
             values: hash_set, // Already Arc, no wrapping needed
-            not: info.is_negated,
-        })
+            not,
+        });
+        if !not {
+            return membership;
+        }
+
+        let outer_is_null = Expression::Infix(InfixExpression::new(
+            dummy_token_clone(),
+            Box::new(outer_col_expr),
+            "IS".to_string(),
+            Box::new(Expression::NullLiteral(NullLiteral {
+                token: dummy_token_clone(),
+            })),
+        ));
+        Expression::Infix(InfixExpression::new(
+            dummy_token_clone(),
+            Box::new(membership),
+            "OR".to_string(),
+            Box::new(outer_is_null),
+        ))
     }
 
     /// Try to optimize correlated EXISTS subqueries to semi-join.

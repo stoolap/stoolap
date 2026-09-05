@@ -3834,6 +3834,11 @@ impl VersionStore {
                     *float_sum += *f;
                     *count += 1;
                 }
+                // A boolean counts as one or nought, as SUM reads it
+                Value::Boolean(b) => {
+                    *int_sum += *b as i128;
+                    *count += 1;
+                }
                 _ => {} // NULL or non-numeric
             }
         }
@@ -4200,6 +4205,10 @@ impl VersionStore {
                         *float_sum += *f;
                         *cnt += 1;
                     }
+                    Value::Boolean(b) => {
+                        *int_sum += *b as i128;
+                        *cnt += 1;
+                    }
                     _ => {}
                 },
                 (AggregateAccumulator::Min(min), AggregateOp::Min) if !val.is_null() => match min {
@@ -4226,6 +4235,10 @@ impl VersionStore {
                     }
                     Value::Float(f) => {
                         *float_sum += *f;
+                        *cnt += 1;
+                    }
+                    Value::Boolean(b) => {
+                        *int_sum += *b as i128;
                         *cnt += 1;
                     }
                     _ => {}
@@ -5985,6 +5998,11 @@ impl VersionStore {
                                 }
                                 Value::Float(f) => {
                                     accum.float_sum += *f;
+                                    accum.count += 1;
+                                }
+                                // A boolean counts as one or nought
+                                Value::Boolean(b) => {
+                                    accum.int_sum += *b as i128;
                                     accum.count += 1;
                                 }
                                 _ => {}

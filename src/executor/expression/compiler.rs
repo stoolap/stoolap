@@ -1334,19 +1334,18 @@ impl<'a> ExprCompiler<'a> {
 
         while let Some(c) = chars.next() {
             if c == escape {
-                // Next character should be treated literally
-                if let Some(&next) = chars.peek() {
-                    if next == '%' || next == '_' || next == escape {
-                        // Escape the wildcard - use regex escape sequence
-                        result.push('\\');
-                        result.push(chars.next().unwrap());
-                    } else {
-                        // Not escaping a special character, keep the escape char
-                        result.push(c);
+                // Whatever follows stands for itself. A wildcard and the
+                // backslash the pattern reads as its own marker keep that
+                // marker in front of them; anything else is already itself
+                match chars.next() {
+                    Some(next) => {
+                        if next == '%' || next == '_' || next == '\\' {
+                            result.push('\\');
+                        }
+                        result.push(next);
                     }
-                } else {
-                    // Escape at end of pattern
-                    result.push(c);
+                    // Nothing follows, so the escape stands for itself
+                    None => result.push(c),
                 }
             } else {
                 result.push(c);
@@ -1374,8 +1373,8 @@ impl<'a> ExprCompiler<'a> {
 
         for when_clause in &case.when_clauses {
             if is_simple {
-                // Simple CASE: compare operand with WHEN value
-                builder.emit(Op::Dup); // Keep operand on stack
+                // Simple CASE: compare the operand, which CaseCompare reads
+                // without taking, so it is there for the branch after this
                 self.compile_expr(&when_clause.condition, builder)?;
                 builder.emit(Op::CaseCompare);
             } else {
@@ -1389,7 +1388,7 @@ impl<'a> ExprCompiler<'a> {
 
             // Compile THEN result
             if is_simple {
-                builder.emit(Op::Pop); // Remove operand copy
+                builder.emit(Op::Pop); // The operand has served its purpose
             }
             self.compile_expr(&when_clause.then_result, builder)?;
 

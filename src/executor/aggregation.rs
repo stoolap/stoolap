@@ -514,8 +514,27 @@ impl Executor {
                 (result_columns, result_rows)
             } else {
                 // Pre-process scalar subqueries in HAVING clause
-                // This executes subqueries like (SELECT AVG(a) FROM t) and replaces them with values
-                let processed_having = self.process_where_subqueries(having, ctx)?;
+                // This executes subqueries like (SELECT AVG(a) FROM t) and replaces them with values.
+                // One that reads the group is left as written; apply_having
+                // runs it once per group with that group as the outer row
+                let has_correlated_having = Self::has_correlated_subqueries(having);
+                let processed_having = if has_correlated_having {
+                    (**having).clone()
+                } else {
+                    self.process_where_subqueries(having, ctx)?
+                };
+                let outer_table: Option<String> =
+                    stmt.table_expr.as_ref().and_then(|te| match te.as_ref() {
+                        Expression::TableSource(source) => Some(
+                            source
+                                .alias
+                                .as_ref()
+                                .map(|a| a.value_lower.to_string())
+                                .unwrap_or_else(|| source.name.value_lower.to_string()),
+                        ),
+                        Expression::Aliased(aliased) => Some(aliased.alias.value_lower.to_string()),
+                        _ => None,
+                    });
 
                 // Build aggregate expression aliases for HAVING clause
                 // IMPORTANT: Include ALL aggregates, not just aliased ones,
@@ -548,6 +567,7 @@ impl Executor {
                     &result_columns,
                     &agg_aliases,
                     &expr_aliases,
+                    outer_table.as_deref(),
                     ctx,
                 )?;
 
@@ -896,7 +916,8 @@ impl Executor {
                     Expression::FunctionCall(func) if is_aggregate_function(&func.function) => {
                         self.get_aggregate_column_name(func).to_lowercase()
                     }
-                    _ => continue, // Can't easily compare, assume mismatch
+                    // Anything else matches only as a GROUP BY expression column
+                    _ => self.expression_to_string(col_expr).to_lowercase(),
                 };
                 if i >= agg_columns.len() || agg_columns[i].to_lowercase() != expected_name {
                     columns_match = false;
@@ -973,9 +994,15 @@ impl Executor {
                             )));
                         }
                     } else {
-                        // Non-aggregate function - evaluate it
+                        // Non-aggregate function: a GROUP BY expression column is
+                        // read as it is, anything else is evaluated
+                        let expr_lower = self.expression_to_string(col_expr).to_lowercase();
                         final_columns.push(format!("{}(...)", func.function));
-                        column_sources.push(make_source(col_expr, is_correlated));
+                        if agg_col_index_map.contains_key(&expr_lower) && !is_correlated {
+                            column_sources.push(ColumnSource::AggColumn(expr_lower));
+                        } else {
+                            column_sources.push(make_source(col_expr, is_correlated));
+                        }
                     }
                 }
                 Expression::Aliased(aliased) => {
@@ -3071,18 +3098,17 @@ impl Executor {
                         }
                         SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                             if let Some(value) = row.get(*sum_col_idx) {
-                                match value {
-                                    Value::Integer(v) => {
-                                        state.agg_values[i] += *v as f64;
-                                        state.agg_has_value[i] = true;
-                                        state.counts[i] += 1;
-                                    }
-                                    Value::Float(v) => {
-                                        state.agg_values[i] += v;
-                                        state.agg_has_value[i] = true;
-                                        state.counts[i] += 1;
-                                    }
-                                    _ => {}
+                                // A boolean counts as one or nought
+                                let numeric = match value {
+                                    Value::Integer(v) => Some(*v as f64),
+                                    Value::Float(v) => Some(*v),
+                                    Value::Boolean(b) => Some(*b as i64 as f64),
+                                    _ => None,
+                                };
+                                if let Some(v) = numeric {
+                                    state.agg_values[i] += v;
+                                    state.agg_has_value[i] = true;
+                                    state.counts[i] += 1;
                                 }
                             }
                         }
@@ -3319,18 +3345,17 @@ impl Executor {
                         }
                         SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                             if let Some(value) = row.get(*sum_col_idx) {
-                                match value {
-                                    Value::Integer(v) => {
-                                        state.agg_values[i] += *v as f64;
-                                        state.agg_has_value[i] = true;
-                                        state.counts[i] += 1;
-                                    }
-                                    Value::Float(v) => {
-                                        state.agg_values[i] += v;
-                                        state.agg_has_value[i] = true;
-                                        state.counts[i] += 1;
-                                    }
-                                    _ => {}
+                                // A boolean counts as one or nought
+                                let numeric = match value {
+                                    Value::Integer(v) => Some(*v as f64),
+                                    Value::Float(v) => Some(*v),
+                                    Value::Boolean(b) => Some(*b as i64 as f64),
+                                    _ => None,
+                                };
+                                if let Some(v) = numeric {
+                                    state.agg_values[i] += v;
+                                    state.agg_has_value[i] = true;
+                                    state.counts[i] += 1;
                                 }
                             }
                         }
@@ -3546,18 +3571,17 @@ impl Executor {
                     }
                     SimpleAgg::Sum(sum_col_idx) | SimpleAgg::Avg(sum_col_idx) => {
                         if let Some(value) = row.get(*sum_col_idx) {
-                            match value {
-                                Value::Integer(v) => {
-                                    state.agg_values[i] += *v as f64;
-                                    state.agg_has_value[i] = true;
-                                    state.counts[i] += 1;
-                                }
-                                Value::Float(v) => {
-                                    state.agg_values[i] += v;
-                                    state.agg_has_value[i] = true;
-                                    state.counts[i] += 1;
-                                }
-                                _ => {}
+                            // A boolean counts as one or nought
+                            let numeric = match value {
+                                Value::Integer(v) => Some(*v as f64),
+                                Value::Float(v) => Some(*v),
+                                Value::Boolean(b) => Some(*b as i64 as f64),
+                                _ => None,
+                            };
+                            if let Some(v) = numeric {
+                                state.agg_values[i] += v;
+                                state.agg_has_value[i] = true;
+                                state.counts[i] += 1;
                             }
                         }
                     }
@@ -4928,6 +4952,7 @@ impl Executor {
     }
 
     /// Apply HAVING clause to aggregated results
+    #[allow(clippy::too_many_arguments)]
     fn apply_having(
         &self,
         result: Box<dyn QueryResult>,
@@ -4935,6 +4960,7 @@ impl Executor {
         columns: &[String],
         agg_aliases: &[(String, usize)],
         expr_aliases: &[(String, usize)],
+        outer_table: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         // Materialize the result
@@ -4949,6 +4975,50 @@ impl Executor {
         // Combine all aliases for HAVING clause evaluation
         let mut all_aliases: Vec<(String, usize)> = agg_aliases.to_vec();
         all_aliases.extend_from_slice(expr_aliases);
+
+        // A subquery that reads the group it is asked about is run once per
+        // group, with the group's row standing as the outer row, the way a
+        // correlated subquery in the WHERE clause is run once per row. The
+        // group's columns are offered under their bare names and under the
+        // table's, since the subquery may name either
+        if Self::has_correlated_subqueries(having) {
+            let columns_arc = CompactArc::new(columns.to_vec());
+            let keys: Vec<(CompactArc<str>, Option<CompactArc<str>>)> = columns
+                .iter()
+                .map(|c| {
+                    let bare = c.to_lowercase();
+                    let qualified = outer_table.filter(|_| !bare.contains('.')).map(|t| {
+                        CompactArc::from(format!("{}.{}", t.to_lowercase(), bare).as_str())
+                    });
+                    (CompactArc::from(bare.as_str()), qualified)
+                })
+                .collect();
+            let mut filtered_rows = RowVec::new();
+            let mut new_id = 0i64;
+            for (_, row) in rows {
+                let mut outer_row_map: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
+                for (i, (bare, qualified)) in keys.iter().enumerate() {
+                    let value = row.get(i).cloned().unwrap_or_else(Value::null_unknown);
+                    if let Some(q) = qualified {
+                        outer_row_map.insert(q.clone(), value.clone());
+                    }
+                    outer_row_map.insert(bare.clone(), value);
+                }
+                let correlated_ctx =
+                    ctx.with_outer_row(outer_row_map, CompactArc::clone(&columns_arc));
+                let processed = self.process_correlated_where(having, &correlated_ctx)?;
+                let filter = RowFilter::with_aliases(&processed, columns, &all_aliases)?
+                    .with_context(&correlated_ctx);
+                if filter.matches_checked(&row)? {
+                    filtered_rows.push((new_id, row));
+                    new_id += 1;
+                }
+            }
+            return Ok(Box::new(ExecutorResult::new(
+                columns.to_vec(),
+                filtered_rows,
+            )));
+        }
 
         // Create RowFilter with all aliases and context
         let having_filter =
@@ -5007,6 +5077,15 @@ impl Executor {
                                 sum_int += i;
                             }
                         }
+                        // A boolean counts as one or nought
+                        Value::Boolean(b) => {
+                            has_value = true;
+                            if has_float {
+                                sum_float += *b as i64 as f64;
+                            } else {
+                                sum_int += *b as i64;
+                            }
+                        }
                         Value::Float(f) => {
                             has_value = true;
                             if !has_float {
@@ -5031,6 +5110,14 @@ impl Executor {
                             sum_float += *i as f64;
                         } else {
                             sum_int += i;
+                        }
+                    }
+                    Value::Boolean(b) => {
+                        has_value = true;
+                        if has_float {
+                            sum_float += *b as i64 as f64;
+                        } else {
+                            sum_int += *b as i64;
                         }
                     }
                     Value::Float(f) => {
@@ -5079,6 +5166,14 @@ impl Executor {
                                     sum_float += *i as f64;
                                 } else {
                                     sum_int += i;
+                                }
+                            }
+                            Value::Boolean(b) => {
+                                has_value = true;
+                                if has_float {
+                                    sum_float += *b as i64 as f64;
+                                } else {
+                                    sum_int += *b as i64;
                                 }
                             }
                             Value::Float(f) => {
@@ -5161,6 +5256,11 @@ impl Executor {
                         sum += f;
                         count += 1;
                     }
+                    // A boolean counts as one or nought
+                    Value::Boolean(b) => {
+                        sum += *b as i64 as f64;
+                        count += 1;
+                    }
                     _ => {}
                 }
             }
@@ -5195,6 +5295,10 @@ impl Executor {
                             }
                             Value::Float(f) => {
                                 sum += f;
+                                count += 1;
+                            }
+                            Value::Boolean(b) => {
+                                sum += *b as i64 as f64;
                                 count += 1;
                             }
                             _ => {}
@@ -5909,6 +6013,8 @@ impl Executor {
                         let num = match value {
                             Value::Integer(i) => *i as f64,
                             Value::Float(f) => *f,
+                            // A boolean counts as one or nought
+                            Value::Boolean(b) => *b as i64 as f64,
                             _ => continue,
                         };
                         state.sum += num;
@@ -6075,12 +6181,21 @@ impl Executor {
         // Parse aggregations
         let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
 
-        // Must have only aggregations plus the GROUP BY column (no other regular columns)
-        // Non-agg columns must be exactly the GROUP BY column
-        if non_agg_columns.len() > 1 {
+        // The rows come out as the GROUP BY column and then the aggregates,
+        // so the select list has to read exactly that, in that order
+        if non_agg_columns.len() != 1 || !non_agg_columns[0].eq_ignore_ascii_case(&group_col_name) {
             return Ok(None);
         }
-        if non_agg_columns.len() == 1 && !non_agg_columns[0].eq_ignore_ascii_case(&group_col_name) {
+        let leads_with_group_column = match stmt.columns.first() {
+            Some(crate::parser::ast::Expression::Identifier(id)) => {
+                id.value_lower.eq_ignore_ascii_case(&group_col_name)
+            }
+            Some(crate::parser::ast::Expression::QualifiedIdentifier(qid)) => {
+                qid.name.value_lower.eq_ignore_ascii_case(&group_col_name)
+            }
+            _ => false,
+        };
+        if !leads_with_group_column {
             return Ok(None);
         }
 
@@ -6274,6 +6389,11 @@ impl Executor {
                                         }
                                         Value::Float(v) => {
                                             state.agg_values[i] += v;
+                                            state.agg_has_value[i] = true;
+                                            state.counts[i] += 1;
+                                        }
+                                        Value::Boolean(v) => {
+                                            state.agg_values[i] += *v as i64 as f64;
                                             state.agg_has_value[i] = true;
                                             state.counts[i] += 1;
                                         }
