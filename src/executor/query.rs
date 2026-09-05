@@ -616,7 +616,13 @@ impl Executor {
                                 }
                             }
                         }
-                        None
+                        // A function of anything but a bare column is named
+                        // after the whole call, the way the projection names
+                        // the column it puts an unselected expression in
+                        let order_expr_str = ob.expression.to_string();
+                        columns
+                            .iter()
+                            .position(|c| c.eq_ignore_ascii_case(&order_expr_str))
                     }
                     _ => {
                         // For any other expression (Infix, Prefix, Cast, etc.),
@@ -8195,6 +8201,55 @@ impl Executor {
 
     /// Project rows including ORDER BY columns not in SELECT
     /// Returns rows with SELECT columns followed by ORDER BY columns
+    /// True when an expression names a SELECT alias that no source column
+    /// carries. Inside an expression a source column wins over an alias of
+    /// the same name, so only a name the source lacks counts here.
+    fn reads_a_select_alias(
+        expr: &Expression,
+        aliases: &FxHashSet<String>,
+        source_columns: &crate::common::StringMap<usize>,
+    ) -> bool {
+        let check = |e: &Expression| Self::reads_a_select_alias(e, aliases, source_columns);
+        let only_an_alias =
+            |name: &str| aliases.contains(name) && !source_columns.contains_key(name);
+
+        match expr {
+            Expression::Identifier(id) => only_an_alias(id.value_lower.as_str()),
+            // An alias is never qualified
+            Expression::QualifiedIdentifier(_) => false,
+            Expression::IntegerLiteral(_)
+            | Expression::FloatLiteral(_)
+            | Expression::StringLiteral(_)
+            | Expression::BooleanLiteral(_)
+            | Expression::NullLiteral(_)
+            | Expression::IntervalLiteral(_)
+            | Expression::Parameter(_)
+            | Expression::Star(_)
+            | Expression::QualifiedStar(_)
+            | Expression::Default(_) => false,
+            Expression::Prefix(p) => check(&p.right),
+            Expression::Infix(inf) => check(&inf.left) || check(&inf.right),
+            Expression::FunctionCall(fc) => fc.arguments.iter().any(check),
+            Expression::Cast(c) => check(&c.expr),
+            Expression::Aliased(a) => check(&a.expression),
+            Expression::Case(case) => {
+                case.value.as_ref().is_some_and(|v| check(v))
+                    || case
+                        .when_clauses
+                        .iter()
+                        .any(|w| check(&w.condition) || check(&w.then_result))
+                    || case.else_value.as_ref().is_some_and(|e| check(e))
+            }
+            Expression::Between(b) => check(&b.expr) || check(&b.lower) || check(&b.upper),
+            Expression::In(i) => check(&i.left),
+            Expression::Like(l) => check(&l.left) || check(&l.pattern),
+            Expression::Distinct(d) => check(&d.expr),
+            Expression::Window(w) => w.function.arguments.iter().any(check),
+            // Anything else is left to the sort, which reads the projected row
+            _ => true,
+        }
+    }
+
     fn project_rows_with_order_by(
         &self,
         select_exprs: &[Expression],
@@ -8245,6 +8300,15 @@ impl Executor {
             })
             .collect();
 
+        // The names the projection alone brings into scope
+        let select_aliases: FxHashSet<String> = select_exprs
+            .iter()
+            .filter_map(|e| match e {
+                Expression::Aliased(a) => Some(a.alias.value_lower.to_string()),
+                _ => None,
+            })
+            .collect();
+
         // Find ORDER BY columns not in SELECT
         let mut extra_order_indices: Vec<usize> = Vec::new();
         // An ORDER BY expression is read from a column of its own, so the
@@ -8279,12 +8343,19 @@ impl Executor {
                     }
                 }
                 // A subquery is read per row against the parent, which the
-                // sort does for itself, so it is not read from a column here
+                // sort does for itself, so it is not read from a column here.
+                // Neither is an expression naming an alias, which the row
+                // only carries once the projection has run
                 other
                     if !matches!(
                         other,
                         Expression::Identifier(_) | Expression::QualifiedIdentifier(_)
-                    ) && !Self::has_subqueries(other) =>
+                    ) && !Self::has_subqueries(other)
+                        && !Self::reads_a_select_alias(
+                            other,
+                            &select_aliases,
+                            &col_index_map_lower,
+                        ) =>
                 {
                     let name = other.to_string();
                     if !select_column_names

@@ -179,3 +179,61 @@ fn test_sorting_by_a_correlated_subquery() {
         5
     );
 }
+
+/// An expression naming an alias reads it, since the projection brings the
+/// name into scope before the sort runs
+#[test]
+fn test_sorting_by_an_expression_over_a_select_alias() {
+    let db = setup("order_by_alias_expression");
+    assert_eq!(
+        values(&db, "SELECT n AS x FROM t ORDER BY x + 0"),
+        ["10", "20", "30", "40"]
+    );
+    assert_eq!(
+        values(&db, "SELECT n AS x FROM t ORDER BY x * 1 DESC"),
+        ["40", "30", "20", "10"]
+    );
+    assert_eq!(
+        values(&db, "SELECT n AS x FROM t ORDER BY ABS(x)"),
+        ["10", "20", "30", "40"]
+    );
+}
+
+/// Inside an expression a source column wins over an alias of the same
+/// name; a bare name in ORDER BY reads the alias
+#[test]
+fn test_a_source_column_wins_over_an_alias_of_the_same_name() {
+    let db = setup("order_by_alias_shadow");
+    assert_eq!(
+        values(&db, "SELECT n AS id FROM t ORDER BY id + 0"),
+        ["30", "10", "20", "40"],
+        "id + 0 reads the table's id"
+    );
+    assert_eq!(
+        values(&db, "SELECT n AS id FROM t ORDER BY id"),
+        ["10", "20", "30", "40"],
+        "a bare id reads the alias"
+    );
+}
+
+/// A function of anything but a bare column is read from the column the
+/// projection names after the whole call
+#[test]
+fn test_sorting_by_a_function_of_an_expression() {
+    let db = setup("order_by_function_expression");
+    assert_eq!(
+        values(&db, "SELECT id FROM t ORDER BY ABS(n - 20)"),
+        ["3", "1", "2", "4"]
+    );
+    assert_eq!(
+        values(&db, "SELECT g FROM t ORDER BY ABS(n - 20)"),
+        ["b", "b", "a", "a"]
+    );
+    assert_eq!(
+        values(&db, "SELECT id FROM t ORDER BY ABS(n)"),
+        ["2", "3", "1", "4"]
+    );
+    let (columns, widths) = widths(&db, "SELECT id FROM t ORDER BY ABS(n - 20)");
+    assert_eq!(columns, 1);
+    assert!(widths.iter().all(|w| *w == 1), "{widths:?}");
+}
