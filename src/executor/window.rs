@@ -466,7 +466,8 @@ impl Executor {
         };
 
         // Parse window functions from the SELECT list
-        let window_functions = self.parse_window_functions(stmt, base_columns)?;
+        let mut window_functions = self.parse_window_functions(stmt, base_columns)?;
+        self.fold_window_control_arguments(&mut window_functions, ctx)?;
 
         if window_functions.is_empty() {
             // No window functions found, return base result
@@ -1074,7 +1075,8 @@ impl Executor {
         limit: usize,
     ) -> Result<Box<dyn QueryResult>> {
         // Parse window functions from SELECT list
-        let window_functions = self.parse_window_functions(stmt, base_columns)?;
+        let mut window_functions = self.parse_window_functions(stmt, base_columns)?;
+        self.fold_window_control_arguments(&mut window_functions, ctx)?;
         if window_functions.is_empty() {
             return Err(Error::internal(
                 "No window functions found for lazy partition fetch",

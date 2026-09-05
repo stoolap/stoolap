@@ -1267,3 +1267,94 @@ fn test_aggregate_order_by_nulls_placement() {
         "descending inside a window"
     );
 }
+
+/// The cached answer of a subquery belongs to the binding that produced it,
+/// and a NULL is not the text that spells it
+#[test]
+fn test_subquery_cache_keeps_the_binding_type() {
+    let db = setup("subquery_cache_binding_type");
+    let sql = "SELECT (SELECT $1) IS NULL FROM users LIMIT 1";
+    let read = |value: Option<&str>| -> String {
+        db.query(sql, (value,))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get::<String>(0)
+            .unwrap()
+    };
+    assert_eq!(read(None), "true", "a NULL binding");
+    assert_eq!(read(Some("NULL")), "false", "the text that spells it");
+
+    let number = "SELECT (SELECT $1) FROM users LIMIT 1";
+    let as_integer: String = db
+        .query(number, (7i64,))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    let as_text: String = db
+        .query(number, ("7",))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!((as_integer.as_str(), as_text.as_str()), ("7", "7"));
+    let is_text: String = db
+        .query("SELECT (SELECT $1) || 'x' FROM users LIMIT 1", ("7",))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(is_text, "7x");
+}
+
+/// A control argument that reads no row is resolved even when a correlated
+/// column beside it keeps the SELECT list from being folded up front
+#[test]
+fn test_navigation_control_argument_beside_a_correlated_column() {
+    let db = setup("navigation_control_correlated_neighbour");
+    let correlated = "(SELECT MAX(x.user_id) FROM orders x WHERE x.user_id = u.id)";
+    let tail = "FROM users u WHERE u.id <= 4 ORDER BY u.id";
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT u.id, NTILE((SELECT 2)) OVER (ORDER BY u.id), {correlated} {tail}")
+        )
+        .iter()
+        .map(|row| row[1].clone())
+        .collect::<Vec<_>>(),
+        ["1", "1", "2", "2"],
+        "NTILE group count"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            &format!("SELECT id, LAG(id, (SELECT 1)) OVER (ORDER BY id), {correlated} {tail}")
+        )
+        .iter()
+        .map(|row| row[1].clone())
+        .collect::<Vec<_>>(),
+        ["NULL", "1", "2", "3"],
+        "LAG offset"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            &format!(
+                "SELECT id, NTH_VALUE(id, (SELECT 2)) OVER (ORDER BY id), {correlated} {tail}"
+            )
+        )
+        .iter()
+        .map(|row| row[1].clone())
+        .collect::<Vec<_>>(),
+        ["NULL", "2", "2", "2"],
+        "NTH_VALUE n"
+    );
+}

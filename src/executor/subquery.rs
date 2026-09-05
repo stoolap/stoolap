@@ -2775,7 +2775,9 @@ impl Executor {
     /// The cache key of a subquery that reads no outer row: its text and the
     /// bindings behind it, since a parameter prints as its marker and one
     /// text would otherwise answer for two executions. None when the text
-    /// holds an anonymous marker, which two bindings of one statement share
+    /// holds an anonymous marker, which two bindings of one statement share.
+    /// The bindings go in debug form: it carries the type a value prints
+    /// without, and escapes a separator a text could otherwise hold
     pub(crate) fn subquery_cache_key(
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
@@ -2786,13 +2788,13 @@ impl Executor {
             return None;
         }
         for value in ctx.params() {
-            let _ = write!(key, "\u{1}{value}");
+            let _ = write!(key, "\u{1}{value:?}");
         }
         if !ctx.named_params().is_empty() {
             let mut named: Vec<(&String, &Value)> = ctx.named_params().iter().collect();
             named.sort_unstable_by_key(|(name, _)| *name);
             for (name, value) in named {
-                let _ = write!(key, "\u{1}{name}={value}");
+                let _ = write!(key, "\u{1}{name:?}={value:?}");
             }
         }
         Some(key)
@@ -2952,10 +2954,36 @@ impl Executor {
         ))
     }
 
+    /// A navigation function reads its control argument off no row, so a
+    /// subquery there answers for the whole partition. The lift leaves it
+    /// where it is; this resolves the ones that read no row either, before
+    /// the argument is compiled against no columns at all
+    pub(crate) fn fold_window_control_arguments(
+        &self,
+        window_functions: &mut [super::window::WindowFunctionInfo],
+        ctx: &ExecutionContext,
+    ) -> Result<()> {
+        for window in window_functions {
+            let Some(index) = Self::window_control_argument(&window.name) else {
+                continue;
+            };
+            let Some(argument) = window.arguments.get(index) else {
+                continue;
+            };
+            if !Self::has_subqueries(argument) || Self::has_correlated_subqueries(argument) {
+                continue;
+            }
+            if let Some(folded) = self.try_process_expression_subqueries(argument, ctx)? {
+                window.arguments[index] = folded;
+            }
+        }
+        Ok(())
+    }
+
     /// The argument a navigation window function reads once, off no row:
     /// the offset of LEAD and LAG, the group count of NTILE, the n of
     /// NTH_VALUE
-    fn window_control_argument(function: &str) -> Option<usize> {
+    pub(crate) fn window_control_argument(function: &str) -> Option<usize> {
         if function.eq_ignore_ascii_case("NTILE") {
             Some(0)
         } else if function.eq_ignore_ascii_case("LEAD")
