@@ -2714,13 +2714,18 @@ impl ExprVM {
         // Pattern: [GtColumnConst(idx, val), Return]
         if ops.len() == 2 {
             if let Op::Return = &ops[1] {
-                return Self::eval_single_op_bool(&ops[0], ctx);
+                if Self::is_single_op_predicate(&ops[0]) {
+                    return Self::eval_single_op_bool(&ops[0], ctx);
+                }
             }
         }
 
         // Fast path: Two comparisons with AND (range filter)
         // Pattern: [Compare1, And(_), Compare2, AndFinalize, Return]
-        if ops.len() == 5 {
+        if ops.len() == 5
+            && Self::is_single_op_predicate(&ops[0])
+            && Self::is_single_op_predicate(&ops[2])
+        {
             if let (Op::And(_), Op::AndFinalize, Op::Return) = (&ops[1], &ops[3], &ops[4]) {
                 let a = Self::eval_single_op_tribool(&ops[0], ctx);
                 // Short-circuit: if first is false, result is false
@@ -2768,12 +2773,17 @@ impl ExprVM {
         // Fast path: Single comparison + Return (most common filter)
         if ops.len() == 2 {
             if let Op::Return = &ops[1] {
-                return Ok(Self::eval_single_op_bool(&ops[0], ctx));
+                if Self::is_single_op_predicate(&ops[0]) {
+                    return Ok(Self::eval_single_op_bool(&ops[0], ctx));
+                }
             }
         }
 
         // Fast path: Two comparisons with AND/OR
-        if ops.len() == 5 {
+        if ops.len() == 5
+            && Self::is_single_op_predicate(&ops[0])
+            && Self::is_single_op_predicate(&ops[2])
+        {
             if let (Op::And(_), Op::AndFinalize, Op::Return) = (&ops[1], &ops[3], &ops[4]) {
                 let a = Self::eval_single_op_tribool(&ops[0], ctx);
                 if a == Some(false) {
@@ -2800,6 +2810,30 @@ impl ExprVM {
             Ok(_) => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// The ops the two single-op paths below answer for themselves. They
+    /// report a NULL as false, which is what a filter wants, so an op they
+    /// do not know has to go to the full VM rather than be read the same
+    /// way: a bare column load is a value to be read as a condition, not a
+    /// comparison that came out unknown.
+    #[inline]
+    fn is_single_op_predicate(op: &Op) -> bool {
+        matches!(
+            op,
+            Op::GtColumnConst(..)
+                | Op::LtColumnConst(..)
+                | Op::GeColumnConst(..)
+                | Op::LeColumnConst(..)
+                | Op::EqColumnConst(..)
+                | Op::NeColumnConst(..)
+                | Op::IsNullColumn(..)
+                | Op::IsNotNullColumn(..)
+                | Op::BetweenColumnConst(..)
+                | Op::InSetColumn(..)
+                | Op::LikeColumn(..)
+                | Op::LoadConst(..)
+        )
     }
 
     /// Evaluate a single comparison op and return bool (for fast path)
