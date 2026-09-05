@@ -2009,13 +2009,49 @@ impl Executor {
                 .any(|fks| super::foreign_key::fk_tree_needs_precheck(&self.engine, fks));
             if any_needs_precheck {
                 let parent_rows = table.collect_all_rows(where_expr.as_deref())?;
+                // A WHERE the semi-join rewrite refused is bound to each
+                // row here as it is in the update itself, or the check
+                // would look at rows the update does not touch
+                let bound_pairs: Vec<(CompactArc<str>, CompactArc<str>)> = if where_is_correlated {
+                    schema
+                        .column_names_lower_arc()
+                        .iter()
+                        .map(|col_lower| {
+                            let qualified =
+                                CompactArc::from(format!("{}.{}", table_name, col_lower).as_str());
+                            (CompactArc::from(col_lower.as_str()), qualified)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 for (_rid, row) in parent_rows.iter() {
                     if needs_memory_filter {
                         if let Some(ref mem_where) = memory_where_clause {
                             evaluator.set_row_array(row);
-                            match evaluator.evaluate_bool(mem_where) {
-                                Ok(true) => {}
-                                _ => continue,
+                            let held = if where_is_correlated {
+                                let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
+                                    FxHashMap::with_capacity_and_hasher(
+                                        bound_pairs.len() * 2,
+                                        Default::default(),
+                                    );
+                                for (i, (col_lower, qualified)) in bound_pairs.iter().enumerate() {
+                                    if let Some(value) = row.get(i) {
+                                        outer_row_map.insert(col_lower.clone(), value.clone());
+                                        outer_row_map.insert(qualified.clone(), value.clone());
+                                    }
+                                }
+                                let correlated_ctx = ctx.with_outer_row(
+                                    outer_row_map,
+                                    CompactArc::clone(&column_names),
+                                );
+                                self.process_correlated_where(mem_where, &correlated_ctx)
+                                    .and_then(|processed| evaluator.evaluate_bool(&processed))
+                            } else {
+                                evaluator.evaluate_bool(mem_where)
+                            };
+                            if !matches!(held, Ok(true)) {
+                                continue;
                             }
                         }
                     }
