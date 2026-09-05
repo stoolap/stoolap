@@ -4273,7 +4273,9 @@ impl Executor {
                                                 }
                                                 start_idx
                                             } else {
-                                                0
+                                                // No offset measures against a NULL
+                                                // key: the row frames to its peers
+                                                peer_groups[i].0
                                             }
                                         } else {
                                             0
@@ -4309,7 +4311,7 @@ impl Executor {
                                                 }
                                                 start_idx
                                             } else {
-                                                i
+                                                peer_groups[i].0
                                             }
                                         } else {
                                             i
@@ -4361,7 +4363,7 @@ impl Executor {
                                                     }
                                                     end_idx
                                                 } else {
-                                                    partition_len
+                                                    peer_groups[i].1
                                                 }
                                             } else {
                                                 partition_len
@@ -4398,7 +4400,7 @@ impl Executor {
                                                     }
                                                     end_idx
                                                 } else {
-                                                    i + 1
+                                                    peer_groups[i].1
                                                 }
                                             } else {
                                                 i + 1
