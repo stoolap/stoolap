@@ -311,3 +311,90 @@ fn test_update_with_exists() {
         .expect("Failed to count");
     assert_eq!(count, 4, "Expected all 4 products to be out of stock");
 }
+
+/// A subquery that groups its rows and then keeps only some of the groups
+/// is asked whether a group survived, not whether a row matched
+#[test]
+fn test_exists_over_a_subquery_that_groups_and_filters() {
+    let db = Database::open("memory://exists_group_having").unwrap();
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY, g TEXT)", ())
+        .unwrap();
+    db.execute("CREATE TABLE e (id INTEGER PRIMARY KEY, d_id INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO d VALUES (1,'a'),(2,'a'),(3,'b')", ())
+        .unwrap();
+    db.execute("INSERT INTO e VALUES (1,1),(2,1),(3,2)", ())
+        .unwrap();
+
+    let count = |sql: &str| -> i64 {
+        db.query(sql, ())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap()
+    };
+
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.d_id = d.id GROUP BY e.d_id HAVING COUNT(*) > 1)"
+        ),
+        1,
+        "only the row with two children"
+    );
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.d_id = d.id GROUP BY e.d_id HAVING COUNT(*) > 99)"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM d WHERE NOT EXISTS (SELECT 1 FROM e WHERE e.d_id = d.id GROUP BY e.d_id HAVING COUNT(*) > 1)"
+        ),
+        2
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.d_id = d.id GROUP BY e.d_id)"),
+        2,
+        "grouping alone does not change whether a row is there"
+    );
+}
+
+/// A bare aggregate returns its one row whether or not anything matched
+#[test]
+fn test_exists_over_a_bare_aggregate() {
+    let db = Database::open("memory://exists_bare_aggregate").unwrap();
+    db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("CREATE TABLE e (id INTEGER PRIMARY KEY, d_id INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO d VALUES (1),(2),(3)", ()).unwrap();
+    db.execute("INSERT INTO e VALUES (1,1),(2,1)", ()).unwrap();
+
+    let count = |sql: &str| -> i64 {
+        db.query(sql, ())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get(0)
+            .unwrap()
+    };
+
+    assert_eq!(
+        count("SELECT COUNT(*) FROM d WHERE EXISTS (SELECT COUNT(*) FROM e WHERE e.d_id = d.id)"),
+        3
+    );
+    assert_eq!(
+        count(
+            "SELECT COUNT(*) FROM d WHERE NOT EXISTS (SELECT COUNT(*) FROM e WHERE e.d_id = d.id)"
+        ),
+        0
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.d_id = d.id LIMIT 0)"),
+        0
+    );
+}

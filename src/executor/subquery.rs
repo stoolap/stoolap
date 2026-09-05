@@ -3784,6 +3784,27 @@ impl Executor {
     ) -> Option<SemiJoinInfo> {
         let subquery = &exists.subquery;
 
+        // 0. A semi-join answers whether the inner table holds a matching
+        // row. Anything that decides which rows the subquery returns beyond
+        // its WHERE has to run, so it is left to the general path: HAVING,
+        // a row count, a set operation, and a bare aggregate, which returns
+        // its one row whether or not anything matched
+        if subquery.having.is_some()
+            || subquery.limit.is_some()
+            || subquery.offset.is_some()
+            || !subquery.set_operations.is_empty()
+        {
+            return None;
+        }
+        if subquery.group_by.columns.is_empty()
+            && subquery
+                .columns
+                .iter()
+                .any(crate::executor::utils::expression_contains_aggregate)
+        {
+            return None;
+        }
+
         // 1. Check for simple table source (not a join)
         let (inner_table, inner_alias): (String, Option<String>) =
             match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
