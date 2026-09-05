@@ -2725,6 +2725,7 @@ impl Executor {
             let column_indices: Vec<usize> = (0..column_count).collect();
             let mut scanner = table.scan(&column_indices, where_expr.as_deref())?;
             let mut rows_to_delete: Vec<(Value, Option<Row>)> = Vec::new();
+            let mut rows_to_delete_by_row_id: Vec<(i64, Option<Row>)> = Vec::new();
 
             // Pre-compute column name mappings for correlated subqueries
             let column_names_arc = if has_correlated {
@@ -2838,16 +2839,20 @@ impl Executor {
                 };
 
                 if matches {
-                    // Row matches - get primary key value for deletion
-                    if let Some(pk_idx) = pk_col_idx {
-                        if let Some(pk_value) = row.get(pk_idx) {
-                            let row_data = if has_returning {
-                                Some(row.clone())
-                            } else {
-                                None
-                            };
-                            rows_to_delete.push((pk_value.clone(), row_data));
+                    let row_data = if has_returning {
+                        Some(row.clone())
+                    } else {
+                        None
+                    };
+                    // Row matches - get primary key value for deletion.
+                    // A table without one is named by its row id instead
+                    match pk_col_idx {
+                        Some(pk_idx) => {
+                            if let Some(pk_value) = row.get(pk_idx) {
+                                rows_to_delete.push((pk_value.clone(), row_data));
+                            }
                         }
+                        None => rows_to_delete_by_row_id.push((scanner.current_row_id(), row_data)),
                     }
                 }
             }
@@ -2879,6 +2884,19 @@ impl Executor {
                         }
                         delete_count += deleted;
                     }
+                }
+            } else if !rows_to_delete_by_row_id.is_empty() {
+                // A table without a primary key: the rows are named by the
+                // ids the scan read them under
+                let row_ids: Vec<i64> =
+                    rows_to_delete_by_row_id.iter().map(|(id, _)| *id).collect();
+                delete_count = table.delete_by_row_ids(&row_ids)?;
+                if has_returning {
+                    returning_rows.extend(
+                        rows_to_delete_by_row_id
+                            .into_iter()
+                            .filter_map(|(_, row)| row),
+                    );
                 }
             }
             delete_count

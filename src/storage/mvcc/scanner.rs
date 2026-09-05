@@ -218,6 +218,13 @@ impl Scanner for MVCCScanner {
         std::mem::take(&mut self.rows[idx].1)
     }
 
+    fn current_row_id(&self) -> i64 {
+        if self.current_index < 0 || (self.current_index as usize) >= self.rows.len() {
+            return 0;
+        }
+        self.rows[self.current_index as usize].0
+    }
+
     fn estimated_count(&self) -> Option<usize> {
         Some(self.rows.len())
     }
