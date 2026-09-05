@@ -129,11 +129,19 @@ impl Executor {
             }
 
             Expression::AllAny(all_any) => {
+                // The left operand may hold a subquery of its own
+                let bound = AllAnyExpression {
+                    token: all_any.token.clone(),
+                    left: Box::new(self.process_where_subqueries(&all_any.left, ctx)?),
+                    operator: all_any.operator.clone(),
+                    all_any_type: all_any.all_any_type,
+                    subquery: all_any.subquery.clone(),
+                };
                 // Execute the subquery to get all values
-                let values = self.execute_in_subquery(&all_any.subquery, ctx)?;
+                let values = self.execute_in_subquery(&bound.subquery, ctx)?;
 
                 // Convert ALL/ANY to an equivalent expression that the evaluator can handle
-                self.convert_all_any_to_expression(all_any, values)
+                self.convert_all_any_to_expression(&bound, values)
             }
 
             Expression::Prefix(prefix) => {
@@ -225,7 +233,8 @@ impl Executor {
                             && !Self::is_subquery_correlated(&subquery.subquery)
                             && ctx.transaction_id().is_none();
                         let cached_set = if is_non_correlated {
-                            get_cached_in_subquery_set(&subquery.subquery.to_string())
+                            Self::subquery_cache_key(&subquery.subquery, ctx)
+                                .and_then(|key| get_cached_in_subquery_set(&key))
                         } else {
                             None
                         };
@@ -247,11 +256,11 @@ impl Executor {
                     }
                 }
 
-                // If not a subquery, just return the original with processed left
+                // Not a subquery on the right: a list may still hold one
                 Ok(Expression::In(InExpression {
                     token: in_expr.token.clone(),
                     left: Box::new(processed_left),
-                    right: in_expr.right.clone(),
+                    right: Box::new(self.process_where_subqueries(&in_expr.right, ctx)?),
                     not: in_expr.not,
                 }))
             }
@@ -372,6 +381,45 @@ impl Executor {
                     filter: func.filter.clone(),
                 })))
             }
+
+            Expression::Like(like) => {
+                let escape = match &like.escape {
+                    Some(escape) => Some(Box::new(self.process_where_subqueries(escape, ctx)?)),
+                    None => None,
+                };
+                Ok(Expression::Like(LikeExpression {
+                    token: like.token.clone(),
+                    left: Box::new(self.process_where_subqueries(&like.left, ctx)?),
+                    pattern: Box::new(self.process_where_subqueries(&like.pattern, ctx)?),
+                    operator: like.operator.clone(),
+                    escape,
+                }))
+            }
+
+            Expression::List(list) => Ok(Expression::List(Box::new(ListExpression {
+                token: list.token.clone(),
+                elements: list
+                    .elements
+                    .iter()
+                    .map(|element| self.process_where_subqueries(element, ctx))
+                    .collect::<Result<Vec<_>>>()?,
+            }))),
+
+            Expression::ExpressionList(list) => {
+                Ok(Expression::ExpressionList(Box::new(ExpressionList {
+                    token: list.token.clone(),
+                    expressions: list
+                        .expressions
+                        .iter()
+                        .map(|element| self.process_where_subqueries(element, ctx))
+                        .collect::<Result<Vec<_>>>()?,
+                })))
+            }
+
+            Expression::Distinct(distinct) => Ok(Expression::Distinct(DistinctExpression {
+                token: distinct.token.clone(),
+                expr: Box::new(self.process_where_subqueries(&distinct.expr, ctx)?),
+            })),
 
             // For all other expression types, return as-is
             _ => Ok(expr.clone()),
@@ -1577,12 +1625,45 @@ impl Executor {
             };
         }
 
+        // A NULL among the values makes the comparison with it UNKNOWN, so an
+        // ALL that holds on the others and an ANY that fails on the others are
+        // UNKNOWN: the folded predicate carries a NULL beside it
+        let has_null = values.iter().any(|v| v.is_null());
+        let non_null_values: Vec<&crate::core::Value> =
+            values.iter().filter(|v| !v.is_null()).collect();
+        let unknown = || {
+            Expression::NullLiteral(NullLiteral {
+                token: dummy_token("NULL", TokenType::Keyword),
+            })
+        };
+        let with_unknown = |predicate: Expression| -> Expression {
+            if !has_null {
+                return predicate;
+            }
+            let logical = match all_any.all_any_type {
+                AllAnyType::All => "AND",
+                AllAnyType::Any => "OR",
+            };
+            Expression::Infix(InfixExpression::new(
+                all_any.token.clone(),
+                Box::new(predicate),
+                logical.to_string(),
+                Box::new(unknown()),
+            ))
+        };
+        if non_null_values.is_empty() {
+            return Ok(unknown());
+        }
+
         // Convert values to expressions
-        let value_exprs: Vec<Expression> = values.iter().map(value_to_expression).collect();
+        let value_exprs: Vec<Expression> = non_null_values
+            .iter()
+            .map(|v| value_to_expression(v))
+            .collect();
 
         // Special case: = ANY is equivalent to IN
         if op == "=" && matches!(all_any.all_any_type, AllAnyType::Any) {
-            return Ok(Expression::In(InExpression {
+            return Ok(with_unknown(Expression::In(InExpression {
                 token: all_any.token.clone(),
                 left: all_any.left.clone(),
                 right: Box::new(Expression::ExpressionList(Box::new(ExpressionList {
@@ -1590,12 +1671,12 @@ impl Executor {
                     expressions: value_exprs,
                 }))),
                 not: false,
-            }));
+            })));
         }
 
         // Special case: <> ALL is equivalent to NOT IN
         if (op == "<>" || op == "!=") && matches!(all_any.all_any_type, AllAnyType::All) {
-            return Ok(Expression::In(InExpression {
+            return Ok(with_unknown(Expression::In(InExpression {
                 token: all_any.token.clone(),
                 left: all_any.left.clone(),
                 right: Box::new(Expression::ExpressionList(Box::new(ExpressionList {
@@ -1603,7 +1684,7 @@ impl Executor {
                     expressions: value_exprs,
                 }))),
                 not: true,
-            }));
+            })));
         }
 
         // For comparison operators, we can optimize using MIN/MAX:
@@ -1615,19 +1696,6 @@ impl Executor {
         // - x >= ANY (values) → x >= MIN(values)
         // - x < ANY (values) → x < MAX(values)
         // - x <= ANY (values) → x <= MAX(values)
-
-        // Filter out NULL values for comparison
-        let non_null_values: Vec<&crate::core::Value> =
-            values.iter().filter(|v| !v.is_null()).collect();
-
-        // If all values are NULL, result depends on semantics
-        if non_null_values.is_empty() {
-            // Comparison with all NULLs is UNKNOWN, which filters as FALSE
-            return Ok(Expression::BooleanLiteral(BooleanLiteral {
-                token: dummy_token("FALSE", TokenType::Keyword),
-                value: false,
-            }));
-        }
 
         // Find min and max
         let min_val = non_null_values
@@ -1654,12 +1722,12 @@ impl Executor {
 
         if let Some(cmp_val) = comparison_value {
             // Build simple comparison: left op value
-            return Ok(Expression::Infix(InfixExpression::new(
+            return Ok(with_unknown(Expression::Infix(InfixExpression::new(
                 all_any.token.clone(),
                 all_any.left.clone(),
                 op.to_string(),
                 Box::new(value_to_expression(cmp_val)),
-            )));
+            ))));
         }
 
         // Fallback: build compound expression with AND/OR
@@ -1691,12 +1759,12 @@ impl Executor {
             });
         }
 
-        Ok(result_expr.unwrap_or_else(|| {
+        Ok(with_unknown(result_expr.unwrap_or_else(|| {
             Expression::BooleanLiteral(BooleanLiteral {
                 token: dummy_token("TRUE", TokenType::Keyword),
                 value: true,
             })
-        }))
+        })))
     }
 
     /// Execute a scalar subquery and return its single value.
@@ -1716,14 +1784,15 @@ impl Executor {
         // as key; bypassed inside explicit transactions (see
         // execute_in_subquery for the ROLLBACK rationale)
         let cache_key = if is_non_correlated && ctx.transaction_id().is_none() {
-            let key = subquery.to_string();
-            if let Some(cached_value) = get_cached_scalar_subquery(&key) {
-                return Ok(cached_value);
-            }
-            Some(key)
+            Self::subquery_cache_key(subquery, ctx)
         } else {
             None
         };
+        if let Some(key) = &cache_key {
+            if let Some(cached_value) = get_cached_scalar_subquery(key) {
+                return Ok(cached_value);
+            }
+        }
 
         // OPTIMIZATION: For correlated scalar subqueries with LIMIT, index-based is faster
         // because it only checks rows for the limited outer rows.
@@ -1830,14 +1899,15 @@ impl Executor {
         // entirely: an in-transaction execution sees uncommitted rows, and
         // caching that view would survive a ROLLBACK
         let cache_key = if is_non_correlated && ctx.transaction_id().is_none() {
-            let key = subquery.to_string();
-            if let Some(cached_values) = get_cached_in_subquery(&key) {
-                return Ok(cached_values);
-            }
-            Some(key)
+            Self::subquery_cache_key(subquery, ctx)
         } else {
             None
         };
+        if let Some(key) = &cache_key {
+            if let Some(cached_values) = get_cached_in_subquery(key) {
+                return Ok(cached_values);
+            }
+        }
 
         // Execute the subquery with incremented depth to avoid creating new TimeoutGuard
         let subquery_ctx = ctx.with_incremented_query_depth();
@@ -1901,8 +1971,7 @@ impl Executor {
                 Self::has_subqueries(&infix.left) || Self::has_subqueries(&infix.right)
             }
             Expression::In(in_expr) => {
-                Self::has_subqueries(&in_expr.left)
-                    || matches!(in_expr.right.as_ref(), Expression::ScalarSubquery(_))
+                Self::has_subqueries(&in_expr.left) || Self::has_subqueries(&in_expr.right)
             }
             Expression::Between(between) => {
                 Self::has_subqueries(&between.expr)
@@ -1910,7 +1979,39 @@ impl Executor {
                     || Self::has_subqueries(&between.upper)
             }
             Expression::Aliased(aliased) => Self::has_subqueries(&aliased.expression),
-            Expression::FunctionCall(func) => func.arguments.iter().any(Self::has_subqueries),
+            Expression::FunctionCall(func) => {
+                func.arguments.iter().any(Self::has_subqueries)
+                    || func.filter.as_deref().is_some_and(Self::has_subqueries)
+                    || func
+                        .order_by
+                        .iter()
+                        .any(|order| Self::has_subqueries(&order.expression))
+            }
+            Expression::Case(case) => {
+                case.value.as_deref().is_some_and(Self::has_subqueries)
+                    || case.when_clauses.iter().any(|w| {
+                        Self::has_subqueries(&w.condition) || Self::has_subqueries(&w.then_result)
+                    })
+                    || case.else_value.as_deref().is_some_and(Self::has_subqueries)
+            }
+            Expression::Cast(cast) => Self::has_subqueries(&cast.expr),
+            Expression::Like(like) => {
+                Self::has_subqueries(&like.left)
+                    || Self::has_subqueries(&like.pattern)
+                    || like.escape.as_deref().is_some_and(Self::has_subqueries)
+            }
+            Expression::List(list) => list.elements.iter().any(Self::has_subqueries),
+            Expression::ExpressionList(list) => list.expressions.iter().any(Self::has_subqueries),
+            Expression::Distinct(distinct) => Self::has_subqueries(&distinct.expr),
+            Expression::Window(window) => window
+                .function
+                .arguments
+                .iter()
+                .chain(window.function.filter.as_deref())
+                .chain(window.function.order_by.iter().map(|o| &o.expression))
+                .chain(window.partition_by.iter())
+                .chain(window.order_by.iter().map(|o| &o.expression))
+                .any(Self::has_subqueries),
             _ => false,
         }
     }
@@ -2033,6 +2134,14 @@ impl Executor {
                     }
                     processed_args.push(processed);
                 }
+                // The FILTER of an aggregate may hold a subquery as well
+                let processed_filter = match &func.filter {
+                    Some(filter) => self.try_process_expression_subqueries(filter, ctx)?,
+                    None => None,
+                };
+                if processed_filter.is_some() {
+                    any_changed = true;
+                }
 
                 if any_changed {
                     let final_args: Vec<Expression> = func
@@ -2048,7 +2157,10 @@ impl Executor {
                         arguments: final_args,
                         is_distinct: func.is_distinct,
                         order_by: func.order_by.clone(),
-                        filter: func.filter.clone(),
+                        filter: match processed_filter {
+                            Some(filter) => Some(Box::new(filter)),
+                            None => func.filter.clone(),
+                        },
                     }))))
                 } else {
                     Ok(None)
@@ -2130,16 +2242,175 @@ impl Executor {
             }
 
             Expression::AllAny(all_any) => {
+                // The left operand may hold a subquery of its own
+                let left = self
+                    .try_process_expression_subqueries(&all_any.left, ctx)?
+                    .unwrap_or_else(|| (*all_any.left).clone());
+                let bound = AllAnyExpression {
+                    token: all_any.token.clone(),
+                    left: Box::new(left),
+                    operator: all_any.operator.clone(),
+                    all_any_type: all_any.all_any_type,
+                    subquery: all_any.subquery.clone(),
+                };
                 // Execute the subquery to get all values
-                let values = self.execute_in_subquery(&all_any.subquery, ctx)?;
+                let values = self.execute_in_subquery(&bound.subquery, ctx)?;
 
                 // Convert ALL/ANY to an equivalent expression that the evaluator can handle
-                Ok(Some(self.convert_all_any_to_expression(all_any, values)?))
+                Ok(Some(self.convert_all_any_to_expression(&bound, values)?))
+            }
+
+            Expression::In(in_expr) => {
+                // A subquery on the right folds to its values as in a WHERE
+                if matches!(in_expr.right.as_ref(), Expression::ScalarSubquery(_)) {
+                    return Ok(Some(self.process_where_subqueries(expr, ctx)?));
+                }
+                let left = self.try_process_expression_subqueries(&in_expr.left, ctx)?;
+                let right = self.try_process_expression_subqueries(&in_expr.right, ctx)?;
+                if left.is_none() && right.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(Expression::In(InExpression {
+                    token: in_expr.token.clone(),
+                    left: Box::new(left.unwrap_or_else(|| (*in_expr.left).clone())),
+                    right: Box::new(right.unwrap_or_else(|| (*in_expr.right).clone())),
+                    not: in_expr.not,
+                })))
+            }
+
+            Expression::Between(between) => {
+                let expr_p = self.try_process_expression_subqueries(&between.expr, ctx)?;
+                let lower = self.try_process_expression_subqueries(&between.lower, ctx)?;
+                let upper = self.try_process_expression_subqueries(&between.upper, ctx)?;
+                if expr_p.is_none() && lower.is_none() && upper.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(Expression::Between(BetweenExpression {
+                    token: between.token.clone(),
+                    expr: Box::new(expr_p.unwrap_or_else(|| (*between.expr).clone())),
+                    lower: Box::new(lower.unwrap_or_else(|| (*between.lower).clone())),
+                    upper: Box::new(upper.unwrap_or_else(|| (*between.upper).clone())),
+                    not: between.not,
+                })))
+            }
+
+            Expression::Like(like) => {
+                let left = self.try_process_expression_subqueries(&like.left, ctx)?;
+                let pattern = self.try_process_expression_subqueries(&like.pattern, ctx)?;
+                let escape = match &like.escape {
+                    Some(escape) => self.try_process_expression_subqueries(escape, ctx)?,
+                    None => None,
+                };
+                if left.is_none() && pattern.is_none() && escape.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(Expression::Like(LikeExpression {
+                    token: like.token.clone(),
+                    left: Box::new(left.unwrap_or_else(|| (*like.left).clone())),
+                    pattern: Box::new(pattern.unwrap_or_else(|| (*like.pattern).clone())),
+                    operator: like.operator.clone(),
+                    escape: match escape {
+                        Some(escape) => Some(Box::new(escape)),
+                        None => like.escape.clone(),
+                    },
+                })))
+            }
+
+            Expression::List(list) => {
+                let processed = self.try_process_expression_list(&list.elements, ctx)?;
+                Ok(processed.map(|elements| {
+                    Expression::List(Box::new(ListExpression {
+                        token: list.token.clone(),
+                        elements,
+                    }))
+                }))
+            }
+
+            Expression::ExpressionList(list) => {
+                let processed = self.try_process_expression_list(&list.expressions, ctx)?;
+                Ok(processed.map(|expressions| {
+                    Expression::ExpressionList(Box::new(ExpressionList {
+                        token: list.token.clone(),
+                        expressions,
+                    }))
+                }))
+            }
+
+            Expression::Distinct(distinct) => Ok(self
+                .try_process_expression_subqueries(&distinct.expr, ctx)?
+                .map(|inner| {
+                    Expression::Distinct(DistinctExpression {
+                        token: distinct.token.clone(),
+                        expr: Box::new(inner),
+                    })
+                })),
+
+            Expression::Window(window) => {
+                let function = match self.try_process_expression_subqueries(
+                    &Expression::FunctionCall(window.function.clone()),
+                    ctx,
+                )? {
+                    Some(Expression::FunctionCall(function)) => Some(function),
+                    _ => None,
+                };
+                let partition_by = self.try_process_expression_list(&window.partition_by, ctx)?;
+                let order_exprs: Vec<Expression> = window
+                    .order_by
+                    .iter()
+                    .map(|o| o.expression.clone())
+                    .collect();
+                let order_by = self.try_process_expression_list(&order_exprs, ctx)?;
+                if function.is_none() && partition_by.is_none() && order_by.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(Expression::Window(Box::new(
+                    crate::parser::ast::WindowExpression {
+                        token: window.token.clone(),
+                        function: function.unwrap_or_else(|| window.function.clone()),
+                        window_ref: window.window_ref.clone(),
+                        partition_by: partition_by.unwrap_or_else(|| window.partition_by.clone()),
+                        order_by: match order_by {
+                            Some(expressions) => expressions
+                                .into_iter()
+                                .zip(window.order_by.iter())
+                                .map(|(expression, order)| OrderByExpression {
+                                    expression,
+                                    ..order.clone()
+                                })
+                                .collect(),
+                            None => window.order_by.clone(),
+                        },
+                        frame: window.frame.clone(),
+                    },
+                ))))
             }
 
             // No subqueries possible in other expression types
             _ => Ok(None),
         }
+    }
+
+    /// The elements of a list with their subqueries resolved, or None when
+    /// none held one
+    fn try_process_expression_list(
+        &self,
+        elements: &[Expression],
+        ctx: &ExecutionContext,
+    ) -> Result<Option<Vec<Expression>>> {
+        let mut processed: Vec<Option<Expression>> = Vec::with_capacity(elements.len());
+        for element in elements {
+            processed.push(self.try_process_expression_subqueries(element, ctx)?);
+        }
+        if processed.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+        Ok(Some(
+            processed
+                .into_iter()
+                .zip(elements.iter())
+                .map(|(new, old)| new.unwrap_or_else(|| old.clone()))
+                .collect(),
+        ))
     }
 
     // ============================================================================
@@ -2154,6 +2425,10 @@ impl Executor {
             Expression::Exists(exists) => Self::is_subquery_correlated(&exists.subquery),
             Expression::ScalarSubquery(subquery) => {
                 Self::is_subquery_correlated(&subquery.subquery)
+            }
+            Expression::AllAny(all_any) => {
+                Self::is_subquery_correlated(&all_any.subquery)
+                    || Self::has_correlated_subqueries(&all_any.left)
             }
             Expression::Prefix(prefix) => {
                 // Handle NOT EXISTS
@@ -2171,6 +2446,7 @@ impl Executor {
                     return Self::is_subquery_correlated(&subquery.subquery);
                 }
                 Self::has_correlated_subqueries(&in_expr.left)
+                    || Self::has_correlated_subqueries(&in_expr.right)
             }
             Expression::Between(between) => {
                 Self::has_correlated_subqueries(&between.expr)
@@ -2180,7 +2456,51 @@ impl Executor {
             Expression::Aliased(aliased) => Self::has_correlated_subqueries(&aliased.expression),
             Expression::FunctionCall(func) => {
                 func.arguments.iter().any(Self::has_correlated_subqueries)
+                    || func
+                        .filter
+                        .as_deref()
+                        .is_some_and(Self::has_correlated_subqueries)
+                    || func
+                        .order_by
+                        .iter()
+                        .any(|order| Self::has_correlated_subqueries(&order.expression))
             }
+            Expression::Case(case) => {
+                case.value
+                    .as_deref()
+                    .is_some_and(Self::has_correlated_subqueries)
+                    || case.when_clauses.iter().any(|w| {
+                        Self::has_correlated_subqueries(&w.condition)
+                            || Self::has_correlated_subqueries(&w.then_result)
+                    })
+                    || case
+                        .else_value
+                        .as_deref()
+                        .is_some_and(Self::has_correlated_subqueries)
+            }
+            Expression::Cast(cast) => Self::has_correlated_subqueries(&cast.expr),
+            Expression::Like(like) => {
+                Self::has_correlated_subqueries(&like.left)
+                    || Self::has_correlated_subqueries(&like.pattern)
+                    || like
+                        .escape
+                        .as_deref()
+                        .is_some_and(Self::has_correlated_subqueries)
+            }
+            Expression::List(list) => list.elements.iter().any(Self::has_correlated_subqueries),
+            Expression::ExpressionList(list) => {
+                list.expressions.iter().any(Self::has_correlated_subqueries)
+            }
+            Expression::Distinct(distinct) => Self::has_correlated_subqueries(&distinct.expr),
+            Expression::Window(window) => window
+                .function
+                .arguments
+                .iter()
+                .chain(window.function.filter.as_deref())
+                .chain(window.function.order_by.iter().map(|o| &o.expression))
+                .chain(window.partition_by.iter())
+                .chain(window.order_by.iter().map(|o| &o.expression))
+                .any(Self::has_correlated_subqueries),
             _ => false,
         }
     }
@@ -2346,9 +2666,586 @@ impl Executor {
                 }))
             }
 
+            // ALL and ANY run their subquery under this row's context; the
+            // left operand is resolved first
+            Expression::AllAny(all_any) => {
+                let bound = AllAnyExpression {
+                    token: all_any.token.clone(),
+                    left: Box::new(self.process_correlated_expression(&all_any.left, ctx)?),
+                    operator: all_any.operator.clone(),
+                    all_any_type: all_any.all_any_type,
+                    subquery: all_any.subquery.clone(),
+                };
+                let values = self.execute_in_subquery(&bound.subquery, ctx)?;
+                self.convert_all_any_to_expression(&bound, values)
+            }
+
+            Expression::Like(like) => {
+                let escape = match &like.escape {
+                    Some(escape) => {
+                        Some(Box::new(self.process_correlated_expression(escape, ctx)?))
+                    }
+                    None => None,
+                };
+                Ok(Expression::Like(LikeExpression {
+                    token: like.token.clone(),
+                    left: Box::new(self.process_correlated_expression(&like.left, ctx)?),
+                    pattern: Box::new(self.process_correlated_expression(&like.pattern, ctx)?),
+                    operator: like.operator.clone(),
+                    escape,
+                }))
+            }
+
+            Expression::List(list) => Ok(Expression::List(Box::new(ListExpression {
+                token: list.token.clone(),
+                elements: list
+                    .elements
+                    .iter()
+                    .map(|element| self.process_correlated_expression(element, ctx))
+                    .collect::<Result<Vec<_>>>()?,
+            }))),
+
+            Expression::ExpressionList(list) => {
+                Ok(Expression::ExpressionList(Box::new(ExpressionList {
+                    token: list.token.clone(),
+                    expressions: list
+                        .expressions
+                        .iter()
+                        .map(|element| self.process_correlated_expression(element, ctx))
+                        .collect::<Result<Vec<_>>>()?,
+                })))
+            }
+
+            Expression::Distinct(distinct) => Ok(Expression::Distinct(DistinctExpression {
+                token: distinct.token.clone(),
+                expr: Box::new(self.process_correlated_expression(&distinct.expr, ctx)?),
+            })),
+
             // For all other expression types, return as-is
+            Expression::Window(window) => {
+                let function = match self.process_correlated_expression(
+                    &Expression::FunctionCall(window.function.clone()),
+                    ctx,
+                )? {
+                    Expression::FunctionCall(function) => function,
+                    _ => window.function.clone(),
+                };
+                Ok(Expression::Window(Box::new(
+                    crate::parser::ast::WindowExpression {
+                        token: window.token.clone(),
+                        function,
+                        window_ref: window.window_ref.clone(),
+                        partition_by: window
+                            .partition_by
+                            .iter()
+                            .map(|e| self.process_correlated_expression(e, ctx))
+                            .collect::<Result<Vec<_>>>()?,
+                        order_by: window
+                            .order_by
+                            .iter()
+                            .map(|order| {
+                                Ok(OrderByExpression {
+                                    expression: self
+                                        .process_correlated_expression(&order.expression, ctx)?,
+                                    ..order.clone()
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                        frame: window.frame.clone(),
+                    },
+                )))
+            }
+
             _ => Ok(expr.clone()),
         }
+    }
+
+    /// True when the SELECT list, HAVING or ORDER BY still holds a subquery;
+    /// an aggregation path that reads them raw must leave the statement to
+    /// the general entry, which lifts them
+    pub(crate) fn aggregates_hold_subquery(stmt: &SelectStatement) -> bool {
+        stmt.columns.iter().any(Self::has_subqueries)
+            || stmt.having.as_deref().is_some_and(Self::has_subqueries)
+            || stmt
+                .order_by
+                .iter()
+                .any(|order| Self::has_subqueries(&order.expression))
+    }
+
+    /// The cache key of a subquery that reads no outer row: its text and the
+    /// bindings behind it, since a parameter prints as its marker and one
+    /// text would otherwise answer for two executions. None when the text
+    /// holds an anonymous marker, which two bindings of one statement share.
+    /// The bindings go in debug form: it carries the type a value prints
+    /// without, and escapes a separator a text could otherwise hold
+    pub(crate) fn subquery_cache_key(
+        subquery: &SelectStatement,
+        ctx: &ExecutionContext,
+    ) -> Option<String> {
+        use std::fmt::Write;
+        let mut key = subquery.to_string();
+        if key.contains('?') {
+            return None;
+        }
+        for value in ctx.params() {
+            let _ = write!(key, "\u{1}{value:?}");
+        }
+        if !ctx.named_params().is_empty() {
+            let mut named: Vec<(&String, &Value)> = ctx.named_params().iter().collect();
+            named.sort_unstable_by_key(|(name, _)| *name);
+            for (name, value) in named {
+                let _ = write!(key, "\u{1}{name:?}={value:?}");
+            }
+        }
+        Some(key)
+    }
+
+    /// Whether a window function, its OVER clause or a named window holds a subquery
+    pub(crate) fn windows_hold_subquery(stmt: &SelectStatement) -> bool {
+        stmt.columns.iter().any(Self::has_subqueries)
+            || stmt.window_defs.iter().any(|window| {
+                window.partition_by.iter().any(Self::has_subqueries)
+                    || window
+                        .order_by
+                        .iter()
+                        .any(|order| Self::has_subqueries(&order.expression))
+            })
+    }
+
+    /// The column a lifted subquery lands in: its own text, so the result
+    /// column keeps its name, shared by an identical subquery, and never an
+    /// input column's name, qualified or not
+    fn lifted_column_name(
+        expr: &Expression,
+        lifted: &mut Vec<(Expression, String)>,
+        base_columns: &[String],
+    ) -> String {
+        let text = expr.to_string();
+        // An anonymous parameter prints as a bare marker, so one text can
+        // stand for two bindings and only a distinct text may be shared
+        if !text.contains('?') {
+            if let Some((_, name)) = lifted.iter().find(|(e, _)| e.to_string() == text) {
+                return name.clone();
+            }
+        }
+        let mut name = text;
+        // A qualifier holds no dot, the name after it may
+        while base_columns.iter().any(|column| {
+            column.eq_ignore_ascii_case(&name)
+                || column
+                    .split_once('.')
+                    .is_some_and(|(_, bare)| bare.eq_ignore_ascii_case(&name))
+        }) || lifted
+            .iter()
+            .any(|(_, taken)| taken.eq_ignore_ascii_case(&name))
+        {
+            name.push('_');
+        }
+        lifted.push((expr.clone(), name.clone()));
+        name
+    }
+
+    /// The statement with every subquery inside an aggregate call, in the
+    /// SELECT list, HAVING or ORDER BY, replaced by a column, and the
+    /// subqueries taken out in that order. None when no aggregate holds one.
+    /// Window functions are left alone: they run over the aggregate's output
+    pub(crate) fn lift_subqueries_in_aggregates(
+        stmt: &SelectStatement,
+        base_columns: &[String],
+    ) -> Option<(SelectStatement, Vec<Expression>, Vec<String>)> {
+        let mut lifted = Vec::new();
+        let columns: Vec<Expression> = stmt
+            .columns
+            .iter()
+            .map(|column| Self::lift_subqueries_in(column, false, false, &mut lifted, base_columns))
+            .collect();
+        let having = stmt.having.as_ref().map(|having| {
+            Box::new(Self::lift_subqueries_in(
+                having,
+                false,
+                false,
+                &mut lifted,
+                base_columns,
+            ))
+        });
+        let order_by: Vec<OrderByExpression> = stmt
+            .order_by
+            .iter()
+            .map(|order| OrderByExpression {
+                expression: Self::lift_subqueries_in(
+                    &order.expression,
+                    false,
+                    false,
+                    &mut lifted,
+                    base_columns,
+                ),
+                ..order.clone()
+            })
+            .collect();
+        if lifted.is_empty() {
+            return None;
+        }
+        let (lifted, names) = lifted.into_iter().unzip();
+        Some((
+            SelectStatement {
+                columns,
+                having,
+                order_by,
+                ..stmt.clone()
+            },
+            lifted,
+            names,
+        ))
+    }
+
+    /// The statement with every subquery in the SELECT list, the OVER clauses
+    /// and the named windows replaced by a column, and the subqueries taken
+    /// out in that order. None when there is none
+    pub(crate) fn lift_subqueries_in_windows(
+        stmt: &SelectStatement,
+        base_columns: &[String],
+    ) -> Option<(SelectStatement, Vec<Expression>, Vec<String>)> {
+        let mut lifted = Vec::new();
+        // Every SELECT expression beside a window function is read per row
+        let columns: Vec<Expression> = stmt
+            .columns
+            .iter()
+            .map(|column| Self::lift_subqueries_in(column, true, true, &mut lifted, base_columns))
+            .collect();
+        let window_defs: Vec<crate::parser::ast::WindowDefinition> = stmt
+            .window_defs
+            .iter()
+            .map(|window| crate::parser::ast::WindowDefinition {
+                name: window.name.clone(),
+                partition_by: window
+                    .partition_by
+                    .iter()
+                    .map(|e| Self::lift_subqueries_in(e, true, true, &mut lifted, base_columns))
+                    .collect(),
+                order_by: window
+                    .order_by
+                    .iter()
+                    .map(|order| OrderByExpression {
+                        expression: Self::lift_subqueries_in(
+                            &order.expression,
+                            true,
+                            true,
+                            &mut lifted,
+                            base_columns,
+                        ),
+                        ..order.clone()
+                    })
+                    .collect(),
+                frame: window.frame.clone(),
+            })
+            .collect();
+        if lifted.is_empty() {
+            return None;
+        }
+        let (lifted, names) = lifted.into_iter().unzip();
+        Some((
+            SelectStatement {
+                columns,
+                window_defs,
+                ..stmt.clone()
+            },
+            lifted,
+            names,
+        ))
+    }
+
+    /// A navigation function reads its control argument off no row, so a
+    /// subquery there answers for the whole partition. The lift leaves it
+    /// where it is; this resolves the ones that read no row either, before
+    /// the argument is compiled against no columns at all
+    pub(crate) fn fold_window_control_arguments(
+        &self,
+        window_functions: &mut [super::window::WindowFunctionInfo],
+        ctx: &ExecutionContext,
+    ) -> Result<()> {
+        for window in window_functions {
+            let Some(index) = Self::window_control_argument(&window.name) else {
+                continue;
+            };
+            let Some(argument) = window.arguments.get(index) else {
+                continue;
+            };
+            if !Self::has_subqueries(argument) || Self::has_correlated_subqueries(argument) {
+                continue;
+            }
+            if let Some(folded) = self.try_process_expression_subqueries(argument, ctx)? {
+                window.arguments[index] = folded;
+            }
+        }
+        Ok(())
+    }
+
+    /// The argument a navigation window function reads once, off no row:
+    /// the offset of LEAD and LAG, the group count of NTILE, the n of
+    /// NTH_VALUE
+    pub(crate) fn window_control_argument(function: &str) -> Option<usize> {
+        if function.eq_ignore_ascii_case("NTILE") {
+            Some(0)
+        } else if function.eq_ignore_ascii_case("LEAD")
+            || function.eq_ignore_ascii_case("LAG")
+            || function.eq_ignore_ascii_case("NTH_VALUE")
+        {
+            Some(1)
+        } else {
+            None
+        }
+    }
+
+    fn lift_subqueries_in_call(
+        func: &FunctionCall,
+        inside_aggregate: bool,
+        windows: bool,
+        lifted: &mut Vec<(Expression, String)>,
+        base_columns: &[String],
+    ) -> FunctionCall {
+        let inside =
+            inside_aggregate || (!windows && super::utils::is_aggregate_function(&func.function));
+        // A navigation window function reads its control argument off no row
+        // at all, so a column put there would never resolve
+        let control = windows
+            .then(|| Self::window_control_argument(&func.function))
+            .flatten();
+        FunctionCall {
+            token: func.token.clone(),
+            function: func.function.clone(),
+            arguments: func
+                .arguments
+                .iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    if control == Some(i) {
+                        a.clone()
+                    } else {
+                        Self::lift_subqueries_in(a, inside, windows, lifted, base_columns)
+                    }
+                })
+                .collect(),
+            is_distinct: func.is_distinct,
+            order_by: func
+                .order_by
+                .iter()
+                .map(|order| OrderByExpression {
+                    expression: Self::lift_subqueries_in(
+                        &order.expression,
+                        inside,
+                        windows,
+                        lifted,
+                        base_columns,
+                    ),
+                    ..order.clone()
+                })
+                .collect(),
+            filter: func.filter.as_ref().map(|f| {
+                Box::new(Self::lift_subqueries_in(
+                    f,
+                    inside,
+                    windows,
+                    lifted,
+                    base_columns,
+                ))
+            }),
+        }
+    }
+
+    /// `windows` selects the scope: aggregate calls, or window functions
+    /// with their OVER clauses
+    fn lift_subqueries_in(
+        expr: &Expression,
+        inside_aggregate: bool,
+        windows: bool,
+        lifted: &mut Vec<(Expression, String)>,
+        base_columns: &[String],
+    ) -> Expression {
+        let is_subquery = matches!(
+            expr,
+            Expression::ScalarSubquery(_) | Expression::Exists(_) | Expression::AllAny(_)
+        ) || matches!(expr, Expression::In(in_expr)
+            if matches!(in_expr.right.as_ref(), Expression::ScalarSubquery(_)));
+        if inside_aggregate && is_subquery {
+            let name = Self::lifted_column_name(expr, lifted, base_columns);
+            return Expression::Identifier(crate::parser::ast::Identifier::new(
+                dummy_token(&name, TokenType::Identifier),
+                name.as_str(),
+            ));
+        }
+        let lift = |e: &Expression, lifted: &mut Vec<(Expression, String)>| {
+            Self::lift_subqueries_in(e, inside_aggregate, windows, lifted, base_columns)
+        };
+        match expr {
+            Expression::FunctionCall(func) => {
+                Expression::FunctionCall(Box::new(Self::lift_subqueries_in_call(
+                    func,
+                    inside_aggregate,
+                    windows,
+                    lifted,
+                    base_columns,
+                )))
+            }
+            Expression::Window(_) if !windows => expr.clone(),
+            // A window function and its OVER clause read every input row
+            Expression::Window(window) => {
+                let per_row = |e: &Expression, lifted: &mut Vec<(Expression, String)>| {
+                    Self::lift_subqueries_in(e, true, windows, lifted, base_columns)
+                };
+                Expression::Window(Box::new(crate::parser::ast::WindowExpression {
+                    token: window.token.clone(),
+                    function: Box::new(Self::lift_subqueries_in_call(
+                        &window.function,
+                        true,
+                        windows,
+                        lifted,
+                        base_columns,
+                    )),
+                    window_ref: window.window_ref.clone(),
+                    partition_by: window
+                        .partition_by
+                        .iter()
+                        .map(|e| per_row(e, lifted))
+                        .collect(),
+                    order_by: window
+                        .order_by
+                        .iter()
+                        .map(|order| OrderByExpression {
+                            expression: per_row(&order.expression, lifted),
+                            ..order.clone()
+                        })
+                        .collect(),
+                    frame: window.frame.clone(),
+                }))
+            }
+            Expression::Infix(infix) => Expression::Infix(InfixExpression {
+                token: infix.token.clone(),
+                left: Box::new(lift(&infix.left, lifted)),
+                operator: infix.operator.clone(),
+                op_type: infix.op_type,
+                right: Box::new(lift(&infix.right, lifted)),
+            }),
+            Expression::Prefix(prefix) => Expression::Prefix(PrefixExpression {
+                token: prefix.token.clone(),
+                operator: prefix.operator.clone(),
+                op_type: prefix.op_type,
+                right: Box::new(lift(&prefix.right, lifted)),
+            }),
+            Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
+                token: aliased.token.clone(),
+                expression: Box::new(lift(&aliased.expression, lifted)),
+                alias: aliased.alias.clone(),
+            }),
+            Expression::Cast(cast) => Expression::Cast(CastExpression {
+                token: cast.token.clone(),
+                expr: Box::new(lift(&cast.expr, lifted)),
+                type_name: cast.type_name.clone(),
+            }),
+            Expression::Case(case) => Expression::Case(Box::new(CaseExpression {
+                token: case.token.clone(),
+                value: case.value.as_ref().map(|v| Box::new(lift(v, lifted))),
+                when_clauses: case
+                    .when_clauses
+                    .iter()
+                    .map(|when| WhenClause {
+                        token: when.token.clone(),
+                        condition: lift(&when.condition, lifted),
+                        then_result: lift(&when.then_result, lifted),
+                    })
+                    .collect(),
+                else_value: case.else_value.as_ref().map(|e| Box::new(lift(e, lifted))),
+            })),
+            Expression::In(in_expr) => Expression::In(InExpression {
+                token: in_expr.token.clone(),
+                left: Box::new(lift(&in_expr.left, lifted)),
+                right: Box::new(lift(&in_expr.right, lifted)),
+                not: in_expr.not,
+            }),
+            Expression::Between(between) => Expression::Between(BetweenExpression {
+                token: between.token.clone(),
+                expr: Box::new(lift(&between.expr, lifted)),
+                lower: Box::new(lift(&between.lower, lifted)),
+                upper: Box::new(lift(&between.upper, lifted)),
+                not: between.not,
+            }),
+            Expression::Like(like) => Expression::Like(LikeExpression {
+                token: like.token.clone(),
+                left: Box::new(lift(&like.left, lifted)),
+                pattern: Box::new(lift(&like.pattern, lifted)),
+                operator: like.operator.clone(),
+                escape: like.escape.as_ref().map(|e| Box::new(lift(e, lifted))),
+            }),
+            Expression::List(list) => Expression::List(Box::new(ListExpression {
+                token: list.token.clone(),
+                elements: list.elements.iter().map(|e| lift(e, lifted)).collect(),
+            })),
+            Expression::ExpressionList(list) => {
+                Expression::ExpressionList(Box::new(ExpressionList {
+                    token: list.token.clone(),
+                    expressions: list.expressions.iter().map(|e| lift(e, lifted)).collect(),
+                }))
+            }
+            Expression::Distinct(distinct) => Expression::Distinct(DistinctExpression {
+                token: distinct.token.clone(),
+                expr: Box::new(lift(&distinct.expr, lifted)),
+            }),
+            _ => expr.clone(),
+        }
+    }
+
+    /// Every input row extended with the value of each lifted subquery,
+    /// resolved with that row as the outer row, and the column names to go
+    /// with them
+    pub(crate) fn materialize_lifted_subqueries(
+        &self,
+        lifted: &[Expression],
+        names: &[String],
+        ctx: &ExecutionContext,
+        base_rows: &[(i64, crate::core::Row)],
+        base_columns: &[String],
+        qualifier: Option<&str>,
+    ) -> Result<(crate::core::RowVec, Vec<String>)> {
+        // Each column under its own name, its bare name when qualified, and
+        // its qualified name when the source's name or alias is known
+        let keys: Vec<(CompactArc<str>, Option<CompactArc<str>>)> = base_columns
+            .iter()
+            .map(|name| {
+                let lower = name.to_lowercase();
+                let other = match lower.rfind('.') {
+                    Some(dot) => Some(CompactArc::from(&lower[dot + 1..])),
+                    None => qualifier.map(|q| {
+                        CompactArc::from(format!("{}.{}", q.to_lowercase(), lower).as_str())
+                    }),
+                };
+                (CompactArc::from(lower.as_str()), other)
+            })
+            .collect();
+        let outer_columns = CompactArc::new(base_columns.to_vec());
+        let mut rows = crate::core::RowVec::with_capacity(base_rows.len());
+        for (id, row) in base_rows {
+            let mut outer: rustc_hash::FxHashMap<CompactArc<str>, Value> =
+                ctx.outer_row().cloned().unwrap_or_default();
+            for ((full, short), value) in keys.iter().zip(row.as_slice()) {
+                if let Some(short) = short {
+                    outer.insert(short.clone(), value.clone());
+                }
+                outer.insert(full.clone(), value.clone());
+            }
+            let row_ctx = ctx.with_outer_row(outer, outer_columns.clone());
+            let mut values: Vec<Value> = row.as_slice().to_vec();
+            for node in lifted {
+                let bound = self.process_correlated_expression(node, &row_ctx)?;
+                let value = super::expression::ExpressionEval::compile(&bound, base_columns)?
+                    .with_context(&row_ctx)
+                    .eval_slice(row)?;
+                values.push(value);
+            }
+            ctx.check_cancelled()?;
+            rows.push((*id, crate::core::Row::from_values(values)));
+        }
+        let mut columns = base_columns.to_vec();
+        columns.extend(names.iter().cloned());
+        Ok((rows, columns))
     }
 
     /// Check if a subquery is correlated (references outer columns)
@@ -2453,10 +3350,19 @@ impl Executor {
             Expression::Prefix(prefix) => {
                 Self::references_outer_columns(&prefix.right, subquery_tables)
             }
-            Expression::FunctionCall(func) => func
-                .arguments
-                .iter()
-                .any(|arg| Self::references_outer_columns(arg, subquery_tables)),
+            Expression::FunctionCall(func) => {
+                func.arguments
+                    .iter()
+                    .any(|arg| Self::references_outer_columns(arg, subquery_tables))
+                    || func
+                        .filter
+                        .as_deref()
+                        .is_some_and(|f| Self::references_outer_columns(f, subquery_tables))
+                    || func
+                        .order_by
+                        .iter()
+                        .any(|o| Self::references_outer_columns(&o.expression, subquery_tables))
+            }
             Expression::In(in_expr) => {
                 Self::references_outer_columns(&in_expr.left, subquery_tables)
                     || Self::references_outer_columns(&in_expr.right, subquery_tables)
@@ -2489,7 +3395,38 @@ impl Executor {
             Expression::Aliased(aliased) => {
                 Self::references_outer_columns(&aliased.expression, subquery_tables)
             }
+            Expression::AllAny(all_any) => {
+                Self::references_outer_columns(&all_any.left, subquery_tables)
+            }
             Expression::Cast(cast) => Self::references_outer_columns(&cast.expr, subquery_tables),
+            Expression::Like(like) => {
+                Self::references_outer_columns(&like.left, subquery_tables)
+                    || Self::references_outer_columns(&like.pattern, subquery_tables)
+                    || like
+                        .escape
+                        .as_deref()
+                        .is_some_and(|e| Self::references_outer_columns(e, subquery_tables))
+            }
+            Expression::Distinct(distinct) => {
+                Self::references_outer_columns(&distinct.expr, subquery_tables)
+            }
+            Expression::List(list) => list
+                .elements
+                .iter()
+                .any(|e| Self::references_outer_columns(e, subquery_tables)),
+            Expression::ExpressionList(list) => list
+                .expressions
+                .iter()
+                .any(|e| Self::references_outer_columns(e, subquery_tables)),
+            Expression::Window(window) => window
+                .function
+                .arguments
+                .iter()
+                .chain(window.function.filter.as_deref())
+                .chain(window.function.order_by.iter().map(|o| &o.expression))
+                .chain(window.partition_by.iter())
+                .chain(window.order_by.iter().map(|o| &o.expression))
+                .any(|e| Self::references_outer_columns(e, subquery_tables)),
             _ => false,
         }
     }
@@ -2576,7 +3513,7 @@ impl Executor {
                 Ok(Expression::In(InExpression {
                     token: in_expr.token.clone(),
                     left: Box::new(processed_left),
-                    right: in_expr.right.clone(),
+                    right: Box::new(self.process_correlated_where(&in_expr.right, ctx)?),
                     not: in_expr.not,
                 }))
             }
@@ -2594,6 +3531,106 @@ impl Executor {
                     upper: Box::new(processed_upper),
                 }))
             }
+
+            Expression::FunctionCall(func) => {
+                let arguments = func
+                    .arguments
+                    .iter()
+                    .map(|arg| self.process_correlated_where(arg, ctx))
+                    .collect::<Result<Vec<_>>>()?;
+                let filter = match &func.filter {
+                    Some(filter) => Some(Box::new(self.process_correlated_where(filter, ctx)?)),
+                    None => None,
+                };
+                Ok(Expression::FunctionCall(Box::new(FunctionCall {
+                    token: func.token.clone(),
+                    function: func.function.clone(),
+                    arguments,
+                    is_distinct: func.is_distinct,
+                    order_by: func.order_by.clone(),
+                    filter,
+                })))
+            }
+
+            Expression::Case(case) => {
+                let value = match &case.value {
+                    Some(value) => Some(Box::new(self.process_correlated_where(value, ctx)?)),
+                    None => None,
+                };
+                let mut when_clauses = Vec::with_capacity(case.when_clauses.len());
+                for when in &case.when_clauses {
+                    when_clauses.push(WhenClause {
+                        token: when.token.clone(),
+                        condition: self.process_correlated_where(&when.condition, ctx)?,
+                        then_result: self.process_correlated_where(&when.then_result, ctx)?,
+                    });
+                }
+                let else_value = match &case.else_value {
+                    Some(value) => Some(Box::new(self.process_correlated_where(value, ctx)?)),
+                    None => None,
+                };
+                Ok(Expression::Case(Box::new(CaseExpression {
+                    token: case.token.clone(),
+                    value,
+                    when_clauses,
+                    else_value,
+                })))
+            }
+
+            Expression::Cast(cast) => Ok(Expression::Cast(CastExpression {
+                token: cast.token.clone(),
+                expr: Box::new(self.process_correlated_where(&cast.expr, ctx)?),
+                type_name: cast.type_name.clone(),
+            })),
+
+            Expression::Like(like) => {
+                let escape = match &like.escape {
+                    Some(escape) => Some(Box::new(self.process_correlated_where(escape, ctx)?)),
+                    None => None,
+                };
+                Ok(Expression::Like(LikeExpression {
+                    token: like.token.clone(),
+                    left: Box::new(self.process_correlated_where(&like.left, ctx)?),
+                    pattern: Box::new(self.process_correlated_where(&like.pattern, ctx)?),
+                    operator: like.operator.clone(),
+                    escape,
+                }))
+            }
+
+            Expression::Aliased(aliased) => Ok(Expression::Aliased(AliasedExpression {
+                token: aliased.token.clone(),
+                expression: Box::new(self.process_correlated_where(&aliased.expression, ctx)?),
+                alias: aliased.alias.clone(),
+            })),
+
+            // ALL and ANY run their subquery under this row's context and
+            // fold to a plain comparison
+            Expression::AllAny(_) => self.process_where_subqueries(expr, ctx),
+
+            Expression::List(list) => Ok(Expression::List(Box::new(ListExpression {
+                token: list.token.clone(),
+                elements: list
+                    .elements
+                    .iter()
+                    .map(|element| self.process_correlated_where(element, ctx))
+                    .collect::<Result<Vec<_>>>()?,
+            }))),
+
+            Expression::ExpressionList(list) => {
+                Ok(Expression::ExpressionList(Box::new(ExpressionList {
+                    token: list.token.clone(),
+                    expressions: list
+                        .expressions
+                        .iter()
+                        .map(|element| self.process_correlated_where(element, ctx))
+                        .collect::<Result<Vec<_>>>()?,
+                })))
+            }
+
+            Expression::Distinct(distinct) => Ok(Expression::Distinct(DistinctExpression {
+                token: distinct.token.clone(),
+                expr: Box::new(self.process_correlated_where(&distinct.expr, ctx)?),
+            })),
 
             // For all other expression types, return as-is
             _ => Ok(expr.clone()),

@@ -401,6 +401,34 @@ impl Executor {
         base_rows: RowVec,
         base_columns: &[String],
     ) -> Result<Box<dyn QueryResult>> {
+        // A subquery inside an aggregate is resolved per input row and read
+        // back as a column, since an aggregate cannot resolve one itself
+        let lifted_stmt;
+        let lifted_columns;
+        let (stmt, base_rows, base_columns) = match Self::aggregates_hold_subquery(stmt)
+            .then(|| Self::lift_subqueries_in_aggregates(stmt, base_columns))
+            .flatten()
+        {
+            Some((rewritten, lifted, names)) => {
+                let qualifier = stmt
+                    .table_expr
+                    .as_deref()
+                    .and_then(super::utils::get_table_alias_from_expr);
+                let (rows, all_columns) = self.materialize_lifted_subqueries(
+                    &lifted,
+                    &names,
+                    ctx,
+                    &base_rows,
+                    base_columns,
+                    qualifier.as_deref(),
+                )?;
+                lifted_stmt = rewritten;
+                lifted_columns = all_columns;
+                (&lifted_stmt, rows, lifted_columns.as_slice())
+            }
+            None => (stmt, base_rows, base_columns),
+        };
+
         // Parse aggregations and group by columns
         let (aggregations, _non_agg_columns) = self.parse_aggregations(stmt)?;
         let group_by_columns = self.parse_group_by(stmt, base_columns)?;
@@ -1270,10 +1298,70 @@ impl Executor {
         None
     }
 
+    /// The ORDER BY of an aggregate that orders its own input, with the
+    /// NULLS placement the query asked for
+    pub(crate) fn aggregate_order_keys(
+        order_by: &[crate::parser::ast::OrderByExpression],
+    ) -> Vec<crate::functions::AggregateOrder> {
+        order_by
+            .iter()
+            .map(|order| crate::functions::AggregateOrder {
+                ascending: order.ascending,
+                nulls_first: order.nulls_first,
+            })
+            .collect()
+    }
+
+    /// Aggregate, then run the window functions over the aggregate's output.
+    /// A subquery inside an aggregate is resolved per input row first, and
+    /// both stages read the same rewritten statement
+    pub(crate) fn execute_aggregation_then_windows(
+        &self,
+        stmt: &SelectStatement,
+        ctx: &ExecutionContext,
+        base_rows: &[(i64, Row)],
+        base_columns: &[String],
+    ) -> Result<Box<dyn QueryResult>> {
+        let lifted_stmt;
+        let lifted_rows;
+        let lifted_columns;
+        let (stmt, base_rows, base_columns) = match Self::aggregates_hold_subquery(stmt)
+            .then(|| Self::lift_subqueries_in_aggregates(stmt, base_columns))
+            .flatten()
+        {
+            Some((rewritten, lifted, names)) => {
+                let qualifier = stmt
+                    .table_expr
+                    .as_deref()
+                    .and_then(super::utils::get_table_alias_from_expr);
+                let (rows, all_columns) = self.materialize_lifted_subqueries(
+                    &lifted,
+                    &names,
+                    ctx,
+                    base_rows,
+                    base_columns,
+                    qualifier.as_deref(),
+                )?;
+                lifted_stmt = rewritten;
+                lifted_rows = rows;
+                lifted_columns = all_columns;
+                (
+                    &lifted_stmt,
+                    lifted_rows.as_slice(),
+                    lifted_columns.as_slice(),
+                )
+            }
+            None => (stmt, base_rows, base_columns),
+        };
+        let (agg_columns, agg_rows) =
+            self.execute_aggregation_for_window(stmt, ctx, base_rows, base_columns)?;
+        self.execute_select_with_window_functions(stmt, ctx, &agg_rows, &agg_columns)
+    }
+
     /// Execute GROUP BY aggregation and return raw columns/rows for window function processing
     /// This is used when both GROUP BY and window functions are present in the query.
     /// Window functions operate on the aggregated result.
-    pub(crate) fn execute_aggregation_for_window(
+    fn execute_aggregation_for_window(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
@@ -2169,12 +2257,7 @@ impl Executor {
                 for (i, agg) in aggregations.iter().enumerate() {
                     if !agg.order_by.is_empty() {
                         if let Some(ref mut func) = agg_funcs[i] {
-                            let directions: Vec<bool> = agg
-                                .order_by
-                                .iter()
-                                .map(|o| o.ascending) // true = ASC, false = DESC
-                                .collect();
-                            func.set_order_by(directions);
+                            func.set_order_by(Self::aggregate_order_keys(&agg.order_by));
                         }
                     }
                 }
@@ -4118,12 +4201,7 @@ impl Executor {
             for (i, agg) in aggregations.iter().enumerate() {
                 if !agg.order_by.is_empty() {
                     if let Some(ref mut func) = agg_funcs[i] {
-                        let directions: Vec<bool> = agg
-                            .order_by
-                            .iter()
-                            .map(|o| o.ascending) // true = ASC, false = DESC
-                            .collect();
-                        func.set_order_by(directions);
+                        func.set_order_by(Self::aggregate_order_keys(&agg.order_by));
                     }
                 }
             }
@@ -5197,6 +5275,9 @@ impl Executor {
         classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
         // classification is passed from caller to avoid redundant cache lookups
+        if Self::aggregates_hold_subquery(stmt) {
+            return Ok(None);
+        }
 
         // Quick eligibility checks using cached classification
         if classification.has_where {
@@ -5395,6 +5476,10 @@ impl Executor {
     ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
         use crate::storage::mvcc::version_store::AggregateOp;
 
+        if Self::aggregates_hold_subquery(stmt) {
+            return Ok(None);
+        }
+
         // --- Eligibility checks ---
 
         if !classification.has_where {
@@ -5574,7 +5659,7 @@ impl Executor {
         classification: &std::sync::Arc<QueryClassification>,
     ) -> Result<Option<Box<dyn crate::storage::traits::QueryResult>>> {
         // Quick eligibility checks using cached classification
-        if classification.has_where {
+        if classification.has_where || Self::aggregates_hold_subquery(stmt) {
             return Ok(None);
         }
         if classification.has_group_by {
@@ -5939,6 +6024,10 @@ impl Executor {
     ) -> Result<Option<Box<dyn QueryResult>>> {
         use crate::common::SmartString;
         use smallvec::SmallVec;
+
+        if Self::aggregates_hold_subquery(stmt) {
+            return Ok(None);
+        }
 
         // Quick eligibility checks
         if !classification.has_group_by {
@@ -6328,6 +6417,10 @@ impl Executor {
     ) -> Option<Box<dyn QueryResult>> {
         use crate::parser::ast::GroupByModifier;
         use crate::storage::mvcc::version_store::AggregateOp;
+
+        if Self::aggregates_hold_subquery(stmt) {
+            return None;
+        }
 
         // Only for GROUP BY without WHERE or HAVING
         if classification.has_where || !classification.has_group_by || classification.has_having {

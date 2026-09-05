@@ -64,14 +64,33 @@ pub use sum::SumFunction;
 use crate::core::Value;
 use std::cmp::Ordering;
 
-/// Compare two Values for ordering (used by FIRST/LAST with ORDER BY).
-/// NULLs sort last (greater than all non-NULL values).
-pub(crate) fn compare_sort_keys(a: &[Value], b: &[Value], directions: &[bool]) -> Ordering {
+/// Compare two sort keys of an aggregate that orders its own input.
+/// A NULL goes where the key says, or where the direction implies
+pub(crate) fn compare_sort_keys(
+    a: &[Value],
+    b: &[Value],
+    keys: &[crate::functions::AggregateOrder],
+) -> Ordering {
+    const DEFAULT: crate::functions::AggregateOrder = crate::functions::AggregateOrder {
+        ascending: true,
+        nulls_first: None,
+    };
     for (i, (key_a, key_b)) in a.iter().zip(b.iter()).enumerate() {
-        let is_asc = directions.get(i).copied().unwrap_or(true);
+        let key = keys.get(i).copied().unwrap_or(DEFAULT);
+        let (a_null, b_null) = (key_a.is_null(), key_b.is_null());
+        if a_null || b_null {
+            if a_null && b_null {
+                continue;
+            }
+            return if a_null == key.nulls_first() {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            };
+        }
         let cmp = compare_values_for_sort(key_a, key_b);
         if cmp != Ordering::Equal {
-            return if is_asc { cmp } else { cmp.reverse() };
+            return if key.ascending { cmp } else { cmp.reverse() };
         }
     }
     Ordering::Equal

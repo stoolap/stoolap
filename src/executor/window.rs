@@ -42,6 +42,40 @@ use crate::core::value::NULL_VALUE;
 /// Stack constant for COUNT(*) accumulation by reference
 const COUNT_ONE: Value = Value::Integer(1);
 
+/// The value a window aggregate reads from one row: its argument column,
+/// the argument expression evaluated up front, or one per row for COUNT(*)
+#[inline(always)]
+fn window_argument_value<'a>(
+    rows: &'a [(i64, Row)],
+    idx: usize,
+    arg_col_idx: Option<usize>,
+    expression_values: &'a [Value],
+) -> &'a Value {
+    if let Some(col_idx) = arg_col_idx {
+        rows[idx].1.get(col_idx).unwrap_or(&NULL_VALUE)
+    } else if !expression_values.is_empty() {
+        &expression_values[idx]
+    } else {
+        &COUNT_ONE
+    }
+}
+
+/// One frame of an aggregate that orders its own input
+fn accumulate_ordered_frame(
+    agg_func: &mut Box<dyn crate::functions::AggregateFunction>,
+    frame: &[usize],
+    rows: &[(i64, Row)],
+    arg_col_idx: Option<usize>,
+    expression_values: &[Value],
+    keys: &[Vec<Value>],
+    is_distinct: bool,
+) {
+    for &idx in frame {
+        let value = window_argument_value(rows, idx, arg_col_idx, expression_values);
+        agg_func.accumulate_with_sort_key(value, keys[idx].clone(), is_distinct);
+    }
+}
+
 /// A window-function argument that cannot reference row columns:
 /// compiled once, evaluated once when deterministic and per call when
 /// volatile (RANDOM and friends keep their per-row behavior)
@@ -199,6 +233,10 @@ pub struct WindowFunctionInfo {
     pub column_name: String,
     /// Whether DISTINCT was specified (for COUNT(DISTINCT col) OVER())
     pub is_distinct: bool,
+    /// The aggregate's FILTER (WHERE ...) clause
+    pub filter: Option<Box<Expression>>,
+    /// The aggregate's own ORDER BY, for an aggregate that orders its input
+    pub call_order_by: Box<[OrderByExpression]>,
 }
 
 /// Information about a SELECT list item for window function processing
@@ -392,8 +430,44 @@ impl Executor {
         pre_sorted: Option<WindowPreSortedState>,
         pre_grouped: Option<WindowPreGroupedState>,
     ) -> Result<Box<dyn QueryResult>> {
+        // A subquery inside a window function or its OVER clause is resolved
+        // per input row first; the columns it adds stay out of SELECT *
+        let visible_columns = base_columns.len();
+        let lifted_stmt;
+        let lifted_rows;
+        let lifted_columns;
+        let (stmt, base_rows, base_columns) = match Self::windows_hold_subquery(stmt)
+            .then(|| Self::lift_subqueries_in_windows(stmt, base_columns))
+            .flatten()
+        {
+            Some((rewritten, lifted, names)) => {
+                let qualifier = stmt
+                    .table_expr
+                    .as_deref()
+                    .and_then(super::utils::get_table_alias_from_expr);
+                let (rows, all_columns) = self.materialize_lifted_subqueries(
+                    &lifted,
+                    &names,
+                    ctx,
+                    base_rows,
+                    base_columns,
+                    qualifier.as_deref(),
+                )?;
+                lifted_stmt = rewritten;
+                lifted_rows = rows;
+                lifted_columns = all_columns;
+                (
+                    &lifted_stmt,
+                    lifted_rows.as_slice(),
+                    lifted_columns.as_slice(),
+                )
+            }
+            None => (stmt, base_rows, base_columns),
+        };
+
         // Parse window functions from the SELECT list
-        let window_functions = self.parse_window_functions(stmt, base_columns)?;
+        let mut window_functions = self.parse_window_functions(stmt, base_columns)?;
+        self.fold_window_control_arguments(&mut window_functions, ctx)?;
 
         if window_functions.is_empty() {
             // No window functions found, return base result
@@ -427,6 +501,7 @@ impl Executor {
                                 ctx,
                                 base_rows,
                                 base_columns,
+                                visible_columns,
                                 &window_functions,
                                 limit_val as usize,
                             );
@@ -510,7 +585,12 @@ impl Executor {
         let mut result_columns = Vec::new();
 
         // Parse the SELECT list to determine output column order
-        let select_items = self.parse_select_list_for_window(stmt, base_columns, &window_functions);
+        let select_items = self.parse_select_list_for_window(
+            stmt,
+            base_columns,
+            visible_columns,
+            &window_functions,
+        );
 
         for item in &select_items {
             result_columns.push(item.output_name.clone());
@@ -750,12 +830,14 @@ impl Executor {
 
     /// Streaming execution for window functions with LIMIT pushdown
     /// Processes partitions one at a time and stops early when LIMIT is reached
+    #[allow(clippy::too_many_arguments)]
     fn execute_select_with_window_functions_streaming(
         &self,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         base_rows: &[(i64, Row)],
         base_columns: &[String],
+        visible_columns: usize,
         window_functions: &[WindowFunctionInfo],
         limit: usize,
     ) -> Result<Box<dyn QueryResult>> {
@@ -773,7 +855,12 @@ impl Executor {
             Self::build_partition_map(primary_wf, base_rows, base_columns, &col_index_map, ctx)?;
 
         // Build result columns from SELECT list
-        let select_items = self.parse_select_list_for_window(stmt, base_columns, window_functions);
+        let select_items = self.parse_select_list_for_window(
+            stmt,
+            base_columns,
+            visible_columns,
+            window_functions,
+        );
         let result_columns: Vec<String> =
             select_items.iter().map(|i| i.output_name.clone()).collect();
 
@@ -988,7 +1075,8 @@ impl Executor {
         limit: usize,
     ) -> Result<Box<dyn QueryResult>> {
         // Parse window functions from SELECT list
-        let window_functions = self.parse_window_functions(stmt, base_columns)?;
+        let mut window_functions = self.parse_window_functions(stmt, base_columns)?;
+        self.fold_window_control_arguments(&mut window_functions, ctx)?;
         if window_functions.is_empty() {
             return Err(Error::internal(
                 "No window functions found for lazy partition fetch",
@@ -1013,7 +1101,12 @@ impl Executor {
             .collect();
 
         // Build result columns from SELECT list
-        let select_items = self.parse_select_list_for_window(stmt, base_columns, &window_functions);
+        let select_items = self.parse_select_list_for_window(
+            stmt,
+            base_columns,
+            base_columns.len(),
+            &window_functions,
+        );
         let result_columns: Vec<String> =
             select_items.iter().map(|i| i.output_name.clone()).collect();
 
@@ -1199,6 +1292,7 @@ impl Executor {
         &self,
         stmt: &SelectStatement,
         base_columns: &[String],
+        visible_columns: usize,
         window_functions: &[WindowFunctionInfo],
     ) -> Vec<SelectItem> {
         let col_index_map = build_column_index_map(base_columns);
@@ -1358,7 +1452,7 @@ impl Executor {
                 }
                 Expression::Star(_) | Expression::QualifiedStar(_) => {
                     // SELECT * or t.* - include all base columns
-                    for (idx, col) in base_columns.iter().enumerate() {
+                    for (idx, col) in base_columns.iter().take(visible_columns).enumerate() {
                         items.push(SelectItem {
                             output_name: col.clone(),
                             source: SelectItemSource::BaseColumn(idx),
@@ -1808,6 +1902,8 @@ impl Executor {
             frame,
             column_name,
             is_distinct: func.is_distinct,
+            filter: func.filter.clone(),
+            call_order_by: func.order_by.clone().into_boxed_slice(),
         })
     }
 
@@ -3786,6 +3882,61 @@ impl Executor {
         }
     }
 
+    /// The aggregate's argument per row, NULL where its FILTER rejects the row
+    #[allow(clippy::too_many_arguments)]
+    fn window_filtered_values(
+        &self,
+        filter: &Expression,
+        rows: &[(i64, Row)],
+        columns: &[String],
+        ctx: &ExecutionContext,
+        arg_col_idx: Option<usize>,
+        expression_values: &[Value],
+    ) -> Result<Vec<Value>> {
+        let mut eval = ExpressionEval::compile(filter, columns)?.with_context(ctx);
+        let mut values = Vec::with_capacity(rows.len());
+        for (idx, (_, row)) in rows.iter().enumerate() {
+            values.push(if matches!(eval.eval(row)?, Value::Boolean(true)) {
+                window_argument_value(rows, idx, arg_col_idx, expression_values).clone()
+            } else {
+                Value::null_unknown()
+            });
+        }
+        Ok(values)
+    }
+
+    /// The keys the call's own ORDER BY gives each row, empty without one or
+    /// for an aggregate that does not order its input
+    fn window_call_sort_keys(
+        &self,
+        wf_info: &WindowFunctionInfo,
+        rows: &[(i64, Row)],
+        columns: &[String],
+        ctx: &ExecutionContext,
+    ) -> Result<Vec<Vec<Value>>> {
+        if wf_info.call_order_by.is_empty()
+            || !self
+                .function_registry
+                .get_aggregate(&wf_info.name)
+                .is_some_and(|f| f.supports_order_by())
+        {
+            return Ok(Vec::new());
+        }
+        let mut evals = Vec::with_capacity(wf_info.call_order_by.len());
+        for order in wf_info.call_order_by.iter() {
+            evals.push(ExpressionEval::compile(&order.expression, columns)?.with_context(ctx));
+        }
+        let mut sort_keys = Vec::with_capacity(rows.len());
+        for (_, row) in rows {
+            let mut key = Vec::with_capacity(evals.len());
+            for eval in evals.iter_mut() {
+                key.push(eval.eval(row)?);
+            }
+            sort_keys.push(key);
+        }
+        Ok(sort_keys)
+    }
+
     /// Compute aggregate function as window function (SUM, COUNT, AVG, MIN, MAX)
     /// cached_order_by: Optional precomputed ORDER BY values from cache to avoid redundant computation
     #[allow(clippy::too_many_arguments)]
@@ -3805,7 +3956,7 @@ impl Executor {
             !wf_info.arguments.is_empty() && matches!(wf_info.arguments[0], Expression::Star(_));
 
         // Get the column index for the aggregate argument
-        let arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() && !is_count_star {
+        let mut arg_col_idx: Option<usize> = if !wf_info.arguments.is_empty() && !is_count_star {
             self.resolve_column_index(&wf_info.arguments[0], col_index_map)
         } else {
             // COUNT(*) has no arguments or Star expression
@@ -3819,7 +3970,7 @@ impl Executor {
             !wf_info.arguments.is_empty() && !is_count_star && arg_col_idx.is_none();
 
         // Pre-compute expression values for all rows if needed
-        let expression_values: Vec<Value> = if has_expression_arg {
+        let mut expression_values: Vec<Value> = if has_expression_arg {
             let mut eval =
                 ExpressionEval::compile(&wf_info.arguments[0], columns)?.with_context(ctx);
             rows.iter()
@@ -3828,6 +3979,25 @@ impl Executor {
         } else {
             vec![]
         };
+
+        // A FILTER hides a row by handing the aggregate a NULL, which every
+        // aggregate skips, so the frames below read one plain value column
+        if let Some(filter) = wf_info.filter.as_deref() {
+            expression_values = self.window_filtered_values(
+                filter,
+                rows,
+                columns,
+                ctx,
+                arg_col_idx,
+                &expression_values,
+            )?;
+            arg_col_idx = None;
+        }
+
+        // The keys the call's own ORDER BY gives each row, empty without one
+        let sort_keys = self.window_call_sort_keys(wf_info, rows, columns, ctx)?;
+        let is_distinct = wf_info.is_distinct;
+        let keys: Option<&[Vec<Value>]> = (!sort_keys.is_empty()).then_some(&sort_keys);
 
         // Use precomputed ORDER BY values from cache if available
         let empty_order_by = ColumnarOrderByValues {
@@ -3928,6 +4098,9 @@ impl Executor {
                     .ok_or_else(|| {
                         Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name))
                     })?;
+                if keys.is_some() {
+                    agg_func.set_order_by(Self::aggregate_order_keys(&wf_info.call_order_by));
+                }
 
                 // Check if we can use O(n) incremental accumulation instead of O(n²) reset.
                 // Safe when: frame start is UNBOUNDED PRECEDING (frame only grows),
@@ -4034,17 +4207,26 @@ impl Executor {
                         };
 
                         // Accumulate only the new values since prev_end
-                        for j in prev_end..frame_end {
-                            // Bind by reference: accumulate clones
-                            // internally only when it retains the value
-                            let value: &Value = if let Some(col_idx) = arg_col_idx {
-                                rows[row_indices[j]].1.get(col_idx).unwrap_or(&NULL_VALUE)
-                            } else if has_expression_arg {
-                                &expression_values[row_indices[j]]
-                            } else {
-                                &COUNT_ONE
-                            };
-                            agg_func.accumulate(value, false);
+                        if keys.is_none() {
+                            for &idx in &row_indices[prev_end..frame_end] {
+                                let value = window_argument_value(
+                                    rows,
+                                    idx,
+                                    arg_col_idx,
+                                    &expression_values,
+                                );
+                                agg_func.accumulate(value, is_distinct);
+                            }
+                        } else {
+                            accumulate_ordered_frame(
+                                &mut agg_func,
+                                &row_indices[prev_end..frame_end],
+                                rows,
+                                arg_col_idx,
+                                &expression_values,
+                                sort_keys.as_slice(),
+                                is_distinct,
+                            );
                         }
                         if frame_end > prev_end {
                             prev_end = frame_end;
@@ -4270,19 +4452,26 @@ impl Executor {
                         };
 
                         // Accumulate values within the frame
-                        for &idx in &row_indices[frame_start..frame_end] {
-                            // Bind by reference: accumulate clones
-                            // internally only when it retains the value
-                            let value: &Value = if let Some(col_idx) = arg_col_idx {
-                                rows[idx].1.get(col_idx).unwrap_or(&NULL_VALUE)
-                            } else if has_expression_arg {
-                                // Expression argument (e.g., val * 2) - use pre-computed value
-                                &expression_values[idx]
-                            } else {
-                                // COUNT(*) counts all rows
-                                &COUNT_ONE
-                            };
-                            agg_func.accumulate(value, wf_info.is_distinct);
+                        if keys.is_none() {
+                            for &idx in &row_indices[frame_start..frame_end] {
+                                let value = window_argument_value(
+                                    rows,
+                                    idx,
+                                    arg_col_idx,
+                                    &expression_values,
+                                );
+                                agg_func.accumulate(value, is_distinct);
+                            }
+                        } else {
+                            accumulate_ordered_frame(
+                                &mut agg_func,
+                                &row_indices[frame_start..frame_end],
+                                rows,
+                                arg_col_idx,
+                                &expression_values,
+                                sort_keys.as_slice(),
+                                is_distinct,
+                            );
                         }
                         results[row_idx] = Some(agg_func.result());
                     }
@@ -4295,21 +4484,27 @@ impl Executor {
                     .ok_or_else(|| {
                         Error::NotSupported(format!("Unknown aggregate function: {}", wf_info.name))
                     })?;
+                if keys.is_some() {
+                    agg_func.set_order_by(Self::aggregate_order_keys(&wf_info.call_order_by));
+                }
 
                 // Accumulate all values in the partition
-                for &row_idx in row_indices {
-                    // Bind by reference: accumulate clones internally only
-                    // when it retains the value
-                    let value: &Value = if let Some(col_idx) = arg_col_idx {
-                        rows[row_idx].1.get(col_idx).unwrap_or(&NULL_VALUE)
-                    } else if has_expression_arg {
-                        // Expression argument (e.g., val * 2) - use pre-computed value
-                        &expression_values[row_idx]
-                    } else {
-                        // COUNT(*) counts all rows
-                        &COUNT_ONE
-                    };
-                    agg_func.accumulate(value, wf_info.is_distinct);
+                if keys.is_none() {
+                    for &idx in row_indices {
+                        let value =
+                            window_argument_value(rows, idx, arg_col_idx, &expression_values);
+                        agg_func.accumulate(value, is_distinct);
+                    }
+                } else {
+                    accumulate_ordered_frame(
+                        &mut agg_func,
+                        row_indices,
+                        rows,
+                        arg_col_idx,
+                        &expression_values,
+                        sort_keys.as_slice(),
+                        is_distinct,
+                    );
                 }
                 let aggregate_result = agg_func.result();
 
@@ -4555,6 +4750,8 @@ mod tests {
             frame: None,
             column_name: "rn".to_string(),
             is_distinct: false,
+            filter: None,
+            call_order_by: Box::new([]),
         };
 
         assert_eq!(info.name, "ROW_NUMBER");
