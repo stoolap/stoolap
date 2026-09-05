@@ -158,3 +158,45 @@ fn test_cascade_on_a_parent_without_a_primary_key() {
     assert_eq!(ids(&db, "SELECT code FROM par"), [2]);
     assert_eq!(ids(&db, "SELECT id FROM ch"), [2], "the child went with it");
 }
+
+/// A key that cascades and a key that refuses, in that order, must leave
+/// nothing behind when the refusal comes
+#[test]
+fn test_a_refusal_leaves_no_cascade_behind() {
+    for parent in [
+        "CREATE TABLE par (code INTEGER UNIQUE)",
+        "CREATE TABLE par (code INTEGER PRIMARY KEY)",
+    ] {
+        let keyed = parent.contains("PRIMARY KEY");
+        let db = Database::open(&format!(
+            "memory://delete_fk_atomic_{}",
+            if keyed { "pk" } else { "nopk" }
+        ))
+        .unwrap();
+        db.execute(parent, ()).unwrap();
+        db.execute(
+            "CREATE TABLE kid (id INTEGER PRIMARY KEY, a INTEGER REFERENCES par(code) ON DELETE CASCADE, b INTEGER REFERENCES par(code) ON DELETE RESTRICT)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO par VALUES (1), (2)", ()).unwrap();
+        db.execute("INSERT INTO kid VALUES (1, 1, NULL), (2, NULL, 1)", ())
+            .unwrap();
+
+        assert!(
+            db.execute("DELETE FROM par WHERE code IN (SELECT 1)", ())
+                .is_err(),
+            "the second key refuses ({parent})"
+        );
+        assert_eq!(
+            ids(&db, "SELECT code FROM par ORDER BY code"),
+            [1, 2],
+            "{parent}"
+        );
+        assert_eq!(
+            ids(&db, "SELECT id FROM kid ORDER BY id"),
+            [1, 2],
+            "the first key cascaded nothing away ({parent})"
+        );
+    }
+}

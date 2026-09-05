@@ -185,28 +185,40 @@ pub(crate) fn enforce_delete_actions_iter<'a>(
         return Ok(0);
     }
 
+    let values: Vec<&Value> = deleted_pk_values.collect();
+
+    // Every key that can refuse the delete is asked before the first change,
+    // so a refusal leaves the statement having written nothing. Otherwise a
+    // key that cascades and a key that restricts, in that order, would take
+    // the children of the first away and then refuse the parent
+    for pk_value in &values {
+        for (child_table_name, fk) in referencing_fks {
+            if matches!(
+                fk.on_delete,
+                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction
+            ) && child_rows_exist(engine, txn_id, child_table_name, fk, pk_value)?
+            {
+                return Err(Error::foreign_key_violation(
+                    child_table_name,
+                    &fk.column_name,
+                    parent_table,
+                    &fk.referenced_column,
+                    format!(
+                        "cannot delete row with {} = {} — still referenced by table '{}'",
+                        fk.referenced_column, pk_value, child_table_name
+                    ),
+                ));
+            }
+        }
+    }
+
     let mut total_affected = 0i32;
 
-    for pk_value in deleted_pk_values {
+    for pk_value in &values {
         for (child_table_name, fk) in referencing_fks {
-            let action = fk.on_delete;
-
-            match action {
-                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
-                    // Check if any child rows reference this PK value
-                    if child_rows_exist(engine, txn_id, child_table_name, fk, pk_value)? {
-                        return Err(Error::foreign_key_violation(
-                            child_table_name,
-                            &fk.column_name,
-                            parent_table,
-                            &fk.referenced_column,
-                            format!(
-                                "cannot delete row with {} = {} — still referenced by table '{}'",
-                                fk.referenced_column, pk_value, child_table_name
-                            ),
-                        ));
-                    }
-                }
+            match fk.on_delete {
+                // Asked above, before anything was written
+                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {}
                 ForeignKeyAction::Cascade => {
                     // Delete matching child rows within the caller's transaction
                     let affected = cascade_delete(engine, txn_id, child_table_name, fk, pk_value)?;

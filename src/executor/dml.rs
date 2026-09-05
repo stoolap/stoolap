@@ -2873,9 +2873,20 @@ impl Executor {
                 )?;
             }
             // Without a primary key each key is read from the column it
-            // names, which is why the rows were kept
+            // names, which is why the rows were kept. The keys that can
+            // refuse the delete are asked first, all of them, so a refusal
+            // leaves the statement having written nothing
             if has_referencing_fks && !rows_to_delete_by_row_id.is_empty() {
-                for fk_entry in referencing_fks.iter() {
+                let mut ordered: Vec<&(String, crate::core::ForeignKeyConstraint)> =
+                    referencing_fks.iter().collect();
+                ordered.sort_by_key(|(_, fk)| {
+                    !matches!(
+                        fk.on_delete,
+                        crate::core::ForeignKeyAction::Restrict
+                            | crate::core::ForeignKeyAction::NoAction
+                    )
+                });
+                for fk_entry in ordered {
                     let referenced = fk_entry.1.referenced_column.to_lowercase();
                     let Some(idx) = schema_arc
                         .columns
