@@ -254,3 +254,56 @@ fn test_a_refusal_below_a_cascade_leaves_nothing_behind() {
         );
     }
 }
+
+/// A key beneath a cascade names the column it points at, which need not
+/// be the child's primary key; the walk reads the child rows through that
+/// column, before anything goes and while the cascade runs
+#[test]
+fn test_keys_beneath_a_cascade_read_the_column_they_name() {
+    for (parent, child) in [
+        (
+            "CREATE TABLE par (code INTEGER UNIQUE)",
+            "CREATE TABLE child (ccode INTEGER UNIQUE, pcode INTEGER REFERENCES par(code) ON DELETE CASCADE)",
+        ),
+        (
+            "CREATE TABLE par (code INTEGER PRIMARY KEY)",
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, ccode INTEGER UNIQUE, pcode INTEGER REFERENCES par(code) ON DELETE CASCADE)",
+        ),
+    ] {
+        let keyed = child.contains("PRIMARY KEY");
+        let db = Database::open(&format!(
+            "memory://delete_fk_unique_chain_{}",
+            if keyed { "keyed" } else { "unique" }
+        ))
+        .unwrap();
+        db.execute(parent, ()).unwrap();
+        db.execute(child, ()).unwrap();
+        db.execute(
+            "CREATE TABLE grand (id INTEGER PRIMARY KEY, ccode INTEGER REFERENCES child(ccode) ON DELETE RESTRICT)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO par VALUES (1), (2)", ()).unwrap();
+        if keyed {
+            db.execute("INSERT INTO child VALUES (1, 10, 1), (2, 20, 2)", ())
+                .unwrap();
+        } else {
+            db.execute("INSERT INTO child VALUES (10, 1), (20, 2)", ())
+                .unwrap();
+        }
+        db.execute("INSERT INTO grand VALUES (1, 20)", ()).unwrap();
+
+        // The grandchild holds child 20, which belongs to parent 2
+        assert!(
+            db.execute("DELETE FROM par WHERE code = 2", ()).is_err(),
+            "the grandchild refuses ({child})"
+        );
+        assert_eq!(ids(&db, "SELECT ccode FROM child ORDER BY ccode"), [10, 20], "{child}");
+        assert_eq!(ids(&db, "SELECT id FROM grand"), [1], "{child}");
+
+        // Parent 1's child has nothing beneath it and goes with the parent
+        db.execute("DELETE FROM par WHERE code = 1", ()).unwrap();
+        assert_eq!(ids(&db, "SELECT ccode FROM child"), [20], "{child}");
+        assert_eq!(ids(&db, "SELECT code FROM par"), [2], "{child}");
+    }
+}

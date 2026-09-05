@@ -282,12 +282,10 @@ fn pre_check_delete_recursive(
                 if grandchild_fks.is_empty() {
                     continue;
                 }
-                // The child rows that would go are named by their primary
-                // key, which is what the keys beneath them point at
+                // Each key beneath the child names the column it points at,
+                // and the child rows that would go are read through that
+                // column, whether or not it is the child's primary key
                 let child_schema = engine.get_table_schema(child_table_name)?;
-                let Some(pk_idx) = child_schema.pk_column_index() else {
-                    continue;
-                };
                 let child_handle = engine.get_table_for_txn(txn_id, child_table_name)?;
                 let col_name = &child_schema.columns[fk.column_index].name;
                 let mut filter = crate::storage::expression::ComparisonExpr::new(
@@ -297,16 +295,29 @@ fn pre_check_delete_recursive(
                 );
                 filter.prepare_for_schema(&child_schema);
                 let rows = child_handle.collect_all_rows(Some(&filter))?;
-                for (_, row) in rows.iter() {
-                    if let Some(child_pk) = row.get(pk_idx) {
-                        pre_check_delete_recursive(
-                            engine,
-                            txn_id,
-                            child_table_name,
-                            child_pk,
-                            &grandchild_fks[..],
-                            depth + 1,
-                        )?;
+                for gfk_entry in grandchild_fks.iter() {
+                    let referenced = gfk_entry.1.referenced_column.to_lowercase();
+                    let Some(ref_idx) = child_schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name_lower == referenced)
+                    else {
+                        continue;
+                    };
+                    for (_, row) in rows.iter() {
+                        if let Some(child_value) = row.get(ref_idx) {
+                            if child_value.is_null() {
+                                continue;
+                            }
+                            pre_check_delete_recursive(
+                                engine,
+                                txn_id,
+                                child_table_name,
+                                child_value,
+                                std::slice::from_ref(gfk_entry),
+                                depth + 1,
+                            )?;
+                        }
                     }
                 }
             }
@@ -573,29 +584,40 @@ fn cascade_delete_recursive(
         )));
     }
 
-    // Before deleting child rows, collect their PK values for recursive CASCADE.
-    // This is needed because the child table may itself be a parent with CASCADE children.
+    // Before deleting child rows, read what the keys beneath the child point
+    // at. Each such key names a column of the child, its primary key or
+    // any other, so the child rows about to go are read through that
+    // column, once per key
     let grandchild_fks = find_referencing_fks(engine, child_table);
-    let mut deleted_child_pks: Vec<Value> = Vec::new();
+    let mut deleted_child_keys: Vec<(usize, Vec<Value>)> = Vec::new();
 
     if !grandchild_fks.is_empty() {
-        // Need to collect PK values of rows about to be deleted
         let child_schema = engine.get_table_schema(child_table)?;
-        if let Some(pk_idx) = child_schema.pk_column_index() {
-            let child_handle = engine.get_table_for_txn(txn_id, child_table)?;
-            // Use filtered scan instead of full table scan
-            let col_name = &child_schema.columns[fk.column_index].name;
-            let mut filter = crate::storage::expression::ComparisonExpr::new(
-                col_name.as_str(),
-                crate::core::Operator::Eq,
-                parent_pk_value.clone(),
-            );
-            filter.prepare_for_schema(&child_schema);
-            let rows = child_handle.collect_all_rows(Some(&filter))?;
-            for (_, row) in rows.iter() {
-                if let Some(pk_val) = row.get(pk_idx) {
-                    deleted_child_pks.push(pk_val.clone());
-                }
+        let child_handle = engine.get_table_for_txn(txn_id, child_table)?;
+        // Use filtered scan instead of full table scan
+        let col_name = &child_schema.columns[fk.column_index].name;
+        let mut filter = crate::storage::expression::ComparisonExpr::new(
+            col_name.as_str(),
+            crate::core::Operator::Eq,
+            parent_pk_value.clone(),
+        );
+        filter.prepare_for_schema(&child_schema);
+        let rows = child_handle.collect_all_rows(Some(&filter))?;
+        for (gfk_idx, (_, grandchild_fk)) in grandchild_fks.iter().enumerate() {
+            let referenced = grandchild_fk.referenced_column.to_lowercase();
+            let Some(ref_idx) = child_schema
+                .columns
+                .iter()
+                .position(|c| c.name_lower == referenced)
+            else {
+                continue;
+            };
+            let values: Vec<Value> = rows
+                .iter()
+                .filter_map(|(_, row)| row.get(ref_idx).filter(|v| !v.is_null()).cloned())
+                .collect();
+            if !values.is_empty() {
+                deleted_child_keys.push((gfk_idx, values));
             }
         }
     }
@@ -603,25 +625,26 @@ fn cascade_delete_recursive(
     // Pre-check: verify grandchild RESTRICT constraints BEFORE deleting child rows.
     // If we deleted children first and a grandchild RESTRICT check fails, the child
     // deletions would remain in the transaction state (orphaning data in explicit txns).
-    if !grandchild_fks.is_empty() && !deleted_child_pks.is_empty() {
-        for child_pk in &deleted_child_pks {
-            for (grandchild_table, grandchild_fk) in grandchild_fks.iter() {
-                if matches!(
-                    grandchild_fk.on_delete,
-                    ForeignKeyAction::Restrict | ForeignKeyAction::NoAction
-                ) && child_rows_exist(engine, txn_id, grandchild_table, grandchild_fk, child_pk)?
-                {
-                    return Err(Error::foreign_key_violation(
-                        grandchild_table,
-                        &grandchild_fk.column_name,
-                        child_table,
-                        &grandchild_fk.referenced_column,
-                        format!(
-                            "cannot cascade-delete row with {} = {} — still referenced by table '{}'",
-                            grandchild_fk.referenced_column, child_pk, grandchild_table
-                        ),
-                    ));
-                }
+    for (gfk_idx, values) in &deleted_child_keys {
+        let (grandchild_table, grandchild_fk) = &grandchild_fks[*gfk_idx];
+        if !matches!(
+            grandchild_fk.on_delete,
+            ForeignKeyAction::Restrict | ForeignKeyAction::NoAction
+        ) {
+            continue;
+        }
+        for child_value in values {
+            if child_rows_exist(engine, txn_id, grandchild_table, grandchild_fk, child_value)? {
+                return Err(Error::foreign_key_violation(
+                    grandchild_table,
+                    &grandchild_fk.column_name,
+                    child_table,
+                    &grandchild_fk.referenced_column,
+                    format!(
+                        "cannot cascade-delete row with {} = {} — still referenced by table '{}'",
+                        grandchild_fk.referenced_column, child_value, grandchild_table
+                    ),
+                ));
             }
         }
     }
@@ -644,34 +667,33 @@ fn cascade_delete_recursive(
     let mut total = count;
 
     // Recursively enforce CASCADE/SET NULL on grandchild tables (RESTRICT already checked above)
-    if !grandchild_fks.is_empty() && !deleted_child_pks.is_empty() {
-        for child_pk in &deleted_child_pks {
-            for (grandchild_table, grandchild_fk) in grandchild_fks.iter() {
-                match grandchild_fk.on_delete {
-                    ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
-                        // Already checked above — skip
-                    }
-                    ForeignKeyAction::Cascade => {
-                        let affected = cascade_delete_recursive(
-                            engine,
-                            txn_id,
-                            grandchild_table,
-                            grandchild_fk,
-                            child_pk,
-                            depth + 1,
-                        )?;
-                        total = total.saturating_add(affected);
-                    }
-                    ForeignKeyAction::SetNull => {
-                        let affected = set_null_on_delete(
-                            engine,
-                            txn_id,
-                            grandchild_table,
-                            grandchild_fk,
-                            child_pk,
-                        )?;
-                        total = total.saturating_add(affected);
-                    }
+    for (gfk_idx, values) in &deleted_child_keys {
+        let (grandchild_table, grandchild_fk) = &grandchild_fks[*gfk_idx];
+        for child_value in values {
+            match grandchild_fk.on_delete {
+                ForeignKeyAction::Restrict | ForeignKeyAction::NoAction => {
+                    // Already checked above — skip
+                }
+                ForeignKeyAction::Cascade => {
+                    let affected = cascade_delete_recursive(
+                        engine,
+                        txn_id,
+                        grandchild_table,
+                        grandchild_fk,
+                        child_value,
+                        depth + 1,
+                    )?;
+                    total = total.saturating_add(affected);
+                }
+                ForeignKeyAction::SetNull => {
+                    let affected = set_null_on_delete(
+                        engine,
+                        txn_id,
+                        grandchild_table,
+                        grandchild_fk,
+                        child_value,
+                    )?;
+                    total = total.saturating_add(affected);
                 }
             }
         }
