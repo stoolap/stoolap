@@ -5410,12 +5410,18 @@ impl Executor {
                 (filtered_columns, filtered_rows)
             } else {
                 // An explicit select list finds the join column by its
-                // bare name too, as `a` or as `x.a`
-                let mut renamed = all_columns.clone();
+                // bare name too, as a column of its own beside the
+                // qualified ones, so `a`, `x.a` and `x.*` all see it
+                let mut columns = all_columns.clone();
+                let mut rows = filtered_rows;
                 for (idx, base_name) in &join_col_renames {
-                    renamed[*idx] = base_name.clone();
+                    columns.push(base_name.clone());
+                    for (_, row) in rows.iter_mut() {
+                        let value = row.get(*idx).cloned().unwrap_or_else(Value::null_unknown);
+                        row.push(value);
+                    }
                 }
-                (renamed, filtered_rows)
+                (columns, rows)
             }
         } else {
             (all_columns.clone(), filtered_rows)

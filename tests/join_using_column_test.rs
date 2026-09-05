@@ -95,3 +95,27 @@ fn test_the_using_column_is_aggregated_and_grouped() {
         ["3,3"]
     );
 }
+
+#[test]
+fn test_a_qualified_star_keeps_the_using_column() {
+    let db = setup("using_qualified_star");
+    let result = db
+        .query("SELECT ux.* FROM ux JOIN uy USING (a) ORDER BY ux.id", ())
+        .unwrap();
+    assert_eq!(result.columns(), ["id", "a"]);
+    let rows: Vec<String> = result
+        .map(|r| {
+            let r = r.unwrap();
+            format!("{},{}", r.get::<i64>(0).unwrap(), r.get::<i64>(1).unwrap())
+        })
+        .collect();
+    assert_eq!(rows, ["2,2", "2,2", "3,3", "5,2", "5,2"]);
+    assert_eq!(
+        rows_of(&db, "SELECT uy.*, a FROM ux JOIN uy USING (a) WHERE a = 3"),
+        ["3,3,3"]
+    );
+}
+
+fn rows_of(db: &Database, sql: &str) -> Vec<String> {
+    rows(db, sql)
+}
