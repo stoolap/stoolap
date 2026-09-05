@@ -92,9 +92,8 @@
 //! The optimizer has bloom filter propagation logic, but runtime bloom filter
 //! checks are not yet integrated into the streaming operators.
 
-use crate::common::{CompactArc, CompactVec};
-use crate::core::value::NULL_VALUE;
-use crate::core::{Result, Row, RowVec, Value};
+use crate::common::CompactArc;
+use crate::core::{Result, Row, RowVec};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::RowFilter;
 use crate::executor::hash_table::JoinHashTable;
@@ -109,7 +108,6 @@ use crate::executor::planner::{RuntimeJoinAlgorithm, RuntimeJoinDecision};
 use crate::executor::utils::{extract_join_keys_and_residual, is_sorted_on_keys};
 use crate::optimizer::bloom::RuntimeBloomFilter;
 use crate::parser::ast::Expression;
-use ahash::AHashSet as HashSet;
 
 /// LIMIT threshold below which streaming execution is preferred over parallel.
 ///
@@ -292,6 +290,7 @@ impl JoinExecutor {
                 request.right_columns,
                 &analysis,
                 request.limit,
+                request.ctx,
             )?,
             RuntimeJoinAlgorithm::NestedLoop => self.execute_nested_loop(
                 request.left_rows,
@@ -396,41 +395,30 @@ impl JoinExecutor {
             )
         };
 
-        // Compile residual filters for inline application (INNER JOINs only)
+        // Compile the non-equality part of the ON clause
         let is_inner = !analysis.join_type_str.contains("LEFT")
             && !analysis.join_type_str.contains("RIGHT")
             && !analysis.join_type_str.contains("FULL");
 
-        let residual_filters: Vec<RowFilter> = if is_inner {
-            analysis
-                .residual_conditions
-                .iter()
-                .map(|cond| RowFilter::new(cond, &all_columns).map(|f| f.with_context(request.ctx)))
-                .collect::<Result<Vec<_>>>()?
+        let residual_filters: Vec<RowFilter> = analysis
+            .residual_conditions
+            .iter()
+            .map(|cond| RowFilter::new(cond, &all_columns).map(|f| f.with_context(request.ctx)))
+            .collect::<Result<Vec<_>>>()?;
+
+        // OUTER joins have to reject a pair inside the operator so the row it
+        // came from still counts as unmatched; INNER joins can filter the
+        // output rows, which avoids materializing a candidate per pair.
+        let inline_filters: &[RowFilter] = if is_inner {
+            &residual_filters
         } else {
-            Vec::new()
+            join_op = join_op.with_residual(residual_filters);
+            &[]
         };
 
         // Execute with Volcano model - this is where true streaming happens!
         let rows =
-            self.execute_operator_with_filter(&mut join_op, request.limit, &residual_filters)?;
-
-        // Apply residual conditions for OUTER joins (after iteration)
-        let left_col_count = left_columns.len();
-        let right_col_count = right_columns.len();
-        let rows = if !is_inner && !analysis.residual_conditions.is_empty() {
-            self.apply_residual_post_join(
-                rows,
-                &analysis.residual_conditions,
-                &all_columns,
-                &analysis.join_type_str,
-                left_col_count,
-                right_col_count,
-                request.ctx,
-            )?
-        } else {
-            rows
-        };
+            self.execute_operator_with_filter(&mut join_op, request.limit, inline_filters)?;
 
         Ok(JoinResult {
             rows,
@@ -600,8 +588,14 @@ impl JoinExecutor {
         } else {
             right_rows.len()
         };
+        // OUTER joins with a non-equality ON condition need the residual applied
+        // per candidate pair, which only the streaming operator does.
+        let is_outer = analysis.join_type_str.contains("LEFT")
+            || analysis.join_type_str.contains("RIGHT")
+            || analysis.join_type_str.contains("FULL");
         let use_parallel = build_row_count >= DEFAULT_PARALLEL_JOIN_THRESHOLD
-            && limit.is_none_or(|l| l > STREAMING_LIMIT_THRESHOLD);
+            && limit.is_none_or(|l| l > STREAMING_LIMIT_THRESHOLD)
+            && !(is_outer && !analysis.residual_conditions.is_empty());
 
         if use_parallel {
             // Parallel execution path
@@ -624,8 +618,6 @@ impl JoinExecutor {
                 analysis,
                 left_columns,
                 right_columns,
-                left_col_count,
-                right_col_count,
                 &all_columns,
                 build_left,
                 limit,
@@ -703,30 +695,12 @@ impl JoinExecutor {
             .collect();
 
         // Apply residual conditions FIRST (before LIMIT)
-        // This ensures correct semantics: filter matching rows, then limit
-        let is_inner = !analysis.join_type_str.contains("LEFT")
-            && !analysis.join_type_str.contains("RIGHT")
-            && !analysis.join_type_str.contains("FULL");
-
-        if !analysis.residual_conditions.is_empty() {
-            if is_inner {
-                // For INNER joins, simply filter rows
-                for cond in &analysis.residual_conditions {
-                    let filter = RowFilter::new(cond, all_columns)?.with_context(ctx);
-                    filter.retain_checked(&mut rows)?;
-                }
-            } else {
-                // For OUTER joins, need special NULL-padding handling
-                rows = self.apply_residual_post_join(
-                    rows,
-                    &analysis.residual_conditions,
-                    all_columns,
-                    &analysis.join_type_str,
-                    left_col_count,
-                    right_col_count,
-                    ctx,
-                )?;
-            }
+        // This ensures correct semantics: filter matching rows, then limit.
+        // Only INNER joins reach this path: execute_hash_join() routes OUTER
+        // joins carrying a residual to the streaming operator.
+        for cond in &analysis.residual_conditions {
+            let filter = RowFilter::new(cond, all_columns)?.with_context(ctx);
+            filter.retain_checked(&mut rows)?;
         }
 
         // Apply LIMIT after filtering (correct order)
@@ -749,8 +723,6 @@ impl JoinExecutor {
         analysis: &JoinAnalysis,
         left_columns: &[String],
         right_columns: &[String],
-        left_col_count: usize,
-        right_col_count: usize,
         all_columns: &[String],
         build_left: bool,
         limit: Option<u64>,
@@ -780,43 +752,33 @@ impl JoinExecutor {
             build_side,
         );
 
-        // Compile residual filters for inline application (INNER JOINs only)
+        // Compile the non-equality part of the ON clause
         let is_inner = !analysis.join_type_str.contains("LEFT")
             && !analysis.join_type_str.contains("RIGHT")
             && !analysis.join_type_str.contains("FULL");
 
-        let residual_filters: Vec<RowFilter> = if is_inner {
-            analysis
-                .residual_conditions
-                .iter()
-                .map(|cond| RowFilter::new(cond, all_columns).map(|f| f.with_context(ctx)))
-                .collect::<Result<Vec<_>>>()?
+        let residual_filters: Vec<RowFilter> = analysis
+            .residual_conditions
+            .iter()
+            .map(|cond| RowFilter::new(cond, all_columns).map(|f| f.with_context(ctx)))
+            .collect::<Result<Vec<_>>>()?;
+
+        // OUTER joins have to reject a pair inside the operator so the row it
+        // came from still counts as unmatched; INNER joins can filter the
+        // output rows, which avoids materializing a candidate per pair.
+        let inline_filters: &[RowFilter] = if is_inner {
+            &residual_filters
         } else {
-            Vec::new()
+            join_op = join_op.with_residual(residual_filters);
+            &[]
         };
 
         // Execute with Volcano model
-        let rows = self.execute_operator_with_filter(&mut join_op, limit, &residual_filters)?;
-
-        // Apply residual conditions for OUTER joins (after iteration)
-        let rows = if !is_inner && !analysis.residual_conditions.is_empty() {
-            self.apply_residual_post_join(
-                rows,
-                &analysis.residual_conditions,
-                all_columns,
-                &analysis.join_type_str,
-                left_col_count,
-                right_col_count,
-                ctx,
-            )?
-        } else {
-            rows
-        };
-
-        Ok(rows)
+        self.execute_operator_with_filter(&mut join_op, limit, inline_filters)
     }
 
     /// Execute merge join for pre-sorted inputs using MergeJoinOperator.
+    #[allow(clippy::too_many_arguments)]
     fn execute_merge_join(
         &self,
         left_rows: CompactArc<Vec<Row>>,
@@ -825,6 +787,7 @@ impl JoinExecutor {
         right_columns: &[String],
         analysis: &JoinAnalysis,
         limit: Option<u64>,
+        ctx: &ExecutionContext,
     ) -> Result<RowVec> {
         // Build schema for operators
         let left_schema: Vec<ColumnInfo> = left_columns.iter().map(ColumnInfo::new).collect();
@@ -847,7 +810,20 @@ impl JoinExecutor {
             analysis.right_key_indices.clone(),
         );
 
-        // Execute with Volcano model (no residual filters for merge join currently)
+        // The non-equality part of the ON clause decides whether a pair is a
+        // match, so the operator applies it while it walks the two runs.
+        if !analysis.residual_conditions.is_empty() {
+            let mut all_columns = left_columns.to_vec();
+            all_columns.extend(right_columns.iter().cloned());
+            let residual_filters: Vec<RowFilter> = analysis
+                .residual_conditions
+                .iter()
+                .map(|cond| RowFilter::new(cond, &all_columns).map(|f| f.with_context(ctx)))
+                .collect::<Result<Vec<_>>>()?;
+            merge_op = merge_op.with_residual(residual_filters);
+        }
+
+        // Execute with Volcano model
         self.execute_operator_with_filter(&mut merge_op, limit, &[])
     }
 
@@ -960,89 +936,6 @@ impl JoinExecutor {
         op.close()?;
         Ok(rows)
     }
-
-    /// Apply residual conditions for OUTER joins.
-    ///
-    /// For OUTER joins, residual conditions need special handling:
-    /// matched rows that fail residual should produce NULL-padded output.
-    #[allow(clippy::too_many_arguments)]
-    fn apply_residual_post_join(
-        &self,
-        rows: RowVec,
-        residual: &[Expression],
-        all_columns: &[String],
-        join_type: &str,
-        left_col_count: usize,
-        right_col_count: usize,
-        ctx: &ExecutionContext,
-    ) -> Result<RowVec> {
-        let is_left_outer = join_type.contains("LEFT") || join_type.contains("FULL");
-        let is_right_outer = join_type.contains("RIGHT") || join_type.contains("FULL");
-
-        let mut filters = Vec::with_capacity(residual.len());
-        for cond in residual {
-            filters.push(RowFilter::new(cond, all_columns)?.with_context(ctx));
-        }
-
-        // A row the condition rejects is not a row of the join. The side the
-        // join preserves keeps a row of its own only where the whole
-        // condition matched nothing for it, and one row however many pairs
-        // it rejected
-        let mut kept = RowVec::with_capacity(rows.len());
-        let mut matched_left: HashSet<Vec<Value>> = HashSet::default();
-        let mut matched_right: HashSet<Vec<Value>> = HashSet::default();
-        let mut rejected: Vec<Row> = Vec::new();
-        for (row_id, row) in rows {
-            let mut passes = true;
-            for filter in &filters {
-                if !filter.matches_checked(&row)? {
-                    passes = false;
-                    break;
-                }
-            }
-            if passes {
-                if is_left_outer {
-                    matched_left.insert(row.iter().take(left_col_count).cloned().collect());
-                }
-                if is_right_outer {
-                    matched_right.insert(row.iter().skip(left_col_count).cloned().collect());
-                }
-                kept.push((row_id, row));
-            } else {
-                rejected.push(row);
-            }
-        }
-
-        let mut next_row_id = kept.len() as i64;
-        let mut seen_left: HashSet<Vec<Value>> = HashSet::default();
-        let mut seen_right: HashSet<Vec<Value>> = HashSet::default();
-        for row in rejected {
-            if is_left_outer {
-                let left: Vec<Value> = row.iter().take(left_col_count).cloned().collect();
-                if !matched_left.contains(&left) && seen_left.insert(left.clone()) {
-                    let mut values: CompactVec<Value> =
-                        CompactVec::with_capacity(left_col_count + right_col_count);
-                    values.extend(left);
-                    values.extend(std::iter::repeat_n(NULL_VALUE, right_col_count));
-                    kept.push((next_row_id, Row::from_compact_vec(values)));
-                    next_row_id += 1;
-                }
-            }
-            if is_right_outer {
-                let right: Vec<Value> = row.iter().skip(left_col_count).cloned().collect();
-                if !matched_right.contains(&right) && seen_right.insert(right.clone()) {
-                    let mut values: CompactVec<Value> =
-                        CompactVec::with_capacity(left_col_count + right_col_count);
-                    values.extend(std::iter::repeat_n(NULL_VALUE, left_col_count));
-                    values.extend(right);
-                    kept.push((next_row_id, Row::from_compact_vec(values)));
-                    next_row_id += 1;
-                }
-            }
-        }
-
-        Ok(kept)
-    }
 }
 
 impl Default for JoinExecutor {
@@ -1054,6 +947,7 @@ impl Default for JoinExecutor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Value;
 
     fn make_rows(data: Vec<Vec<i64>>) -> Vec<Row> {
         data.into_iter()

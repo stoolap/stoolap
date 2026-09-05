@@ -163,3 +163,111 @@ fn test_right_join_with_a_predicate_beside_the_key() {
         ["1,2", "2,3", "3,NULL", "4,NULL", "5,4", "6,NULL"]
     );
 }
+
+/// Two left rows holding the same values are two rows, and each keeps a
+/// row of its own when the condition turns its candidates away
+#[test]
+fn test_left_rows_that_hold_the_same_values_stay_apart() {
+    let db = Database::open("memory://join_on_condition_twins").unwrap();
+    db.execute("CREATE TABLE l (k INTEGER)", ()).unwrap();
+    db.execute("CREATE TABLE r (k INTEGER, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO l VALUES (1), (1), (2)", ())
+        .unwrap();
+    db.execute("INSERT INTO r VALUES (1, 0), (1, 9), (3, 7)", ())
+        .unwrap();
+
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM l LEFT JOIN r ON l.k = r.k AND r.v > 900"
+        ),
+        3,
+        "both rows holding a 1 are turned away and both are kept"
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT l.k, r.v FROM l LEFT JOIN r ON l.k = r.k AND r.v > 100 ORDER BY l.k"
+        ),
+        ["1,NULL", "1,NULL", "2,NULL"]
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM l LEFT JOIN r ON l.k = r.k AND r.v > 1"
+        ),
+        3,
+        "each 1 keeps its one match and the 2 keeps a row of its own"
+    );
+}
+
+/// A full join returns the rows of both sides and nothing besides
+#[test]
+fn test_full_join_adds_no_row_of_its_own() {
+    let db = Database::open("memory://join_on_condition_full").unwrap();
+    db.execute("CREATE TABLE l (k INTEGER)", ()).unwrap();
+    db.execute("CREATE TABLE r (k INTEGER, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO l VALUES (1), (2)", ()).unwrap();
+    db.execute("INSERT INTO r VALUES (1, 0), (3, 7)", ())
+        .unwrap();
+
+    let out = rows(
+        &db,
+        "SELECT l.k, r.k, r.v FROM l FULL OUTER JOIN r ON l.k = r.k AND r.v > 0",
+    );
+    assert_eq!(out.len(), 4, "two left rows and two right rows: {out:?}");
+    assert!(
+        !out.contains(&"NULL,NULL,NULL".to_string()),
+        "a row of nothing but NULLs belongs to neither side: {out:?}"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM l FULL OUTER JOIN r ON l.k = r.k AND 1 = 0"
+        ),
+        4
+    );
+}
+
+/// Sorted inputs take a different path through the join and honour the
+/// condition on it just the same
+#[test]
+fn test_sorted_inputs_honour_the_condition() {
+    let db = Database::open("memory://join_on_condition_sorted").unwrap();
+    db.execute("CREATE TABLE a (k INTEGER, x INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (k INTEGER, v INTEGER)", ())
+        .unwrap();
+    for i in 1i64..=400 {
+        db.execute("INSERT INTO a VALUES ($1, $2)", (i, i * 10))
+            .unwrap();
+        db.execute("INSERT INTO b VALUES ($1, $2)", (i, i % 4))
+            .unwrap();
+    }
+
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM a JOIN b ON a.k = b.k AND b.v = 2"
+        ),
+        100,
+        "every fourth row meets the condition"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM a LEFT JOIN b ON a.k = b.k AND b.v = 2"
+        ),
+        400
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(b.v) FROM a LEFT JOIN b ON a.k = b.k AND b.v = 2"
+        ),
+        100,
+        "the rows the condition turned away are kept without a right side"
+    );
+}

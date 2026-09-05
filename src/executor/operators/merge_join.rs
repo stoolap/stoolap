@@ -24,6 +24,7 @@ use std::cmp::Ordering;
 
 use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row};
+use crate::executor::expression::RowFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::executor::utils::compare_values;
 
@@ -64,6 +65,11 @@ pub struct MergeJoinOperator {
     current_left_in_group: usize,
     current_right_in_group: usize,
     in_cartesian_product: bool,
+    current_left_matched: bool,
+
+    // Non-equality ON conditions, applied to each candidate pair before it
+    // counts as a match. Empty when the whole ON clause is equi-keys.
+    residual: Vec<RowFilter>,
 
     // Track matched rows for OUTER joins
     right_matched: Vec<bool>,
@@ -133,6 +139,8 @@ impl MergeJoinOperator {
             current_left_in_group: 0,
             current_right_in_group: 0,
             in_cartesian_product: false,
+            current_left_matched: false,
+            residual: Vec::new(),
             right_matched: Vec::new(),
             returning_unmatched_right: false,
             unmatched_right_idx: 0,
@@ -140,6 +148,27 @@ impl MergeJoinOperator {
             cached_null_right: Row::new(), // Initialized in open()
             opened: false,
         }
+    }
+
+    /// Attach the non-equality part of the ON clause.
+    ///
+    /// The filters are compiled against the joined column layout
+    /// (left columns followed by right columns). A pair that fails them is
+    /// not a match: it is neither emitted nor counted when deciding which
+    /// rows an OUTER join has to NULL-pad.
+    pub fn with_residual(mut self, residual: Vec<RowFilter>) -> Self {
+        self.residual = residual;
+        self
+    }
+
+    /// Test a combined candidate row against the residual ON conditions.
+    fn residual_matches(&self, combined: &Row) -> Result<bool> {
+        for filter in &self.residual {
+            if !filter.matches_checked(combined)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Compare two rows on their respective join keys.
@@ -280,40 +309,51 @@ impl Operator for MergeJoinOperator {
         // Phase 1: Merge join with cartesian product for duplicate key groups
         loop {
             // If we're in a cartesian product of matching groups
-            if self.in_cartesian_product {
+            while self.in_cartesian_product && self.current_left_in_group < self.left_idx {
                 // Try to emit next pair from current groups
-                if self.current_left_in_group < self.left_idx
-                    && self.current_right_in_group < self.current_right_group_end
-                {
-                    let left_row = &self.left_rows[self.current_left_in_group];
-                    let right_row = &self.right_rows[self.current_right_in_group];
+                if self.current_right_in_group < self.current_right_group_end {
+                    let left_idx = self.current_left_in_group;
+                    let right_idx = self.current_right_in_group;
+                    self.current_right_in_group += 1;
+
+                    let combined =
+                        self.combine(&self.left_rows[left_idx], &self.right_rows[right_idx]);
+                    if !self.residual.is_empty() && !self.residual_matches(&combined)? {
+                        continue;
+                    }
 
                     // Mark right row as matched
                     if is_right_outer {
-                        self.right_matched[self.current_right_in_group] = true;
+                        self.right_matched[right_idx] = true;
                     }
+                    self.current_left_matched = true;
 
-                    self.current_right_in_group += 1;
-
-                    // If we've exhausted right group, move to next left row
-                    if self.current_right_in_group >= self.current_right_group_end {
-                        self.current_left_in_group += 1;
-                        self.current_right_in_group = self.current_right_group_start;
-
-                        // If we've exhausted left group, exit cartesian product mode
-                        if self.current_left_in_group >= self.left_idx {
-                            self.in_cartesian_product = false;
-                            self.right_idx = self.current_right_group_end;
-                        }
-                    }
-
-                    let combined = self.combine(left_row, right_row);
                     return Ok(Some(RowRef::Owned(combined)));
                 }
 
-                // Shouldn't reach here, but safety exit
-                self.in_cartesian_product = false;
+                // Right group exhausted for this left row - move to the next one
+                let left_idx = self.current_left_in_group;
+                let left_unmatched = !self.current_left_matched;
+                self.current_left_in_group += 1;
+                self.current_right_in_group = self.current_right_group_start;
+                self.current_left_matched = false;
+
+                // If we've exhausted left group, exit cartesian product mode
+                if self.current_left_in_group >= self.left_idx {
+                    self.in_cartesian_product = false;
+                    self.right_idx = self.current_right_group_end;
+                }
+
+                // A left row whose every pair failed the residual is unmatched
+                if left_unmatched && is_left_outer {
+                    let null_right = self.null_right_row();
+                    let combined = self.combine(&self.left_rows[left_idx], &null_right);
+                    return Ok(Some(RowRef::Owned(combined)));
+                }
             }
+
+            // Safety exit: empty group leaves cartesian mode without emitting
+            self.in_cartesian_product = false;
 
             // Check if either side is exhausted
             if self.left_idx >= self.left_rows.len() {
@@ -414,6 +454,7 @@ impl Operator for MergeJoinOperator {
                     self.current_left_in_group = left_start;
                     self.current_right_in_group = right_start;
                     self.in_cartesian_product = true;
+                    self.current_left_matched = false;
 
                     // Continue loop to emit first match
                 }
