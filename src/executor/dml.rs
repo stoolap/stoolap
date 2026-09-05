@@ -231,6 +231,8 @@ fn build_default_slots(
 struct CompiledUpsert {
     /// (column_index, column_type, vector_dimensions, compiled_program)
     compiled_updates: Vec<(usize, DataType, u16, super::expression::SharedProgram)>,
+    /// DO UPDATE ... WHERE, read against the row met and the EXCLUDED row
+    compiled_where: Option<super::expression::SharedProgram>,
     /// (column_index, column_name, check_expression_text, compiled_check_program)
     /// The program is executed with a single-column row containing the new value.
     compiled_checks: Vec<(usize, String, String, super::expression::SharedProgram)>,
@@ -3198,6 +3200,23 @@ impl Executor {
             }
         }
 
+        // DO UPDATE ... WHERE is compiled the same way, with EXCLUDED as the
+        // second row source
+        let compiled_where = match stmt.update_where.as_deref() {
+            Some(expr) => {
+                let compile_ctx = CompileContext::new(&column_names, global_registry())
+                    .with_second_row(&excluded_columns);
+                let program = ExprCompiler::new(&compile_ctx).compile(expr).map_err(|e| {
+                    Error::internal(format!(
+                        "failed to compile ON CONFLICT update condition: {}",
+                        e
+                    ))
+                })?;
+                Some(CompactArc::new(program))
+            }
+            None => None,
+        };
+
         // Compile CHECK constraints for columns being updated.
         // Store as SharedProgram (not ExpressionEval) so the struct can be shared
         // immutably — the VM used to execute the program lives in the setter closure.
@@ -3234,6 +3253,7 @@ impl Executor {
 
         Ok(CompiledUpsert {
             compiled_updates,
+            compiled_where,
             compiled_checks,
         })
     }
@@ -3330,6 +3350,20 @@ impl Executor {
 
         // Create a setter function that applies the ON DUPLICATE KEY UPDATE
         let mut setter = |mut row: Row| -> Result<(Row, bool)> {
+            // DO UPDATE ... WHERE leaves the row as it is where it does not hold
+            if let Some(program) = &effective.compiled_where {
+                let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row);
+                if !params.is_empty() {
+                    exec_ctx = exec_ctx.with_params(params);
+                }
+                if !named_params.is_empty() {
+                    exec_ctx = exec_ctx.with_named_params(named_params);
+                }
+                if !vm.execute_bool(program, &exec_ctx) {
+                    return Ok((row, false));
+                }
+            }
+
             // Collect all updates first to avoid borrow conflicts
             let updates_to_apply: Vec<(usize, Value)> = {
                 // Use for_join to make EXCLUDED columns available as row2

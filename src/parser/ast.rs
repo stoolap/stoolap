@@ -1570,6 +1570,8 @@ pub struct InsertStatement {
     pub on_duplicate: bool,
     pub update_columns: Vec<Identifier>,
     pub update_expressions: Vec<Expression>,
+    /// DO UPDATE ... WHERE: the row is updated only where this holds
+    pub update_where: Option<Box<Expression>>,
     /// ON CONFLICT DO NOTHING (skip duplicates silently)
     pub do_nothing: bool,
     /// Conflict target columns for ON CONFLICT (col1, col2, ...)
@@ -1627,6 +1629,9 @@ impl fmt::Display for InsertStatement {
                 .map(|(col, expr)| format!("{} = {}", col, expr))
                 .collect();
             result.push_str(&updates.join(", "));
+            if let Some(ref update_where) = self.update_where {
+                result.push_str(&format!(" WHERE {}", update_where));
+            }
         }
         if !self.returning.is_empty() {
             let returning: Vec<String> = self.returning.iter().map(|e| e.to_string()).collect();
@@ -2552,6 +2557,7 @@ mod tests {
             on_duplicate: false,
             update_columns: vec![],
             update_expressions: vec![],
+            update_where: None,
             do_nothing: false,
             conflict_target: vec![],
             returning: vec![],
