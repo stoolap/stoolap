@@ -543,3 +543,66 @@ fn test_having_binds_the_group_to_a_correlated_exists() {
         vec![3]
     );
 }
+
+#[test]
+fn test_update_binds_each_row_to_a_where_the_semi_join_rewrite_refused() {
+    for keyed in [true, false] {
+        let db =
+            Database::open(&format!("memory://update_two_conjunct_not_exists_{keyed}")).unwrap();
+        let pk = if keyed { "PRIMARY KEY" } else { "" };
+        db.execute(
+            &format!("CREATE TABLE uy (id INTEGER {pk}, a INTEGER, s TEXT, b INTEGER)"),
+            (),
+        )
+        .unwrap();
+        db.execute("CREATE TABLE ux (a INTEGER, s TEXT)", ())
+            .unwrap();
+        db.execute("INSERT INTO ux VALUES (1, 'p'), (2, 'q')", ())
+            .unwrap();
+        db.execute(
+            "INSERT INTO uy VALUES (1, 1, 'p', 1), (2, 1, 'q', 1), (3, 2, 'q', 1), (4, 3, 'p', 1), (5, NULL, 'p', 1)",
+            (),
+        )
+        .unwrap();
+        let count = |sql: &str| -> i64 {
+            db.query(sql, ())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap()
+        };
+
+        let changed = db
+            .execute(
+                "UPDATE uy SET b = 0 WHERE NOT EXISTS (SELECT 1 FROM ux WHERE ux.a = uy.a AND ux.s = uy.s)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(changed, 3, "keyed: {keyed}");
+        assert_eq!(
+            count("SELECT COUNT(*) FROM uy WHERE b = 0"),
+            3,
+            "keyed: {keyed}"
+        );
+
+        let changed = db
+            .execute(
+                "UPDATE uy SET b = 5 WHERE EXISTS (SELECT 1 FROM ux WHERE ux.a = uy.a AND ux.s = uy.s)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(changed, 2, "keyed: {keyed}");
+
+        // a correlated SET alongside the correlated WHERE
+        let changed = db
+            .execute(
+                "UPDATE uy SET b = (SELECT COUNT(*) FROM ux WHERE ux.a = uy.a) WHERE NOT EXISTS (SELECT 1 FROM ux WHERE ux.a = uy.a AND ux.s = uy.s)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(changed, 3, "keyed: {keyed}");
+        assert_eq!(count("SELECT SUM(b) FROM uy"), 11, "keyed: {keyed}");
+    }
+}

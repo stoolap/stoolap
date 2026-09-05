@@ -1885,6 +1885,7 @@ impl Executor {
         //
         // OPTIMIZATION: For correlated EXISTS/IN in WHERE, try semi-join optimization first.
         // This transforms O(outer × inner) per-row subquery execution to O(inner + outer).
+        let mut where_is_correlated = false;
         let (where_expr, needs_memory_filter, memory_where_clause): (
             Option<Box<dyn StorageExpr>>,
             bool,
@@ -1916,8 +1917,11 @@ impl Executor {
                     .or(exists_optimized)
                     .unwrap_or_else(|| (**where_clause).clone());
 
-                // Process any remaining non-correlated subqueries
-                if Self::has_subqueries(&current_expr) {
+                // What the semi-join rewrite refused is bound to each row as it is met
+                if Self::has_correlated_subqueries(&current_expr) {
+                    where_is_correlated = true;
+                    current_expr
+                } else if Self::has_subqueries(&current_expr) {
                     self.process_where_subqueries(&current_expr, ctx)?
                 } else {
                     current_expr
@@ -1928,14 +1932,18 @@ impl Executor {
                 (**where_clause).clone()
             };
 
-            // Try to push down predicate to storage layer
-            let (storage_expr, needs_mem) =
-                pushdown::try_pushdown(&processed_where, schema, Some(ctx));
-            if needs_mem {
-                // Complex expression (like a + b > 100) - use in-memory filtering
-                (storage_expr, true, Some(processed_where))
+            if where_is_correlated {
+                (None, true, Some(processed_where))
             } else {
-                (storage_expr, false, None)
+                // Try to push down predicate to storage layer
+                let (storage_expr, needs_mem) =
+                    pushdown::try_pushdown(&processed_where, schema, Some(ctx));
+                if needs_mem {
+                    // Complex expression (like a + b > 100) - use in-memory filtering
+                    (storage_expr, true, Some(processed_where))
+                } else {
+                    (storage_expr, false, None)
+                }
             }
         } else {
             (None, false, None)
@@ -2070,17 +2078,7 @@ impl Executor {
             let mut scanner = table.scan(&all_col_indices, None)?;
             while scanner.next() {
                 let row = scanner.row();
-
-                // Check WHERE condition if needed
                 evaluator.set_row_array(row);
-                if needs_memory_filter {
-                    if let Some(ref where_clause) = memory_where_clause {
-                        match evaluator.evaluate_bool(where_clause) {
-                            Ok(true) => {}
-                            _ => continue,
-                        }
-                    }
-                }
 
                 // Get PK value for this row
                 let pk_value = row.get(pk_idx).cloned().unwrap_or(Value::null_unknown());
@@ -2100,6 +2098,22 @@ impl Executor {
                     std::mem::take(&mut outer_row_map),
                     CompactArc::clone(&column_names),
                 );
+
+                // Check WHERE condition if needed
+                if needs_memory_filter {
+                    if let Some(ref where_clause) = memory_where_clause {
+                        let held = if where_is_correlated {
+                            self.process_correlated_where(where_clause, &correlated_ctx)
+                                .and_then(|processed| evaluator.evaluate_bool(&processed))
+                        } else {
+                            evaluator.evaluate_bool(where_clause)
+                        };
+                        if !matches!(held, Ok(true)) {
+                            outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
+                            continue;
+                        }
+                    }
+                }
 
                 // Evaluate all update expressions
                 let mut new_values: Vec<(usize, Value)> = Vec::with_capacity(update_indices.len());
@@ -2297,6 +2311,22 @@ impl Executor {
                     .ok()
                 });
             let transaction_id = ctx.transaction_id();
+            // A WHERE the semi-join rewrite refused is bound to each row as it is met
+            let col_name_pairs: Vec<(CompactArc<str>, CompactArc<str>)> = if where_is_correlated {
+                schema
+                    .column_names_lower_arc()
+                    .iter()
+                    .map(|col_lower| {
+                        let qualified =
+                            CompactArc::from(format!("{}.{}", table_name, col_lower).as_str());
+                        (CompactArc::from(col_lower.as_str()), qualified)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
+                FxHashMap::with_capacity_and_hasher(col_name_pairs.len() * 2, Default::default());
             let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                 // Execute pre-compiled programs (no recompilation per row)
                 let updates_to_apply: Vec<(usize, Value)> = {
@@ -2313,9 +2343,29 @@ impl Executor {
                             }
                         } else if let Some(ref where_expr) = memory_where_clause {
                             evaluator.set_row_array(&row);
-                            match evaluator.evaluate_bool(where_expr) {
-                                Ok(true) => {}
-                                _ => return Ok((row, false)),
+                            let held = if where_is_correlated {
+                                outer_row_map.clear();
+                                for (i, (col_lower, qualified)) in col_name_pairs.iter().enumerate()
+                                {
+                                    if let Some(value) = row.get(i) {
+                                        outer_row_map.insert(col_lower.clone(), value.clone());
+                                        outer_row_map.insert(qualified.clone(), value.clone());
+                                    }
+                                }
+                                let mut correlated_ctx = ctx.with_outer_row(
+                                    std::mem::take(&mut outer_row_map),
+                                    CompactArc::clone(&column_names),
+                                );
+                                let held = self
+                                    .process_correlated_where(where_expr, &correlated_ctx)
+                                    .and_then(|processed| evaluator.evaluate_bool(&processed));
+                                outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
+                                held
+                            } else {
+                                evaluator.evaluate_bool(where_expr)
+                            };
+                            if !matches!(held, Ok(true)) {
+                                return Ok((row, false));
                             }
                         }
                     }
