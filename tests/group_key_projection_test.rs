@@ -99,3 +99,26 @@ fn test_a_group_by_expression_column_is_read_as_it_is() {
         ["1,4", "NULL,1"]
     );
 }
+
+#[test]
+fn test_counting_alone_over_a_text_key_of_a_derived_table() {
+    let db = setup("group_key_derived_text");
+    assert_eq!(
+        rows(&db, "SELECT COUNT(*) FROM (SELECT s FROM hx) t GROUP BY s"),
+        ["1", "2", "2"]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT COUNT(*) FROM (SELECT '' AS t UNION ALL SELECT '' UNION ALL SELECT NULL) GROUP BY t"
+        ),
+        ["1", "2"]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT COUNT(*), s FROM (SELECT s FROM hx) t GROUP BY s"
+        ),
+        ["1,NULL", "2,p", "2,q"]
+    );
+}

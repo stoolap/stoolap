@@ -6181,12 +6181,21 @@ impl Executor {
         // Parse aggregations
         let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
 
-        // Must have only aggregations plus the GROUP BY column (no other regular columns)
-        // Non-agg columns must be exactly the GROUP BY column
-        if non_agg_columns.len() > 1 {
+        // The rows come out as the GROUP BY column and then the aggregates,
+        // so the select list has to read exactly that, in that order
+        if non_agg_columns.len() != 1 || !non_agg_columns[0].eq_ignore_ascii_case(&group_col_name) {
             return Ok(None);
         }
-        if non_agg_columns.len() == 1 && !non_agg_columns[0].eq_ignore_ascii_case(&group_col_name) {
+        let leads_with_group_column = match stmt.columns.first() {
+            Some(crate::parser::ast::Expression::Identifier(id)) => {
+                id.value_lower.eq_ignore_ascii_case(&group_col_name)
+            }
+            Some(crate::parser::ast::Expression::QualifiedIdentifier(qid)) => {
+                qid.name.value_lower.eq_ignore_ascii_case(&group_col_name)
+            }
+            _ => false,
+        };
+        if !leads_with_group_column {
             return Ok(None);
         }
 
