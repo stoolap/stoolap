@@ -454,6 +454,17 @@ impl Executor {
         // Check if there's an active explicit transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
 
+        // INSERT is dispatched before the dispatcher puts the transaction
+        // id in the context, so the expressions are given it here
+        let ctx_with_txn;
+        let ctx = match (*active_tx).as_ref().map(|t| t.transaction.id()) {
+            Some(txn_id) => {
+                ctx_with_txn = ctx.with_transaction_id(txn_id as u64);
+                &ctx_with_txn
+            }
+            None => ctx,
+        };
+
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
                 // Use the active transaction
@@ -3380,6 +3391,7 @@ impl Executor {
         // Extract params from execution context for use in the setter closure
         let params = ctx.params();
         let named_params = ctx.named_params();
+        let transaction_id = ctx.transaction_id();
 
         // Capture the post-update row for RETURNING clause
         let mut captured_row: Option<Row> = None;
@@ -3388,7 +3400,8 @@ impl Executor {
         let mut setter = |mut row: Row| -> Result<(Row, bool)> {
             // DO UPDATE ... WHERE leaves the row as it is where it does not hold
             if let Some(program) = &effective.compiled_where {
-                let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row);
+                let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row)
+                    .with_transaction_id(transaction_id);
                 if !params.is_empty() {
                     exec_ctx = exec_ctx.with_params(params);
                 }
@@ -3403,7 +3416,8 @@ impl Executor {
             // Collect all updates first to avoid borrow conflicts
             let updates_to_apply: Vec<(usize, Value)> = {
                 // Use for_join to make EXCLUDED columns available as row2
-                let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row);
+                let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row)
+                    .with_transaction_id(transaction_id);
                 if !params.is_empty() {
                     exec_ctx = exec_ctx.with_params(params);
                 }
