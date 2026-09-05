@@ -363,3 +363,66 @@ fn test_left_join_against_a_derived_table() {
         "the left side comes first"
     );
 }
+
+/// An index on the key offers a shorter road to the pairs, and the rest of
+/// the ON clause is still asked of each one it returns
+#[test]
+fn test_the_condition_holds_when_an_index_answers_the_key() {
+    for indexed in [false, true] {
+        let db = Database::open(&format!(
+            "memory://join_on_indexed_{}",
+            if indexed { "yes" } else { "no" }
+        ))
+        .unwrap();
+        db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute(
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, p_id INTEGER, v INTEGER)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO p VALUES (1), (2), (3)", ())
+            .unwrap();
+        db.execute(
+            "INSERT INTO r VALUES (1,1,100), (2,1,200), (3,2,300), (4,3,400), (5,3,500)",
+            (),
+        )
+        .unwrap();
+        if indexed {
+            db.execute("CREATE INDEX rp ON r (p_id)", ()).unwrap();
+        }
+
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT p.id FROM p JOIN r ON r.p_id = p.id AND r.v > 300 ORDER BY p.id"
+            ),
+            ["3", "3"],
+            "indexed: {indexed}"
+        );
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT p.id FROM p JOIN r ON r.p_id = p.id AND r.v > (SELECT AVG(v) FROM r) ORDER BY p.id"
+            ),
+            ["3", "3"],
+            "indexed: {indexed}"
+        );
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT p.id, r.v FROM p LEFT JOIN r ON r.p_id = p.id AND r.v > 300 ORDER BY p.id, r.v"
+            ),
+            ["1,NULL", "2,NULL", "3,400", "3,500"],
+            "indexed: {indexed}"
+        );
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT p.id, (SELECT COUNT(*) FROM r WHERE r.p_id = p.id) FROM p ORDER BY p.id"
+            ),
+            ["1,2", "2,1", "3,2"],
+            "a correlated count still reads the same, indexed: {indexed}"
+        );
+    }
+}

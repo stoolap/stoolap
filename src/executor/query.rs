@@ -3958,6 +3958,18 @@ impl Executor {
         let left_alias = get_table_alias_from_expr(&join_source.left);
         let right_alias = get_table_alias_from_expr(&join_source.right);
 
+        // A subquery in the ON clause is read once, the way the WHERE clause
+        // reads one, so every path below compares each pair against a value
+        // rather than against something it never evaluated
+        let processed_on: Option<Expression> = match join_source.condition.as_deref() {
+            Some(cond) if Self::has_subqueries(cond) && !Self::has_correlated_subqueries(cond) => {
+                Some(self.process_where_subqueries(cond, ctx)?)
+            }
+            _ => None,
+        };
+        let on_condition: Option<&Expression> =
+            processed_on.as_ref().or(join_source.condition.as_deref());
+
         // Determine join type early for filter pushdown decisions
         let join_type = join_source.join_type.to_uppercase();
 
@@ -4145,7 +4157,7 @@ impl Executor {
             } else {
                 self.check_index_nested_loop_opportunity(
                     &join_source.right,
-                    join_source.condition.as_ref().map(|c| c.as_ref()),
+                    on_condition,
                     &join_type,
                     left_alias.as_deref(),
                     right_alias.as_deref(),
@@ -4171,7 +4183,7 @@ impl Executor {
                 // Right is subquery/CTE - check if left side has Index NL opportunity
                 let left_as_inner = self.check_index_nested_loop_opportunity(
                     &join_source.left,
-                    join_source.condition.as_ref().map(|c| c.as_ref()),
+                    on_condition,
                     &join_type,
                     right_alias.as_deref(), // Swap aliases for the check
                     left_alias.as_deref(),
@@ -4209,7 +4221,7 @@ impl Executor {
                 // (which is more efficient than secondary index lookup)
                 let swapped_info = self.check_index_nested_loop_opportunity(
                     &join_source.left, // Left becomes inner (right)
-                    join_source.condition.as_ref().map(|c| c.as_ref()),
+                    on_condition,
                     &join_type,
                     right_alias.as_deref(), // Swap aliases
                     left_alias.as_deref(),
@@ -4420,13 +4432,30 @@ impl Executor {
                         all
                     };
 
-                    // Residual filter from nl_right_filter, re-qualified with the
-                    // inner alias; built per pass since the operator owns it
+                    // The probe answers one equality out of the ON clause, so
+                    // the whole clause is asked of each pair it returns, next
+                    // to the filter the WHERE put on the inner table. The
+                    // operator asks it where the pair is formed, so a pair it
+                    // turns away leaves an outer row still unmatched. The
+                    // filter is built per pass since the operator owns it
                     let build_residual_filter = || {
-                        nl_right_filter.as_ref().and_then(|rf| {
-                            let qualified_rf = add_table_qualifier(rf, inner_alias);
+                        let inner_filter = nl_right_filter
+                            .as_ref()
+                            .map(|rf| add_table_qualifier(rf, inner_alias));
+                        let combined = match (on_condition, inner_filter) {
+                            (Some(on), Some(f)) => Some(Expression::Infix(InfixExpression::new(
+                                Token::new(TokenType::Operator, "AND", Position::default()),
+                                Box::new(on.clone()),
+                                "AND".to_string(),
+                                Box::new(f),
+                            ))),
+                            (Some(on), None) => Some(on.clone()),
+                            (None, Some(f)) => Some(f),
+                            (None, None) => None,
+                        };
+                        combined.and_then(|expr| {
                             JoinFilter::new(
-                                &qualified_rf,
+                                &expr,
                                 &outer_cols,
                                 &inner_cols,
                                 &self.function_registry,
@@ -4865,12 +4894,12 @@ impl Executor {
                     )?;
 
                     // Extract join keys BEFORE moving columns (uses original left/right positions)
-                    let (left_key_indices, right_key_indices, _) =
-                        if let Some(cond) = join_source.condition.as_ref() {
-                            extract_join_keys_and_residual(cond, &left_cols, &right_cols)
-                        } else {
-                            (Vec::new(), Vec::new(), Vec::new())
-                        };
+                    let (left_key_indices, right_key_indices, _) = if let Some(cond) = on_condition
+                    {
+                        extract_join_keys_and_residual(cond, &left_cols, &right_cols)
+                    } else {
+                        (Vec::new(), Vec::new(), Vec::new())
+                    };
 
                     // Build combined columns (always left-first for consistent output schema)
                     let mut all_cols = left_cols.clone();
@@ -4953,7 +4982,7 @@ impl Executor {
                         build_columns: &build_cols,
                         probe_source,
                         probe_columns: probe_cols.clone(),
-                        condition: join_source.condition.as_ref().map(|c| c.as_ref()),
+                        condition: on_condition,
                         join_type: &join_type,
                         build_is_left,
                         limit: Some(limit),
@@ -5115,20 +5144,9 @@ impl Executor {
         // Destructure the tuple: (condition, excluded_column_indices, column_renames)
         let (natural_join_cond, excluded_column_indices, join_col_renames) = natural_join_condition;
 
-        // Use natural join condition if present, otherwise use explicit condition
-        let effective_condition = natural_join_cond
-            .as_ref()
-            .or(join_source.condition.as_ref().map(|c| c.as_ref()));
-
-        // A subquery in the ON clause is read once, the way the WHERE clause
-        // reads one, so the join has a value to compare each pair against
-        let processed_join_cond: Option<Expression> = match effective_condition {
-            Some(cond) if Self::has_subqueries(cond) && !Self::has_correlated_subqueries(cond) => {
-                Some(self.process_where_subqueries(cond, ctx)?)
-            }
-            _ => None,
-        };
-        let effective_condition = processed_join_cond.as_ref().or(effective_condition);
+        // Use natural join condition if present, otherwise use explicit
+        // condition, whose subqueries were read at the top of the function
+        let effective_condition = natural_join_cond.as_ref().or(on_condition);
 
         // =================================================================
         // Execute JOIN using streaming JoinExecutor
