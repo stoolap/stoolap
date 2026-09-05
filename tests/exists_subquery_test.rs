@@ -398,3 +398,62 @@ fn test_exists_over_a_bare_aggregate() {
         0
     );
 }
+
+/// An index on the correlation column offers a shorter road to the same
+/// question, and it is only the same question under the same conditions
+#[test]
+fn test_exists_reads_the_same_with_an_index_on_the_correlation() {
+    for indexed in [false, true] {
+        let name = if indexed {
+            "exists_guard_indexed"
+        } else {
+            "exists_guard_plain"
+        };
+        let db = Database::open(&format!("memory://{name}")).unwrap();
+        db.execute("CREATE TABLE d (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("CREATE TABLE e (id INTEGER PRIMARY KEY, d_id INTEGER)", ())
+            .unwrap();
+        db.execute("INSERT INTO d VALUES (1),(2),(3)", ()).unwrap();
+        db.execute("INSERT INTO e VALUES (1,1),(2,1),(3,2)", ())
+            .unwrap();
+        if indexed {
+            db.execute("CREATE INDEX ed ON e (d_id)", ()).unwrap();
+        }
+
+        let count = |sql: &str| -> i64 {
+            db.query(sql, ())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap()
+        };
+
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.d_id = d.id LIMIT 0)"
+            ),
+            0,
+            "indexed: {indexed}"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.d_id = d.id GROUP BY e.d_id HAVING COUNT(*) > 1)"),
+            1,
+            "indexed: {indexed}"
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM d WHERE EXISTS (SELECT COUNT(*) FROM e WHERE e.d_id = d.id)"
+            ),
+            3,
+            "indexed: {indexed}"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM d WHERE EXISTS (SELECT 1 FROM e WHERE e.d_id = d.id)"),
+            2,
+            "indexed: {indexed}"
+        );
+    }
+}

@@ -691,11 +691,38 @@ impl Executor {
         Ok(Some(false))
     }
 
+    /// True when the rows an EXISTS subquery returns are not decided by its
+    /// WHERE clause alone. Neither a semi-join nor an index probe can stand
+    /// in for running such a subquery: a HAVING keeps only some of the
+    /// groups, a row count keeps only some of the rows, and a bare aggregate
+    /// returns its one row whether or not anything matched. Grouping on its
+    /// own is not among them, since a group is there exactly where a row is.
+    fn exists_subquery_is_more_than_its_where(subquery: &SelectStatement) -> bool {
+        if subquery.having.is_some()
+            || subquery.limit.is_some()
+            || subquery.offset.is_some()
+            || !subquery.set_operations.is_empty()
+        {
+            return true;
+        }
+        subquery.group_by.columns.is_empty()
+            && subquery
+                .columns
+                .iter()
+                .any(crate::executor::utils::expression_contains_aggregate)
+    }
+
     /// Extract index-nested-loop correlation info from a subquery.
     ///
     /// Looks for patterns like:
     /// SELECT 1 FROM orders WHERE orders.user_id = u.id [AND additional_predicates]
     fn extract_index_nested_loop_info(subquery: &SelectStatement) -> Option<IndexNestedLoopInfo> {
+        // Probing the index answers whether a matching row is there, which
+        // is the whole question only when the WHERE decides the rows
+        if Self::exists_subquery_is_more_than_its_where(subquery) {
+            return None;
+        }
+
         // Must have a simple table source
         let (inner_table, inner_alias) = match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
             Some(Expression::TableSource(ts)) => {
@@ -3784,24 +3811,8 @@ impl Executor {
     ) -> Option<SemiJoinInfo> {
         let subquery = &exists.subquery;
 
-        // 0. A semi-join answers whether the inner table holds a matching
-        // row. Anything that decides which rows the subquery returns beyond
-        // its WHERE has to run, so it is left to the general path: HAVING,
-        // a row count, a set operation, and a bare aggregate, which returns
-        // its one row whether or not anything matched
-        if subquery.having.is_some()
-            || subquery.limit.is_some()
-            || subquery.offset.is_some()
-            || !subquery.set_operations.is_empty()
-        {
-            return None;
-        }
-        if subquery.group_by.columns.is_empty()
-            && subquery
-                .columns
-                .iter()
-                .any(crate::executor::utils::expression_contains_aggregate)
-        {
+        // 0. A semi-join answers whether the inner table holds a matching row
+        if Self::exists_subquery_is_more_than_its_where(subquery) {
             return None;
         }
 
