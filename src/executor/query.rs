@@ -6841,6 +6841,16 @@ impl Executor {
                     .unwrap_or_else(|| agg.get_expression_name()),
             );
         }
+        // A HAVING that reads the group it is asked about has to be run once
+        // per group with that group as the outer row, which the general
+        // aggregation does and this streaming path does not
+        if stmt
+            .having
+            .as_deref()
+            .is_some_and(Self::has_correlated_subqueries)
+        {
+            return Ok(None);
+        }
         let having = match &stmt.having {
             Some(having) => {
                 let processed = self.process_where_subqueries(having, ctx)?;

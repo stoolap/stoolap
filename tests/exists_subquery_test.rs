@@ -506,3 +506,40 @@ fn test_not_exists_over_a_null_outer_value() {
         assert_eq!(count("SELECT COUNT(*) FROM t"), 2, "keyed: {keyed}");
     }
 }
+
+#[test]
+fn test_having_binds_the_group_to_a_correlated_exists() {
+    let db = Database::open("memory://having_correlated_exists").unwrap();
+    db.execute("CREATE TABLE hx (a INTEGER, b INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE hy (a INTEGER)", ()).unwrap();
+    db.execute(
+        "INSERT INTO hx VALUES (1, 10), (1, 11), (2, 20), (3, 30), (NULL, 40)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO hy VALUES (1), (3), (NULL)", ())
+        .unwrap();
+
+    let groups = |having: &str| -> Vec<i64> {
+        db.query(
+            &format!("SELECT COALESCE(a, -1) FROM hx GROUP BY a HAVING {having} ORDER BY a"),
+            (),
+        )
+        .unwrap()
+        .map(|r| r.unwrap().get::<i64>(0).unwrap())
+        .collect()
+    };
+    assert_eq!(
+        groups("EXISTS (SELECT 1 FROM hy WHERE hy.a = hx.a)"),
+        vec![1, 3]
+    );
+    assert_eq!(
+        groups("NOT EXISTS (SELECT 1 FROM hy WHERE hy.a = hx.a)"),
+        vec![2, -1]
+    );
+    assert_eq!(
+        groups("COUNT(*) = 1 AND EXISTS (SELECT 1 FROM hy WHERE hy.a = hx.a)"),
+        vec![3]
+    );
+}

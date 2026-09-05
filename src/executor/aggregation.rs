@@ -514,8 +514,27 @@ impl Executor {
                 (result_columns, result_rows)
             } else {
                 // Pre-process scalar subqueries in HAVING clause
-                // This executes subqueries like (SELECT AVG(a) FROM t) and replaces them with values
-                let processed_having = self.process_where_subqueries(having, ctx)?;
+                // This executes subqueries like (SELECT AVG(a) FROM t) and replaces them with values.
+                // One that reads the group is left as written; apply_having
+                // runs it once per group with that group as the outer row
+                let has_correlated_having = Self::has_correlated_subqueries(having);
+                let processed_having = if has_correlated_having {
+                    (**having).clone()
+                } else {
+                    self.process_where_subqueries(having, ctx)?
+                };
+                let outer_table: Option<String> =
+                    stmt.table_expr.as_ref().and_then(|te| match te.as_ref() {
+                        Expression::TableSource(source) => Some(
+                            source
+                                .alias
+                                .as_ref()
+                                .map(|a| a.value_lower.to_string())
+                                .unwrap_or_else(|| source.name.value_lower.to_string()),
+                        ),
+                        Expression::Aliased(aliased) => Some(aliased.alias.value_lower.to_string()),
+                        _ => None,
+                    });
 
                 // Build aggregate expression aliases for HAVING clause
                 // IMPORTANT: Include ALL aggregates, not just aliased ones,
@@ -548,6 +567,7 @@ impl Executor {
                     &result_columns,
                     &agg_aliases,
                     &expr_aliases,
+                    outer_table.as_deref(),
                     ctx,
                 )?;
 
@@ -4925,6 +4945,7 @@ impl Executor {
     }
 
     /// Apply HAVING clause to aggregated results
+    #[allow(clippy::too_many_arguments)]
     fn apply_having(
         &self,
         result: Box<dyn QueryResult>,
@@ -4932,6 +4953,7 @@ impl Executor {
         columns: &[String],
         agg_aliases: &[(String, usize)],
         expr_aliases: &[(String, usize)],
+        outer_table: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         // Materialize the result
@@ -4946,6 +4968,50 @@ impl Executor {
         // Combine all aliases for HAVING clause evaluation
         let mut all_aliases: Vec<(String, usize)> = agg_aliases.to_vec();
         all_aliases.extend_from_slice(expr_aliases);
+
+        // A subquery that reads the group it is asked about is run once per
+        // group, with the group's row standing as the outer row, the way a
+        // correlated subquery in the WHERE clause is run once per row. The
+        // group's columns are offered under their bare names and under the
+        // table's, since the subquery may name either
+        if Self::has_correlated_subqueries(having) {
+            let columns_arc = CompactArc::new(columns.to_vec());
+            let keys: Vec<(CompactArc<str>, Option<CompactArc<str>>)> = columns
+                .iter()
+                .map(|c| {
+                    let bare = c.to_lowercase();
+                    let qualified = outer_table.filter(|_| !bare.contains('.')).map(|t| {
+                        CompactArc::from(format!("{}.{}", t.to_lowercase(), bare).as_str())
+                    });
+                    (CompactArc::from(bare.as_str()), qualified)
+                })
+                .collect();
+            let mut filtered_rows = RowVec::new();
+            let mut new_id = 0i64;
+            for (_, row) in rows {
+                let mut outer_row_map: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
+                for (i, (bare, qualified)) in keys.iter().enumerate() {
+                    let value = row.get(i).cloned().unwrap_or_else(Value::null_unknown);
+                    if let Some(q) = qualified {
+                        outer_row_map.insert(q.clone(), value.clone());
+                    }
+                    outer_row_map.insert(bare.clone(), value);
+                }
+                let correlated_ctx =
+                    ctx.with_outer_row(outer_row_map, CompactArc::clone(&columns_arc));
+                let processed = self.process_correlated_where(having, &correlated_ctx)?;
+                let filter = RowFilter::with_aliases(&processed, columns, &all_aliases)?
+                    .with_context(&correlated_ctx);
+                if filter.matches_checked(&row)? {
+                    filtered_rows.push((new_id, row));
+                    new_id += 1;
+                }
+            }
+            return Ok(Box::new(ExecutorResult::new(
+                columns.to_vec(),
+                filtered_rows,
+            )));
+        }
 
         // Create RowFilter with all aliases and context
         let having_filter =
