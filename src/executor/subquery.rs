@@ -4531,13 +4531,52 @@ impl Executor {
             ))
         };
 
+        // EXISTS asks whether an inner row equals the outer value, and a
+        // NULL on either side equals nothing. IN reads it differently: a
+        // NULL outer value, or a NULL among the members, leaves the answer
+        // unknown. For EXISTS the unknown is the same as false in a filter;
+        // for NOT EXISTS it is not, since the answer there is true. So the
+        // negated set is asked without its NULLs, and an outer NULL, which
+        // no inner row can match, is kept alongside
+        let (hash_set, not) = if info.is_negated && hash_set.iter().any(|v| v.is_null()) {
+            let without_nulls: ValueSet =
+                hash_set.iter().filter(|v| !v.is_null()).cloned().collect();
+            if without_nulls.is_empty() {
+                return Expression::BooleanLiteral(BooleanLiteral {
+                    token: dummy_token_clone(),
+                    value: true,
+                });
+            }
+            (CompactArc::new(without_nulls), true)
+        } else {
+            (hash_set, info.is_negated)
+        };
+
         // Use InHashSet with Arc for O(1) lookup and cheap cloning in parallel execution
-        Expression::InHashSet(InHashSetExpression {
+        let membership = Expression::InHashSet(InHashSetExpression {
             token: dummy_token_clone(),
-            column: Box::new(outer_col_expr),
+            column: Box::new(outer_col_expr.clone()),
             values: hash_set, // Already Arc, no wrapping needed
-            not: info.is_negated,
-        })
+            not,
+        });
+        if !not {
+            return membership;
+        }
+
+        let outer_is_null = Expression::Infix(InfixExpression::new(
+            dummy_token_clone(),
+            Box::new(outer_col_expr),
+            "IS".to_string(),
+            Box::new(Expression::NullLiteral(NullLiteral {
+                token: dummy_token_clone(),
+            })),
+        ));
+        Expression::Infix(InfixExpression::new(
+            dummy_token_clone(),
+            Box::new(membership),
+            "OR".to_string(),
+            Box::new(outer_is_null),
+        ))
     }
 
     /// Try to optimize correlated EXISTS subqueries to semi-join.

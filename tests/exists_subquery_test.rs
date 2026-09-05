@@ -457,3 +457,52 @@ fn test_exists_reads_the_same_with_an_index_on_the_correlation() {
         );
     }
 }
+
+/// No inner row equals a NULL, so EXISTS over one is false and NOT EXISTS
+/// is true; the set the rewrite reads must not turn that into unknown
+#[test]
+fn test_not_exists_over_a_null_outer_value() {
+    for keyed in [true, false] {
+        let db = Database::open(&format!(
+            "memory://not_exists_null_outer_{}",
+            if keyed { "pk" } else { "nopk" }
+        ))
+        .unwrap();
+        let pk = if keyed { "PRIMARY KEY" } else { "" };
+        db.execute(&format!("CREATE TABLE t (id INTEGER {pk}, k INTEGER)"), ())
+            .unwrap();
+        db.execute("CREATE TABLE r (k INTEGER)", ()).unwrap();
+        db.execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, NULL), (4, 9)", ())
+            .unwrap();
+        db.execute("INSERT INTO r VALUES (1), (2), (NULL)", ())
+            .unwrap();
+
+        let count = |sql: &str| -> i64 {
+            db.query(sql, ())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .get(0)
+                .unwrap()
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) FROM t WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = t.k)"),
+            2,
+            "the NULL row and the 9 row, keyed: {keyed}"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) FROM t WHERE EXISTS (SELECT 1 FROM r WHERE r.k = t.k)"),
+            2,
+            "keyed: {keyed}"
+        );
+        let removed = db
+            .execute(
+                "DELETE FROM t WHERE NOT EXISTS (SELECT 1 FROM r WHERE r.k = t.k)",
+                (),
+            )
+            .unwrap();
+        assert_eq!(removed, 2, "keyed: {keyed}");
+        assert_eq!(count("SELECT COUNT(*) FROM t"), 2, "keyed: {keyed}");
+    }
+}
