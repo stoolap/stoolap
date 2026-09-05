@@ -2873,38 +2873,46 @@ impl Executor {
                 )?;
             }
             // Without a primary key each key is read from the column it
-            // names, which is why the rows were kept. The keys that can
-            // refuse the delete are asked first, all of them, so a refusal
-            // leaves the statement having written nothing
+            // names, which is why the rows were kept. Every key is asked
+            // whether it refuses before any key acts, so a refusal leaves
+            // the statement having written nothing
             if has_referencing_fks && !rows_to_delete_by_row_id.is_empty() {
-                let mut ordered: Vec<&(String, crate::core::ForeignKeyConstraint)> =
-                    referencing_fks.iter().collect();
-                ordered.sort_by_key(|(_, fk)| {
-                    !matches!(
-                        fk.on_delete,
-                        crate::core::ForeignKeyAction::Restrict
-                            | crate::core::ForeignKeyAction::NoAction
-                    )
-                });
-                for fk_entry in ordered {
-                    let referenced = fk_entry.1.referenced_column.to_lowercase();
-                    let Some(idx) = schema_arc
-                        .columns
+                let keyed_values: Vec<(&(String, crate::core::ForeignKeyConstraint), Vec<Value>)> =
+                    referencing_fks
                         .iter()
-                        .position(|c| c.name_lower == referenced)
-                    else {
-                        continue;
-                    };
-                    let values: Vec<Value> = rows_to_delete_by_row_id
-                        .iter()
-                        .filter_map(|(_, row)| row.as_ref().and_then(|r| r.get(idx).cloned()))
+                        .filter_map(|fk_entry| {
+                            let referenced = fk_entry.1.referenced_column.to_lowercase();
+                            let idx = schema_arc
+                                .columns
+                                .iter()
+                                .position(|c| c.name_lower == referenced)?;
+                            let values: Vec<Value> = rows_to_delete_by_row_id
+                                .iter()
+                                .filter_map(|(_, row)| {
+                                    row.as_ref().and_then(|r| r.get(idx).cloned())
+                                })
+                                .collect();
+                            Some((fk_entry, values))
+                        })
                         .collect();
-                    super::foreign_key::enforce_delete_actions_iter(
+                for (fk_entry, values) in &keyed_values {
+                    let refs: Vec<&Value> = values.iter().collect();
+                    super::foreign_key::pre_check_delete_keys(
                         &self.engine,
                         table.txn_id(),
                         table_name,
-                        values.iter(),
-                        std::slice::from_ref(fk_entry),
+                        &refs,
+                        std::slice::from_ref(*fk_entry),
+                    )?;
+                }
+                for (fk_entry, values) in &keyed_values {
+                    let refs: Vec<&Value> = values.iter().collect();
+                    super::foreign_key::apply_delete_actions(
+                        &self.engine,
+                        table.txn_id(),
+                        table_name,
+                        &refs,
+                        std::slice::from_ref(*fk_entry),
                     )?;
                 }
             }

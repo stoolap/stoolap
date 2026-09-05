@@ -200,3 +200,57 @@ fn test_a_refusal_leaves_no_cascade_behind() {
         );
     }
 }
+
+/// A key that refuses two levels down refuses the whole statement, before
+/// a key one level down has taken anything away
+#[test]
+fn test_a_refusal_below_a_cascade_leaves_nothing_behind() {
+    for parent in [
+        "CREATE TABLE par (code INTEGER UNIQUE)",
+        "CREATE TABLE par (code INTEGER PRIMARY KEY)",
+    ] {
+        let keyed = parent.contains("PRIMARY KEY");
+        let db = Database::open(&format!(
+            "memory://delete_fk_chain_{}",
+            if keyed { "pk" } else { "nopk" }
+        ))
+        .unwrap();
+        db.execute(parent, ()).unwrap();
+        db.execute(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pcode INTEGER REFERENCES par(code) ON DELETE CASCADE)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "CREATE TABLE grand (id INTEGER PRIMARY KEY, cid INTEGER REFERENCES child(id) ON DELETE RESTRICT)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO par VALUES (1), (2)", ()).unwrap();
+        db.execute("INSERT INTO child VALUES (1, 1), (2, 2)", ())
+            .unwrap();
+        db.execute("INSERT INTO grand VALUES (1, 2)", ()).unwrap();
+
+        db.execute("BEGIN", ()).unwrap();
+        assert!(
+            db.execute("DELETE FROM par WHERE code <= 2", ()).is_err(),
+            "the grandchild refuses ({parent})"
+        );
+        assert_eq!(
+            ids(&db, "SELECT id FROM child ORDER BY id"),
+            [1, 2],
+            "the first parent's child did not go before the refusal ({parent})"
+        );
+        assert_eq!(
+            ids(&db, "SELECT code FROM par ORDER BY code"),
+            [1, 2],
+            "{parent}"
+        );
+        db.execute("COMMIT", ()).unwrap();
+        assert_eq!(
+            ids(&db, "SELECT id FROM child ORDER BY id"),
+            [1, 2],
+            "nothing was left to commit ({parent})"
+        );
+    }
+}
