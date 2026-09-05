@@ -668,7 +668,11 @@ impl ExprVM {
                         .row
                         .get(*idx as usize)
                         .unwrap_or(&Value::Null(DataType::Null));
-                    let result = if col_val.is_null() {
+                    // A set holding nothing matches nothing, whatever it is
+                    // asked about, so NOT IN over it holds for every row
+                    let result = if set.is_empty() && !*has_null {
+                        Value::Boolean(false)
+                    } else if col_val.is_null() {
                         Value::Null(DataType::Boolean)
                     } else if set.contains(col_val) {
                         Value::Boolean(true)
@@ -1335,7 +1339,11 @@ impl ExprVM {
                 // =============================================================
                 Op::InSet(set, has_null) => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if v.is_null() {
+                    // A set holding nothing matches nothing, whatever it is
+                    // asked about, so NOT IN over it holds for every row
+                    let result = if set.is_empty() && !*has_null {
+                        Value::Boolean(false)
+                    } else if v.is_null() {
                         Value::Null(DataType::Boolean)
                     } else if set.contains(&v) {
                         Value::Boolean(true)
@@ -1350,7 +1358,9 @@ impl ExprVM {
 
                 Op::NotInSet(set, has_null) => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = if v.is_null() {
+                    let result = if set.is_empty() && !*has_null {
+                        Value::Boolean(true)
+                    } else if v.is_null() {
                         Value::Null(DataType::Boolean)
                     } else if set.contains(&v) {
                         Value::Boolean(false)
@@ -3121,6 +3131,11 @@ impl ExprVM {
                 None => None,
             },
             Op::InSetColumn(idx, set, has_null) => {
+                // A set holding nothing matches nothing, whatever it is
+                // asked about
+                if set.is_empty() && !*has_null {
+                    return Some(false);
+                }
                 match ctx.row.get(*idx as usize) {
                     Some(v) if v.is_null() => None, // NULL IN set -> NULL
                     Some(v) if set.contains(v) => Some(true),

@@ -97,3 +97,55 @@ fn test_a_column_minus_itself_is_null_where_the_column_is() {
         "the two rows holding a value each contribute a zero"
     );
 }
+
+/// A set holding nothing matches nothing, so NOT IN over it holds for
+/// every row, including the rows the column is NULL in
+#[test]
+fn test_in_and_not_in_over_an_empty_set() {
+    let db = Database::open("memory://null_cmp_empty_set").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO a VALUES (1, 10), (2, 20), (3, NULL)", ())
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (1, 100), (2, NULL)", ())
+        .unwrap();
+
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM a WHERE k NOT IN (SELECT v FROM b WHERE v > 9999)"
+        ),
+        3
+    );
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM a WHERE k NOT IN (SELECT v FROM b WHERE v > 9999) ORDER BY id"
+        ),
+        [1, 2, 3]
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM a WHERE k IN (SELECT v FROM b WHERE v > 9999)"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM a WHERE k NOT IN (SELECT v FROM b)"
+        ),
+        0,
+        "a set holding a NULL still leaves it unknown"
+    );
+    assert_eq!(
+        count(
+            &db,
+            "SELECT COUNT(*) FROM a WHERE k NOT IN (SELECT v FROM b WHERE v IS NOT NULL)"
+        ),
+        2
+    );
+}
