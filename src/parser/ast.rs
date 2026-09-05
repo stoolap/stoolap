@@ -1662,11 +1662,16 @@ pub struct UpdateStatement {
     pub where_clause: Option<Box<Expression>>,
     /// RETURNING clause expressions
     pub returning: Vec<Expression>,
+    /// WITH clause the statement's subqueries may read
+    pub with: Option<WithClause>,
 }
 
 impl fmt::Display for UpdateStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut result = format!("UPDATE {} SET ", self.table_name);
+        let mut result = match self.with {
+            Some(ref with) => format!("{} UPDATE {} SET ", with, self.table_name),
+            None => format!("UPDATE {} SET ", self.table_name),
+        };
         let updates: Vec<String> = self
             .updates
             .iter()
@@ -1694,11 +1699,16 @@ pub struct DeleteStatement {
     pub where_clause: Option<Box<Expression>>,
     /// RETURNING clause expressions
     pub returning: Vec<Expression>,
+    /// WITH clause the statement's subqueries may read
+    pub with: Option<WithClause>,
 }
 
 impl fmt::Display for DeleteStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut result = format!("DELETE FROM {}", self.table_name);
+        let mut result = match self.with {
+            Some(ref with) => format!("{} DELETE FROM {}", with, self.table_name),
+            None => format!("DELETE FROM {}", self.table_name),
+        };
         if let Some(ref alias) = self.alias {
             result.push_str(&format!(" AS {}", alias));
         }

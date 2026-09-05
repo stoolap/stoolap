@@ -1696,6 +1696,16 @@ impl Executor {
         stmt: &UpdateStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        // A WITH clause is run first, so the subqueries can read it
+        let ctx_with_ctes;
+        let ctx = match &stmt.with {
+            Some(with_clause) => {
+                let registry = self.materialize_ctes(with_clause, ctx, None)?;
+                ctx_with_ctes = ctx.with_cte_data(registry.data());
+                &ctx_with_ctes
+            }
+            None => ctx,
+        };
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
 
@@ -2642,6 +2652,16 @@ impl Executor {
         stmt: &DeleteStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        // A WITH clause is run first, so the subqueries can read it
+        let ctx_with_ctes;
+        let ctx = match &stmt.with {
+            Some(with_clause) => {
+                let registry = self.materialize_ctes(with_clause, ctx, None)?;
+                ctx_with_ctes = ctx.with_cte_data(registry.data());
+                &ctx_with_ctes
+            }
+            None => ctx,
+        };
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
         // Use alias if provided, otherwise use table name

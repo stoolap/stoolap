@@ -766,9 +766,17 @@ impl Parser {
                 return None;
             }
             Some(Statement::Insert(insert))
+        } else if self.cur_token_is_keyword("UPDATE") {
+            let mut update = self.parse_update_statement()?;
+            update.with = Some(with_clause);
+            Some(Statement::Update(update))
+        } else if self.cur_token_is_keyword("DELETE") {
+            let mut delete = self.parse_delete_statement()?;
+            delete.with = Some(with_clause);
+            Some(Statement::Delete(delete))
         } else {
             self.add_error(format!(
-                "expected SELECT or INSERT after WITH clause at {}",
+                "expected SELECT, INSERT, UPDATE or DELETE after WITH clause at {}",
                 self.cur_token.position
             ));
             None
@@ -1492,6 +1500,7 @@ impl Parser {
             updates,
             where_clause,
             returning,
+            with: None,
         })
     }
 
@@ -1561,6 +1570,7 @@ impl Parser {
             alias,
             where_clause,
             returning,
+            with: None,
         })
     }
 

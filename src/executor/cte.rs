@@ -114,7 +114,7 @@ fn expr_to_normalized_string(expr: &Expression) -> String {
 
 /// Hint for CTE optimization including LIMIT and optional ORDER BY pushdown
 #[derive(Clone)]
-struct CtePushdownHint {
+pub(crate) struct CtePushdownHint {
     limit: u64,
     order_by: Vec<OrderByExpression>,
 }
@@ -232,14 +232,27 @@ impl Executor {
         // This enables streaming GROUP BY early termination
         let cte_limit_hints = self.compute_cte_limit_hints(stmt, with_clause);
 
-        // Create CTE registry
+        let mut cte_registry = self.materialize_ctes(with_clause, ctx, Some(&cte_limit_hints))?;
+
+        // Execute the main query with CTE registry
+        self.execute_main_query_with_ctes(stmt, ctx, &mut cte_registry)
+    }
+
+    /// Run the CTEs of a WITH clause in order and store each result, so
+    /// the statement that follows, a SELECT or a DML, can read them
+    pub(crate) fn materialize_ctes(
+        &self,
+        with_clause: &WithClause,
+        ctx: &ExecutionContext,
+        cte_limit_hints: Option<&StringMap<CtePushdownHint>>,
+    ) -> Result<CteRegistry> {
         let mut cte_registry = CteRegistry::new();
 
         // Execute each CTE in order
         for cte in &with_clause.ctes {
             // Check if we have a pushdown hint for this CTE
             let cte_name_lower: String = cte.name.value_lower.to_string();
-            let pushdown_hint = cte_limit_hints.get(&cte_name_lower);
+            let pushdown_hint = cte_limit_hints.and_then(|hints| hints.get(&cte_name_lower));
 
             // Execute the CTE query (handles recursive CTEs)
             let (columns, rows) = if cte.is_recursive {
@@ -287,8 +300,7 @@ impl Executor {
             cte_registry.store(&cte.name.value, columns, rows);
         }
 
-        // Execute the main query with CTE registry
-        self.execute_main_query_with_ctes(stmt, ctx, &mut cte_registry)
+        Ok(cte_registry)
     }
 
     /// Execute a single CTE query
