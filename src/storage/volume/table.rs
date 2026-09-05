@@ -2444,6 +2444,10 @@ impl Table for SegmentedTable {
                             total_sum += values[i];
                             total_count += 1;
                         }
+                        crate::storage::volume::column::ColumnData::Boolean { values, .. } => {
+                            total_sum += if values[i] { 1.0 } else { 0.0 };
+                            total_count += 1;
+                        }
                         _ => {}
                     }
                 } else if let Some(def) = default_f64 {
