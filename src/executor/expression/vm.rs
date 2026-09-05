@@ -431,13 +431,7 @@ impl ExprVM {
                         (Value::Float(x), Value::Integer(y)) => {
                             Value::Boolean(crate::core::value::i64_ge_f64(*y, *x))
                         }
-                        _ => match a.partial_cmp(&b) {
-                            Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
-                                Value::Boolean(true)
-                            }
-                            Some(std::cmp::Ordering::Greater) => Value::Boolean(false),
-                            None => Value::Null(DataType::Boolean),
-                        },
+                        _ => self.compare_values_or_equal(&a, &b, std::cmp::Ordering::Less),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -475,13 +469,7 @@ impl ExprVM {
                         (Value::Float(x), Value::Integer(y)) => {
                             Value::Boolean(crate::core::value::i64_le_f64(*y, *x))
                         }
-                        _ => match a.partial_cmp(&b) {
-                            Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
-                                Value::Boolean(true)
-                            }
-                            Some(std::cmp::Ordering::Less) => Value::Boolean(false),
-                            None => Value::Null(DataType::Boolean),
-                        },
+                        _ => self.compare_values_or_equal(&a, &b, std::cmp::Ordering::Greater),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -605,13 +593,7 @@ impl ExprVM {
                     let result = match val {
                         Value::Integer(threshold) => Self::le_int(col_val, *threshold),
                         Value::Float(threshold) => Self::le_float(col_val, *threshold),
-                        _ => match col_val.partial_cmp(val) {
-                            Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
-                                Value::Boolean(true)
-                            }
-                            Some(std::cmp::Ordering::Greater) => Value::Boolean(false),
-                            None => Value::Null(DataType::Boolean),
-                        },
+                        _ => self.compare_values_or_equal(col_val, val, std::cmp::Ordering::Less),
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -641,13 +623,9 @@ impl ExprVM {
                     let result = match val {
                         Value::Integer(threshold) => Self::ge_int(col_val, *threshold),
                         Value::Float(threshold) => Self::ge_float(col_val, *threshold),
-                        _ => match col_val.partial_cmp(val) {
-                            Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
-                                Value::Boolean(true)
-                            }
-                            Some(std::cmp::Ordering::Less) => Value::Boolean(false),
-                            None => Value::Null(DataType::Boolean),
-                        },
+                        _ => {
+                            self.compare_values_or_equal(col_val, val, std::cmp::Ordering::Greater)
+                        }
                     };
                     self.stack.push(result);
                     pc += 1;
@@ -2183,13 +2161,7 @@ impl ExprVM {
                         (Value::Float(x), Value::Integer(y)) => {
                             Value::Boolean(crate::core::value::i64_ge_f64(*y, *x))
                         }
-                        _ => match (*a).partial_cmp(&*b) {
-                            Some(std::cmp::Ordering::Less) | Some(std::cmp::Ordering::Equal) => {
-                                Value::Boolean(true)
-                            }
-                            Some(std::cmp::Ordering::Greater) => Value::Boolean(false),
-                            None => Value::Null(DataType::Boolean),
-                        },
+                        _ => self.compare_values_or_equal(&a, &b, std::cmp::Ordering::Less),
                     };
                     stack.push(Cow::Owned(result));
                     pc += 1;
@@ -2225,13 +2197,7 @@ impl ExprVM {
                         (Value::Float(x), Value::Integer(y)) => {
                             Value::Boolean(crate::core::value::i64_le_f64(*y, *x))
                         }
-                        _ => match (*a).partial_cmp(&*b) {
-                            Some(std::cmp::Ordering::Greater) | Some(std::cmp::Ordering::Equal) => {
-                                Value::Boolean(true)
-                            }
-                            Some(std::cmp::Ordering::Less) => Value::Boolean(false),
-                            None => Value::Null(DataType::Boolean),
-                        },
+                        _ => self.compare_values_or_equal(&a, &b, std::cmp::Ordering::Greater),
                     };
                     stack.push(Cow::Owned(result));
                     pc += 1;
@@ -3237,8 +3203,28 @@ impl ExprVM {
 
     #[inline]
     fn compare_values(&self, a: &Value, b: &Value, expected: std::cmp::Ordering) -> Value {
+        // Two NULLs order equal so an index can hold them; asked whether one
+        // is below or above the other, SQL answers that it does not know
+        if a.is_null() || b.is_null() {
+            return Value::Null(DataType::Boolean);
+        }
         match a.partial_cmp(b) {
             Some(ord) if ord == expected => Value::Boolean(true),
+            Some(_) => Value::Boolean(false),
+            None => Value::Null(DataType::Boolean),
+        }
+    }
+
+    /// Answer `<=` or `>=`: `expected` is the strict half of the operator.
+    #[inline]
+    fn compare_values_or_equal(&self, a: &Value, b: &Value, expected: std::cmp::Ordering) -> Value {
+        if a.is_null() || b.is_null() {
+            return Value::Null(DataType::Boolean);
+        }
+        match a.partial_cmp(b) {
+            Some(ord) if ord == expected || ord == std::cmp::Ordering::Equal => {
+                Value::Boolean(true)
+            }
             Some(_) => Value::Boolean(false),
             None => Value::Null(DataType::Boolean),
         }
