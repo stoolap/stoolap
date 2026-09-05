@@ -79,3 +79,19 @@ fn test_an_order_by_on_top_of_a_partition_only_window() {
         [(1, 2), (2, 2), (3, 1), (4, 3), (5, 3), (6, 3)]
     );
 }
+
+#[test]
+fn test_two_extensions_of_one_window_stay_apart() {
+    let db = setup("named_window_apart");
+    // rn by id within a: 1,2 | 1 | 1,2,3 ; sorting by the reverse numbering
+    // puts the last row of each partition first
+    let ids: Vec<i64> = db
+        .query(
+            "SELECT id, ROW_NUMBER() OVER (w ORDER BY id) AS rn FROM hx WINDOW w AS (PARTITION BY a) ORDER BY ROW_NUMBER() OVER (w ORDER BY id DESC), id",
+            (),
+        )
+        .unwrap()
+        .map(|r| r.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(ids, [2, 3, 6, 1, 5, 4]);
+}

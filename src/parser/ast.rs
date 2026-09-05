@@ -943,11 +943,23 @@ pub struct WindowExpression {
 impl fmt::Display for WindowExpression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut result = self.function.to_string();
-        if let Some(ref win_ref) = self.window_ref {
+        let extends_named = self.window_ref.is_some()
+            && (!self.partition_by.is_empty() || !self.order_by.is_empty() || self.frame.is_some());
+        if let (Some(win_ref), false) = (&self.window_ref, extends_named) {
             result.push_str(" OVER ");
             result.push_str(win_ref);
         } else {
             result.push_str(" OVER (");
+            // OVER (w ...) names the window it builds on first
+            if let Some(ref win_ref) = self.window_ref {
+                result.push_str(win_ref);
+                if !self.partition_by.is_empty()
+                    || !self.order_by.is_empty()
+                    || self.frame.is_some()
+                {
+                    result.push(' ');
+                }
+            }
             if !self.partition_by.is_empty() {
                 result.push_str("PARTITION BY ");
                 let parts: Vec<String> = self.partition_by.iter().map(|e| e.to_string()).collect();
