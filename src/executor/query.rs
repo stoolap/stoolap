@@ -2543,7 +2543,11 @@ impl Executor {
         // FAST PATH: MIN/MAX index optimization
         // For queries like `SELECT MIN(col) FROM table` or `SELECT MAX(col) FROM table`
         // without WHERE or GROUP BY, use the index directly (O(1) instead of O(n))
-        if storage_expr.is_none() && !needs_memory_filter && !classification.has_group_by {
+        if storage_expr.is_none()
+            && !needs_memory_filter
+            && !classification.has_group_by
+            && stmt.having.is_none()
+        {
             if let Some((result, columns)) =
                 self.try_min_max_index_optimization(stmt, &*table, &all_columns)?
             {
@@ -2554,7 +2558,11 @@ impl Executor {
         // FAST PATH: COUNT(*) pushdown optimization
         // For queries like `SELECT COUNT(*) FROM table` without WHERE or GROUP BY,
         // use the table's row_count() method instead of scanning all rows
-        if storage_expr.is_none() && !needs_memory_filter && !classification.has_group_by {
+        if storage_expr.is_none()
+            && !needs_memory_filter
+            && !classification.has_group_by
+            && stmt.having.is_none()
+        {
             if let Some((result, columns)) = self.try_count_star_optimization(stmt, &*table)? {
                 return Ok((result, columns, false, None));
             }
