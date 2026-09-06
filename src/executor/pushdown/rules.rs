@@ -139,6 +139,10 @@ pub(crate) fn contains_non_deterministic_volatile(expr: &ast::Expression) -> boo
             .elements
             .iter()
             .any(contains_non_deterministic_volatile),
+        ast::Expression::ExpressionList(list) => list
+            .expressions
+            .iter()
+            .any(contains_non_deterministic_volatile),
         _ => false,
     }
 }

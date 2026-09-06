@@ -43,6 +43,8 @@ fn test_random_beside_a_subquery_rolls_once() {
         "SELECT COUNT(*) FROM x WHERE a = 1 + (CASE WHEN RANDOM() < 0.5 THEN -1 ELSE 0 END) \
          AND EXISTS (SELECT 1)",
         "SELECT COUNT(*) FROM x WHERE RANDOM() BETWEEN 0 AND 0.5 AND EXISTS (SELECT 1)",
+        "SELECT COUNT(*) FROM x WHERE a = 1 + (CASE WHEN TRUE IN (RANDOM() < 0.5) THEN -1 ELSE 0 END) \
+         AND EXISTS (SELECT 1)",
     ] {
         let kept = count(&db, sql);
         assert!((8500..=11500).contains(&kept), "{sql} kept {kept}");
