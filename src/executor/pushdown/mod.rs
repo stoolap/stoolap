@@ -207,6 +207,17 @@ impl PushdownRegistry {
         expr: &ast::Expression,
         ctx: &PushdownContext<'_>,
     ) -> (Option<Box<dyn StorageExpr>>, bool) {
+        // A volatile function is judged once, in memory: pushed beside a
+        // conjunct the memory filter re-evaluates, it would roll twice
+        let is_logical = matches!(
+            expr,
+            ast::Expression::Infix(infix)
+                if matches!(infix.op_type, ast::InfixOperator::And | ast::InfixOperator::Or)
+        );
+        if !is_logical && rules::contains_non_deterministic_volatile(expr) {
+            return (None, true);
+        }
+
         for rule in &self.rules {
             match rule.try_convert(expr, ctx) {
                 PushdownResult::Converted(storage_expr) => {

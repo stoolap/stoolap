@@ -86,7 +86,7 @@ fn extract_literal_with_ctx(expr: &ast::Expression, ctx: &PushdownContext<'_>) -
 /// Stable-within-query functions (NOW, CURRENT_DATE, CURRENT_TIMESTAMP) are NOT
 /// considered volatile here — they return the same value for every row in a single
 /// query execution, so pushing them down as a frozen literal is correct.
-fn contains_non_deterministic_volatile(expr: &ast::Expression) -> bool {
+pub(crate) fn contains_non_deterministic_volatile(expr: &ast::Expression) -> bool {
     match expr {
         ast::Expression::FunctionCall(func) => {
             let upper = func.function.to_uppercase();
