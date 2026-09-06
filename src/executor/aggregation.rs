@@ -1501,6 +1501,17 @@ impl Executor {
                 &mut non_agg_columns,
             )?;
         }
+        // A named window a function refers to with OVER w may partition or
+        // order by an aggregate as well; it is computed like ORDER BY's
+        for window in &stmt.window_defs {
+            for expr in window
+                .partition_by
+                .iter()
+                .chain(window.order_by.iter().map(|o| &o.expression))
+            {
+                self.extract_aggregates_from_expr(expr, &mut aggregations, &mut non_agg_columns)?;
+            }
+        }
         // Mark any new aggregates (from ORDER BY) as hidden, but only if they're truly new
         // Helper to create a signature string for an aggregate including its filter
         let make_sig = |agg: &SqlAggregateFunction| -> (String, String, bool, String) {

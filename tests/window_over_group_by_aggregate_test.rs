@@ -64,3 +64,32 @@ fn test_a_window_orders_by_an_aggregate_outside_the_select_list() {
         [(1, 50), (2, 50), (3, 50)]
     );
 }
+
+#[test]
+fn test_a_named_window_orders_by_an_aggregate() {
+    let db = Database::open("memory://named_window_over_aggregate").unwrap();
+    db.execute(
+        "CREATE TABLE x (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO x VALUES (1, 1, 10), (2, 2, 20), (3, 3, 30), (4, 1, 40)",
+        (),
+    )
+    .unwrap();
+    assert_eq!(
+        pairs(
+            &db,
+            "SELECT a, RANK() OVER w FROM x GROUP BY a WINDOW w AS (ORDER BY SUM(b) DESC) ORDER BY a"
+        ),
+        [(1, 1), (2, 3), (3, 2)]
+    );
+    assert_eq!(
+        pairs(
+            &db,
+            "SELECT a, ROW_NUMBER() OVER w FROM x GROUP BY a WINDOW w AS (PARTITION BY COUNT(*) ORDER BY a) ORDER BY a"
+        ),
+        [(1, 1), (2, 1), (3, 2)]
+    );
+}
