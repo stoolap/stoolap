@@ -108,3 +108,17 @@ fn test_a_derived_table_or_cte_column_outside_the_select_list_sorts() {
         [3, 2, 1]
     );
 }
+
+#[test]
+fn test_an_alias_inside_an_in_list_sorts_the_projected_row() {
+    let db = Database::open("memory://order_by_alias_in_list").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, -1), (2, 1)", ())
+        .unwrap();
+    // z is 1 for a = -1, so that row sorts first
+    assert_eq!(
+        ints(&db, "SELECT -a AS z FROM t ORDER BY 1 IN (z, 99), a"),
+        [-1, 1]
+    );
+}

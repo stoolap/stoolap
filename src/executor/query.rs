@@ -8676,7 +8676,9 @@ impl Executor {
                     || case.else_value.as_ref().is_some_and(|e| check(e))
             }
             Expression::Between(b) => check(&b.expr) || check(&b.lower) || check(&b.upper),
-            Expression::In(i) => check(&i.left),
+            Expression::In(i) => check(&i.left) || check(&i.right),
+            Expression::List(list) => list.elements.iter().any(check),
+            Expression::ExpressionList(list) => list.expressions.iter().any(check),
             Expression::Like(l) => check(&l.left) || check(&l.pattern),
             Expression::Distinct(d) => check(&d.expr),
             Expression::Window(w) => w.function.arguments.iter().any(check),
