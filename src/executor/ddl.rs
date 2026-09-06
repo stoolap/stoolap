@@ -189,6 +189,18 @@ impl Executor {
             TableConstraint::PrimaryKey(cols) if cols.len() == 1 => Some(cols[0].value.as_str()),
             _ => None,
         });
+        // The columns of a composite PRIMARY KEY hold no NULL, or the
+        // unique index that keeps the key would let (NULL, 1) in twice
+        let composite_pk_columns: Vec<&str> = stmt
+            .table_constraints
+            .iter()
+            .filter_map(|c| match c {
+                TableConstraint::PrimaryKey(cols) if cols.len() > 1 => Some(cols),
+                _ => None,
+            })
+            .flatten()
+            .map(|c| c.value.as_str())
+            .collect();
 
         for col_def in &stmt.columns {
             let col_name = &col_def.name.value;
@@ -196,7 +208,10 @@ impl Executor {
             let nullable = !col_def
                 .constraints
                 .iter()
-                .any(|c| matches!(c, ColumnConstraint::NotNull));
+                .any(|c| matches!(c, ColumnConstraint::NotNull))
+                && !composite_pk_columns
+                    .iter()
+                    .any(|pk| pk.eq_ignore_ascii_case(col_name));
             let is_primary_key = col_def
                 .constraints
                 .iter()

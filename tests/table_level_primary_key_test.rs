@@ -78,3 +78,21 @@ fn test_a_table_level_primary_key_over_one_column_is_the_column_key() {
     assert_eq!(rows(&db, "SELECT id, v FROM t1 ORDER BY id"), ["1,12"]);
     assert_eq!(rows(&db, "SELECT v FROM t1 WHERE id = 1"), ["12"]);
 }
+
+#[test]
+fn test_a_composite_primary_key_takes_no_null() {
+    let db = Database::open("memory://composite_primary_key_null").unwrap();
+    db.execute(
+        "CREATE TABLE cu (k1 INTEGER, k2 INTEGER, v INTEGER, PRIMARY KEY (k1, k2))",
+        (),
+    )
+    .unwrap();
+    assert!(db
+        .execute("INSERT INTO cu VALUES (NULL, 1, 10)", ())
+        .is_err());
+    assert!(db
+        .execute("INSERT INTO cu VALUES (1, NULL, 10)", ())
+        .is_err());
+    db.execute("INSERT INTO cu VALUES (1, 1, 10)", ()).unwrap();
+    assert_eq!(rows(&db, "SELECT COUNT(*) FROM cu"), ["1"]);
+}
