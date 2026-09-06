@@ -470,9 +470,15 @@ impl Executor {
         };
 
         // ORDER BY, LIMIT and OFFSET belong to the whole set operation, so
-        // the first branch runs without them, apart from that bound
+        // the first branch runs without them, apart from that bound. With
+        // no ORDER BY or OFFSET the statement's own LIMIT is that bound,
+        // so the statement runs as it is, without a copy
         let branch_stmt;
-        let branch = if stmt.set_operations.is_empty() {
+        let branch = if stmt.set_operations.is_empty()
+            || (stmt.order_by.is_empty()
+                && stmt.offset.is_none()
+                && (stmt.limit.is_none() || set_limit.is_some()))
+        {
             stmt
         } else {
             branch_stmt = SelectStatement {

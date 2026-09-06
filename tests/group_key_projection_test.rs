@@ -122,3 +122,33 @@ fn test_counting_alone_over_a_text_key_of_a_derived_table() {
         ["1,NULL", "2,p", "2,q"]
     );
 }
+
+#[test]
+fn test_a_derived_group_by_keeps_every_select_expression() {
+    let db = Database::open("memory://group_key_projection_derived_exprs").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b')", ())
+        .unwrap();
+    // An expression over the group column beside the aggregates is a
+    // column of its own, whatever path answers the query
+    let rows: Vec<(String, String, i64)> = db
+        .query(
+            "SELECT k, UPPER(k), COUNT(*) FROM (SELECT k FROM t) s GROUP BY k ORDER BY k",
+            (),
+        )
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (
+                r.get::<String>(0).unwrap(),
+                r.get::<String>(1).unwrap(),
+                r.get::<i64>(2).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [("a".into(), "A".into(), 2), ("b".into(), "B".into(), 1)]
+    );
+}
