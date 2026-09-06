@@ -615,6 +615,10 @@ pub enum Op {
     /// Stack: [value] -> [bool]
     NotInSet(CompactArc<ValueSet>, bool), // set, has_null
 
+    /// IN over items evaluated at run time; the value is judged once
+    /// Stack: [value, item_1, ..., item_n] -> [bool]
+    InList(u16), // item count
+
     /// BETWEEN check: value BETWEEN low AND high
     /// Stack: [value, low, high] -> [bool]
     Between,
@@ -943,6 +947,7 @@ impl std::fmt::Debug for Op {
             Op::NotInSet(set, has_null) => {
                 write!(f, "NotInSet(len={}, has_null={})", set.len(), has_null)
             }
+            Op::InList(count) => write!(f, "InList({})", count),
             Op::Between => write!(f, "Between"),
             Op::NotBetween => write!(f, "NotBetween"),
             Op::InTupleSet {

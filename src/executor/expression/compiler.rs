@@ -1166,43 +1166,19 @@ impl<'a> ExprCompiler<'a> {
                     ))
                 }
             };
-            let operator = |op: &str| {
-                crate::parser::token::Token::new(
-                    crate::parser::token::TokenType::Operator,
-                    op,
-                    crate::parser::token::Position::default(),
-                )
-            };
-            let mut chain: Option<Expression> = None;
-            for item in items {
-                let equal = Expression::Infix(InfixExpression::new(
-                    operator("="),
-                    Box::new((*in_expr.left).clone()),
-                    "=",
-                    Box::new(item.clone()),
-                ));
-                chain = Some(match chain {
-                    None => equal,
-                    Some(previous) => Expression::Infix(InfixExpression::new(
-                        crate::parser::token::Token::new(
-                            crate::parser::token::TokenType::Keyword,
-                            "OR",
-                            crate::parser::token::Position::default(),
-                        ),
-                        Box::new(previous),
-                        "OR",
-                        Box::new(equal),
-                    )),
-                });
-            }
-            match chain {
-                Some(chain) => {
-                    self.compile_expr(&chain, builder)?;
-                    if in_expr.not {
-                        builder.emit(Op::Not);
-                    }
+            // The value is evaluated once and judged against every item,
+            // so a volatile left side rolls a single time
+            if items.is_empty() {
+                builder.emit(Op::LoadConst(Value::Boolean(in_expr.not)));
+            } else {
+                self.compile_expr(&in_expr.left, builder)?;
+                for item in &items {
+                    self.compile_expr(item, builder)?;
                 }
-                None => builder.emit(Op::LoadConst(Value::Boolean(in_expr.not))),
+                builder.emit(Op::InList(items.len() as u16));
+                if in_expr.not {
+                    builder.emit(Op::Not);
+                }
             }
         }
 

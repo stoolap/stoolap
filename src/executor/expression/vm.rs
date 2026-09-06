@@ -1356,6 +1356,23 @@ impl ExprVM {
                     pc += 1;
                 }
 
+                Op::InList(count) => {
+                    let start = self.stack.len().saturating_sub(*count as usize);
+                    let items: Vec<Value> = self.stack.drain(start..).collect();
+                    let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let result = if v.is_null() {
+                        Value::Null(DataType::Boolean)
+                    } else if items.iter().any(|item| !item.is_null() && *item == v) {
+                        Value::Boolean(true)
+                    } else if items.iter().any(Value::is_null) {
+                        Value::Null(DataType::Boolean)
+                    } else {
+                        Value::Boolean(false)
+                    };
+                    self.stack.push(result);
+                    pc += 1;
+                }
+
                 Op::NotInSet(set, has_null) => {
                     let v = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let result = if set.is_empty() && !*has_null {

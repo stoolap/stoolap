@@ -46,3 +46,34 @@ fn test_in_over_expressions() {
     assert_eq!(count("a NOT IN (b, NULL)"), 0);
     assert_eq!(count("a IN (b * 2, 1)"), 1);
 }
+
+#[test]
+fn test_the_value_is_evaluated_once() {
+    let db = Database::open("memory://in_list_value_once").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, b BOOLEAN)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, true), (2, false)", ())
+        .unwrap();
+    // A value judged against b and NOT b is in the list whatever it is,
+    // unless it is rolled again for each item
+    for _ in 0..200 {
+        let hits: Vec<bool> = db
+            .query("SELECT (RANDOM() < 0.5) IN (b, NOT b) FROM t", ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<bool>(0).unwrap())
+            .collect();
+        assert_eq!(hits, [true, true]);
+    }
+    let nulls: Vec<Option<bool>> = db
+        .query(
+            "SELECT id IN (NULL, id + 0), id IN (NULL, 5), NULL IN (id) FROM t",
+            (),
+        )
+        .unwrap()
+        .flat_map(|r| {
+            let r = r.unwrap();
+            [0, 1, 2].map(|i| r.get::<Option<bool>>(i).unwrap())
+        })
+        .collect();
+    assert_eq!(nulls, [Some(true), None, None, Some(true), None, None]);
+}

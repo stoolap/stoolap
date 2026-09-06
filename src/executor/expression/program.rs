@@ -269,6 +269,8 @@ impl Program {
 
                 // Pop 3, push 1 (-2)
                 Op::Between | Op::NotBetween => -2,
+                // Pop the value and its items, push 1
+                Op::InList(count) => -(*count as i32),
 
                 // Dynamic pattern ops: Pop 2, push 1 (-1)
                 Op::LikeDynamic(_)
