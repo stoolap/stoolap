@@ -1642,7 +1642,9 @@ pub fn expression_to_string(expr: &Expression) -> String {
             format!("{}({})", func.function, args.join(", "))
         }
         // An operand bound less tightly than its operator keeps its
-        // parentheses, or (a + b) * 2 and a + b * 2 would read the same
+        // parentheses, or (a + b) * 2 and a + b * 2 would read the same; a
+        // right operand of the same precedence keeps them too unless it is
+        // the same associative operator, or a * (b % 3) and a * b % 3 would
         Expression::Infix(infix) => {
             let precedence = infix_precedence(&infix.op_type);
             let side = |operand: &Expression, on_the_right: bool| -> String {
@@ -1650,10 +1652,10 @@ pub fn expression_to_string(expr: &Expression) -> String {
                 match operand {
                     Expression::Infix(inner) => {
                         let inner_precedence = infix_precedence(&inner.op_type);
+                        let same_associative =
+                            inner.op_type == infix.op_type && infix_is_commutative(&infix.op_type);
                         if inner_precedence < precedence
-                            || (on_the_right
-                                && inner_precedence == precedence
-                                && !infix_is_commutative(&infix.op_type))
+                            || (on_the_right && inner_precedence == precedence && !same_associative)
                         {
                             format!("({text})")
                         } else {

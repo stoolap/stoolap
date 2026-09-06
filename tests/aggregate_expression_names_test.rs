@@ -51,4 +51,9 @@ fn test_parentheses_keep_aggregates_apart() {
     assert_eq!(values, [17, 10]);
     let (_, values) = row(&db, "SELECT SUM((a - b) - 1), SUM(a - (b - 1)) FROM x");
     assert_eq!(values, [-57, -51]);
+    let (columns, values) = row(&db, "SELECT SUM(a * (b % 3)), SUM(a * b % 3) FROM x");
+    assert_eq!(columns, ["SUM(a * (b % 3))", "SUM(a * b % 3)"]);
+    assert_eq!(values, [5, 2]);
+    let (_, values) = row(&db, "SELECT SUM(a * (b / 4)), SUM(a * b / 4) FROM x");
+    assert_eq!(values, [33, 34]);
 }
