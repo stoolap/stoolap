@@ -339,31 +339,43 @@ impl ScalarFunction for SubstringFunction {
         let s = value_to_string(&args[0]);
         let chars: Vec<char> = s.chars().collect();
 
-        // SQL SUBSTRING uses 1-based indexing
+        // SQL SUBSTRING counts from one. A start below one names a
+        // position before the string, and a negative one counts back from
+        // the end, so the window it opens may reach in from either side
         let start = value_to_i64(&args[1]).ok_or_else(|| {
             Error::invalid_argument("SUBSTRING start position must be an integer")
         })?;
+        let len = chars.len() as i64;
+        let start = if start < 0 {
+            len.saturating_add(start).saturating_add(1)
+        } else {
+            start
+        };
 
-        // Convert to 0-based index, handling negative values
-        let start_idx = if start < 1 { 0 } else { (start - 1) as usize };
-
-        if start_idx >= chars.len() {
+        // The window runs from the start for a length, or back from it for
+        // a negative one, and only the part inside the string is returned
+        let (from, to) = if args.len() == 3 {
+            let length = value_to_i64(&args[2])
+                .ok_or_else(|| Error::invalid_argument("SUBSTRING length must be an integer"))?;
+            // A length near the limits runs past either end of the string,
+            // which the clamp below turns into that end
+            if length < 0 {
+                (start.saturating_add(length), start)
+            } else {
+                (start, start.saturating_add(length))
+            }
+        } else {
+            (start, len + 1)
+        };
+        let from = from.max(1);
+        let to = to.min(len + 1);
+        if to <= from {
             return Ok(Value::Text(SmartString::from("")));
         }
 
-        let result: String = if args.len() == 3 {
-            let length = value_to_i64(&args[2])
-                .ok_or_else(|| Error::invalid_argument("SUBSTRING length must be an integer"))?;
-
-            if length < 0 {
-                return Ok(Value::Text(SmartString::from("")));
-            }
-
-            let end_idx = std::cmp::min(start_idx + length as usize, chars.len());
-            chars[start_idx..end_idx].iter().collect()
-        } else {
-            chars[start_idx..].iter().collect()
-        };
+        let result: String = chars[(from - 1) as usize..(to - 1) as usize]
+            .iter()
+            .collect();
 
         Ok(Value::Text(SmartString::from_string(result)))
     }
@@ -431,20 +443,31 @@ impl ScalarFunction for TrimFunction {
         FunctionInfo::new(
             "TRIM",
             FunctionType::Scalar,
-            "Removes leading and trailing whitespace from a string",
-            FunctionSignature::new(FunctionDataType::String, vec![FunctionDataType::Any], 1, 1),
+            "Removes leading and trailing whitespace, or the given characters, from a string",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![FunctionDataType::Any, FunctionDataType::String],
+                1,
+                2,
+            ),
         )
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        validate_arg_count!(args, "TRIM", 1);
+        validate_arg_count!(args, "TRIM", 1, 2);
 
-        if args[0].is_null() {
+        if args[0].is_null() || args.get(1).is_some_and(Value::is_null) {
             return Ok(Value::null_unknown());
         }
 
         let s = value_to_string(&args[0]);
-        Ok(Value::Text(SmartString::from(s.trim())))
+        Ok(Value::Text(SmartString::from(match args.get(1) {
+            Some(chars) => {
+                let chars = value_to_string(chars);
+                s.trim_matches(|c| chars.contains(c))
+            }
+            None => s.trim(),
+        })))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -469,20 +492,31 @@ impl ScalarFunction for LtrimFunction {
         FunctionInfo::new(
             "LTRIM",
             FunctionType::Scalar,
-            "Removes leading whitespace from a string",
-            FunctionSignature::new(FunctionDataType::String, vec![FunctionDataType::Any], 1, 1),
+            "Removes leading whitespace, or the given characters, from a string",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![FunctionDataType::Any, FunctionDataType::String],
+                1,
+                2,
+            ),
         )
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        validate_arg_count!(args, "LTRIM", 1);
+        validate_arg_count!(args, "LTRIM", 1, 2);
 
-        if args[0].is_null() {
+        if args[0].is_null() || args.get(1).is_some_and(Value::is_null) {
             return Ok(Value::null_unknown());
         }
 
         let s = value_to_string(&args[0]);
-        Ok(Value::Text(SmartString::from(s.trim_start())))
+        Ok(Value::Text(SmartString::from(match args.get(1) {
+            Some(chars) => {
+                let chars = value_to_string(chars);
+                s.trim_start_matches(|c| chars.contains(c))
+            }
+            None => s.trim_start(),
+        })))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -507,20 +541,31 @@ impl ScalarFunction for RtrimFunction {
         FunctionInfo::new(
             "RTRIM",
             FunctionType::Scalar,
-            "Removes trailing whitespace from a string",
-            FunctionSignature::new(FunctionDataType::String, vec![FunctionDataType::Any], 1, 1),
+            "Removes trailing whitespace, or the given characters, from a string",
+            FunctionSignature::new(
+                FunctionDataType::String,
+                vec![FunctionDataType::Any, FunctionDataType::String],
+                1,
+                2,
+            ),
         )
     }
 
     fn evaluate(&self, args: &[Value]) -> Result<Value> {
-        validate_arg_count!(args, "RTRIM", 1);
+        validate_arg_count!(args, "RTRIM", 1, 2);
 
-        if args[0].is_null() {
+        if args[0].is_null() || args.get(1).is_some_and(Value::is_null) {
             return Ok(Value::null_unknown());
         }
 
         let s = value_to_string(&args[0]);
-        Ok(Value::Text(SmartString::from(s.trim_end())))
+        Ok(Value::Text(SmartString::from(match args.get(1) {
+            Some(chars) => {
+                let chars = value_to_string(chars);
+                s.trim_end_matches(|c| chars.contains(c))
+            }
+            None => s.trim_end(),
+        })))
     }
 
     fn clone_box(&self) -> Box<dyn ScalarFunction> {
@@ -570,6 +615,12 @@ impl ScalarFunction for ReplaceFunction {
         let s = value_to_string(&args[0]);
         let from = value_to_string(&args[1]);
         let to = value_to_string(&args[2]);
+
+        // There is nothing to find in a string that holds no characters,
+        // so the subject is returned as it stands
+        if from.is_empty() {
+            return Ok(Value::Text(SmartString::from_string(s)));
+        }
 
         Ok(Value::Text(SmartString::from_string(s.replace(&from, &to))))
     }

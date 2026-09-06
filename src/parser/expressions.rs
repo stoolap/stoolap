@@ -1006,6 +1006,15 @@ impl Parser {
             return None;
         }
 
+        // OVER (w ...) builds on a named window: its own ORDER BY, where the
+        // named window has none, and its own frame go on top of it
+        let window_ref = if self.peek_token_is(TokenType::Identifier) {
+            self.next_token(); // consume window name
+            Some(self.cur_token.literal.clone())
+        } else {
+            None
+        };
+
         let mut partition_by = Vec::new();
         let mut order_by = Vec::new();
         let mut frame = None;
@@ -1068,7 +1077,7 @@ impl Parser {
         Some(Expression::Window(Box::new(WindowExpression {
             token,
             function: Box::new(function),
-            window_ref: None,
+            window_ref,
             partition_by,
             order_by,
             frame,

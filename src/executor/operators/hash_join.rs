@@ -35,6 +35,7 @@
 use crate::common::CompactArc;
 use crate::core::value::NULL_VALUE;
 use crate::core::{Result, Row};
+use crate::executor::expression::RowFilter;
 use crate::executor::hash_table::{hash_row_keys, verify_key_equality, JoinHashTable};
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 
@@ -230,6 +231,10 @@ pub struct HashJoinOperator {
     current_matches: Vec<usize>,
     probe_had_match: bool,
 
+    // Non-equality ON conditions, applied to each candidate pair before it
+    // counts as a match. Empty when the whole ON clause is equi-keys.
+    residual: Vec<RowFilter>,
+
     // For OUTER joins: track which build rows were matched
     build_matched: Vec<bool>,
     returning_unmatched_build: bool,
@@ -296,6 +301,7 @@ impl HashJoinOperator {
             current_match_idx: 0,
             current_matches: Vec::new(),
             probe_had_match: false,
+            residual: Vec::new(),
             build_matched: Vec::new(),
             returning_unmatched_build: false,
             unmatched_build_idx: 0,
@@ -406,6 +412,7 @@ impl HashJoinOperator {
             current_match_idx: 0,
             current_matches: Vec::new(),
             probe_had_match: false,
+            residual: Vec::new(),
             build_matched,
             returning_unmatched_build: false,
             unmatched_build_idx: 0,
@@ -453,6 +460,7 @@ impl HashJoinOperator {
             current_match_idx: 0,
             current_matches: Vec::new(),
             probe_had_match: false,
+            residual: Vec::new(),
             build_matched: Vec::new(),
             returning_unmatched_build: false,
             unmatched_build_idx: 0,
@@ -463,6 +471,32 @@ impl HashJoinOperator {
             opened: false,
             probe_exhausted: false,
         }
+    }
+
+    /// Attach the non-equality part of the ON clause.
+    ///
+    /// The filters are compiled against the joined column layout
+    /// (left columns followed by right columns). A pair that fails them is
+    /// not a match: it is neither emitted nor counted when deciding which
+    /// rows an OUTER join has to NULL-pad.
+    pub fn with_residual(mut self, residual: Vec<RowFilter>) -> Self {
+        self.residual = residual;
+        self
+    }
+
+    /// Test a candidate pair against the residual ON conditions.
+    fn residual_matches(&self, build_idx: usize) -> Result<bool> {
+        let probe_row = match self.current_probe_row.as_ref() {
+            Some(row) => row.clone(),
+            None => return Ok(true),
+        };
+        let candidate = self.combine_rows_direct(probe_row, build_idx).into_owned();
+        for filter in &self.residual {
+            if !filter.matches_checked(&candidate)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Get the key indices based on which side is build vs probe.
@@ -674,6 +708,10 @@ impl Operator for HashJoinOperator {
                     self.probe_key_indices(),
                     self.build_key_indices(),
                 ) {
+                    if !self.residual.is_empty() && !self.residual_matches(build_idx)? {
+                        continue;
+                    }
+
                     self.probe_had_match = true;
 
                     // SEMI JOIN: Return probe row only (no build columns), then skip remaining matches

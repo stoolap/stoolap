@@ -35,11 +35,12 @@ use crate::core::value::NULL_VALUE;
 use crate::core::{DataType, Operator, Row, Schema, Value};
 use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
-    BetweenExpression, BooleanLiteral, CaseExpression, CastExpression, DistinctExpression,
-    Expression, ExpressionList, FloatLiteral, FunctionCall, Identifier, InExpression,
-    InHashSetExpression, InfixExpression, InfixOperator, IntegerLiteral, LikeExpression,
-    ListExpression, NullLiteral, PrefixExpression, QualifiedIdentifier, StringLiteral, WhenClause,
-    WindowFrameBound,
+    AliasedExpression, AllAnyExpression, BetweenExpression, BooleanLiteral, CaseExpression,
+    CastExpression, DistinctExpression, ExistsExpression, Expression, ExpressionList, FloatLiteral,
+    FunctionCall, Identifier, InExpression, InHashSetExpression, InfixExpression, InfixOperator,
+    IntegerLiteral, JoinTableSource, LikeExpression, ListExpression, NullLiteral, PrefixExpression,
+    QualifiedIdentifier, ScalarSubquery, SelectStatement, StringLiteral, SubqueryTableSource,
+    WhenClause, WindowFrameBound,
 };
 use crate::parser::token::{Position, Token, TokenType};
 
@@ -99,11 +100,31 @@ pub fn value_to_expression(v: &Value) -> Expression {
         Value::Null(_) => Expression::NullLiteral(NullLiteral {
             token: dummy_token("NULL", TokenType::Keyword),
         }),
-        _ => Expression::StringLiteral(StringLiteral {
-            token: dummy_token(&format!("'{}'", v), TokenType::String),
+        // A timestamp keeps its type through the literal's hint, the way
+        // TIMESTAMP '...' does when written
+        Value::Timestamp(_) => Expression::StringLiteral(StringLiteral {
+            token: dummy_token(&format!("TIMESTAMP '{}'", v), TokenType::String),
             value: v.to_string().into(),
-            type_hint: None,
+            type_hint: Some("TIMESTAMP".into()),
         }),
+        // JSON and a vector keep theirs through an explicit CAST; a hint
+        // alone would read as the loose one the parser puts on any text
+        // shaped like an object
+        Value::Extension(_) => {
+            let type_name = match v.data_type() {
+                crate::core::DataType::Vector => "VECTOR",
+                _ => "JSON",
+            };
+            Expression::Cast(CastExpression {
+                token: dummy_token("CAST", TokenType::Keyword),
+                expr: Box::new(Expression::StringLiteral(StringLiteral {
+                    token: dummy_token(&format!("'{}'", v), TokenType::String),
+                    value: v.to_string().into(),
+                    type_hint: None,
+                })),
+                type_name: type_name.into(),
+            })
+        }
     }
 }
 
@@ -134,20 +155,25 @@ pub fn substitute_outer_references(
 /// alone: an inner column may share its name with an outer one, and SQL
 /// binds the nearer scope first.
 pub struct InnerScope<'a> {
-    pub table: &'a str,
-    pub alias: Option<&'a str>,
-    pub schema: &'a Schema,
+    /// The names the subquery's own FROM defines. With an alias only the
+    /// alias names the table; the table's own name may then be an alias in
+    /// the outer query.
+    pub tables: &'a [&'a str],
+    /// The scanned table's schema, where there is one table to have it.
+    /// Without it a bare name is left alone: it can only mean the inner one
+    pub schema: Option<&'a Schema>,
 }
 
 impl InnerScope<'_> {
-    /// With an alias only the alias names the inner table; the table's own
-    /// name may then be an alias in the outer query.
     fn owns_qualifier(&self, qualifier: &str) -> bool {
-        qualifier == self.alias.unwrap_or(self.table)
+        self.tables.contains(&qualifier)
     }
 
     fn owns_column(&self, column: &str) -> bool {
-        self.schema.column_index_map().contains_key(column)
+        match self.schema {
+            Some(schema) => schema.column_index_map().contains_key(column),
+            None => true,
+        }
     }
 }
 
@@ -386,6 +412,15 @@ fn substitute_outer_references_inner(
                     type_name: cast.type_name.clone(),
                 })
             }),
+        Expression::Aliased(aliased) => {
+            substitute_outer_references_inner(&aliased.expression, outer_row, scope).map(|expr| {
+                Expression::Aliased(AliasedExpression {
+                    token: aliased.token.clone(),
+                    expression: Box::new(expr),
+                    alias: aliased.alias.clone(),
+                })
+            })
+        }
         Expression::Distinct(distinct) => {
             substitute_outer_references_inner(&distinct.expr, outer_row, scope).map(|expr| {
                 Expression::Distinct(DistinctExpression {
@@ -460,7 +495,148 @@ fn substitute_outer_references_inner(
             })))
         }
 
+        // A subquery keeps what its own FROM defines and takes the rest
+        // from the outer row, so one that reads only the outer row runs
+        // once instead of once per row of the query holding it
+        Expression::ScalarSubquery(subquery) => {
+            substitute_in_select(&subquery.subquery, outer_row, scope).map(|select| {
+                Expression::ScalarSubquery(ScalarSubquery {
+                    token: subquery.token.clone(),
+                    subquery: Box::new(select),
+                })
+            })
+        }
+        Expression::Exists(exists) => {
+            substitute_in_select(&exists.subquery, outer_row, scope).map(|select| {
+                Expression::Exists(ExistsExpression {
+                    token: exists.token.clone(),
+                    subquery: Box::new(select),
+                })
+            })
+        }
+        Expression::AllAny(all_any) => {
+            let new_left = substitute_outer_references_inner(&all_any.left, outer_row, scope);
+            let new_subquery = substitute_in_select(&all_any.subquery, outer_row, scope);
+            if new_left.is_none() && new_subquery.is_none() {
+                return None;
+            }
+            Some(Expression::AllAny(AllAnyExpression {
+                token: all_any.token.clone(),
+                left: Box::new(new_left.unwrap_or_else(|| (*all_any.left).clone())),
+                operator: all_any.operator.clone(),
+                all_any_type: all_any.all_any_type,
+                subquery: Box::new(new_subquery.unwrap_or_else(|| (*all_any.subquery).clone())),
+            }))
+        }
+
         // Literals and other expressions that don't need substitution
+        _ => None,
+    }
+}
+
+/// The statement with the outer row bound into its expressions; the names
+/// its own FROM defines are shielded along with the enclosing scope's
+fn substitute_in_select(
+    stmt: &SelectStatement,
+    outer_row: &FxHashMap<CompactArc<str>, Value>,
+    scope: Option<&InnerScope<'_>>,
+) -> Option<SelectStatement> {
+    let mut tables: Vec<String> = scope
+        .map(|s| s.tables.iter().map(|t| t.to_string()).collect())
+        .unwrap_or_default();
+    if let Some(table_expr) = stmt.table_expr.as_deref() {
+        collect_table_aliases(table_expr, &mut tables);
+    }
+    let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
+    let inner = InnerScope {
+        tables: &tables,
+        schema: None,
+    };
+    let inner = Some(&inner);
+    let substitute = |expr: &Expression| substitute_outer_references_inner(expr, outer_row, inner);
+
+    let columns: Vec<Option<Expression>> = stmt.columns.iter().map(substitute).collect();
+    let table_expr = stmt
+        .table_expr
+        .as_deref()
+        .and_then(|expr| substitute_in_table_expr(expr, outer_row, inner));
+    let where_clause = stmt.where_clause.as_deref().and_then(substitute);
+    let having = stmt.having.as_deref().and_then(substitute);
+    let order_by: Vec<Option<Expression>> = stmt
+        .order_by
+        .iter()
+        .map(|o| substitute(&o.expression))
+        .collect();
+    let changed = columns.iter().any(Option::is_some)
+        || table_expr.is_some()
+        || where_clause.is_some()
+        || having.is_some()
+        || order_by.iter().any(Option::is_some);
+    if !changed {
+        return None;
+    }
+
+    let mut bound = stmt.clone();
+    for (target, new) in bound.columns.iter_mut().zip(columns) {
+        if let Some(new) = new {
+            *target = new;
+        }
+    }
+    if let Some(expr) = table_expr {
+        bound.table_expr = Some(Box::new(expr));
+    }
+    if let Some(expr) = where_clause {
+        bound.where_clause = Some(Box::new(expr));
+    }
+    if let Some(expr) = having {
+        bound.having = Some(Box::new(expr));
+    }
+    for (target, new) in bound.order_by.iter_mut().zip(order_by) {
+        if let Some(new) = new {
+            target.expression = new;
+        }
+    }
+    Some(bound)
+}
+
+/// A FROM with the outer row bound into its join conditions and derived tables
+fn substitute_in_table_expr(
+    expr: &Expression,
+    outer_row: &FxHashMap<CompactArc<str>, Value>,
+    scope: Option<&InnerScope<'_>>,
+) -> Option<Expression> {
+    match expr {
+        Expression::JoinSource(join) => {
+            let left = substitute_in_table_expr(&join.left, outer_row, scope);
+            let right = substitute_in_table_expr(&join.right, outer_row, scope);
+            let condition = join
+                .condition
+                .as_deref()
+                .and_then(|c| substitute_outer_references_inner(c, outer_row, scope));
+            if left.is_none() && right.is_none() && condition.is_none() {
+                return None;
+            }
+            Some(Expression::JoinSource(Box::new(JoinTableSource {
+                token: join.token.clone(),
+                left: Box::new(left.unwrap_or_else(|| (*join.left).clone())),
+                join_type: join.join_type.clone(),
+                right: Box::new(right.unwrap_or_else(|| (*join.right).clone())),
+                condition: match condition {
+                    Some(c) => Some(Box::new(c)),
+                    None => join.condition.clone(),
+                },
+                using_columns: join.using_columns.clone(),
+            })))
+        }
+        Expression::SubquerySource(source) => {
+            substitute_in_select(&source.subquery, outer_row, scope).map(|select| {
+                Expression::SubquerySource(Box::new(SubqueryTableSource {
+                    token: source.token.clone(),
+                    subquery: Box::new(select),
+                    alias: source.alias.clone(),
+                }))
+            })
+        }
         _ => None,
     }
 }
@@ -1151,6 +1327,23 @@ pub fn get_table_alias_from_expr(expr: &Expression) -> Option<String> {
     }
 }
 
+/// The lowercased table names and aliases of every leaf of a FROM
+/// expression, so a nested join lists all of its tables
+pub fn collect_table_aliases(expr: &Expression, out: &mut Vec<String>) {
+    match expr {
+        Expression::JoinSource(join) => {
+            collect_table_aliases(&join.left, out);
+            collect_table_aliases(&join.right, out);
+        }
+        Expression::Aliased(aliased) => out.push(aliased.alias.value_lower.to_string()),
+        _ => {
+            if let Some(alias) = get_table_alias_from_expr(expr) {
+                out.push(alias.to_lowercase());
+            }
+        }
+    }
+}
+
 /// Strip table qualifier from an expression, replacing qualified identifiers
 /// with unqualified ones. Used when pushing filters to individual table scans.
 pub fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression {
@@ -1607,15 +1800,76 @@ pub fn expression_to_string(expr: &Expression) -> String {
             let args: Vec<String> = func.arguments.iter().map(expression_to_string).collect();
             format!("{}({})", func.function, args.join(", "))
         }
+        // An operand bound less tightly than its operator keeps its
+        // parentheses, or (a + b) * 2 and a + b * 2 would read the same; a
+        // right operand of the same precedence keeps them too unless it is
+        // the same associative operator, or a * (b % 3) and a * b % 3 would
         Expression::Infix(infix) => {
+            let precedence = infix_precedence(&infix.op_type);
+            let side = |operand: &Expression, on_the_right: bool| -> String {
+                let text = expression_to_string(operand);
+                match operand {
+                    Expression::Infix(inner) => {
+                        let inner_precedence = infix_precedence(&inner.op_type);
+                        // Arithmetic is not associative in floats or at the
+                        // limits of an integer, so only these fold
+                        let same_associative = inner.op_type == infix.op_type
+                            && matches!(
+                                infix.op_type,
+                                InfixOperator::Or
+                                    | InfixOperator::And
+                                    | InfixOperator::Xor
+                                    | InfixOperator::Concat
+                            );
+                        if inner_precedence < precedence
+                            || (on_the_right && inner_precedence == precedence && !same_associative)
+                        {
+                            format!("({text})")
+                        } else {
+                            text
+                        }
+                    }
+                    _ => text,
+                }
+            };
             format!(
                 "{} {} {}",
-                expression_to_string(&infix.left),
+                side(&infix.left, false),
                 infix.operator,
-                expression_to_string(&infix.right)
+                side(&infix.right, true)
+            )
+        }
+        Expression::Prefix(prefix) => {
+            let operand = expression_to_string(&prefix.right);
+            let operand = match prefix.right.as_ref() {
+                Expression::Infix(_) => format!("({operand})"),
+                _ => operand,
+            };
+            if prefix.operator == "-" || prefix.operator == "+" {
+                format!("{}{}", prefix.operator, operand)
+            } else {
+                format!("{} {}", prefix.operator, operand)
+            }
+        }
+        Expression::Cast(cast) => {
+            format!(
+                "CAST({} AS {})",
+                expression_to_string(&cast.expr),
+                cast.type_name
             )
         }
         _ => format!("{}", expr),
+    }
+}
+
+/// How tightly an infix operator binds, higher first
+fn infix_precedence(op: &InfixOperator) -> u8 {
+    match op {
+        InfixOperator::Or => 1,
+        InfixOperator::And | InfixOperator::Xor => 2,
+        InfixOperator::Multiply | InfixOperator::Divide | InfixOperator::Modulo => 5,
+        InfixOperator::Add | InfixOperator::Subtract | InfixOperator::Concat => 4,
+        _ => 3,
     }
 }
 
@@ -2185,9 +2439,8 @@ mod tests {
             .add("Name", DataType::Text)
             .build();
         let scope = InnerScope {
-            table: "parent",
-            alias: Some("p"),
-            schema: &schema,
+            tables: &["p"],
+            schema: Some(&schema),
         };
         let mut outer: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
         for (key, value) in [
@@ -2243,9 +2496,8 @@ mod tests {
 
         // without an alias, the table name is the inner qualifier
         let bare = InnerScope {
-            table: "parent",
-            alias: None,
-            schema: &schema,
+            tables: &["parent"],
+            schema: Some(&schema),
         };
         assert!(matches!(
             substitute_outer_references_in_scope(&qualified("parent", "id"), &outer, &bare),

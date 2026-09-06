@@ -185,11 +185,11 @@ SELECT COUNT(*) FROM types_test WHERE i_val = NULL
 ----
 0
 
-# NULL = NULL in stoolap evaluates to true (non-standard behavior)
+# NULL = NULL is unknown, so it keeps no rows
 query I
 SELECT COUNT(*) FROM types_test WHERE NULL = NULL
 ----
-2
+0
 
 statement ok
 DROP TABLE types_test

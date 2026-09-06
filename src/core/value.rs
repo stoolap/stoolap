@@ -600,6 +600,7 @@ impl Value {
                     Value::Integer(v) => Value::Integer(*v),
                     Value::Float(v) => Value::Integer(*v as i64),
                     Value::Text(s) => s
+                        .trim()
                         .parse::<i64>()
                         .map(Value::Integer)
                         .unwrap_or(Value::Null(target_type)),
@@ -613,6 +614,7 @@ impl Value {
                     Value::Float(v) => Value::Float(*v),
                     Value::Integer(v) => Value::Float(*v as f64),
                     Value::Text(s) => s
+                        .trim()
                         .parse::<f64>()
                         .map(Value::Float)
                         .unwrap_or(Value::Null(target_type)),

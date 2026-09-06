@@ -231,6 +231,8 @@ fn build_default_slots(
 struct CompiledUpsert {
     /// (column_index, column_type, vector_dimensions, compiled_program)
     compiled_updates: Vec<(usize, DataType, u16, super::expression::SharedProgram)>,
+    /// DO UPDATE ... WHERE, read against the row met and the EXCLUDED row
+    compiled_where: Option<super::expression::SharedProgram>,
     /// (column_index, column_name, check_expression_text, compiled_check_program)
     /// The program is executed with a single-column row containing the new value.
     compiled_checks: Vec<(usize, String, String, super::expression::SharedProgram)>,
@@ -451,6 +453,17 @@ impl Executor {
 
         // Check if there's an active explicit transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
+
+        // INSERT is dispatched before the dispatcher puts the transaction
+        // id in the context, so the expressions are given it here
+        let ctx_with_txn;
+        let ctx = match (*active_tx).as_ref().map(|t| t.transaction.id()) {
+            Some(txn_id) => {
+                ctx_with_txn = ctx.with_transaction_id(txn_id as u64);
+                &ctx_with_txn
+            }
+            None => ctx,
+        };
 
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
@@ -762,12 +775,13 @@ impl Executor {
                                 ctx,
                                 has_returning,
                             ) {
-                                Ok(Some(updated_row)) => {
-                                    returning_rows.push(updated_row);
-                                    rows_affected += 1;
-                                }
-                                Ok(None) => {
-                                    rows_affected += 1;
+                                Ok((updated, returned)) => {
+                                    if let Some(updated_row) = returned {
+                                        returning_rows.push(updated_row);
+                                    }
+                                    if updated {
+                                        rows_affected += 1;
+                                    }
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -811,12 +825,13 @@ impl Executor {
                                         ctx,
                                         has_returning,
                                     ) {
-                                        Ok(Some(updated_row)) => {
-                                            returning_rows.push(updated_row);
-                                            rows_affected += 1;
-                                        }
-                                        Ok(None) => {
-                                            rows_affected += 1;
+                                        Ok((updated, returned)) => {
+                                            if let Some(updated_row) = returned {
+                                                returning_rows.push(updated_row);
+                                            }
+                                            if updated {
+                                                rows_affected += 1;
+                                            }
                                         }
                                         Err(e) => return Err(e),
                                     }
@@ -1041,12 +1056,13 @@ impl Executor {
                                 ctx,
                                 has_returning,
                             ) {
-                                Ok(Some(updated_row)) => {
-                                    returning_rows.push(updated_row);
-                                    rows_affected += 1;
-                                }
-                                Ok(None) => {
-                                    rows_affected += 1;
+                                Ok((updated, returned)) => {
+                                    if let Some(updated_row) = returned {
+                                        returning_rows.push(updated_row);
+                                    }
+                                    if updated {
+                                        rows_affected += 1;
+                                    }
                                 }
                                 Err(e) => return Err(e),
                             }
@@ -1091,12 +1107,13 @@ impl Executor {
                                         ctx,
                                         has_returning,
                                     ) {
-                                        Ok(Some(updated_row)) => {
-                                            returning_rows.push(updated_row);
-                                            rows_affected += 1;
-                                        }
-                                        Ok(None) => {
-                                            rows_affected += 1;
+                                        Ok((updated, returned)) => {
+                                            if let Some(updated_row) = returned {
+                                                returning_rows.push(updated_row);
+                                            }
+                                            if updated {
+                                                rows_affected += 1;
+                                            }
                                         }
                                         Err(e) => return Err(e),
                                     }
@@ -1674,11 +1691,52 @@ impl Executor {
     }
 
     /// Execute an UPDATE statement
+    /// The expression a column's DEFAULT stands for in an UPDATE: its
+    /// default value, else its default expression, else NULL
+    fn column_default_expression(schema: &crate::core::Schema, name: &str) -> Result<Expression> {
+        let column = schema
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
+        // The expression comes first: a value kept beside it was computed
+        // once, when the column was added, and a RANDOM() default must be
+        // drawn again for every row
+        match (&column.default_expr, &column.default_value) {
+            (None, Some(value)) => Ok(super::utils::value_to_expression(value)),
+            (Some(text), _) => {
+                let statements = crate::parser::parse_sql(&format!("SELECT {}", text))
+                    .map_err(|e| Error::parse(e.to_string()))?;
+                match statements.into_iter().next() {
+                    Some(Statement::Select(select)) => select
+                        .columns
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| Error::parse(format!("the default of {name} is empty"))),
+                    _ => Err(Error::parse(format!(
+                        "the default of {name} is not an expression"
+                    ))),
+                }
+            }
+            (None, None) => Ok(super::utils::value_to_expression(&Value::null_unknown())),
+        }
+    }
+
     pub(crate) fn execute_update(
         &self,
         stmt: &UpdateStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        // A WITH clause is run first, so the subqueries can read it
+        let ctx_with_ctes;
+        let ctx = match &stmt.with {
+            Some(with_clause) => {
+                let registry = self.materialize_ctes(with_clause, ctx, None)?;
+                ctx_with_ctes = ctx.with_cte_data(registry.data());
+                &ctx_with_ctes
+            }
+            None => ctx,
+        };
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
 
@@ -1715,6 +1773,29 @@ impl Executor {
 
         // Pre-compute column names and indices to avoid schema borrow conflicts
         let schema = table.schema();
+
+        // SET col = DEFAULT reads the column's default
+        let defaulted_stmt;
+        let stmt = if stmt
+            .updates
+            .values()
+            .any(|e| matches!(e, Expression::Default(_)))
+        {
+            let mut updates = stmt.updates.clone();
+            for (name, expr) in updates.iter_mut() {
+                if matches!(expr, Expression::Default(_)) {
+                    *expr = Self::column_default_expression(schema, name.as_str())?;
+                }
+            }
+            defaulted_stmt = UpdateStatement {
+                updates,
+                ..stmt.clone()
+            };
+            &defaulted_stmt
+        } else {
+            stmt
+        };
+
         // OPTIMIZATION: Use CompactArc<Vec<String>> to share column names without cloning
         let column_names = schema.column_names_arc();
 
@@ -1885,6 +1966,7 @@ impl Executor {
         //
         // OPTIMIZATION: For correlated EXISTS/IN in WHERE, try semi-join optimization first.
         // This transforms O(outer × inner) per-row subquery execution to O(inner + outer).
+        let mut where_is_correlated = false;
         let (where_expr, needs_memory_filter, memory_where_clause): (
             Option<Box<dyn StorageExpr>>,
             bool,
@@ -1916,8 +1998,11 @@ impl Executor {
                     .or(exists_optimized)
                     .unwrap_or_else(|| (**where_clause).clone());
 
-                // Process any remaining non-correlated subqueries
-                if Self::has_subqueries(&current_expr) {
+                // What the semi-join rewrite refused is bound to each row as it is met
+                if Self::has_correlated_subqueries(&current_expr) {
+                    where_is_correlated = true;
+                    current_expr
+                } else if Self::has_subqueries(&current_expr) {
                     self.process_where_subqueries(&current_expr, ctx)?
                 } else {
                     current_expr
@@ -1928,14 +2013,18 @@ impl Executor {
                 (**where_clause).clone()
             };
 
-            // Try to push down predicate to storage layer
-            let (storage_expr, needs_mem) =
-                pushdown::try_pushdown(&processed_where, schema, Some(ctx));
-            if needs_mem {
-                // Complex expression (like a + b > 100) - use in-memory filtering
-                (storage_expr, true, Some(processed_where))
+            if where_is_correlated {
+                (None, true, Some(processed_where))
             } else {
-                (storage_expr, false, None)
+                // Try to push down predicate to storage layer
+                let (storage_expr, needs_mem) =
+                    pushdown::try_pushdown(&processed_where, schema, Some(ctx));
+                if needs_mem {
+                    // Complex expression (like a + b > 100) - use in-memory filtering
+                    (storage_expr, true, Some(processed_where))
+                } else {
+                    (storage_expr, false, None)
+                }
             }
         } else {
             (None, false, None)
@@ -1999,13 +2088,49 @@ impl Executor {
                 .any(|fks| super::foreign_key::fk_tree_needs_precheck(&self.engine, fks));
             if any_needs_precheck {
                 let parent_rows = table.collect_all_rows(where_expr.as_deref())?;
+                // A WHERE the semi-join rewrite refused is bound to each
+                // row here as it is in the update itself, or the check
+                // would look at rows the update does not touch
+                let bound_pairs: Vec<(CompactArc<str>, CompactArc<str>)> = if where_is_correlated {
+                    schema
+                        .column_names_lower_arc()
+                        .iter()
+                        .map(|col_lower| {
+                            let qualified =
+                                CompactArc::from(format!("{}.{}", table_name, col_lower).as_str());
+                            (CompactArc::from(col_lower.as_str()), qualified)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 for (_rid, row) in parent_rows.iter() {
                     if needs_memory_filter {
                         if let Some(ref mem_where) = memory_where_clause {
                             evaluator.set_row_array(row);
-                            match evaluator.evaluate_bool(mem_where) {
-                                Ok(true) => {}
-                                _ => continue,
+                            let held = if where_is_correlated {
+                                let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
+                                    FxHashMap::with_capacity_and_hasher(
+                                        bound_pairs.len() * 2,
+                                        Default::default(),
+                                    );
+                                for (i, (col_lower, qualified)) in bound_pairs.iter().enumerate() {
+                                    if let Some(value) = row.get(i) {
+                                        outer_row_map.insert(col_lower.clone(), value.clone());
+                                        outer_row_map.insert(qualified.clone(), value.clone());
+                                    }
+                                }
+                                let correlated_ctx = ctx.with_outer_row(
+                                    outer_row_map,
+                                    CompactArc::clone(&column_names),
+                                );
+                                self.process_correlated_where(mem_where, &correlated_ctx)
+                                    .and_then(|processed| evaluator.evaluate_bool(&processed))
+                            } else {
+                                evaluator.evaluate_bool(mem_where)
+                            };
+                            if !matches!(held, Ok(true)) {
+                                continue;
                             }
                         }
                     }
@@ -2070,17 +2195,7 @@ impl Executor {
             let mut scanner = table.scan(&all_col_indices, None)?;
             while scanner.next() {
                 let row = scanner.row();
-
-                // Check WHERE condition if needed
                 evaluator.set_row_array(row);
-                if needs_memory_filter {
-                    if let Some(ref where_clause) = memory_where_clause {
-                        match evaluator.evaluate_bool(where_clause) {
-                            Ok(true) => {}
-                            _ => continue,
-                        }
-                    }
-                }
 
                 // Get PK value for this row
                 let pk_value = row.get(pk_idx).cloned().unwrap_or(Value::null_unknown());
@@ -2100,6 +2215,22 @@ impl Executor {
                     std::mem::take(&mut outer_row_map),
                     CompactArc::clone(&column_names),
                 );
+
+                // Check WHERE condition if needed
+                if needs_memory_filter {
+                    if let Some(ref where_clause) = memory_where_clause {
+                        let held = if where_is_correlated {
+                            self.process_correlated_where(where_clause, &correlated_ctx)
+                                .and_then(|processed| evaluator.evaluate_bool(&processed))
+                        } else {
+                            evaluator.evaluate_bool(where_clause)
+                        };
+                        if !matches!(held, Ok(true)) {
+                            outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
+                            continue;
+                        }
+                    }
+                }
 
                 // Evaluate all update expressions
                 let mut new_values: Vec<(usize, Value)> = Vec::with_capacity(update_indices.len());
@@ -2297,6 +2428,22 @@ impl Executor {
                     .ok()
                 });
             let transaction_id = ctx.transaction_id();
+            // A WHERE the semi-join rewrite refused is bound to each row as it is met
+            let col_name_pairs: Vec<(CompactArc<str>, CompactArc<str>)> = if where_is_correlated {
+                schema
+                    .column_names_lower_arc()
+                    .iter()
+                    .map(|col_lower| {
+                        let qualified =
+                            CompactArc::from(format!("{}.{}", table_name, col_lower).as_str());
+                        (CompactArc::from(col_lower.as_str()), qualified)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut outer_row_map: FxHashMap<CompactArc<str>, Value> =
+                FxHashMap::with_capacity_and_hasher(col_name_pairs.len() * 2, Default::default());
             let mut setter = |mut row: Row| -> Result<(Row, bool)> {
                 // Execute pre-compiled programs (no recompilation per row)
                 let updates_to_apply: Vec<(usize, Value)> = {
@@ -2313,9 +2460,29 @@ impl Executor {
                             }
                         } else if let Some(ref where_expr) = memory_where_clause {
                             evaluator.set_row_array(&row);
-                            match evaluator.evaluate_bool(where_expr) {
-                                Ok(true) => {}
-                                _ => return Ok((row, false)),
+                            let held = if where_is_correlated {
+                                outer_row_map.clear();
+                                for (i, (col_lower, qualified)) in col_name_pairs.iter().enumerate()
+                                {
+                                    if let Some(value) = row.get(i) {
+                                        outer_row_map.insert(col_lower.clone(), value.clone());
+                                        outer_row_map.insert(qualified.clone(), value.clone());
+                                    }
+                                }
+                                let mut correlated_ctx = ctx.with_outer_row(
+                                    std::mem::take(&mut outer_row_map),
+                                    CompactArc::clone(&column_names),
+                                );
+                                let held = self
+                                    .process_correlated_where(where_expr, &correlated_ctx)
+                                    .and_then(|processed| evaluator.evaluate_bool(&processed));
+                                outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
+                                held
+                            } else {
+                                evaluator.evaluate_bool(where_expr)
+                            };
+                            if !matches!(held, Ok(true)) {
+                                return Ok((row, false));
                             }
                         }
                     }
@@ -2539,6 +2706,16 @@ impl Executor {
         stmt: &DeleteStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        // A WITH clause is run first, so the subqueries can read it
+        let ctx_with_ctes;
+        let ctx = match &stmt.with {
+            Some(with_clause) => {
+                let registry = self.materialize_ctes(with_clause, ctx, None)?;
+                ctx_with_ctes = ctx.with_cte_data(registry.data());
+                &ctx_with_ctes
+            }
+            None => ctx,
+        };
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
         // Use alias if provided, otherwise use table name
@@ -2725,6 +2902,7 @@ impl Executor {
             let column_indices: Vec<usize> = (0..column_count).collect();
             let mut scanner = table.scan(&column_indices, where_expr.as_deref())?;
             let mut rows_to_delete: Vec<(Value, Option<Row>)> = Vec::new();
+            let mut rows_to_delete_by_row_id: Vec<(i64, Option<Row>)> = Vec::new();
 
             // Pre-compute column name mappings for correlated subqueries
             let column_names_arc = if has_correlated {
@@ -2838,16 +3016,23 @@ impl Executor {
                 };
 
                 if matches {
-                    // Row matches - get primary key value for deletion
-                    if let Some(pk_idx) = pk_col_idx {
-                        if let Some(pk_value) = row.get(pk_idx) {
-                            let row_data = if has_returning {
-                                Some(row.clone())
-                            } else {
-                                None
-                            };
-                            rows_to_delete.push((pk_value.clone(), row_data));
+                    // Without a primary key the row itself is what the
+                    // foreign keys are read from, so it is kept for them too
+                    let row_data = if has_returning || (has_referencing_fks && pk_col_idx.is_none())
+                    {
+                        Some(row.clone())
+                    } else {
+                        None
+                    };
+                    // Row matches - get primary key value for deletion.
+                    // A table without one is named by its row id instead
+                    match pk_col_idx {
+                        Some(pk_idx) => {
+                            if let Some(pk_value) = row.get(pk_idx) {
+                                rows_to_delete.push((pk_value.clone(), row_data));
+                            }
                         }
+                        None => rows_to_delete_by_row_id.push((scanner.current_row_id(), row_data)),
                     }
                 }
             }
@@ -2864,6 +3049,50 @@ impl Executor {
                     &referencing_fks,
                 )?;
             }
+            // Without a primary key each key is read from the column it
+            // names, which is why the rows were kept. Every key is asked
+            // whether it refuses before any key acts, so a refusal leaves
+            // the statement having written nothing
+            if has_referencing_fks && !rows_to_delete_by_row_id.is_empty() {
+                let keyed_values: Vec<(&(String, crate::core::ForeignKeyConstraint), Vec<Value>)> =
+                    referencing_fks
+                        .iter()
+                        .filter_map(|fk_entry| {
+                            let referenced = fk_entry.1.referenced_column.to_lowercase();
+                            let idx = schema_arc
+                                .columns
+                                .iter()
+                                .position(|c| c.name_lower == referenced)?;
+                            let values: Vec<Value> = rows_to_delete_by_row_id
+                                .iter()
+                                .filter_map(|(_, row)| {
+                                    row.as_ref().and_then(|r| r.get(idx).cloned())
+                                })
+                                .collect();
+                            Some((fk_entry, values))
+                        })
+                        .collect();
+                for (fk_entry, values) in &keyed_values {
+                    let refs: Vec<&Value> = values.iter().collect();
+                    super::foreign_key::pre_check_delete_keys(
+                        &self.engine,
+                        table.txn_id(),
+                        table_name,
+                        &refs,
+                        std::slice::from_ref(*fk_entry),
+                    )?;
+                }
+                for (fk_entry, values) in &keyed_values {
+                    let refs: Vec<&Value> = values.iter().collect();
+                    super::foreign_key::apply_delete_actions(
+                        &self.engine,
+                        table.txn_id(),
+                        table_name,
+                        &refs,
+                        std::slice::from_ref(*fk_entry),
+                    )?;
+                }
+            }
 
             // Delete matching rows by primary key
             let mut delete_count = 0;
@@ -2879,6 +3108,19 @@ impl Executor {
                         }
                         delete_count += deleted;
                     }
+                }
+            } else if !rows_to_delete_by_row_id.is_empty() {
+                // A table without a primary key: the rows are named by the
+                // ids the scan read them under
+                let row_ids: Vec<i64> =
+                    rows_to_delete_by_row_id.iter().map(|(id, _)| *id).collect();
+                delete_count = table.delete_by_row_ids(&row_ids)?;
+                if has_returning {
+                    returning_rows.extend(
+                        rows_to_delete_by_row_id
+                            .into_iter()
+                            .filter_map(|(_, row)| row),
+                    );
                 }
             }
             delete_count
@@ -3083,6 +3325,23 @@ impl Executor {
             }
         }
 
+        // DO UPDATE ... WHERE is compiled the same way, with EXCLUDED as the
+        // second row source
+        let compiled_where = match stmt.update_where.as_deref() {
+            Some(expr) => {
+                let compile_ctx = CompileContext::new(&column_names, global_registry())
+                    .with_second_row(&excluded_columns);
+                let program = ExprCompiler::new(&compile_ctx).compile(expr).map_err(|e| {
+                    Error::internal(format!(
+                        "failed to compile ON CONFLICT update condition: {}",
+                        e
+                    ))
+                })?;
+                Some(CompactArc::new(program))
+            }
+            None => None,
+        };
+
         // Compile CHECK constraints for columns being updated.
         // Store as SharedProgram (not ExpressionEval) so the struct can be shared
         // immutably — the VM used to execute the program lives in the setter closure.
@@ -3119,6 +3378,7 @@ impl Executor {
 
         Ok(CompiledUpsert {
             compiled_updates,
+            compiled_where,
             compiled_checks,
         })
     }
@@ -3141,7 +3401,7 @@ impl Executor {
         compiled: Option<&CompiledUpsert>,
         ctx: &ExecutionContext,
         capture_row: bool,
-    ) -> Result<Option<Row>> {
+    ) -> Result<(bool, Option<Row>)> {
         // Build a WHERE clause to find the specific row
         // Use schema's cached pk_column_index for O(1) lookup
         let pk_col = schema
@@ -3209,16 +3469,33 @@ impl Executor {
         // Extract params from execution context for use in the setter closure
         let params = ctx.params();
         let named_params = ctx.named_params();
+        let transaction_id = ctx.transaction_id();
 
         // Capture the post-update row for RETURNING clause
         let mut captured_row: Option<Row> = None;
 
         // Create a setter function that applies the ON DUPLICATE KEY UPDATE
         let mut setter = |mut row: Row| -> Result<(Row, bool)> {
+            // DO UPDATE ... WHERE leaves the row as it is where it does not hold
+            if let Some(program) = &effective.compiled_where {
+                let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row)
+                    .with_transaction_id(transaction_id);
+                if !params.is_empty() {
+                    exec_ctx = exec_ctx.with_params(params);
+                }
+                if !named_params.is_empty() {
+                    exec_ctx = exec_ctx.with_named_params(named_params);
+                }
+                if !vm.execute_bool_checked(program, &exec_ctx)? {
+                    return Ok((row, false));
+                }
+            }
+
             // Collect all updates first to avoid borrow conflicts
             let updates_to_apply: Vec<(usize, Value)> = {
                 // Use for_join to make EXCLUDED columns available as row2
-                let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row);
+                let mut exec_ctx = ExecuteContext::for_join(&row, &excluded_row)
+                    .with_transaction_id(transaction_id);
                 if !params.is_empty() {
                     exec_ctx = exec_ctx.with_params(params);
                 }
@@ -3291,13 +3568,14 @@ impl Executor {
         // Prefer direct row_id lookup when we have a concrete conflicting row_id.
         // This avoids a second scan on non-PK upserts after conflict resolution.
         // row_id < 0 means "unknown" (sentinel from UniqueConstraint error).
-        if row_id >= 0 {
-            table.update_by_row_ids(&[row_id], &mut setter)?;
+        // A row DO UPDATE ... WHERE left alone is not an updated row
+        let updated = if row_id >= 0 {
+            table.update_by_row_ids(&[row_id], &mut setter)?
         } else {
-            table.update(where_expr.as_deref(), &mut setter)?;
-        }
+            table.update(where_expr.as_deref(), &mut setter)?
+        };
 
-        Ok(captured_row)
+        Ok((updated > 0, captured_row))
     }
 
     /// Find a row by unique index value (supports single and composite unique constraints).

@@ -1154,11 +1154,38 @@ impl<'a> ExprCompiler<'a> {
                 }
             }
         } else {
-            // Fallback: evaluate each item (less efficient)
-            // For now, return error - would need runtime set building
-            return Err(CompileError::UnsupportedExpression(
-                "Dynamic IN list not yet supported in VM".to_string(),
-            ));
+            // An item that is not a constant is compared in turn:
+            // left = item OR left = item ..., with IN's NULL rule falling
+            // out of OR's
+            let items: Vec<&Expression> = match &*in_expr.right {
+                Expression::List(list) => list.elements.iter().collect(),
+                Expression::ExpressionList(list) => list.expressions.iter().collect(),
+                _ => {
+                    return Err(CompileError::UnsupportedExpression(
+                        "IN over something that is not a list".to_string(),
+                    ))
+                }
+            };
+            // The value is evaluated once and judged against every item,
+            // so a volatile left side rolls a single time
+            if items.is_empty() {
+                builder.emit(Op::LoadConst(Value::Boolean(in_expr.not)));
+            } else {
+                self.compile_expr(&in_expr.left, builder)?;
+                for item in &items {
+                    self.compile_expr(item, builder)?;
+                }
+                let count = u32::try_from(items.len()).map_err(|_| {
+                    CompileError::UnsupportedExpression(format!(
+                        "IN list holds {} items, more than an expression can hold",
+                        items.len()
+                    ))
+                })?;
+                builder.emit(Op::InList(count));
+                if in_expr.not {
+                    builder.emit(Op::Not);
+                }
+            }
         }
 
         Ok(())
@@ -1334,19 +1361,18 @@ impl<'a> ExprCompiler<'a> {
 
         while let Some(c) = chars.next() {
             if c == escape {
-                // Next character should be treated literally
-                if let Some(&next) = chars.peek() {
-                    if next == '%' || next == '_' || next == escape {
-                        // Escape the wildcard - use regex escape sequence
-                        result.push('\\');
-                        result.push(chars.next().unwrap());
-                    } else {
-                        // Not escaping a special character, keep the escape char
-                        result.push(c);
+                // Whatever follows stands for itself. A wildcard and the
+                // backslash the pattern reads as its own marker keep that
+                // marker in front of them; anything else is already itself
+                match chars.next() {
+                    Some(next) => {
+                        if next == '%' || next == '_' || next == '\\' {
+                            result.push('\\');
+                        }
+                        result.push(next);
                     }
-                } else {
-                    // Escape at end of pattern
-                    result.push(c);
+                    // Nothing follows, so the escape stands for itself
+                    None => result.push(c),
                 }
             } else {
                 result.push(c);
@@ -1374,8 +1400,8 @@ impl<'a> ExprCompiler<'a> {
 
         for when_clause in &case.when_clauses {
             if is_simple {
-                // Simple CASE: compare operand with WHEN value
-                builder.emit(Op::Dup); // Keep operand on stack
+                // Simple CASE: compare the operand, which CaseCompare reads
+                // without taking, so it is there for the branch after this
                 self.compile_expr(&when_clause.condition, builder)?;
                 builder.emit(Op::CaseCompare);
             } else {
@@ -1389,7 +1415,7 @@ impl<'a> ExprCompiler<'a> {
 
             // Compile THEN result
             if is_simple {
-                builder.emit(Op::Pop); // Remove operand copy
+                builder.emit(Op::Pop); // The operand has served its purpose
             }
             self.compile_expr(&when_clause.then_result, builder)?;
 

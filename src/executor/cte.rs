@@ -114,7 +114,7 @@ fn expr_to_normalized_string(expr: &Expression) -> String {
 
 /// Hint for CTE optimization including LIMIT and optional ORDER BY pushdown
 #[derive(Clone)]
-struct CtePushdownHint {
+pub(crate) struct CtePushdownHint {
     limit: u64,
     order_by: Vec<OrderByExpression>,
 }
@@ -232,14 +232,27 @@ impl Executor {
         // This enables streaming GROUP BY early termination
         let cte_limit_hints = self.compute_cte_limit_hints(stmt, with_clause);
 
-        // Create CTE registry
+        let mut cte_registry = self.materialize_ctes(with_clause, ctx, Some(&cte_limit_hints))?;
+
+        // Execute the main query with CTE registry
+        self.execute_main_query_with_ctes(stmt, ctx, &mut cte_registry)
+    }
+
+    /// Run the CTEs of a WITH clause in order and store each result, so
+    /// the statement that follows, a SELECT or a DML, can read them
+    pub(crate) fn materialize_ctes(
+        &self,
+        with_clause: &WithClause,
+        ctx: &ExecutionContext,
+        cte_limit_hints: Option<&StringMap<CtePushdownHint>>,
+    ) -> Result<CteRegistry> {
         let mut cte_registry = CteRegistry::new();
 
         // Execute each CTE in order
         for cte in &with_clause.ctes {
             // Check if we have a pushdown hint for this CTE
             let cte_name_lower: String = cte.name.value_lower.to_string();
-            let pushdown_hint = cte_limit_hints.get(&cte_name_lower);
+            let pushdown_hint = cte_limit_hints.and_then(|hints| hints.get(&cte_name_lower));
 
             // Execute the CTE query (handles recursive CTEs)
             let (columns, rows) = if cte.is_recursive {
@@ -287,8 +300,7 @@ impl Executor {
             cte_registry.store(&cte.name.value, columns, rows);
         }
 
-        // Execute the main query with CTE registry
-        self.execute_main_query_with_ctes(stmt, ctx, &mut cte_registry)
+        Ok(cte_registry)
     }
 
     /// Execute a single CTE query
@@ -300,17 +312,19 @@ impl Executor {
     ) -> Result<(Vec<String>, RowVec)> {
         // Check if the CTE references another CTE
         if let Some(ref table_expr) = stmt.table_expr {
-            // First check for simple CTE reference
-            // BUT: if there are set operations (UNION, etc.), we need to fall through
-            // to execute_select which handles them properly
-            if stmt.set_operations.is_empty() {
+            // First check for simple CTE reference, when the CTE path can
+            // finish the statement on its own; otherwise fall through to
+            // execute_select, which handles set operations and the rest
+            if Self::cte_result_path_finishes(stmt) {
                 if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
                     if let Some((columns, rows)) = cte_registry.get(&cte_name) {
                         // Execute query against CTE result
                         // Clone Arc data into RowVec for processing
+                        // A subquery in the statement reads the earlier
+                        // CTEs through the context
                         return self.execute_query_on_cte_result(
                             stmt,
-                            ctx,
+                            &ctx.with_cte_data(cte_registry.data()),
                             columns.to_vec(),
                             RowVec::from_vec((**rows).clone()),
                         );
@@ -514,14 +528,11 @@ impl Executor {
         let ctx_with_ctes = ctx.with_cte_data(cte_registry.data());
 
         // Check if the main query references a CTE
-        // NOTE: Skip the CTE fast path if there are set operations (UNION/INTERSECT/EXCEPT)
-        // because execute_query_on_cte_result doesn't handle set_operations
-        let has_set_operations = !stmt.set_operations.is_empty();
-
         if let Some(ref table_expr) = stmt.table_expr {
-            // First check for simple CTE reference (only when no set operations)
+            // First check for simple CTE reference, when the CTE path can
+            // finish the statement on its own
             // Use the base CTE name (not alias) for registry lookup
-            if !has_set_operations {
+            if Self::cte_result_path_finishes(stmt) {
                 if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
                     if let Some((columns, rows)) = cte_registry.get(&cte_name) {
                         // Execute query against CTE result
@@ -1128,29 +1139,66 @@ impl Executor {
         // OPTIMIZATION: Get cached query classification to avoid repeated AST traversals
         let classification = get_classification(stmt);
 
+        let cte_alias = stmt
+            .table_expr
+            .as_deref()
+            .and_then(super::utils::get_table_alias_from_expr)
+            .map(|name| name.to_lowercase());
+
         // Apply WHERE clause filter
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
             // Process subqueries in WHERE clause (e.g., IN subqueries on CTEs)
-            // Use cached classification to avoid AST traversal
-            let processed_where = if classification.where_has_subqueries {
+            // Use cached classification to avoid AST traversal; a correlated
+            // one is evaluated per row below
+            let processed_where = if classification.where_has_subqueries
+                && !Self::has_correlated_subqueries(where_clause)
+            {
                 self.process_where_subqueries(where_clause, ctx)?
             } else {
                 (**where_clause).clone()
             };
-
-            // Compile filter once and reuse for all rows
-            let mut eval =
-                ExpressionEval::compile(&processed_where, &cte_columns)?.with_context(ctx);
-
-            let mut result = RowVec::new();
-            let mut row_id = 0i64;
-            for (_, row) in cte_rows {
-                if eval.eval_bool_checked(&row)? {
-                    result.push((row_id, row));
-                    row_id += 1;
+            // A parent row's column named through its own table is bound
+            // first, or the bare name it would fall back to could be the
+            // CTE's own
+            let processed_where = match ctx.outer_row() {
+                Some(outer) => {
+                    let inner: Vec<&str> = cte_alias.iter().map(String::as_str).collect();
+                    let scope = super::utils::InnerScope {
+                        tables: &inner,
+                        schema: None,
+                    };
+                    super::utils::substitute_outer_references_in_scope(
+                        &processed_where,
+                        outer,
+                        &scope,
+                    )
                 }
+                None => processed_where,
+            };
+
+            if Self::has_correlated_subqueries(&processed_where) {
+                self.filter_rows_by_correlated_where(
+                    &processed_where,
+                    cte_rows,
+                    &cte_columns,
+                    cte_alias.as_deref(),
+                    ctx,
+                )?
+            } else {
+                // Compile filter once and reuse for all rows
+                let mut eval =
+                    ExpressionEval::compile(&processed_where, &cte_columns)?.with_context(ctx);
+
+                let mut result = RowVec::new();
+                let mut row_id = 0i64;
+                for (_, row) in cte_rows {
+                    if eval.eval_bool_checked(&row)? {
+                        result.push((row_id, row));
+                        row_id += 1;
+                    }
+                }
+                result
             }
-            result
         } else {
             cte_rows
         };
@@ -1181,8 +1229,13 @@ impl Executor {
             return Ok((columns, rows, !skip_order_limit));
         }
 
-        // Process scalar subqueries in SELECT columns before projection
-        let processed_columns = self.try_process_select_subqueries(&stmt.columns, ctx)?;
+        // Process scalar subqueries in SELECT columns before projection; a
+        // correlated one is evaluated per row by the projection
+        let processed_columns = if Self::has_correlated_select_subqueries(&stmt.columns) {
+            None
+        } else {
+            self.try_process_select_subqueries(&stmt.columns, ctx)?
+        };
         let columns_to_use = processed_columns.as_ref().unwrap_or(&stmt.columns);
 
         // Determine output columns
@@ -1222,6 +1275,7 @@ impl Executor {
                         columns_to_use,
                         &filtered_rows,
                         &cte_columns,
+                        cte_alias.as_deref(),
                         ctx,
                     )?;
                     // Append source columns that aren't in output
@@ -1258,6 +1312,7 @@ impl Executor {
                     columns_to_use,
                     &filtered_rows,
                     &cte_columns,
+                    cte_alias.as_deref(),
                     ctx,
                 )?
             } else {
@@ -1277,7 +1332,13 @@ impl Executor {
                 // Sort on source columns first, then project
                 let sorted =
                     self.apply_order_by_to_rows(filtered_rows, &stmt.order_by, &cte_columns)?;
-                self.project_cte_rows_from_columns(columns_to_use, &sorted, &cte_columns, ctx)?
+                self.project_cte_rows_from_columns(
+                    columns_to_use,
+                    &sorted,
+                    &cte_columns,
+                    cte_alias.as_deref(),
+                    ctx,
+                )?
             } else {
                 self.apply_order_by_to_rows(filtered_rows, &stmt.order_by, &cte_columns)?
             }
@@ -1288,6 +1349,7 @@ impl Executor {
                     columns_to_use,
                     &filtered_rows,
                     &cte_columns,
+                    cte_alias.as_deref(),
                     ctx,
                 )?
             } else {
@@ -1424,9 +1486,22 @@ impl Executor {
         columns: &[Expression],
         rows: &RowVec,
         cte_columns: &[String],
+        table_alias: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
         use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
+
+        // A correlated subquery reads each row as its outer row
+        if Self::has_correlated_select_subqueries(columns) {
+            return self.project_rows_with_alias(
+                columns,
+                RowVec::from_vec((**rows).clone()),
+                cte_columns,
+                None,
+                ctx,
+                table_alias,
+            );
+        }
 
         let col_index_map = build_column_index_map(cte_columns);
 
@@ -1497,6 +1572,22 @@ impl Executor {
     /// Check if a SELECT statement has a WITH clause
     pub(crate) fn has_cte(&self, stmt: &SelectStatement) -> bool {
         stmt.with.is_some()
+    }
+
+    /// Whether the query-on-CTE-result path can finish a statement by
+    /// itself: it sorts by column only, and leaves set operations and
+    /// DISTINCT to execute_select
+    fn cte_result_path_finishes(stmt: &SelectStatement) -> bool {
+        stmt.set_operations.is_empty()
+            && !stmt.distinct
+            && stmt.order_by.iter().all(|ob| {
+                matches!(
+                    &ob.expression,
+                    Expression::Identifier(_)
+                        | Expression::QualifiedIdentifier(_)
+                        | Expression::IntegerLiteral(_)
+                )
+            })
     }
 
     /// Apply ORDER BY to rows
@@ -1859,6 +1950,9 @@ impl Executor {
             self.count_cte_references_in_expr(where_clause, &mut where_ref_counts);
         }
 
+        // A reference from any other clause reads the CTE by name as well
+        self.count_cte_references_outside_from(stmt, &mut where_ref_counts);
+
         // Only inline CTEs that:
         // 1. Are used exactly once in table expressions (FROM/JOIN)
         // 2. Are NOT used in WHERE clause subqueries (these need special handling)
@@ -1972,9 +2066,33 @@ impl Executor {
             self.count_cte_references_in_expr(where_clause, ref_counts);
         }
 
-        // Check SELECT columns for subqueries
-        for col in &stmt.columns {
-            self.count_cte_references_in_expr(col, ref_counts);
+        self.count_cte_references_outside_from(stmt, ref_counts);
+    }
+
+    /// Count CTE references in the clauses other than FROM and WHERE: the
+    /// select list, HAVING, ORDER BY, named windows and set-operation branches
+    fn count_cte_references_outside_from(
+        &self,
+        stmt: &SelectStatement,
+        ref_counts: &mut StringMap<usize>,
+    ) {
+        let windows = stmt.window_defs.iter().flat_map(|w| {
+            w.partition_by
+                .iter()
+                .chain(w.order_by.iter().map(|o| &o.expression))
+        });
+        for expr in stmt
+            .columns
+            .iter()
+            .chain(stmt.having.as_deref())
+            .chain(stmt.order_by.iter().map(|o| &o.expression))
+            .chain(windows)
+        {
+            self.count_cte_references_in_expr(expr, ref_counts);
+        }
+
+        for set_op in &stmt.set_operations {
+            self.count_cte_references_in_stmt(&set_op.right, ref_counts);
         }
     }
 
@@ -2011,20 +2129,68 @@ impl Executor {
             }
             Expression::In(in_expr) => {
                 self.count_cte_references_in_expr(&in_expr.left, ref_counts);
-                // Check if right side is a ScalarSubquery
-                if let Expression::ScalarSubquery(sq) = &*in_expr.right {
-                    self.count_cte_references_in_stmt(&sq.subquery, ref_counts);
-                }
+                self.count_cte_references_in_expr(&in_expr.right, ref_counts);
             }
             Expression::Exists(ex) => {
                 self.count_cte_references_in_stmt(&ex.subquery, ref_counts);
+            }
+            Expression::AllAny(all_any) => {
+                self.count_cte_references_in_expr(&all_any.left, ref_counts);
+                self.count_cte_references_in_stmt(&all_any.subquery, ref_counts);
             }
             Expression::Infix(infix) => {
                 self.count_cte_references_in_expr(&infix.left, ref_counts);
                 self.count_cte_references_in_expr(&infix.right, ref_counts);
             }
+            Expression::Prefix(prefix) => {
+                self.count_cte_references_in_expr(&prefix.right, ref_counts);
+            }
+            Expression::Between(between) => {
+                self.count_cte_references_in_expr(&between.expr, ref_counts);
+                self.count_cte_references_in_expr(&between.lower, ref_counts);
+                self.count_cte_references_in_expr(&between.upper, ref_counts);
+            }
+            Expression::Cast(cast) => {
+                self.count_cte_references_in_expr(&cast.expr, ref_counts);
+            }
+            Expression::Like(like) => {
+                self.count_cte_references_in_expr(&like.left, ref_counts);
+                self.count_cte_references_in_expr(&like.pattern, ref_counts);
+            }
+            Expression::FunctionCall(func) => {
+                for arg in func.arguments.iter().chain(func.filter.as_deref()) {
+                    self.count_cte_references_in_expr(arg, ref_counts);
+                }
+            }
+            Expression::Case(case) => {
+                for expr in case
+                    .value
+                    .as_deref()
+                    .into_iter()
+                    .chain(
+                        case.when_clauses
+                            .iter()
+                            .flat_map(|w| [&w.condition, &w.then_result]),
+                    )
+                    .chain(case.else_value.as_deref())
+                {
+                    self.count_cte_references_in_expr(expr, ref_counts);
+                }
+            }
             Expression::Aliased(aliased) => {
                 self.count_cte_references_in_expr(&aliased.expression, ref_counts);
+            }
+            Expression::Window(window) => {
+                for expr in window
+                    .function
+                    .arguments
+                    .iter()
+                    .chain(window.function.filter.as_deref())
+                    .chain(window.partition_by.iter())
+                    .chain(window.order_by.iter().map(|o| &o.expression))
+                {
+                    self.count_cte_references_in_expr(expr, ref_counts);
+                }
             }
             _ => {}
         }

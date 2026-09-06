@@ -534,6 +534,14 @@ impl CompiledAggregate {
     /// Helper: accumulate into SumState
     #[inline(always)]
     fn accumulate_sum(state: &mut SumState, value: &Value) {
+        // A boolean counts as one or nought, as SUM reads it
+        let promoted;
+        let value = if let Value::Boolean(b) = value {
+            promoted = Value::Integer(*b as i64);
+            &promoted
+        } else {
+            value
+        };
         match value {
             Value::Integer(i) => match state {
                 SumState::Empty => *state = SumState::Integer(*i),
@@ -557,6 +565,8 @@ impl CompiledAggregate {
         match value {
             Value::Integer(i) => Some(*i as f64),
             Value::Float(f) => Some(*f),
+            // A boolean counts as one or nought, as the aggregate reads it
+            Value::Boolean(b) => Some(*b as i64 as f64),
             _ => None,
         }
     }

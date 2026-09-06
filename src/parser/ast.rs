@@ -943,11 +943,23 @@ pub struct WindowExpression {
 impl fmt::Display for WindowExpression {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut result = self.function.to_string();
-        if let Some(ref win_ref) = self.window_ref {
+        let extends_named = self.window_ref.is_some()
+            && (!self.partition_by.is_empty() || !self.order_by.is_empty() || self.frame.is_some());
+        if let (Some(win_ref), false) = (&self.window_ref, extends_named) {
             result.push_str(" OVER ");
             result.push_str(win_ref);
         } else {
             result.push_str(" OVER (");
+            // OVER (w ...) names the window it builds on first
+            if let Some(ref win_ref) = self.window_ref {
+                result.push_str(win_ref);
+                if !self.partition_by.is_empty()
+                    || !self.order_by.is_empty()
+                    || self.frame.is_some()
+                {
+                    result.push(' ');
+                }
+            }
             if !self.partition_by.is_empty() {
                 result.push_str("PARTITION BY ");
                 let parts: Vec<String> = self.partition_by.iter().map(|e| e.to_string()).collect();
@@ -1570,6 +1582,8 @@ pub struct InsertStatement {
     pub on_duplicate: bool,
     pub update_columns: Vec<Identifier>,
     pub update_expressions: Vec<Expression>,
+    /// DO UPDATE ... WHERE: the row is updated only where this holds
+    pub update_where: Option<Box<Expression>>,
     /// ON CONFLICT DO NOTHING (skip duplicates silently)
     pub do_nothing: bool,
     /// Conflict target columns for ON CONFLICT (col1, col2, ...)
@@ -1627,6 +1641,9 @@ impl fmt::Display for InsertStatement {
                 .map(|(col, expr)| format!("{} = {}", col, expr))
                 .collect();
             result.push_str(&updates.join(", "));
+            if let Some(ref update_where) = self.update_where {
+                result.push_str(&format!(" WHERE {}", update_where));
+            }
         }
         if !self.returning.is_empty() {
             let returning: Vec<String> = self.returning.iter().map(|e| e.to_string()).collect();
@@ -1645,11 +1662,16 @@ pub struct UpdateStatement {
     pub where_clause: Option<Box<Expression>>,
     /// RETURNING clause expressions
     pub returning: Vec<Expression>,
+    /// WITH clause the statement's subqueries may read
+    pub with: Option<WithClause>,
 }
 
 impl fmt::Display for UpdateStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut result = format!("UPDATE {} SET ", self.table_name);
+        let mut result = match self.with {
+            Some(ref with) => format!("{} UPDATE {} SET ", with, self.table_name),
+            None => format!("UPDATE {} SET ", self.table_name),
+        };
         let updates: Vec<String> = self
             .updates
             .iter()
@@ -1677,11 +1699,16 @@ pub struct DeleteStatement {
     pub where_clause: Option<Box<Expression>>,
     /// RETURNING clause expressions
     pub returning: Vec<Expression>,
+    /// WITH clause the statement's subqueries may read
+    pub with: Option<WithClause>,
 }
 
 impl fmt::Display for DeleteStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut result = format!("DELETE FROM {}", self.table_name);
+        let mut result = match self.with {
+            Some(ref with) => format!("{} DELETE FROM {}", with, self.table_name),
+            None => format!("DELETE FROM {}", self.table_name),
+        };
         if let Some(ref alias) = self.alias {
             result.push_str(&format!(" AS {}", alias));
         }
@@ -2552,6 +2579,7 @@ mod tests {
             on_duplicate: false,
             update_columns: vec![],
             update_expressions: vec![],
+            update_where: None,
             do_nothing: false,
             conflict_target: vec![],
             returning: vec![],

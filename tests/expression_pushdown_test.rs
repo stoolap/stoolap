@@ -99,10 +99,11 @@ fn test_not_with_and_condition() {
         &db,
         "SELECT * FROM test_products WHERE NOT (category = 'Electronics' AND price > 500)",
     );
-    // Not (Electronics AND expensive): should exclude Laptop(1200) and Smartphone(800)
+    // Not (Electronics AND expensive) excludes Laptop(1200) and Smartphone(800),
+    // and the all-NULL row, for which the conjunction is UNKNOWN and so is its NOT
     assert_eq!(
-        count, 8,
-        "Expected 8 products not (Electronics AND expensive)"
+        count, 7,
+        "Expected 7 products not (Electronics AND expensive)"
     );
 }
 
@@ -147,10 +148,11 @@ fn test_not_with_composite_condition() {
         &db,
         "SELECT * FROM test_products WHERE NOT (category = 'Electronics' AND price > 500 AND in_stock = true)",
     );
-    // Not (expensive Electronics in stock)
+    // Not (expensive Electronics in stock), less the all-NULL row whose
+    // conjunction is UNKNOWN
     assert_eq!(
-        count, 8,
-        "Expected 8 products not (expensive Electronics in stock)"
+        count, 7,
+        "Expected 7 products not (expensive Electronics in stock)"
     );
 }
 

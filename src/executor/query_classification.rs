@@ -699,11 +699,12 @@ impl QueryClassification {
     fn check_has_window_functions(stmt: &SelectStatement) -> bool {
         stmt.columns
             .iter()
+            .chain(stmt.order_by.iter().map(|ob| &ob.expression))
             .any(Self::expression_has_window_function)
     }
 
     /// Check if an expression contains window functions
-    fn expression_has_window_function(expr: &Expression) -> bool {
+    pub(crate) fn expression_has_window_function(expr: &Expression) -> bool {
         match expr {
             Expression::Window(_) => true,
             Expression::Aliased(aliased) => {
@@ -1013,7 +1014,42 @@ impl QueryClassification {
             }
         }
 
-        false
+        // An ORDER BY reads the parent row too, and decides what a LIMIT keeps
+        if subquery
+            .order_by
+            .iter()
+            .any(|o| Self::has_outer_column_reference(&o.expression, &subquery_tables))
+        {
+            return true;
+        }
+
+        // A derived table in the FROM may read the parent row too
+        subquery
+            .table_expr
+            .as_deref()
+            .is_some_and(|from| Self::from_has_outer_reference(from, &subquery_tables))
+    }
+
+    /// Whether a derived table in a FROM, or a join condition there, reads a
+    /// column that neither the query nor the derived table defines
+    fn from_has_outer_reference(from: &Expression, inner_tables: &[String]) -> bool {
+        match from {
+            Expression::SubquerySource(source) => {
+                Self::nested_has_outer_reference(&source.subquery, inner_tables)
+            }
+            Expression::JoinSource(join) => {
+                Self::from_has_outer_reference(&join.left, inner_tables)
+                    || Self::from_has_outer_reference(&join.right, inner_tables)
+                    || join
+                        .condition
+                        .as_deref()
+                        .is_some_and(|c| Self::has_outer_column_reference(c, inner_tables))
+            }
+            Expression::Aliased(aliased) => {
+                Self::from_has_outer_reference(&aliased.expression, inner_tables)
+            }
+            _ => false,
+        }
     }
 
     /// Collect table names and aliases from a subquery's FROM clause
@@ -1108,6 +1144,7 @@ impl QueryClassification {
             }
             Expression::AllAny(all_any) => {
                 Self::has_outer_column_reference(&all_any.left, inner_tables)
+                    || Self::nested_has_outer_reference(&all_any.subquery, inner_tables)
             }
             Expression::Cast(cast) => Self::has_outer_column_reference(&cast.expr, inner_tables),
             Expression::Like(like) => {
@@ -1150,8 +1187,43 @@ impl QueryClassification {
                 .chain(window.partition_by.iter())
                 .chain(window.order_by.iter().map(|o| &o.expression))
                 .any(|e| Self::has_outer_column_reference(e, inner_tables)),
+            // A subquery nested in this one may read a column from further
+            // out than either of them, which this one has to carry in
+            Expression::Exists(exists) => {
+                Self::nested_has_outer_reference(&exists.subquery, inner_tables)
+            }
+            Expression::ScalarSubquery(subquery) => {
+                Self::nested_has_outer_reference(&subquery.subquery, inner_tables)
+            }
             _ => false,
         }
+    }
+
+    /// Whether a subquery nested inside another reads a column that neither
+    /// of them defines
+    fn nested_has_outer_reference(nested: &SelectStatement, inner_tables: &[String]) -> bool {
+        let mut tables = inner_tables.to_vec();
+        tables.extend(Self::collect_subquery_tables(&nested.table_expr));
+        nested
+            .where_clause
+            .as_deref()
+            .is_some_and(|where_clause| Self::has_outer_column_reference(where_clause, &tables))
+            || nested
+                .columns
+                .iter()
+                .any(|column| Self::has_outer_column_reference(column, &tables))
+            || nested
+                .having
+                .as_deref()
+                .is_some_and(|having| Self::has_outer_column_reference(having, &tables))
+            || nested
+                .order_by
+                .iter()
+                .any(|o| Self::has_outer_column_reference(&o.expression, &tables))
+            || nested
+                .table_expr
+                .as_deref()
+                .is_some_and(|from| Self::from_has_outer_reference(from, &tables))
     }
 }
 

@@ -1302,7 +1302,31 @@ impl MVCCTable {
                     return Ok(());
                 }
                 let entries = index.find(&values)?;
-                if let Some(entry) = entries.first() {
+                // The index holds the committed rows. A row this transaction
+                // has deleted no longer holds the value against it, and one
+                // it has rewritten holds only what its latest version says
+                let taken = {
+                    let txn_versions = self.txn_versions.read().unwrap();
+                    entries.iter().find(|entry| {
+                        let local = txn_versions
+                            .local_versions_ref()
+                            .and_then(|versions| versions.get(entry.row_id))
+                            .and_then(|versions| versions.last());
+                        match local {
+                            None => true,
+                            Some(version) if version.is_deleted() => false,
+                            Some(version) => {
+                                column_ids
+                                    .iter()
+                                    .zip(values.iter())
+                                    .all(|(&col_id, value)| {
+                                        version.data.get(col_id as usize) == Some(value)
+                                    })
+                            }
+                        }
+                    })
+                };
+                if let Some(entry) = taken {
                     let col_names: Vec<&str> = column_ids
                         .iter()
                         .map(|&col_id| {
@@ -1387,16 +1411,23 @@ impl MVCCTable {
             )));
         }
 
-        // Check if row already exists in local versions
-        {
+        // Check if row already exists in local versions. A row this
+        // transaction has deleted is gone for it, whatever the global
+        // store still holds, so the key may be taken again
+        let deleted_locally = {
             let txn_versions = self.txn_versions.read().unwrap();
             if txn_versions.has_locally_seen(row_id) && txn_versions.get(row_id).is_some() {
                 return Err(Error::primary_key_constraint(row_id));
             }
-        }
+            txn_versions
+                .local_versions_ref()
+                .and_then(|versions| versions.get(row_id))
+                .and_then(|versions| versions.last())
+                .is_some_and(|version| version.is_deleted())
+        };
 
         // Check if row exists in global store
-        if self.version_store.quick_check_row_existence(row_id) {
+        if !deleted_locally && self.version_store.quick_check_row_existence(row_id) {
             if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
                 if !version.is_deleted() {
                     return Err(Error::primary_key_constraint(row_id));

@@ -68,6 +68,11 @@ impl ColumnAggregateStats {
                 self.sum_float += *f;
                 self.numeric_count += 1;
             }
+            // A boolean counts as one or nought, as SUM and AVG read it
+            Value::Boolean(b) => {
+                self.sum_int += *b as i128;
+                self.numeric_count += 1;
+            }
             Value::Float(_) => {}
             _ => {}
         }

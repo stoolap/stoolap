@@ -84,6 +84,19 @@ impl Expression for AndExpr {
         true // All expressions were true
     }
 
+    /// UNKNOWN AND FALSE is FALSE; UNKNOWN AND TRUE is UNKNOWN
+    fn is_unknown_due_to_null(&self, row: &Row) -> bool {
+        let mut any_unknown = false;
+        for expr in &self.expressions {
+            if expr.is_unknown_due_to_null(row) {
+                any_unknown = true;
+            } else if !expr.evaluate_fast(row) {
+                return false;
+            }
+        }
+        any_unknown
+    }
+
     fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {
         let aliased_exprs: Vec<Box<dyn Expression>> = self
             .expressions
@@ -187,6 +200,19 @@ impl Expression for OrExpr {
             }
         }
         false // No expression was true
+    }
+
+    /// UNKNOWN OR TRUE is TRUE; UNKNOWN OR FALSE is UNKNOWN
+    fn is_unknown_due_to_null(&self, row: &Row) -> bool {
+        let mut any_unknown = false;
+        for expr in &self.expressions {
+            if expr.is_unknown_due_to_null(row) {
+                any_unknown = true;
+            } else if expr.evaluate_fast(row) {
+                return false;
+            }
+        }
+        any_unknown
     }
 
     fn with_aliases(&self, aliases: &FxHashMap<String, String>) -> Box<dyn Expression> {

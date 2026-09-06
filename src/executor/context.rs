@@ -978,6 +978,16 @@ impl ExecutionContext {
         outer_row: FxHashMap<CompactArc<str>, Value>,
         outer_columns: CompactArc<Vec<String>>,
     ) -> Self {
+        // A subquery inside a subquery reads the row its grandparent sits
+        // on as well, with the nearer scope winning where both name a column
+        let outer_row = match &self.outer_row {
+            Some(grandparent) if !grandparent.is_empty() => {
+                let mut merged = grandparent.clone();
+                merged.extend(outer_row);
+                merged
+            }
+            _ => outer_row,
+        };
         Self {
             params: self.params.clone(),             // Arc clone = cheap
             named_params: self.named_params.clone(), // Arc clone = cheap

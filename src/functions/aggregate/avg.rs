@@ -66,6 +66,9 @@ impl AggregateFunction for AvgFunction {
         let numeric_value = match value {
             Value::Integer(i) => *i as f64,
             Value::Float(f) => *f,
+            // A boolean counts as one or nought, so AVG(v > 100) is the
+            // share of rows the condition holds for
+            Value::Boolean(b) => *b as i64 as f64,
             _ => return, // Ignore non-numeric types
         };
 

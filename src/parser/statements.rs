@@ -29,6 +29,7 @@ struct ConflictClause {
     on_duplicate: bool,
     update_columns: Vec<Identifier>,
     update_expressions: Vec<Expression>,
+    update_where: Option<Box<Expression>>,
     do_nothing: bool,
     conflict_target: Vec<Identifier>,
 }
@@ -765,9 +766,17 @@ impl Parser {
                 return None;
             }
             Some(Statement::Insert(insert))
+        } else if self.cur_token_is_keyword("UPDATE") {
+            let mut update = self.parse_update_statement()?;
+            update.with = Some(with_clause);
+            Some(Statement::Update(update))
+        } else if self.cur_token_is_keyword("DELETE") {
+            let mut delete = self.parse_delete_statement()?;
+            delete.with = Some(with_clause);
+            Some(Statement::Delete(delete))
         } else {
             self.add_error(format!(
-                "expected SELECT or INSERT after WITH clause at {}",
+                "expected SELECT, INSERT, UPDATE or DELETE after WITH clause at {}",
                 self.cur_token.position
             ));
             None
@@ -929,6 +938,7 @@ impl Parser {
                 on_duplicate: conflict.on_duplicate,
                 update_columns: conflict.update_columns,
                 update_expressions: conflict.update_expressions,
+                update_where: conflict.update_where,
                 do_nothing: conflict.do_nothing,
                 conflict_target: conflict.conflict_target,
                 returning,
@@ -966,6 +976,7 @@ impl Parser {
                 on_duplicate: conflict.on_duplicate,
                 update_columns: conflict.update_columns,
                 update_expressions: conflict.update_expressions,
+                update_where: conflict.update_where,
                 do_nothing: conflict.do_nothing,
                 conflict_target: conflict.conflict_target,
                 returning,
@@ -995,6 +1006,7 @@ impl Parser {
             on_duplicate: conflict.on_duplicate,
             update_columns: conflict.update_columns,
             update_expressions: conflict.update_expressions,
+            update_where: conflict.update_where,
             do_nothing: conflict.do_nothing,
             conflict_target: conflict.conflict_target,
             returning,
@@ -1065,10 +1077,23 @@ impl Parser {
                     return ConflictClause::default();
                 }
                 let (update_columns, update_expressions) = self.parse_update_assignments();
+                // DO UPDATE ... WHERE: the row is updated only where this holds
+                let update_where = if self.peek_token_is_keyword("WHERE") {
+                    self.next_token(); // consume WHERE
+                    self.current_clause = "WHERE".to_string();
+                    self.next_token();
+                    match self.parse_expression(Precedence::Lowest) {
+                        Some(expr) => Some(Box::new(expr)),
+                        None => return ConflictClause::default(),
+                    }
+                } else {
+                    None
+                };
                 ConflictClause {
                     on_duplicate: true,
                     update_columns,
                     update_expressions,
+                    update_where,
                     conflict_target,
                     do_nothing: false,
                 }
@@ -1475,6 +1500,7 @@ impl Parser {
             updates,
             where_clause,
             returning,
+            with: None,
         })
     }
 
@@ -1544,6 +1570,7 @@ impl Parser {
             alias,
             where_clause,
             returning,
+            with: None,
         })
     }
 

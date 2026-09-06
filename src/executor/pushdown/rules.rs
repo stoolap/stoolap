@@ -86,7 +86,7 @@ fn extract_literal_with_ctx(expr: &ast::Expression, ctx: &PushdownContext<'_>) -
 /// Stable-within-query functions (NOW, CURRENT_DATE, CURRENT_TIMESTAMP) are NOT
 /// considered volatile here — they return the same value for every row in a single
 /// query execution, so pushing them down as a frozen literal is correct.
-fn contains_non_deterministic_volatile(expr: &ast::Expression) -> bool {
+pub(crate) fn contains_non_deterministic_volatile(expr: &ast::Expression) -> bool {
     match expr {
         ast::Expression::FunctionCall(func) => {
             let upper = func.function.to_uppercase();
@@ -106,6 +106,43 @@ fn contains_non_deterministic_volatile(expr: &ast::Expression) -> bool {
         }
         ast::Expression::Prefix(prefix) => contains_non_deterministic_volatile(&prefix.right),
         ast::Expression::Cast(cast) => contains_non_deterministic_volatile(&cast.expr),
+        ast::Expression::Aliased(aliased) => {
+            contains_non_deterministic_volatile(&aliased.expression)
+        }
+        ast::Expression::Case(case) => {
+            case.value
+                .as_deref()
+                .is_some_and(contains_non_deterministic_volatile)
+                || case.when_clauses.iter().any(|w| {
+                    contains_non_deterministic_volatile(&w.condition)
+                        || contains_non_deterministic_volatile(&w.then_result)
+                })
+                || case
+                    .else_value
+                    .as_deref()
+                    .is_some_and(contains_non_deterministic_volatile)
+        }
+        ast::Expression::Between(between) => {
+            contains_non_deterministic_volatile(&between.expr)
+                || contains_non_deterministic_volatile(&between.lower)
+                || contains_non_deterministic_volatile(&between.upper)
+        }
+        ast::Expression::Like(like) => {
+            contains_non_deterministic_volatile(&like.left)
+                || contains_non_deterministic_volatile(&like.pattern)
+        }
+        ast::Expression::In(in_expr) => {
+            contains_non_deterministic_volatile(&in_expr.left)
+                || contains_non_deterministic_volatile(&in_expr.right)
+        }
+        ast::Expression::List(list) => list
+            .elements
+            .iter()
+            .any(contains_non_deterministic_volatile),
+        ast::Expression::ExpressionList(list) => list
+            .expressions
+            .iter()
+            .any(contains_non_deterministic_volatile),
         _ => false,
     }
 }
