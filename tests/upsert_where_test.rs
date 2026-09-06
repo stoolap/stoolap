@@ -97,3 +97,20 @@ fn test_the_condition_sees_the_transaction() {
     db.execute("COMMIT", ()).unwrap();
     assert_eq!(rows(&db), [(1, Some(99))]);
 }
+
+#[test]
+fn test_a_condition_that_fails_to_evaluate_is_an_error() {
+    let db = Database::open("memory://upsert_where_error").unwrap();
+    db.execute("CREATE TABLE u (k INTEGER PRIMARY KEY, p TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (1, 'a')", ()).unwrap();
+    let result = db.execute(
+        "INSERT INTO u VALUES (1, '[') ON CONFLICT (k) DO UPDATE SET p = excluded.p \
+         WHERE 'abc' REGEXP excluded.p",
+        (),
+    );
+    assert!(
+        result.is_err(),
+        "an invalid pattern must not read as a false condition"
+    );
+}

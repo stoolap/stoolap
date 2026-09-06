@@ -3486,7 +3486,7 @@ impl Executor {
                 if !named_params.is_empty() {
                     exec_ctx = exec_ctx.with_named_params(named_params);
                 }
-                if !vm.execute_bool(program, &exec_ctx) {
+                if !vm.execute_bool_checked(program, &exec_ctx)? {
                     return Ok((row, false));
                 }
             }
