@@ -6173,20 +6173,44 @@ impl Executor {
             }
             _ => false,
         };
-        let bare_aggregate_call = |expr: &crate::parser::ast::Expression| {
+        // The parser folds a repeated aggregate into one and appends the
+        // ones a hidden ORDER BY needs, so each select column is matched to
+        // the aggregate in its own position, by name, argument and DISTINCT
+        let same_aggregate = |expr: &crate::parser::ast::Expression, agg: &SqlAggregateFunction| {
             let inner = match expr {
                 crate::parser::ast::Expression::Aliased(aliased) => aliased.expression.as_ref(),
                 other => other,
             };
-            matches!(
-                inner,
-                crate::parser::ast::Expression::FunctionCall(func)
-                    if crate::executor::utils::is_aggregate_function(&func.function)
-            )
+            let crate::parser::ast::Expression::FunctionCall(func) = inner else {
+                return false;
+            };
+            if !crate::executor::utils::is_aggregate_function(&func.function)
+                || !agg.name.eq_ignore_ascii_case(&func.function)
+                || agg.distinct != func.is_distinct
+            {
+                return false;
+            }
+            match func.arguments.first() {
+                None | Some(crate::parser::ast::Expression::Star(_)) => agg.column == "*",
+                Some(arg) => {
+                    let arg_text = crate::executor::utils::expression_to_string(arg);
+                    match &agg.expression {
+                        Some(expr) => {
+                            crate::executor::utils::expression_to_string(expr) == arg_text
+                        }
+                        None => agg.column.eq_ignore_ascii_case(&arg_text),
+                    }
+                }
+            }
         };
         let shape_matches = stmt.columns.first().is_some_and(names_group_column)
-            && stmt.columns.iter().skip(1).all(bare_aggregate_call)
             && aggregations.len() + 1 == stmt.columns.len()
+            && stmt
+                .columns
+                .iter()
+                .skip(1)
+                .zip(&aggregations)
+                .all(|(column, agg)| same_aggregate(column, agg))
             && non_agg_columns
                 .iter()
                 .all(|column| column.eq_ignore_ascii_case(&group_col_name));
