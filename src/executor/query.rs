@@ -5559,6 +5559,50 @@ impl Executor {
         Ok((Box::new(result), output_columns, false, None))
     }
 
+    /// Keep the rows of an in-memory source that pass a WHERE holding a
+    /// correlated subquery, each row bound as the subquery's outer row
+    pub(crate) fn filter_rows_by_correlated_where(
+        &self,
+        where_expr: &Expression,
+        rows: RowVec,
+        columns: &[String],
+        table_alias: Option<&str>,
+        ctx: &ExecutionContext,
+    ) -> Result<RowVec> {
+        let mut evaluator = CompiledEvaluator::new(&self.function_registry).with_context(ctx);
+        evaluator.init_columns(columns);
+        let column_keys = ColumnKeyMapping::build_mappings(columns, table_alias);
+        let columns_arc = CompactArc::new(columns.to_vec());
+        let mut outer_row_map: FxHashMap<CompactArc<str>, Value> = FxHashMap::default();
+        let mut kept = RowVec::with_capacity(rows.len());
+        for (id, row) in rows {
+            outer_row_map.clear();
+            for mapping in &column_keys {
+                if let Some(value) = row.get(mapping.index) {
+                    if let Some(ref upart) = mapping.unqualified_part {
+                        outer_row_map.insert(upart.clone(), value.clone());
+                    }
+                    if let Some(ref qname) = mapping.qualified_name {
+                        outer_row_map.insert(qname.clone(), value.clone());
+                    }
+                    outer_row_map.insert(mapping.col_lower.clone(), value.clone());
+                }
+            }
+            let mut correlated_ctx =
+                ctx.with_outer_row(std::mem::take(&mut outer_row_map), columns_arc.clone());
+            let processed = self.process_correlated_where(where_expr, &correlated_ctx)?;
+            ctx.check_cancelled()?;
+            evaluator.set_outer_row_owned(correlated_ctx.outer_row.take().unwrap_or_default());
+            evaluator.set_row_array(&row);
+            let keep = evaluator.evaluate_bool(&processed)?;
+            outer_row_map = evaluator.take_outer_row();
+            if keep {
+                kept.push((id, row));
+            }
+        }
+        Ok(kept)
+    }
+
     /// Execute a subquery source
     fn execute_subquery_source(
         &self,
@@ -5646,15 +5690,23 @@ impl Executor {
                 }
                 None => where_clause,
             };
-            let where_filter = RowFilter::new(where_clause, &columns)?.with_context(ctx);
+            if Self::has_correlated_subqueries(where_clause) {
+                let alias = subquery_source
+                    .alias
+                    .as_ref()
+                    .map(|a| a.value_lower.as_str());
+                self.filter_rows_by_correlated_where(where_clause, rows, &columns, alias, ctx)?
+            } else {
+                let where_filter = RowFilter::new(where_clause, &columns)?.with_context(ctx);
 
-            let mut filtered = RowVec::with_capacity(rows.len());
-            for (id, row) in rows {
-                if where_filter.matches_checked(&row)? {
-                    filtered.push((id, row));
+                let mut filtered = RowVec::with_capacity(rows.len());
+                for (id, row) in rows {
+                    if where_filter.matches_checked(&row)? {
+                        filtered.push((id, row));
+                    }
                 }
+                filtered
             }
-            filtered
         } else {
             rows
         };
@@ -5797,6 +5849,11 @@ impl Executor {
         // avoiding repeated expression compilation per row.
         // CRITICAL: Must pass ctx for parameter resolution ($1, named params, etc.)
         let mut result: Box<dyn QueryResult> = result;
+        let view_alias = stmt
+            .table_expr
+            .as_deref()
+            .and_then(super::utils::get_table_alias_from_expr)
+            .map(|name| name.to_lowercase());
         if let Some(ref where_clause) = stmt.where_clause {
             // A parent row's column named through its own table is bound
             // first, or the bare name it would fall back to could be the
@@ -5825,8 +5882,45 @@ impl Executor {
                 }
                 None => where_clause,
             };
-            let filter = RowFilter::new(where_clause, &view_columns)?.with_context(ctx);
-            result = Box::new(FilteredResult::from_filter(result, filter));
+            if Self::has_correlated_subqueries(where_clause) {
+                let rows = Self::materialize_result(result)?;
+                let rows = self.filter_rows_by_correlated_where(
+                    where_clause,
+                    rows,
+                    &view_columns,
+                    view_alias.as_deref(),
+                    ctx,
+                )?;
+                result = Box::new(ExecutorResult::new(view_columns.clone(), rows));
+            } else {
+                let filter = RowFilter::new(where_clause, &view_columns)?.with_context(ctx);
+                result = Box::new(FilteredResult::from_filter(result, filter));
+            }
+        }
+
+        // A correlated subquery in the select list reads each view row as
+        // its outer row, the way it does over a derived table
+        if Self::has_correlated_select_subqueries(&stmt.columns)
+            && !classification.has_aggregation
+            && !classification.has_window_functions
+            && !self.order_by_needs_extra_columns(stmt, &view_columns)
+        {
+            let rows = Self::materialize_result(result)?;
+            let projected_rows = self.project_rows_with_alias(
+                &stmt.columns,
+                rows,
+                &view_columns,
+                None,
+                ctx,
+                view_alias.as_deref(),
+            )?;
+            let output_columns =
+                CompactArc::new(self.get_output_column_names(&stmt.columns, &view_columns, None));
+            let result = ExecutorResult::with_arc_columns(
+                CompactArc::clone(&output_columns),
+                projected_rows,
+            );
+            return Ok((Box::new(result), output_columns, false, None));
         }
 
         // Handle aggregation: if outer query has aggregates, materialize view result and aggregate

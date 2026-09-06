@@ -1140,11 +1140,20 @@ impl Executor {
         // OPTIMIZATION: Get cached query classification to avoid repeated AST traversals
         let classification = get_classification(stmt);
 
+        let cte_alias = stmt
+            .table_expr
+            .as_deref()
+            .and_then(super::utils::get_table_alias_from_expr)
+            .map(|name| name.to_lowercase());
+
         // Apply WHERE clause filter
         let filtered_rows = if let Some(ref where_clause) = stmt.where_clause {
             // Process subqueries in WHERE clause (e.g., IN subqueries on CTEs)
-            // Use cached classification to avoid AST traversal
-            let processed_where = if classification.where_has_subqueries {
+            // Use cached classification to avoid AST traversal; a correlated
+            // one is evaluated per row below
+            let processed_where = if classification.where_has_subqueries
+                && !Self::has_correlated_subqueries(where_clause)
+            {
                 self.process_where_subqueries(where_clause, ctx)?
             } else {
                 (**where_clause).clone()
@@ -1154,14 +1163,7 @@ impl Executor {
             // CTE's own
             let processed_where = match ctx.outer_row() {
                 Some(outer) => {
-                    let inner: Vec<String> = stmt
-                        .table_expr
-                        .as_deref()
-                        .and_then(super::utils::get_table_alias_from_expr)
-                        .map(|name| name.to_lowercase())
-                        .into_iter()
-                        .collect();
-                    let inner: Vec<&str> = inner.iter().map(String::as_str).collect();
+                    let inner: Vec<&str> = cte_alias.iter().map(String::as_str).collect();
                     let scope = super::utils::InnerScope {
                         tables: &inner,
                         schema: None,
@@ -1175,19 +1177,29 @@ impl Executor {
                 None => processed_where,
             };
 
-            // Compile filter once and reuse for all rows
-            let mut eval =
-                ExpressionEval::compile(&processed_where, &cte_columns)?.with_context(ctx);
+            if Self::has_correlated_subqueries(&processed_where) {
+                self.filter_rows_by_correlated_where(
+                    &processed_where,
+                    cte_rows,
+                    &cte_columns,
+                    cte_alias.as_deref(),
+                    ctx,
+                )?
+            } else {
+                // Compile filter once and reuse for all rows
+                let mut eval =
+                    ExpressionEval::compile(&processed_where, &cte_columns)?.with_context(ctx);
 
-            let mut result = RowVec::new();
-            let mut row_id = 0i64;
-            for (_, row) in cte_rows {
-                if eval.eval_bool_checked(&row)? {
-                    result.push((row_id, row));
-                    row_id += 1;
+                let mut result = RowVec::new();
+                let mut row_id = 0i64;
+                for (_, row) in cte_rows {
+                    if eval.eval_bool_checked(&row)? {
+                        result.push((row_id, row));
+                        row_id += 1;
+                    }
                 }
+                result
             }
-            result
         } else {
             cte_rows
         };
@@ -1218,8 +1230,13 @@ impl Executor {
             return Ok((columns, rows, !skip_order_limit));
         }
 
-        // Process scalar subqueries in SELECT columns before projection
-        let processed_columns = self.try_process_select_subqueries(&stmt.columns, ctx)?;
+        // Process scalar subqueries in SELECT columns before projection; a
+        // correlated one is evaluated per row by the projection
+        let processed_columns = if Self::has_correlated_select_subqueries(&stmt.columns) {
+            None
+        } else {
+            self.try_process_select_subqueries(&stmt.columns, ctx)?
+        };
         let columns_to_use = processed_columns.as_ref().unwrap_or(&stmt.columns);
 
         // Determine output columns
@@ -1259,6 +1276,7 @@ impl Executor {
                         columns_to_use,
                         &filtered_rows,
                         &cte_columns,
+                        cte_alias.as_deref(),
                         ctx,
                     )?;
                     // Append source columns that aren't in output
@@ -1295,6 +1313,7 @@ impl Executor {
                     columns_to_use,
                     &filtered_rows,
                     &cte_columns,
+                    cte_alias.as_deref(),
                     ctx,
                 )?
             } else {
@@ -1314,7 +1333,13 @@ impl Executor {
                 // Sort on source columns first, then project
                 let sorted =
                     self.apply_order_by_to_rows(filtered_rows, &stmt.order_by, &cte_columns)?;
-                self.project_cte_rows_from_columns(columns_to_use, &sorted, &cte_columns, ctx)?
+                self.project_cte_rows_from_columns(
+                    columns_to_use,
+                    &sorted,
+                    &cte_columns,
+                    cte_alias.as_deref(),
+                    ctx,
+                )?
             } else {
                 self.apply_order_by_to_rows(filtered_rows, &stmt.order_by, &cte_columns)?
             }
@@ -1325,6 +1350,7 @@ impl Executor {
                     columns_to_use,
                     &filtered_rows,
                     &cte_columns,
+                    cte_alias.as_deref(),
                     ctx,
                 )?
             } else {
@@ -1461,9 +1487,22 @@ impl Executor {
         columns: &[Expression],
         rows: &RowVec,
         cte_columns: &[String],
+        table_alias: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<RowVec> {
         use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
+
+        // A correlated subquery reads each row as its outer row
+        if Self::has_correlated_select_subqueries(columns) {
+            return self.project_rows_with_alias(
+                columns,
+                RowVec::from_vec((**rows).clone()),
+                cte_columns,
+                None,
+                ctx,
+                table_alias,
+            );
+        }
 
         let col_index_map = build_column_index_map(cte_columns);
 
