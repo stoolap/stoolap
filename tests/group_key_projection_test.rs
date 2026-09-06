@@ -152,3 +152,28 @@ fn test_a_derived_group_by_keeps_every_select_expression() {
         [("a".into(), "A".into(), 2), ("b".into(), "B".into(), 1)]
     );
 }
+
+#[test]
+fn test_a_repeated_aggregate_beside_a_hidden_order_by_aggregate_keeps_its_place() {
+    let db = Database::open("memory://group_key_projection_hidden_aggregate").unwrap();
+    // COUNT(*) appears twice and SUM(v) only in ORDER BY: the parser folds
+    // the repeat and appends the hidden one, so the select list and the
+    // parsed aggregates disagree on positions
+    let rows: Vec<(String, i64, i64)> = db
+        .query(
+            "SELECT t.k, COUNT(*) AS a, COUNT(*) AS b FROM (SELECT 'x' AS k, 10 AS v) t \
+             GROUP BY t.k ORDER BY SUM(v)",
+            (),
+        )
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (
+                r.get::<String>(0).unwrap(),
+                r.get::<i64>(1).unwrap(),
+                r.get::<i64>(2).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(rows, [("x".into(), 1, 1)]);
+}

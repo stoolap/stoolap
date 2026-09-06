@@ -6161,20 +6161,60 @@ impl Executor {
         let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
 
         // The rows come out as the GROUP BY column and then the aggregates,
-        // so the select list has to read exactly that, in that order
-        if non_agg_columns.len() != 1 || !non_agg_columns[0].eq_ignore_ascii_case(&group_col_name) {
-            return Ok(None);
-        }
-        let leads_with_group_column = match stmt.columns.first() {
-            Some(crate::parser::ast::Expression::Identifier(id)) => {
+        // so the select list has to read exactly that, in that order: the
+        // group column first, bare or qualified, then nothing but aggregate
+        // calls, one per aggregate parsed
+        let names_group_column = |expr: &crate::parser::ast::Expression| match expr {
+            crate::parser::ast::Expression::Identifier(id) => {
                 id.value_lower.eq_ignore_ascii_case(&group_col_name)
             }
-            Some(crate::parser::ast::Expression::QualifiedIdentifier(qid)) => {
+            crate::parser::ast::Expression::QualifiedIdentifier(qid) => {
                 qid.name.value_lower.eq_ignore_ascii_case(&group_col_name)
             }
             _ => false,
         };
-        if !leads_with_group_column {
+        // The parser folds a repeated aggregate into one and appends the
+        // ones a hidden ORDER BY needs, so each select column is matched to
+        // the aggregate in its own position, by name, argument and DISTINCT
+        let same_aggregate = |expr: &crate::parser::ast::Expression, agg: &SqlAggregateFunction| {
+            let inner = match expr {
+                crate::parser::ast::Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                other => other,
+            };
+            let crate::parser::ast::Expression::FunctionCall(func) = inner else {
+                return false;
+            };
+            if !crate::executor::utils::is_aggregate_function(&func.function)
+                || !agg.name.eq_ignore_ascii_case(&func.function)
+                || agg.distinct != func.is_distinct
+            {
+                return false;
+            }
+            match func.arguments.first() {
+                None | Some(crate::parser::ast::Expression::Star(_)) => agg.column == "*",
+                Some(arg) => {
+                    let arg_text = crate::executor::utils::expression_to_string(arg);
+                    match &agg.expression {
+                        Some(expr) => {
+                            crate::executor::utils::expression_to_string(expr) == arg_text
+                        }
+                        None => agg.column.eq_ignore_ascii_case(&arg_text),
+                    }
+                }
+            }
+        };
+        let shape_matches = stmt.columns.first().is_some_and(names_group_column)
+            && aggregations.len() + 1 == stmt.columns.len()
+            && stmt
+                .columns
+                .iter()
+                .skip(1)
+                .zip(&aggregations)
+                .all(|(column, agg)| same_aggregate(column, agg))
+            && non_agg_columns
+                .iter()
+                .all(|column| column.eq_ignore_ascii_case(&group_col_name));
+        if !shape_matches {
             return Ok(None);
         }
 
