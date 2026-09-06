@@ -3354,6 +3354,15 @@ impl Executor {
             }
         }
 
+        // So does an ORDER BY, which decides what a LIMIT keeps
+        if subquery
+            .order_by
+            .iter()
+            .any(|o| Self::references_outer_columns(&o.expression, &subquery_tables))
+        {
+            return true;
+        }
+
         // A derived table in the FROM may read the parent row too
         subquery
             .table_expr
@@ -3613,6 +3622,10 @@ impl Executor {
                 .having
                 .as_deref()
                 .is_some_and(|having| Self::references_outer_columns(having, &tables))
+            || nested
+                .order_by
+                .iter()
+                .any(|o| Self::references_outer_columns(&o.expression, &tables))
             || nested
                 .table_expr
                 .as_deref()

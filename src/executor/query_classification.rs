@@ -1014,6 +1014,15 @@ impl QueryClassification {
             }
         }
 
+        // An ORDER BY reads the parent row too, and decides what a LIMIT keeps
+        if subquery
+            .order_by
+            .iter()
+            .any(|o| Self::has_outer_column_reference(&o.expression, &subquery_tables))
+        {
+            return true;
+        }
+
         // A derived table in the FROM may read the parent row too
         subquery
             .table_expr
@@ -1207,6 +1216,10 @@ impl QueryClassification {
                 .having
                 .as_deref()
                 .is_some_and(|having| Self::has_outer_column_reference(having, &tables))
+            || nested
+                .order_by
+                .iter()
+                .any(|o| Self::has_outer_column_reference(&o.expression, &tables))
             || nested
                 .table_expr
                 .as_deref()

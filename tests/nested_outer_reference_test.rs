@@ -89,3 +89,35 @@ fn test_an_exists_tied_to_the_parent_through_its_own_subquery() {
         [2, 4]
     );
 }
+
+#[test]
+fn test_a_subquery_tied_to_the_parent_only_through_its_order_by() {
+    let db = Database::open("memory://nested_outer_order_by").unwrap();
+    db.execute("CREATE TABLE x (id INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO x VALUES (1, 0)", ()).unwrap();
+    db.execute("CREATE TABLE y (id INTEGER PRIMARY KEY, b INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO y VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+    db.execute("CREATE TABLE z (id INTEGER PRIMARY KEY, c INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO z VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+    // The nearest z.c to each y.b is y.b itself, so every y row matches
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT (SELECT COUNT(*) FROM y WHERE y.b = \
+             (SELECT z.c + x.a FROM z ORDER BY ABS(z.c - y.b) LIMIT 1)) FROM x"
+        ),
+        [2]
+    );
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT COUNT(*) FROM y WHERE y.b = (SELECT z.c FROM z ORDER BY ABS(z.c - y.b) LIMIT 1)"
+        ),
+        [2]
+    );
+}
