@@ -35,11 +35,12 @@ use crate::core::value::NULL_VALUE;
 use crate::core::{DataType, Operator, Row, Schema, Value};
 use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
-    AliasedExpression, BetweenExpression, BooleanLiteral, CaseExpression, CastExpression,
-    DistinctExpression, Expression, ExpressionList, FloatLiteral, FunctionCall, Identifier,
-    InExpression, InHashSetExpression, InfixExpression, InfixOperator, IntegerLiteral,
-    LikeExpression, ListExpression, NullLiteral, PrefixExpression, QualifiedIdentifier,
-    StringLiteral, WhenClause, WindowFrameBound,
+    AliasedExpression, AllAnyExpression, BetweenExpression, BooleanLiteral, CaseExpression,
+    CastExpression, DistinctExpression, ExistsExpression, Expression, ExpressionList, FloatLiteral,
+    FunctionCall, Identifier, InExpression, InHashSetExpression, InfixExpression, InfixOperator,
+    IntegerLiteral, JoinTableSource, LikeExpression, ListExpression, NullLiteral, PrefixExpression,
+    QualifiedIdentifier, ScalarSubquery, SelectStatement, StringLiteral, SubqueryTableSource,
+    WhenClause, WindowFrameBound,
 };
 use crate::parser::token::{Position, Token, TokenType};
 
@@ -494,7 +495,148 @@ fn substitute_outer_references_inner(
             })))
         }
 
+        // A subquery keeps what its own FROM defines and takes the rest
+        // from the outer row, so one that reads only the outer row runs
+        // once instead of once per row of the query holding it
+        Expression::ScalarSubquery(subquery) => {
+            substitute_in_select(&subquery.subquery, outer_row, scope).map(|select| {
+                Expression::ScalarSubquery(ScalarSubquery {
+                    token: subquery.token.clone(),
+                    subquery: Box::new(select),
+                })
+            })
+        }
+        Expression::Exists(exists) => {
+            substitute_in_select(&exists.subquery, outer_row, scope).map(|select| {
+                Expression::Exists(ExistsExpression {
+                    token: exists.token.clone(),
+                    subquery: Box::new(select),
+                })
+            })
+        }
+        Expression::AllAny(all_any) => {
+            let new_left = substitute_outer_references_inner(&all_any.left, outer_row, scope);
+            let new_subquery = substitute_in_select(&all_any.subquery, outer_row, scope);
+            if new_left.is_none() && new_subquery.is_none() {
+                return None;
+            }
+            Some(Expression::AllAny(AllAnyExpression {
+                token: all_any.token.clone(),
+                left: Box::new(new_left.unwrap_or_else(|| (*all_any.left).clone())),
+                operator: all_any.operator.clone(),
+                all_any_type: all_any.all_any_type,
+                subquery: Box::new(new_subquery.unwrap_or_else(|| (*all_any.subquery).clone())),
+            }))
+        }
+
         // Literals and other expressions that don't need substitution
+        _ => None,
+    }
+}
+
+/// The statement with the outer row bound into its expressions; the names
+/// its own FROM defines are shielded along with the enclosing scope's
+fn substitute_in_select(
+    stmt: &SelectStatement,
+    outer_row: &FxHashMap<CompactArc<str>, Value>,
+    scope: Option<&InnerScope<'_>>,
+) -> Option<SelectStatement> {
+    let mut tables: Vec<String> = scope
+        .map(|s| s.tables.iter().map(|t| t.to_string()).collect())
+        .unwrap_or_default();
+    if let Some(table_expr) = stmt.table_expr.as_deref() {
+        collect_table_aliases(table_expr, &mut tables);
+    }
+    let tables: Vec<&str> = tables.iter().map(String::as_str).collect();
+    let inner = InnerScope {
+        tables: &tables,
+        schema: None,
+    };
+    let inner = Some(&inner);
+    let substitute = |expr: &Expression| substitute_outer_references_inner(expr, outer_row, inner);
+
+    let columns: Vec<Option<Expression>> = stmt.columns.iter().map(substitute).collect();
+    let table_expr = stmt
+        .table_expr
+        .as_deref()
+        .and_then(|expr| substitute_in_table_expr(expr, outer_row, inner));
+    let where_clause = stmt.where_clause.as_deref().and_then(substitute);
+    let having = stmt.having.as_deref().and_then(substitute);
+    let order_by: Vec<Option<Expression>> = stmt
+        .order_by
+        .iter()
+        .map(|o| substitute(&o.expression))
+        .collect();
+    let changed = columns.iter().any(Option::is_some)
+        || table_expr.is_some()
+        || where_clause.is_some()
+        || having.is_some()
+        || order_by.iter().any(Option::is_some);
+    if !changed {
+        return None;
+    }
+
+    let mut bound = stmt.clone();
+    for (target, new) in bound.columns.iter_mut().zip(columns) {
+        if let Some(new) = new {
+            *target = new;
+        }
+    }
+    if let Some(expr) = table_expr {
+        bound.table_expr = Some(Box::new(expr));
+    }
+    if let Some(expr) = where_clause {
+        bound.where_clause = Some(Box::new(expr));
+    }
+    if let Some(expr) = having {
+        bound.having = Some(Box::new(expr));
+    }
+    for (target, new) in bound.order_by.iter_mut().zip(order_by) {
+        if let Some(new) = new {
+            target.expression = new;
+        }
+    }
+    Some(bound)
+}
+
+/// A FROM with the outer row bound into its join conditions and derived tables
+fn substitute_in_table_expr(
+    expr: &Expression,
+    outer_row: &FxHashMap<CompactArc<str>, Value>,
+    scope: Option<&InnerScope<'_>>,
+) -> Option<Expression> {
+    match expr {
+        Expression::JoinSource(join) => {
+            let left = substitute_in_table_expr(&join.left, outer_row, scope);
+            let right = substitute_in_table_expr(&join.right, outer_row, scope);
+            let condition = join
+                .condition
+                .as_deref()
+                .and_then(|c| substitute_outer_references_inner(c, outer_row, scope));
+            if left.is_none() && right.is_none() && condition.is_none() {
+                return None;
+            }
+            Some(Expression::JoinSource(Box::new(JoinTableSource {
+                token: join.token.clone(),
+                left: Box::new(left.unwrap_or_else(|| (*join.left).clone())),
+                join_type: join.join_type.clone(),
+                right: Box::new(right.unwrap_or_else(|| (*join.right).clone())),
+                condition: match condition {
+                    Some(c) => Some(Box::new(c)),
+                    None => join.condition.clone(),
+                },
+                using_columns: join.using_columns.clone(),
+            })))
+        }
+        Expression::SubquerySource(source) => {
+            substitute_in_select(&source.subquery, outer_row, scope).map(|select| {
+                Expression::SubquerySource(Box::new(SubqueryTableSource {
+                    token: source.token.clone(),
+                    subquery: Box::new(select),
+                    alias: source.alias.clone(),
+                }))
+            })
+        }
         _ => None,
     }
 }

@@ -2387,6 +2387,26 @@ impl Executor {
         // Check if this query might reference outer columns (correlated)
         let has_outer_context = ctx.outer_row().is_some();
 
+        // A parent row's columns are bound into a WHERE holding subqueries,
+        // the subqueries included, so one that reads only the parent row
+        // folds once instead of running for every row of this table
+        let bound_where: Option<Expression> = match (where_to_use, ctx.outer_row()) {
+            (Some(where_expr), Some(outer_row)) if classification.where_has_subqueries => {
+                let inner = [table_alias.as_deref().unwrap_or(table_name)];
+                let scope = super::utils::InnerScope {
+                    tables: &inner,
+                    schema: Some(table.schema()),
+                };
+                Some(super::utils::substitute_outer_references_in_scope(
+                    where_expr, outer_row, &scope,
+                ))
+            }
+            _ => None,
+        };
+        let where_to_use: Option<&Expression> = bound_where.as_ref().or(where_to_use);
+        let where_still_correlated = classification.where_has_correlated_subqueries
+            && where_to_use.is_some_and(Self::has_correlated_subqueries);
+
         // SEMANTIC CACHE: Check if we can serve this query from cache
         // Eligible queries: simple column projections with WHERE, no aggregation/window/grouping, no outer context
         // Use cached classification for is_select_star check
@@ -2998,8 +3018,7 @@ impl Executor {
 
             // Check if WHERE contains correlated subqueries
             // Use cached classification to avoid expensive AST traversal
-            let has_correlated = classification.where_has_subqueries
-                && classification.where_has_correlated_subqueries;
+            let has_correlated = where_still_correlated;
 
             // Check if WHERE contains any subqueries (correlated or not)
             // Use cached classification to avoid redundant traversal of the expression tree
