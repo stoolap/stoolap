@@ -4577,6 +4577,13 @@ impl Executor {
                     // operator asks it where the pair is formed, so a pair it
                     // turns away leaves an outer row still unmatched. The
                     // filter is built per pass since the operator owns it
+                    // The inner key column, checked on each fetched row in
+                    // place of the equality the residual filter leaves out
+                    let inner_key_idx = inner_cols.iter().position(|c| {
+                        c.rsplit('.')
+                            .next()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&inner_col))
+                    });
                     let build_residual_filter = || {
                         let inner_filter = nl_right_filter
                             .as_ref()
@@ -4671,7 +4678,8 @@ impl Executor {
                                 outer_idx,
                                 lookup_strategy.clone(),
                                 build_residual_filter(),
-                            );
+                            )
+                            .with_inner_key(inner_key_idx);
                             if let Some(ref proj) = projection_pushdown {
                                 let projected_schema: Vec<ColumnInfo> =
                                     proj.output_columns.iter().map(ColumnInfo::new).collect();
@@ -4767,7 +4775,8 @@ impl Executor {
                             outer_idx,
                             lookup_strategy.clone(),
                             build_residual_filter(),
-                        );
+                        )
+                        .with_inner_key(inner_key_idx);
                         let mut join_op: Box<dyn Operator> =
                             if let Some(ref proj) = projection_pushdown {
                                 let projected_schema: Vec<ColumnInfo> =

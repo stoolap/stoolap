@@ -94,6 +94,9 @@ pub struct IndexNestedLoopJoinOperator {
     outer_key_idx: usize,
     lookup_strategy: IndexLookupStrategy,
     residual_filter: Option<JoinFilter>,
+    // The inner key column, checked on each fetched row: inside a
+    // transaction an index entry may be older than the row it points at
+    inner_key_idx: Option<usize>,
 
     // Output schema
     schema: Vec<ColumnInfo>,
@@ -165,6 +168,7 @@ impl IndexNestedLoopJoinOperator {
             outer_key_idx,
             lookup_strategy,
             residual_filter,
+            inner_key_idx: None,
             schema,
             inner_col_count,
             projection: None,
@@ -214,6 +218,13 @@ impl IndexNestedLoopJoinOperator {
     /// predicate on inner columns only
     pub fn with_inner_filter(mut self, filter: Box<dyn Expression>) -> Self {
         self.inner_filter = Some(filter);
+        self
+    }
+
+    /// The inner key column, so a row an index entry points at is kept
+    /// only when its own key equals the outer one
+    pub fn with_inner_key(mut self, inner_key_idx: Option<usize>) -> Self {
+        self.inner_key_idx = inner_key_idx;
         self
     }
 
@@ -358,7 +369,17 @@ impl IndexNestedLoopJoinOperator {
             &self.row_id_buffer,
             filter,
             &mut self.current_inner_rows,
-        )
+        )?;
+
+        // An index entry may point at a row whose key has since changed
+        // inside the transaction, so the row's own key decides
+        if let (IndexLookupStrategy::SecondaryIndex(_), Some(idx)) =
+            (&self.lookup_strategy, self.inner_key_idx)
+        {
+            self.current_inner_rows
+                .retain(|(_, row)| row.get(idx) == Some(key_value));
+        }
+        Ok(())
     }
 
     /// Advance to the next outer row and lookup matching inner rows.
@@ -537,6 +558,9 @@ pub struct BatchIndexNestedLoopJoinOperator {
     outer_key_idx: usize,
     lookup_strategy: IndexLookupStrategy,
     residual_filter: Option<JoinFilter>,
+    // The inner key column, checked on each fetched row: inside a
+    // transaction an index entry may be older than the row it points at
+    inner_key_idx: Option<usize>,
 
     // Output schema
     schema: Vec<ColumnInfo>,
@@ -580,6 +604,7 @@ impl BatchIndexNestedLoopJoinOperator {
             outer_key_idx,
             lookup_strategy,
             residual_filter,
+            inner_key_idx: None,
             schema,
             inner_col_count,
             projection: None,
@@ -589,6 +614,13 @@ impl BatchIndexNestedLoopJoinOperator {
             row_id_buffer: Vec::with_capacity(16),
             opened: false,
         }
+    }
+
+    /// The inner key column, so a row an index entry points at is kept
+    /// only when its own key equals the outer one
+    pub fn with_inner_key(mut self, inner_key_idx: Option<usize>) -> Self {
+        self.inner_key_idx = inner_key_idx;
+        self
     }
 
     /// Set projection pushdown configuration.
@@ -745,6 +777,16 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
             if let Some(outer_indices) = key_to_outer_indices.get(*row_id) {
                 for &outer_idx in outer_indices {
                     let outer_row = &outer_rows[outer_idx];
+
+                    // An index entry may point at a row whose key has since
+                    // changed inside the transaction, so the row's own key decides
+                    if let (IndexLookupStrategy::SecondaryIndex(_), Some(idx)) =
+                        (&self.lookup_strategy, self.inner_key_idx)
+                    {
+                        if inner_row.get(idx) != outer_row.get(self.outer_key_idx) {
+                            continue;
+                        }
+                    }
 
                     // Apply residual filter if present
                     let passes_filter = if let Some(ref filter) = self.residual_filter {
