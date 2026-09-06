@@ -75,8 +75,8 @@ pub struct MvccTransaction {
     last_table_name: Option<String>,
     /// Engine reference for table operations (will be set by Engine)
     engine_operations: Option<Arc<dyn TransactionEngineOperations>>,
-    /// Savepoints: maps savepoint name to state (timestamp + DDL snapshot)
-    savepoints: FxHashMap<String, SavepointState>,
+    /// Savepoints in creation order; the same name may appear more than once
+    savepoints: Vec<(String, SavepointState)>,
     /// Tables created in this transaction (for rollback)
     created_tables: Vec<String>,
     /// Tables dropped in this transaction (for rollback - stores name and schema)
@@ -204,7 +204,7 @@ impl MvccTransaction {
             begin_seq,
             last_table_name: None,
             engine_operations: None,
-            savepoints: FxHashMap::default(),
+            savepoints: Vec::new(),
             created_tables: Vec::new(),
             dropped_tables: Vec::new(),
         }
@@ -304,7 +304,7 @@ impl MvccTransaction {
     /// Creates a savepoint with the given name
     ///
     /// Records the current timestamp and DDL state so we can rollback to this point later.
-    /// If a savepoint with this name already exists, it is overwritten.
+    /// A name already in use starts a new, more recent savepoint of that name.
     pub fn create_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
         let timestamp = get_fast_timestamp();
@@ -312,28 +312,32 @@ impl MvccTransaction {
             created_tables_len: self.created_tables.len(),
             dropped_tables_len: self.dropped_tables.len(),
         };
-        self.savepoints.insert(
+        self.savepoints.push((
             name.to_string(),
             SavepointState {
                 timestamp,
                 ddl_state,
             },
-        );
+        ));
         Ok(())
     }
 
-    /// Releases (removes) a savepoint without rolling back
+    /// Position of the most recent savepoint with this name
+    fn savepoint_position(&self, name: &str) -> Result<usize> {
+        self.savepoints
+            .iter()
+            .rposition(|(sp_name, _)| sp_name == name)
+            .ok_or_else(|| Error::invalid_argument(format!("savepoint '{}' does not exist", name)))
+    }
+
+    /// Releases a savepoint, and every savepoint created after it, without rolling back
     ///
     /// The changes made after the savepoint remain intact.
     /// Returns an error if the savepoint doesn't exist.
     pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
-        if self.savepoints.remove(name).is_none() {
-            return Err(Error::invalid_argument(format!(
-                "savepoint '{}' does not exist",
-                name
-            )));
-        }
+        let position = self.savepoint_position(name)?;
+        self.savepoints.truncate(position);
         Ok(())
     }
 
@@ -341,13 +345,12 @@ impl MvccTransaction {
     ///
     /// All local DML changes with timestamps after the savepoint are discarded.
     /// DDL operations (CREATE/DROP TABLE) after the savepoint are also reversed.
-    /// The savepoint itself is also removed (SQL standard behavior).
+    /// Savepoints created after it are removed; the savepoint itself stays.
     pub fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
         self.check_active()?;
 
-        let sp_state = self.savepoints.get(name).copied().ok_or_else(|| {
-            Error::invalid_argument(format!("savepoint '{}' does not exist", name))
-        })?;
+        let position = self.savepoint_position(name)?;
+        let sp_state = self.savepoints[position].1;
 
         // Rollback DML changes via engine operations (not self.tables which is empty)
         if let Some(ops) = &self.engine_operations {
@@ -385,21 +388,20 @@ impl MvccTransaction {
             }
         }
 
-        // Remove this savepoint and all savepoints created after it
-        self.savepoints
-            .retain(|_, sp| sp.timestamp <= sp_state.timestamp);
+        self.savepoints.truncate(position + 1);
 
         Ok(())
     }
 
     /// Check if a savepoint exists
     pub fn has_savepoint(&self, name: &str) -> bool {
-        self.savepoints.contains_key(name)
+        self.savepoint_position(name).is_ok()
     }
 
-    /// Gets the timestamp associated with a savepoint
+    /// Gets the timestamp of the most recent savepoint with this name
     pub fn get_savepoint_ts(&self, name: &str) -> Option<i64> {
-        self.savepoints.get(name).map(|sp| sp.timestamp)
+        let position = self.savepoint_position(name).ok()?;
+        Some(self.savepoints[position].1.timestamp)
     }
 }
 

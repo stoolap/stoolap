@@ -39,7 +39,7 @@ use crate::core::{Error, Result, Row, Schema, Value};
 use crate::executor::context::ExecutionContext;
 use crate::executor::expression::ExpressionEval;
 use crate::executor::Executor;
-use crate::parser::ast::{Expression, Statement};
+use crate::parser::ast::{Expression, RollbackStatement, Statement};
 use crate::parser::Parser;
 use crate::storage::expression::Expression as StorageExprTrait;
 use crate::storage::mvcc::engine::MVCCEngine;
@@ -433,6 +433,21 @@ impl Transaction {
                 Ok(Box::new(ExecResult::with_rows_affected(
                     deleted_count as i64,
                 )))
+            }
+            Statement::Savepoint(stmt) => {
+                tx.create_savepoint(&stmt.savepoint_name.value)?;
+                Ok(Box::new(ExecResult::empty()))
+            }
+            Statement::ReleaseSavepoint(stmt) => {
+                tx.release_savepoint(&stmt.savepoint_name.value)?;
+                Ok(Box::new(ExecResult::empty()))
+            }
+            Statement::Rollback(RollbackStatement {
+                savepoint_name: Some(name),
+                ..
+            }) => {
+                tx.rollback_to_savepoint(&name.value)?;
+                Ok(Box::new(ExecResult::empty()))
             }
             Statement::Select(_) | Statement::Insert(_) => {
                 unreachable!("SELECT and INSERT handled above via executor delegation")
