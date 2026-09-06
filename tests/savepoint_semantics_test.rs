@@ -148,4 +148,12 @@ fn test_release_stays_usable_as_a_column_name() {
         .map(|r| r.unwrap().get::<String>(0).unwrap())
         .collect();
     assert_eq!(release, ["v1"]);
+    run(
+        &db,
+        &[
+            "ALTER TABLE r RENAME COLUMN release TO version",
+            "ALTER TABLE r ADD COLUMN release TEXT",
+            "ALTER TABLE r DROP COLUMN release",
+        ],
+    );
 }

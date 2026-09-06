@@ -345,7 +345,6 @@ pub static KEYWORDS: &[&str] = &[
     "COMMIT",
     "ROLLBACK",
     "SAVEPOINT",
-    "RELEASE",
     "PRECEDING",
     "FOLLOWING",
     "CURRENT",

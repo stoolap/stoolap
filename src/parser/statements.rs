@@ -99,9 +99,6 @@ impl Parser {
                 "COMMIT" => self.parse_commit_statement().map(Statement::Commit),
                 "ROLLBACK" => self.parse_rollback_statement().map(Statement::Rollback),
                 "SAVEPOINT" => self.parse_savepoint_statement().map(Statement::Savepoint),
-                "RELEASE" => self
-                    .parse_release_savepoint_statement()
-                    .map(Statement::ReleaseSavepoint),
                 "SET" => self
                     .parse_set_statement()
                     .map(|s| Statement::Set(Box::new(s))),
@@ -117,6 +114,14 @@ impl Parser {
                     self.parse_expression_statement().map(Statement::Expression)
                 }
             }
+        } else if self.cur_token_is(TokenType::Identifier)
+            && self.cur_token.literal.eq_ignore_ascii_case("RELEASE")
+            && (self.peek_token_is_keyword("SAVEPOINT")
+                || self.peek_token_is(TokenType::Identifier))
+        {
+            // RELEASE stays a plain identifier elsewhere, so `release` remains a column name
+            self.parse_release_savepoint_statement()
+                .map(Statement::ReleaseSavepoint)
         } else {
             // Try to parse as expression statement
             self.parse_expression_statement().map(Statement::Expression)
