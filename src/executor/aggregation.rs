@@ -6161,20 +6161,36 @@ impl Executor {
         let (aggregations, non_agg_columns) = self.parse_aggregations(stmt)?;
 
         // The rows come out as the GROUP BY column and then the aggregates,
-        // so the select list has to read exactly that, in that order
-        if non_agg_columns.len() != 1 || !non_agg_columns[0].eq_ignore_ascii_case(&group_col_name) {
-            return Ok(None);
-        }
-        let leads_with_group_column = match stmt.columns.first() {
-            Some(crate::parser::ast::Expression::Identifier(id)) => {
+        // so the select list has to read exactly that, in that order: the
+        // group column first, bare or qualified, then nothing but aggregate
+        // calls, one per aggregate parsed
+        let names_group_column = |expr: &crate::parser::ast::Expression| match expr {
+            crate::parser::ast::Expression::Identifier(id) => {
                 id.value_lower.eq_ignore_ascii_case(&group_col_name)
             }
-            Some(crate::parser::ast::Expression::QualifiedIdentifier(qid)) => {
+            crate::parser::ast::Expression::QualifiedIdentifier(qid) => {
                 qid.name.value_lower.eq_ignore_ascii_case(&group_col_name)
             }
             _ => false,
         };
-        if !leads_with_group_column {
+        let bare_aggregate_call = |expr: &crate::parser::ast::Expression| {
+            let inner = match expr {
+                crate::parser::ast::Expression::Aliased(aliased) => aliased.expression.as_ref(),
+                other => other,
+            };
+            matches!(
+                inner,
+                crate::parser::ast::Expression::FunctionCall(func)
+                    if crate::executor::utils::is_aggregate_function(&func.function)
+            )
+        };
+        let shape_matches = stmt.columns.first().is_some_and(names_group_column)
+            && stmt.columns.iter().skip(1).all(bare_aggregate_call)
+            && aggregations.len() + 1 == stmt.columns.len()
+            && non_agg_columns
+                .iter()
+                .all(|column| column.eq_ignore_ascii_case(&group_col_name));
+        if !shape_matches {
             return Ok(None);
         }
 
