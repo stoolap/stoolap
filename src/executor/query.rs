@@ -440,15 +440,33 @@ impl Executor {
         // Execute the main query
         // The third return value indicates if LIMIT/OFFSET was already applied (by storage-level pushdown)
         // The fourth return value contains deferred projection info if applicable
+        // A pure UNION ALL without ORDER BY or DISTINCT needs LIMIT + OFFSET
+        // rows at most from each branch, so that many bound the first
+        // branch and the set operation; the whole is cut below
+        let all_union_all = stmt
+            .set_operations
+            .iter()
+            .all(|op| matches!(op.operation, SetOperationType::UnionAll));
+        let set_limit = if all_union_all && stmt.order_by.is_empty() && !stmt.distinct {
+            limit.map(|l| l + offset)
+        } else {
+            None
+        };
+
         // ORDER BY, LIMIT and OFFSET belong to the whole set operation, so
-        // the first branch runs without them
+        // the first branch runs without them, apart from that bound
         let branch_stmt;
         let branch = if stmt.set_operations.is_empty() {
             stmt
         } else {
             branch_stmt = SelectStatement {
                 order_by: Vec::new(),
-                limit: None,
+                limit: set_limit.map(|l| {
+                    Box::new(Expression::IntegerLiteral(IntegerLiteral {
+                        token: dummy_token(&l.to_string(), TokenType::Integer),
+                        value: l as i64,
+                    }))
+                }),
                 offset: None,
                 ..stmt.clone()
             };
@@ -461,17 +479,6 @@ impl Executor {
         // Pass limit+offset to enable early termination for UNION ALL
         let mut limit_offset_applied = limit_offset_applied;
         if !stmt.set_operations.is_empty() {
-            // Only enable limit pushdown for pure UNION ALL (no dedup needed)
-            let all_union_all = stmt
-                .set_operations
-                .iter()
-                .all(|op| matches!(op.operation, SetOperationType::UnionAll));
-            let set_limit = if all_union_all && stmt.order_by.is_empty() && !stmt.distinct {
-                // Only push limit when there's no ORDER BY or DISTINCT that needs full result
-                limit.map(|l| l + offset)
-            } else {
-                None
-            };
             result = self.execute_set_operations(result, &stmt.set_operations, ctx, set_limit)?;
 
             // The set operation gathers LIMIT + OFFSET rows at most; the
