@@ -678,3 +678,57 @@ fn test_not_exists_keeps_the_keys_the_table_holds() {
         [30]
     );
 }
+
+#[test]
+fn test_not_exists_on_a_primary_key_sees_the_transaction_and_every_conjunct() {
+    let db = Database::open("memory://exists_not_exists_pk_transaction").unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, enabled INTEGER, region INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO u VALUES (10, 1, 1), (20, 0, 1), (40, 1, 1)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 10)", ()).unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        let mut ids: Vec<i64> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    // A row inserted in the transaction is a key, a row deleted in it is not
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("INSERT INTO u VALUES (30, 1, 1)", ()).unwrap();
+    db.execute("DELETE FROM u WHERE id = 40", ()).unwrap();
+    assert_eq!(
+        ids("SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) LIMIT 5"),
+        [20, 30]
+    );
+    db.execute("ROLLBACK", ()).unwrap();
+    // Every conjunct beside the negated set applies, however the AND nests
+    assert_eq!(
+        ids("SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) AND enabled = 1 AND region = 1"),
+        [40]
+    );
+    // A float past i64 names no key, so it excludes none
+    db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO big VALUES (9223372036854775807)", ())
+        .unwrap();
+    db.execute("CREATE TABLE bo (id INTEGER PRIMARY KEY, uid FLOAT)", ())
+        .unwrap();
+    db.execute("INSERT INTO bo VALUES (1, 9223372036854775808.0)", ())
+        .unwrap();
+    assert_eq!(
+        ids("SELECT id FROM big WHERE NOT EXISTS (SELECT 1 FROM bo WHERE bo.uid = big.id) LIMIT 1"),
+        [9223372036854775807]
+    );
+}

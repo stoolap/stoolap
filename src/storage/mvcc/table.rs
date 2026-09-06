@@ -2521,7 +2521,25 @@ impl Table for MVCCTable {
     }
 
     fn get_active_row_ids(&self) -> Result<Vec<i64>> {
-        Ok(self.version_store.get_all_row_ids())
+        let mut ids = self.version_store.get_all_row_ids();
+        // The transaction's own inserts and deletes are part of what it sees
+        let txn_versions = self.txn_versions.read().unwrap();
+        if txn_versions.has_local_changes() {
+            let mut deleted = crate::common::I64Set::new();
+            let mut inserted = Vec::new();
+            for (row_id, version) in txn_versions.iter_local() {
+                if version.is_deleted() {
+                    deleted.insert(row_id);
+                } else {
+                    inserted.push(row_id);
+                }
+            }
+            ids.retain(|id| !deleted.contains(*id));
+            ids.extend(inserted);
+            ids.sort_unstable();
+            ids.dedup();
+        }
+        Ok(ids)
     }
 
     fn visible_row_ids_excluding(

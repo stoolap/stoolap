@@ -1723,11 +1723,13 @@ impl Executor {
             if is_negated {
                 // NOT IN optimization for INTEGER PRIMARY KEY (from NOT EXISTS semi-join):
                 // Iterate through row_ids and exclude those in the hash set
+                // Only a losslessly integral float can name a key; one past
+                // i64 would saturate onto a key it does not equal
                 let exclusion_set: I64Set = values
                     .iter()
                     .filter_map(|v| match v {
                         Value::Integer(id) => Some(*id),
-                        Value::Float(f) if f.fract() == 0.0 => Some(*f as i64),
+                        Value::Float(f) => Self::lossless_float_key(*f),
                         _ => None,
                     })
                     .collect();
@@ -1963,13 +1965,20 @@ impl Executor {
 
             // InHashSet with AND: column IN {hash_set} AND other_condition
             Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
+                // A side that is itself an AND around the set brings its own
+                // remaining predicate, which the sibling joins rather than replaces
+                let keep_both = |rest: Option<Expression>, sibling: &Expression| {
+                    crate::executor::utils::combine_predicates_with_and(
+                        rest.into_iter().chain([sibling.clone()]).collect(),
+                    )
+                };
                 // Try left side as InHashSet
-                if let Some((col, vals, neg, _)) = Self::extract_in_hashset_info(&infix.left) {
-                    return Some((col, vals, neg, Some((*infix.right).clone())));
+                if let Some((col, vals, neg, rest)) = Self::extract_in_hashset_info(&infix.left) {
+                    return Some((col, vals, neg, keep_both(rest, &infix.right)));
                 }
                 // Try right side as InHashSet
-                if let Some((col, vals, neg, _)) = Self::extract_in_hashset_info(&infix.right) {
-                    return Some((col, vals, neg, Some((*infix.left).clone())));
+                if let Some((col, vals, neg, rest)) = Self::extract_in_hashset_info(&infix.right) {
+                    return Some((col, vals, neg, keep_both(rest, &infix.left)));
                 }
                 None
             }
