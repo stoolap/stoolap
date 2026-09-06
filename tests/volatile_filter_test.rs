@@ -30,7 +30,7 @@ fn test_random_beside_a_subquery_rolls_once() {
     let db = Database::open("memory://volatile_filter").unwrap();
     db.execute("CREATE TABLE x (id INTEGER PRIMARY KEY, a INTEGER)", ())
         .unwrap();
-    let rows: Vec<String> = (1..=20000).map(|i| format!("({i}, 0)")).collect();
+    let rows: Vec<String> = (1..=20000).map(|i| format!("({i}, {})", i % 2)).collect();
     for chunk in rows.chunks(1000) {
         db.execute(&format!("INSERT INTO x VALUES {}", chunk.join(", ")), ())
             .unwrap();
@@ -38,9 +38,9 @@ fn test_random_beside_a_subquery_rolls_once() {
     // Half the rows pass, give or take a few hundred; rolled twice, a quarter would
     for sql in [
         "SELECT COUNT(*) FROM x WHERE RANDOM() < 0.5 AND EXISTS (SELECT 1)",
-        "SELECT COUNT(*) FROM x WHERE RANDOM() < 0.5 AND a = 0 AND (SELECT 1) = 1",
-        "SELECT COUNT(*) FROM x WHERE RANDOM() < 0.5 AND a = 0",
-        "SELECT COUNT(*) FROM x WHERE id % 2 = (CASE WHEN RANDOM() < 0.5 THEN 0 ELSE 1 END) \
+        "SELECT COUNT(*) FROM x WHERE RANDOM() < 0.5 AND a >= 0 AND (SELECT 1) = 1",
+        "SELECT COUNT(*) FROM x WHERE RANDOM() < 0.5 AND a >= 0",
+        "SELECT COUNT(*) FROM x WHERE a = 1 + (CASE WHEN RANDOM() < 0.5 THEN -1 ELSE 0 END) \
          AND EXISTS (SELECT 1)",
         "SELECT COUNT(*) FROM x WHERE RANDOM() BETWEEN 0 AND 0.5 AND EXISTS (SELECT 1)",
     ] {
