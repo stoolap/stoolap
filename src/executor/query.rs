@@ -3872,6 +3872,7 @@ impl Executor {
                 &stmt.distinct_on,
                 rows,
                 &all_columns,
+                table_alias.as_deref(),
                 ctx,
             )?;
             // Get base column names, then the ones the projection appended,
@@ -5531,6 +5532,7 @@ impl Executor {
                 &stmt.distinct_on,
                 final_rows,
                 &final_columns,
+                None,
                 ctx,
             )?;
             let mut output_columns =
@@ -5742,6 +5744,7 @@ impl Executor {
                 &stmt.distinct_on,
                 filtered_rows,
                 &columns,
+                subquery_alias,
                 ctx,
             )?;
             let mut output_columns =
@@ -6002,6 +6005,7 @@ impl Executor {
                 &stmt.distinct_on,
                 rows,
                 &view_columns,
+                view_alias.as_deref(),
                 ctx,
             )?;
             let mut output_columns =
@@ -8658,6 +8662,69 @@ impl Executor {
         }
     }
 
+    /// Evaluate each select expression holding a correlated subquery per
+    /// row into a column appended to the rows, and name that column where
+    /// the expression stood, so a projection reads a plain column there
+    fn bind_correlated_select_columns(
+        &self,
+        select_exprs: &[Expression],
+        rows: RowVec,
+        all_columns: &[String],
+        table_alias: Option<&str>,
+        ctx: &ExecutionContext,
+    ) -> Result<(Vec<Expression>, RowVec, Vec<String>)> {
+        let correlated: Vec<usize> = select_exprs
+            .iter()
+            .enumerate()
+            .filter(|(_, expr)| Self::has_correlated_subqueries(expr))
+            .map(|(i, _)| i)
+            .collect();
+        let bare: Vec<Expression> = correlated
+            .iter()
+            .map(|&i| match &select_exprs[i] {
+                Expression::Aliased(aliased) => (*aliased.expression).clone(),
+                expr => expr.clone(),
+            })
+            .collect();
+        let values = self.project_rows_with_alias(
+            &bare,
+            RowVec::from_vec((*rows).clone()),
+            all_columns,
+            None,
+            ctx,
+            table_alias,
+        )?;
+        let mut columns = all_columns.to_vec();
+        let mut exprs = select_exprs.to_vec();
+        for (n, &i) in correlated.iter().enumerate() {
+            let name = format!("__correlated_{n}");
+            let column = Expression::Identifier(Identifier::new(
+                dummy_token(&name, TokenType::Identifier),
+                name.clone(),
+            ));
+            exprs[i] = match &select_exprs[i] {
+                Expression::Aliased(aliased) => Expression::Aliased(AliasedExpression {
+                    token: aliased.token.clone(),
+                    expression: Box::new(column),
+                    alias: aliased.alias.clone(),
+                }),
+                _ => column,
+            };
+            columns.push(name);
+        }
+        let rows = rows
+            .into_iter()
+            .zip(values)
+            .map(|((id, row), (_, extra))| {
+                let mut values = row.into_values();
+                values.extend(extra.into_values());
+                (id, Row::from_values(values))
+            })
+            .collect();
+        Ok((exprs, rows, columns))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn project_rows_with_order_by(
         &self,
         select_exprs: &[Expression],
@@ -8665,8 +8732,28 @@ impl Executor {
         distinct_on: &[Expression],
         mut rows: RowVec,
         all_columns: &[String],
+        table_alias: Option<&str>,
         ctx: &ExecutionContext,
     ) -> Result<(RowVec, Vec<String>)> {
+        // A correlated select expression is evaluated per row first, and
+        // read below as the column it was bound to
+        let mut bound_exprs = None;
+        let mut bound_columns = None;
+        if Self::has_correlated_select_subqueries(select_exprs) {
+            let (exprs, bound_rows, columns) = self.bind_correlated_select_columns(
+                select_exprs,
+                rows,
+                all_columns,
+                table_alias,
+                ctx,
+            )?;
+            bound_exprs = Some(exprs);
+            rows = bound_rows;
+            bound_columns = Some(columns);
+        }
+        let select_exprs: &[Expression] = bound_exprs.as_deref().unwrap_or(select_exprs);
+        let all_columns: &[String] = bound_columns.as_deref().unwrap_or(all_columns);
+
         // Process scalar subqueries in SELECT columns before evaluation (single-pass)
         let processed = self.try_process_select_subqueries(select_exprs, ctx)?;
         let select_exprs = match &processed {

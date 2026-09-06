@@ -35,7 +35,8 @@ fn setup(name: &str) -> Database {
         .unwrap();
     db.execute("INSERT INTO x VALUES (1, 1), (2, 2), (3, NULL)", ())
         .unwrap();
-    db.execute("CREATE VIEW vx AS SELECT a FROM x", ()).unwrap();
+    db.execute("CREATE VIEW vx AS SELECT id, a FROM x", ())
+        .unwrap();
     db
 }
 
@@ -70,6 +71,22 @@ fn test_correlated_subquery_over_view() {
             "SELECT a FROM vx v WHERE (SELECT COUNT(*) FROM x x2 WHERE x2.a > v.a) = 1"
         ),
         [[Some(1)]]
+    );
+    // A sort column the select list leaves out rides along
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT (SELECT COUNT(*) FROM x x2 WHERE x2.a > v.a) FROM vx v ORDER BY v.id DESC"
+        ),
+        [[Some(0)], [Some(0)], [Some(1)]]
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT (SELECT COUNT(*) FROM x x2 WHERE x2.a > d.a) AS n \
+             FROM (SELECT id, a FROM x) d ORDER BY d.id DESC, n"
+        ),
+        [[Some(0)], [Some(0)], [Some(1)]]
     );
 }
 
