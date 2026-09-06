@@ -732,3 +732,29 @@ fn test_not_exists_on_a_primary_key_sees_the_transaction_and_every_conjunct() {
         [9223372036854775807]
     );
 }
+
+#[test]
+fn test_not_exists_on_a_primary_key_skips_a_committed_delete() {
+    let db = Database::open("memory://exists_not_exists_committed_delete").unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (10), (20)", ()).unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 999)", ()).unwrap();
+    db.execute("DELETE FROM u WHERE id = 10", ()).unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        db.query(sql, ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    // The deleted key stays in the version tree until it is collected,
+    // but it is not a row, so it must not use up the LIMIT
+    let query = "SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) LIMIT 1";
+    assert_eq!(ids(query), [20]);
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("INSERT INTO u VALUES (30)", ()).unwrap();
+    assert_eq!(ids(query), [20]);
+    db.execute("ROLLBACK", ()).unwrap();
+}

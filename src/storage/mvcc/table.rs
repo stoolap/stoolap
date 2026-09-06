@@ -2521,7 +2521,13 @@ impl Table for MVCCTable {
     }
 
     fn get_active_row_ids(&self) -> Result<Vec<i64>> {
-        let mut ids = self.version_store.get_all_row_ids();
+        // Only the keys this transaction sees: a committed delete stays in
+        // the version tree until it is collected, but it is not a row
+        let mut ids = self.version_store.visible_row_ids_excluding(
+            self.txn_id,
+            &crate::common::I64Set::new(),
+            usize::MAX,
+        );
         // The transaction's own inserts and deletes are part of what it sees
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
