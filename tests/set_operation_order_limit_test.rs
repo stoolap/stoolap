@@ -137,3 +137,21 @@ fn test_union_all_limit_and_offset_without_order_by() {
         [1003]
     );
 }
+
+#[test]
+fn test_a_limit_and_offset_past_i64_do_not_fail_the_first_branch() {
+    let db = Database::open("memory://set_operation_limit_overflow").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO a VALUES (1)", ()).unwrap();
+    db.execute("INSERT INTO b VALUES (2)", ()).unwrap();
+    assert_eq!(
+        ints(
+            &db,
+            "SELECT id FROM a UNION ALL SELECT id FROM b LIMIT 9223372036854775807 OFFSET 1"
+        ),
+        [2]
+    );
+}

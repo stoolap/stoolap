@@ -461,7 +461,10 @@ impl Executor {
             .iter()
             .all(|op| matches!(op.operation, SetOperationType::UnionAll));
         let set_limit = if all_union_all && stmt.order_by.is_empty() && !stmt.distinct {
-            limit.map(|l| l + offset)
+            // A sum past i64 is no bound the branch can take
+            limit
+                .and_then(|l| l.checked_add(offset))
+                .filter(|bound| i64::try_from(*bound).is_ok())
         } else {
             None
         };
