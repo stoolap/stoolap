@@ -1669,8 +1669,16 @@ pub fn expression_to_string(expr: &Expression) -> String {
                 match operand {
                     Expression::Infix(inner) => {
                         let inner_precedence = infix_precedence(&inner.op_type);
-                        let same_associative =
-                            inner.op_type == infix.op_type && infix_is_commutative(&infix.op_type);
+                        // Arithmetic is not associative in floats or at the
+                        // limits of an integer, so only these fold
+                        let same_associative = inner.op_type == infix.op_type
+                            && matches!(
+                                infix.op_type,
+                                InfixOperator::Or
+                                    | InfixOperator::And
+                                    | InfixOperator::Xor
+                                    | InfixOperator::Concat
+                            );
                         if inner_precedence < precedence
                             || (on_the_right && inner_precedence == precedence && !same_associative)
                         {
@@ -1721,19 +1729,6 @@ fn infix_precedence(op: &InfixOperator) -> u8 {
         InfixOperator::Add | InfixOperator::Subtract | InfixOperator::Concat => 4,
         _ => 3,
     }
-}
-
-/// Whether a op (b op c) reads as (a op b) op c
-fn infix_is_commutative(op: &InfixOperator) -> bool {
-    matches!(
-        op,
-        InfixOperator::Or
-            | InfixOperator::And
-            | InfixOperator::Xor
-            | InfixOperator::Add
-            | InfixOperator::Multiply
-            | InfixOperator::Concat
-    )
 }
 
 // ============================================================================

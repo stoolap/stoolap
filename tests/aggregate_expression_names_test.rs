@@ -57,3 +57,25 @@ fn test_parentheses_keep_aggregates_apart() {
     let (_, values) = row(&db, "SELECT SUM(a * (b / 4)), SUM(a * b / 4) FROM x");
     assert_eq!(values, [33, 34]);
 }
+
+#[test]
+fn test_float_addition_keeps_its_grouping() {
+    let db = Database::open("memory://aggregate_expression_names_float").unwrap();
+    db.execute(
+        "CREATE TABLE f (id INTEGER PRIMARY KEY, a FLOAT, b FLOAT, c FLOAT)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO f VALUES (1, 1e16, -1e16, 1)", ())
+        .unwrap();
+    let result = db
+        .query("SELECT SUM(a + (b + c)), SUM((a + b) + c) FROM f", ())
+        .unwrap();
+    let columns = result.columns().to_vec();
+    let r = result.map(|r| r.unwrap()).next().unwrap();
+    assert_eq!(columns[0], "SUM(a + (b + c))");
+    assert_eq!(
+        (r.get::<f64>(0).unwrap(), r.get::<f64>(1).unwrap()),
+        (0.0, 1.0)
+    );
+}
