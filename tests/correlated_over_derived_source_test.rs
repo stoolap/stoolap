@@ -122,3 +122,43 @@ fn test_a_view_source_binds_the_parent_column() {
         [1, 4]
     );
 }
+
+#[test]
+fn test_a_derived_table_in_the_subquery_from_reads_the_parent() {
+    let db = setup("correlated_derived_in_from");
+    // per x row, the largest group count of y rows sharing a, grouped by b
+    assert_eq!(
+        values(
+            &db,
+            "SELECT id, (SELECT MAX(c) FROM (SELECT COUNT(*) AS c FROM y WHERE y.a = x.a GROUP BY b) t) FROM x ORDER BY id"
+        ),
+        [Some(1), Some(1), None, Some(1)]
+    );
+    assert_eq!(
+        values(
+            &db,
+            "SELECT id, (SELECT SUM(b) FROM (SELECT b FROM y WHERE y.a = x.a ORDER BY b DESC LIMIT 2) top) FROM x ORDER BY id"
+        ),
+        [Some(57), Some(9), None, Some(57)]
+    );
+}
+
+#[test]
+fn test_a_join_of_derived_tables_binds_the_parent_column() {
+    let db = setup("correlated_join_of_derived");
+    // pairs of y rows sharing the parent's a with p.b < q.b: a = 1 has 5, 50, 7
+    assert_eq!(
+        values(
+            &db,
+            "SELECT id, (SELECT COUNT(*) FROM (SELECT a, b FROM y) p JOIN (SELECT a, b FROM y) q ON p.a = q.a AND p.b < q.b WHERE p.a = x.a) FROM x ORDER BY id"
+        ),
+        [Some(3), Some(0), Some(0), Some(3)]
+    );
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM x WHERE EXISTS (SELECT 1 FROM (SELECT a, b FROM y) p JOIN (SELECT a, b FROM y) q ON p.a = q.a AND p.b < q.b WHERE p.a = x.a) ORDER BY id"
+        ),
+        [1, 4]
+    );
+}

@@ -3354,7 +3354,33 @@ impl Executor {
             }
         }
 
-        false
+        // A derived table in the FROM may read the parent row too
+        subquery
+            .table_expr
+            .as_deref()
+            .is_some_and(|from| Self::from_reads_outer_columns(from, &subquery_tables))
+    }
+
+    /// Whether a derived table in a FROM, or a join condition there, reads a
+    /// column that neither the query nor the derived table defines
+    fn from_reads_outer_columns(from: &Expression, subquery_tables: &[String]) -> bool {
+        match from {
+            Expression::SubquerySource(source) => {
+                Self::nested_reads_outer_columns(&source.subquery, subquery_tables)
+            }
+            Expression::JoinSource(join) => {
+                Self::from_reads_outer_columns(&join.left, subquery_tables)
+                    || Self::from_reads_outer_columns(&join.right, subquery_tables)
+                    || join
+                        .condition
+                        .as_deref()
+                        .is_some_and(|c| Self::references_outer_columns(c, subquery_tables))
+            }
+            Expression::Aliased(aliased) => {
+                Self::from_reads_outer_columns(&aliased.expression, subquery_tables)
+            }
+            _ => false,
+        }
     }
 
     /// The subquery with the parent row's values in place of the outer
@@ -3587,6 +3613,10 @@ impl Executor {
                 .having
                 .as_deref()
                 .is_some_and(|having| Self::references_outer_columns(having, &tables))
+            || nested
+                .table_expr
+                .as_deref()
+                .is_some_and(|from| Self::from_reads_outer_columns(from, &tables))
     }
 
     /// Process WHERE clause with correlated subqueries for a specific outer row.

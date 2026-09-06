@@ -1014,7 +1014,33 @@ impl QueryClassification {
             }
         }
 
-        false
+        // A derived table in the FROM may read the parent row too
+        subquery
+            .table_expr
+            .as_deref()
+            .is_some_and(|from| Self::from_has_outer_reference(from, &subquery_tables))
+    }
+
+    /// Whether a derived table in a FROM, or a join condition there, reads a
+    /// column that neither the query nor the derived table defines
+    fn from_has_outer_reference(from: &Expression, inner_tables: &[String]) -> bool {
+        match from {
+            Expression::SubquerySource(source) => {
+                Self::nested_has_outer_reference(&source.subquery, inner_tables)
+            }
+            Expression::JoinSource(join) => {
+                Self::from_has_outer_reference(&join.left, inner_tables)
+                    || Self::from_has_outer_reference(&join.right, inner_tables)
+                    || join
+                        .condition
+                        .as_deref()
+                        .is_some_and(|c| Self::has_outer_column_reference(c, inner_tables))
+            }
+            Expression::Aliased(aliased) => {
+                Self::from_has_outer_reference(&aliased.expression, inner_tables)
+            }
+            _ => false,
+        }
     }
 
     /// Collect table names and aliases from a subquery's FROM clause
@@ -1181,6 +1207,10 @@ impl QueryClassification {
                 .having
                 .as_deref()
                 .is_some_and(|having| Self::has_outer_column_reference(having, &tables))
+            || nested
+                .table_expr
+                .as_deref()
+                .is_some_and(|from| Self::from_has_outer_reference(from, &tables))
     }
 }
 
