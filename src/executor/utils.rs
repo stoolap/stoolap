@@ -1185,6 +1185,23 @@ pub fn get_table_alias_from_expr(expr: &Expression) -> Option<String> {
     }
 }
 
+/// The lowercased table names and aliases of every leaf of a FROM
+/// expression, so a nested join lists all of its tables
+pub fn collect_table_aliases(expr: &Expression, out: &mut Vec<String>) {
+    match expr {
+        Expression::JoinSource(join) => {
+            collect_table_aliases(&join.left, out);
+            collect_table_aliases(&join.right, out);
+        }
+        Expression::Aliased(aliased) => out.push(aliased.alias.value_lower.to_string()),
+        _ => {
+            if let Some(alias) = get_table_alias_from_expr(expr) {
+                out.push(alias.to_lowercase());
+            }
+        }
+    }
+}
+
 /// Strip table qualifier from an expression, replacing qualified identifiers
 /// with unqualified ones. Used when pushing filters to individual table scans.
 pub fn strip_table_qualifier(expr: &Expression, table_alias: &str) -> Expression {

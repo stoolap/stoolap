@@ -4070,11 +4070,9 @@ impl Executor {
         // A predicate holding a subquery is left for the per-row path
         let where_for_join = match (where_for_join, ctx.outer_row()) {
             (Some(where_clause), Some(outer)) => {
-                let inner: Vec<String> = [&left_alias, &right_alias]
-                    .into_iter()
-                    .flatten()
-                    .map(|alias| alias.to_lowercase())
-                    .collect();
+                let mut inner = Vec::new();
+                super::utils::collect_table_aliases(&join_source.left, &mut inner);
+                super::utils::collect_table_aliases(&join_source.right, &mut inner);
                 let inner: Vec<&str> = inner.iter().map(String::as_str).collect();
                 let scope = super::utils::InnerScope {
                     tables: &inner,
