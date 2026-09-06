@@ -6505,6 +6505,16 @@ impl Executor {
                         .iter()
                         .map(|col| format!("{}.{}", table_alias, col))
                         .collect();
+                    // The filter pushed to this side applies to the view's
+                    // rows the way it does to a CTE's
+                    let result: Box<dyn QueryResult> = match filter {
+                        Some(filter_expr) => {
+                            let row_filter =
+                                RowFilter::new(filter_expr, &qualified_columns)?.with_context(ctx);
+                            Box::new(FilteredResult::from_filter(result, row_filter))
+                        }
+                        None => result,
+                    };
                     return Ok((result, qualified_columns));
                 }
 
