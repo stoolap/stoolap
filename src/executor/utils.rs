@@ -1641,16 +1641,80 @@ pub fn expression_to_string(expr: &Expression) -> String {
             let args: Vec<String> = func.arguments.iter().map(expression_to_string).collect();
             format!("{}({})", func.function, args.join(", "))
         }
+        // An operand bound less tightly than its operator keeps its
+        // parentheses, or (a + b) * 2 and a + b * 2 would read the same
         Expression::Infix(infix) => {
+            let precedence = infix_precedence(&infix.op_type);
+            let side = |operand: &Expression, on_the_right: bool| -> String {
+                let text = expression_to_string(operand);
+                match operand {
+                    Expression::Infix(inner) => {
+                        let inner_precedence = infix_precedence(&inner.op_type);
+                        if inner_precedence < precedence
+                            || (on_the_right
+                                && inner_precedence == precedence
+                                && !infix_is_commutative(&infix.op_type))
+                        {
+                            format!("({text})")
+                        } else {
+                            text
+                        }
+                    }
+                    _ => text,
+                }
+            };
             format!(
                 "{} {} {}",
-                expression_to_string(&infix.left),
+                side(&infix.left, false),
                 infix.operator,
-                expression_to_string(&infix.right)
+                side(&infix.right, true)
+            )
+        }
+        Expression::Prefix(prefix) => {
+            let operand = expression_to_string(&prefix.right);
+            let operand = match prefix.right.as_ref() {
+                Expression::Infix(_) => format!("({operand})"),
+                _ => operand,
+            };
+            if prefix.operator == "-" || prefix.operator == "+" {
+                format!("{}{}", prefix.operator, operand)
+            } else {
+                format!("{} {}", prefix.operator, operand)
+            }
+        }
+        Expression::Cast(cast) => {
+            format!(
+                "CAST({} AS {})",
+                expression_to_string(&cast.expr),
+                cast.type_name
             )
         }
         _ => format!("{}", expr),
     }
+}
+
+/// How tightly an infix operator binds, higher first
+fn infix_precedence(op: &InfixOperator) -> u8 {
+    match op {
+        InfixOperator::Or => 1,
+        InfixOperator::And | InfixOperator::Xor => 2,
+        InfixOperator::Multiply | InfixOperator::Divide | InfixOperator::Modulo => 5,
+        InfixOperator::Add | InfixOperator::Subtract | InfixOperator::Concat => 4,
+        _ => 3,
+    }
+}
+
+/// Whether a op (b op c) reads as (a op b) op c
+fn infix_is_commutative(op: &InfixOperator) -> bool {
+    matches!(
+        op,
+        InfixOperator::Or
+            | InfixOperator::And
+            | InfixOperator::Xor
+            | InfixOperator::Add
+            | InfixOperator::Multiply
+            | InfixOperator::Concat
+    )
 }
 
 // ============================================================================

@@ -1927,55 +1927,10 @@ impl Executor {
         self.expression_to_string(target_expr)
     }
 
-    /// Convert an expression to a display string
-    #[allow(clippy::only_used_in_recursion)]
+    /// Convert an expression to a display string: the one stringifier, so
+    /// two aggregates over different expressions never share a name
     fn expression_to_string(&self, expr: &Expression) -> String {
-        match expr {
-            Expression::FunctionCall(func) => {
-                let args: Vec<String> = func
-                    .arguments
-                    .iter()
-                    .map(|a| self.expression_to_string(a))
-                    .collect();
-                format!("{}({})", func.function, args.join(", "))
-            }
-            Expression::Identifier(id) => id.value.to_string(),
-            Expression::QualifiedIdentifier(qid) => {
-                format!("{}.{}", qid.qualifier.value, qid.name.value)
-            }
-            Expression::StringLiteral(lit) => format!("'{}'", lit.value),
-            Expression::IntegerLiteral(lit) => lit.value.to_string(),
-            Expression::FloatLiteral(lit) => lit.value.to_string(),
-            Expression::BooleanLiteral(lit) => lit.value.to_string(),
-            Expression::Case(case) => {
-                // Use the Display implementation for CaseExpression
-                format!("{}", case)
-            }
-            Expression::Infix(infix) => {
-                format!(
-                    "{} {} {}",
-                    self.expression_to_string(&infix.left),
-                    infix.operator,
-                    self.expression_to_string(&infix.right)
-                )
-            }
-            Expression::Prefix(prefix) => {
-                format!(
-                    "{}{}",
-                    prefix.operator,
-                    self.expression_to_string(&prefix.right)
-                )
-            }
-            Expression::Cast(cast) => {
-                format!(
-                    "CAST({} AS {})",
-                    self.expression_to_string(&cast.expr),
-                    cast.type_name
-                )
-            }
-            // For any other expression type, use the Display trait if implemented
-            _ => format!("{}", expr),
-        }
+        super::utils::expression_to_string(expr)
     }
 
     /// Execute global aggregation (no GROUP BY)
