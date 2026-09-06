@@ -1699,11 +1699,12 @@ impl Executor {
             .iter()
             .find(|c| c.name.eq_ignore_ascii_case(name))
             .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
-        if let Some(value) = &column.default_value {
-            return Ok(super::utils::value_to_expression(value));
-        }
-        match &column.default_expr {
-            Some(text) => {
+        // The expression comes first: a value kept beside it was computed
+        // once, when the column was added, and a RANDOM() default must be
+        // drawn again for every row
+        match (&column.default_expr, &column.default_value) {
+            (None, Some(value)) => Ok(super::utils::value_to_expression(value)),
+            (Some(text), _) => {
                 let statements = crate::parser::parse_sql(&format!("SELECT {}", text))
                     .map_err(|e| Error::parse(e.to_string()))?;
                 match statements.into_iter().next() {
@@ -1717,7 +1718,7 @@ impl Executor {
                     ))),
                 }
             }
-            None => Ok(super::utils::value_to_expression(&Value::null_unknown())),
+            (None, None) => Ok(super::utils::value_to_expression(&Value::null_unknown())),
         }
     }
 

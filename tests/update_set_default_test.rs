@@ -43,3 +43,24 @@ fn test_set_default_writes_the_column_default() {
     assert_eq!(row.get::<String>(1).unwrap(), "x");
     assert_eq!(row.get::<Option<String>>(2).unwrap(), None);
 }
+
+#[test]
+fn test_set_default_draws_a_volatile_default_again() {
+    let db = Database::open("memory://update_set_default_volatile").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3), (4, 4)", ())
+        .unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN r FLOAT DEFAULT (RANDOM())", ())
+        .unwrap();
+    db.execute("UPDATE t SET r = DEFAULT", ()).unwrap();
+    let distinct: i64 = db
+        .query("SELECT COUNT(DISTINCT r) FROM t", ())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .get(0)
+        .unwrap();
+    assert_eq!(distinct, 4);
+}
