@@ -1615,6 +1615,19 @@ impl Executor {
             Expression::Cast(cast) => {
                 self.extract_aggregates_from_expr(&cast.expr, aggregations, non_agg_columns)?;
             }
+            // An aggregate a window function takes as its argument, or
+            // partitions or orders by, is computed like any other
+            Expression::Window(window) => {
+                for expr in window
+                    .function
+                    .arguments
+                    .iter()
+                    .chain(window.partition_by.iter())
+                    .chain(window.order_by.iter().map(|o| &o.expression))
+                {
+                    self.extract_aggregates_from_expr(expr, aggregations, non_agg_columns)?;
+                }
+            }
             _ => {}
         }
         Ok(())
