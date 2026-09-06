@@ -1149,6 +1149,31 @@ impl Executor {
             } else {
                 (**where_clause).clone()
             };
+            // A parent row's column named through its own table is bound
+            // first, or the bare name it would fall back to could be the
+            // CTE's own
+            let processed_where = match ctx.outer_row() {
+                Some(outer) => {
+                    let inner: Vec<String> = stmt
+                        .table_expr
+                        .as_deref()
+                        .and_then(super::utils::get_table_alias_from_expr)
+                        .map(|name| name.to_lowercase())
+                        .into_iter()
+                        .collect();
+                    let inner: Vec<&str> = inner.iter().map(String::as_str).collect();
+                    let scope = super::utils::InnerScope {
+                        tables: &inner,
+                        schema: None,
+                    };
+                    super::utils::substitute_outer_references_in_scope(
+                        &processed_where,
+                        outer,
+                        &scope,
+                    )
+                }
+                None => processed_where,
+            };
 
             // Compile filter once and reuse for all rows
             let mut eval =

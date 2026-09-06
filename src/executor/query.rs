@@ -5572,8 +5572,31 @@ impl Executor {
             return Err(err);
         }
 
-        // Apply WHERE clause if present
+        // Apply WHERE clause if present. A parent row's column named through
+        // its own table is bound first, or the bare name it would fall
+        // back to could be this source's own
         let filtered_rows: RowVec = if let Some(ref where_clause) = stmt.where_clause {
+            let bound_where;
+            let where_clause: &Expression = match ctx.outer_row() {
+                Some(outer) => {
+                    let inner: Vec<&str> = subquery_source
+                        .alias
+                        .iter()
+                        .map(|a| a.value_lower.as_str())
+                        .collect();
+                    let scope = super::utils::InnerScope {
+                        tables: &inner,
+                        schema: None,
+                    };
+                    bound_where = super::utils::substitute_outer_references_in_scope(
+                        where_clause,
+                        outer,
+                        &scope,
+                    );
+                    &bound_where
+                }
+                None => where_clause,
+            };
             let where_filter = RowFilter::new(where_clause, &columns)?.with_context(ctx);
 
             let mut filtered = RowVec::with_capacity(rows.len());
