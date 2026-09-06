@@ -162,3 +162,40 @@ fn test_a_join_of_derived_tables_binds_the_parent_column() {
         [1, 4]
     );
 }
+
+#[test]
+fn test_a_bound_parent_value_keeps_its_type() {
+    let db = Database::open("memory://correlated_bound_types").unwrap();
+    db.execute(
+        "CREATE TABLE tx (id INTEGER PRIMARY KEY, ts TIMESTAMP, j JSON, v VECTOR(2))",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO tx VALUES (1, '2024-01-01 10:00:00', '{\"k\": 1}', '[1, 2]'), (2, '2024-02-01 10:00:00', '{\"k\": 2}', '[3, 4]'), (3, NULL, NULL, NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE ty (id INTEGER PRIMARY KEY, ts TIMESTAMP)", ())
+        .unwrap();
+    db.execute("INSERT INTO ty VALUES (1, '2024-01-15 00:00:00')", ())
+        .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        db.query(sql, ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    assert_eq!(
+        ids("SELECT id FROM tx WHERE EXISTS (SELECT 1 FROM (SELECT ts FROM ty) d WHERE TYPEOF(tx.ts) = 'TIMESTAMP') ORDER BY id"),
+        [1, 2]
+    );
+    assert_eq!(
+        ids("SELECT id FROM tx WHERE EXISTS (SELECT 1 FROM (SELECT ts FROM ty) d WHERE d.ts > tx.ts) ORDER BY id"),
+        [1]
+    );
+    assert_eq!(
+        ids("SELECT id FROM tx WHERE EXISTS (SELECT 1 FROM (SELECT ts FROM ty) d WHERE TYPEOF(tx.j) = 'JSON' AND TYPEOF(tx.v) = 'VECTOR') ORDER BY id"),
+        [1, 2]
+    );
+}

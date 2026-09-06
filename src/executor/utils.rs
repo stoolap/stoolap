@@ -99,11 +99,31 @@ pub fn value_to_expression(v: &Value) -> Expression {
         Value::Null(_) => Expression::NullLiteral(NullLiteral {
             token: dummy_token("NULL", TokenType::Keyword),
         }),
-        _ => Expression::StringLiteral(StringLiteral {
-            token: dummy_token(&format!("'{}'", v), TokenType::String),
+        // A timestamp keeps its type through the literal's hint, the way
+        // TIMESTAMP '...' does when written
+        Value::Timestamp(_) => Expression::StringLiteral(StringLiteral {
+            token: dummy_token(&format!("TIMESTAMP '{}'", v), TokenType::String),
             value: v.to_string().into(),
-            type_hint: None,
+            type_hint: Some("TIMESTAMP".into()),
         }),
+        // JSON and a vector keep theirs through an explicit CAST; a hint
+        // alone would read as the loose one the parser puts on any text
+        // shaped like an object
+        Value::Extension(_) => {
+            let type_name = match v.data_type() {
+                crate::core::DataType::Vector => "VECTOR",
+                _ => "JSON",
+            };
+            Expression::Cast(CastExpression {
+                token: dummy_token("CAST", TokenType::Keyword),
+                expr: Box::new(Expression::StringLiteral(StringLiteral {
+                    token: dummy_token(&format!("'{}'", v), TokenType::String),
+                    value: v.to_string().into(),
+                    type_hint: None,
+                })),
+                type_name: type_name.into(),
+            })
+        }
     }
 }
 
