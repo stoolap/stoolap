@@ -100,3 +100,58 @@ fn test_offset_skips_rows_of_the_whole_union() {
         [2]
     );
 }
+
+#[test]
+fn test_union_all_limit_and_offset_without_order_by() {
+    let db = Database::open("memory://set_operation_union_all_bound").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    let rows: Vec<String> = (1..=1000).map(|i| format!("({i}, {i})")).collect();
+    db.execute(&format!("INSERT INTO a VALUES {}", rows.join(", ")), ())
+        .unwrap();
+    db.execute("INSERT INTO b VALUES (1, -1), (2, -2), (3, -3)", ())
+        .unwrap();
+    // The first branch alone covers LIMIT + OFFSET, so its rows are the answer
+    assert_eq!(
+        ints(
+            &db,
+            "SELECT v FROM a UNION ALL SELECT v FROM b LIMIT 3 OFFSET 2"
+        ),
+        [3, 4, 5]
+    );
+    // The first branch runs out and the second one fills the rest
+    assert_eq!(
+        ints(
+            &db,
+            "SELECT v FROM a WHERE id <= 2 UNION ALL SELECT v FROM b LIMIT 3 OFFSET 1"
+        ),
+        [2, -1, -2]
+    );
+    assert_eq!(
+        ints(
+            &db,
+            "SELECT COUNT(*) FROM (SELECT v FROM a UNION ALL SELECT v FROM b LIMIT 1500)"
+        ),
+        [1003]
+    );
+}
+
+#[test]
+fn test_a_limit_and_offset_past_i64_do_not_fail_the_first_branch() {
+    let db = Database::open("memory://set_operation_limit_overflow").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO a VALUES (1)", ()).unwrap();
+    db.execute("INSERT INTO b VALUES (2)", ()).unwrap();
+    assert_eq!(
+        ints(
+            &db,
+            "SELECT id FROM a UNION ALL SELECT id FROM b LIMIT 9223372036854775807 OFFSET 1"
+        ),
+        [2]
+    );
+}

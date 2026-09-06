@@ -606,3 +606,155 @@ fn test_update_binds_each_row_to_a_where_the_semi_join_rewrite_refused() {
         assert_eq!(count("SELECT SUM(b) FROM uy"), 11, "keyed: {keyed}");
     }
 }
+
+#[test]
+fn test_not_exists_on_a_primary_key_with_limit() {
+    let db = Database::open("memory://exists_not_exists_pk_limit").unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER, s TEXT)",
+        (),
+    )
+    .unwrap();
+    let rows: Vec<String> = (1..=300).map(|i| format!("({i}, {})", i % 7)).collect();
+    db.execute(&format!("INSERT INTO u VALUES {}", rows.join(", ")), ())
+        .unwrap();
+    let orders: Vec<String> = (1..=300)
+        .map(|i| format!("({i}, {i}, '{}')", if i % 3 == 0 { "x" } else { "y" }))
+        .collect();
+    db.execute(&format!("INSERT INTO o VALUES {}", orders.join(", ")), ())
+        .unwrap();
+    // Every third user has an x order; the rest are kept, in id order
+    let kept: Vec<i64> = db
+        .query(
+            "SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id AND o.s = 'x') LIMIT 5",
+            (),
+        )
+        .unwrap()
+        .map(|r| r.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(kept, [1, 2, 4, 5, 7]);
+    let count: i64 = db
+        .query(
+            "SELECT COUNT(*) FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id AND o.s = 'x')",
+            (),
+        )
+        .unwrap()
+        .map(|r| r.unwrap().get::<i64>(0).unwrap())
+        .next()
+        .unwrap();
+    assert_eq!(count, 200);
+}
+
+#[test]
+fn test_not_exists_keeps_the_keys_the_table_holds() {
+    let db = Database::open("memory://exists_not_exists_sparse_pk").unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, enabled INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO u VALUES (10, 1), (20, 0), (30, 1)", ())
+        .unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 10), (2, NULL)", ())
+        .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        db.query(sql, ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    // The keys are 10, 20 and 30, not 1, 2 and 3
+    assert_eq!(
+        ids("SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) LIMIT 5"),
+        [20, 30]
+    );
+    // A conjunct beside the negated set still applies
+    assert_eq!(
+        ids("SELECT id FROM u WHERE (NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) AND enabled = 1) OR id IS NULL"),
+        [30]
+    );
+}
+
+#[test]
+fn test_not_exists_on_a_primary_key_sees_the_transaction_and_every_conjunct() {
+    let db = Database::open("memory://exists_not_exists_pk_transaction").unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, enabled INTEGER, region INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO u VALUES (10, 1, 1), (20, 0, 1), (40, 1, 1)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 10)", ()).unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        let mut ids: Vec<i64> = db
+            .query(sql, ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    // A row inserted in the transaction is a key, a row deleted in it is not
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("INSERT INTO u VALUES (30, 1, 1)", ()).unwrap();
+    db.execute("DELETE FROM u WHERE id = 40", ()).unwrap();
+    assert_eq!(
+        ids("SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) LIMIT 5"),
+        [20, 30]
+    );
+    db.execute("ROLLBACK", ()).unwrap();
+    // Every conjunct beside the negated set applies, however the AND nests
+    assert_eq!(
+        ids("SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) AND enabled = 1 AND region = 1"),
+        [40]
+    );
+    // A float past i64 names no key, so it excludes none
+    db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO big VALUES (9223372036854775807)", ())
+        .unwrap();
+    db.execute("CREATE TABLE bo (id INTEGER PRIMARY KEY, uid FLOAT)", ())
+        .unwrap();
+    db.execute("INSERT INTO bo VALUES (1, 9223372036854775808.0)", ())
+        .unwrap();
+    assert_eq!(
+        ids("SELECT id FROM big WHERE NOT EXISTS (SELECT 1 FROM bo WHERE bo.uid = big.id) LIMIT 1"),
+        [9223372036854775807]
+    );
+}
+
+#[test]
+fn test_not_exists_on_a_primary_key_skips_a_committed_delete() {
+    let db = Database::open("memory://exists_not_exists_committed_delete").unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("INSERT INTO u VALUES (10), (20)", ()).unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 999)", ()).unwrap();
+    db.execute("DELETE FROM u WHERE id = 10", ()).unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        db.query(sql, ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    // The deleted key stays in the version tree until it is collected,
+    // but it is not a row, so it must not use up the LIMIT
+    let query = "SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) LIMIT 1";
+    assert_eq!(ids(query), [20]);
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("INSERT INTO u VALUES (30)", ()).unwrap();
+    assert_eq!(ids(query), [20]);
+    db.execute("ROLLBACK", ()).unwrap();
+}

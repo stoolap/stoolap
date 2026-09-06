@@ -460,3 +460,34 @@ fn test_the_condition_sees_the_transaction() {
         db.execute("ROLLBACK", ()).unwrap();
     }
 }
+
+#[test]
+fn test_an_index_probe_checks_the_key_of_the_row_it_fetches() {
+    let db = Database::open("memory://join_on_stale_index_entry").unwrap();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE r (id INTEGER PRIMARY KEY, p_id INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE INDEX idx_r_p ON r(p_id)", ()).unwrap();
+    db.execute("INSERT INTO p VALUES (1, 100), (2, 200)", ())
+        .unwrap();
+    db.execute("INSERT INTO r VALUES (1, 1)", ()).unwrap();
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("UPDATE r SET p_id = 2 WHERE id = 1", ())
+        .unwrap();
+    // The index still points key 1 at the row, whose key is now 2: the
+    // row must not come back as a match for p.id = 1
+    let pairs: Vec<(i64, i64)> = db
+        .query("SELECT p.id, r.p_id FROM p JOIN r ON p.id = r.p_id", ())
+        .unwrap()
+        .map(|r| {
+            let r = r.unwrap();
+            (r.get::<i64>(0).unwrap(), r.get::<i64>(1).unwrap())
+        })
+        .collect();
+    assert!(
+        pairs.iter().all(|(p, r)| p == r),
+        "a pair whose keys differ came back: {pairs:?}"
+    );
+    db.execute("ROLLBACK", ()).unwrap();
+}

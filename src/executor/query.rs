@@ -141,6 +141,19 @@ impl ColumnKeyMapping {
     }
 }
 
+/// Whether a predicate is the equality of the two join keys, in either order
+fn is_key_equality(pred: &Expression, outer_key: &str, inner_key: &str) -> bool {
+    let Expression::Infix(infix) = pred else {
+        return false;
+    };
+    if infix.op_type != InfixOperator::Equal {
+        return false;
+    }
+    let left = super::utils::expression_to_string(&infix.left).to_lowercase();
+    let right = super::utils::expression_to_string(&infix.right).to_lowercase();
+    (left == outer_key && right == inner_key) || (left == inner_key && right == outer_key)
+}
+
 /// Partition WHERE clause predicates for JOIN filter pushdown.
 /// Returns (left_filter, right_filter, cross_table_filter).
 /// - left_filter: predicates referencing only left table
@@ -440,15 +453,36 @@ impl Executor {
         // Execute the main query
         // The third return value indicates if LIMIT/OFFSET was already applied (by storage-level pushdown)
         // The fourth return value contains deferred projection info if applicable
+        // A pure UNION ALL without ORDER BY or DISTINCT needs LIMIT + OFFSET
+        // rows at most from each branch, so that many bound the first
+        // branch and the set operation; the whole is cut below
+        let all_union_all = stmt
+            .set_operations
+            .iter()
+            .all(|op| matches!(op.operation, SetOperationType::UnionAll));
+        let set_limit = if all_union_all && stmt.order_by.is_empty() && !stmt.distinct {
+            // A sum past i64 is no bound the branch can take
+            limit
+                .and_then(|l| l.checked_add(offset))
+                .filter(|bound| i64::try_from(*bound).is_ok())
+        } else {
+            None
+        };
+
         // ORDER BY, LIMIT and OFFSET belong to the whole set operation, so
-        // the first branch runs without them
+        // the first branch runs without them, apart from that bound
         let branch_stmt;
         let branch = if stmt.set_operations.is_empty() {
             stmt
         } else {
             branch_stmt = SelectStatement {
                 order_by: Vec::new(),
-                limit: None,
+                limit: set_limit.map(|l| {
+                    Box::new(Expression::IntegerLiteral(IntegerLiteral {
+                        token: dummy_token(&l.to_string(), TokenType::Integer),
+                        value: l as i64,
+                    }))
+                }),
                 offset: None,
                 ..stmt.clone()
             };
@@ -461,17 +495,6 @@ impl Executor {
         // Pass limit+offset to enable early termination for UNION ALL
         let mut limit_offset_applied = limit_offset_applied;
         if !stmt.set_operations.is_empty() {
-            // Only enable limit pushdown for pure UNION ALL (no dedup needed)
-            let all_union_all = stmt
-                .set_operations
-                .iter()
-                .all(|op| matches!(op.operation, SetOperationType::UnionAll));
-            let set_limit = if all_union_all && stmt.order_by.is_empty() && !stmt.distinct {
-                // Only push limit when there's no ORDER BY or DISTINCT that needs full result
-                limit.map(|l| l + offset)
-            } else {
-                None
-            };
             result = self.execute_set_operations(result, &stmt.set_operations, ctx, set_limit)?;
 
             // The set operation gathers LIMIT + OFFSET rows at most; the
@@ -4554,18 +4577,37 @@ impl Executor {
                     // operator asks it where the pair is formed, so a pair it
                     // turns away leaves an outer row still unmatched. The
                     // filter is built per pass since the operator owns it
+                    // The inner key column, checked on each fetched row in
+                    // place of the equality the residual filter leaves out
+                    let inner_key_idx = inner_cols.iter().position(|c| {
+                        c.rsplit('.')
+                            .next()
+                            .is_some_and(|name| name.eq_ignore_ascii_case(&inner_col))
+                    });
                     let build_residual_filter = || {
                         let inner_filter = nl_right_filter
                             .as_ref()
                             .map(|rf| add_table_qualifier(rf, inner_alias));
-                        let combined = match (on_condition, inner_filter) {
+                        // The equality the probe answers is left out, so
+                        // only the rest of the clause is asked of each pair
+                        let inner_key = format!("{inner_alias}.{inner_col}").to_lowercase();
+                        let outer_key = outer_col.to_lowercase();
+                        let rest = on_condition.and_then(|on| {
+                            combine_predicates_with_and(
+                                flatten_and_predicates(on)
+                                    .into_iter()
+                                    .filter(|pred| !is_key_equality(pred, &outer_key, &inner_key))
+                                    .collect(),
+                            )
+                        });
+                        let combined = match (rest, inner_filter) {
                             (Some(on), Some(f)) => Some(Expression::Infix(InfixExpression::new(
                                 Token::new(TokenType::Operator, "AND", Position::default()),
-                                Box::new(on.clone()),
+                                Box::new(on),
                                 "AND".to_string(),
                                 Box::new(f),
                             ))),
-                            (Some(on), None) => Some(on.clone()),
+                            (Some(on), None) => Some(on),
                             (None, Some(f)) => Some(f),
                             (None, None) => None,
                         };
@@ -4636,7 +4678,8 @@ impl Executor {
                                 outer_idx,
                                 lookup_strategy.clone(),
                                 build_residual_filter(),
-                            );
+                            )
+                            .with_inner_key(inner_key_idx);
                             if let Some(ref proj) = projection_pushdown {
                                 let projected_schema: Vec<ColumnInfo> =
                                     proj.output_columns.iter().map(ColumnInfo::new).collect();
@@ -4732,7 +4775,8 @@ impl Executor {
                             outer_idx,
                             lookup_strategy.clone(),
                             build_residual_filter(),
-                        );
+                        )
+                        .with_inner_key(inner_key_idx);
                         let mut join_op: Box<dyn Operator> =
                             if let Some(ref proj) = projection_pushdown {
                                 let projected_schema: Vec<ColumnInfo> =

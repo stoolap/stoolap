@@ -1723,26 +1723,23 @@ impl Executor {
             if is_negated {
                 // NOT IN optimization for INTEGER PRIMARY KEY (from NOT EXISTS semi-join):
                 // Iterate through row_ids and exclude those in the hash set
+                // Only a losslessly integral float can name a key; one past
+                // i64 would saturate onto a key it does not equal
                 let exclusion_set: I64Set = values
                     .iter()
                     .filter_map(|v| match v {
                         Value::Integer(id) => Some(*id),
-                        Value::Float(f) if f.fract() == 0.0 => Some(*f as i64),
+                        Value::Float(f) => Self::lossless_float_key(*f),
                         _ => None,
                     })
                     .collect();
 
                 let target = early_termination_target.unwrap_or(usize::MAX);
-                let row_count = table.row_count();
 
-                for row_id in 1..=(row_count as i64) {
-                    if !exclusion_set.contains(row_id) {
-                        all_row_ids.push(row_id);
-                        if all_row_ids.len() >= target {
-                            break;
-                        }
-                    }
-                }
+                // The keys the table holds, in key order and no further
+                // than the LIMIT: a key it never held, or no longer holds,
+                // is not a row to keep
+                all_row_ids.extend(table.visible_row_ids_excluding(&exclusion_set, target)?);
             } else {
                 // IN: PRIMARY KEY - the value IS the row_id (for INTEGER PK)
                 for value in values.iter() {
@@ -1929,15 +1926,59 @@ impl Executor {
                 Some((column_name, in_hash.values.clone(), in_hash.not, None))
             }
 
+            // A NOT EXISTS rewrite keeps a NULL outer value beside the
+            // negated set: column NOT IN {hash_set} OR column IS NULL. The
+            // negated set is only probed on a primary key, which holds no
+            // NULL, so the second side never fires there
+            Expression::Infix(infix) if infix.op_type == InfixOperator::Or => {
+                // Only the bare negated set qualifies: a set holding a NULL
+                // keeps no row, and a conjunct beside the set would be lost
+                let Expression::InHashSet(in_hash) = infix.left.as_ref() else {
+                    return None;
+                };
+                if !in_hash.not || in_hash.values.iter().any(|v| v.is_null()) {
+                    return None;
+                }
+                let column_name = match in_hash.column.as_ref() {
+                    Expression::Identifier(id) => id.value_lower.to_string(),
+                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.to_string(),
+                    _ => return None,
+                };
+                let values = in_hash.values.clone();
+                match infix.right.as_ref() {
+                    Expression::Infix(is_null)
+                        if is_null.operator.eq_ignore_ascii_case("IS")
+                            && matches!(is_null.right.as_ref(), Expression::NullLiteral(_)) =>
+                    {
+                        let same_column = match is_null.left.as_ref() {
+                            Expression::Identifier(id) => id.value_lower == column_name,
+                            Expression::QualifiedIdentifier(qid) => {
+                                qid.name.value_lower == column_name
+                            }
+                            _ => false,
+                        };
+                        same_column.then_some((column_name, values, true, None))
+                    }
+                    _ => None,
+                }
+            }
+
             // InHashSet with AND: column IN {hash_set} AND other_condition
             Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
+                // A side that is itself an AND around the set brings its own
+                // remaining predicate, which the sibling joins rather than replaces
+                let keep_both = |rest: Option<Expression>, sibling: &Expression| {
+                    crate::executor::utils::combine_predicates_with_and(
+                        rest.into_iter().chain([sibling.clone()]).collect(),
+                    )
+                };
                 // Try left side as InHashSet
-                if let Some((col, vals, neg, _)) = Self::extract_in_hashset_info(&infix.left) {
-                    return Some((col, vals, neg, Some((*infix.right).clone())));
+                if let Some((col, vals, neg, rest)) = Self::extract_in_hashset_info(&infix.left) {
+                    return Some((col, vals, neg, keep_both(rest, &infix.right)));
                 }
                 // Try right side as InHashSet
-                if let Some((col, vals, neg, _)) = Self::extract_in_hashset_info(&infix.right) {
-                    return Some((col, vals, neg, Some((*infix.left).clone())));
+                if let Some((col, vals, neg, rest)) = Self::extract_in_hashset_info(&infix.right) {
+                    return Some((col, vals, neg, keep_both(rest, &infix.left)));
                 }
                 None
             }
