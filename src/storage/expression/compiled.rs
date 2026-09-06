@@ -1848,6 +1848,40 @@ impl CompiledFilter {
     /// However, NOT(UNKNOWN) should remain UNKNOWN, not become true.
     ///
     /// This method detects when a false result is actually UNKNOWN due to NULL.
+    /// A conjunction is UNKNOWN where no part is false and some part is
+    fn conjunction_is_unknown<'a>(
+        filters: impl Iterator<Item = &'a CompiledFilter>,
+        unknown: impl Fn(&CompiledFilter) -> bool,
+        holds: impl Fn(&CompiledFilter) -> bool,
+    ) -> bool {
+        let mut any_unknown = false;
+        for filter in filters {
+            if unknown(filter) {
+                any_unknown = true;
+            } else if !holds(filter) {
+                return false;
+            }
+        }
+        any_unknown
+    }
+
+    /// A disjunction is UNKNOWN where no part is true and some part is
+    fn disjunction_is_unknown<'a>(
+        filters: impl Iterator<Item = &'a CompiledFilter>,
+        unknown: impl Fn(&CompiledFilter) -> bool,
+        holds: impl Fn(&CompiledFilter) -> bool,
+    ) -> bool {
+        let mut any_unknown = false;
+        for filter in filters {
+            if unknown(filter) {
+                any_unknown = true;
+            } else if holds(filter) {
+                return false;
+            }
+        }
+        any_unknown
+    }
+
     #[inline(always)]
     pub fn is_unknown_due_to_null(&self, row: &Row) -> bool {
         match self {
@@ -1901,13 +1935,28 @@ impl CompiledFilter {
             // IS NULL / IS NOT NULL - never produces UNKNOWN (they check for NULL explicitly)
             CompiledFilter::IsNull { .. } | CompiledFilter::IsNotNull { .. } => false,
 
-            // AND/OR: Match original Expression behavior which returns false by default
-            // for is_unknown_due_to_null. This means NOT(AND(...)) won't propagate
-            // UNKNOWN from children, matching the existing Expression semantics.
-            CompiledFilter::And(_, _) | CompiledFilter::AndN(_) => false,
-
-            // OR: Match original Expression behavior which returns false by default
-            CompiledFilter::Or(_, _) | CompiledFilter::OrN(_) => false,
+            // UNKNOWN AND FALSE is FALSE, UNKNOWN AND TRUE is UNKNOWN;
+            // UNKNOWN OR TRUE is TRUE, UNKNOWN OR FALSE is UNKNOWN
+            CompiledFilter::And(a, b) => Self::conjunction_is_unknown(
+                [a.as_ref(), b.as_ref()].into_iter(),
+                |f| f.is_unknown_due_to_null(row),
+                |f| f.matches(row),
+            ),
+            CompiledFilter::AndN(filters) => Self::conjunction_is_unknown(
+                filters.iter(),
+                |f| f.is_unknown_due_to_null(row),
+                |f| f.matches(row),
+            ),
+            CompiledFilter::Or(a, b) => Self::disjunction_is_unknown(
+                [a.as_ref(), b.as_ref()].into_iter(),
+                |f| f.is_unknown_due_to_null(row),
+                |f| f.matches(row),
+            ),
+            CompiledFilter::OrN(filters) => Self::disjunction_is_unknown(
+                filters.iter(),
+                |f| f.is_unknown_due_to_null(row),
+                |f| f.matches(row),
+            ),
 
             // NOT(UNKNOWN) = UNKNOWN
             CompiledFilter::Not(inner) => inner.is_unknown_due_to_null(row),
@@ -1974,9 +2023,26 @@ impl CompiledFilter {
             // IS NULL / IS NOT NULL - never produces UNKNOWN
             CompiledFilter::IsNull { .. } | CompiledFilter::IsNotNull { .. } => false,
 
-            // AND/OR: Match original Expression behavior
-            CompiledFilter::And(_, _) | CompiledFilter::AndN(_) => false,
-            CompiledFilter::Or(_, _) | CompiledFilter::OrN(_) => false,
+            CompiledFilter::And(a, b) => Self::conjunction_is_unknown(
+                [a.as_ref(), b.as_ref()].into_iter(),
+                |f| f.is_unknown_due_to_null_slice(values),
+                |f| f.matches_arc_slice(values),
+            ),
+            CompiledFilter::AndN(filters) => Self::conjunction_is_unknown(
+                filters.iter(),
+                |f| f.is_unknown_due_to_null_slice(values),
+                |f| f.matches_arc_slice(values),
+            ),
+            CompiledFilter::Or(a, b) => Self::disjunction_is_unknown(
+                [a.as_ref(), b.as_ref()].into_iter(),
+                |f| f.is_unknown_due_to_null_slice(values),
+                |f| f.matches_arc_slice(values),
+            ),
+            CompiledFilter::OrN(filters) => Self::disjunction_is_unknown(
+                filters.iter(),
+                |f| f.is_unknown_due_to_null_slice(values),
+                |f| f.matches_arc_slice(values),
+            ),
 
             // NOT(UNKNOWN) = UNKNOWN
             CompiledFilter::Not(inner) => inner.is_unknown_due_to_null_slice(values),
@@ -2046,9 +2112,26 @@ impl CompiledFilter {
             // IS NULL / IS NOT NULL - never produces UNKNOWN
             CompiledFilter::IsNull { .. } | CompiledFilter::IsNotNull { .. } => false,
 
-            // AND/OR: Match original Expression behavior
-            CompiledFilter::And(_, _) | CompiledFilter::AndN(_) => false,
-            CompiledFilter::Or(_, _) | CompiledFilter::OrN(_) => false,
+            CompiledFilter::And(a, b) => Self::conjunction_is_unknown(
+                [a.as_ref(), b.as_ref()].into_iter(),
+                |f| f.is_unknown_due_to_null_arc_slice(values),
+                |f| f.matches_arc_slice(values),
+            ),
+            CompiledFilter::AndN(filters) => Self::conjunction_is_unknown(
+                filters.iter(),
+                |f| f.is_unknown_due_to_null_arc_slice(values),
+                |f| f.matches_arc_slice(values),
+            ),
+            CompiledFilter::Or(a, b) => Self::disjunction_is_unknown(
+                [a.as_ref(), b.as_ref()].into_iter(),
+                |f| f.is_unknown_due_to_null_arc_slice(values),
+                |f| f.matches_arc_slice(values),
+            ),
+            CompiledFilter::OrN(filters) => Self::disjunction_is_unknown(
+                filters.iter(),
+                |f| f.is_unknown_due_to_null_arc_slice(values),
+                |f| f.matches_arc_slice(values),
+            ),
 
             // NOT(UNKNOWN) = UNKNOWN
             CompiledFilter::Not(inner) => inner.is_unknown_due_to_null_arc_slice(values),
