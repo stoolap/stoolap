@@ -406,6 +406,19 @@ db.execute("RELEASE SAVEPOINT sp1", ())?;       // Release savepoint
 db.execute("COMMIT", ())?;  // Only Alice is inserted
 ```
 
+The same statements work on a `Transaction`:
+
+```rust
+let mut tx = db.begin()?;
+tx.execute("SAVEPOINT sp1", ())?;
+tx.execute("INSERT INTO users VALUES ($1, $2)", (2, "Bob"))?;
+tx.execute("ROLLBACK TO SAVEPOINT sp1", ())?;
+tx.execute("RELEASE SAVEPOINT sp1", ())?;
+tx.commit()?;
+```
+
+RELEASE also drops every savepoint opened after the named one; ROLLBACK TO drops the later ones and keeps its own. See [Savepoints]({% link _docs/sql-features/savepoints.md %}) for the full rules.
+
 ### Isolation Levels
 
 ```rust
