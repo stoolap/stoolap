@@ -141,6 +141,19 @@ impl ColumnKeyMapping {
     }
 }
 
+/// Whether a predicate is the equality of the two join keys, in either order
+fn is_key_equality(pred: &Expression, outer_key: &str, inner_key: &str) -> bool {
+    let Expression::Infix(infix) = pred else {
+        return false;
+    };
+    if infix.op_type != InfixOperator::Equal {
+        return false;
+    }
+    let left = super::utils::expression_to_string(&infix.left).to_lowercase();
+    let right = super::utils::expression_to_string(&infix.right).to_lowercase();
+    (left == outer_key && right == inner_key) || (left == inner_key && right == outer_key)
+}
+
 /// Partition WHERE clause predicates for JOIN filter pushdown.
 /// Returns (left_filter, right_filter, cross_table_filter).
 /// - left_filter: predicates referencing only left table
@@ -4565,14 +4578,26 @@ impl Executor {
                         let inner_filter = nl_right_filter
                             .as_ref()
                             .map(|rf| add_table_qualifier(rf, inner_alias));
-                        let combined = match (on_condition, inner_filter) {
+                        // The equality the probe answers is left out, so
+                        // only the rest of the clause is asked of each pair
+                        let inner_key = format!("{inner_alias}.{inner_col}").to_lowercase();
+                        let outer_key = outer_col.to_lowercase();
+                        let rest = on_condition.and_then(|on| {
+                            combine_predicates_with_and(
+                                flatten_and_predicates(on)
+                                    .into_iter()
+                                    .filter(|pred| !is_key_equality(pred, &outer_key, &inner_key))
+                                    .collect(),
+                            )
+                        });
+                        let combined = match (rest, inner_filter) {
                             (Some(on), Some(f)) => Some(Expression::Infix(InfixExpression::new(
                                 Token::new(TokenType::Operator, "AND", Position::default()),
-                                Box::new(on.clone()),
+                                Box::new(on),
                                 "AND".to_string(),
                                 Box::new(f),
                             ))),
-                            (Some(on), None) => Some(on.clone()),
+                            (Some(on), None) => Some(on),
                             (None, Some(f)) => Some(f),
                             (None, None) => None,
                         };
