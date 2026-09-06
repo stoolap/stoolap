@@ -2687,7 +2687,9 @@ impl VersionStore {
             Some(c) => c,
             None => return Vec::new(),
         };
-        let versions = self.versions.read().clone();
+        // Read under the lock rather than cloning the tree: the walk stops
+        // at the limit, and a full one only reads keys and heads
+        let versions = self.versions.read();
         let mut result = Vec::with_capacity(limit.min(4096));
         for (&row_id, chain) in versions.iter() {
             if exclude.contains(row_id) {
