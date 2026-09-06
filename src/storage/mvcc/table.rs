@@ -1302,16 +1302,28 @@ impl MVCCTable {
                     return Ok(());
                 }
                 let entries = index.find(&values)?;
-                // A row this transaction has deleted no longer holds the
-                // value against it
+                // The index holds the committed rows. A row this transaction
+                // has deleted no longer holds the value against it, and one
+                // it has rewritten holds only what its latest version says
                 let taken = {
                     let txn_versions = self.txn_versions.read().unwrap();
                     entries.iter().find(|entry| {
-                        !txn_versions
+                        let local = txn_versions
                             .local_versions_ref()
                             .and_then(|versions| versions.get(entry.row_id))
-                            .and_then(|versions| versions.last())
-                            .is_some_and(|version| version.is_deleted())
+                            .and_then(|versions| versions.last());
+                        match local {
+                            None => true,
+                            Some(version) if version.is_deleted() => false,
+                            Some(version) => {
+                                column_ids
+                                    .iter()
+                                    .zip(values.iter())
+                                    .all(|(&col_id, value)| {
+                                        version.data.get(col_id as usize) == Some(value)
+                                    })
+                            }
+                        }
                     })
                 };
                 if let Some(entry) = taken {

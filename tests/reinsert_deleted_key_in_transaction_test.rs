@@ -115,3 +115,15 @@ fn test_a_key_still_held_is_refused() {
     db.execute("COMMIT", ()).unwrap();
     assert_eq!(rows(&db), [(2, 8, 20), (3, 7, 30), (9, 1, 10)]);
 }
+
+#[test]
+fn test_unique_values_are_swapped_through_delete_and_reinsert() {
+    let db = setup("reinsert_swap_unique", false);
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("DELETE FROM x WHERE id IN (1, 2)", ()).unwrap();
+    db.execute("INSERT INTO x VALUES (1, 8, 20), (2, 7, 10)", ())
+        .unwrap();
+    db.execute("COMMIT", ()).unwrap();
+    assert_eq!(rows(&db), [(1, 8, 20), (2, 7, 10), (3, 7, 30)]);
+    assert!(db.execute("INSERT INTO x VALUES (4, 1, 10)", ()).is_err());
+}
