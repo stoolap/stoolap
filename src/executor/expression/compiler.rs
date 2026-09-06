@@ -1154,11 +1154,56 @@ impl<'a> ExprCompiler<'a> {
                 }
             }
         } else {
-            // Fallback: evaluate each item (less efficient)
-            // For now, return error - would need runtime set building
-            return Err(CompileError::UnsupportedExpression(
-                "Dynamic IN list not yet supported in VM".to_string(),
-            ));
+            // An item that is not a constant is compared in turn:
+            // left = item OR left = item ..., with IN's NULL rule falling
+            // out of OR's
+            let items: Vec<&Expression> = match &*in_expr.right {
+                Expression::List(list) => list.elements.iter().collect(),
+                Expression::ExpressionList(list) => list.expressions.iter().collect(),
+                _ => {
+                    return Err(CompileError::UnsupportedExpression(
+                        "IN over something that is not a list".to_string(),
+                    ))
+                }
+            };
+            let operator = |op: &str| {
+                crate::parser::token::Token::new(
+                    crate::parser::token::TokenType::Operator,
+                    op,
+                    crate::parser::token::Position::default(),
+                )
+            };
+            let mut chain: Option<Expression> = None;
+            for item in items {
+                let equal = Expression::Infix(InfixExpression::new(
+                    operator("="),
+                    Box::new((*in_expr.left).clone()),
+                    "=",
+                    Box::new(item.clone()),
+                ));
+                chain = Some(match chain {
+                    None => equal,
+                    Some(previous) => Expression::Infix(InfixExpression::new(
+                        crate::parser::token::Token::new(
+                            crate::parser::token::TokenType::Keyword,
+                            "OR",
+                            crate::parser::token::Position::default(),
+                        ),
+                        Box::new(previous),
+                        "OR",
+                        Box::new(equal),
+                    )),
+                });
+            }
+            match chain {
+                Some(chain) => {
+                    self.compile_expr(&chain, builder)?;
+                    if in_expr.not {
+                        builder.emit(Op::Not);
+                    }
+                }
+                None => builder.emit(Op::LoadConst(Value::Boolean(in_expr.not))),
+            }
         }
 
         Ok(())
