@@ -646,3 +646,35 @@ fn test_not_exists_on_a_primary_key_with_limit() {
         .unwrap();
     assert_eq!(count, 200);
 }
+
+#[test]
+fn test_not_exists_keeps_the_keys_the_table_holds() {
+    let db = Database::open("memory://exists_not_exists_sparse_pk").unwrap();
+    db.execute(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, enabled INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO u VALUES (10, 1), (20, 0), (30, 1)", ())
+        .unwrap();
+    db.execute("CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO o VALUES (1, 10), (2, NULL)", ())
+        .unwrap();
+    let ids = |sql: &str| -> Vec<i64> {
+        db.query(sql, ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<i64>(0).unwrap())
+            .collect()
+    };
+    // The keys are 10, 20 and 30, not 1, 2 and 3
+    assert_eq!(
+        ids("SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) LIMIT 5"),
+        [20, 30]
+    );
+    // A conjunct beside the negated set still applies
+    assert_eq!(
+        ids("SELECT id FROM u WHERE (NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id) AND enabled = 1) OR id IS NULL"),
+        [30]
+    );
+}

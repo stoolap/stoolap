@@ -1733,16 +1733,11 @@ impl Executor {
                     .collect();
 
                 let target = early_termination_target.unwrap_or(usize::MAX);
-                let row_count = table.row_count();
 
-                for row_id in 1..=(row_count as i64) {
-                    if !exclusion_set.contains(row_id) {
-                        all_row_ids.push(row_id);
-                        if all_row_ids.len() >= target {
-                            break;
-                        }
-                    }
-                }
+                // The keys the table holds, in key order and no further
+                // than the LIMIT: a key it never held, or no longer holds,
+                // is not a row to keep
+                all_row_ids.extend(table.visible_row_ids_excluding(&exclusion_set, target)?);
             } else {
                 // IN: PRIMARY KEY - the value IS the row_id (for INTEGER PK)
                 for value in values.iter() {
@@ -1934,10 +1929,20 @@ impl Executor {
             // negated set is only probed on a primary key, which holds no
             // NULL, so the second side never fires there
             Expression::Infix(infix) if infix.op_type == InfixOperator::Or => {
-                let (column_name, values, negated, _) = Self::extract_in_hashset_info(&infix.left)?;
-                if !negated {
+                // Only the bare negated set qualifies: a set holding a NULL
+                // keeps no row, and a conjunct beside the set would be lost
+                let Expression::InHashSet(in_hash) = infix.left.as_ref() else {
+                    return None;
+                };
+                if !in_hash.not || in_hash.values.iter().any(|v| v.is_null()) {
                     return None;
                 }
+                let column_name = match in_hash.column.as_ref() {
+                    Expression::Identifier(id) => id.value_lower.to_string(),
+                    Expression::QualifiedIdentifier(qid) => qid.name.value_lower.to_string(),
+                    _ => return None,
+                };
+                let values = in_hash.values.clone();
                 match infix.right.as_ref() {
                     Expression::Infix(is_null)
                         if is_null.operator.eq_ignore_ascii_case("IS")

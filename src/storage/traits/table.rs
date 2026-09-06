@@ -376,6 +376,22 @@ pub trait Table: Send + Sync {
     /// Used for NOT IN (anti-join) optimization.
     fn get_active_row_ids(&self) -> Result<Vec<i64>>;
 
+    /// The row ids the current transaction sees, in key order, leaving
+    /// out the ones in `exclude` and stopping after `limit` of them
+    fn visible_row_ids_excluding(
+        &self,
+        exclude: &crate::common::I64Set,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        let mut ids = self.get_active_row_ids()?;
+        ids.sort_unstable();
+        Ok(ids
+            .into_iter()
+            .filter(|id| !exclude.contains(*id))
+            .take(limit)
+            .collect())
+    }
+
     /// Populate a FxHashSet with all hot row_ids. Avoids the intermediate Vec
     /// allocation of get_active_row_ids() when building skip sets. Required
     /// (no default): implementations must stay infallible for hot data.

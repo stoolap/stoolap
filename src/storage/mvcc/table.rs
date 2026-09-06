@@ -2524,6 +2524,26 @@ impl Table for MVCCTable {
         Ok(self.version_store.get_all_row_ids())
     }
 
+    fn visible_row_ids_excluding(
+        &self,
+        exclude: &crate::common::I64Set,
+        limit: usize,
+    ) -> Result<Vec<i64>> {
+        // A transaction with writes of its own reads the whole key list
+        if self.txn_versions.read().unwrap().has_local_changes() {
+            let mut ids = self.get_active_row_ids()?;
+            ids.sort_unstable();
+            return Ok(ids
+                .into_iter()
+                .filter(|id| !exclude.contains(*id))
+                .take(limit)
+                .collect());
+        }
+        Ok(self
+            .version_store
+            .visible_row_ids_excluding(self.txn_id, exclude, limit))
+    }
+
     fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>) {
         self.version_store.collect_row_ids_into(dest);
     }

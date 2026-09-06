@@ -2672,6 +2672,49 @@ impl VersionStore {
         result
     }
 
+    /// The row ids visible to `txn_id`, in key order, leaving out the ones
+    /// in `exclude` and stopping after `limit` of them
+    pub fn visible_row_ids_excluding(
+        &self,
+        txn_id: i64,
+        exclude: &crate::common::I64Set,
+        limit: usize,
+    ) -> Vec<i64> {
+        if self.closed.load(Ordering::Acquire) || limit == 0 {
+            return Vec::new();
+        }
+        let checker = match self.visibility_checker.as_ref() {
+            Some(c) => c,
+            None => return Vec::new(),
+        };
+        let versions = self.versions.read().clone();
+        let mut result = Vec::with_capacity(limit.min(4096));
+        for (&row_id, chain) in versions.iter() {
+            if exclude.contains(row_id) {
+                continue;
+            }
+            // The newest version this transaction sees decides whether
+            // the row exists for it
+            let mut current: Option<&VersionChainEntry> = Some(chain);
+            let mut exists = false;
+            while let Some(e) = current {
+                if checker.is_visible(e.version.txn_id, txn_id) {
+                    let deleted_at = e.version.deleted_at_txn_id;
+                    exists = deleted_at == 0 || !checker.is_visible(deleted_at, txn_id);
+                    break;
+                }
+                current = e.prev.as_ref().map(|b| b.as_ref());
+            }
+            if exists {
+                result.push(row_id);
+                if result.len() >= limit {
+                    break;
+                }
+            }
+        }
+        result
+    }
+
     /// Get visible rows with LIMIT (with early termination).
     ///
     /// Note: Functionally identical to get_visible_rows_with_limit. Kept for API compatibility.
