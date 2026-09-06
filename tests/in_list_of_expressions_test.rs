@@ -77,3 +77,19 @@ fn test_the_value_is_evaluated_once() {
         .collect();
     assert_eq!(nulls, [Some(true), None, None, Some(true), None, None]);
 }
+
+#[test]
+fn test_a_list_longer_than_a_short_count_holds() {
+    let db = Database::open("memory://in_list_long").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1)", ()).unwrap();
+    // 65,536 items: the first is the column itself, the rest are zeros
+    let zeros = vec!["0"; 65_535].join(", ");
+    let hit: Vec<bool> = db
+        .query(&format!("SELECT a IN (a + 0, {zeros}) FROM t"), ())
+        .unwrap()
+        .map(|r| r.unwrap().get::<bool>(0).unwrap())
+        .collect();
+    assert_eq!(hit, [true]);
+}

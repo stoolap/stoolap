@@ -1175,7 +1175,13 @@ impl<'a> ExprCompiler<'a> {
                 for item in &items {
                     self.compile_expr(item, builder)?;
                 }
-                builder.emit(Op::InList(items.len() as u16));
+                let count = u32::try_from(items.len()).map_err(|_| {
+                    CompileError::UnsupportedExpression(format!(
+                        "IN list holds {} items, more than an expression can hold",
+                        items.len()
+                    ))
+                })?;
+                builder.emit(Op::InList(count));
                 if in_expr.not {
                     builder.emit(Op::Not);
                 }

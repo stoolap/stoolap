@@ -617,7 +617,7 @@ pub enum Op {
 
     /// IN over items evaluated at run time; the value is judged once
     /// Stack: [value, item_1, ..., item_n] -> [bool]
-    InList(u16), // item count
+    InList(u32), // item count
 
     /// BETWEEN check: value BETWEEN low AND high
     /// Stack: [value, low, high] -> [bool]
