@@ -1,0 +1,18 @@
+# `cargo nextest run` uses the default profile, which leaves out the tests
+# that judge wall-clock time and the concurrency stress binaries: they turn
+# red under load and cost minutes. `cargo nextest run -P full` runs every
+# test, for CI and before a merge.
+
+[profile.default]
+default-filter = """
+not (
+  test(=storage::mvcc::version_store::tests::test_unique_constraint_performance_bulk_update)
+  | test(=test_fk_cascade_delete_performance_with_auto_index)
+  | binary(=concurrency_history_test)
+  | binary(=volume_concurrency_test)
+)
+"""
+slow-timeout = { period = "60s" }
+
+[profile.full]
+default-filter = "all()"
