@@ -5800,6 +5800,33 @@ impl Executor {
         // CRITICAL: Must pass ctx for parameter resolution ($1, named params, etc.)
         let mut result: Box<dyn QueryResult> = result;
         if let Some(ref where_clause) = stmt.where_clause {
+            // A parent row's column named through its own table is bound
+            // first, or the bare name it would fall back to could be the
+            // view's own
+            let bound_where;
+            let where_clause: &Expression = match ctx.outer_row() {
+                Some(outer) => {
+                    let inner: Vec<String> = stmt
+                        .table_expr
+                        .as_deref()
+                        .and_then(super::utils::get_table_alias_from_expr)
+                        .map(|name| name.to_lowercase())
+                        .into_iter()
+                        .collect();
+                    let inner: Vec<&str> = inner.iter().map(String::as_str).collect();
+                    let scope = super::utils::InnerScope {
+                        tables: &inner,
+                        schema: None,
+                    };
+                    bound_where = super::utils::substitute_outer_references_in_scope(
+                        where_clause,
+                        outer,
+                        &scope,
+                    );
+                    &bound_where
+                }
+                None => where_clause,
+            };
             let filter = RowFilter::new(where_clause, &view_columns)?.with_context(ctx);
             result = Box::new(FilteredResult::from_filter(result, filter));
         }

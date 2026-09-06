@@ -199,3 +199,31 @@ fn test_a_bound_parent_value_keeps_its_type() {
         [1, 2]
     );
 }
+
+#[test]
+fn test_a_view_source_binds_two_parent_columns() {
+    let db = setup("correlated_view_two_columns");
+    db.execute("INSERT INTO y VALUES (5, 2, 20)", ()).unwrap();
+    // a y row of the parent's a with a larger b: x1 (10) and x4 (40) see 50, x2 (20) does not
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM x WHERE EXISTS (SELECT 1 FROM vy WHERE vy.a = x.a AND vy.b > x.b) ORDER BY id"
+        ),
+        [1, 4]
+    );
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM x WHERE x.b > (SELECT AVG(b) FROM vy v WHERE v.a = x.a) ORDER BY id"
+        ),
+        [2, 4]
+    );
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM x WHERE EXISTS (SELECT 1 FROM vy v JOIN y ON y.id = v.id WHERE v.a = x.a AND y.b = x.b) ORDER BY id"
+        ),
+        [2]
+    );
+}
