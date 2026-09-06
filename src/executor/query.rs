@@ -2515,7 +2515,11 @@ impl Executor {
             // If there are subqueries, we must filter in memory
             // Use cached classification to avoid AST traversal
             if classification.where_has_subqueries {
-                (None, true)
+                // The conjuncts without a subquery still narrow the scan;
+                // the whole WHERE is evaluated in memory afterwards
+                let (storage_expr, _) =
+                    pushdown::try_pushdown(where_expr, table.schema(), Some(ctx));
+                (storage_expr, true)
             } else if has_outer_context {
                 // If we have outer row context, this is a correlated subquery
                 // OPTIMIZATION: Substitute outer references with their actual values
