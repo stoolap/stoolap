@@ -3768,6 +3768,8 @@ impl Table for SegmentedTable {
 
     fn rollback_to_timestamp(&self, timestamp: i64) {
         self.hot.rollback_to_timestamp(timestamp);
+        self.segment_mgr
+            .rollback_pending_tombstones_after(self.txn_id(), timestamp);
     }
 
     fn has_local_changes(&self) -> bool {

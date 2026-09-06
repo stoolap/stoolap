@@ -7643,6 +7643,24 @@ impl TransactionEngineOperations for EngineOperations {
         }
     }
 
+    fn rollback_tombstones_after(&self, txn_id: i64, timestamp: i64) {
+        let cache = self.txn_version_stores().read().unwrap();
+        let touched: smallvec::SmallVec<[crate::common::SmartString; 4]> = cache
+            .get(txn_id)
+            .map(|tables| tables.iter().map(|(name, _)| name.clone()).collect())
+            .unwrap_or_default();
+        drop(cache);
+
+        if !touched.is_empty() {
+            let mgrs = self.segment_managers.read().unwrap();
+            for name in &touched {
+                if let Some(mgr) = mgrs.get(name.as_str()) {
+                    mgr.rollback_pending_tombstones_after(txn_id, timestamp);
+                }
+            }
+        }
+    }
+
     fn acquire_seal_fence(&self) -> Option<SealFenceGuard> {
         Some(SealFenceGuard::new(Arc::clone(&self.seal_fence)))
     }

@@ -157,3 +157,39 @@ fn test_release_stays_usable_as_a_column_name() {
         ],
     );
 }
+
+#[test]
+fn test_rollback_to_restores_checkpointed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}/sp", dir.path().display())).unwrap();
+    run(
+        &db,
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+            "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)",
+            "PRAGMA CHECKPOINT",
+            "BEGIN",
+            "SAVEPOINT a",
+            "DELETE FROM t WHERE id = 1",
+            "UPDATE t SET v = 20 WHERE id = 2",
+            "ROLLBACK TO SAVEPOINT a",
+        ],
+    );
+    assert_eq!(count(&db), 3);
+    run(&db, &["COMMIT"]);
+    let values: Vec<i64> = db
+        .query("SELECT v FROM t ORDER BY id", ())
+        .unwrap()
+        .map(|r| r.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(values, [1, 2, 3]);
+
+    let mut tx = db.begin().unwrap();
+    tx.execute("SAVEPOINT a", ()).unwrap();
+    tx.execute("DELETE FROM t WHERE id = 3", ()).unwrap();
+    tx.execute("SAVEPOINT b", ()).unwrap();
+    tx.execute("DELETE FROM t WHERE id = 1", ()).unwrap();
+    tx.execute("ROLLBACK TO SAVEPOINT b", ()).unwrap();
+    tx.commit().unwrap();
+    assert_eq!(count(&db), 2);
+}

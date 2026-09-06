@@ -137,6 +137,10 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// This cleans up the transaction's entries in txn_version_stores
     fn rollback_all_tables(&self, txn_id: i64);
 
+    /// Discard the cold-row tombstones the transaction made after a timestamp
+    /// (savepoint rollback). Engines without cold storage have none.
+    fn rollback_tombstones_after(&self, _txn_id: i64, _timestamp: i64) {}
+
     /// Defer table cleanup to background thread (avoids synchronous deallocation)
     /// Default implementation drops synchronously
     fn defer_table_cleanup(&self, _tables: Vec<Box<dyn Table>>) {
@@ -359,6 +363,7 @@ impl MvccTransaction {
                     table.rollback_to_timestamp(sp_state.timestamp);
                 }
             }
+            ops.rollback_tombstones_after(self.id, sp_state.timestamp);
         }
 
         // Rollback DDL: undo CREATE TABLEs after savepoint
