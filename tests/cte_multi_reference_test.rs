@@ -87,6 +87,23 @@ fn test_cte_read_by_select_list_having_and_order_by() {
         ),
         [[Some(2)], [Some(1)], [None]]
     );
+    assert_eq!(
+        rows(
+            &db,
+            "WITH c AS (SELECT a FROM x) \
+             SELECT ROW_NUMBER() OVER (ORDER BY (SELECT MAX(a) FROM c)) FROM c"
+        )
+        .len(),
+        3
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "WITH c AS (SELECT a FROM x) \
+             SELECT COUNT(*) OVER w FROM c WINDOW w AS (ORDER BY (SELECT MIN(a) FROM c))"
+        ),
+        [[Some(3)], [Some(3)], [Some(3)]]
+    );
 }
 
 #[test]

@@ -1950,19 +1950,8 @@ impl Executor {
             self.count_cte_references_in_expr(where_clause, &mut where_ref_counts);
         }
 
-        // A reference from the select list, HAVING, ORDER BY or another
-        // branch of a set operation reads the CTE by name as well
-        for expr in stmt
-            .columns
-            .iter()
-            .chain(stmt.having.as_deref())
-            .chain(stmt.order_by.iter().map(|o| &o.expression))
-        {
-            self.count_cte_references_in_expr(expr, &mut where_ref_counts);
-        }
-        for set_op in &stmt.set_operations {
-            self.count_cte_references_in_stmt(&set_op.right, &mut where_ref_counts);
-        }
+        // A reference from any other clause reads the CTE by name as well
+        self.count_cte_references_outside_from(stmt, &mut where_ref_counts);
 
         // Only inline CTEs that:
         // 1. Are used exactly once in table expressions (FROM/JOIN)
@@ -2077,12 +2066,27 @@ impl Executor {
             self.count_cte_references_in_expr(where_clause, ref_counts);
         }
 
-        // Check SELECT columns, HAVING and ORDER BY for subqueries
+        self.count_cte_references_outside_from(stmt, ref_counts);
+    }
+
+    /// Count CTE references in the clauses other than FROM and WHERE: the
+    /// select list, HAVING, ORDER BY, named windows and set-operation branches
+    fn count_cte_references_outside_from(
+        &self,
+        stmt: &SelectStatement,
+        ref_counts: &mut StringMap<usize>,
+    ) {
+        let windows = stmt.window_defs.iter().flat_map(|w| {
+            w.partition_by
+                .iter()
+                .chain(w.order_by.iter().map(|o| &o.expression))
+        });
         for expr in stmt
             .columns
             .iter()
             .chain(stmt.having.as_deref())
             .chain(stmt.order_by.iter().map(|o| &o.expression))
+            .chain(windows)
         {
             self.count_cte_references_in_expr(expr, ref_counts);
         }
@@ -2175,6 +2179,18 @@ impl Executor {
             }
             Expression::Aliased(aliased) => {
                 self.count_cte_references_in_expr(&aliased.expression, ref_counts);
+            }
+            Expression::Window(window) => {
+                for expr in window
+                    .function
+                    .arguments
+                    .iter()
+                    .chain(window.function.filter.as_deref())
+                    .chain(window.partition_by.iter())
+                    .chain(window.order_by.iter().map(|o| &o.expression))
+                {
+                    self.count_cte_references_in_expr(expr, ref_counts);
+                }
             }
             _ => {}
         }
