@@ -107,6 +107,17 @@ typedef struct StoolapValue {
     } v;
 } StoolapValue;
 
+/** A named parameter for :name-style bindings. */
+typedef struct StoolapNamedParam {
+    /** Parameter name without the ':' prefix. Need not be null-terminated. */
+    const char* name;
+    /** Length of name in bytes. */
+    int32_t name_len;
+    int32_t _padding;
+    /** Parameter value. */
+    StoolapValue value;
+} StoolapNamedParam;
+
 /* =========================================================================
  * Library info
  * ========================================================================= */
@@ -224,6 +235,21 @@ int32_t stoolap_exec_params(
     int64_t* rows_affected
 );
 
+/**
+ * Execute a SQL statement with named parameters (:name).
+ *
+ * @param params      Array of named parameters. May be NULL if params_len is 0.
+ * @param params_len  Number of parameters.
+ * @param rows_affected  If non-NULL, receives the number of affected rows.
+ */
+int32_t stoolap_exec_named(
+    StoolapDB* db,
+    const char* sql,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    int64_t* rows_affected
+);
+
 /* =========================================================================
  * Query (returns result rows)
  * ========================================================================= */
@@ -242,6 +268,18 @@ int32_t stoolap_query_params(
     StoolapDB* db,
     const char* sql,
     const StoolapValue* params,
+    int32_t params_len,
+    StoolapRows** out_rows
+);
+
+/**
+ * Execute a query with named parameters (:name).
+ * On success, *out_rows must be closed with stoolap_rows_close().
+ */
+int32_t stoolap_query_named(
+    StoolapDB* db,
+    const char* sql,
+    const StoolapNamedParam* params,
     int32_t params_len,
     StoolapRows** out_rows
 );
@@ -350,6 +388,15 @@ int32_t stoolap_tx_exec_params(
     int64_t* rows_affected
 );
 
+/** Execute within a transaction (with named parameters). */
+int32_t stoolap_tx_exec_named(
+    StoolapTx* tx,
+    const char* sql,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    int64_t* rows_affected
+);
+
 /** Query within a transaction (no parameters). */
 int32_t stoolap_tx_query(StoolapTx* tx, const char* sql, StoolapRows** out_rows);
 
@@ -358,6 +405,15 @@ int32_t stoolap_tx_query_params(
     StoolapTx* tx,
     const char* sql,
     const StoolapValue* params,
+    int32_t params_len,
+    StoolapRows** out_rows
+);
+
+/** Query within a transaction (with named parameters). */
+int32_t stoolap_tx_query_named(
+    StoolapTx* tx,
+    const char* sql,
+    const StoolapNamedParam* params,
     int32_t params_len,
     StoolapRows** out_rows
 );
@@ -383,6 +439,21 @@ int32_t stoolap_tx_stmt_exec(
 );
 
 /**
+ * Execute a prepared statement within a transaction (with named parameters).
+ *
+ * @param params         Array of named parameters. May be NULL if params_len is 0.
+ * @param params_len     Number of parameters.
+ * @param rows_affected  If non-NULL, receives the number of affected rows.
+ */
+int32_t stoolap_tx_stmt_exec_named(
+    StoolapTx* tx,
+    const StoolapStmt* stmt,
+    const StoolapNamedParam* params,
+    int32_t params_len,
+    int64_t* rows_affected
+);
+
+/**
  * Query using a prepared statement within a transaction (with parameters).
  *
  * Combines parse-once performance with transaction atomicity.
@@ -398,6 +469,21 @@ int32_t stoolap_tx_stmt_query(
     StoolapTx* tx,
     const StoolapStmt* stmt,
     const StoolapValue* params,
+    int32_t params_len,
+    StoolapRows** out_rows
+);
+
+/**
+ * Query using a prepared statement within a transaction (with named parameters).
+ *
+ * @param params      Array of named parameters. May be NULL if params_len is 0.
+ * @param params_len  Number of parameters.
+ * @param out_rows    On success, receives the result set handle.
+ */
+int32_t stoolap_tx_stmt_query_named(
+    StoolapTx* tx,
+    const StoolapStmt* stmt,
+    const StoolapNamedParam* params,
     int32_t params_len,
     StoolapRows** out_rows
 );
