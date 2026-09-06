@@ -1929,6 +1929,33 @@ impl Executor {
                 Some((column_name, in_hash.values.clone(), in_hash.not, None))
             }
 
+            // A NOT EXISTS rewrite keeps a NULL outer value beside the
+            // negated set: column NOT IN {hash_set} OR column IS NULL. The
+            // negated set is only probed on a primary key, which holds no
+            // NULL, so the second side never fires there
+            Expression::Infix(infix) if infix.op_type == InfixOperator::Or => {
+                let (column_name, values, negated, _) = Self::extract_in_hashset_info(&infix.left)?;
+                if !negated {
+                    return None;
+                }
+                match infix.right.as_ref() {
+                    Expression::Infix(is_null)
+                        if is_null.operator.eq_ignore_ascii_case("IS")
+                            && matches!(is_null.right.as_ref(), Expression::NullLiteral(_)) =>
+                    {
+                        let same_column = match is_null.left.as_ref() {
+                            Expression::Identifier(id) => id.value_lower == column_name,
+                            Expression::QualifiedIdentifier(qid) => {
+                                qid.name.value_lower == column_name
+                            }
+                            _ => false,
+                        };
+                        same_column.then_some((column_name, values, true, None))
+                    }
+                    _ => None,
+                }
+            }
+
             // InHashSet with AND: column IN {hash_set} AND other_condition
             Expression::Infix(infix) if infix.op_type == InfixOperator::And => {
                 // Try left side as InHashSet

@@ -606,3 +606,43 @@ fn test_update_binds_each_row_to_a_where_the_semi_join_rewrite_refused() {
         assert_eq!(count("SELECT SUM(b) FROM uy"), 11, "keyed: {keyed}");
     }
 }
+
+#[test]
+fn test_not_exists_on_a_primary_key_with_limit() {
+    let db = Database::open("memory://exists_not_exists_pk_limit").unwrap();
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, uid INTEGER, s TEXT)",
+        (),
+    )
+    .unwrap();
+    let rows: Vec<String> = (1..=300).map(|i| format!("({i}, {})", i % 7)).collect();
+    db.execute(&format!("INSERT INTO u VALUES {}", rows.join(", ")), ())
+        .unwrap();
+    let orders: Vec<String> = (1..=300)
+        .map(|i| format!("({i}, {i}, '{}')", if i % 3 == 0 { "x" } else { "y" }))
+        .collect();
+    db.execute(&format!("INSERT INTO o VALUES {}", orders.join(", ")), ())
+        .unwrap();
+    // Every third user has an x order; the rest are kept, in id order
+    let kept: Vec<i64> = db
+        .query(
+            "SELECT id FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id AND o.s = 'x') LIMIT 5",
+            (),
+        )
+        .unwrap()
+        .map(|r| r.unwrap().get::<i64>(0).unwrap())
+        .collect();
+    assert_eq!(kept, [1, 2, 4, 5, 7]);
+    let count: i64 = db
+        .query(
+            "SELECT COUNT(*) FROM u WHERE NOT EXISTS (SELECT 1 FROM o WHERE o.uid = u.id AND o.s = 'x')",
+            (),
+        )
+        .unwrap()
+        .map(|r| r.unwrap().get::<i64>(0).unwrap())
+        .next()
+        .unwrap();
+    assert_eq!(count, 200);
+}
