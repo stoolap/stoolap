@@ -7644,18 +7644,34 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn rollback_tombstones_after(&self, txn_id: i64, timestamp: i64) {
+        // Same lock order as rollback_all_tables: the txn cache is released
+        // before the segment managers are read.
         let cache = self.txn_version_stores().read().unwrap();
-        let touched: smallvec::SmallVec<[crate::common::SmartString; 4]> = cache
+        let touched: smallvec::SmallVec<
+            [(
+                crate::common::SmartString,
+                Arc<RwLock<TransactionVersionStore>>,
+            ); 4],
+        > = cache
             .get(txn_id)
-            .map(|tables| tables.iter().map(|(name, _)| name.clone()).collect())
+            .map(|tables| {
+                tables
+                    .iter()
+                    .map(|(name, store)| (name.clone(), Arc::clone(store)))
+                    .collect()
+            })
             .unwrap_or_default();
         drop(cache);
 
-        if !touched.is_empty() {
-            let mgrs = self.segment_managers.read().unwrap();
-            for name in &touched {
-                if let Some(mgr) = mgrs.get(name.as_str()) {
-                    mgr.rollback_pending_tombstones_after(txn_id, timestamp);
+        if touched.is_empty() {
+            return;
+        }
+        let mgrs = self.segment_managers.read().unwrap();
+        for (name, txn_store) in &touched {
+            if let Some(mgr) = mgrs.get(name.as_str()) {
+                let discarded = mgr.rollback_pending_tombstones_after(txn_id, timestamp);
+                if !discarded.is_empty() {
+                    txn_store.write().unwrap().release_claims(&discarded);
                 }
             }
         }

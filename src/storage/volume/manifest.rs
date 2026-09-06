@@ -1859,11 +1859,20 @@ impl SegmentManager {
         self.pending_txn_tombstones.write().remove(&txn_id);
     }
 
-    /// Discard the pending tombstones made after a timestamp (savepoint rollback).
-    pub fn rollback_pending_tombstones_after(&self, txn_id: i64, timestamp: i64) {
+    /// Discard the pending tombstones made after a timestamp (savepoint rollback)
+    /// and return the row_ids discarded, so their row claims can be released.
+    pub fn rollback_pending_tombstones_after(&self, txn_id: i64, timestamp: i64) -> Vec<i64> {
+        let mut discarded = Vec::new();
         if let Some(ids) = self.pending_txn_tombstones.write().get_mut(&txn_id) {
-            ids.retain(|_, tombstoned_at| *tombstoned_at <= timestamp);
+            ids.retain(|&row_id, tombstoned_at| {
+                let keep = *tombstoned_at <= timestamp;
+                if !keep {
+                    discarded.push(row_id);
+                }
+                keep
+            });
         }
+        discarded
     }
 
     /// Check if a txn has any pending tombstones (for has_local_changes).

@@ -193,3 +193,35 @@ fn test_rollback_to_restores_checkpointed_rows() {
     tx.commit().unwrap();
     assert_eq!(count(&db), 2);
 }
+
+#[test]
+fn test_rollback_to_releases_the_claims_on_checkpointed_rows() {
+    // Without an INTEGER PRIMARY KEY a cold DELETE claims the row without a hot version
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}/claims", dir.path().display())).unwrap();
+    run(
+        &db,
+        &[
+            "CREATE TABLE t (k TEXT, v INTEGER)",
+            "INSERT INTO t VALUES ('a', 1), ('b', 2), ('c', 3)",
+            "PRAGMA CHECKPOINT",
+            "BEGIN",
+            "SAVEPOINT a",
+            "DELETE FROM t WHERE k = 'a'",
+            "UPDATE t SET v = 20 WHERE k = 'b'",
+            "ROLLBACK TO SAVEPOINT a",
+            "COMMIT",
+            "UPDATE t SET v = 10 WHERE k = 'a'",
+            "DELETE FROM t WHERE k = 'b'",
+        ],
+    );
+    assert_eq!(count(&db), 2);
+
+    let mut tx = db.begin().unwrap();
+    tx.execute("SAVEPOINT a", ()).unwrap();
+    tx.execute("DELETE FROM t WHERE k = 'c'", ()).unwrap();
+    tx.execute("ROLLBACK TO SAVEPOINT a", ()).unwrap();
+    tx.commit().unwrap();
+    run(&db, &["DELETE FROM t WHERE k = 'c'"]);
+    assert_eq!(count(&db), 1);
+}
