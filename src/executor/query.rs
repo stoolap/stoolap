@@ -8719,8 +8719,23 @@ impl Executor {
         )?;
         let mut columns = all_columns.to_vec();
         let mut exprs = select_exprs.to_vec();
-        for (n, &i) in correlated.iter().enumerate() {
-            let name = format!("__correlated_{n}");
+        // A source column may carry any name, so the bound column takes the
+        // first name no source column has, qualified or bare
+        let taken = |name: &str, columns: &[String]| {
+            columns.iter().any(|column| {
+                let bare = column.rsplit('.').next().unwrap_or(column);
+                column.eq_ignore_ascii_case(name) || bare.eq_ignore_ascii_case(name)
+            })
+        };
+        let mut next = 0usize;
+        for &i in &correlated {
+            let name = loop {
+                let candidate = format!("__correlated_{next}");
+                next += 1;
+                if !taken(&candidate, &columns) {
+                    break candidate;
+                }
+            };
             let column = Expression::Identifier(Identifier::new(
                 dummy_token(&name, TokenType::Identifier),
                 name.clone(),

@@ -91,6 +91,44 @@ fn test_correlated_subquery_over_view() {
 }
 
 #[test]
+fn test_bound_column_does_not_shadow_a_source_column() {
+    let db = Database::open("memory://correlated_over_view_shadow").unwrap();
+    db.execute(
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, __correlated_0 INTEGER, a INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO q VALUES (1, 100, 1), (2, 200, 2), (3, 300, NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE VIEW vq AS SELECT id, __correlated_0, a FROM q", ())
+        .unwrap();
+    let expected = [
+        [Some(300), Some(0)],
+        [Some(200), Some(0)],
+        [Some(100), Some(1)],
+    ];
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT __correlated_0, (SELECT COUNT(*) FROM q q2 WHERE q2.a > v.a) AS n \
+             FROM vq v ORDER BY v.id DESC"
+        ),
+        expected
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "SELECT __correlated_0, (SELECT COUNT(*) FROM q q2 WHERE q2.a > d.a) AS n \
+             FROM (SELECT id, __correlated_0, a FROM q) d ORDER BY d.id DESC"
+        ),
+        expected
+    );
+}
+
+#[test]
 fn test_correlated_where_over_derived_table() {
     let db = setup("correlated_over_derived");
     assert_eq!(
