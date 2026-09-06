@@ -312,17 +312,19 @@ impl Executor {
     ) -> Result<(Vec<String>, RowVec)> {
         // Check if the CTE references another CTE
         if let Some(ref table_expr) = stmt.table_expr {
-            // First check for simple CTE reference
-            // BUT: if there are set operations (UNION, etc.), we need to fall through
-            // to execute_select which handles them properly
-            if stmt.set_operations.is_empty() {
+            // First check for simple CTE reference, when the CTE path can
+            // finish the statement on its own; otherwise fall through to
+            // execute_select, which handles set operations and the rest
+            if Self::cte_result_path_finishes(stmt) {
                 if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
                     if let Some((columns, rows)) = cte_registry.get(&cte_name) {
                         // Execute query against CTE result
                         // Clone Arc data into RowVec for processing
+                        // A subquery in the statement reads the earlier
+                        // CTEs through the context
                         return self.execute_query_on_cte_result(
                             stmt,
-                            ctx,
+                            &ctx.with_cte_data(cte_registry.data()),
                             columns.to_vec(),
                             RowVec::from_vec((**rows).clone()),
                         );
@@ -526,14 +528,11 @@ impl Executor {
         let ctx_with_ctes = ctx.with_cte_data(cte_registry.data());
 
         // Check if the main query references a CTE
-        // NOTE: Skip the CTE fast path if there are set operations (UNION/INTERSECT/EXCEPT)
-        // because execute_query_on_cte_result doesn't handle set_operations
-        let has_set_operations = !stmt.set_operations.is_empty();
-
         if let Some(ref table_expr) = stmt.table_expr {
-            // First check for simple CTE reference (only when no set operations)
+            // First check for simple CTE reference, when the CTE path can
+            // finish the statement on its own
             // Use the base CTE name (not alias) for registry lookup
-            if !has_set_operations {
+            if Self::cte_result_path_finishes(stmt) {
                 if let Some(cte_name) = self.extract_cte_name_for_lookup(table_expr) {
                     if let Some((columns, rows)) = cte_registry.get(&cte_name) {
                         // Execute query against CTE result
@@ -1575,6 +1574,22 @@ impl Executor {
         stmt.with.is_some()
     }
 
+    /// Whether the query-on-CTE-result path can finish a statement by
+    /// itself: it sorts by column only, and leaves set operations and
+    /// DISTINCT to execute_select
+    fn cte_result_path_finishes(stmt: &SelectStatement) -> bool {
+        stmt.set_operations.is_empty()
+            && !stmt.distinct
+            && stmt.order_by.iter().all(|ob| {
+                matches!(
+                    &ob.expression,
+                    Expression::Identifier(_)
+                        | Expression::QualifiedIdentifier(_)
+                        | Expression::IntegerLiteral(_)
+                )
+            })
+    }
+
     /// Apply ORDER BY to rows
     fn apply_order_by_to_rows(
         &self,
@@ -1935,6 +1950,20 @@ impl Executor {
             self.count_cte_references_in_expr(where_clause, &mut where_ref_counts);
         }
 
+        // A reference from the select list, HAVING, ORDER BY or another
+        // branch of a set operation reads the CTE by name as well
+        for expr in stmt
+            .columns
+            .iter()
+            .chain(stmt.having.as_deref())
+            .chain(stmt.order_by.iter().map(|o| &o.expression))
+        {
+            self.count_cte_references_in_expr(expr, &mut where_ref_counts);
+        }
+        for set_op in &stmt.set_operations {
+            self.count_cte_references_in_stmt(&set_op.right, &mut where_ref_counts);
+        }
+
         // Only inline CTEs that:
         // 1. Are used exactly once in table expressions (FROM/JOIN)
         // 2. Are NOT used in WHERE clause subqueries (these need special handling)
@@ -2048,9 +2077,18 @@ impl Executor {
             self.count_cte_references_in_expr(where_clause, ref_counts);
         }
 
-        // Check SELECT columns for subqueries
-        for col in &stmt.columns {
-            self.count_cte_references_in_expr(col, ref_counts);
+        // Check SELECT columns, HAVING and ORDER BY for subqueries
+        for expr in stmt
+            .columns
+            .iter()
+            .chain(stmt.having.as_deref())
+            .chain(stmt.order_by.iter().map(|o| &o.expression))
+        {
+            self.count_cte_references_in_expr(expr, ref_counts);
+        }
+
+        for set_op in &stmt.set_operations {
+            self.count_cte_references_in_stmt(&set_op.right, ref_counts);
         }
     }
 
@@ -2087,17 +2125,53 @@ impl Executor {
             }
             Expression::In(in_expr) => {
                 self.count_cte_references_in_expr(&in_expr.left, ref_counts);
-                // Check if right side is a ScalarSubquery
-                if let Expression::ScalarSubquery(sq) = &*in_expr.right {
-                    self.count_cte_references_in_stmt(&sq.subquery, ref_counts);
-                }
+                self.count_cte_references_in_expr(&in_expr.right, ref_counts);
             }
             Expression::Exists(ex) => {
                 self.count_cte_references_in_stmt(&ex.subquery, ref_counts);
             }
+            Expression::AllAny(all_any) => {
+                self.count_cte_references_in_expr(&all_any.left, ref_counts);
+                self.count_cte_references_in_stmt(&all_any.subquery, ref_counts);
+            }
             Expression::Infix(infix) => {
                 self.count_cte_references_in_expr(&infix.left, ref_counts);
                 self.count_cte_references_in_expr(&infix.right, ref_counts);
+            }
+            Expression::Prefix(prefix) => {
+                self.count_cte_references_in_expr(&prefix.right, ref_counts);
+            }
+            Expression::Between(between) => {
+                self.count_cte_references_in_expr(&between.expr, ref_counts);
+                self.count_cte_references_in_expr(&between.lower, ref_counts);
+                self.count_cte_references_in_expr(&between.upper, ref_counts);
+            }
+            Expression::Cast(cast) => {
+                self.count_cte_references_in_expr(&cast.expr, ref_counts);
+            }
+            Expression::Like(like) => {
+                self.count_cte_references_in_expr(&like.left, ref_counts);
+                self.count_cte_references_in_expr(&like.pattern, ref_counts);
+            }
+            Expression::FunctionCall(func) => {
+                for arg in func.arguments.iter().chain(func.filter.as_deref()) {
+                    self.count_cte_references_in_expr(arg, ref_counts);
+                }
+            }
+            Expression::Case(case) => {
+                for expr in case
+                    .value
+                    .as_deref()
+                    .into_iter()
+                    .chain(
+                        case.when_clauses
+                            .iter()
+                            .flat_map(|w| [&w.condition, &w.then_result]),
+                    )
+                    .chain(case.else_value.as_deref())
+                {
+                    self.count_cte_references_in_expr(expr, ref_counts);
+                }
             }
             Expression::Aliased(aliased) => {
                 self.count_cte_references_in_expr(&aliased.expression, ref_counts);
