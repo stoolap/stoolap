@@ -14,7 +14,7 @@ Works with any MCP-compatible AI client: Claude Desktop, Claude Code, Cursor, Wi
 
 The server provides 30 tools, 2 resources, and 1 prompt. On connection, it sends built-in instructions so the AI can write correct Stoolap SQL from the first query. Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`), so clients can auto-approve the read-only ones.
 
-Version 0.4.x of the server targets the Stoolap 0.4.x engine (volume-based storage) through [`@stoolap/node`](https://github.com/stoolap/stoolap-node).
+This page describes `@stoolap/mcp` 0.4.1 or later, which targets the Stoolap 0.4.x engine (volume-based storage) through [`@stoolap/node`](https://github.com/stoolap/stoolap-node). Pin the version in your client configuration (`@stoolap/mcp@^0.4.1`) if you rely on the read-only guarantees below; 0.4.0 does not block COPY ... FROM in read-only mode.
 
 ## Installation
 
@@ -352,7 +352,7 @@ The server includes several safety measures:
 - **Single statement per call**: the engine executes every statement of a multi-statement string but reports only the last one, so semicolon-separated batches are rejected.
 - **Tool routing**: `query` accepts only read statements, `execute` is blocked while a transaction is open, and transaction control statements (BEGIN, COMMIT, ROLLBACK, SAVEPOINT) are only reachable through the transaction tools, so the server always knows the connection's transaction state.
 - **Read-only mode**: `--read-only` rejects every write, including COPY, DDL, SET, ANALYZE, VACUUM and PRAGMA actions.
-- **COPY ... FROM reads files on the host** with the server process's permissions, so an assistant can load any readable file into a table. Run with `--read-only` when that is not acceptable.
+- **COPY ... FROM reads files on the host** with the server process's permissions, so an assistant can load any readable file into a table. Run with `--read-only` when that is not acceptable. Server 0.4.0 does not apply the read-only check to COPY; use 0.4.1 or later.
 - **DDL outside transactions**: only CREATE TABLE is rolled back reliably by the engine, so DDL, TRUNCATE and COPY are refused inside a transaction.
 - **EXPLAIN ANALYZE** is refused for write statements because it executes them.
 - **Injection guards**: table and view names are double-quoted, savepoint and pragma names must be bare identifiers, pragma values are validated per pragma.
@@ -364,6 +364,6 @@ The server includes several safety measures:
 git clone https://github.com/stoolap/stoolap-mcp.git
 cd stoolap-mcp
 npm install
-npm test          # builds, then runs the end-to-end smoke tests against the built server
+npm run build
 node build/index.js --path ./mydata
 ```
