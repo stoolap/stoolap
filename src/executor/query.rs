@@ -4064,6 +4064,36 @@ impl Executor {
             Some(where_clause) => Some((**where_clause).clone()),
             None => None,
         };
+        // A parent row's column named through the parent's table is bound
+        // before the predicates are split, or the side a predicate is
+        // pushed to would read the bare name it falls back to as its own.
+        // A predicate holding a subquery is left for the per-row path
+        let where_for_join = match (where_for_join, ctx.outer_row()) {
+            (Some(where_clause), Some(outer)) => {
+                let inner: Vec<String> = [&left_alias, &right_alias]
+                    .into_iter()
+                    .flatten()
+                    .map(|alias| alias.to_lowercase())
+                    .collect();
+                let inner: Vec<&str> = inner.iter().map(String::as_str).collect();
+                let scope = super::utils::InnerScope {
+                    tables: &inner,
+                    schema: None,
+                };
+                let bound: Vec<Expression> = flatten_and_predicates(&where_clause)
+                    .into_iter()
+                    .map(|pred| {
+                        if Self::has_subqueries(&pred) {
+                            pred
+                        } else {
+                            super::utils::substitute_outer_references_in_scope(&pred, outer, &scope)
+                        }
+                    })
+                    .collect();
+                combine_predicates_with_and(bound)
+            }
+            (where_clause, _) => where_clause,
+        };
         let (left_filter, right_filter, cross_filter) =
             if let Some(where_clause) = where_for_join.as_ref() {
                 if let (Some(left_a), Some(right_a)) = (&left_alias, &right_alias) {
@@ -5332,6 +5362,17 @@ impl Executor {
                 // WHERE, so they are resolved and the predicate compiled per row
                 let keys = ColumnKeyMapping::build_mappings(&all_columns, None);
                 let outer_columns = CompactArc::new(all_columns.clone());
+                let joined_qualifiers: Vec<String> = {
+                    let mut qualifiers: Vec<String> = all_columns
+                        .iter()
+                        .filter_map(|c| c.split_once('.').map(|(q, _)| q.to_lowercase()))
+                        .collect();
+                    qualifiers.sort_unstable();
+                    qualifiers.dedup();
+                    qualifiers
+                };
+                let joined_qualifiers: Vec<&str> =
+                    joined_qualifiers.iter().map(String::as_str).collect();
                 let mut filtered = RowVec::with_capacity(result_rows.len());
                 for (id, row) in result_rows {
                     // The row of a query around this one stays visible to the subqueries
@@ -5349,9 +5390,19 @@ impl Executor {
                     let processed = self.process_correlated_where(where_clause, &row_ctx)?;
                     ctx.check_cancelled()?;
                     // A column of the query around this one is not in the joined
-                    // row, so every reference takes its value from the context
+                    // row, so a reference through the parent's table takes its
+                    // value from the context; one through a joined table's name
+                    // is the row's own, whatever bare name it shares
                     let bound = match row_ctx.outer_row() {
-                        Some(outer) => super::utils::substitute_outer_references(&processed, outer),
+                        Some(outer) => {
+                            let scope = super::utils::InnerScope {
+                                tables: &joined_qualifiers,
+                                schema: None,
+                            };
+                            super::utils::substitute_outer_references_in_scope(
+                                &processed, outer, &scope,
+                            )
+                        }
                         None => processed,
                     };
                     if RowFilter::new(&bound, &all_columns)?
