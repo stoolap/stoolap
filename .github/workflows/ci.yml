@@ -37,6 +37,23 @@ jobs:
     - name: Clippy
       run: cargo clippy --all-targets --all-features -- -D warnings
 
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Rust 1.88
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: "1.88"
+
+    - name: Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Check all features on MSRV
+      run: cargo check --all-features
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}
