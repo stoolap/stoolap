@@ -32,7 +32,7 @@ fn value_to_f64(value: &Value) -> Option<f64> {
 }
 
 // ============================================================================
-// STDDEV_POP / STDDEV - Population Standard Deviation
+// STDDEV_POP - Population Standard Deviation
 // ============================================================================
 
 /// STDDEV_POP aggregate function (Population Standard Deviation)
@@ -99,10 +99,10 @@ impl AggregateFunction for StddevPopFunction {
     }
 }
 
-/// STDDEV aggregate function (alias for STDDEV_POP)
+/// STDDEV aggregate function (alias for STDDEV_SAMP, as in PostgreSQL and DuckDB)
 #[derive(Default)]
 pub struct StddevFunction {
-    inner: StddevPopFunction,
+    inner: StddevSampFunction,
 }
 
 impl AggregateFunction for StddevFunction {
@@ -114,7 +114,7 @@ impl AggregateFunction for StddevFunction {
         FunctionInfo::new(
             "STDDEV",
             FunctionType::Aggregate,
-            "Returns the population standard deviation (alias for STDDEV_POP)",
+            "Returns the sample standard deviation (alias for STDDEV_SAMP)",
             FunctionSignature::new(FunctionDataType::Float, vec![FunctionDataType::Any], 1, 1),
         )
     }
@@ -207,7 +207,7 @@ impl AggregateFunction for StddevSampFunction {
 }
 
 // ============================================================================
-// VAR_POP / VARIANCE - Population Variance
+// VAR_POP - Population Variance
 // ============================================================================
 
 /// VAR_POP aggregate function (Population Variance)
@@ -274,10 +274,10 @@ impl AggregateFunction for VarPopFunction {
     }
 }
 
-/// VARIANCE aggregate function (alias for VAR_POP)
+/// VARIANCE aggregate function (alias for VAR_SAMP, as in PostgreSQL and DuckDB)
 #[derive(Default)]
 pub struct VarianceFunction {
-    inner: VarPopFunction,
+    inner: VarSampFunction,
 }
 
 impl AggregateFunction for VarianceFunction {
@@ -289,7 +289,7 @@ impl AggregateFunction for VarianceFunction {
         FunctionInfo::new(
             "VARIANCE",
             FunctionType::Aggregate,
-            "Returns the population variance (alias for VAR_POP)",
+            "Returns the sample variance (alias for VAR_SAMP)",
             FunctionSignature::new(FunctionDataType::Float, vec![FunctionDataType::Any], 1, 1),
         )
     }
@@ -495,13 +495,14 @@ mod tests {
 
     #[test]
     fn test_stddev_alias() {
+        // STDDEV is the sample standard deviation (alias for STDDEV_SAMP)
         let mut stddev = StddevFunction::default();
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
             stddev.accumulate(&Value::Float(v), false);
         }
         let result = stddev.result();
         if let Value::Float(f) = result {
-            assert!((f - 2.0).abs() < 0.0001);
+            assert!((f - 2.138).abs() < 0.01);
         } else {
             panic!("Expected float result");
         }
@@ -551,13 +552,14 @@ mod tests {
 
     #[test]
     fn test_variance_alias() {
+        // VARIANCE is the sample variance (alias for VAR_SAMP)
         let mut var = VarianceFunction::default();
         for v in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
             var.accumulate(&Value::Float(v), false);
         }
         let result = var.result();
         if let Value::Float(f) = result {
-            assert!((f - 4.0).abs() < 0.0001);
+            assert!((f - 4.571).abs() < 0.01);
         } else {
             panic!("Expected float result");
         }
