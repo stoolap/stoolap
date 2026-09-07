@@ -3991,6 +3991,7 @@ impl Table for SegmentedTable {
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
         let hot_skip_arc = Arc::new(hot_skip);
         let current_schema = self.hot.schema();
+        let all_cols: Vec<usize> = (0..current_schema.columns.len()).collect();
         let prepared_filter = where_expr.map(|expr| {
             let mut filter = expr.with_aliases(&Default::default());
             filter.prepare_for_schema(current_schema);
@@ -4066,7 +4067,7 @@ impl Table for SegmentedTable {
                     }
                 }
                 let mut scanner =
-                    VolumeScanner::with_range(Arc::clone(vol), Vec::new(), start, end, None);
+                    VolumeScanner::with_range(Arc::clone(vol), all_cols.clone(), start, end, None);
                 scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
                 scanner.set_visibility_bitmap(cs.visible.clone());
                 scanner.snapshot_seq = self.snapshot_seq;
