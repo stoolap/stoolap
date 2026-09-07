@@ -116,8 +116,7 @@ impl Parser {
             }
         } else if self.cur_token_is(TokenType::Identifier)
             && self.cur_token.literal.eq_ignore_ascii_case("RELEASE")
-            && (self.peek_token_is_keyword("SAVEPOINT")
-                || self.peek_token_is(TokenType::Identifier))
+            && (self.peek_token_is_keyword("SAVEPOINT") || self.peek_token_is_identifier_like())
         {
             // RELEASE stays a plain identifier elsewhere, so `release` remains a column name
             self.parse_release_savepoint_statement()
@@ -602,6 +601,14 @@ impl Parser {
             if !self.expect_peek_identifier_like() {
                 return None;
             }
+            alias = Some(Identifier::new(
+                self.cur_token.clone(),
+                self.cur_token.literal.clone(),
+            ));
+        } else if self.cur_token_is_keyword("AS") && self.peek_token_is_identifier_like() {
+            // The AS OF check above consumed a lone AS; after an explicit AS
+            // any non-reserved keyword is the alias
+            self.next_token();
             alias = Some(Identifier::new(
                 self.cur_token.clone(),
                 self.cur_token.literal.clone(),

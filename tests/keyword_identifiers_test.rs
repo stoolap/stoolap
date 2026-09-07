@@ -99,6 +99,8 @@ fn test_non_reserved_keywords_name_tables_views_and_savepoints() {
             format!("CREATE TABLE {kw} (id INTEGER PRIMARY KEY, v INTEGER)"),
             format!("INSERT INTO {kw} VALUES (1, 1)"),
             format!("UPDATE {kw} SET v = 2 WHERE id = 1"),
+            format!("SELECT {kw}.id FROM {kw} AS {kw} WHERE {kw}.id = 1"),
+            format!("SELECT a.id FROM {kw} AS a JOIN {kw} AS {kw} ON a.id = {kw}.id"),
             format!("CREATE VIEW {kw}_view AS SELECT id FROM {kw}"),
             format!("DROP VIEW {kw}_view"),
             format!("DELETE FROM {kw} WHERE id = 1"),
@@ -110,6 +112,8 @@ fn test_non_reserved_keywords_name_tables_views_and_savepoints() {
             format!("SAVEPOINT {kw}"),
             format!("ROLLBACK TO SAVEPOINT {kw}"),
             format!("RELEASE SAVEPOINT {kw}"),
+            format!("SAVEPOINT {kw}"),
+            format!("RELEASE {kw}"),
             "COMMIT".to_string(),
             format!("DROP TABLE {kw}"),
         ] {
