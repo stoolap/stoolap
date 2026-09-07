@@ -265,8 +265,10 @@ impl MultiColumnIndex {
             return;
         }
 
-        // Build prefix index from row_to_key (read lock prevents concurrent inserts)
-        // Insert in sorted order for O(N+M) merge operations
+        // Build prefix index from row_to_key (read lock prevents concurrent inserts).
+        // Gather each key's row ids unsorted, then sort once: a sorted insert per
+        // row is quadratic in the rows per key.
+        let mut gathered: FxHashMap<CompositeKey, Vec<i64>> = FxHashMap::default();
         for (row_id, arc_values) in row_to_key.iter() {
             if arc_values.len() >= prefix_len {
                 // Dereference CompactArc<Value> to create CompositeKey for prefix
@@ -276,15 +278,57 @@ impl MultiColumnIndex {
                         .map(|a| (**a).clone())
                         .collect(),
                 );
-                let rows = prefix_index.entry(prefix_key).or_default();
-                if let Err(pos) = rows.binary_search(&row_id) {
-                    rows.insert(pos, row_id);
-                }
+                gathered.entry(prefix_key).or_default().push(row_id);
             }
+        }
+        for (prefix_key, mut rows) in gathered {
+            rows.sort_unstable();
+            rows.dedup();
+            prefix_index.insert(prefix_key, CompactVec::from_vec(rows));
         }
 
         // Set flag before releasing locks - subsequent inserts will see prefix_built=true
         self.prefix_built[idx].store(true, AtomicOrdering::Release);
+    }
+
+    /// The row ids of a removal batch grouped by the first `key_len` values,
+    /// each group sorted for binary search.
+    fn group_removed_by_key(
+        entries: &[(i64, &[Value])],
+        key_len: usize,
+    ) -> FxHashMap<CompositeKey, Vec<i64>> {
+        let mut grouped: FxHashMap<CompositeKey, Vec<i64>> = FxHashMap::default();
+        for &(row_id, values) in entries {
+            if values.len() >= key_len {
+                grouped
+                    .entry(CompositeKey(values[..key_len].to_vec()))
+                    .or_default()
+                    .push(row_id);
+            }
+        }
+        for ids in grouped.values_mut() {
+            ids.sort_unstable();
+        }
+        grouped
+    }
+
+    /// Remove the sorted `ids` from the sorted `rows`, touching only the rows
+    /// from the first removed id onwards: taking the newest rows off a large
+    /// group stays cheap, taking the whole group is one pass.
+    fn subtract_sorted(rows: &mut CompactVec<i64>, ids: &[i64]) {
+        let Some(&first) = ids.first() else {
+            return;
+        };
+        let start = rows.binary_search(&first).unwrap_or_else(|pos| pos);
+        let slice = rows.as_mut_slice();
+        let mut keep = start;
+        for read in start..slice.len() {
+            if ids.binary_search(&slice[read]).is_err() {
+                slice[keep] = slice[read];
+                keep += 1;
+            }
+        }
+        rows.truncate(keep);
     }
 
     /// Check uniqueness constraint (must be called while holding write lock on value_to_rows)
@@ -764,15 +808,14 @@ impl Index for MultiColumnIndex {
         drop(value_to_rows);
         drop(row_to_key);
 
-        // Only update BTree if it was built
+        // The sorted and prefix structures are subtracted one key at a time:
+        // a removal per row is quadratic in the rows per key.
         if self.btree_built.load(AtomicOrdering::Acquire) {
+            let removed = Self::group_removed_by_key(entries, self.column_ids.len());
             let mut sorted_values = self.sorted_values.write();
-            for &(row_id, values) in entries {
-                let key = CompositeKey(values.to_vec());
+            for (key, ids) in removed {
                 if let Some(rows) = sorted_values.get_mut(&key) {
-                    if let Ok(pos) = rows.binary_search(&row_id) {
-                        rows.remove(pos);
-                    }
+                    Self::subtract_sorted(rows, &ids);
                     if rows.is_empty() {
                         sorted_values.remove(&key);
                     }
@@ -780,21 +823,16 @@ impl Index for MultiColumnIndex {
             }
         }
 
-        // Only update prefix indexes if they were built
         for prefix_len in 1..self.column_ids.len() {
             let idx = prefix_len - 1;
             if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
+                let removed = Self::group_removed_by_key(entries, prefix_len);
                 let mut prefix_index = self.prefix_indexes[idx].write();
-                for &(row_id, values) in entries {
-                    if values.len() >= prefix_len {
-                        let prefix_key = CompositeKey(values[..prefix_len].to_vec());
-                        if let Some(rows) = prefix_index.get_mut(&prefix_key) {
-                            if let Ok(pos) = rows.binary_search(&row_id) {
-                                rows.remove(pos);
-                            }
-                            if rows.is_empty() {
-                                prefix_index.remove(&prefix_key);
-                            }
+                for (key, ids) in removed {
+                    if let Some(rows) = prefix_index.get_mut(&key) {
+                        Self::subtract_sorted(rows, &ids);
+                        if rows.is_empty() {
+                            prefix_index.remove(&key);
                         }
                     }
                 }
@@ -1127,6 +1165,90 @@ mod tests {
         index.remove(&[Value::Integer(1)], 100, 0).unwrap();
         let results = index.find(&[Value::Integer(1)]).unwrap();
         assert_eq!(results.len(), 0);
+    }
+
+    /// Building the prefix index and removing a batch stay linear in the rows
+    /// per key. Left out of the default nextest profile as a timing test.
+    #[test]
+    fn test_prefix_build_and_batch_removal_scale() {
+        let index = MultiColumnIndex::new(
+            "scale_idx".to_string(),
+            "scale_table".to_string(),
+            vec!["k".to_string(), "t".to_string()],
+            vec![0, 1],
+            vec![DataType::Integer, DataType::Integer],
+            true,
+            0,
+        );
+        let per_key = 400_000i64;
+        let mut all: Vec<(i64, Vec<Value>)> = Vec::new();
+        for k in 0..1 {
+            for t in 0..per_key {
+                let row_id = k * per_key + t;
+                let values = vec![Value::Integer(k), Value::Integer(t)];
+                index.add(&values, row_id, 0).unwrap();
+                all.push((row_id, values));
+            }
+        }
+
+        let start = std::time::Instant::now();
+        let hits = index.find(&[Value::Integer(0)]).unwrap();
+        assert!(
+            start.elapsed().as_secs() < 3,
+            "prefix build took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(hits.len(), per_key as usize);
+        assert!(hits.windows(2).all(|w| w[0].row_id < w[1].row_id));
+
+        // Taking the newest two rows off the group leaves the rest untouched
+        let newest: Vec<(i64, &[Value])> = all[all.len() - 2..]
+            .iter()
+            .map(|(row_id, values)| (*row_id, values.as_slice()))
+            .collect();
+        index.remove_batch_slice(&newest).unwrap();
+        let hits = index.find(&[Value::Integer(0)]).unwrap();
+        assert_eq!(hits.len(), per_key as usize - 2);
+        assert_eq!(hits.last().map(|h| h.row_id), Some(per_key - 3));
+        all.truncate(all.len() - 2);
+
+        // Range use builds the sorted structure too
+        assert_eq!(
+            index
+                .find_range(
+                    &[Value::Integer(0), Value::Integer(0)],
+                    &[Value::Integer(0), Value::Integer(9)],
+                    true,
+                    true
+                )
+                .unwrap()
+                .len(),
+            10
+        );
+
+        let half: Vec<(i64, &[Value])> = all
+            .iter()
+            .filter(|(row_id, _)| row_id % 2 == 0)
+            .map(|(row_id, values)| (*row_id, values.as_slice()))
+            .collect();
+        let start = std::time::Instant::now();
+        index.remove_batch_slice(&half).unwrap();
+        assert!(
+            start.elapsed().as_secs() < 3,
+            "batch removal took {:?}",
+            start.elapsed()
+        );
+        let hits = index.find(&[Value::Integer(0)]).unwrap();
+        assert_eq!(hits.len(), all.len() - half.len());
+        assert!(hits.iter().all(|h| h.row_id % 2 == 1));
+
+        let rest: Vec<(i64, &[Value])> = all
+            .iter()
+            .filter(|(row_id, _)| row_id % 2 == 1)
+            .map(|(row_id, values)| (*row_id, values.as_slice()))
+            .collect();
+        index.remove_batch_slice(&rest).unwrap();
+        assert!(index.find(&[Value::Integer(0)]).unwrap().is_empty());
     }
 
     #[test]
