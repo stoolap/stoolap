@@ -67,13 +67,18 @@ SELECT CONCAT_WS('-', city, state, zip) AS address FROM customers;
 Note: NULL values are skipped.
 
 ### TRIM / LTRIM / RTRIM
-Removes whitespace from strings.
+Removes whitespace, or the characters given as the optional second argument, from strings.
 
 ```sql
 SELECT TRIM('  hello  ');                  -- Returns 'hello'
 SELECT LTRIM('  hello');                   -- Returns 'hello'
 SELECT RTRIM('hello  ');                   -- Returns 'hello'
+SELECT TRIM('xxhelloxx', 'x');             -- Returns 'hello'
+SELECT LTRIM('--hello', '-');              -- Returns 'hello'
+SELECT RTRIM('hello!!', '!');              -- Returns 'hello'
 ```
+
+The SQL-standard `TRIM(LEADING | TRAILING | BOTH chars FROM str)` form is not supported.
 
 ### LPAD / RPAD
 Pads a string to a specified length.
