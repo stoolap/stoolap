@@ -711,44 +711,55 @@ impl SegmentedTable {
                             None
                         };
                         match op {
+                            // A search that hits a block it cannot decode
+                            // leaves the range as it is: the scan then reaches
+                            // the block and reports the error
                             crate::core::Operator::Gte => {
                                 let idx = if let Some(st) = store {
                                     st.binary_search_ge(col_idx, target, &vol.meta.row_groups)
                                 } else {
-                                    vol.columns[col_idx].binary_search_ge(target)
+                                    Some(vol.columns[col_idx].binary_search_ge(target))
                                 };
-                                if idx > start {
-                                    start = idx;
+                                if let Some(idx) = idx {
+                                    if idx > start {
+                                        start = idx;
+                                    }
                                 }
                             }
                             crate::core::Operator::Gt => {
                                 let idx = if let Some(st) = store {
                                     st.binary_search_gt(col_idx, target, &vol.meta.row_groups)
                                 } else {
-                                    vol.columns[col_idx].binary_search_gt(target)
+                                    Some(vol.columns[col_idx].binary_search_gt(target))
                                 };
-                                if idx > start {
-                                    start = idx;
+                                if let Some(idx) = idx {
+                                    if idx > start {
+                                        start = idx;
+                                    }
                                 }
                             }
                             crate::core::Operator::Lte => {
                                 let idx = if let Some(st) = store {
                                     st.binary_search_gt(col_idx, target, &vol.meta.row_groups)
                                 } else {
-                                    vol.columns[col_idx].binary_search_gt(target)
+                                    Some(vol.columns[col_idx].binary_search_gt(target))
                                 };
-                                if idx < end {
-                                    end = idx;
+                                if let Some(idx) = idx {
+                                    if idx < end {
+                                        end = idx;
+                                    }
                                 }
                             }
                             crate::core::Operator::Lt => {
                                 let idx = if let Some(st) = store {
                                     st.binary_search_ge(col_idx, target, &vol.meta.row_groups)
                                 } else {
-                                    vol.columns[col_idx].binary_search_ge(target)
+                                    Some(vol.columns[col_idx].binary_search_ge(target))
                                 };
-                                if idx < end {
-                                    end = idx;
+                                if let Some(idx) = idx {
+                                    if idx < end {
+                                        end = idx;
+                                    }
                                 }
                             }
                             _ => {}
@@ -3991,7 +4002,8 @@ impl Table for SegmentedTable {
                 break;
             }
             let (seg_id, cs) = &volumes[i];
-            let (should_skip, _, _) = Self::prune_volume(&cs.volume, &comparisons, &bloom_hashes);
+            let (should_skip, mut narrow_start, mut narrow_end) =
+                Self::prune_volume(&cs.volume, &comparisons, &bloom_hashes);
             if should_skip {
                 continue;
             }
@@ -4001,14 +4013,14 @@ impl Table for SegmentedTable {
                     Some(v) => v,
                     None => continue,
                 };
+                // Only a loaded volume can narrow the range through the sorted
+                // columns' binary search; a warm one already did above
+                (_, narrow_start, narrow_end) =
+                    Self::prune_volume(&loaded, &comparisons, &bloom_hashes);
                 &loaded
             } else {
                 &cs.volume
             };
-            // On a loaded volume the prune also narrows the range through the
-            // sorted columns' binary search
-            let (_, narrow_start, narrow_end) =
-                Self::prune_volume(vol, &comparisons, &bloom_hashes);
             let sorted = vol.is_sorted(vcol);
             // Row groups in bound order, clipped to the narrowed range; a
             // volume without group metadata is one group

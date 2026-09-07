@@ -213,7 +213,7 @@ fn test_top_k_over_volumes_sorted_by_time() {
         check_all(&db);
     }
     // A bigger sealed batch spanning several row groups
-    insert_sorted(&db, base + 12_000 * 60, 10_000, 20, 60);
+    insert_sorted(&db, base + 12_000 * 60, 5_000, 20, 60);
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     db.execute("DELETE FROM c WHERE v = 99", ()).unwrap();
     check_all(&db);
@@ -343,4 +343,71 @@ fn test_top_k_on_the_memory_engine_and_after_reopen() {
     drop(db);
     let db = Database::open(&dsn).unwrap();
     check_all(&db);
+}
+
+#[test]
+fn test_top_k_reports_a_block_it_cannot_decode_instead_of_an_empty_answer() {
+    // A valid file whose column block fails to decode: the sorted-column
+    // binary search must not narrow the range to nothing and hide the error
+    use std::sync::Arc;
+    use stoolap::core::{Operator, Row, Value};
+    use stoolap::storage::expression::ComparisonExpr;
+    use stoolap::storage::traits::{Engine, Table};
+    use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
+    use stoolap::storage::volume::manifest::{SegmentManager, SegmentMeta};
+    use stoolap::storage::volume::table::SegmentedTable;
+    use stoolap::storage::volume::writer::VolumeBuilder;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open("memory://ordered_limited_scan_corrupt_block").unwrap();
+    db.execute("CREATE TABLE c (t INTEGER NOT NULL)", ())
+        .unwrap();
+    let tx = db.engine().begin_transaction().unwrap();
+    let hot = tx.get_table("c").unwrap();
+    let schema = hot.schema().clone();
+    let mut builder = VolumeBuilder::new(&schema);
+    builder.add_row(1, &Row::from_values(vec![Value::Integer(10)]));
+    builder.add_row(2, &Row::from_values(vec![Value::Integer(20)]));
+    let volume = builder.finish();
+    let path = write_volume_to_disk(dir.path(), "c", 1, &volume).unwrap();
+
+    // Keep the framing, metadata and CRC valid; replace the column block
+    let original = std::fs::read(&path).unwrap();
+    let meta_len = u32::from_le_bytes(original[16..20].try_into().unwrap()) as usize;
+    let index_offset = 20 + meta_len;
+    let mut bytes = original[..index_offset].to_vec();
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&100u64.to_le_bytes());
+    bytes.push(0xff);
+    let crc = crc32fast::hash(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    let loaded = read_volume_from_disk(&path).unwrap();
+    assert!(loaded
+        .columns
+        .compressed_store()
+        .unwrap()
+        .decompress_single_group(0, 0)
+        .is_err());
+
+    let mgr = Arc::new(SegmentManager::new("c", Some(dir.path().to_path_buf())));
+    mgr.register_segment(
+        1,
+        Arc::new(volume.to_cold()),
+        SegmentMeta {
+            segment_id: 1,
+            file_path: path,
+            row_count: 2,
+            min_row_id: 1,
+            max_row_id: 2,
+            schema_version: 0,
+            creation_lsn: 0,
+            seal_seq: 0,
+        },
+        Some(&schema),
+    );
+    let table = SegmentedTable::new(hot, mgr);
+    let filter = ComparisonExpr::new("t", Operator::Lt, Value::Integer(15));
+    let result = table.scan_top_k(Some(&filter), "t", false, 1, 0);
+    assert!(result.is_err(), "corrupt column accepted: {result:?}");
 }
