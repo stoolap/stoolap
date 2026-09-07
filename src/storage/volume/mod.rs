@@ -59,6 +59,7 @@
 
 pub mod column;
 pub mod format;
+pub mod group_cache;
 pub mod io;
 pub mod manifest;
 pub mod scanner;
