@@ -511,6 +511,16 @@ impl ColumnData {
 
     /// Get the dictionary ID for a row. Returns u32::MAX on type mismatch.
     #[inline]
+    /// The bytes this column owns on its own: like `memory_size` but without
+    /// the dictionary strings, which every group of a column shares through
+    /// one Arc and which a cache must therefore count once, not per group
+    pub fn cache_size(&self) -> usize {
+        match self {
+            ColumnData::Dictionary { ids, nulls, .. } => ids.len() * 4 + nulls.len(),
+            other => other.memory_size(),
+        }
+    }
+
     /// The per-row dictionary ids and null flags of a dictionary column, for
     /// callers that test many rows in one pass
     pub fn dict_ids(&self) -> Option<(&[u32], &[bool])> {

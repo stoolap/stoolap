@@ -135,3 +135,150 @@ fn test_cache_budget_bounds_the_bytes_and_zero_disables_it() {
     db.execute("PRAGMA GROUP_CACHE_MB = 64", ()).unwrap();
     assert_eq!(ids(&db, "PRAGMA GROUP_CACHE_MB"), [64]);
 }
+
+// The cache's own invariants, exercised through its API: one decode shared
+// by concurrent readers, no phantom bytes after an in-flight eviction, a
+// budget change during a decode, a column larger than the budget, and a
+// dictionary shared by the groups of one column counted once.
+
+mod invariants {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Barrier};
+    use std::time::Duration;
+    use stoolap::core::DataType;
+    use stoolap::storage::volume::column::ColumnData;
+    use stoolap::storage::volume::group_cache::DECODED_GROUPS;
+
+    fn ints(rows: usize) -> ColumnData {
+        ColumnData::Int64 {
+            values: vec![1; rows],
+            nulls: vec![false; rows],
+        }
+    }
+
+    #[test]
+    fn concurrent_readers_share_one_decode() {
+        DECODED_GROUPS.set_budget_bytes(1024);
+        let starts = Arc::new(Barrier::new(16));
+        let decodes = Arc::new(AtomicUsize::new(0));
+        let workers: Vec<_> = (0..16)
+            .map(|_| {
+                let starts = Arc::clone(&starts);
+                let decodes = Arc::clone(&decodes);
+                std::thread::spawn(move || {
+                    starts.wait();
+                    DECODED_GROUPS
+                        .get_or_decode((600, 0, 0), || {
+                            decodes.fetch_add(1, Ordering::SeqCst);
+                            Ok(ints(1))
+                        })
+                        .unwrap()
+                })
+            })
+            .collect();
+        let columns: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+        assert_eq!(decodes.load(Ordering::SeqCst), 1);
+        assert!(columns.iter().all(|c| Arc::ptr_eq(&columns[0], c)));
+        DECODED_GROUPS.remove_store(600);
+        assert_eq!(DECODED_GROUPS.stats().bytes, 0);
+    }
+
+    #[test]
+    fn an_entry_evicted_while_decoding_leaves_no_phantom_bytes() {
+        DECODED_GROUPS.set_budget_bytes(18);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            DECODED_GROUPS
+                .get_or_decode((100, 0, 0), || {
+                    entered_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    Ok(ints(1))
+                })
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        DECODED_GROUPS
+            .get_or_decode((200, 0, 0), || Ok(ints(2)))
+            .unwrap();
+        DECODED_GROUPS
+            .get_or_decode((300, 0, 0), || Ok(ints(2)))
+            .unwrap();
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap();
+        for store in [100, 200, 300] {
+            DECODED_GROUPS.remove_store(store);
+        }
+        let stats = DECODED_GROUPS.stats();
+        assert_eq!((stats.bytes, stats.entries), (0, 0));
+    }
+
+    #[test]
+    fn a_budget_of_zero_set_during_a_decode_leaves_the_cache_empty() {
+        DECODED_GROUPS.set_budget_bytes(18);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            DECODED_GROUPS
+                .get_or_decode((400, 0, 0), || {
+                    entered_tx.send(()).unwrap();
+                    resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    Ok(ints(1))
+                })
+                .unwrap();
+        });
+        entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        DECODED_GROUPS.set_budget_bytes(0);
+        resume_tx.send(()).unwrap();
+        worker.join().unwrap();
+        let stats = DECODED_GROUPS.stats();
+        assert_eq!((stats.budget_bytes, stats.bytes, stats.entries), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_column_larger_than_the_budget_is_not_kept() {
+        DECODED_GROUPS.set_budget_bytes(1024 * 1024);
+        DECODED_GROUPS
+            .get_or_decode((500, 0, 0), || {
+                Ok(ColumnData::Bytes {
+                    data: vec![b'x'; 8 * 1024 * 1024],
+                    offsets: vec![(0, 8 * 1024 * 1024)],
+                    ext_type: DataType::Json,
+                    nulls: vec![false],
+                })
+            })
+            .unwrap();
+        let stats = DECODED_GROUPS.stats();
+        assert!(
+            stats.bytes <= stats.budget_bytes,
+            "kept {} bytes",
+            stats.bytes
+        );
+        assert_eq!(stats.entries, 0);
+    }
+
+    #[test]
+    fn a_dictionary_shared_by_the_groups_is_counted_once() {
+        use stoolap::common::SmartString;
+        use stoolap::storage::volume::column::ROW_GROUP_SIZE;
+        use stoolap::storage::volume::writer::{CompressedBlockStore, LazyColumns};
+        let rows = 2 * ROW_GROUP_SIZE;
+        let dictionary: Arc<[SmartString]> = (0..10_000)
+            .map(|i| SmartString::from(format!("{i:010}{}", "x".repeat(90))))
+            .collect::<Vec<_>>()
+            .into();
+        let column = ColumnData::Dictionary {
+            ids: (0..rows).map(|i| (i % 10_000) as u32).collect(),
+            nulls: vec![false; rows],
+            dictionary,
+        };
+        assert!(column.memory_size() < 2 * 1024 * 1024);
+        let columns = LazyColumns::eager(vec![column], vec![DataType::Text]);
+        let store = CompressedBlockStore::compress_columns(&columns, &[DataType::Text], rows);
+        DECODED_GROUPS.set_budget_bytes(2 * 1024 * 1024);
+        let first = store.group_column(0, 0).unwrap();
+        let _second = store.group_column(0, 1).unwrap();
+        let again = store.group_column(0, 0).unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "the first group was evicted");
+    }
+}

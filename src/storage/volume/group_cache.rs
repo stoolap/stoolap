@@ -122,7 +122,7 @@ impl DecodedGroupCache {
         match outcome {
             Ok(column) => {
                 if !slot.charged.swap(true, Ordering::AcqRel) {
-                    self.charge(key, column.memory_size(), budget);
+                    self.charge(key, &slot, column.cache_size());
                 }
                 Ok(Arc::clone(column))
             }
@@ -134,14 +134,29 @@ impl DecodedGroupCache {
         }
     }
 
-    /// Account a decoded entry and make room for it
-    fn charge(&self, key: GroupKey, bytes: usize, budget: usize) {
+    /// Account a decoded entry and make room for it. The entry may have been
+    /// evicted while it decoded, the budget may have moved, or the column may
+    /// not fit at all: in each case the caller keeps its column and the cache
+    /// keeps nothing.
+    fn charge(&self, key: GroupKey, slot: &Arc<Slot>, bytes: usize) {
+        let budget = self.budget.load(Ordering::Relaxed);
         let mut inner = self.lock();
+        let still_ours = inner
+            .entries
+            .get(&key)
+            .is_some_and(|entry| Arc::ptr_eq(&entry.slot, slot));
+        if !still_ours {
+            return;
+        }
+        if budget == 0 || bytes > budget {
+            inner.entries.remove(&key);
+            return;
+        }
         if let Some(entry) = inner.entries.get_mut(&key) {
             entry.bytes = bytes;
         }
         inner.bytes += bytes;
-        while inner.bytes > budget && inner.entries.len() > 1 {
+        while inner.bytes > budget {
             let victim = inner
                 .entries
                 .iter()
