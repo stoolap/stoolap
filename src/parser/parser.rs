@@ -99,6 +99,7 @@ static RESERVED_KEYWORDS: LazyLock<FxHashSet<&'static str>> = LazyLock::new(|| {
         "IF",
         "WITH",
         "RECURSIVE",
+        "DEFAULT",
     ]
     .into_iter()
     .collect()
