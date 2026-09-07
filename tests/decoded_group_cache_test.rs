@@ -281,4 +281,40 @@ mod invariants {
         let again = store.group_column(0, 0).unwrap();
         assert!(Arc::ptr_eq(&first, &again), "the first group was evicted");
     }
+
+    #[test]
+    fn a_zero_budget_racing_with_a_charge_leaves_nothing_behind() {
+        const READERS: usize = 8;
+        const ROUNDS: usize = 20_000;
+        let barrier = Barrier::new(READERS + 1);
+        let mut failure = None;
+        std::thread::scope(|scope| {
+            for worker in 0..READERS {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    for _ in 0..ROUNDS {
+                        barrier.wait();
+                        DECODED_GROUPS
+                            .get_or_decode((10_000 + worker, 0, 0), || Ok(ints(1)))
+                            .unwrap();
+                        barrier.wait();
+                    }
+                });
+            }
+            for round in 0..ROUNDS {
+                DECODED_GROUPS.set_budget_bytes(1024);
+                barrier.wait();
+                DECODED_GROUPS.set_budget_bytes(0);
+                barrier.wait();
+                let stats = DECODED_GROUPS.stats();
+                if stats.bytes != 0 || stats.entries != 0 {
+                    failure.get_or_insert((round, stats.bytes, stats.entries));
+                }
+            }
+        });
+        assert_eq!(
+            failure, None,
+            "a zero budget left data behind (round, bytes, entries)"
+        );
+    }
 }

@@ -139,8 +139,10 @@ impl DecodedGroupCache {
     /// not fit at all: in each case the caller keeps its column and the cache
     /// keeps nothing.
     fn charge(&self, key: GroupKey, slot: &Arc<Slot>, bytes: usize) {
-        let budget = self.budget.load(Ordering::Relaxed);
+        // The budget is read under the same lock that set_budget_bytes holds
+        // while it stores it, so a change cannot slip in between
         let mut inner = self.lock();
+        let budget = self.budget.load(Ordering::Relaxed);
         let still_ours = inner
             .entries
             .get(&key)
@@ -196,8 +198,8 @@ impl DecodedGroupCache {
 
     /// Set the budget; entries beyond it leave at once
     pub fn set_budget_bytes(&self, budget: usize) {
-        self.budget.store(budget, Ordering::Relaxed);
         let mut inner = self.lock();
+        self.budget.store(budget, Ordering::Relaxed);
         while inner.bytes > budget && !inner.entries.is_empty() {
             let victim = inner
                 .entries
