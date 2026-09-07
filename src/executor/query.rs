@@ -2687,6 +2687,29 @@ impl Executor {
             }
         }
 
+        // FAST PATH: ORDER BY one column + LIMIT answered by the table's top-k
+        // scan with the pushed-down WHERE, so only the rows near the bound are read
+        if classification.has_limit
+            && stmt.order_by.len() == 1
+            && stmt.distinct_on.is_empty()
+            && !classification.has_group_by
+            && !classification.has_aggregation
+            && !classification.has_window_functions
+            && !classification.has_distinct
+            && !needs_memory_filter
+        {
+            if let Some((result, columns)) = self.try_top_k_scan_optimization(
+                stmt,
+                &*table,
+                storage_expr.as_deref(),
+                &all_columns,
+                table_alias.as_deref(),
+                ctx,
+            )? {
+                return Ok((result, columns, true, None));
+            }
+        }
+
         // FAST PATH: Vector search optimization (HNSW index or parallel brute-force)
         // For queries like `SELECT id, VEC_DISTANCE_L2(embedding, '...') AS dist
         //   FROM documents ORDER BY dist LIMIT 10`

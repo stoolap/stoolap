@@ -279,6 +279,76 @@ impl Executor {
         Ok(None)
     }
 
+    /// ORDER BY one column + LIMIT answered by the table's own top-k scan,
+    /// with the pushed-down WHERE. The table returns None when it cannot find
+    /// the rows without a full sort.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn try_top_k_scan_optimization(
+        &self,
+        stmt: &SelectStatement,
+        table: &dyn Table,
+        storage_expr: Option<&dyn crate::storage::expression::Expression>,
+        all_columns: &[String],
+        table_alias: Option<&str>,
+        ctx: &ExecutionContext,
+    ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
+        let order_by = &stmt.order_by[0];
+        let column_name = match &order_by.expression {
+            Expression::Identifier(id) => id.value.clone(),
+            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
+            _ => return Ok(None),
+        };
+        // The name may be a select-list alias for another expression; only a
+        // bare column under that alias still orders by the table column
+        for item in &stmt.columns {
+            if let Expression::Aliased(aliased) = item {
+                if aliased.alias.value.eq_ignore_ascii_case(&column_name) {
+                    let same_column = match &*aliased.expression {
+                        Expression::Identifier(id) => id.value.eq_ignore_ascii_case(&column_name),
+                        Expression::QualifiedIdentifier(qid) => {
+                            qid.name.value.eq_ignore_ascii_case(&column_name)
+                        }
+                        _ => false,
+                    };
+                    if !same_column {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        let ascending = order_by.ascending;
+
+        let limit = match stmt.limit.as_ref().and_then(|e| {
+            ExpressionEval::compile(e, &[])
+                .ok()
+                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
+        }) {
+            Some(Value::Integer(l)) if l >= 0 => l as usize,
+            _ => return Ok(None),
+        };
+        let offset = match stmt.offset.as_ref().and_then(|e| {
+            ExpressionEval::compile(e, &[])
+                .ok()
+                .and_then(|e| e.with_context(ctx).eval_slice(&Row::new()).ok())
+        }) {
+            Some(Value::Integer(o)) if o >= 0 => o as usize,
+            Some(_) => return Ok(None),
+            None => 0,
+        };
+
+        let Some(rows) = table.scan_top_k(storage_expr, &column_name, ascending, limit, offset)?
+        else {
+            return Ok(None);
+        };
+        let projected_rows =
+            self.project_rows_with_alias(&stmt.columns, rows, all_columns, None, ctx, table_alias)?;
+        let output_columns =
+            CompactArc::new(self.get_output_column_names(&stmt.columns, all_columns, table_alias));
+        let result =
+            ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
+        Ok(Some((Box::new(result), output_columns)))
+    }
+
     /// Keyset pagination optimization for PRIMARY KEY columns
     ///
     /// For queries like `SELECT * FROM table WHERE id > X ORDER BY id LIMIT Y`,

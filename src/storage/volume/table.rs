@@ -40,6 +40,115 @@ use super::manifest::SegmentManager;
 use super::scanner::{RowVecScanner, VolumeScanner};
 use super::writer::FrozenVolume;
 
+/// One row held by [`TopK`]: ordered so that the worst row of the k is the
+/// greatest, which puts it on top of a max-heap.
+struct Ranked {
+    key: Value,
+    row_id: i64,
+    row: Row,
+    ascending: bool,
+}
+
+impl Ranked {
+    fn beats(&self, other: &Self) -> std::cmp::Ordering {
+        if self.ascending {
+            self.key
+                .cmp(&other.key)
+                .then(self.row_id.cmp(&other.row_id))
+        } else {
+            other
+                .key
+                .cmp(&self.key)
+                .then(other.row_id.cmp(&self.row_id))
+        }
+    }
+}
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.beats(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for Ranked {}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.beats(other)
+    }
+}
+
+/// The best `k` rows seen so far by one column, ties broken by row id
+/// (the newest row first on DESC, the oldest first on ASC).
+struct TopK {
+    k: usize,
+    col: usize,
+    ascending: bool,
+    heap: std::collections::BinaryHeap<Ranked>,
+}
+
+impl TopK {
+    fn new(k: usize, col: usize, ascending: bool) -> Self {
+        Self {
+            k,
+            col,
+            ascending,
+            heap: std::collections::BinaryHeap::with_capacity(k.saturating_add(1).min(4096)),
+        }
+    }
+
+    fn offer(&mut self, row_id: i64, row: Row) {
+        let Some(key) = row.get(self.col).cloned() else {
+            return;
+        };
+        if key.is_null() {
+            return;
+        }
+        let candidate = Ranked {
+            key,
+            row_id,
+            row,
+            ascending: self.ascending,
+        };
+        if self.heap.len() < self.k {
+            self.heap.push(candidate);
+        } else if let Some(worst) = self.heap.peek() {
+            if candidate.cmp(worst) == std::cmp::Ordering::Less {
+                self.heap.pop();
+                self.heap.push(candidate);
+            }
+        }
+    }
+
+    /// True once k rows are held and no row bounded by `bound` can beat the worst
+    fn cannot_improve(&self, bound: &Value) -> bool {
+        if self.heap.len() < self.k {
+            return false;
+        }
+        match self.heap.peek() {
+            Some(worst) if self.ascending => bound.cmp(&worst.key) == std::cmp::Ordering::Greater,
+            Some(worst) => bound.cmp(&worst.key) == std::cmp::Ordering::Less,
+            None => false,
+        }
+    }
+
+    /// The rows in order, the first `offset` dropped
+    fn into_rows(self, offset: usize) -> RowVec {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .skip(offset)
+            .map(|r| (r.row_id, r.row))
+            .collect()
+    }
+}
+
 /// A table backed by immutable segments (historical) + an MVCCTable (hot buffer).
 ///
 /// The executor sees a single Table interface. Reads merge across all sources.
@@ -3779,6 +3888,176 @@ impl Table for SegmentedTable {
     }
 
     // =========================================================================
+    /// Top-k in the order of one NOT NULL column: the hot rows first, then the
+    /// volumes and their row groups in the order of their zone-map bound on
+    /// that column, stopping as soon as a bound can no longer beat the k rows
+    /// held. Volumes past the bound are never opened, so the old ones stay
+    /// warm.
+    fn scan_top_k(
+        &self,
+        where_expr: Option<&dyn Expression>,
+        column_name: &str,
+        ascending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<RowVec>> {
+        // Without volumes the hot store's own index paths answer faster
+        if self.snapshot_seq.is_some() || !self.segment_mgr.has_segments() {
+            return Ok(None);
+        }
+        let needed = limit.saturating_add(offset);
+        if needed == 0 {
+            return Ok(Some(RowVec::new()));
+        }
+        let schema = self.hot.schema();
+        let col_lower = column_name.to_lowercase();
+        let Some(col_idx) = schema
+            .columns
+            .iter()
+            .position(|c| c.name_lower == col_lower)
+        else {
+            return Ok(None);
+        };
+        // A float column may hold NaN, which the zone maps leave out but the
+        // sort puts last, so a volume's finite bound is not a bound at all
+        if schema.columns[col_idx].nullable || schema.columns[col_idx].data_type == DataType::Float
+        {
+            return Ok(None);
+        }
+
+        let hot_rows = self.hot.collect_all_rows(where_expr)?;
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
+        let mut keep = TopK::new(needed, col_idx, ascending);
+        for (row_id, row) in hot_rows {
+            hot_skip.insert(row_id);
+            keep.offer(row_id, row);
+        }
+        // Cold rows this transaction deleted or updated are not in the volumes'
+        // committed tombstones yet
+        self.segment_mgr
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+
+        let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
+        // Every volume must carry the column and a zone map without NULLs
+        let mut ordered: Vec<(usize, usize, Value)> = Vec::with_capacity(volumes.len());
+        for (i, (_, cs)) in volumes.iter().enumerate() {
+            let vol = &cs.volume;
+            let Some(vcol) = vol.column_index(&col_lower) else {
+                return Ok(None);
+            };
+            let Some(zm) = vol.meta.zone_maps.get(vcol) else {
+                return Ok(None);
+            };
+            if zm.null_count > 0 {
+                return Ok(None);
+            }
+            let bound = if ascending {
+                zm.min.clone()
+            } else {
+                zm.max.clone()
+            };
+            ordered.push((i, vcol, bound));
+        }
+        if ascending {
+            ordered.sort_by(|a, b| a.2.cmp(&b.2));
+        } else {
+            ordered.sort_by(|a, b| b.2.cmp(&a.2));
+        }
+
+        let comparisons = where_expr
+            .map(|e| e.collect_comparisons())
+            .unwrap_or_default();
+        let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
+        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+        let hot_skip_arc = Arc::new(hot_skip);
+        let current_schema = self.hot.schema();
+        let prepared_filter = where_expr.map(|expr| {
+            let mut filter = expr.with_aliases(&Default::default());
+            filter.prepare_for_schema(current_schema);
+            filter
+        });
+
+        for (i, vcol, bound) in ordered {
+            if keep.cannot_improve(&bound) {
+                break;
+            }
+            let (seg_id, cs) = &volumes[i];
+            let (should_skip, _, _) = Self::prune_volume(&cs.volume, &comparisons, &bloom_hashes);
+            if should_skip {
+                continue;
+            }
+            let loaded;
+            let vol: &Arc<FrozenVolume> = if cs.volume.is_cold() {
+                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
+                    Some(v) => v,
+                    None => continue,
+                };
+                &loaded
+            } else {
+                &cs.volume
+            };
+            // Row groups in bound order; a volume without group metadata is one group
+            let mut groups: Vec<(usize, usize, Option<&Value>)> = vol
+                .meta
+                .row_groups
+                .iter()
+                .map(|rg| {
+                    let bound =
+                        rg.zone_maps
+                            .get(vcol)
+                            .map(|zm| if ascending { &zm.min } else { &zm.max });
+                    (rg.start_idx as usize, rg.end_idx as usize, bound)
+                })
+                .collect();
+            if groups.is_empty() {
+                groups.push((0, vol.meta.row_count, None));
+            }
+            // Bound order, not physical order: a volume written out of time order
+            // has its best group anywhere. A group without a bound goes first.
+            groups.sort_by(|a, b| match (&a.2, &b.2) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(x), Some(y)) => {
+                    if ascending {
+                        x.cmp(y)
+                    } else {
+                        y.cmp(x)
+                    }
+                }
+            });
+
+            for (start, end, group_bound) in groups {
+                if let Some(bound) = group_bound {
+                    if keep.cannot_improve(bound) {
+                        break;
+                    }
+                }
+                let mut scanner =
+                    VolumeScanner::with_range(Arc::clone(vol), Vec::new(), start, end, None);
+                scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
+                scanner.set_visibility_bitmap(cs.visible.clone());
+                scanner.snapshot_seq = self.snapshot_seq;
+                scanner.set_column_mapping(
+                    self.segment_mgr.get_volume_mapping(*seg_id, current_schema),
+                );
+                if let Some(filter) = &prepared_filter {
+                    scanner.set_filter(filter.clone_box());
+                }
+                while scanner.next() {
+                    let (row_id, row) = scanner.take_row_with_id();
+                    keep.offer(row_id, row);
+                }
+                if let Some(e) = scanner.err() {
+                    return Err(crate::core::Error::internal(format!("scan error: {}", e)));
+                }
+            }
+        }
+
+        Ok(Some(keep.into_rows(offset)))
+    }
+
     // Index operations
     // =========================================================================
 

@@ -913,6 +913,22 @@ pub trait Table: Send + Sync {
         None // Default implementation - override in concrete tables
     }
 
+    /// The first `limit` rows after `offset` in the order of `column_name`,
+    /// with `where_expr` applied, from a table that can find them without
+    /// reading every row. None when the table cannot answer in that order
+    /// and the caller must sort a full scan.
+    fn scan_top_k(
+        &self,
+        where_expr: Option<&dyn Expression>,
+        column_name: &str,
+        ascending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<RowVec>> {
+        let _ = (where_expr, column_name, ascending, limit, offset);
+        Ok(None)
+    }
+
     /// Keyset pagination optimization for PRIMARY KEY columns
     ///
     /// For queries like `WHERE id > X ORDER BY id LIMIT Y`, this uses the PK's
