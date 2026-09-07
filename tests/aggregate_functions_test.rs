@@ -192,12 +192,12 @@ fn test_stddev_pop() {
 fn test_stddev_alias() {
     let db = setup_numbers_db("stddev_alias");
 
-    // STDDEV should be alias for STDDEV_POP
+    // STDDEV is an alias for STDDEV_SAMP (PostgreSQL semantics)
     let stddev: f64 = db
         .query_one("SELECT STDDEV(value) FROM numbers WHERE category = 'A'", ())
         .unwrap();
 
-    assert!((stddev - 2.0).abs() < 0.0001);
+    assert!((stddev - 2.138).abs() < 0.01);
 }
 
 #[test]
@@ -270,7 +270,7 @@ fn test_var_pop() {
 fn test_variance_alias() {
     let db = setup_numbers_db("variance_alias");
 
-    // VARIANCE should be alias for VAR_POP
+    // VARIANCE is an alias for VAR_SAMP (PostgreSQL semantics)
     let var: f64 = db
         .query_one(
             "SELECT VARIANCE(value) FROM numbers WHERE category = 'A'",
@@ -278,7 +278,7 @@ fn test_variance_alias() {
         )
         .unwrap();
 
-    assert!((var - 4.0).abs() < 0.0001);
+    assert!((var - 4.571).abs() < 0.01);
 }
 
 #[test]
@@ -365,7 +365,7 @@ fn test_multiple_aggregates_in_query() {
 
     let result = db
         .query(
-            "SELECT AVG(value), STDDEV_POP(value), VARIANCE(value), MEDIAN(value)
+            "SELECT AVG(value), STDDEV_POP(value), VAR_POP(value), MEDIAN(value)
          FROM numbers WHERE category = 'A'",
             (),
         )
