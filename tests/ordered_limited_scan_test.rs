@@ -229,14 +229,25 @@ fn test_top_k_keeps_the_select_list_alias_and_qualified_star() {
     insert_batch(&db, &mut rng, 20_000, 1_709_251_200, 30 * 86400, 20);
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
 
-    // ORDER BY names the alias of -v, not the column v
-    let min_v = ids(&db, "SELECT MIN(v) FROM c WHERE v > 0")[0];
+    // ORDER BY names the alias of -n, not the sealed NOT NULL column n
+    db.execute(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO a VALUES (1, 1), (2, 2), (3, 3)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     assert_eq!(
         ids(
             &db,
-            "SELECT -v AS v FROM c WHERE v > 0 ORDER BY v DESC LIMIT 1"
+            "SELECT -n AS n FROM a WHERE n > 0 ORDER BY n DESC LIMIT 1"
         ),
-        [-min_v]
+        [-1]
+    );
+    assert_eq!(
+        ids(&db, "SELECT -n AS n FROM a ORDER BY n ASC LIMIT 2"),
+        [-3, -2]
     );
 
     // A qualified star keeps every column
