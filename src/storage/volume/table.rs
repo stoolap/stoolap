@@ -3920,9 +3920,17 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
-        // Without volumes the hot store's own index paths answer faster
-        if self.snapshot_seq.is_some() || !self.segment_mgr.has_segments() {
+        if self.snapshot_seq.is_some() {
             return Ok(None);
+        }
+        // Without volumes the hot store answers alone, from its index or not
+        // at all. No seal fence here: a seal registers its volume before it
+        // removes a hot row, so a table seen without volumes still has every
+        // row hot, and a query must not wait out a seal.
+        if !self.segment_mgr.has_segments() {
+            return self
+                .hot
+                .scan_top_k(where_expr, column_name, ascending, limit, offset);
         }
         let needed = limit.saturating_add(offset);
         if needed == 0 {
@@ -3944,7 +3952,17 @@ impl Table for SegmentedTable {
             return Ok(None);
         }
 
-        let hot_rows = self.hot.collect_all_rows(where_expr)?;
+        // The hot store answers from an index when it can; then only its
+        // best rows are read, and a sealed copy of a hot row is recognised
+        // per candidate instead of through a set of every matching hot row
+        let hot_top = self
+            .hot
+            .scan_top_k(where_expr, column_name, ascending, needed, 0)?;
+        let sealed_copies_checked = hot_top.is_some();
+        let hot_rows = match hot_top {
+            Some(rows) => rows,
+            None => self.hot.collect_all_rows(where_expr)?,
+        };
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
         let mut keep = TopK::new(needed, col_idx, ascending);
@@ -4087,6 +4105,9 @@ impl Table for SegmentedTable {
                 }
                 while scanner.next() {
                     let (row_id, row) = scanner.take_row_with_id();
+                    if sealed_copies_checked && self.hot.has_row_id(row_id) {
+                        continue;
+                    }
                     keep.offer(row_id, row);
                     if sorted {
                         if let Some(worst) = keep.worst_key() {
