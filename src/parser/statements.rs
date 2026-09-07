@@ -599,7 +599,7 @@ impl Parser {
         let mut alias = None;
         if self.peek_token_is_keyword("AS") {
             self.next_token(); // consume AS
-            if !self.expect_peek(TokenType::Identifier) {
+            if !self.expect_peek_identifier_like() {
                 return None;
             }
             alias = Some(Identifier::new(
@@ -906,7 +906,7 @@ impl Parser {
         }
 
         // Parse table name
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.expect_peek_identifier_like() {
             return None;
         }
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
@@ -1274,7 +1274,7 @@ impl Parser {
 
         if self.peek_token_is_keyword("AS") {
             self.next_token(); // consume AS
-            if !self.expect_peek(TokenType::Identifier) {
+            if !self.expect_peek_identifier_like() {
                 self.add_error(format!(
                     "expected alias after AS at {}",
                     self.cur_token.position
@@ -1378,7 +1378,7 @@ impl Parser {
 
         if self.peek_token_is_keyword("AS") {
             self.next_token(); // consume AS
-            if !self.expect_peek(TokenType::Identifier) {
+            if !self.expect_peek_identifier_like() {
                 self.add_error(format!(
                     "expected alias after AS at {}",
                     self.cur_token.position
@@ -1443,7 +1443,7 @@ impl Parser {
         let token = self.cur_token.clone();
 
         // Parse table name
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.expect_peek_identifier_like() {
             return None;
         }
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
@@ -1520,7 +1520,7 @@ impl Parser {
         }
 
         // Parse table name
-        if !self.peek_token_is(TokenType::Identifier) {
+        if !self.peek_token_is_identifier_like() {
             self.add_error(format!(
                 "expected table name after DELETE FROM, got {}",
                 Self::format_token_for_error(&self.peek_token)
@@ -1533,7 +1533,7 @@ impl Parser {
         // Parse optional alias (AS alias or just alias)
         let alias = if self.peek_token_is_keyword("AS") {
             self.next_token(); // consume AS
-            if !self.expect_peek(TokenType::Identifier) {
+            if !self.expect_peek_identifier_like() {
                 return None;
             }
             Some(Identifier::new(
@@ -1590,7 +1590,7 @@ impl Parser {
         }
 
         // Parse table name
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.expect_peek_identifier_like() {
             return None;
         }
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
@@ -1604,7 +1604,7 @@ impl Parser {
         let token = self.cur_token.clone();
 
         // Optional table name
-        let table_name = if self.peek_token_is(TokenType::Identifier) {
+        let table_name = if self.peek_token_is_identifier_like() {
             self.next_token();
             Some(Identifier::new(
                 self.cur_token.clone(),
@@ -1802,7 +1802,7 @@ impl Parser {
                 return None;
             }
             // Parse single FK column
-            if !self.expect_peek(TokenType::Identifier) {
+            if !self.expect_peek_identifier_like() {
                 return None;
             }
             let fk_column = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
@@ -1813,13 +1813,13 @@ impl Parser {
             if !self.expect_keyword("REFERENCES") {
                 return None;
             }
-            if !self.expect_peek(TokenType::Identifier) {
+            if !self.expect_peek_identifier_like() {
                 return None;
             }
             let ref_table = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
             let ref_column = if self.peek_token_is_punctuator("(") {
                 self.next_token();
-                if !self.expect_peek(TokenType::Identifier) {
+                if !self.expect_peek_identifier_like() {
                     return None;
                 }
                 let col = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
@@ -2066,14 +2066,14 @@ impl Parser {
                 }
                 "REFERENCES" => {
                     self.next_token(); // consume REFERENCES
-                    if !self.expect_peek(TokenType::Identifier) {
+                    if !self.expect_peek_identifier_like() {
                         return None;
                     }
                     let ref_table =
                         Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
                     let ref_column = if self.peek_token_is_punctuator("(") {
                         self.next_token();
-                        if !self.expect_peek(TokenType::Identifier) {
+                        if !self.expect_peek_identifier_like() {
                             return None;
                         }
                         let col =
@@ -2128,7 +2128,7 @@ impl Parser {
         };
 
         // Parse index name
-        if !self.peek_token_is(TokenType::Identifier) {
+        if !self.peek_token_is_identifier_like() {
             self.add_error(format!(
                 "expected index name after CREATE INDEX, got {}",
                 Self::format_token_for_error(&self.peek_token)
@@ -2144,7 +2144,7 @@ impl Parser {
         }
 
         // Parse table name
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.expect_peek_identifier_like() {
             return None;
         }
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
@@ -2200,7 +2200,7 @@ impl Parser {
             let mut opts = Vec::new();
             loop {
                 // Parse key
-                if !self.expect_peek(TokenType::Identifier) {
+                if !self.expect_peek_identifier_like() {
                     return None;
                 }
                 let key = self.cur_token.literal.to_lowercase().to_string();
@@ -2290,7 +2290,7 @@ impl Parser {
         };
 
         // Parse view name
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.expect_peek_identifier_like() {
             return None;
         }
         let view_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
@@ -2370,7 +2370,7 @@ impl Parser {
         };
 
         // Parse table name
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.expect_peek_identifier_like() {
             return None;
         }
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
@@ -2398,7 +2398,7 @@ impl Parser {
         };
 
         // Parse index name
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.expect_peek_identifier_like() {
             return None;
         }
         let index_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
@@ -2406,7 +2406,7 @@ impl Parser {
         // Check for optional ON clause
         let table_name = if self.peek_token_is_keyword("ON") {
             self.next_token();
-            if !self.expect_peek(TokenType::Identifier) {
+            if !self.expect_peek_identifier_like() {
                 return None;
             }
             Some(Identifier::new(
@@ -2441,7 +2441,7 @@ impl Parser {
         };
 
         // Parse view name
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.expect_peek_identifier_like() {
             return None;
         }
         let view_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
@@ -2463,7 +2463,7 @@ impl Parser {
         }
 
         // Parse table name
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.expect_peek_identifier_like() {
             return None;
         }
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
@@ -2500,7 +2500,7 @@ impl Parser {
                     if self.peek_token_is_keyword("COLUMN") {
                         self.next_token();
                     }
-                    if !self.expect_peek(TokenType::Identifier) {
+                    if !self.expect_peek_identifier_like() {
                         return None;
                     }
                     let col_name =
@@ -2519,7 +2519,7 @@ impl Parser {
                     }
                     let rename_keyword = self.cur_token.literal.to_uppercase();
                     if rename_keyword == "COLUMN" {
-                        if !self.expect_peek(TokenType::Identifier) {
+                        if !self.expect_peek_identifier_like() {
                             return None;
                         }
                         let col_name =
@@ -2527,7 +2527,7 @@ impl Parser {
                         if !self.expect_keyword("TO") {
                             return None;
                         }
-                        if !self.expect_peek(TokenType::Identifier) {
+                        if !self.expect_peek_identifier_like() {
                             return None;
                         }
                         let new_col_name =
@@ -2540,7 +2540,7 @@ impl Parser {
                             None,
                         )
                     } else if rename_keyword == "TO" {
-                        if !self.expect_peek(TokenType::Identifier) {
+                        if !self.expect_peek_identifier_like() {
                             return None;
                         }
                         let new_tbl_name =
@@ -2682,7 +2682,7 @@ impl Parser {
             if self.peek_token_is_keyword("SAVEPOINT") {
                 self.next_token();
             }
-            if !self.expect_peek(TokenType::Identifier) {
+            if !self.expect_peek_identifier_like() {
                 return None;
             }
             Some(Identifier::new(
@@ -2703,7 +2703,7 @@ impl Parser {
     fn parse_savepoint_statement(&mut self) -> Option<SavepointStatement> {
         let token = self.cur_token.clone();
 
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.expect_peek_identifier_like() {
             return None;
         }
 
@@ -2725,7 +2725,7 @@ impl Parser {
             self.next_token();
         }
 
-        if !self.expect_peek(TokenType::Identifier) {
+        if !self.expect_peek_identifier_like() {
             return None;
         }
 
@@ -2814,7 +2814,7 @@ impl Parser {
             // Check for TABLE or VIEW
             if self.peek_token_is_keyword("TABLE") {
                 self.next_token();
-                if !self.expect_peek(TokenType::Identifier) {
+                if !self.expect_peek_identifier_like() {
                     return None;
                 }
                 let table_name =
@@ -2825,7 +2825,7 @@ impl Parser {
                 }))
             } else if self.peek_token_is_keyword("VIEW") {
                 self.next_token();
-                if !self.expect_peek(TokenType::Identifier) {
+                if !self.expect_peek_identifier_like() {
                     return None;
                 }
                 let view_name =
@@ -2846,7 +2846,7 @@ impl Parser {
             if !self.expect_keyword("FROM") {
                 return None;
             }
-            if !self.expect_peek(TokenType::Identifier) {
+            if !self.expect_peek_identifier_like() {
                 return None;
             }
             let table_name =

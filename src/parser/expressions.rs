@@ -289,11 +289,18 @@ impl Parser {
                 token: self.cur_token.clone(),
             })),
             "CASE" => self.parse_case_expression(),
-            "CAST" => self.parse_cast_expression(),
-            "EXTRACT" => self.parse_extract_expression(),
+            // Without the shape that follows them, CAST, EXTRACT and INTERVAL
+            // are columns of that name
+            "CAST" if self.peek_token_is_punctuator("(") => self.parse_cast_expression(),
+            "EXTRACT" if self.peek_token_is_punctuator("(") => self.parse_extract_expression(),
             "EXISTS" => self.parse_exists_expression(),
             "NOT" => self.parse_not_expression(),
-            "INTERVAL" => self.parse_interval_literal(),
+            "INTERVAL"
+                if self.peek_token_is(TokenType::String)
+                    || self.peek_token_is(TokenType::Integer) =>
+            {
+                self.parse_interval_literal()
+            }
             "DEFAULT" => Some(Expression::Default(DefaultExpression {
                 token: self.cur_token.clone(),
             })),
