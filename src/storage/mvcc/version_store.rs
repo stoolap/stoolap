@@ -7516,6 +7516,30 @@ impl TransactionVersionStore {
         }
     }
 
+    /// Release the claims on rows this transaction no longer changes (savepoint
+    /// rollback of cold-row tombstones). A row that still has a local version
+    /// keeps its claim.
+    pub fn release_claims(&mut self, row_ids: &[i64]) {
+        let Some(write_set) = self.write_set.as_mut() else {
+            return;
+        };
+        let mut released: Vec<i64> = Vec::with_capacity(row_ids.len());
+        for &row_id in row_ids {
+            let has_local_version = self
+                .local_versions
+                .as_ref()
+                .is_some_and(|versions| versions.contains_key(row_id));
+            if !has_local_version && write_set.remove(row_id).is_some() {
+                released.push(row_id);
+            }
+        }
+        if !released.is_empty() {
+            released.sort_unstable();
+            self.parent_store
+                .release_row_claims_batch(&released, self.txn_id);
+        }
+    }
+
     /// Release all row claims held by this transaction
     fn release_all_claims(&self) {
         let Some(write_set) = self.write_set.as_ref() else {

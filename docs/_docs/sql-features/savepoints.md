@@ -176,6 +176,8 @@ COMMIT;
 
 Note: RELEASE does not commit to the database - it only removes the savepoint. The transaction must still be committed.
 
+Releasing a savepoint also releases every savepoint opened after it. Rolling back to a savepoint discards the savepoints opened after it and keeps the one rolled back to, so it can be rolled back to again. A name may be reused, and RELEASE and ROLLBACK TO reach the most recent savepoint of that name.
+
 ## Rolling Back Past a Released Savepoint
 
 If you release a savepoint and then create another one, you cannot roll back past it:

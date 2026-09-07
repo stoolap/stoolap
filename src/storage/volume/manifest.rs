@@ -31,6 +31,8 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::storage::mvcc::get_fast_timestamp;
+
 use crate::common::SmartString;
 use crate::core::{Result, Value};
 
@@ -636,7 +638,9 @@ pub struct SegmentManager {
     /// This lives on the SegmentManager (not SegmentedTable) because the commit
     /// path in engine.rs creates fresh MVCCTable instances that don't have
     /// access to SegmentedTable state.
-    pending_txn_tombstones: RwLock<FxHashMap<i64, FxHashSet<i64>>>,
+    /// Each row_id carries the timestamp it was tombstoned at, so a savepoint
+    /// rollback can discard the tombstones made after the savepoint.
+    pending_txn_tombstones: RwLock<FxHashMap<i64, FxHashMap<i64, i64>>>,
     // Unique constraint checks use per-volume hash indices (on FrozenVolume).
     // No global cache needed. Each volume builds its index lazily on first
     // unique check and never invalidates (volumes are immutable).
@@ -1795,7 +1799,7 @@ impl SegmentManager {
             .write()
             .entry(txn_id)
             .or_default()
-            .insert(row_id);
+            .insert(row_id, get_fast_timestamp());
     }
 
     /// Get pending tombstone row_ids for a transaction (for WAL recording).
@@ -1803,7 +1807,7 @@ impl SegmentManager {
         self.pending_txn_tombstones
             .read()
             .get(&txn_id)
-            .map(|set| set.iter().copied().collect())
+            .map(|set| set.keys().copied().collect())
             .unwrap_or_default()
     }
 
@@ -1814,7 +1818,7 @@ impl SegmentManager {
         dest: &mut rustc_hash::FxHashSet<i64>,
     ) {
         if let Some(ids) = self.pending_txn_tombstones.read().get(&txn_id) {
-            for &id in ids {
+            for &id in ids.keys() {
                 dest.insert(id);
             }
         }
@@ -1834,7 +1838,7 @@ impl SegmentManager {
         self.pending_txn_tombstones
             .read()
             .get(&txn_id)
-            .is_some_and(|set| set.contains(&row_id))
+            .is_some_and(|set| set.contains_key(&row_id))
     }
 
     /// Commit pending tombstones: move from per-txn pending to shared tombstone set.
@@ -1844,7 +1848,7 @@ impl SegmentManager {
         let pending = self.pending_txn_tombstones.write().remove(&txn_id);
         if let Some(ids) = pending {
             if !ids.is_empty() {
-                let id_vec: Vec<i64> = ids.into_iter().collect();
+                let id_vec: Vec<i64> = ids.into_keys().collect();
                 self.add_tombstones(&id_vec, commit_seq);
             }
         }
@@ -1853,6 +1857,22 @@ impl SegmentManager {
     /// Rollback pending tombstones: discard without applying.
     pub fn rollback_pending_tombstones(&self, txn_id: i64) {
         self.pending_txn_tombstones.write().remove(&txn_id);
+    }
+
+    /// Discard the pending tombstones made after a timestamp (savepoint rollback)
+    /// and return the row_ids discarded, so their row claims can be released.
+    pub fn rollback_pending_tombstones_after(&self, txn_id: i64, timestamp: i64) -> Vec<i64> {
+        let mut discarded = Vec::new();
+        if let Some(ids) = self.pending_txn_tombstones.write().get_mut(&txn_id) {
+            ids.retain(|&row_id, tombstoned_at| {
+                let keep = *tombstoned_at <= timestamp;
+                if !keep {
+                    discarded.push(row_id);
+                }
+                keep
+            });
+        }
+        discarded
     }
 
     /// Check if a txn has any pending tombstones (for has_local_changes).
