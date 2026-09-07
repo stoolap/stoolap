@@ -150,12 +150,89 @@ fn test_top_k_matches_the_full_sort_across_layouts() {
     db.execute("DELETE FROM c WHERE v = 5", ()).unwrap();
     check_all(&db);
 
-    // Inside a transaction the same rows come back
+    // Inside a transaction the same rows come back, and a sealed row this
+    // transaction deleted or updated away from the filter is not among them
     db.execute("BEGIN", ()).unwrap();
     insert_batch(&db, &mut rng, 500, base + 80 * day, day, 20);
+    // The two newest sealed rows of k7 (volume 3 ends before 2024-04-25)
+    let sealed = "k = 'k7' AND t < '2024-04-25 00:00:00'";
+    let newest_k7 = ids(
+        &db,
+        &format!("SELECT id FROM c WHERE {sealed} ORDER BY t DESC LIMIT 2"),
+    );
+    db.execute(&format!("DELETE FROM c WHERE id = {}", newest_k7[0]), ())
+        .unwrap();
+    db.execute(
+        &format!("UPDATE c SET k = 'moved' WHERE id = {}", newest_k7[1]),
+        (),
+    )
+    .unwrap();
+    let after = ids(
+        &db,
+        &format!("SELECT id FROM c WHERE {sealed} ORDER BY t DESC LIMIT 5"),
+    );
+    assert!(
+        !after.contains(&newest_k7[0]) && !after.contains(&newest_k7[1]),
+        "{after:?} still holds {newest_k7:?}"
+    );
     check_all(&db);
     db.execute("ROLLBACK", ()).unwrap();
     check_all(&db);
+}
+
+#[test]
+fn test_top_k_over_a_volume_written_out_of_time_order() {
+    // Three row groups of 65,536 rows whose time bounds run high, low, medium
+    // in physical order: the newest rows sit in the first group
+    let dir = tempfile::tempdir().unwrap();
+    let (db, mut rng) = setup(&format!("file://{}/unsorted", dir.path().display()));
+    let base = 1_709_251_200;
+    let day = 86400;
+    for start in [base + 300 * day, base, base + 100 * day] {
+        for _ in 0..4 {
+            insert_batch(&db, &mut rng, 16_384, start, 30 * day, 20);
+        }
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let newest = ids(&db, "SELECT id FROM c ORDER BY t DESC LIMIT 1");
+    let reference = ids(&db, "SELECT id FROM c ORDER BY t DESC, id DESC");
+    assert_eq!(newest, reference[..1]);
+    check_all(&db);
+}
+
+#[test]
+fn test_top_k_keeps_the_select_list_alias_and_qualified_star() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, mut rng) = setup(&format!("file://{}/alias", dir.path().display()));
+    insert_batch(&db, &mut rng, 20_000, 1_709_251_200, 30 * 86400, 20);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    // ORDER BY names the alias of -v, not the column v
+    let min_v = ids(&db, "SELECT MIN(v) FROM c WHERE v > 0")[0];
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT -v AS v FROM c WHERE v > 0 ORDER BY v DESC LIMIT 1"
+        ),
+        [-min_v]
+    );
+
+    // A qualified star keeps every column
+    let expected = ids(
+        &db,
+        "SELECT id FROM c WHERE k = 'k7' ORDER BY t DESC, id DESC",
+    );
+    let row = db
+        .query(
+            "SELECT c.* FROM c WHERE k = 'k7' ORDER BY t DESC LIMIT 1",
+            (),
+        )
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.len(), 4);
+    assert_eq!(row.get::<i64>(0).unwrap(), expected[0]);
 }
 
 #[test]

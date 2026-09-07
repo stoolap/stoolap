@@ -2703,6 +2703,7 @@ impl Executor {
                 &*table,
                 storage_expr.as_deref(),
                 &all_columns,
+                table_alias.as_deref(),
                 ctx,
             )? {
                 return Ok((result, columns, true, None));
