@@ -12,17 +12,23 @@ MCP ([Model Context Protocol](https://modelcontextprotocol.io)) server for Stool
 
 Works with any MCP-compatible AI client: Claude Desktop, Claude Code, Cursor, Windsurf, Cline, and others.
 
-The server provides 30 tools, 2 resources, and 1 prompt. On connection, it sends built-in instructions so the AI can write correct Stoolap SQL from the first query.
+The server provides 30 tools, 2 resources, and 1 prompt. On connection, it sends built-in instructions so the AI can write correct Stoolap SQL from the first query. Every tool carries MCP annotations (`readOnlyHint`, `destructiveHint`), so clients can auto-approve the read-only ones.
+
+This page describes `@stoolap/mcp` 0.4.1 or later, which targets the Stoolap 0.4.x engine (volume-based storage) through [`@stoolap/node`](https://github.com/stoolap/stoolap-node). Pin the version in your client configuration (`@stoolap/mcp@^0.4.1`) if you rely on the read-only guarantees below; 0.4.0 does not block COPY ... FROM in read-only mode.
 
 ## Installation
 
 The MCP server is published as `@stoolap/mcp` on npm. No manual installation is needed when using `npx`.
 
 Requirements:
-- Node.js >= 18
-- The `@stoolap/node` package (installed automatically as a dependency)
+- Node.js >= 20
+- The `@stoolap/node` package (installed automatically as a dependency) with prebuilt engine libraries for Linux (x64, arm64), macOS (x64, arm64) and Windows (x64). A C compiler is needed for its small N-API addon.
 
-Prebuilt native binaries are bundled for Linux (x64, arm64) and macOS (x64, arm64).
+The first `npx` run compiles that addon, which can take a while. MCP clients with a short startup timeout may report a failed connection on that first run. Retry once the install has finished, or install the package globally beforehand:
+
+```bash
+npm install -g @stoolap/mcp
+```
 
 ## Quick Start
 
@@ -79,7 +85,7 @@ Omit the `--path` flag to use an in-memory database:
 
 ### Read-only mode
 
-Add `--read-only` to disable all write operations. Read-only transactions (begin, query, commit) are still allowed for consistent reads.
+Add `--read-only` to reject every statement that writes data, schema or engine state. Read-only transactions (begin, query, commit) are still allowed for consistent reads.
 
 ```json
 {
@@ -96,8 +102,9 @@ Add `--read-only` to disable all write operations. Read-only transactions (begin
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--path <path>` | `:memory:` | Database path. Use `:memory:` for in-memory or a file path for persistence. |
-| `--read-only` | `false` | Disable write operations |
+| `--path <path>` | `:memory:` | Database path or DSN. Engine options go in the query string, e.g. `./mydata?sync_mode=full&checkpoint_interval=30`. |
+| `--read-only` | `false` | Reject every statement that writes data, schema or engine state. |
+| `--version` | | Print the server version and exit. |
 
 ## Tools
 
@@ -107,24 +114,24 @@ The server exposes 30 tools organized into five categories.
 
 | Tool | Description |
 |------|-------------|
-| `query` | Run SELECT, SHOW, DESCRIBE, EXPLAIN queries. Returns results as JSON. |
-| `execute` | Run INSERT, UPDATE, DELETE with parameter binding. Supports RETURNING clause and upsert (ON DUPLICATE KEY UPDATE). Returns affected row count. |
+| `query` | Run SELECT, SHOW, DESCRIBE, EXPLAIN, VALUES and WITH ... SELECT. Returns rows as JSON. Runs inside the active transaction if one is open. |
+| `execute` | Run INSERT, UPDATE, DELETE, COPY ... FROM, DDL, SET, ANALYZE, VACUUM with parameter binding. Supports upsert (ON CONFLICT / ON DUPLICATE KEY UPDATE) and RETURNING. Returns rows for RETURNING, otherwise the affected row count. |
 | `execute_batch` | Execute the same SQL with multiple parameter sets in a single atomic transaction. All rows succeed or all are rolled back. |
-| `explain` | Show query execution plan. Set `analyze=true` to run the query and show actual runtime stats. |
+| `explain` | Show the query plan. `analyze=true` runs the statement and reports actual row counts and timings (refused for write statements). |
 
 ### Transaction Control (9 tools)
 
 | Tool | Description |
 |------|-------------|
-| `begin_transaction` | Begin a new transaction with optional isolation level (`read_committed` or `snapshot`). Only one active transaction at a time. |
-| `transaction_execute` | Execute a DML statement within the active transaction. Sees uncommitted changes. |
-| `transaction_query` | Run a SELECT query within the active transaction. Sees uncommitted changes. Full SQL feature support. |
-| `transaction_execute_batch` | Execute the same SQL with multiple parameter sets within the active transaction. |
-| `commit_transaction` | Commit the active transaction. All changes become permanent. |
-| `rollback_transaction` | Rollback the active transaction. All changes are discarded. |
-| `savepoint` | Create a named savepoint within the active transaction. |
-| `rollback_to_savepoint` | Rollback to a savepoint, undoing changes after it without aborting the transaction. |
-| `release_savepoint` | Release a savepoint. Changes are kept. |
+| `begin_transaction` | Begin a transaction with optional isolation level (`read_committed` or `snapshot`). One active transaction at a time. |
+| `transaction_execute` | Execute INSERT, UPDATE or DELETE inside the active transaction. DDL, TRUNCATE and COPY are refused. |
+| `transaction_query` | Run a read-only statement inside the active transaction. Sees uncommitted changes. |
+| `transaction_execute_batch` | Execute the same SQL with multiple parameter sets inside the active transaction. |
+| `commit_transaction` | Commit the active transaction. |
+| `rollback_transaction` | Rollback the active transaction. |
+| `savepoint` | Create a named savepoint. |
+| `rollback_to_savepoint` | Undo changes made after a savepoint without ending the transaction. |
+| `release_savepoint` | Remove a savepoint, keeping its changes. |
 
 ### Schema Inspection (7 tools)
 
@@ -132,38 +139,38 @@ The server exposes 30 tools organized into five categories.
 |------|-------------|
 | `list_tables` | List all tables |
 | `list_views` | List all views |
-| `describe_table` | Show columns, types, nullability, keys, defaults, and extras |
-| `show_create_table` | Get the full CREATE TABLE DDL including all constraints |
-| `show_create_view` | Get the full CREATE VIEW DDL |
-| `show_indexes` | Show all indexes on a table (type, columns, uniqueness) |
-| `get_schema` | Get the complete database schema: all tables with columns, indexes, DDL, plus all views |
+| `describe_table` | Columns, types, nullability, keys, defaults and extras |
+| `show_create_table` | Full CREATE TABLE DDL including constraints and foreign keys |
+| `show_create_view` | Full CREATE VIEW DDL |
+| `show_indexes` | Indexes of a table: name, type, columns, uniqueness, options |
+| `get_schema` | The complete schema: every table with columns, indexes and DDL, plus every view |
 
 ### Schema Modification (5 tools)
 
 | Tool | Description |
 |------|-------------|
-| `create_table` | Create a table with all column types and constraints. Supports IF NOT EXISTS and CREATE TABLE AS SELECT. |
-| `create_index` | Create BTREE, HASH, BITMAP, or HNSW indexes. Supports UNIQUE and composite. |
-| `create_view` | Create a read-only view (persists across restarts) |
+| `create_table` | INTEGER, FLOAT, TEXT, BOOLEAN, TIMESTAMP, JSON, VECTOR(N) columns; PRIMARY KEY (including composite), NOT NULL, UNIQUE, DEFAULT, CHECK, AUTO_INCREMENT, single-column foreign keys; IF NOT EXISTS; CREATE TABLE AS SELECT |
+| `create_index` | BTREE, HASH, BITMAP or HNSW indexes, UNIQUE and composite. HNSW options: m, ef_construction, ef_search, metric |
+| `create_view` | Read-only view that persists across restarts |
 | `alter_table` | ADD COLUMN, DROP COLUMN, RENAME COLUMN, MODIFY COLUMN, RENAME TO |
-| `drop` | Drop a table, view, or index (supports IF EXISTS) |
+| `drop` | DROP TABLE / VIEW / INDEX ... ON table (supports IF EXISTS) |
 
 ### Database Administration (5 tools)
 
 | Tool | Description |
 |------|-------------|
-| `analyze_table` | Collect optimizer statistics for better query plans |
-| `vacuum` | Clean up deleted rows, old MVCC versions, and compact indexes |
-| `pragma` | Get/set database config: sync_mode, checkpoint_interval, compact_threshold, keep_snapshots, wal_flush_trigger |
-| `version` | Get the Stoolap engine version |
-| `list_functions` | List all 130+ built-in SQL functions with signatures, grouped by category |
+| `analyze_table` | Collect optimizer statistics for a table |
+| `vacuum` | Remove deleted rows and old MVCC versions, compact indexes (discards time-travel history) |
+| `pragma` | Read or set `checkpoint_interval`, `compact_threshold`, `target_volume_rows`, `keep_snapshots`; read `sync_mode`, `wal_flush_trigger`, `volume_stats`; run `snapshot`, `checkpoint`, `vacuum`, `restore` |
+| `version` | Engine and server version |
+| `list_functions` | All built-in SQL functions with signatures, grouped by category |
 
 ## Resources
 
 | URI | Description |
 |-----|-------------|
-| `stoolap://schema` | Full database schema with all tables, views, columns, indexes, and DDL statements |
-| `stoolap://sql-reference` | Live database schema plus complete Stoolap SQL reference: data types, 130+ functions with signatures, operators, joins, indexes, window functions, CTEs, transactions, temporal queries, vector search, and known limitations |
+| `stoolap://schema` | Full database schema with all tables, views, columns, indexes, and DDL statements (JSON) |
+| `stoolap://sql-reference` | Live database schema plus the complete Stoolap SQL reference (Markdown) |
 
 ## Prompts
 
@@ -173,16 +180,16 @@ The server exposes 30 tools organized into five categories.
 
 ## Auto-injected Instructions
 
-The server provides built-in [MCP instructions](https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/instructions) that are automatically sent to the AI during the connection handshake. Any AI client receives a comprehensive Stoolap SQL reference on connect, covering data types, supported syntax, all operator categories, index types, vector search, transaction isolation levels, and known limitations, without the user needing to configure anything.
+The server sends [MCP instructions](https://modelcontextprotocol.io/specification/2025-03-26/server/utilities/instructions) during the connection handshake, so any AI client receives a compact Stoolap SQL reference on connect: data types, tool routing, upsert syntax, index and vector rules, transaction rules, and the known limitations of the 0.4.x engine, without the user needing to configure anything.
 
-For deeper reference (live schema and full function signatures), attach the `sql-assistant` prompt.
+For the full reference with the live schema, attach the `sql-assistant` prompt or read `stoolap://sql-reference`.
 
 ## Parameter Binding
 
 All query and execute tools support parameter binding:
 
 ```
--- Positional ($1, $2, ...)
+-- Positional ($1, $2, ... or ?)
 params: [1, "Alice", 30]
 
 -- Named (:key)
@@ -215,6 +222,15 @@ INSERT INTO users (name, email) VALUES ($1, $2)
 params: ["Alice", "alice@example.com"]
 ```
 
+### Upsert
+
+Use `execute` with ON CONFLICT. Refer to the incoming row as `EXCLUDED`:
+
+```sql
+INSERT INTO users (id, name, email) VALUES ($1, $2, $3)
+ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, email = EXCLUDED.email
+```
+
 ### Bulk Insert
 
 Use `execute_batch` with a single SQL and multiple parameter sets:
@@ -231,6 +247,12 @@ params_array: [
 ```
 
 All rows are inserted atomically in a single transaction.
+
+To load a CSV file from the server host, use `execute`:
+
+```sql
+COPY users (name, email) FROM '/data/users.csv' WITH (FORMAT CSV, HEADER true)
+```
 
 ### Querying with Aggregates
 
@@ -283,7 +305,7 @@ Create an HNSW index for fast similarity search using `create_index`:
 CREATE INDEX idx_emb ON docs(embedding) USING HNSW WITH (metric = 'cosine')
 ```
 
-Query nearest neighbors with `query`:
+Query nearest neighbors with `query`. The distance function must match the index metric:
 
 ```sql
 SELECT id, title, VEC_DISTANCE_COSINE(embedding, '[0.1, 0.2, ...]') AS dist
@@ -309,29 +331,32 @@ The MCP server exposes the full Stoolap SQL surface:
 - **7 data types**: INTEGER, FLOAT, TEXT, BOOLEAN, TIMESTAMP, JSON, VECTOR(N)
 - **Joins**: INNER, LEFT, RIGHT, FULL OUTER, CROSS, NATURAL, self-joins, multi-table
 - **Subqueries**: scalar, IN/NOT IN, EXISTS/NOT EXISTS, ANY/SOME/ALL, correlated, derived tables
-- **CTEs**: WITH, WITH RECURSIVE, multiple CTEs, column aliases
-- **Window functions**: ROW_NUMBER, RANK, DENSE_RANK, NTILE, LEAD, LAG, FIRST_VALUE, LAST_VALUE, NTH_VALUE, PERCENT_RANK, CUME_DIST (plus all aggregates with OVER)
-- **GROUP BY extensions**: ROLLUP, CUBE, GROUPING SETS, GROUPING()
-- **Aggregates**: COUNT, SUM, AVG, MIN, MAX, MEDIAN, STRING_AGG, ARRAY_AGG, STDDEV, VARIANCE, and more
-- **100+ scalar functions**: string, math, date/time, JSON, hash, conditional, vector, type conversion
+- **CTEs**: WITH, WITH RECURSIVE, multiple CTEs, column aliases, WITH before INSERT/UPDATE/DELETE
+- **Window functions**: ROW_NUMBER, RANK, DENSE_RANK, NTILE, LEAD, LAG, FIRST_VALUE, LAST_VALUE, NTH_VALUE, PERCENT_RANK, CUME_DIST, every aggregate with OVER, named windows
+- **Aggregates**: 17 functions with DISTINCT and FILTER; GROUP BY ROLLUP, CUBE, GROUPING SETS; DISTINCT ON
+- **Scalar functions**: 98 functions across string, math, date/time, JSON, hash, conditional, type and vector categories
 - **Operators**: arithmetic, comparison, logical, bitwise, LIKE/ILIKE/GLOB/REGEXP, JSON (->/->>), vector (<=>), BETWEEN, IN, IS [NOT] DISTINCT FROM, INTERVAL
-- **Transactions**: BEGIN with isolation levels (READ COMMITTED, SNAPSHOT), COMMIT, ROLLBACK, SAVEPOINT
+- **Upsert**: ON CONFLICT DO UPDATE / DO NOTHING with EXCLUDED, ON DUPLICATE KEY UPDATE
+- **Bulk load**: COPY table FROM 'file.csv' WITH (FORMAT CSV, HEADER true)
+- **Transactions**: READ COMMITTED and SNAPSHOT isolation, savepoints
 - **Temporal queries**: AS OF TIMESTAMP, AS OF TRANSACTION
-- **Index types**: BTree, Hash, Bitmap, HNSW (vector), Unique, Composite
-- **Vector search**: k-NN with L2, cosine, inner product distances and HNSW indexing
-- **EXPLAIN / EXPLAIN ANALYZE** for query plan inspection
-- **DISTINCT ON**: Per-group deduplication (PostgreSQL-inspired, no leading ORDER BY restriction)
+- **Indexes**: BTree, Hash, Bitmap, HNSW (vector), unique, composite
+- **Vector search**: k-NN with L2, cosine and inner product distances, HNSW indexing
 - **Set operations**: UNION [ALL], INTERSECT [ALL], EXCEPT [ALL]
+- **EXPLAIN / EXPLAIN ANALYZE** for query plan inspection
 
 ## Safety
 
 The server includes several safety measures:
 
-- **Single-statement enforcement**: Multi-statement SQL (semicolons outside strings/comments) is rejected. Each tool call runs one statement.
-- **Read-only mode**: `--read-only` disables all write operations at the server level.
-- **Tool routing**: `query` only accepts read-only statements (SELECT, SHOW, DESCRIBE, EXPLAIN). `execute` only accepts write statements. Misrouted statements are rejected with a descriptive error.
-- **Transaction isolation**: DDL (CREATE/ALTER/DROP) is rejected inside transactions because it is auto-committed and cannot be rolled back.
-- **SQL injection prevention**: Table/view names are quoted with double-quote escaping. Savepoint and pragma names are validated as bare identifiers. PRAGMA values are validated as numeric.
+- **Single statement per call**: the engine executes every statement of a multi-statement string but reports only the last one, so semicolon-separated batches are rejected.
+- **Tool routing**: `query` accepts only read statements, `execute` is blocked while a transaction is open, and transaction control statements (BEGIN, COMMIT, ROLLBACK, SAVEPOINT) are only reachable through the transaction tools, so the server always knows the connection's transaction state.
+- **Read-only mode**: `--read-only` rejects every write, including COPY, DDL, SET, ANALYZE, VACUUM and PRAGMA actions.
+- **COPY ... FROM reads files on the host** with the server process's permissions, so an assistant can load any readable file into a table. Run with `--read-only` when that is not acceptable. Server 0.4.0 does not apply the read-only check to COPY; use 0.4.1 or later.
+- **DDL outside transactions**: only CREATE TABLE is rolled back reliably by the engine, so DDL, TRUNCATE and COPY are refused inside a transaction.
+- **EXPLAIN ANALYZE** is refused for write statements because it executes them.
+- **Injection guards**: table and view names are double-quoted, savepoint and pragma names must be bare identifiers, pragma values are validated per pragma.
+- **Clean shutdown**: the database is closed cleanly (open transaction rolled back, checkpoint on close) when the client disconnects or the process receives SIGINT/SIGTERM.
 
 ## Building from Source
 
