@@ -180,6 +180,58 @@ fn test_top_k_matches_the_full_sort_across_layouts() {
     check_all(&db);
 }
 
+/// Rows in time order, every key once per step, as a market data feed writes them
+fn insert_sorted(db: &Database, from: i64, steps: i64, keys: i64, step_secs: i64) {
+    let mut stmt = String::from("INSERT INTO c (t, k, v) VALUES ");
+    for s in 0..steps {
+        for k in 0..keys {
+            if s > 0 || k > 0 {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!(
+                "('{}', 'k{k}', {})",
+                ts(from + s * step_secs),
+                (s * 7 + k) % 100
+            ));
+        }
+    }
+    db.execute(&stmt, ()).unwrap();
+}
+
+#[test]
+fn test_top_k_over_volumes_sorted_by_time() {
+    // Sorted volumes take the ordered walk that stops on the raw key
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = setup(&format!("file://{}/sorted", dir.path().display()));
+    let base = 1_709_251_200;
+    // Three sealed batches of 20 keys x 4,000 minutes, then deletes, then hot rows
+    for i in 0..3 {
+        insert_sorted(&db, base + i * 4_000 * 60, 4_000, 20, 60);
+        db.execute(&format!("DELETE FROM c WHERE v = {}", 10 + i), ())
+            .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        check_all(&db);
+    }
+    // A bigger sealed batch spanning several row groups
+    insert_sorted(&db, base + 12_000 * 60, 10_000, 20, 60);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("DELETE FROM c WHERE v = 99", ()).unwrap();
+    check_all(&db);
+    // Hot rows newer than the sealed ones, and a key that stopped producing
+    insert_sorted(&db, base + 22_000 * 60, 300, 19, 60);
+    check_all(&db);
+    db.execute("BEGIN", ()).unwrap();
+    let newest = ids(
+        &db,
+        "SELECT id FROM c WHERE k = 'k3' AND t < '2024-03-10 00:00:00' ORDER BY t DESC LIMIT 1",
+    );
+    db.execute(&format!("DELETE FROM c WHERE id = {}", newest[0]), ())
+        .unwrap();
+    check_all(&db);
+    db.execute("ROLLBACK", ()).unwrap();
+    check_all(&db);
+}
+
 #[test]
 fn test_top_k_over_a_volume_written_out_of_time_order() {
     // Three row groups of 65,536 rows whose time bounds run high, low, medium
