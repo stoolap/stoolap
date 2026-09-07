@@ -33,11 +33,18 @@ fn env_or(name: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
+#[cfg(unix)]
 fn cpu_secs() -> f64 {
     let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut ru) };
     let t = |tv: libc::timeval| tv.tv_sec as f64 + tv.tv_usec as f64 / 1e6;
     t(ru.ru_utime) + t(ru.ru_stime)
+}
+
+/// Process CPU time is reported as zero where getrusage is not available.
+#[cfg(not(unix))]
+fn cpu_secs() -> f64 {
+    0.0
 }
 
 fn rss_mb() -> f64 {
