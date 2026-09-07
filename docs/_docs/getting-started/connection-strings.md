@@ -194,14 +194,15 @@ You can also configure settings after connection using PRAGMA commands:
 
 ```sql
 -- Set configuration values
-PRAGMA sync_mode = 2;
 PRAGMA checkpoint_interval = 60;
 PRAGMA compact_threshold = 4;
+PRAGMA target_volume_rows = 1048576;
 PRAGMA keep_snapshots = 5;
-PRAGMA wal_flush_trigger = 500;
 
--- Read current values
+-- Read current values (sync_mode and wal_flush_trigger are read-only here;
+-- set them in the connection string)
 PRAGMA sync_mode;
+PRAGMA wal_flush_trigger;
 PRAGMA checkpoint_interval;
 PRAGMA keep_snapshots;
 

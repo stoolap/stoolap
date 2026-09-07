@@ -48,9 +48,9 @@ Aggregate functions operate on a set of rows and return a single value. Used wit
 | `CONCAT_WS` | `CONCAT_WS(sep, str1, str2, ...)` | Concatenate with separator |
 | `SUBSTRING` | `SUBSTRING(str, pos, len)` | Extract substring |
 | `SUBSTR` | `SUBSTR(str, pos, len)` | Alias for SUBSTRING |
-| `TRIM` | `TRIM(str)` | Remove leading/trailing whitespace |
-| `LTRIM` | `LTRIM(str)` | Remove leading whitespace |
-| `RTRIM` | `RTRIM(str)` | Remove trailing whitespace |
+| `TRIM` | `TRIM(str [, chars])` | Remove leading/trailing whitespace or the given characters |
+| `LTRIM` | `LTRIM(str [, chars])` | Remove leading whitespace or the given characters |
+| `RTRIM` | `RTRIM(str [, chars])` | Remove trailing whitespace or the given characters |
 | `REPLACE` | `REPLACE(str, from, to)` | Replace occurrences |
 | `REVERSE` | `REVERSE(str)` | Reverse a string |
 | `LEFT` | `LEFT(str, n)` | First n characters |
