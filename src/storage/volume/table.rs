@@ -3930,6 +3930,10 @@ impl Table for SegmentedTable {
             hot_skip.insert(row_id);
             keep.offer(row_id, row);
         }
+        // Cold rows this transaction deleted or updated are not in the volumes'
+        // committed tombstones yet
+        self.segment_mgr
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
         let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
         // Every volume must carry the column and a zone map without NULLs
@@ -4005,9 +4009,21 @@ impl Table for SegmentedTable {
                 .collect();
             if groups.is_empty() {
                 groups.push((0, vol.meta.row_count, None));
-            } else if !ascending {
-                groups.reverse();
             }
+            // Bound order, not physical order: a volume written out of time order
+            // has its best group anywhere. A group without a bound goes first.
+            groups.sort_by(|a, b| match (&a.2, &b.2) {
+                (None, None) => std::cmp::Ordering::Equal,
+                (None, Some(_)) => std::cmp::Ordering::Less,
+                (Some(_), None) => std::cmp::Ordering::Greater,
+                (Some(x), Some(y)) => {
+                    if ascending {
+                        x.cmp(y)
+                    } else {
+                        y.cmp(x)
+                    }
+                }
+            });
 
             for (start, end, group_bound) in groups {
                 if let Some(bound) = group_bound {
