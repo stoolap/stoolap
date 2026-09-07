@@ -9843,6 +9843,54 @@ impl Executor {
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
             }
+            "GROUP_CACHE_MB" => {
+                // Budget of the decoded row-group column cache, in megabytes;
+                // zero disables it
+                use crate::storage::volume::group_cache::DECODED_GROUPS;
+                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
+                if let Some(ref value) = stmt.value {
+                    let mb = self.extract_pragma_int_value(value)?;
+                    if mb < 0 {
+                        return Err(Error::internal("group_cache_mb must not be negative"));
+                    }
+                    DECODED_GROUPS.set_budget_bytes((mb as usize).saturating_mul(1024 * 1024));
+                }
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![Value::Integer(
+                        (DECODED_GROUPS.budget_bytes() / (1024 * 1024)) as i64,
+                    )]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
+            "GROUP_CACHE_STATS" => {
+                if stmt.value.is_some() {
+                    return Err(Error::internal(
+                        "PRAGMA GROUP_CACHE_STATS does not accept values",
+                    ));
+                }
+                let stats = crate::storage::volume::group_cache::DECODED_GROUPS.stats();
+                let columns = vec![
+                    "budget_bytes".to_string(),
+                    "bytes".to_string(),
+                    "entries".to_string(),
+                    "hits".to_string(),
+                    "misses".to_string(),
+                ];
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![
+                        Value::Integer(stats.budget_bytes as i64),
+                        Value::Integer(stats.bytes as i64),
+                        Value::Integer(stats.entries as i64),
+                        Value::Integer(stats.hits as i64),
+                        Value::Integer(stats.misses as i64),
+                    ]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
             "VOLUME_STATS" => {
                 if stmt.value.is_some() {
                     return Err(Error::internal(

@@ -57,8 +57,9 @@ struct ColumnPredicate {
 struct GroupColumnCache {
     #[allow(dead_code)]
     group_idx: usize,
-    /// Decompressed columns for this group (only needed columns populated)
-    columns: Vec<Option<super::column::ColumnData>>,
+    /// Decoded columns for this group (only needed columns populated),
+    /// shared with the decoded group cache
+    columns: Vec<Option<Arc<super::column::ColumnData>>>,
     /// Global row index where this group starts
     group_start: usize,
 }
@@ -72,7 +73,7 @@ impl GroupColumnCache {
         global_idx: usize,
     ) -> Option<(&super::column::ColumnData, usize)> {
         self.columns[col_idx]
-            .as_ref()
+            .as_deref()
             .map(|col| (col, global_idx - self.group_start))
     }
 }
@@ -577,7 +578,7 @@ impl VolumeScanner {
                     let mut group_cols = Vec::with_capacity(self.dict_filters.len());
                     let mut corrupt = false;
                     for &(ci, _) in &self.dict_filters {
-                        match st.decompress_single_group(ci, gi) {
+                        match st.group_column(ci, gi) {
                             Ok(col) => group_cols.push(col),
                             Err(_) => {
                                 corrupt = true;
@@ -849,11 +850,11 @@ impl VolumeScanner {
         let col_count = self.volume.columns.len();
         let group_start = group_idx * super::column::ROW_GROUP_SIZE;
 
-        let mut columns: Vec<Option<super::column::ColumnData>> = vec![None; col_count];
+        let mut columns: Vec<Option<Arc<super::column::ColumnData>>> = vec![None; col_count];
         if let Some(ref needed) = self.needed_cols {
             for (ci, &need) in needed.iter().enumerate() {
                 if need && ci < col_count && group_idx < store.num_groups(ci) {
-                    match store.decompress_single_group(ci, group_idx) {
+                    match store.group_column(ci, group_idx) {
                         Ok(col) => columns[ci] = Some(col),
                         Err(e) => {
                             self.error = Some(Error::internal(format!("corrupt V4 block: {}", e)));
@@ -865,7 +866,7 @@ impl VolumeScanner {
         } else {
             for (ci, slot) in columns.iter_mut().enumerate() {
                 if group_idx < store.num_groups(ci) {
-                    match store.decompress_single_group(ci, group_idx) {
+                    match store.group_column(ci, group_idx) {
                         Ok(col) => *slot = Some(col),
                         Err(e) => {
                             self.error = Some(Error::internal(format!("corrupt V4 block: {}", e)));

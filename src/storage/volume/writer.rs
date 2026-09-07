@@ -67,9 +67,37 @@ pub struct CompressedBlockStore {
     group_size: usize,
     /// Total row count across all groups
     row_count: usize,
+    /// Process-unique id, the key of this store's entries in the decoded
+    /// group cache
+    id: usize,
+}
+
+/// Ids for block stores; the decoded group cache keys its entries by them
+fn next_store_id() -> usize {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl Drop for CompressedBlockStore {
+    fn drop(&mut self) {
+        super::group_cache::DECODED_GROUPS.remove_store(self.id);
+    }
 }
 
 impl CompressedBlockStore {
+    /// One column of one row group, decoded once and shared through the
+    /// decoded group cache while the budget holds it
+    pub fn group_column(
+        &self,
+        col_idx: usize,
+        group_idx: usize,
+    ) -> std::io::Result<Arc<ColumnData>> {
+        super::group_cache::DECODED_GROUPS
+            .get_or_decode((self.id, col_idx as u32, group_idx as u32), || {
+                self.decompress_single_group(col_idx, group_idx)
+            })
+    }
+
     /// Compress existing columns into per-group LZ4 blocks.
     /// Used when sealing (VolumeBuilder::finish() → eager columns → V4 write).
     pub fn compress_columns(
@@ -191,6 +219,7 @@ impl CompressedBlockStore {
             col_dicts,
             group_size,
             row_count,
+            id: next_store_id(),
         }
     }
 
@@ -222,6 +251,7 @@ impl CompressedBlockStore {
             col_dicts,
             group_size,
             row_count,
+            id: next_store_id(),
         }
     }
 
@@ -652,7 +682,7 @@ impl CompressedBlockStore {
                 if target > max_i64 {
                     continue;
                 }
-                let col = self.decompress_single_group(col_idx, gi).ok()?;
+                let col = self.group_column(col_idx, gi).ok()?;
                 let group_rows = (rg.end_idx - rg.start_idx) as usize;
                 let local = if strict {
                     col.binary_search_gt(target)
@@ -667,7 +697,7 @@ impl CompressedBlockStore {
         }
 
         if num_groups == 1 {
-            let col = self.decompress_single_group(col_idx, 0).ok()?;
+            let col = self.group_column(col_idx, 0).ok()?;
             return Some(if strict {
                 col.binary_search_gt(target)
             } else {
