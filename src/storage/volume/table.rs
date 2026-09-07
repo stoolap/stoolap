@@ -3918,7 +3918,10 @@ impl Table for SegmentedTable {
         else {
             return Ok(None);
         };
-        if schema.columns[col_idx].nullable {
+        // A float column may hold NaN, which the zone maps leave out but the
+        // sort puts last, so a volume's finite bound is not a bound at all
+        if schema.columns[col_idx].nullable || schema.columns[col_idx].data_type == DataType::Float
+        {
             return Ok(None);
         }
 

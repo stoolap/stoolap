@@ -201,6 +201,28 @@ fn test_top_k_over_a_volume_written_out_of_time_order() {
 }
 
 #[test]
+fn test_top_k_over_a_float_column_keeps_nan_in_order() {
+    // Zone maps leave NaN out, so a float column is never answered from the bounds
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}/nan", dir.path().display())).unwrap();
+    db.execute(
+        "CREATE TABLE f (id INTEGER PRIMARY KEY, x FLOAT NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO f VALUES (1, $1), (2, 100.0)", (f64::NAN,))
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("INSERT INTO f VALUES (3, 200.0)", ()).unwrap();
+    for dir in ["DESC", "ASC"] {
+        assert_eq!(
+            ids(&db, &format!("SELECT id FROM f ORDER BY x {dir} LIMIT 1")),
+            ids(&db, &format!("SELECT id FROM f ORDER BY x {dir}, id {dir}"))[..1]
+        );
+    }
+}
+
+#[test]
 fn test_top_k_keeps_the_select_list_alias_and_qualified_star() {
     let dir = tempfile::tempdir().unwrap();
     let (db, mut rng) = setup(&format!("file://{}/alias", dir.path().display()));
