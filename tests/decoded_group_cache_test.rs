@@ -16,7 +16,29 @@
 //! between queries within its byte budget, answers the same rows as a fresh
 //! decode, and steps aside when its budget is zero.
 
+use std::sync::{Mutex, MutexGuard};
+use stoolap::storage::volume::group_cache::{DECODED_GROUPS, DEFAULT_BUDGET_BYTES};
 use stoolap::Database;
+
+// The cache is one per process and `cargo test` runs these tests in one
+// process, so each test takes this lock, starts from an empty cache and
+// hands the default budget back when it is done.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+struct Serial(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+fn serial() -> Serial {
+    let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    DECODED_GROUPS.set_budget_bytes(0);
+    Serial(guard)
+}
+
+impl Drop for Serial {
+    fn drop(&mut self) {
+        DECODED_GROUPS.set_budget_bytes(0);
+        DECODED_GROUPS.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+    }
+}
 
 fn ts(secs: i64) -> String {
     chrono::DateTime::from_timestamp(secs, 0)
@@ -85,6 +107,7 @@ const SUMMARY: &str =
 
 #[test]
 fn test_cache_keeps_decoded_groups_and_answers_the_same_rows() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = warm_table(&dir, "keeps");
     db.execute("PRAGMA GROUP_CACHE_MB = 64", ()).unwrap();
@@ -111,6 +134,7 @@ fn test_cache_keeps_decoded_groups_and_answers_the_same_rows() {
 
 #[test]
 fn test_cache_budget_bounds_the_bytes_and_zero_disables_it() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = warm_table(&dir, "budget");
 
@@ -132,8 +156,8 @@ fn test_cache_budget_bounds_the_bytes_and_zero_disables_it() {
     let (_, _, entries, _, _) = stats(&db);
     assert_eq!(entries, 0, "a zero budget must not cache");
 
-    db.execute("PRAGMA GROUP_CACHE_MB = 64", ()).unwrap();
-    assert_eq!(ids(&db, "PRAGMA GROUP_CACHE_MB"), [64]);
+    db.execute("PRAGMA GROUP_CACHE_MB = 32", ()).unwrap();
+    assert_eq!(ids(&db, "PRAGMA GROUP_CACHE_MB"), [32]);
 }
 
 // The cache's own invariants, exercised through its API: one decode shared
@@ -142,6 +166,7 @@ fn test_cache_budget_bounds_the_bytes_and_zero_disables_it() {
 // dictionary shared by the groups of one column counted once.
 
 mod invariants {
+    use super::serial;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Barrier};
     use std::time::Duration;
@@ -158,6 +183,7 @@ mod invariants {
 
     #[test]
     fn concurrent_readers_share_one_decode() {
+        let _serial = serial();
         DECODED_GROUPS.set_budget_bytes(1024);
         let starts = Arc::new(Barrier::new(16));
         let decodes = Arc::new(AtomicUsize::new(0));
@@ -185,6 +211,7 @@ mod invariants {
 
     #[test]
     fn an_entry_evicted_while_decoding_leaves_no_phantom_bytes() {
+        let _serial = serial();
         DECODED_GROUPS.set_budget_bytes(18);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
@@ -215,6 +242,7 @@ mod invariants {
 
     #[test]
     fn a_budget_of_zero_set_during_a_decode_leaves_the_cache_empty() {
+        let _serial = serial();
         DECODED_GROUPS.set_budget_bytes(18);
         let (entered_tx, entered_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
@@ -237,6 +265,7 @@ mod invariants {
 
     #[test]
     fn a_column_larger_than_the_budget_is_not_kept() {
+        let _serial = serial();
         DECODED_GROUPS.set_budget_bytes(1024 * 1024);
         DECODED_GROUPS
             .get_or_decode((500, 0, 0), || {
@@ -262,6 +291,7 @@ mod invariants {
         use stoolap::common::SmartString;
         use stoolap::storage::volume::column::ROW_GROUP_SIZE;
         use stoolap::storage::volume::writer::{CompressedBlockStore, LazyColumns};
+        let _serial = serial();
         let rows = 2 * ROW_GROUP_SIZE;
         let dictionary: Arc<[SmartString]> = (0..10_000)
             .map(|i| SmartString::from(format!("{i:010}{}", "x".repeat(90))))
@@ -286,6 +316,7 @@ mod invariants {
     fn a_zero_budget_racing_with_a_charge_leaves_nothing_behind() {
         const READERS: usize = 8;
         const ROUNDS: usize = 20_000;
+        let _serial = serial();
         let barrier = Barrier::new(READERS + 1);
         let mut failure = None;
         std::thread::scope(|scope| {
