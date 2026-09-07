@@ -511,6 +511,15 @@ impl ColumnData {
 
     /// Get the dictionary ID for a row. Returns u32::MAX on type mismatch.
     #[inline]
+    /// The per-row dictionary ids and null flags of a dictionary column, for
+    /// callers that test many rows in one pass
+    pub fn dict_ids(&self) -> Option<(&[u32], &[bool])> {
+        match self {
+            ColumnData::Dictionary { ids, nulls, .. } => Some((ids, nulls)),
+            _ => None,
+        }
+    }
+
     pub fn get_dict_id(&self, idx: usize) -> u32 {
         match self {
             ColumnData::Dictionary { ids, .. } => ids[idx],

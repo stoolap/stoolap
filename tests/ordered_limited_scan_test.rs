@@ -180,6 +180,58 @@ fn test_top_k_matches_the_full_sort_across_layouts() {
     check_all(&db);
 }
 
+/// Rows in time order, every key once per step, as a market data feed writes them
+fn insert_sorted(db: &Database, from: i64, steps: i64, keys: i64, step_secs: i64) {
+    let mut stmt = String::from("INSERT INTO c (t, k, v) VALUES ");
+    for s in 0..steps {
+        for k in 0..keys {
+            if s > 0 || k > 0 {
+                stmt.push(',');
+            }
+            stmt.push_str(&format!(
+                "('{}', 'k{k}', {})",
+                ts(from + s * step_secs),
+                (s * 7 + k) % 100
+            ));
+        }
+    }
+    db.execute(&stmt, ()).unwrap();
+}
+
+#[test]
+fn test_top_k_over_volumes_sorted_by_time() {
+    // Sorted volumes take the ordered walk that stops on the raw key
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = setup(&format!("file://{}/sorted", dir.path().display()));
+    let base = 1_709_251_200;
+    // Three sealed batches of 20 keys x 4,000 minutes, then deletes, then hot rows
+    for i in 0..3 {
+        insert_sorted(&db, base + i * 4_000 * 60, 4_000, 20, 60);
+        db.execute(&format!("DELETE FROM c WHERE v = {}", 10 + i), ())
+            .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        check_all(&db);
+    }
+    // A bigger sealed batch spanning several row groups
+    insert_sorted(&db, base + 12_000 * 60, 5_000, 20, 60);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("DELETE FROM c WHERE v = 99", ()).unwrap();
+    check_all(&db);
+    // Hot rows newer than the sealed ones, and a key that stopped producing
+    insert_sorted(&db, base + 22_000 * 60, 300, 19, 60);
+    check_all(&db);
+    db.execute("BEGIN", ()).unwrap();
+    let newest = ids(
+        &db,
+        "SELECT id FROM c WHERE k = 'k3' AND t < '2024-03-10 00:00:00' ORDER BY t DESC LIMIT 1",
+    );
+    db.execute(&format!("DELETE FROM c WHERE id = {}", newest[0]), ())
+        .unwrap();
+    check_all(&db);
+    db.execute("ROLLBACK", ()).unwrap();
+    check_all(&db);
+}
+
 #[test]
 fn test_top_k_over_a_volume_written_out_of_time_order() {
     // Three row groups of 65,536 rows whose time bounds run high, low, medium
@@ -291,4 +343,71 @@ fn test_top_k_on_the_memory_engine_and_after_reopen() {
     drop(db);
     let db = Database::open(&dsn).unwrap();
     check_all(&db);
+}
+
+#[test]
+fn test_top_k_reports_a_block_it_cannot_decode_instead_of_an_empty_answer() {
+    // A valid file whose column block fails to decode: the sorted-column
+    // binary search must not narrow the range to nothing and hide the error
+    use std::sync::Arc;
+    use stoolap::core::{Operator, Row, Value};
+    use stoolap::storage::expression::ComparisonExpr;
+    use stoolap::storage::traits::{Engine, Table};
+    use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
+    use stoolap::storage::volume::manifest::{SegmentManager, SegmentMeta};
+    use stoolap::storage::volume::table::SegmentedTable;
+    use stoolap::storage::volume::writer::VolumeBuilder;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open("memory://ordered_limited_scan_corrupt_block").unwrap();
+    db.execute("CREATE TABLE c (t INTEGER NOT NULL)", ())
+        .unwrap();
+    let tx = db.engine().begin_transaction().unwrap();
+    let hot = tx.get_table("c").unwrap();
+    let schema = hot.schema().clone();
+    let mut builder = VolumeBuilder::new(&schema);
+    builder.add_row(1, &Row::from_values(vec![Value::Integer(10)]));
+    builder.add_row(2, &Row::from_values(vec![Value::Integer(20)]));
+    let volume = builder.finish();
+    let path = write_volume_to_disk(dir.path(), "c", 1, &volume).unwrap();
+
+    // Keep the framing, metadata and CRC valid; replace the column block
+    let original = std::fs::read(&path).unwrap();
+    let meta_len = u32::from_le_bytes(original[16..20].try_into().unwrap()) as usize;
+    let index_offset = 20 + meta_len;
+    let mut bytes = original[..index_offset].to_vec();
+    bytes.extend_from_slice(&1u64.to_le_bytes());
+    bytes.extend_from_slice(&100u64.to_le_bytes());
+    bytes.push(0xff);
+    let crc = crc32fast::hash(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    let loaded = read_volume_from_disk(&path).unwrap();
+    assert!(loaded
+        .columns
+        .compressed_store()
+        .unwrap()
+        .decompress_single_group(0, 0)
+        .is_err());
+
+    let mgr = Arc::new(SegmentManager::new("c", Some(dir.path().to_path_buf())));
+    mgr.register_segment(
+        1,
+        Arc::new(volume.to_cold()),
+        SegmentMeta {
+            segment_id: 1,
+            file_path: path,
+            row_count: 2,
+            min_row_id: 1,
+            max_row_id: 2,
+            schema_version: 0,
+            creation_lsn: 0,
+            seal_seq: 0,
+        },
+        Some(&schema),
+    );
+    let table = SegmentedTable::new(hot, mgr);
+    let filter = ComparisonExpr::new("t", Operator::Lt, Value::Integer(15));
+    let result = table.scan_top_k(Some(&filter), "t", false, 1, 0);
+    assert!(result.is_err(), "corrupt column accepted: {result:?}");
 }

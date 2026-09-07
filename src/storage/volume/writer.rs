@@ -603,13 +603,15 @@ impl CompressedBlockStore {
 
     /// Binary search on a sorted column using row-group zone maps.
     /// Decompresses only the group(s) containing the target value.
-    /// Returns global row index (same as ColumnData::binary_search_ge/gt).
+    /// Returns global row index (same as ColumnData::binary_search_ge/gt),
+    /// or None when a block fails to decode: the caller must then keep the
+    /// range unnarrowed so the scan reaches the block and reports the error.
     pub fn binary_search_ge(
         &self,
         col_idx: usize,
         target: i64,
         row_groups: &[super::column::RowGroupMeta],
-    ) -> usize {
+    ) -> Option<usize> {
         self.binary_search_impl(col_idx, target, row_groups, false)
     }
 
@@ -618,7 +620,7 @@ impl CompressedBlockStore {
         col_idx: usize,
         target: i64,
         row_groups: &[super::column::RowGroupMeta],
-    ) -> usize {
+    ) -> Option<usize> {
         self.binary_search_impl(col_idx, target, row_groups, true)
     }
 
@@ -628,7 +630,7 @@ impl CompressedBlockStore {
         target: i64,
         row_groups: &[super::column::RowGroupMeta],
         strict: bool,
-    ) -> usize {
+    ) -> Option<usize> {
         let num_groups = self.blocks[col_idx].len();
 
         // Use zone maps to find the group containing the target.
@@ -650,10 +652,7 @@ impl CompressedBlockStore {
                 if target > max_i64 {
                     continue;
                 }
-                let col = match self.decompress_single_group(col_idx, gi) {
-                    Ok(c) => c,
-                    Err(_) => return 0, // corrupt block: scan from start (conservative)
-                };
+                let col = self.decompress_single_group(col_idx, gi).ok()?;
                 let group_rows = (rg.end_idx - rg.start_idx) as usize;
                 let local = if strict {
                     col.binary_search_gt(target)
@@ -661,26 +660,23 @@ impl CompressedBlockStore {
                     col.binary_search_ge(target)
                 };
                 if local < group_rows {
-                    return rg.start_idx as usize + local;
+                    return Some(rg.start_idx as usize + local);
                 }
             }
-            return self.row_count;
+            return Some(self.row_count);
         }
 
         if num_groups == 1 {
-            let col = match self.decompress_single_group(col_idx, 0) {
-                Ok(c) => c,
-                Err(_) => return 0,
-            };
-            return if strict {
+            let col = self.decompress_single_group(col_idx, 0).ok()?;
+            return Some(if strict {
                 col.binary_search_gt(target)
             } else {
                 col.binary_search_ge(target)
-            };
+            });
         }
 
         // Fallback: full column (shouldn't happen for V4 with zone maps)
-        self.row_count
+        Some(self.row_count)
     }
 
     /// Number of groups for a given column.

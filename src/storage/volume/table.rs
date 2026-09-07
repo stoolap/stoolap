@@ -126,6 +126,14 @@ impl TopK {
         }
     }
 
+    /// The key a row must beat once k rows are held
+    fn worst_key(&self) -> Option<&Value> {
+        if self.heap.len() < self.k {
+            return None;
+        }
+        self.heap.peek().map(|r| &r.key)
+    }
+
     /// True once k rows are held and no row bounded by `bound` can beat the worst
     fn cannot_improve(&self, bound: &Value) -> bool {
         if self.heap.len() < self.k {
@@ -703,44 +711,55 @@ impl SegmentedTable {
                             None
                         };
                         match op {
+                            // A search that hits a block it cannot decode
+                            // leaves the range as it is: the scan then reaches
+                            // the block and reports the error
                             crate::core::Operator::Gte => {
                                 let idx = if let Some(st) = store {
                                     st.binary_search_ge(col_idx, target, &vol.meta.row_groups)
                                 } else {
-                                    vol.columns[col_idx].binary_search_ge(target)
+                                    Some(vol.columns[col_idx].binary_search_ge(target))
                                 };
-                                if idx > start {
-                                    start = idx;
+                                if let Some(idx) = idx {
+                                    if idx > start {
+                                        start = idx;
+                                    }
                                 }
                             }
                             crate::core::Operator::Gt => {
                                 let idx = if let Some(st) = store {
                                     st.binary_search_gt(col_idx, target, &vol.meta.row_groups)
                                 } else {
-                                    vol.columns[col_idx].binary_search_gt(target)
+                                    Some(vol.columns[col_idx].binary_search_gt(target))
                                 };
-                                if idx > start {
-                                    start = idx;
+                                if let Some(idx) = idx {
+                                    if idx > start {
+                                        start = idx;
+                                    }
                                 }
                             }
                             crate::core::Operator::Lte => {
                                 let idx = if let Some(st) = store {
                                     st.binary_search_gt(col_idx, target, &vol.meta.row_groups)
                                 } else {
-                                    vol.columns[col_idx].binary_search_gt(target)
+                                    Some(vol.columns[col_idx].binary_search_gt(target))
                                 };
-                                if idx < end {
-                                    end = idx;
+                                if let Some(idx) = idx {
+                                    if idx < end {
+                                        end = idx;
+                                    }
                                 }
                             }
                             crate::core::Operator::Lt => {
                                 let idx = if let Some(st) = store {
                                     st.binary_search_ge(col_idx, target, &vol.meta.row_groups)
                                 } else {
-                                    vol.columns[col_idx].binary_search_ge(target)
+                                    Some(vol.columns[col_idx].binary_search_ge(target))
                                 };
-                                if idx < end {
-                                    end = idx;
+                                if let Some(idx) = idx {
+                                    if idx < end {
+                                        end = idx;
+                                    }
                                 }
                             }
                             _ => {}
@@ -3983,7 +4002,8 @@ impl Table for SegmentedTable {
                 break;
             }
             let (seg_id, cs) = &volumes[i];
-            let (should_skip, _, _) = Self::prune_volume(&cs.volume, &comparisons, &bloom_hashes);
+            let (should_skip, mut narrow_start, mut narrow_end) =
+                Self::prune_volume(&cs.volume, &comparisons, &bloom_hashes);
             if should_skip {
                 continue;
             }
@@ -3993,11 +4013,17 @@ impl Table for SegmentedTable {
                     Some(v) => v,
                     None => continue,
                 };
+                // Only a loaded volume can narrow the range through the sorted
+                // columns' binary search; a warm one already did above
+                (_, narrow_start, narrow_end) =
+                    Self::prune_volume(&loaded, &comparisons, &bloom_hashes);
                 &loaded
             } else {
                 &cs.volume
             };
-            // Row groups in bound order; a volume without group metadata is one group
+            let sorted = vol.is_sorted(vcol);
+            // Row groups in bound order, clipped to the narrowed range; a
+            // volume without group metadata is one group
             let mut groups: Vec<(usize, usize, Option<&Value>)> = vol
                 .meta
                 .row_groups
@@ -4013,6 +4039,11 @@ impl Table for SegmentedTable {
             if groups.is_empty() {
                 groups.push((0, vol.meta.row_count, None));
             }
+            for group in &mut groups {
+                group.0 = group.0.max(narrow_start);
+                group.1 = group.1.min(narrow_end);
+            }
+            groups.retain(|g| g.0 < g.1);
             // Bound order, not physical order: a volume written out of time order
             // has its best group anywhere. A group without a bound goes first.
             groups.sort_by(|a, b| match (&a.2, &b.2) {
@@ -4042,12 +4073,25 @@ impl Table for SegmentedTable {
                 scanner.set_column_mapping(
                     self.segment_mgr.get_volume_mapping(*seg_id, current_schema),
                 );
+                // In a sorted volume the rows come in key order: walk from the
+                // best end and stop at the first key the heap cannot use
+                if sorted {
+                    scanner.set_ordered_walk(ascending);
+                    if let Some(worst) = keep.worst_key() {
+                        scanner.set_stop_key(vcol, worst, ascending);
+                    }
+                }
                 if let Some(filter) = &prepared_filter {
                     scanner.set_filter(filter.clone_box());
                 }
                 while scanner.next() {
                     let (row_id, row) = scanner.take_row_with_id();
                     keep.offer(row_id, row);
+                    if sorted {
+                        if let Some(worst) = keep.worst_key() {
+                            scanner.set_stop_key(vcol, worst, ascending);
+                        }
+                    }
                 }
                 if let Some(e) = scanner.err() {
                     return Err(crate::core::Error::internal(format!("scan error: {}", e)));

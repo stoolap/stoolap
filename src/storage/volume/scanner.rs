@@ -151,9 +151,175 @@ pub struct VolumeScanner {
     /// integer division in the slow-path scan loop. Recomputed only on group
     /// boundary crossings. 0 means "not yet initialized".
     next_group_boundary: usize,
+    /// Walk the range from its end down to its start
+    reverse: bool,
+    /// The caller consumes rows in the volume's order and may stop early, so
+    /// the eager dictionary pre-scan over the whole range is not done
+    ordered_walk: bool,
+    /// Stop when the raw key of the row under the cursor is past this bound:
+    /// (physical column, key, ascending). Only meaningful on a sorted column.
+    stop_key: Option<(usize, i64, bool)>,
+    /// Rows of the current group that pass the dictionary filters, ascending,
+    /// found in one pass over the raw ids; consumed from the back on a
+    /// reverse walk
+    group_candidates: Vec<usize>,
+    /// The group `group_candidates` was computed for
+    candidates_group: Option<usize>,
 }
 
 impl VolumeScanner {
+    /// Rows in the volume's order, from the start (ascending) or from the end
+    /// (descending), without the eager dictionary pre-scan over the range
+    pub fn set_ordered_walk(&mut self, ascending: bool) {
+        self.ordered_walk = true;
+        self.reverse = !ascending;
+    }
+
+    /// Stop as soon as the row under the cursor has a key past `bound`
+    /// (below it walking backwards, above it walking forwards). The column
+    /// must be sorted in the volume; only integer and timestamp keys count.
+    pub fn set_stop_key(&mut self, col_idx: usize, bound: &Value, ascending: bool) {
+        let target = match (bound, self.volume.columns.data_type(col_idx)) {
+            (Value::Integer(v), crate::core::DataType::Integer) => *v,
+            (Value::Timestamp(dt), crate::core::DataType::Timestamp) => {
+                dt.timestamp_nanos_opt().unwrap_or_else(|| {
+                    dt.timestamp()
+                        .saturating_mul(1_000_000_000)
+                        .saturating_add(dt.timestamp_subsec_nanos() as i64)
+                })
+            }
+            _ => return,
+        };
+        self.stop_key = Some((col_idx, target, ascending));
+    }
+
+    /// True when the row at `idx` lies past the stop key
+    fn past_stop_key(&self, idx: usize) -> bool {
+        let Some((col_idx, target, ascending)) = self.stop_key else {
+            return false;
+        };
+        let (col, local) = self.col_and_idx(col_idx, idx);
+        if col.is_null(local) {
+            return false;
+        }
+        let key = col.get_i64(local);
+        if ascending {
+            key > target
+        } else {
+            key < target
+        }
+    }
+
+    /// The rows in `[lo, hi)` that pass every dictionary filter, in one pass
+    /// over the raw ids of the group; None when a filter column is not a
+    /// dictionary column here and the rows must be tested one by one
+    fn dictionary_candidates(&self, lo: usize, hi: usize) -> Option<Vec<usize>> {
+        let mut slices: Vec<(&[u32], &[bool], usize, u32)> =
+            Vec::with_capacity(self.dict_filters.len());
+        for &(col_idx, expected) in &self.dict_filters {
+            let (col, local_lo) = self.col_and_idx(col_idx, lo);
+            let (ids, nulls) = col.dict_ids()?;
+            if local_lo + (hi - lo) > ids.len() {
+                return None;
+            }
+            slices.push((ids, nulls, local_lo, expected));
+        }
+        let mut candidates = Vec::new();
+        let (first_ids, first_nulls, first_lo, first_expected) = slices[0];
+        for offset in 0..hi - lo {
+            let local = first_lo + offset;
+            if first_nulls[local] || first_ids[local] != first_expected {
+                continue;
+            }
+            let others_match = slices[1..].iter().all(|&(ids, nulls, base, expected)| {
+                let local = base + offset;
+                !nulls[local] && ids[local] == expected
+            });
+            if others_match {
+                candidates.push(lo + offset);
+            }
+        }
+        Some(candidates)
+    }
+
+    /// The reverse walk: the newest row of the range first. Row groups are
+    /// entered from their end; a pruned group is skipped whole; with
+    /// dictionary filters the group's candidates are found in one pass.
+    fn next_reverse(&mut self) -> bool {
+        let use_group_cache = self.volume.columns.should_use_group_cache();
+        while self.current_idx < self.end_idx {
+            let idx = self.end_idx - 1;
+            let group_idx = idx / super::column::ROW_GROUP_SIZE;
+            let group_start = group_idx * super::column::ROW_GROUP_SIZE;
+            let cached = self.group_cache.as_ref().map(|c| c.group_idx);
+            if cached != Some(group_idx) {
+                if let Some(ref skips) = self.row_group_skips {
+                    if group_idx < skips.len() && skips[group_idx] {
+                        self.end_idx = group_start.max(self.current_idx);
+                        continue;
+                    }
+                }
+                if use_group_cache {
+                    self.load_group_cache(group_idx);
+                    if self.error.is_some() {
+                        self.has_current = false;
+                        return false;
+                    }
+                }
+            }
+            if !self.dict_filters.is_empty() && self.candidates_group != Some(group_idx) {
+                let lo = group_start.max(self.current_idx);
+                match self.dictionary_candidates(lo, self.end_idx) {
+                    Some(candidates) => {
+                        self.group_candidates = candidates;
+                        self.candidates_group = Some(group_idx);
+                    }
+                    None => {
+                        self.group_candidates.clear();
+                        self.candidates_group = None;
+                    }
+                }
+            }
+            let idx = if self.candidates_group == Some(group_idx) {
+                match self.group_candidates.pop() {
+                    Some(idx) => idx,
+                    None => {
+                        // The group holds no more candidates: leave it whole
+                        self.end_idx = group_start.max(self.current_idx);
+                        continue;
+                    }
+                }
+            } else {
+                idx
+            };
+            if self.past_stop_key(idx) {
+                self.end_idx = self.current_idx;
+                self.has_current = false;
+                return false;
+            }
+            self.end_idx = idx;
+            if self.should_skip_row(idx) {
+                continue;
+            }
+            if self.candidates_group != Some(group_idx)
+                && !self.dict_filters.is_empty()
+                && self.dict_filters_reject(idx)
+            {
+                continue;
+            }
+            if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx) {
+                continue;
+            }
+            if !self.materialize_row(idx) {
+                continue;
+            }
+            self.current_rid = self.volume.meta.row_ids[idx];
+            self.has_current = true;
+            return true;
+        }
+        self.has_current = false;
+        false
+    }
     /// Compute whether `project_cols` is an identity mapping over all volume columns.
     /// Extracted as a helper so both constructors share the same logic.
     #[inline]
@@ -199,6 +365,11 @@ impl VolumeScanner {
             row_group_skips: None,
             group_cache: None,
             next_group_boundary: 0,
+            reverse: false,
+            ordered_walk: false,
+            stop_key: None,
+            group_candidates: Vec::new(),
+            candidates_group: None,
         };
         if !s.is_full_projection && s.volume.columns.should_use_group_cache() {
             let mut mask = vec![false; s.volume.columns.len()];
@@ -251,6 +422,11 @@ impl VolumeScanner {
             row_group_skips: None,
             group_cache: None,
             next_group_boundary: 0,
+            reverse: false,
+            ordered_walk: false,
+            stop_key: None,
+            group_candidates: Vec::new(),
+            candidates_group: None,
         };
         if !s.is_full_projection && s.volume.columns.should_use_group_cache() {
             let mut mask = vec![false; s.volume.columns.len()];
@@ -335,6 +511,11 @@ impl VolumeScanner {
             row_group_skips: None,
             group_cache: None,
             next_group_boundary: 0,
+            reverse: false,
+            ordered_walk: false,
+            stop_key: None,
+            group_candidates: Vec::new(),
+            candidates_group: None,
         }
     }
 
@@ -377,7 +558,9 @@ impl VolumeScanner {
         // Pre-compute matching row indices from dictionary filters.
         // Skip pre-computation when match rate is too high (>10%) to avoid
         // large Vec allocation — use streaming dict filter in the slow path instead.
-        if !self.dict_filters.is_empty() {
+        // An ordered walk may stop after a few rows, so it never pays for the
+        // whole range up front.
+        if !self.dict_filters.is_empty() && !self.ordered_walk {
             let scan_range = self.end_idx - self.current_idx;
             let selectivity_cap = scan_range / 10; // 10% threshold
             let matches = if let Some(st) = store {
@@ -862,6 +1045,9 @@ impl Scanner for VolumeScanner {
             self.has_current = false;
             return false;
         }
+        if self.reverse {
+            return self.next_reverse();
+        }
 
         // Fast path: use pre-computed matching indices (from dictionary filters).
         let use_group_cache_fast = self.volume.columns.should_use_group_cache();
@@ -934,6 +1120,12 @@ impl Scanner for VolumeScanner {
                         return false;
                     }
                 }
+            }
+
+            if self.stop_key.is_some() && self.past_stop_key(self.current_idx) {
+                self.current_idx = self.end_idx;
+                self.has_current = false;
+                return false;
             }
 
             if self.should_skip_row(self.current_idx) {
