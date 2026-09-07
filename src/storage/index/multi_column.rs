@@ -312,6 +312,25 @@ impl MultiColumnIndex {
         grouped
     }
 
+    /// Remove the sorted `ids` from the sorted `rows`, touching only the rows
+    /// from the first removed id onwards: taking the newest rows off a large
+    /// group stays cheap, taking the whole group is one pass.
+    fn subtract_sorted(rows: &mut CompactVec<i64>, ids: &[i64]) {
+        let Some(&first) = ids.first() else {
+            return;
+        };
+        let start = rows.binary_search(&first).unwrap_or_else(|pos| pos);
+        let slice = rows.as_mut_slice();
+        let mut keep = start;
+        for read in start..slice.len() {
+            if ids.binary_search(&slice[read]).is_err() {
+                slice[keep] = slice[read];
+                keep += 1;
+            }
+        }
+        rows.truncate(keep);
+    }
+
     /// Check uniqueness constraint (must be called while holding write lock on value_to_rows)
     fn check_unique_constraint_locked(
         &self,
@@ -796,7 +815,7 @@ impl Index for MultiColumnIndex {
             let mut sorted_values = self.sorted_values.write();
             for (key, ids) in removed {
                 if let Some(rows) = sorted_values.get_mut(&key) {
-                    rows.retain(|id| ids.binary_search(id).is_err());
+                    Self::subtract_sorted(rows, &ids);
                     if rows.is_empty() {
                         sorted_values.remove(&key);
                     }
@@ -811,7 +830,7 @@ impl Index for MultiColumnIndex {
                 let mut prefix_index = self.prefix_indexes[idx].write();
                 for (key, ids) in removed {
                     if let Some(rows) = prefix_index.get_mut(&key) {
-                        rows.retain(|id| ids.binary_search(id).is_err());
+                        Self::subtract_sorted(rows, &ids);
                         if rows.is_empty() {
                             prefix_index.remove(&key);
                         }
@@ -1182,6 +1201,17 @@ mod tests {
         assert_eq!(hits.len(), per_key as usize);
         assert!(hits.windows(2).all(|w| w[0].row_id < w[1].row_id));
 
+        // Taking the newest two rows off the group leaves the rest untouched
+        let newest: Vec<(i64, &[Value])> = all[all.len() - 2..]
+            .iter()
+            .map(|(row_id, values)| (*row_id, values.as_slice()))
+            .collect();
+        index.remove_batch_slice(&newest).unwrap();
+        let hits = index.find(&[Value::Integer(0)]).unwrap();
+        assert_eq!(hits.len(), per_key as usize - 2);
+        assert_eq!(hits.last().map(|h| h.row_id), Some(per_key - 3));
+        all.truncate(all.len() - 2);
+
         // Range use builds the sorted structure too
         assert_eq!(
             index
@@ -1209,7 +1239,7 @@ mod tests {
             start.elapsed()
         );
         let hits = index.find(&[Value::Integer(0)]).unwrap();
-        assert_eq!(hits.len(), per_key as usize / 2);
+        assert_eq!(hits.len(), all.len() - half.len());
         assert!(hits.iter().all(|h| h.row_id % 2 == 1));
 
         let rest: Vec<(i64, &[Value])> = all
