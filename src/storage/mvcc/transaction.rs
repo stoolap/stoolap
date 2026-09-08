@@ -144,6 +144,18 @@ pub trait TransactionEngineOperations: Send + Sync {
         super::version_store::PublishHold::default()
     }
 
+    /// Waits while a table the transaction writes holds more hot bytes than
+    /// its limit allows, so a seal can bring it back under. No fence is held.
+    fn wait_for_hot_admission(&self, txn_id: i64) {
+        let _ = txn_id;
+    }
+
+    /// Asks for a seal when a table the now visible commit wrote is at the
+    /// hot row or byte limit
+    fn request_seal_if_over(&self, hold: &super::version_store::PublishHold) {
+        let _ = hold;
+    }
+
     /// Discard the cold-row tombstones the transaction made after a timestamp
     /// (savepoint rollback). Engines without cold storage have none.
     fn rollback_tombstones_after(&self, _txn_id: i64, _timestamp: i64) {}
@@ -445,6 +457,9 @@ impl Transaction for MvccTransaction {
 
         // Two-phase commit protocol
         if !is_read_only {
+            if let Some(ops) = &self.engine_operations {
+                ops.wait_for_hot_admission(self.id);
+            }
             // Acquire seal fence shared lock. This signals to the checkpoint
             // micro-seal that a commit is in-flight. The micro-seal waits for
             // all in-flight commits to finish before draining hot rows.
@@ -472,6 +487,9 @@ impl Transaction for MvccTransaction {
                         // Partial commit: some tables already committed.
                         // We MUST complete the commit to avoid orphaning those rows.
                         self.registry.complete_commit(self.id);
+                        if let Some(hold) = &publish {
+                            ops.request_seal_if_over(hold);
+                        }
                         // Record commit marker so WAL recovery sees committed state
                         ops.record_commit(self.id)?;
                         self.state = TransactionState::Committed;
@@ -513,6 +531,9 @@ impl Transaction for MvccTransaction {
 
             // Phase 4: Complete commit - make changes visible in registry
             self.registry.complete_commit(self.id);
+            if let (Some(ops), Some(hold)) = (&self.engine_operations, &publish) {
+                ops.request_seal_if_over(hold);
+            }
         } else {
             // Read-only transaction - just mark as committed in registry
             self.registry.complete_commit(self.id);

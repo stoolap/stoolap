@@ -108,6 +108,16 @@ pub struct PersistenceConfig {
     /// reduce per-volume metadata overhead.
     /// Default: 1,048,576 (1M rows = ~16 row groups of 64K each)
     pub target_volume_rows: usize,
+
+    /// Committed hot rows of one table that ask for a seal right away
+    /// instead of at the next checkpoint interval. 0 disables the trigger.
+    /// Default: 262,144 (four row groups)
+    pub hot_max_rows: usize,
+
+    /// Hot row bytes of one table above which commits wait for a seal to
+    /// bring the table back under the limit. 0 disables the wait.
+    /// Default: 0
+    pub hot_max_bytes: usize,
 }
 
 impl Default for PersistenceConfig {
@@ -128,6 +138,8 @@ impl Default for PersistenceConfig {
             keep_snapshots: 3,              // Keep 3 backup snapshots per table
             checkpoint_on_close: true,      // Seal all data on clean shutdown
             target_volume_rows: 1_048_576,  // 1M rows per volume (~16 row groups)
+            hot_max_rows: 262_144,          // Seal a table early at four row groups
+            hot_max_bytes: 0,               // No admission wait
         }
     }
 }
@@ -156,6 +168,8 @@ impl PersistenceConfig {
             keep_snapshots: 3,
             checkpoint_on_close: true,
             target_volume_rows: 1_048_576,
+            hot_max_rows: 262_144,
+            hot_max_bytes: 0,
         }
     }
 
@@ -177,6 +191,8 @@ impl PersistenceConfig {
             keep_snapshots: 3,
             checkpoint_on_close: true,
             target_volume_rows: 2_097_152, // 2M rows for fast mode
+            hot_max_rows: 262_144,
+            hot_max_bytes: 0,
         }
     }
 

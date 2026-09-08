@@ -492,6 +492,19 @@ impl PublishHold {
         self.stores.push(txn_store);
     }
 
+    /// True when a table this commit wrote holds `max_rows` committed hot
+    /// rows or `max_bytes` hot bytes or more (0 = no limit); asked once the
+    /// commit is visible, so the seal it requests can extract the rows
+    pub fn any_table_at(&self, max_rows: usize, max_bytes: usize) -> bool {
+        self.stores.iter().any(|store| {
+            store.read().is_ok_and(|s| {
+                let parent = &s.parent_store;
+                (max_rows > 0 && parent.committed_row_count() >= max_rows)
+                    || (max_bytes > 0 && parent.hot_bytes() >= max_bytes)
+            })
+        })
+    }
+
     /// Takes back the index updates of a commit that failed after applying
     /// them, so the indexes describe the rows that stayed visible
     pub fn undo_index_updates(&self) {
@@ -2024,6 +2037,27 @@ impl VersionStore {
     #[inline]
     pub fn committed_row_count(&self) -> usize {
         self.committed_row_count.load(Ordering::Relaxed)
+    }
+
+    /// Bytes of the rows the arena holds, kept exact by every mutation
+    #[inline]
+    pub fn hot_bytes(&self) -> usize {
+        self.arena.bytes()
+    }
+
+    /// Arena slots in use (deleted and cleared ones included) and the bytes
+    /// its slot vectors reserve
+    pub fn arena_footprint(&self) -> (usize, usize) {
+        (self.arena.len(), self.arena.capacity_bytes())
+    }
+
+    /// Previous versions kept alive by the version chains
+    pub fn chain_entries(&self) -> usize {
+        let versions = self.versions.read().clone();
+        versions
+            .iter()
+            .map(|(_, chain)| count_chain_depth(chain).saturating_sub(1))
+            .sum()
     }
 
     /// Check if a row_id exists in the committed version store (B-tree).
@@ -6872,6 +6906,14 @@ impl TransactionVersionStore {
         self.local_versions
             .as_ref()
             .is_some_and(|lv| lv.contains_key(row_id))
+    }
+
+    /// True when the transaction claimed rows that already exist in the hot
+    /// store: a seal skips those, so waiting for it cannot free them
+    pub fn holds_hot_rows(&self) -> bool {
+        self.write_set
+            .as_ref()
+            .is_some_and(|ws| ws.values().any(|e| e.read_version.is_some()))
     }
 
     /// Returns true if this transaction has any uncommitted local changes

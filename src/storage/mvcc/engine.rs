@@ -21,8 +21,8 @@ use crate::common::{CompactArc, I64Map, SmartString, StringMap};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::borrow::Cow;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use std::path::Path;
 
@@ -405,6 +405,44 @@ impl ViewDefinition {
 /// Arc-wrapped so lookups are a ref-count bump (no Vec clone on every FK check).
 type FkReverseCache = (u64, StringMap<Arc<Vec<(String, ForeignKeyConstraint)>>>);
 
+/// `hot_max_rows` / `hot_max_bytes` mirrored from the config so the commit
+/// path reads them without the config lock, the seal request a commit
+/// raises when a table passes them, and the wait of commits over the byte
+/// limit until a seal cycle brings the table back under
+struct HotLimits {
+    max_rows: AtomicUsize,
+    max_bytes: AtomicUsize,
+    seal_requested: AtomicBool,
+    admission: (Mutex<()>, Condvar),
+    admission_waits: AtomicU64,
+}
+
+impl HotLimits {
+    fn new(config: &crate::storage::config::PersistenceConfig) -> Self {
+        Self {
+            max_rows: AtomicUsize::new(config.hot_max_rows),
+            max_bytes: AtomicUsize::new(config.hot_max_bytes),
+            seal_requested: AtomicBool::new(false),
+            admission: (Mutex::new(()), Condvar::new()),
+            admission_waits: AtomicU64::new(0),
+        }
+    }
+}
+
+/// One PRAGMA MEMORY_STATS row: a table's hot and cold footprint, or the
+/// process totals when `table_name` is `*`
+#[derive(Debug, Default, Clone)]
+pub struct MemoryStat {
+    pub table_name: String,
+    pub hot_rows: usize,
+    pub hot_bytes: usize,
+    pub arena_slots: usize,
+    pub arena_capacity_bytes: usize,
+    pub chain_entries: usize,
+    pub volume_bytes: usize,
+    pub admission_waits: u64,
+}
+
 /// MVCC Storage Engine
 ///
 /// Provides multi-version concurrency control with snapshot isolation.
@@ -456,6 +494,8 @@ pub struct MVCCEngine {
     /// When true, seal_hot_buffers bypasses thresholds and seals all rows.
     /// Set during close_engine to ensure all data is in volumes before shutdown.
     force_seal_all: AtomicBool,
+    /// Hot size limits and the seal request they raise, shared with commits
+    hot_limits: Arc<HotLimits>,
     /// Prevents concurrent checkpoint cycles (background thread vs PRAGMA SNAPSHOT).
     /// Without this, two concurrent seal+compact runs can each read the same old
     /// segments, produce overlapping compacted volumes, and delete each other's data.
@@ -523,6 +563,7 @@ impl MVCCEngine {
     /// Creates a new MVCC engine with the given configuration
     pub fn new(config: Config) -> Self {
         let path = config.path.clone().unwrap_or_default();
+        let hot_limits = Arc::new(HotLimits::new(&config.persistence));
 
         // Initialize persistence manager if path is provided and persistence is enabled
         let persistence = if !path.is_empty() && config.persistence.enabled {
@@ -560,6 +601,7 @@ impl MVCCEngine {
             snapshot_timestamps: RwLock::new(FxHashMap::default()),
             segment_managers: Arc::new(RwLock::new(FxHashMap::default())),
             force_seal_all: AtomicBool::new(false),
+            hot_limits,
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
             compaction_running: Arc::new(AtomicBool::new(false)),
@@ -823,7 +865,10 @@ impl MVCCEngine {
 
                 let check_interval = std::time::Duration::from_millis(100);
                 let mut elapsed = std::time::Duration::ZERO;
-                while elapsed < loop_interval && !stop_flag_clone.load(Ordering::Acquire) {
+                while elapsed < loop_interval
+                    && !stop_flag_clone.load(Ordering::Acquire)
+                    && !engine.hot_limits.seal_requested.load(Ordering::Acquire)
+                {
                     thread::sleep(check_interval);
                     elapsed += check_interval;
                 }
@@ -833,7 +878,7 @@ impl MVCCEngine {
                 }
 
                 // Perform cleanup at the original cleanup interval
-                time_since_cleanup += loop_interval;
+                time_since_cleanup += elapsed;
                 if time_since_cleanup >= interval {
                     time_since_cleanup = std::time::Duration::ZERO;
                     let _txn_count = engine.cleanup_old_transactions(txn_retention);
@@ -841,8 +886,13 @@ impl MVCCEngine {
                     let _prev_version_count = engine.cleanup_old_previous_versions();
                 }
 
-                // Auto-checkpoint using the cached interval
-                if !current_checkpoint_interval.is_zero() {
+                // Auto-checkpoint using the cached interval, or right away
+                // when a commit asked for a seal
+                let requested = engine
+                    .hot_limits
+                    .seal_requested
+                    .swap(false, Ordering::AcqRel);
+                if requested || !current_checkpoint_interval.is_zero() {
                     if let Some(ref pm) = *engine.persistence {
                         let last = pm.last_checkpoint_time();
                         let now = std::time::SystemTime::now()
@@ -851,7 +901,10 @@ impl MVCCEngine {
                             .unwrap_or(0);
                         let elapsed_nanos = now.saturating_sub(last);
                         let interval_nanos = current_checkpoint_interval.as_nanos() as i64;
-                        if elapsed_nanos >= interval_nanos {
+                        if requested
+                            || (!current_checkpoint_interval.is_zero()
+                                && elapsed_nanos >= interval_nanos)
+                        {
                             // Call checkpoint_cycle_inner directly (not
                             // checkpoint_cycle) so compaction is spawned on
                             // a separate thread instead of running synchronously.
@@ -2191,8 +2244,61 @@ impl MVCCEngine {
         }
         drop(current);
 
+        self.hot_limits
+            .max_rows
+            .store(config.persistence.hot_max_rows, Ordering::Relaxed);
+        self.hot_limits
+            .max_bytes
+            .store(config.persistence.hot_max_bytes, Ordering::Relaxed);
         *self.config.write().unwrap() = config;
         Ok(())
+    }
+
+    /// Per-table memory figures for PRAGMA MEMORY_STATS, plus a final `*`
+    /// row with the totals and the number of commits that waited for a seal.
+    pub fn memory_stats(&self) -> Vec<MemoryStat> {
+        let mut volume_bytes: FxHashMap<String, usize> = FxHashMap::default();
+        for (table, _, _, _, mem, _, _) in self.volume_stats() {
+            *volume_bytes.entry(table).or_default() += mem;
+        }
+        let stores: Vec<(String, Arc<VersionStore>)> = {
+            let stores = self.version_stores.read().unwrap();
+            let mut names: Vec<&String> = stores.keys().collect();
+            names.sort();
+            names
+                .into_iter()
+                .filter_map(|name| stores.get(name).map(|s| (name.clone(), Arc::clone(s))))
+                .collect()
+        };
+        let mut result = Vec::with_capacity(stores.len() + 1);
+        let mut total = MemoryStat {
+            table_name: "*".to_string(),
+            admission_waits: self.hot_limits.admission_waits.load(Ordering::Relaxed),
+            ..Default::default()
+        };
+        for (name, store) in stores {
+            let (arena_slots, arena_capacity_bytes) = store.arena_footprint();
+            let stat = MemoryStat {
+                hot_rows: store.committed_row_count(),
+                hot_bytes: store.hot_bytes(),
+                arena_slots,
+                arena_capacity_bytes,
+                chain_entries: store.chain_entries(),
+                volume_bytes: volume_bytes.remove(&name).unwrap_or(0),
+                table_name: name,
+                admission_waits: 0,
+            };
+            total.hot_rows += stat.hot_rows;
+            total.hot_bytes += stat.hot_bytes;
+            total.arena_slots += stat.arena_slots;
+            total.arena_capacity_bytes += stat.arena_capacity_bytes;
+            total.chain_entries += stat.chain_entries;
+            total.volume_bytes += stat.volume_bytes;
+            result.push(stat);
+        }
+        total.volume_bytes += volume_bytes.values().sum::<usize>();
+        result.push(total);
+        result
     }
 
     /// Returns the transaction registry
@@ -5016,6 +5122,13 @@ impl MVCCEngine {
             self.force_seal_all.store(false, Ordering::Release);
         }
 
+        {
+            // Under the mutex, so a writer between its check and its wait
+            // cannot miss this wakeup
+            let _admission = self.hot_limits.admission.0.lock().unwrap();
+            self.hot_limits.admission.1.notify_all();
+        }
+
         // Step 3: Brief fence — block commits just long enough to check if all
         // hot buffers are empty and capture checkpoint_lsn. NO disk I/O inside
         // the fence. Previously this ran a full seal_hot_buffers() (with volume
@@ -5686,8 +5799,16 @@ impl MVCCEngine {
     fn seal_hot_buffers(&self) -> Result<()> {
         const SEAL_ROW_THRESHOLD: usize = 100_000;
         const SEAL_INCREMENTAL_THRESHOLD: usize = 10_000;
-        let seal_row_threshold = SEAL_ROW_THRESHOLD;
-        let seal_incremental_threshold = SEAL_INCREMENTAL_THRESHOLD;
+        let hot_max_rows = self.hot_limits.max_rows.load(Ordering::Relaxed);
+        let bounded = |threshold: usize| {
+            if hot_max_rows > 0 {
+                threshold.min(hot_max_rows)
+            } else {
+                threshold
+            }
+        };
+        let seal_row_threshold = bounded(SEAL_ROW_THRESHOLD);
+        let seal_incremental_threshold = bounded(SEAL_INCREMENTAL_THRESHOLD);
         let target_volume_rows = self
             .config
             .read()
@@ -6694,6 +6815,8 @@ struct EngineOperations {
         Arc<RwLock<FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>>>,
     /// Seal fence for WAL truncation safety
     seal_fence: Arc<parking_lot::RwLock<()>>,
+    /// Hot size limits shared with the engine
+    hot_limits: Arc<HotLimits>,
 }
 
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
@@ -6709,6 +6832,7 @@ impl EngineOperations {
             loading_from_disk: Arc::clone(&engine.loading_from_disk),
             segment_managers: Arc::clone(&engine.segment_managers),
             seal_fence: Arc::clone(&engine.seal_fence),
+            hot_limits: Arc::clone(&engine.hot_limits),
         }
     }
 
@@ -7696,6 +7820,64 @@ impl TransactionEngineOperations for EngineOperations {
 
     fn acquire_seal_fence(&self) -> Option<SealFenceGuard> {
         Some(SealFenceGuard::new(Arc::clone(&self.seal_fence)))
+    }
+
+    fn request_seal_if_over(&self, hold: &super::version_store::PublishHold) {
+        let max_rows = self.hot_limits.max_rows.load(Ordering::Relaxed);
+        let max_bytes = self.hot_limits.max_bytes.load(Ordering::Relaxed);
+        if hold.any_table_at(max_rows, max_bytes) {
+            self.hot_limits
+                .seal_requested
+                .store(true, Ordering::Release);
+        }
+    }
+
+    fn wait_for_hot_admission(&self, txn_id: i64) {
+        let limits = &self.hot_limits;
+        let limit = limits.max_bytes.load(Ordering::Relaxed);
+        if limit == 0
+            || !self
+                .persistence
+                .as_ref()
+                .as_ref()
+                .is_some_and(|pm| pm.is_enabled())
+        {
+            return;
+        }
+        // A table whose existing rows this transaction claimed is left out:
+        // the seal skips claimed rows, so the wait could not end
+        let stores: Vec<Arc<VersionStore>> = {
+            let cache = self.txn_version_stores().read().unwrap();
+            let Some(txn_tables) = cache.get(txn_id) else {
+                return;
+            };
+            let stores = self.version_stores().read().unwrap();
+            txn_tables
+                .iter()
+                .filter(|(_, txn_store)| txn_store.read().is_ok_and(|s| !s.holds_hot_rows()))
+                .filter_map(|(table_name, _)| stores.get(table_name.as_str()).cloned())
+                .collect()
+        };
+        let over = || stores.iter().any(|store| store.hot_bytes() >= limit);
+        if !over() {
+            return;
+        }
+        limits.admission_waits.fetch_add(1, Ordering::Relaxed);
+        limits.seal_requested.store(true, Ordering::Release);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut guard = limits.admission.0.lock().unwrap();
+        while over() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            guard = limits
+                .admission
+                .1
+                .wait_timeout(guard, deadline - now)
+                .unwrap()
+                .0;
+        }
     }
 }
 

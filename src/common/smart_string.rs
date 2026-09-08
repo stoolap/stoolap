@@ -242,6 +242,18 @@ impl SmartString {
         }
     }
 
+    /// Bytes a heap string owns beyond the SmartString itself: the String's
+    /// capacity, which `from_string` keeps as it came. Zero when inline.
+    #[inline]
+    pub fn heap_capacity(&self) -> usize {
+        if self.tag.is_heap() {
+            // SAFETY: heap strings hold a valid Arc<String> pointer
+            unsafe { (*self.get_arc_ptr()).capacity() }
+        } else {
+            0
+        }
+    }
+
     /// Returns the length of the string in bytes.
     #[inline(always)]
     pub fn len(&self) -> usize {

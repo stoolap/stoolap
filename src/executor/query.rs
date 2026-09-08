@@ -9783,6 +9783,77 @@ impl Executor {
                     Ok(Box::new(ExecutorResult::new(columns, rows)))
                 }
             }
+            "HOT_MAX_ROWS" | "HOT_MAX_BYTES" => {
+                let config = self.engine.config();
+                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
+                let is_rows = pragma_name == "HOT_MAX_ROWS";
+
+                if let Some(ref value) = stmt.value {
+                    let new_value = self.extract_pragma_int_value(value)?;
+                    if new_value < 0 {
+                        return Err(Error::internal(format!(
+                            "{} must be non-negative",
+                            pragma_name.to_lowercase()
+                        )));
+                    }
+                    let mut new_config = config.clone();
+                    if is_rows {
+                        new_config.persistence.hot_max_rows = new_value as usize;
+                    } else {
+                        new_config.persistence.hot_max_bytes = new_value as usize;
+                    }
+                    self.engine.update_engine_config(new_config)?;
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((0, Row::from_values(vec![Value::Integer(new_value)])));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
+                } else {
+                    let current = if is_rows {
+                        config.persistence.hot_max_rows
+                    } else {
+                        config.persistence.hot_max_bytes
+                    };
+                    let mut rows = RowVec::with_capacity(1);
+                    rows.push((0, Row::from_values(vec![Value::Integer(current as i64)])));
+                    Ok(Box::new(ExecutorResult::new(columns, rows)))
+                }
+            }
+            "MEMORY_STATS" => {
+                if stmt.value.is_some() {
+                    return Err(Error::internal(
+                        "PRAGMA MEMORY_STATS does not accept values",
+                    ));
+                }
+
+                let columns = vec![
+                    "table_name".to_string(),
+                    "hot_rows".to_string(),
+                    "hot_bytes".to_string(),
+                    "arena_slots".to_string(),
+                    "arena_capacity_bytes".to_string(),
+                    "chain_entries".to_string(),
+                    "volume_bytes".to_string(),
+                    "admission_waits".to_string(),
+                ];
+
+                let stats = self.engine.memory_stats();
+                let mut rows = RowVec::with_capacity(stats.len());
+                for (i, stat) in stats.into_iter().enumerate() {
+                    rows.push((
+                        i as i64,
+                        Row::from_values(vec![
+                            Value::text(&stat.table_name),
+                            Value::Integer(stat.hot_rows as i64),
+                            Value::Integer(stat.hot_bytes as i64),
+                            Value::Integer(stat.arena_slots as i64),
+                            Value::Integer(stat.arena_capacity_bytes as i64),
+                            Value::Integer(stat.chain_entries as i64),
+                            Value::Integer(stat.volume_bytes as i64),
+                            Value::Integer(stat.admission_waits as i64),
+                        ]),
+                    ));
+                }
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
             "SYNC_MODE" => {
                 let config = self.engine.config();
                 let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];

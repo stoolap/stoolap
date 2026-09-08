@@ -546,6 +546,22 @@ impl Database {
                         })?;
                         config.persistence.target_volume_rows = rows.max(65_536);
                     }
+                    // Early seal trigger per table: hot_max_rows=262144 (0 = off)
+                    "hot_max_rows" => {
+                        config.persistence.hot_max_rows = value.parse::<usize>().map_err(|_| {
+                            Error::invalid_argument(format!("invalid hot_max_rows: '{}'", value))
+                        })?;
+                    }
+                    // Commit wait above this many hot bytes per table: hot_max_bytes=0 (off)
+                    "hot_max_bytes" => {
+                        config.persistence.hot_max_bytes =
+                            value.parse::<usize>().map_err(|_| {
+                                Error::invalid_argument(format!(
+                                    "invalid hot_max_bytes: '{}'",
+                                    value
+                                ))
+                            })?;
+                    }
                     // Checkpoint on close: checkpoint_on_close=off
                     // Set to off to simulate crashes in tests (WAL not truncated)
                     "checkpoint_on_close" => {
