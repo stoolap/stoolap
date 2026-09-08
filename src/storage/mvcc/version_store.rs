@@ -28,7 +28,7 @@
 
 use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
@@ -463,6 +463,18 @@ pub struct SealedIndexCleanup {
     snapshot: Option<crate::common::CowBTree<VersionChainEntry>>,
 }
 
+/// Held by a committing transaction while it publishes; see begin_publish
+pub struct PublishGuard<'a> {
+    store: &'a VersionStore,
+}
+
+impl Drop for PublishGuard<'_> {
+    fn drop(&mut self) {
+        self.store.publish_epoch.fetch_add(1, Ordering::SeqCst);
+        self.store.publishing.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// VersionStore tracks the latest committed version of each row for a table
 ///
 /// Uses CowBTreeMap (RwLock<CowBTree>) for the version store because:
@@ -515,6 +527,10 @@ pub struct VersionStore {
     /// Only acquired for upsert statements to prevent TOCTOU races.
     /// Plain INSERTs (no ON CONFLICT) proceed lock-free.
     upsert_mutex: Arc<parking_lot::Mutex<()>>,
+    /// Commits between their index updates and their versions being visible
+    publishing: AtomicUsize,
+    /// Publishes completed
+    publish_epoch: AtomicU64,
 }
 
 impl VersionStore {
@@ -550,6 +566,8 @@ impl VersionStore {
             max_version_history: 10, // Default: keep up to 10 previous versions
             committed_row_count: AtomicUsize::new(0),
             upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
+            publishing: AtomicUsize::new(0),
+            publish_epoch: AtomicU64::new(0),
         }
     }
 
@@ -577,6 +595,8 @@ impl VersionStore {
             max_version_history: 10,
             committed_row_count: AtomicUsize::new(0),
             upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
+            publishing: AtomicUsize::new(0),
+            publish_epoch: AtomicU64::new(0),
         }
     }
 
@@ -2006,6 +2026,22 @@ impl VersionStore {
     /// When true, the O(1) committed_row_count is inaccurate because it includes
     /// rows committed after this transaction's snapshot point.
     #[inline]
+    /// Marks a commit's publish, from its index updates until its versions
+    /// are visible, so a reader that trusts the index order can stand down
+    pub fn begin_publish(&self) -> PublishGuard<'_> {
+        self.publishing.fetch_add(1, Ordering::SeqCst);
+        PublishGuard { store: self }
+    }
+
+    /// The publish epoch while no commit is publishing; None while one is.
+    /// Equal values before and after a read mean no publish overlapped it.
+    pub fn publish_epoch_if_quiet(&self) -> Option<u64> {
+        if self.publishing.load(Ordering::SeqCst) != 0 {
+            return None;
+        }
+        Some(self.publish_epoch.load(Ordering::SeqCst))
+    }
+
     pub fn needs_snapshot_isolation(&self, txn_id: i64) -> bool {
         self.visibility_checker
             .as_ref()
@@ -6939,6 +6975,7 @@ impl TransactionVersionStore {
         // Rows removed by seal (missing from hot B-tree) are not conflicts —
         // they were moved to cold segments, not modified by another transaction.
         self.detect_conflicts_safe()?;
+        let _publish = self.parent_store.begin_publish();
 
         // Update indexes BEFORE committing versions
         self.update_indexes_on_commit()?;

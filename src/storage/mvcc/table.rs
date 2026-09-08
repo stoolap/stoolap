@@ -3032,6 +3032,12 @@ impl Table for MVCCTable {
             return Ok(None);
         }
 
+        // A commit updates the indexes before its versions are visible, and
+        // a key moved by it may sit anywhere in the walk: the walk stands
+        // down while a commit publishes, or if one did meanwhile
+        let Some(epoch) = self.version_store.publish_epoch_if_quiet() else {
+            return Ok(None);
+        };
         let mut rows = RowVec::with_capacity(needed.min(1024));
         // A row whose visible order value differs from its key was changed
         // between the index and the version this transaction sees: the walk
@@ -3064,7 +3070,7 @@ impl Table for MVCCTable {
                 rows.len() < needed
             },
         );
-        if !walked || stale {
+        if !walked || stale || self.version_store.publish_epoch_if_quiet() != Some(epoch) {
             return Ok(None);
         }
         Ok(Some(rows.into_iter().skip(offset).take(limit).collect()))

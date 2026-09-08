@@ -20,10 +20,15 @@
 //! mixed with sealed ones.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use stoolap::core::{Operator, Result, Row, Schema, Value};
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Duration;
+use stoolap::common::I64Map;
+use stoolap::core::{
+    DataType, IndexEntry, IndexType, Operator, Result, Row, RowIdVec, Schema, Value,
+};
 use stoolap::storage::expression::{ComparisonExpr, Expression};
-use stoolap::storage::traits::Engine;
+use stoolap::storage::index::MultiColumnIndex;
+use stoolap::storage::traits::{Engine, Index};
 use stoolap::Database;
 
 fn ids(db: &Database, sql: &str) -> Vec<i64> {
@@ -383,4 +388,205 @@ fn test_first_seal_during_the_hot_top_k_keeps_the_series() {
     let got: Option<Vec<i64>> = answer.map(|rows| rows.into_iter().map(|(id, _)| id).collect());
     assert_eq!(got, Some(vec![1]));
     tx.rollback().unwrap();
+}
+
+/// Hands every call to the real index and, once, stops the caller right
+/// after an add returned: the point in a commit where the index holds the
+/// new key and the new version is not visible yet
+struct StopAfterIndexAdd {
+    inner: Arc<dyn Index>,
+    armed: AtomicBool,
+    stopped: mpsc::Sender<()>,
+    resume: Mutex<mpsc::Receiver<()>>,
+}
+
+impl Index for StopAfterIndexAdd {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn table_name(&self) -> &str {
+        self.inner.table_name()
+    }
+    fn build(&mut self) -> Result<()> {
+        Ok(())
+    }
+    fn add(&self, values: &[Value], row_id: i64, ref_id: i64) -> Result<()> {
+        self.inner.add(values, row_id, ref_id)?;
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.stopped.send(()).unwrap();
+            self.resume
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap();
+        }
+        Ok(())
+    }
+    fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
+        self.inner.add_batch(entries)
+    }
+    fn remove(&self, values: &[Value], row_id: i64, ref_id: i64) -> Result<()> {
+        self.inner.remove(values, row_id, ref_id)
+    }
+    fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
+        self.inner.remove_batch(entries)
+    }
+    fn column_ids(&self) -> &[i32] {
+        self.inner.column_ids()
+    }
+    fn column_names(&self) -> &[String] {
+        self.inner.column_names()
+    }
+    fn data_types(&self) -> &[DataType] {
+        self.inner.data_types()
+    }
+    fn index_type(&self) -> IndexType {
+        self.inner.index_type()
+    }
+    fn is_unique(&self) -> bool {
+        self.inner.is_unique()
+    }
+    fn find(&self, values: &[Value]) -> Result<Vec<IndexEntry>> {
+        self.inner.find(values)
+    }
+    fn find_range(
+        &self,
+        min: &[Value],
+        max: &[Value],
+        min_inclusive: bool,
+        max_inclusive: bool,
+    ) -> Result<Vec<IndexEntry>> {
+        self.inner
+            .find_range(min, max, min_inclusive, max_inclusive)
+    }
+    fn find_with_operator(&self, op: Operator, values: &[Value]) -> Result<Vec<IndexEntry>> {
+        self.inner.find_with_operator(op, values)
+    }
+    fn get_filtered_row_ids(&self, expr: &dyn Expression) -> RowIdVec {
+        self.inner.get_filtered_row_ids(expr)
+    }
+    fn walk_prefix_ordered(
+        &self,
+        prefix: &[Value],
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+        ascending: bool,
+        visit: &mut dyn FnMut(i64, &Value) -> bool,
+    ) -> bool {
+        self.inner
+            .walk_prefix_ordered(prefix, lower, upper, ascending, visit)
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self.inner.as_any()
+    }
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A commit moves the index key of the newest row before its new version
+/// is visible; a reader in that window must answer from the visible values,
+/// so the walk stands down while a commit publishes
+#[test]
+fn test_top_k_during_a_commit_answers_from_the_visible_versions() {
+    let db = Database::open("memory://hot_top_k_commit_window").unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, k TEXT NOT NULL, t INTEGER NOT NULL, UNIQUE(k, t))",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO c VALUES (1, 'a', 100), (2, 'a', 50)", ())
+        .unwrap();
+    let store = db.engine().get_version_store("c").unwrap();
+    let (index, _) = store.get_multi_column_index(&["k"]).unwrap();
+    let name = index.name().to_string();
+    let (stopped_tx, stopped_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    store.add_index(
+        name,
+        Arc::new(StopAfterIndexAdd {
+            inner: index,
+            armed: AtomicBool::new(true),
+            stopped: stopped_tx,
+            resume: Mutex::new(resume_rx),
+        }),
+    );
+    let writer_db = db.clone();
+    let writer = std::thread::spawn(move || {
+        writer_db
+            .execute("UPDATE c SET t = 0 WHERE id = 1", ())
+            .unwrap();
+    });
+    stopped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let full = ids(
+        &db,
+        "SELECT id FROM c WHERE k = 'a' ORDER BY t DESC, id DESC LIMIT 1",
+    );
+    let fast = ids(
+        &db,
+        "SELECT id FROM c WHERE k = 'a' ORDER BY t DESC LIMIT 1",
+    );
+    resume_tx.send(()).unwrap();
+    writer.join().unwrap();
+    assert_eq!(
+        full,
+        vec![1],
+        "the old version stays visible until the commit completes"
+    );
+    assert_eq!(fast, full);
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM c WHERE k = 'a' ORDER BY t DESC LIMIT 1"
+        ),
+        vec![2]
+    );
+}
+
+/// Two built groups are walked at the same time: a reader of one group
+/// does not wait for a reader of another
+#[test]
+fn test_built_groups_are_walked_concurrently() {
+    let index = Arc::new(MultiColumnIndex::new(
+        "idx".into(),
+        "c".into(),
+        vec!["k".into(), "t".into()],
+        vec![0, 1],
+        vec![DataType::Integer; 2],
+        false,
+        0,
+    ));
+    for k in [1, 2] {
+        index
+            .add(&[Value::Integer(k), Value::Integer(100)], k, k)
+            .unwrap();
+        assert!(index.walk_prefix_ordered(&[Value::Integer(k)], None, None, true, &mut |_, _| true));
+    }
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let first_index = Arc::clone(&index);
+    let first = std::thread::spawn(move || {
+        first_index.walk_prefix_ordered(&[Value::Integer(1)], None, None, true, &mut |_, _| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            false
+        });
+    });
+    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let (second_tx, second_rx) = mpsc::channel();
+    let second_index = Arc::clone(&index);
+    let second = std::thread::spawn(move || {
+        second_index.walk_prefix_ordered(&[Value::Integer(2)], None, None, true, &mut |_, _| {
+            second_tx.send(()).unwrap();
+            false
+        });
+    });
+    let overlapped = second_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+    release_tx.send(()).unwrap();
+    first.join().unwrap();
+    second.join().unwrap();
+    assert!(
+        overlapped,
+        "a built group's walk waited for another group's walk"
+    );
 }

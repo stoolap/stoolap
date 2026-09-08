@@ -1093,22 +1093,32 @@ impl Index for MultiColumnIndex {
         // The prefix index is built outside the row map's lock: its build
         // takes that lock too
         self.ensure_prefix_built(walked);
-        let mut orders = self.walk_orders.write();
-        if !orders.contains_key(&group) {
-            let ids = self.get_row_ids_equal(prefix);
-            let row_to_key = self.row_to_key.read();
-            let mut entries: Vec<(Value, i64)> = Vec::with_capacity(ids.len());
-            for row_id in ids.iter() {
-                if let Some(key) = row_to_key.get(*row_id) {
-                    if let Some(value) = key.get(walked) {
-                        entries.push(((**value).clone(), *row_id));
+        // A built group is read under the shared lock; a missing one is built
+        // under the exclusive lock, checked again once that is held
+        let orders = {
+            let orders = self.walk_orders.read();
+            if orders.contains_key(&group) {
+                orders
+            } else {
+                drop(orders);
+                let mut orders = self.walk_orders.write();
+                if !orders.contains_key(&group) {
+                    let ids = self.get_row_ids_equal(prefix);
+                    let row_to_key = self.row_to_key.read();
+                    let mut entries: Vec<(Value, i64)> = Vec::with_capacity(ids.len());
+                    for row_id in ids.iter() {
+                        if let Some(key) = row_to_key.get(*row_id) {
+                            if let Some(value) = key.get(walked) {
+                                entries.push(((**value).clone(), *row_id));
+                            }
+                        }
                     }
+                    entries.sort_unstable();
+                    orders.insert(group.clone(), entries.into_iter().collect());
                 }
+                parking_lot::RwLockWriteGuard::downgrade(orders)
             }
-            entries.sort_unstable();
-            orders.insert(group.clone(), entries.into_iter().collect());
-        }
-        let orders = parking_lot::RwLockWriteGuard::downgrade(orders);
+        };
         let Some(order) = orders.get(&group) else {
             return true;
         };
