@@ -493,13 +493,15 @@ impl PublishHold {
     }
 
     /// True when a table this commit wrote holds `max_rows` committed hot
-    /// rows or more; asked once the commit is visible, so the seal it
-    /// requests can extract the rows
-    pub fn any_table_at(&self, max_rows: usize) -> bool {
+    /// rows or `max_bytes` hot bytes or more (0 = no limit); asked once the
+    /// commit is visible, so the seal it requests can extract the rows
+    pub fn any_table_at(&self, max_rows: usize, max_bytes: usize) -> bool {
         self.stores.iter().any(|store| {
-            store
-                .read()
-                .is_ok_and(|s| s.parent_store.committed_row_count() >= max_rows)
+            store.read().is_ok_and(|s| {
+                let parent = &s.parent_store;
+                (max_rows > 0 && parent.committed_row_count() >= max_rows)
+                    || (max_bytes > 0 && parent.hot_bytes() >= max_bytes)
+            })
         })
     }
 

@@ -151,7 +151,7 @@ pub trait TransactionEngineOperations: Send + Sync {
     }
 
     /// Asks for a seal when a table the now visible commit wrote is at the
-    /// hot row limit
+    /// hot row or byte limit
     fn request_seal_if_over(&self, hold: &super::version_store::PublishHold) {
         let _ = hold;
     }
@@ -487,6 +487,9 @@ impl Transaction for MvccTransaction {
                         // Partial commit: some tables already committed.
                         // We MUST complete the commit to avoid orphaning those rows.
                         self.registry.complete_commit(self.id);
+                        if let Some(hold) = &publish {
+                            ops.request_seal_if_over(hold);
+                        }
                         // Record commit marker so WAL recovery sees committed state
                         ops.record_commit(self.id)?;
                         self.state = TransactionState::Committed;

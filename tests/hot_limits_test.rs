@@ -216,6 +216,46 @@ fn an_update_over_the_byte_limit_does_not_wait_on_its_own_claims() {
     assert_eq!(int(&db, "SELECT COUNT(*) FROM u WHERE t = 'changed'"), 1500);
 }
 
+#[test]
+fn updates_that_grow_past_the_byte_limit_request_a_seal() {
+    let dir = tempdir().expect("tempdir");
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600&hot_max_rows=0",
+        dir.path().display()
+    ))
+    .expect("open");
+    db.execute("CREATE TABLE g (id INTEGER PRIMARY KEY, t TEXT)", ())
+        .expect("create");
+    insert_batch(&db, "g", 1, 2000);
+    let bytes_at_rest = memory_stats(&db, "g").1;
+    db.execute(
+        &format!("PRAGMA HOT_MAX_BYTES = {}", bytes_at_rest + 20_000),
+        (),
+    )
+    .expect("limit");
+    for _ in 0..4 {
+        db.execute("UPDATE g SET t = t || ' grown by an update'", ())
+            .expect("update");
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut volumes = 0;
+    while volumes == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        volumes = db
+            .query("PRAGMA VOLUME_STATS", ())
+            .expect("volume stats")
+            .count();
+    }
+    assert!(
+        volumes > 0,
+        "no seal was requested for a table grown by UPDATEs"
+    );
+    assert_eq!(
+        int(&db, "SELECT COUNT(*) FROM g WHERE t LIKE '%grown%'"),
+        2000
+    );
+}
+
 /// Under `test-filedb` a memory DSN opens a file database, which can seal
 #[cfg(not(feature = "test-filedb"))]
 #[test]

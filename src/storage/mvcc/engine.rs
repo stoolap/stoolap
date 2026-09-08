@@ -7824,7 +7824,8 @@ impl TransactionEngineOperations for EngineOperations {
 
     fn request_seal_if_over(&self, hold: &super::version_store::PublishHold) {
         let max_rows = self.hot_limits.max_rows.load(Ordering::Relaxed);
-        if max_rows > 0 && hold.any_table_at(max_rows) {
+        let max_bytes = self.hot_limits.max_bytes.load(Ordering::Relaxed);
+        if hold.any_table_at(max_rows, max_bytes) {
             self.hot_limits
                 .seal_requested
                 .store(true, Ordering::Release);
