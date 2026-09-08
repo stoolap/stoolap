@@ -621,23 +621,32 @@ impl VolumeScanner {
                 }
             } else {
                 let mut m = Vec::new();
-                let lo = self.current_idx;
-                let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
-                    .dict_filters
-                    .iter()
-                    .map(|&(ci, eid)| (&self.volume.columns[ci], lo, eid))
-                    .collect();
-                if super::column::ColumnData::dict_matching_offsets(
-                    &filters,
-                    self.end_idx - lo,
-                    &mut m,
-                )
-                .is_some()
-                {
-                    for idx in &mut m {
+                // One row group at a time, so a filter that matches most rows
+                // stops at the selectivity cap instead of listing them all
+                let mut lo = self.current_idx;
+                let mut vectorized = true;
+                while lo < self.end_idx && m.len() <= selectivity_cap {
+                    let hi = (lo + super::column::ROW_GROUP_SIZE).min(self.end_idx);
+                    let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
+                        .dict_filters
+                        .iter()
+                        .map(|&(ci, eid)| (&self.volume.columns[ci], lo, eid))
+                        .collect();
+                    let first = m.len();
+                    if super::column::ColumnData::dict_matching_offsets(&filters, hi - lo, &mut m)
+                        .is_none()
+                    {
+                        m.truncate(first);
+                        vectorized = false;
+                        break;
+                    }
+                    for idx in &mut m[first..] {
                         *idx += lo;
                     }
-                } else {
+                    lo = hi;
+                }
+                if !vectorized {
+                    m.clear();
                     for i in self.current_idx..self.end_idx {
                         let ok = self.dict_filters.iter().all(|&(ci, eid)| {
                             !self.volume.columns[ci].is_null(i)
