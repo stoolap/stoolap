@@ -969,8 +969,39 @@ impl SegmentedTable {
                 let current_schema = self.hot.schema();
                 let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
 
+                // The rows that pass the dictionary filters, found in one pass
+                // over the raw ids; None walks the whole range
+                let mut candidates: Vec<usize> = Vec::new();
+                let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = dict_filters
+                    .iter()
+                    .map(|&(col_idx, expected)| (&vol.columns[col_idx], start, expected))
+                    .collect();
+                let prefiltered = !filters.is_empty()
+                    && super::column::ColumnData::dict_matching_offsets(
+                        &filters,
+                        end - start,
+                        &mut candidates,
+                    )
+                    .is_some();
+                let mut next_row = {
+                    let mut pos = 0usize;
+                    let mut plain = start;
+                    move || -> Option<usize> {
+                        if prefiltered {
+                            let i = start + *candidates.get(pos)?;
+                            pos += 1;
+                            Some(i)
+                        } else if plain < end {
+                            plain += 1;
+                            Some(plain - 1)
+                        } else {
+                            None
+                        }
+                    }
+                };
+
                 let mut vol_rows = RowVec::new();
-                for i in start..end {
+                while let Some(i) = next_row() {
                     if !cs.is_visible(i) {
                         continue;
                     }
@@ -981,7 +1012,7 @@ impl SegmentedTable {
                         continue;
                     }
 
-                    if !dict_filters.is_empty() {
+                    if !prefiltered && !dict_filters.is_empty() {
                         let mut matches = true;
                         for &(col_idx, expected_id) in &dict_filters {
                             if vol.columns[col_idx].is_null(i)
@@ -5243,6 +5274,7 @@ impl Table for SegmentedTable {
 
                 // Inner loop: per-volume accumulators
                 let mut vol_accums = vec![Accum::default(); agg_count];
+                let mut group_candidates: Vec<usize> = Vec::new();
                 let row_count = vol.meta.row_count;
                 let rg_size = super::column::ROW_GROUP_SIZE;
                 let num_groups = row_count.div_ceil(rg_size);
@@ -5254,7 +5286,45 @@ impl Table for SegmentedTable {
                     let g_start = gi * rg_size;
                     let g_end = ((gi + 1) * rg_size).min(row_count);
 
-                    for i in g_start..g_end {
+                    // Dictionary equalities are answered for the whole group in
+                    // one pass over the raw ids; the other predicates run per
+                    // surviving row
+                    let dict_preds: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> =
+                        phys_preds
+                            .iter()
+                            .filter(|pp| matches!(pp.target, TypedTarget::DictEq(_)))
+                            .map(|pp| {
+                                (
+                                    &vol.columns[pp.phys_col],
+                                    g_start,
+                                    pp.dict_id.unwrap_or(u32::MAX),
+                                )
+                            })
+                            .collect();
+                    group_candidates.clear();
+                    let prefiltered = !dict_preds.is_empty()
+                        && super::column::ColumnData::dict_matching_offsets(
+                            &dict_preds,
+                            g_end - g_start,
+                            &mut group_candidates,
+                        )
+                        .is_some();
+                    let mut pos = 0usize;
+                    let mut plain = g_start;
+                    let mut next_row = || -> Option<usize> {
+                        if prefiltered {
+                            let i = g_start + *group_candidates.get(pos)?;
+                            pos += 1;
+                            Some(i)
+                        } else if plain < g_end {
+                            plain += 1;
+                            Some(plain - 1)
+                        } else {
+                            None
+                        }
+                    };
+
+                    while let Some(i) = next_row() {
                         if !cs.is_visible(i) {
                             continue;
                         }
@@ -5267,6 +5337,9 @@ impl Table for SegmentedTable {
 
                         let mut all_pass = true;
                         for pp in &phys_preds {
+                            if prefiltered && matches!(pp.target, TypedTarget::DictEq(_)) {
+                                continue;
+                            }
                             let col = &vol.columns[pp.phys_col];
                             if col.is_null(i) {
                                 all_pass = false;

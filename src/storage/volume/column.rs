@@ -27,6 +27,14 @@ use std::sync::Arc;
 use crate::common::SmartString;
 use crate::core::{DataType, Value};
 
+/// A dictionary column, the local index a caller's window starts at in it,
+/// and the id looked for
+pub type DictFilter<'a> = (&'a ColumnData, usize, u32);
+
+/// A dictionary column's raw ids and nulls, the local index its window
+/// starts at, and the id looked for
+type DictSlice<'a> = (&'a [u32], &'a [bool], usize, u32);
+
 /// Typed column data stored contiguously for cache-friendly access.
 ///
 /// Each variant stores a flat array of the native type plus a null bitmap.
@@ -537,6 +545,45 @@ impl ColumnData {
         }
     }
 
+    /// Appends to `out` the offsets in `0..count` whose rows, read at
+    /// `local + offset` in every column of `filters`, carry the expected
+    /// dictionary id and are not null. One tight pass over the first
+    /// column's raw ids; the other columns are only read for its matches.
+    /// None when a filter column is not a dictionary column.
+    pub fn dict_matching_offsets(
+        filters: &[DictFilter<'_>],
+        count: usize,
+        out: &mut Vec<usize>,
+    ) -> Option<()> {
+        let mut slices: smallvec::SmallVec<[DictSlice<'_>; 4]> =
+            smallvec::SmallVec::with_capacity(filters.len());
+        for &(col, local, expected) in filters {
+            let (ids, nulls) = col.dict_ids()?;
+            if local + count > ids.len() {
+                return None;
+            }
+            slices.push((ids, nulls, local, expected));
+        }
+        let Some(&(first_ids, first_nulls, first_local, first_expected)) = slices.first() else {
+            out.extend(0..count);
+            return Some(());
+        };
+        let window = &first_ids[first_local..first_local + count];
+        for (offset, &id) in window.iter().enumerate() {
+            if id != first_expected || first_nulls[first_local + offset] {
+                continue;
+            }
+            let others = slices[1..].iter().all(|&(ids, nulls, local, expected)| {
+                let at = local + offset;
+                ids[at] == expected && !nulls[at]
+            });
+            if others {
+                out.push(offset);
+            }
+        }
+        Some(())
+    }
+
     // =========================================================================
     // Search operations
     // =========================================================================
@@ -867,6 +914,40 @@ impl ZoneMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dict_matching_offsets_reads_every_filter_and_skips_nulls() {
+        let dictionary: Arc<[SmartString]> =
+            vec![SmartString::from("a"), SmartString::from("b")].into();
+        let first = ColumnData::Dictionary {
+            ids: vec![0, 1, 1, 0, 1, 1],
+            dictionary: Arc::clone(&dictionary),
+            nulls: vec![false, false, true, false, false, false],
+        };
+        let second = ColumnData::Dictionary {
+            ids: vec![9, 1, 1, 1, 0, 1],
+            dictionary,
+            nulls: vec![false; 6],
+        };
+        let mut out = Vec::new();
+        // rows 1..6 of `first` against rows 0..5 of `second`: first matches
+        // at offsets 0, 3, 4 (offset 1 is null), second only at offset 3
+        ColumnData::dict_matching_offsets(&[(&first, 1, 1), (&second, 0, 1)], 5, &mut out)
+            .expect("dictionary columns");
+        assert_eq!(out, vec![3]);
+        out.clear();
+        ColumnData::dict_matching_offsets(&[(&first, 1, 1)], 5, &mut out).expect("one column");
+        assert_eq!(out, vec![0, 3, 4]);
+        out.clear();
+        assert!(ColumnData::dict_matching_offsets(&[(&first, 4, 1)], 3, &mut out).is_none());
+        let ints = ColumnData::Int64 {
+            values: vec![1],
+            nulls: vec![false],
+        };
+        assert!(ColumnData::dict_matching_offsets(&[(&ints, 0, 1)], 1, &mut out).is_none());
+        ColumnData::dict_matching_offsets(&[], 3, &mut out).expect("no filters");
+        assert_eq!(out, vec![0, 1, 2]);
+    }
 
     #[test]
     fn test_int64_column() {
