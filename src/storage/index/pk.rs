@@ -397,6 +397,14 @@ impl Index for PkIndex {
         Ok(())
     }
 
+    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
+        let mut inner = self.data.write();
+        for &row_id in row_ids {
+            inner.remove(row_id);
+        }
+        Some(Ok(()))
+    }
+
     fn column_ids(&self) -> &[i32] {
         std::slice::from_ref(&self.column_id)
     }

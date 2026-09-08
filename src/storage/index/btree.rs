@@ -116,6 +116,44 @@ pub struct BTreeIndex {
 }
 
 impl BTreeIndex {
+    /// Removes `row_ids` (sorted) grouped by key: one linear pass per key
+    /// instead of a shift of the key's row list per row
+    fn remove_sorted_ids(&self, row_ids: &[i64]) -> Result<()> {
+        if row_ids.is_empty() {
+            return Ok(());
+        }
+        self.check_closed()?;
+
+        let mut sorted_values = self.sorted_values.write();
+        let mut row_to_value = self.row_to_value.write();
+
+        let mut by_key: BTreeMap<CompactArc<Value>, Vec<i64>> = BTreeMap::new();
+        for &row_id in row_ids {
+            if let Some(arc_value) = row_to_value.remove(row_id) {
+                by_key.entry(arc_value).or_default().push(row_id);
+            }
+        }
+        let mut any_removed = false;
+        for (arc_value, ids) in by_key {
+            if let Some(rows) = sorted_values.get_mut(&arc_value) {
+                let before = rows.len();
+                rows.retain(|id| ids.binary_search(id).is_err());
+                any_removed |= rows.len() != before;
+                if rows.is_empty() {
+                    sorted_values.remove(&arc_value);
+                }
+            }
+        }
+
+        drop(sorted_values);
+        drop(row_to_value);
+
+        if any_removed {
+            self.invalidate_cache();
+        }
+        Ok(())
+    }
+
     /// Creates a new B-tree index
     ///
     /// # Arguments
@@ -654,42 +692,16 @@ impl Index for BTreeIndex {
     ///
     /// Performance: O(1) lock acquisitions instead of O(N)
     fn remove_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
-        if entries.is_empty() {
-            return Ok(());
-        }
+        // The values are not needed: the row map knows each row's key
+        let mut row_ids: Vec<i64> = entries.iter().map(|(row_id, _)| *row_id).collect();
+        row_ids.sort_unstable();
+        self.remove_sorted_ids(&row_ids)
+    }
 
-        self.check_closed()?;
-
-        // Acquire write locks ONCE for entire batch
-        let mut sorted_values = self.sorted_values.write();
-        let mut row_to_value = self.row_to_value.write();
-
-        let mut any_removed = false;
-
-        for &(row_id, _values) in entries {
-            // BTreeIndex looks up by row_id, values aren't used
-            if let Some(arc_value) = row_to_value.remove(row_id) {
-                if let Some(rows) = sorted_values.get_mut(&arc_value) {
-                    if let Ok(pos) = rows.binary_search(&row_id) {
-                        rows.remove(pos);
-                        any_removed = true;
-                    }
-                    if rows.is_empty() {
-                        sorted_values.remove(&arc_value);
-                    }
-                }
-            }
-        }
-
-        // Drop locks before invalidating cache
-        drop(sorted_values);
-        drop(row_to_value);
-
-        if any_removed {
-            self.invalidate_cache();
-        }
-
-        Ok(())
+    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
+        let mut sorted: Vec<i64> = row_ids.to_vec();
+        sorted.sort_unstable();
+        Some(self.remove_sorted_ids(&sorted))
     }
 
     fn column_ids(&self) -> &[i32] {

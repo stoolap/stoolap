@@ -458,9 +458,6 @@ pub struct ExtractionSnapshot {
 pub struct SealedIndexCleanup {
     /// Row IDs that were removed from the version store.
     pub removed_ids: Vec<i64>,
-    /// CowBTree snapshot taken BEFORE version removal. Contains the row data
-    /// needed to compute index values for removal.
-    snapshot: Option<crate::common::CowBTree<VersionChainEntry>>,
 }
 
 /// Held for a table from the first index update of a commit until the
@@ -5490,10 +5487,6 @@ impl VersionStore {
             return (0, SealedIndexCleanup::default(), Vec::new());
         }
 
-        // Snapshot version data BEFORE removal for later index cleanup.
-        // O(1) Arc clone of CowBTree.
-        let snapshot = self.versions.read().clone();
-
         // Remove rows in small sub-batches to reduce write lock hold time.
         // Each sub-batch acquires versions.write() briefly, then releases it,
         // giving concurrent commits a chance to proceed between sub-batches.
@@ -5543,27 +5536,18 @@ impl VersionStore {
         }
 
         let count = removed_ids.len();
-        (
-            count,
-            SealedIndexCleanup {
-                removed_ids,
-                snapshot: Some(snapshot),
-            },
-            skipped_ids,
-        )
+        (count, SealedIndexCleanup { removed_ids }, skipped_ids)
     }
 
     /// Remove stale hot index entries for sealed rows (phase 2 of seal).
     /// Called while the table's seal fence is still held so INSERT cannot race
     /// between cold constraint checks and hot-index cleanup.
-    pub fn remove_sealed_index_entries(&self, cleanup: SealedIndexCleanup) {
+    /// Indexes that keep a row-to-key map remove by row id; the others get
+    /// their values from `rows`, the sealed rows.
+    pub fn remove_sealed_index_entries(&self, cleanup: SealedIndexCleanup, rows: &RowVec) {
         if cleanup.removed_ids.is_empty() {
             return;
         }
-
-        let Some(ref snap) = cleanup.snapshot else {
-            return;
-        };
 
         let indexes = self.indexes.read();
         let hot_only_indexes: Vec<_> = indexes
@@ -5577,31 +5561,39 @@ impl VersionStore {
             return;
         }
 
+        let mut by_id: Option<I64Map<usize>> = None;
         for index in &hot_only_indexes {
-            let col_ids = index.column_ids();
-            let mut owned_entries: Vec<(i64, Vec<crate::core::Value>)> =
-                Vec::with_capacity(cleanup.removed_ids.len());
-
-            for &row_id in &cleanup.removed_ids {
-                let Some(entry) = snap.get(row_id) else {
-                    continue;
-                };
-                let row = &entry.version.data;
-                let values: Vec<crate::core::Value> = col_ids
-                    .iter()
-                    .map(|&col_id| {
-                        row.get(col_id as usize)
-                            .cloned()
-                            .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
-                    })
-                    .collect();
-                owned_entries.push((row_id, values));
+            if index.remove_batch_ids(&cleanup.removed_ids).is_some() {
+                continue;
             }
-
+            let positions = by_id.get_or_insert_with(|| {
+                let mut map = I64Map::with_capacity(rows.len());
+                for (pos, (row_id, _)) in rows.iter().enumerate() {
+                    map.insert(*row_id, pos);
+                }
+                map
+            });
+            let col_ids = index.column_ids();
+            let owned_entries: Vec<(i64, Vec<crate::core::Value>)> = cleanup
+                .removed_ids
+                .iter()
+                .filter_map(|&row_id| {
+                    let pos = *positions.get(row_id)?;
+                    let row = &rows[pos].1;
+                    let values: Vec<crate::core::Value> = col_ids
+                        .iter()
+                        .map(|&col_id| {
+                            row.get(col_id as usize)
+                                .cloned()
+                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
+                        })
+                        .collect();
+                    Some((row_id, values))
+                })
+                .collect();
             if owned_entries.is_empty() {
                 continue;
             }
-
             let borrowed_entries: Vec<(i64, &[crate::core::Value])> = owned_entries
                 .iter()
                 .map(|(row_id, values)| (*row_id, values.as_slice()))

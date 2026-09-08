@@ -558,6 +558,35 @@ impl Index for HashIndex {
         Ok(())
     }
 
+    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Some(Err(Error::IndexClosed));
+        }
+        let mut row_to_hash = self.row_to_hash.write();
+        let mut hash_to_values = self.hash_to_values.write();
+        // Group the rows by hash, then subtract each group from its bucket
+        // in one pass per value
+        let mut by_hash: FxHashMap<u64, Vec<i64>> = FxHashMap::default();
+        for &row_id in row_ids {
+            if let Some(hash) = row_to_hash.remove(row_id) {
+                by_hash.entry(hash).or_default().push(row_id);
+            }
+        }
+        for (hash, mut ids) in by_hash {
+            ids.sort_unstable();
+            if let Some(val_entries) = hash_to_values.get_mut(&hash) {
+                for (_, bucket) in val_entries.iter_mut() {
+                    bucket.retain(|id| ids.binary_search(id).is_err());
+                }
+                val_entries.retain(|(_, bucket)| !bucket.is_empty());
+                if val_entries.is_empty() {
+                    hash_to_values.remove(&hash);
+                }
+            }
+        }
+        Some(Ok(()))
+    }
+
     fn column_ids(&self) -> &[i32] {
         &self.column_ids
     }
