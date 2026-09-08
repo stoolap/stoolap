@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main, develop ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, 'codex/storage-**' ]
 
 # Cancel previous runs when new commits are pushed
 concurrency:
