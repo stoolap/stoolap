@@ -463,16 +463,55 @@ pub struct SealedIndexCleanup {
     snapshot: Option<crate::common::CowBTree<VersionChainEntry>>,
 }
 
-/// Held by a committing transaction while it publishes; see begin_publish
-pub struct PublishGuard<'a> {
-    store: &'a VersionStore,
+/// Held for a table from the first index update of a commit until the
+/// commit is visible or undone; see VersionStore::begin_publish
+pub struct PublishGuard {
+    store: Arc<VersionStore>,
 }
 
-impl Drop for PublishGuard<'_> {
+impl Drop for PublishGuard {
     fn drop(&mut self) {
         self.store.publish_epoch.fetch_add(1, Ordering::SeqCst);
         self.store.publishing.fetch_sub(1, Ordering::SeqCst);
     }
+}
+
+/// What a committing transaction holds while it publishes: a guard per
+/// table it writes, and the tables' stores so their index updates can be
+/// undone if the commit fails after they were applied
+#[derive(Default)]
+pub struct PublishHold {
+    guards: Vec<PublishGuard>,
+    stores: Vec<Arc<std::sync::RwLock<TransactionVersionStore>>>,
+}
+
+impl PublishHold {
+    pub fn add(
+        &mut self,
+        version_store: &Arc<VersionStore>,
+        txn_store: Arc<std::sync::RwLock<TransactionVersionStore>>,
+    ) {
+        self.guards.push(version_store.begin_publish());
+        self.stores.push(txn_store);
+    }
+
+    /// Takes back the index updates of a commit that failed after applying
+    /// them, so the indexes describe the rows that stayed visible
+    pub fn undo_index_updates(&self) {
+        for store in &self.stores {
+            if let Ok(store) = store.read() {
+                store.undo_index_updates();
+            }
+        }
+    }
+}
+
+/// The index entries a commit added and removed for one index, kept until
+/// the commit is visible or undone
+struct IndexUndo {
+    index: Arc<dyn Index>,
+    added: Vec<(i64, Vec<Value>)>,
+    removed: Vec<(i64, Vec<Value>)>,
 }
 
 /// VersionStore tracks the latest committed version of each row for a table
@@ -2027,10 +2066,13 @@ impl VersionStore {
     /// rows committed after this transaction's snapshot point.
     #[inline]
     /// Marks a commit's publish, from its index updates until its versions
-    /// are visible, so a reader that trusts the index order can stand down
-    pub fn begin_publish(&self) -> PublishGuard<'_> {
+    /// are visible or undone, so a reader that trusts the index order can
+    /// stand down
+    pub fn begin_publish(self: &Arc<Self>) -> PublishGuard {
         self.publishing.fetch_add(1, Ordering::SeqCst);
-        PublishGuard { store: self }
+        PublishGuard {
+            store: Arc::clone(self),
+        }
     }
 
     /// The publish epoch while no commit is publishing; None while one is.
@@ -6433,6 +6475,8 @@ pub struct TransactionVersionStore {
     /// Write set for conflict detection
     /// Lazily allocated on first write to avoid allocation overhead for read-only queries
     write_set: Option<I64Map<WriteSetEntry>>,
+    /// Index updates applied by commit, until the commit is visible or undone
+    index_undo: Mutex<Vec<IndexUndo>>,
 }
 
 impl TransactionVersionStore {
@@ -6448,6 +6492,30 @@ impl TransactionVersionStore {
             parent_store,
             txn_id,
             write_set: None,
+            index_undo: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Takes back the index updates of this transaction's commit, in reverse
+    pub fn undo_index_updates(&self) {
+        let undo: Vec<IndexUndo> = std::mem::take(&mut *self.index_undo.lock());
+        for entry in undo.iter().rev() {
+            if !entry.added.is_empty() {
+                let batch: Vec<(i64, &[Value])> = entry
+                    .added
+                    .iter()
+                    .map(|(row_id, values)| (*row_id, values.as_slice()))
+                    .collect();
+                let _ = entry.index.remove_batch_slice(&batch);
+            }
+            if !entry.removed.is_empty() {
+                let batch: Vec<(i64, &[Value])> = entry
+                    .removed
+                    .iter()
+                    .map(|(row_id, values)| (*row_id, values.as_slice()))
+                    .collect();
+                let _ = entry.index.add_batch_slice(&batch);
+            }
         }
     }
 
@@ -6975,7 +7043,6 @@ impl TransactionVersionStore {
         // Rows removed by seal (missing from hot B-tree) are not conflicts —
         // they were moved to cold segments, not modified by another transaction.
         self.detect_conflicts_safe()?;
-        let _publish = self.parent_store.begin_publish();
 
         // Update indexes BEFORE committing versions
         self.update_indexes_on_commit()?;
@@ -7320,6 +7387,18 @@ impl TransactionVersionStore {
             }
         }
 
+        let mut undo = self.index_undo.lock();
+        for (idx, index) in indexes.iter().enumerate() {
+            if add_batches[idx].is_empty() && remove_batches[idx].is_empty() {
+                continue;
+            }
+            undo.push(IndexUndo {
+                index: Arc::clone(index),
+                added: std::mem::take(&mut add_batches[idx]),
+                removed: std::mem::take(&mut remove_batches[idx]),
+            });
+        }
+
         Ok(())
     }
 
@@ -7449,6 +7528,32 @@ impl TransactionVersionStore {
                 }
                 completed_ops.push((idx, true));
             }
+        }
+
+        let mut undo = self.index_undo.lock();
+        for &(idx, is_add) in completed_ops.iter() {
+            let index = &indexes[idx];
+            let source = if is_add {
+                new_row
+            } else {
+                old_row.unwrap_or(new_row)
+            };
+            let values: Vec<Value> = index
+                .column_ids()
+                .iter()
+                .map(|&col_id| {
+                    source
+                        .get(col_id as usize)
+                        .cloned()
+                        .unwrap_or(Value::Null(DataType::Null))
+                })
+                .collect();
+            let entry = vec![(row_id, values)];
+            undo.push(IndexUndo {
+                index: Arc::clone(index),
+                added: if is_add { entry.clone() } else { Vec::new() },
+                removed: if is_add { Vec::new() } else { entry },
+            });
         }
 
         Ok(())

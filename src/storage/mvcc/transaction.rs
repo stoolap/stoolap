@@ -137,6 +137,13 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// This cleans up the transaction's entries in txn_version_stores
     fn rollback_all_tables(&self, txn_id: i64);
 
+    /// Marks every table the transaction writes as publishing, from before
+    /// its index updates until the transaction is visible or undone
+    fn begin_publish(&self, txn_id: i64) -> super::version_store::PublishHold {
+        let _ = txn_id;
+        super::version_store::PublishHold::default()
+    }
+
     /// Discard the cold-row tombstones the transaction made after a timestamp
     /// (savepoint rollback). Engines without cold storage have none.
     fn rollback_tombstones_after(&self, _txn_id: i64, _timestamp: i64) {}
@@ -449,6 +456,12 @@ impl Transaction for MvccTransaction {
 
             // Phase 1: Start commit - mark transaction as "committing"
             self.registry.start_commit(self.id);
+            // Held until the transaction is visible or undone: readers that
+            // trust an index's order stand down while it publishes
+            let publish = self
+                .engine_operations
+                .as_ref()
+                .map(|ops| ops.begin_publish(self.id));
 
             // Phase 2: Commit all tables - apply local changes to global store
             // This now includes WAL recording internally (before each table commit)
@@ -487,6 +500,10 @@ impl Transaction for MvccTransaction {
                     // but not yet visible (complete_commit hasn't run). Abort so GC
                     // can reclaim the orphaned entries and active_txn_count is correct.
                     // On recovery, WAL has no COMMIT marker → entries are discarded.
+                    // The indexes already describe the aborted rows: take that back
+                    if let Some(hold) = &publish {
+                        hold.undo_index_updates();
+                    }
                     self.registry.abort_transaction(self.id);
                     self.state = TransactionState::RolledBack;
                     self.cleanup();

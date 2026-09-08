@@ -590,3 +590,73 @@ fn test_built_groups_are_walked_concurrently() {
         "a built group's walk waited for another group's walk"
     );
 }
+
+/// A transaction that writes two tables is visible only once the whole
+/// commit completes; the first table's index is updated long before that,
+/// so its walk must stand down until the transaction is visible
+#[test]
+fn test_top_k_stands_down_until_a_two_table_commit_is_visible() {
+    let db = Database::open("memory://hot_top_k_two_table_commit").unwrap();
+    for table in ["c", "d"] {
+        db.execute(
+            &format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, k TEXT NOT NULL, t INTEGER NOT NULL, UNIQUE(k, t))"),
+            (),
+        )
+        .unwrap();
+        db.execute(
+            &format!("INSERT INTO {table} VALUES (1, 'a', 100), (2, 'a', 50)"),
+            (),
+        )
+        .unwrap();
+    }
+    let second_store = db.engine().get_version_store("d").unwrap();
+    let (index, _) = second_store.get_multi_column_index(&["k"]).unwrap();
+    let name = index.name().to_string();
+    let (stopped_tx, stopped_rx) = mpsc::channel();
+    let (resume_tx, resume_rx) = mpsc::channel();
+    second_store.add_index(
+        name,
+        Arc::new(StopAfterIndexAdd {
+            inner: index,
+            armed: AtomicBool::new(true),
+            stopped: stopped_tx,
+            resume: Mutex::new(resume_rx),
+        }),
+    );
+    let writer_db = db.clone();
+    let writer = std::thread::spawn(move || {
+        writer_db.execute("BEGIN", ()).unwrap();
+        writer_db
+            .execute("UPDATE c SET t = 0 WHERE id = 1", ())
+            .unwrap();
+        writer_db
+            .execute("UPDATE d SET t = 0 WHERE id = 1", ())
+            .unwrap();
+        writer_db.execute("COMMIT", ()).unwrap();
+    });
+    stopped_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    // c's table commit is done, d's is stopped, the transaction is not visible
+    let full = ids(
+        &db,
+        "SELECT id FROM c WHERE k = 'a' ORDER BY t DESC, id DESC LIMIT 1",
+    );
+    let fast = ids(
+        &db,
+        "SELECT id FROM c WHERE k = 'a' ORDER BY t DESC LIMIT 1",
+    );
+    resume_tx.send(()).unwrap();
+    writer.join().unwrap();
+    assert_eq!(
+        full,
+        vec![1],
+        "c's old row stays visible until the whole transaction commits"
+    );
+    assert_eq!(fast, full);
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM c WHERE k = 'a' ORDER BY t DESC LIMIT 1"
+        ),
+        vec![2]
+    );
+}

@@ -615,3 +615,53 @@ fn test_failpoint_does_not_corrupt_existing_data() {
         );
     }
 }
+
+/// A commit that fails at the WAL after its index updates were applied
+/// takes those updates back, so the indexes describe the rows that stayed
+/// visible and an index-ordered read agrees with the full sort
+#[test]
+fn test_wal_sync_failure_undoes_the_commit_index_updates() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().expect("tempdir");
+    let db = Database::open(&format!(
+        "file://{}?sync_mode=full&checkpoint_interval=3600",
+        dir.path().display()
+    ))
+    .expect("open");
+    db.execute(
+        "CREATE TABLE fp_topk (id INTEGER PRIMARY KEY, k TEXT NOT NULL, t INTEGER NOT NULL, UNIQUE(k, t))",
+        (),
+    )
+    .expect("create");
+    db.execute("INSERT INTO fp_topk VALUES (1, 'a', 100), (2, 'a', 50)", ())
+        .expect("insert");
+
+    test_failpoints::WAL_SYNC_FAIL.store(true, Ordering::Release);
+    let update = db.execute("UPDATE fp_topk SET t = 0 WHERE id = 1", ());
+    test_failpoints::WAL_SYNC_FAIL.store(false, Ordering::Release);
+    assert!(
+        update.is_err(),
+        "the UPDATE must abort on the WAL sync failure"
+    );
+
+    let ids = |sql: &str| -> Vec<i64> {
+        db.query(sql, ())
+            .expect("query")
+            .map(|r| r.expect("row").get::<i64>(0).expect("id"))
+            .collect()
+    };
+    assert_eq!(
+        ids("SELECT id FROM fp_topk WHERE k = 'a' ORDER BY t DESC, id DESC LIMIT 1"),
+        vec![1]
+    );
+    assert_eq!(
+        ids("SELECT id FROM fp_topk WHERE k = 'a' ORDER BY t DESC LIMIT 1"),
+        vec![1]
+    );
+    // The old key is back in the index: an equality on it finds the row
+    assert_eq!(
+        ids("SELECT id FROM fp_topk WHERE k = 'a' AND t = 100"),
+        vec![1]
+    );
+    assert!(ids("SELECT id FROM fp_topk WHERE k = 'a' AND t = 0").is_empty());
+}

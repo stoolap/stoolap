@@ -7618,6 +7618,23 @@ impl TransactionEngineOperations for EngineOperations {
         (any_committed, commit_error)
     }
 
+    fn begin_publish(&self, txn_id: i64) -> super::version_store::PublishHold {
+        let mut hold = super::version_store::PublishHold::default();
+        let cache = self.txn_version_stores().read().unwrap();
+        if let Some(txn_tables) = cache.get(txn_id) {
+            let stores = self.version_stores().read().unwrap();
+            for (table_name, txn_store) in txn_tables.iter() {
+                if !txn_store.read().unwrap().has_local_changes() {
+                    continue;
+                }
+                if let Some(version_store) = stores.get(table_name.as_str()) {
+                    hold.add(version_store, Arc::clone(txn_store));
+                }
+            }
+        }
+        hold
+    }
+
     fn rollback_all_tables(&self, txn_id: i64) {
         // Collect touched table names BEFORE removing the cache entry,
         // so we only rollback tombstones on tables this txn actually used
