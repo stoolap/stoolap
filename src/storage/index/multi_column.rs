@@ -356,25 +356,6 @@ impl MultiColumnIndex {
         grouped
     }
 
-    /// Remove the sorted `ids` from the sorted `rows`, touching only the rows
-    /// from the first removed id onwards: taking the newest rows off a large
-    /// group stays cheap, taking the whole group is one pass.
-    fn subtract_sorted(rows: &mut CompactVec<i64>, ids: &[i64]) {
-        let Some(&first) = ids.first() else {
-            return;
-        };
-        let start = rows.binary_search(&first).unwrap_or_else(|pos| pos);
-        let slice = rows.as_mut_slice();
-        let mut keep = start;
-        for read in start..slice.len() {
-            if ids.binary_search(&slice[read]).is_err() {
-                slice[keep] = slice[read];
-                keep += 1;
-            }
-        }
-        rows.truncate(keep);
-    }
-
     /// Check uniqueness constraint (must be called while holding write lock on value_to_rows)
     fn check_unique_constraint_locked(
         &self,
@@ -853,21 +834,20 @@ impl Index for MultiColumnIndex {
         // The locks are taken per chunk so a reader waits for one chunk of
         // a seal's removal, not for all of it
         for chunk in entries.chunks(Self::REMOVE_CHUNK_ROWS) {
+            // Grouped by key: one subtraction per key instead of a shift per row
+            let removed = Self::group_removed_by_key(chunk, self.column_ids.len());
             let mut value_to_rows = self.value_to_rows.write();
             let mut row_to_key = self.row_to_key.write();
 
-            for &(row_id, values) in chunk {
-                let key = CompositeKey(values.to_vec());
-
+            for (key, ids) in removed {
                 if let Some(rows) = value_to_rows.get_mut(&key) {
-                    if let Ok(pos) = rows.binary_search(&row_id) {
-                        rows.remove(pos);
-                    }
+                    super::subtract_sorted(rows, &ids);
                     if rows.is_empty() {
                         value_to_rows.remove(&key);
                     }
                 }
-
+            }
+            for &(row_id, _) in chunk {
                 row_to_key.remove(row_id);
             }
         }
@@ -879,7 +859,7 @@ impl Index for MultiColumnIndex {
             let mut sorted_values = self.sorted_values.write();
             for (key, ids) in removed {
                 if let Some(rows) = sorted_values.get_mut(&key) {
-                    Self::subtract_sorted(rows, &ids);
+                    super::subtract_sorted(rows, &ids);
                     if rows.is_empty() {
                         sorted_values.remove(&key);
                     }
@@ -894,7 +874,7 @@ impl Index for MultiColumnIndex {
                 let mut prefix_index = self.prefix_indexes[idx].write();
                 for (key, ids) in removed {
                     if let Some(rows) = prefix_index.get_mut(&key) {
-                        Self::subtract_sorted(rows, &ids);
+                        super::subtract_sorted(rows, &ids);
                         if rows.is_empty() {
                             prefix_index.remove(&key);
                         }
@@ -914,6 +894,29 @@ impl Index for MultiColumnIndex {
         }
 
         Ok(())
+    }
+
+    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
+        // The keys come from the row map; the batch path then removes them
+        let owned: Vec<(i64, Vec<Value>)> = {
+            let row_to_key = self.row_to_key.read();
+            row_ids
+                .iter()
+                .filter_map(|&row_id| {
+                    row_to_key
+                        .get(row_id)
+                        .map(|key| (row_id, key.iter().map(|v| (**v).clone()).collect()))
+                })
+                .collect()
+        };
+        if owned.is_empty() {
+            return Some(Ok(()));
+        }
+        let borrowed: Vec<(i64, &[Value])> = owned
+            .iter()
+            .map(|(row_id, values)| (*row_id, values.as_slice()))
+            .collect();
+        Some(self.remove_batch_slice(&borrowed))
     }
 
     fn column_ids(&self) -> &[i32] {

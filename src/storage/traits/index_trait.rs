@@ -165,6 +165,13 @@ pub trait Index: Send + Sync {
     /// Vector of matching index entries
     fn find_with_operator(&self, op: Operator, values: &[Value]) -> Result<Vec<IndexEntry>>;
 
+    /// Removes the entries of `row_ids` using the index's own row-to-key map,
+    /// so the caller needs no row values. None when the index cannot.
+    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
+        let _ = row_ids;
+        None
+    }
+
     /// Visits the row ids whose key starts with `prefix`, in the order of the
     /// key column right after the prefix, within `lower` and `upper` (value,
     /// inclusive) on that column, ascending or descending. `visit` gets the

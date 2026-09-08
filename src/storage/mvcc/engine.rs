@@ -5915,7 +5915,7 @@ impl MVCCEngine {
                         mgr.clear_seal_overlap();
 
                         for cleanup in index_cleanups {
-                            store.remove_sealed_index_entries(cleanup);
+                            store.remove_sealed_index_entries(cleanup, &all_rows);
                         }
 
                         // Clear tombstones for sealed row_ids INSIDE the fence.

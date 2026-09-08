@@ -630,6 +630,29 @@ impl Index for BitmapIndex {
         Ok(())
     }
 
+    fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
+        if self.closed.load(AtomicOrdering::Acquire) {
+            return Some(Err(Error::IndexClosed));
+        }
+        let mut bitmaps = self.bitmaps.write();
+        let mut row_to_value = self.row_to_value.write();
+        for &row_id in row_ids {
+            if row_id < 0 {
+                continue;
+            }
+            if let Some(arc_key) = row_to_value.remove(row_id) {
+                if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
+                    bitmap.remove(row_id as u64);
+                    if bitmap.is_empty() {
+                        bitmaps.remove(&arc_key);
+                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
+                    }
+                }
+            }
+        }
+        Some(Ok(()))
+    }
+
     fn column_ids(&self) -> &[i32] {
         &self.column_ids
     }
