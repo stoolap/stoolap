@@ -165,6 +165,23 @@ pub trait Index: Send + Sync {
     /// Vector of matching index entries
     fn find_with_operator(&self, op: Operator, values: &[Value]) -> Result<Vec<IndexEntry>>;
 
+    /// Visits the row ids whose key starts with `prefix`, in the order of the
+    /// key column right after the prefix, within `lower` and `upper` (value,
+    /// inclusive) on that column, ascending or descending. `visit` gets the
+    /// row id and that column's value in the key and returns false to stop.
+    /// Returns false when the index cannot walk in that order.
+    fn walk_prefix_ordered(
+        &self,
+        prefix: &[Value],
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+        ascending: bool,
+        visit: &mut dyn FnMut(i64, &Value) -> bool,
+    ) -> bool {
+        let _ = (prefix, lower, upper, ascending, visit);
+        false
+    }
+
     /// Returns row IDs with the given values (convenience method)
     ///
     /// This is a simplified version of `find` that returns only row IDs.

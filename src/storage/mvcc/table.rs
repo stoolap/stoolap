@@ -44,6 +44,34 @@ pub struct MVCCTable {
     cached_schema: CompactArc<Schema>,
 }
 
+/// Where a WHERE conjunction sits on a multi-column index: equalities on the
+/// leading columns and the bounds on the column after them
+struct PrefixPlan {
+    index: Arc<dyn crate::storage::traits::Index>,
+    prefix: Vec<Value>,
+    lower: Option<(Value, bool)>,
+    upper: Option<(Value, bool)>,
+}
+
+/// The comparisons of an AND tree; false when a leaf is not a comparison
+fn collect_conjuncts<'a>(
+    expr: &'a dyn Expression,
+    out: &mut Vec<(&'a str, crate::core::Operator, &'a Value)>,
+) -> bool {
+    if let Some(children) = expr.get_and_operands() {
+        return children
+            .iter()
+            .all(|child| collect_conjuncts(child.as_ref(), out));
+    }
+    match expr.get_comparison_info() {
+        Some(leaf) => {
+            out.push(leaf);
+            true
+        }
+        None => false,
+    }
+}
+
 impl MVCCTable {
     /// Creates a new MVCC table with an owned transaction version store
     /// (wraps it in Arc<RwLock> internally)
@@ -302,6 +330,55 @@ impl MVCCTable {
             .filter(|(row_id, version)| !version.is_deleted() && !present.contains(*row_id))
             .map(|(row_id, _)| row_id)
             .collect()
+    }
+
+    /// A conjunction of equalities on the leading columns of a multi-column
+    /// index, with the bounds the same conjunction puts on the next column
+    fn prefix_plan(&self, expr: &dyn Expression) -> Option<PrefixPlan> {
+        let mut leaves = Vec::new();
+        if !collect_conjuncts(expr, &mut leaves) {
+            return None;
+        }
+        let eq_columns: Vec<&str> = leaves
+            .iter()
+            .filter(|(_, op, value)| matches!(op, crate::core::Operator::Eq) && !value.is_null())
+            .map(|(column, _, _)| *column)
+            .collect();
+        if eq_columns.is_empty() {
+            return None;
+        }
+        let (index, matched) = self.version_store.get_multi_column_index(&eq_columns)?;
+        let columns = index.column_names();
+        let mut prefix = Vec::with_capacity(matched);
+        for column in columns.iter().take(matched) {
+            let (_, _, value) = leaves.iter().find(|(name, op, value)| {
+                matches!(op, crate::core::Operator::Eq)
+                    && !value.is_null()
+                    && name.eq_ignore_ascii_case(column)
+            })?;
+            prefix.push((*value).clone());
+        }
+        let walked = columns.get(matched)?;
+        let mut lower = None;
+        let mut upper = None;
+        for (name, op, value) in &leaves {
+            if !name.eq_ignore_ascii_case(walked) || value.is_null() {
+                continue;
+            }
+            match op {
+                crate::core::Operator::Gt => lower = Some(((*value).clone(), false)),
+                crate::core::Operator::Gte => lower = Some(((*value).clone(), true)),
+                crate::core::Operator::Lt => upper = Some(((*value).clone(), false)),
+                crate::core::Operator::Lte => upper = Some(((*value).clone(), true)),
+                _ => {}
+            }
+        }
+        Some(PrefixPlan {
+            index,
+            prefix,
+            lower,
+            upper,
+        })
     }
 
     fn try_index_lookup(&self, expr: &dyn Expression) -> Option<RowIdVec> {
@@ -2907,6 +2984,97 @@ impl Table for MVCCTable {
         let rows = self.collect_visible_rows(where_expr);
         let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
         Ok(Box::new(scanner))
+    }
+
+    /// Answered by walking a multi-column index whose leading columns the
+    /// WHERE pins with equalities and whose next column is the order column:
+    /// the rows come out in key order and the walk stops at the limit
+    fn scan_top_k(
+        &self,
+        where_expr: Option<&dyn Expression>,
+        column_name: &str,
+        ascending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<RowVec>> {
+        let needed = limit.saturating_add(offset);
+        if needed == 0 {
+            return Ok(Some(RowVec::new()));
+        }
+        // Rows this transaction wrote are not in the shared indexes yet, and
+        // a snapshot may see older versions than the keys the index holds
+        if self.txn_versions.read().unwrap().has_local_changes()
+            || self.version_store.needs_snapshot_isolation(self.txn_id)
+        {
+            return Ok(None);
+        }
+        let Some(expr) = where_expr else {
+            return Ok(None);
+        };
+        let Some(plan) = self.prefix_plan(expr) else {
+            return Ok(None);
+        };
+        if !plan.index.column_names()[plan.prefix.len()].eq_ignore_ascii_case(column_name) {
+            return Ok(None);
+        }
+        let schema = &self.cached_schema;
+        let column_lower = column_name.to_lowercase();
+        let Some(col_idx) = schema
+            .columns
+            .iter()
+            .position(|c| c.name_lower == column_lower)
+        else {
+            return Ok(None);
+        };
+        let column = &schema.columns[col_idx];
+        // NULL and NaN sort by rules the key order does not follow
+        if column.nullable || column.data_type == DataType::Float {
+            return Ok(None);
+        }
+
+        // A commit updates the indexes before its versions are visible, and
+        // a key moved by it may sit anywhere in the walk: the walk stands
+        // down while a commit publishes, or if one did meanwhile
+        let Some(epoch) = self.version_store.publish_epoch_if_quiet() else {
+            return Ok(None);
+        };
+        let mut rows = RowVec::with_capacity(needed.min(1024));
+        // A row whose visible order value differs from its key was changed
+        // between the index and the version this transaction sees: the walk
+        // order does not hold for it, and the full scan answers instead
+        let mut stale = false;
+        let walked = plan.index.walk_prefix_ordered(
+            &plan.prefix,
+            plan.lower
+                .as_ref()
+                .map(|(value, inclusive)| (value, *inclusive)),
+            plan.upper
+                .as_ref()
+                .map(|(value, inclusive)| (value, *inclusive)),
+            ascending,
+            &mut |row_id, key_value| {
+                // A version comes back only when it is visible and its
+                // deletion, if any, is not: the raw deleted flag may belong
+                // to an aborted or unfinished transaction
+                if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
+                    let row = self.normalize_row_to_schema(version.data, schema);
+                    if row.get(col_idx) != Some(key_value) {
+                        stale = true;
+                        return false;
+                    }
+                    // The index may be ahead of this transaction's view of
+                    // the row, so the whole WHERE is checked on the row
+                    if expr.evaluate_fast(&row) {
+                        rows.push((row_id, row));
+                    }
+                }
+                rows.len() < needed
+            },
+        );
+        if !walked || stale || self.version_store.publish_epoch_if_quiet() != Some(epoch) {
+            return Ok(None);
+        }
+        Ok(Some(rows.into_iter().skip(offset).take(limit).collect()))
     }
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
