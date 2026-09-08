@@ -18,7 +18,7 @@
 //! Source code checks these flags inside `#[cfg(test)]` guards, so they
 //! have zero cost in release builds.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 /// Fail WAL `write_to_file()` with an I/O error
@@ -26,6 +26,9 @@ pub static WAL_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 
 /// Fail WAL `sync_locked()` (fsync) with an I/O error
 pub static WAL_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
+
+/// Fail cleanup after a WAL write/sync failure, leaving its outcome unknown.
+pub static WAL_ROLLBACK_FAIL: AtomicBool = AtomicBool::new(false);
 
 /// Fail snapshot `append_row()` write with an I/O error
 pub static SNAPSHOT_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
@@ -39,6 +42,38 @@ pub static SNAPSHOT_RENAME_FAIL: AtomicBool = AtomicBool::new(false);
 /// Fail checkpoint metadata write
 pub static CHECKPOINT_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 
+/// Remaining cold reads before a one-shot injected error; zero disables it.
+static COLD_READ_COUNTDOWN: AtomicUsize = AtomicUsize::new(0);
+static TABLE_PUBLISH_COUNTDOWN: AtomicUsize = AtomicUsize::new(0);
+
+/// Fail the nth subsequent table publication after prepare has succeeded.
+pub fn fail_table_publish_on(nth: usize) {
+    TABLE_PUBLISH_COUNTDOWN.store(nth, Ordering::Release);
+}
+
+pub(crate) fn should_fail_table_publish() -> bool {
+    TABLE_PUBLISH_COUNTDOWN.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+        left.checked_sub(1)
+    }) == Ok(1)
+}
+
+/// Fail the nth subsequent fallible cold read, including an already cached view.
+/// Call under `FailpointGuard`; passing zero disables the injection.
+pub fn fail_cold_read_on(nth: usize) {
+    COLD_READ_COUNTDOWN.store(nth, Ordering::Release);
+}
+
+pub(crate) fn check_cold_read() -> std::io::Result<()> {
+    let previous = COLD_READ_COUNTDOWN.fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+        left.checked_sub(1)
+    });
+    if previous == Ok(1) {
+        Err(std::io::Error::other("injected cold read failure"))
+    } else {
+        Ok(())
+    }
+}
+
 /// Serializes failpoint tests so that only one can run at a time.
 /// Global AtomicBool flags are process-wide; concurrent tests would
 /// interfere with each other without this lock.
@@ -49,10 +84,13 @@ pub fn reset_all() {
     use std::sync::atomic::Ordering::Release;
     WAL_WRITE_FAIL.store(false, Release);
     WAL_SYNC_FAIL.store(false, Release);
+    WAL_ROLLBACK_FAIL.store(false, Release);
     SNAPSHOT_WRITE_FAIL.store(false, Release);
     SNAPSHOT_SYNC_FAIL.store(false, Release);
     SNAPSHOT_RENAME_FAIL.store(false, Release);
     CHECKPOINT_WRITE_FAIL.store(false, Release);
+    COLD_READ_COUNTDOWN.store(0, Release);
+    TABLE_PUBLISH_COUNTDOWN.store(0, Release);
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.

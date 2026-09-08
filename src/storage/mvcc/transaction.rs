@@ -57,6 +57,12 @@ pub enum TransactionState {
     RolledBack,
 }
 
+/// Journal positions, without copying prior transaction writes.
+#[derive(Default)]
+pub struct StatementCheckpoint {
+    pub(crate) tables: smallvec::SmallVec<[(crate::common::SmartString, usize, usize); 1]>,
+}
+
 /// MVCC Transaction implementation
 pub struct MvccTransaction {
     /// Transaction ID
@@ -77,6 +83,7 @@ pub struct MvccTransaction {
     engine_operations: Option<Arc<dyn TransactionEngineOperations>>,
     /// Savepoints in creation order; the same name may appear more than once
     savepoints: Vec<(String, SavepointState)>,
+    statement_checkpoint: Option<Box<StatementCheckpoint>>,
     /// Tables created in this transaction (for rollback)
     created_tables: Vec<String>,
     /// Tables dropped in this transaction (for rollback - stores name and schema)
@@ -121,17 +128,25 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// Check if transaction has any pending DML changes (without allocating)
     fn has_pending_dml_changes(&self, txn_id: i64) -> bool;
 
-    /// Commit all tables for a transaction at once (includes WAL recording).
-    ///
-    /// Returns `(any_committed, optional_error)`:
-    /// - `(false, None)`: no tables had changes, nothing to do
-    /// - `(true, None)`: all tables committed successfully
-    /// - `(true, Some(e))`: partial commit - some tables committed before error
-    /// - `(false, Some(e))`: error before any table committed
-    ///
-    /// Callers MUST complete_commit if any_committed is true, even on error,
-    /// to avoid orphaning already-committed rows.
+    /// Prepare every table, then apply changes while retaining complete undo.
+    /// Any error requires finish_publication(false), never a partial commit.
     fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>);
+
+    fn statement_checkpoint(&self, _txn_id: i64) -> Result<StatementCheckpoint> {
+        Ok(StatementCheckpoint::default())
+    }
+    fn finish_statement(&self, _txn_id: i64, _checkpoint: StatementCheckpoint, _success: bool) {}
+    fn finish_publication(&self, _txn_id: i64, _committed: bool) -> Result<()> {
+        Ok(())
+    }
+    fn check_health(&self) -> Result<()> {
+        Ok(())
+    }
+    fn handle_publication_undo_failure(&self, _error: &Error) {}
+    /// Fence access and return true for an indeterminate WAL marker outcome.
+    fn handle_commit_marker_failure(&self, _error: &Error) -> bool {
+        false
+    }
 
     /// Rollback all tables for a transaction at once
     /// This cleans up the transaction's entries in txn_version_stores
@@ -228,6 +243,7 @@ impl MvccTransaction {
             last_table_name: None,
             engine_operations: None,
             savepoints: Vec::new(),
+            statement_checkpoint: None,
             created_tables: Vec::new(),
             dropped_tables: Vec::new(),
         }
@@ -256,6 +272,9 @@ impl MvccTransaction {
 
     /// Check if transaction is active
     fn check_active(&self) -> Result<()> {
+        if let Some(ops) = &self.engine_operations {
+            ops.check_health()?;
+        }
         if self.state != TransactionState::Active {
             return Err(Error::TransactionClosed);
         }
@@ -481,30 +500,18 @@ impl Transaction for MvccTransaction {
             // Phase 2: Commit all tables - apply local changes to global store
             // This now includes WAL recording internally (before each table commit)
             if let Some(ops) = &self.engine_operations {
-                let (any_committed, error) = ops.commit_all_tables(self.id);
-                if let Some(e) = error {
-                    if any_committed {
-                        // Partial commit: some tables already committed.
-                        // We MUST complete the commit to avoid orphaning those rows.
-                        self.registry.complete_commit(self.id);
-                        if let Some(hold) = &publish {
-                            ops.request_seal_if_over(hold);
-                        }
-                        // Record commit marker so WAL recovery sees committed state
-                        ops.record_commit(self.id)?;
-                        self.state = TransactionState::Committed;
-                        self.cleanup();
-                        return Err(e);
-                    } else {
-                        // Nothing committed yet - safe to abort cleanly.
-                        // Release uncommitted_writes claims and remove from
-                        // txn_version_stores to prevent permanent row blocking.
-                        self.registry.abort_transaction(self.id);
-                        ops.rollback_all_tables(self.id);
+                let (_, error) = ops.commit_all_tables(self.id);
+                if let Some(error) = error {
+                    self.registry.abort_transaction(self.id);
+                    if let Err(undo_error) = ops.finish_publication(self.id, false) {
+                        ops.handle_publication_undo_failure(&undo_error);
                         self.state = TransactionState::RolledBack;
-                        self.cleanup();
-                        return Err(e);
+                        return Err(undo_error);
                     }
+                    ops.rollback_all_tables(self.id);
+                    self.state = TransactionState::RolledBack;
+                    self.cleanup();
+                    return Err(error);
                 }
             }
 
@@ -513,24 +520,30 @@ impl Transaction for MvccTransaction {
             // before complete_commit(). WAL is only read during recovery, so writing
             // the marker before visibility doesn't affect normal operation.
             if let Some(ops) = &self.engine_operations {
-                if let Err(e) = ops.record_commit(self.id) {
-                    // WAL commit marker failed. Phase 2 data is in the version store
-                    // but not yet visible (complete_commit hasn't run). Abort so GC
-                    // can reclaim the orphaned entries and active_txn_count is correct.
-                    // On recovery, WAL has no COMMIT marker → entries are discarded.
-                    // The indexes already describe the aborted rows: take that back
-                    if let Some(hold) = &publish {
-                        hold.undo_index_updates();
+                if let Err(error) = ops.record_commit(self.id) {
+                    if ops.handle_commit_marker_failure(&error) {
+                        // Leave published state and transaction outcome unresolved.
+                        // Engine health fencing prevents reads/writes until recovery.
+                        return Err(error);
                     }
                     self.registry.abort_transaction(self.id);
+                    if let Err(undo_error) = ops.finish_publication(self.id, false) {
+                        ops.handle_publication_undo_failure(&undo_error);
+                        self.state = TransactionState::RolledBack;
+                        return Err(undo_error);
+                    }
+                    ops.rollback_all_tables(self.id);
                     self.state = TransactionState::RolledBack;
                     self.cleanup();
-                    return Err(e);
+                    return Err(error);
                 }
             }
 
             // Phase 4: Complete commit - make changes visible in registry
             self.registry.complete_commit(self.id);
+            if let Some(ops) = &self.engine_operations {
+                ops.finish_publication(self.id, true)?;
+            }
             if let (Some(ops), Some(hold)) = (&self.engine_operations, &publish) {
                 ops.request_seal_if_over(hold);
             }
@@ -585,6 +598,27 @@ impl Transaction for MvccTransaction {
         self.state = TransactionState::RolledBack;
         self.cleanup();
         Ok(())
+    }
+
+    fn begin_statement(&mut self) -> Result<bool> {
+        self.check_active()?;
+        if self.statement_checkpoint.is_some() {
+            return Ok(false);
+        }
+        let checkpoint = match &self.engine_operations {
+            Some(ops) => ops.statement_checkpoint(self.id)?,
+            None => StatementCheckpoint::default(),
+        };
+        self.statement_checkpoint = Some(Box::new(checkpoint));
+        Ok(true)
+    }
+
+    fn finish_statement(&mut self, success: bool) {
+        if let Some(checkpoint) = self.statement_checkpoint.take() {
+            if let Some(ops) = &self.engine_operations {
+                ops.finish_statement(self.id, *checkpoint, success);
+            }
+        }
     }
 
     fn create_savepoint(&mut self, name: &str) -> Result<()> {

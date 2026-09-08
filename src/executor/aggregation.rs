@@ -1230,20 +1230,13 @@ impl Executor {
                         );
 
                         // Process the correlated expression with the outer row context
-                        let result = match self.process_correlated_expression(expr, &correlated_ctx)
-                        {
-                            Ok(processed_expr) => {
-                                // Evaluate the processed expression
-                                let mut corr_eval = CompiledEvaluator::new(&self.function_registry)
-                                    .with_context(&correlated_ctx);
-                                corr_eval.init_columns(&agg_columns);
-                                corr_eval.set_row_array(&row);
-                                corr_eval
-                                    .evaluate(&processed_expr)
-                                    .unwrap_or(Value::null_unknown())
-                            }
-                            Err(_) => Value::null_unknown(),
-                        };
+                        let processed_expr =
+                            self.process_correlated_expression(expr, &correlated_ctx)?;
+                        let mut corr_eval = CompiledEvaluator::new(&self.function_registry)
+                            .with_context(&correlated_ctx);
+                        corr_eval.init_columns(&agg_columns);
+                        corr_eval.set_row_array(&row);
+                        let result = corr_eval.evaluate(&processed_expr)?;
 
                         // Take back map for reuse
                         outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
@@ -5430,7 +5423,7 @@ impl Executor {
                 "COUNT" => {
                     if agg.distinct {
                         // COUNT(DISTINCT col) - try to get count from index without cloning values
-                        if let Some(count) = table.get_partition_count(&agg.column_lower) {
+                        if let Some(count) = table.get_partition_count(&agg.column_lower)? {
                             // get_partition_count already excludes NULL values per SQL standard
                             result_values.push(Value::Integer(count as i64));
                         } else {
@@ -5439,7 +5432,7 @@ impl Executor {
                         }
                     } else if agg.column == "*" {
                         // COUNT(*) - use row_count
-                        let count = table.row_count();
+                        let count = table.row_count()?;
                         result_values.push(Value::Integer(count as i64));
                     } else {
                         // COUNT(col) - need to count non-null values, can't pushdown easily
@@ -5449,7 +5442,7 @@ impl Executor {
                 "SUM" => {
                     let col_idx = col_index_map.get(&agg.column_lower).copied();
                     if let Some(idx) = col_idx {
-                        if let Some((sum, count)) = table.sum_column(idx) {
+                        if let Some((sum, count)) = table.sum_column(idx)? {
                             if count == 0 {
                                 result_values.push(Value::null(crate::core::DataType::Float));
                             } else {
@@ -5471,7 +5464,7 @@ impl Executor {
                 "AVG" => {
                     let col_idx = col_index_map.get(&agg.column_lower).copied();
                     if let Some(idx) = col_idx {
-                        if let Some((sum, count)) = table.avg_column(idx) {
+                        if let Some((sum, count)) = table.avg_column(idx)? {
                             if count == 0 {
                                 result_values.push(Value::null(crate::core::DataType::Float));
                             } else {
@@ -5487,7 +5480,7 @@ impl Executor {
                 "MIN" => {
                     let col_idx = col_index_map.get(&agg.column_lower).copied();
                     if let Some(idx) = col_idx {
-                        if let Some(min_val) = table.min_column(idx) {
+                        if let Some(min_val) = table.min_column(idx)? {
                             result_values
                                 .push(min_val.unwrap_or_else(|| {
                                     Value::null(crate::core::DataType::Integer)
@@ -5502,7 +5495,7 @@ impl Executor {
                 "MAX" => {
                     let col_idx = col_index_map.get(&agg.column_lower).copied();
                     if let Some(idx) = col_idx {
-                        if let Some(max_val) = table.max_column(idx) {
+                        if let Some(max_val) = table.max_column(idx)? {
                             result_values
                                 .push(max_val.unwrap_or_else(|| {
                                     Value::null(crate::core::DataType::Integer)
@@ -5699,7 +5692,7 @@ impl Executor {
 
         // --- Call storage-level filtered aggregation ---
 
-        let values = match table.compute_filtered_aggregates(&agg_ops, storage_expr.as_ref()) {
+        let values = match table.compute_filtered_aggregates(&agg_ops, storage_expr.as_ref())? {
             Some(v) => v,
             None => return Ok(None),
         };
@@ -5822,7 +5815,7 @@ impl Executor {
                     "COUNT" => {
                         if agg.column == "*" {
                             // COUNT(*) - use row_count()
-                            Some(Value::Integer(table.row_count() as i64))
+                            Some(Value::Integer(table.row_count()? as i64))
                         } else {
                             // COUNT(col) - need scanner for NULL checking
                             // Could optimize with a dedicated count_non_null method
@@ -5831,7 +5824,7 @@ impl Executor {
                     }
                     "SUM" => {
                         if let Some(idx) = col_idx {
-                            if let Some((sum, count)) = table.sum_column(idx) {
+                            if let Some((sum, count)) = table.sum_column(idx)? {
                                 if count == 0 {
                                     Some(Value::null(crate::core::DataType::Float))
                                 } else if sum.fract() == 0.0 && sum.abs() < i64::MAX as f64 {
@@ -5848,7 +5841,7 @@ impl Executor {
                     }
                     "AVG" => {
                         if let Some(idx) = col_idx {
-                            if let Some((sum, count)) = table.avg_column(idx) {
+                            if let Some((sum, count)) = table.avg_column(idx)? {
                                 if count == 0 {
                                     Some(Value::null(crate::core::DataType::Float))
                                 } else {
@@ -5861,16 +5854,18 @@ impl Executor {
                             None
                         }
                     }
-                    "MIN" => col_idx.and_then(|idx| {
-                        table.min_column(idx).map(|min_opt| {
+                    "MIN" => match col_idx {
+                        Some(idx) => table.min_column(idx)?.map(|min_opt| {
                             min_opt.unwrap_or_else(|| Value::null(crate::core::DataType::Integer))
-                        })
-                    }),
-                    "MAX" => col_idx.and_then(|idx| {
-                        table.max_column(idx).map(|max_opt| {
+                        }),
+                        None => None,
+                    },
+                    "MAX" => match col_idx {
+                        Some(idx) => table.max_column(idx)?.map(|max_opt| {
                             max_opt.unwrap_or_else(|| Value::null(crate::core::DataType::Integer))
-                        })
-                    }),
+                        }),
+                        None => None,
+                    },
                     _ => None,
                 };
 
@@ -6550,33 +6545,33 @@ impl Executor {
         stmt: &SelectStatement,
         all_columns: &[String],
         classification: &QueryClassification,
-    ) -> Option<Box<dyn QueryResult>> {
+    ) -> Result<Option<Box<dyn QueryResult>>> {
         use crate::parser::ast::GroupByModifier;
         use crate::storage::mvcc::version_store::AggregateOp;
 
         if Self::aggregates_hold_subquery(stmt) {
-            return None;
+            return Ok(None);
         }
 
         // Only for GROUP BY without WHERE or HAVING
         if classification.has_where || !classification.has_group_by || classification.has_having {
-            return None;
+            return Ok(None);
         }
 
         // Only for simple GROUP BY (no ROLLUP, CUBE, or GROUPING SETS)
         if !matches!(stmt.group_by.modifier, GroupByModifier::None) {
-            return None;
+            return Ok(None);
         }
 
         // Only for simple GROUP BY expressions (column references)
         let group_by_cols = &stmt.group_by.columns;
         if group_by_cols.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Only for single-column GROUP BY (multi-column causes Vec allocation per row)
         if group_by_cols.len() != 1 {
-            return None;
+            return Ok(None);
         }
 
         // Build column name -> index map
@@ -6597,10 +6592,10 @@ impl Executor {
                         group_by_indices.push(idx);
                         group_by_col_names.push(col_name);
                     } else {
-                        return None; // Unknown column
+                        return Ok(None); // Unknown column
                     }
                 }
-                _ => return None, // Non-column GROUP BY not supported
+                _ => return Ok(None), // Non-column GROUP BY not supported
             }
         }
 
@@ -6617,11 +6612,11 @@ impl Executor {
                     // This must be a GROUP BY column
                     let col_name_lower = ident.value.to_lowercase().to_string();
                     if !group_by_col_names.contains(&col_name_lower) {
-                        return None; // Column not in GROUP BY
+                        return Ok(None); // Column not in GROUP BY
                     }
                     if seen_aggregate {
                         // GROUP BY columns must come before aggregates for this optimization
-                        return None;
+                        return Ok(None);
                     }
                     select_group_count += 1;
                     result_columns.push(ident.value.to_string());
@@ -6629,7 +6624,7 @@ impl Executor {
                 Expression::FunctionCall(fc) => {
                     // Don't support FILTER clause or DISTINCT for this optimization
                     if fc.filter.is_some() || fc.is_distinct {
-                        return None;
+                        return Ok(None);
                     }
                     seen_aggregate = true;
                     let func_name = fc.function.to_uppercase();
@@ -6645,10 +6640,10 @@ impl Executor {
                                 if let Some(&idx) = col_map.get(col_name.as_str()) {
                                     (AggregateOp::Count, idx)
                                 } else {
-                                    return None;
+                                    return Ok(None);
                                 }
                             } else {
-                                return None;
+                                return Ok(None);
                             }
                         }
                         "SUM" => {
@@ -6657,10 +6652,10 @@ impl Executor {
                                 if let Some(&idx) = col_map.get(col_name.as_str()) {
                                     (AggregateOp::Sum, idx)
                                 } else {
-                                    return None;
+                                    return Ok(None);
                                 }
                             } else {
-                                return None;
+                                return Ok(None);
                             }
                         }
                         "AVG" => {
@@ -6669,10 +6664,10 @@ impl Executor {
                                 if let Some(&idx) = col_map.get(col_name.as_str()) {
                                     (AggregateOp::Avg, idx)
                                 } else {
-                                    return None;
+                                    return Ok(None);
                                 }
                             } else {
-                                return None;
+                                return Ok(None);
                             }
                         }
                         "MIN" => {
@@ -6681,10 +6676,10 @@ impl Executor {
                                 if let Some(&idx) = col_map.get(col_name.as_str()) {
                                     (AggregateOp::Min, idx)
                                 } else {
-                                    return None;
+                                    return Ok(None);
                                 }
                             } else {
-                                return None;
+                                return Ok(None);
                             }
                         }
                         "MAX" => {
@@ -6693,13 +6688,13 @@ impl Executor {
                                 if let Some(&idx) = col_map.get(col_name.as_str()) {
                                     (AggregateOp::Max, idx)
                                 } else {
-                                    return None;
+                                    return Ok(None);
                                 }
                             } else {
-                                return None;
+                                return Ok(None);
                             }
                         }
-                        _ => return None, // Unsupported aggregate
+                        _ => return Ok(None), // Unsupported aggregate
                     };
                     aggregates.push((op, col_idx));
 
@@ -6717,10 +6712,10 @@ impl Executor {
                     if let Expression::Identifier(ident) = aliased.expression.as_ref() {
                         let col_name_lower = ident.value.to_lowercase().to_string();
                         if !group_by_col_names.contains(&col_name_lower) {
-                            return None; // Column not in GROUP BY
+                            return Ok(None); // Column not in GROUP BY
                         }
                         if seen_aggregate {
-                            return None;
+                            return Ok(None);
                         }
                         select_group_count += 1;
                         result_columns.push(aliased.alias.value.to_string());
@@ -6729,7 +6724,7 @@ impl Executor {
                     else if let Expression::FunctionCall(fc) = aliased.expression.as_ref() {
                         // Don't support FILTER clause or DISTINCT for this optimization
                         if fc.filter.is_some() || fc.is_distinct {
-                            return None;
+                            return Ok(None);
                         }
                         seen_aggregate = true;
                         let func_name = fc.function.to_uppercase();
@@ -6746,10 +6741,10 @@ impl Executor {
                                     if let Some(&idx) = col_map.get(col_name.as_str()) {
                                         (AggregateOp::Count, idx)
                                     } else {
-                                        return None;
+                                        return Ok(None);
                                     }
                                 } else {
-                                    return None;
+                                    return Ok(None);
                                 }
                             }
                             "SUM" => {
@@ -6758,10 +6753,10 @@ impl Executor {
                                     if let Some(&idx) = col_map.get(col_name.as_str()) {
                                         (AggregateOp::Sum, idx)
                                     } else {
-                                        return None;
+                                        return Ok(None);
                                     }
                                 } else {
-                                    return None;
+                                    return Ok(None);
                                 }
                             }
                             "AVG" => {
@@ -6770,10 +6765,10 @@ impl Executor {
                                     if let Some(&idx) = col_map.get(col_name.as_str()) {
                                         (AggregateOp::Avg, idx)
                                     } else {
-                                        return None;
+                                        return Ok(None);
                                     }
                                 } else {
-                                    return None;
+                                    return Ok(None);
                                 }
                             }
                             "MIN" => {
@@ -6782,10 +6777,10 @@ impl Executor {
                                     if let Some(&idx) = col_map.get(col_name.as_str()) {
                                         (AggregateOp::Min, idx)
                                     } else {
-                                        return None;
+                                        return Ok(None);
                                     }
                                 } else {
-                                    return None;
+                                    return Ok(None);
                                 }
                             }
                             "MAX" => {
@@ -6794,37 +6789,40 @@ impl Executor {
                                     if let Some(&idx) = col_map.get(col_name.as_str()) {
                                         (AggregateOp::Max, idx)
                                     } else {
-                                        return None;
+                                        return Ok(None);
                                     }
                                 } else {
-                                    return None;
+                                    return Ok(None);
                                 }
                             }
-                            _ => return None,
+                            _ => return Ok(None),
                         };
                         aggregates.push((op, col_idx));
                         result_columns.push(aliased.alias.value.to_string());
                     } else {
-                        return None; // Other aliased expression not supported
+                        return Ok(None); // Other aliased expression not supported
                     }
                 }
-                _ => return None, // Unsupported expression type
+                _ => return Ok(None), // Unsupported expression type
             }
         }
 
         // Must have at least one aggregate
         if aggregates.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // SELECT must include at least all GROUP BY columns (can have more)
         // but for simplicity, require exact match with GROUP BY column count
         if select_group_count != group_by_col_names.len() {
-            return None;
+            return Ok(None);
         }
 
         // Call storage-level aggregation
-        let results = table.compute_grouped_aggregates(&group_by_indices, &aggregates)?;
+        let Some(results) = table.compute_grouped_aggregates(&group_by_indices, &aggregates)?
+        else {
+            return Ok(None);
+        };
 
         // Convert to rows
         let mut rows = RowVec::new();
@@ -6837,7 +6835,7 @@ impl Executor {
             ));
         }
 
-        Some(Box::new(ExecutorResult::new(result_columns, rows)))
+        Ok(Some(Box::new(ExecutorResult::new(result_columns, rows))))
     }
 
     /// Try fast COUNT(DISTINCT col) using compiled cache
@@ -6901,7 +6899,7 @@ impl Executor {
         let table = tx.get_table(&cd.table_name)?;
 
         let count = table
-            .get_partition_count(&cd.column_name)
+            .get_partition_count(&cd.column_name)?
             .ok_or_else(|| crate::core::Error::internal("Index no longer available for column"))?;
 
         // Build result
@@ -7080,8 +7078,9 @@ impl Executor {
         // value: a second call could return None (e.g. seal overlap or a
         // cold-volume reload failure) and an unwrap would panic.
         let count = match table.get_partition_count(&column_name) {
-            Some(c) => c,
-            None => {
+            Ok(Some(c)) => c,
+            Err(e) => return Some(Err(e)),
+            Ok(None) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;
             }
@@ -7170,7 +7169,7 @@ impl Executor {
         let tx = self.engine.begin_transaction()?;
         let table = tx.get_table(&cs.table_name)?;
 
-        let count = table.row_count();
+        let count = table.row_count()?;
 
         // Build result
         let mut result_values = CompactVec::with_capacity(1);
@@ -7388,7 +7387,10 @@ impl Executor {
         };
 
         // Get the count
-        let count = table.row_count();
+        let count = match table.row_count() {
+            Ok(count) => count,
+            Err(e) => return Some(Err(e)),
+        };
 
         // Cache the compiled state
         let compiled_cs = CompiledCountStar {

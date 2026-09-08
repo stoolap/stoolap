@@ -962,6 +962,9 @@ pub struct WALManager {
     /// Set after a WAL write failure; all further appends/flushes fail.
     /// See flush_and_maybe_sync for why retrying is never safe.
     poisoned: AtomicBool,
+    /// A failed suffix rollback left transaction durability unresolved.
+    /// Readers as well as writers must reopen before trusting this state.
+    indeterminate_commit: AtomicBool,
     /// Pending commits (legacy, kept for API compatibility)
     #[allow(dead_code)]
     pending_commits: AtomicI32,
@@ -1230,6 +1233,7 @@ impl WALManager {
             sync_mode,
             running: AtomicBool::new(true),
             poisoned: AtomicBool::new(false),
+            indeterminate_commit: AtomicBool::new(false),
             pending_commits: AtomicI32::new(0),
             last_sync_time: AtomicI64::new(now),
             commit_batch_size,
@@ -1410,17 +1414,41 @@ impl WALManager {
     /// durable (via a later sync or plain kernel writeback). In Full mode
     /// everything above the floor is unacknowledged by construction; in
     /// Normal mode it is within the documented sync-interval loss window.
-    /// Truncation is best-effort: if it fails too, the torn-tail recovery
-    /// scan is the fallback.
+    /// The truncation must itself be synced. If that rollback fails, a complete
+    /// commit marker can remain on disk: fence execution until recovery decides
+    /// its outcome instead of treating this as an ordinary transaction abort.
     fn poison_and_truncate(&self, wal_file: &mut Option<File>, e: Error) -> Error {
         self.poisoned.store(true, Ordering::Release);
         let floor = self.synced_position.load(Ordering::Acquire);
-        if let Some(file) = wal_file.as_mut() {
-            let _ = file.set_len(floor);
-            let _ = file.sync_all();
+        let rollback = (|| -> io::Result<()> {
+            #[cfg(any(test, feature = "test-failpoints"))]
+            if crate::test_failpoints::WAL_ROLLBACK_FAIL.load(Ordering::Acquire) {
+                return Err(io::Error::other("failpoint: WAL suffix rollback"));
+            }
+            let file = wal_file
+                .as_mut()
+                .ok_or_else(|| io::Error::other("WAL file is closed"))?;
+            file.set_len(floor)?;
+            file.sync_all()
+        })();
+        match rollback {
+            Ok(()) => {
+                self.current_file_position.store(floor, Ordering::Release);
+                e
+            }
+            Err(rollback_error) => {
+                self.indeterminate_commit.store(true, Ordering::Release);
+                Error::internal(format!(
+                    "commit durability is indeterminate; reopen the database: {e}; \
+                     WAL rollback failed: {rollback_error}"
+                ))
+            }
         }
-        self.current_file_position.store(floor, Ordering::Release);
-        e
+    }
+
+    /// Whether a failed write could still be recovered as committed.
+    pub fn has_indeterminate_commit(&self) -> bool {
+        self.indeterminate_commit.load(Ordering::Acquire)
     }
 
     /// Get previous LSN (last written entry's LSN)

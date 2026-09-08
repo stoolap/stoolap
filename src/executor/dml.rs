@@ -448,6 +448,14 @@ impl Executor {
         stmt: &InsertStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        self.with_statement_rollback(|| self.execute_insert_inner(stmt, ctx))
+    }
+
+    fn execute_insert_inner(
+        &self,
+        stmt: &InsertStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
 
@@ -1280,16 +1288,35 @@ impl Executor {
         ctx: &ExecutionContext,
         compiled_cache: &Arc<RwLock<CompiledExecution>>,
     ) -> Result<Box<dyn QueryResult>> {
-        // Conflict handling requires special handling - fall back to non-cached path
         if stmt.on_duplicate || stmt.do_nothing {
             return self.execute_insert(stmt, ctx);
         }
+        // Reuse the mutex guard needed to select the transaction. Autocommit
+        // does not need a second lock just to discover there is no checkpoint.
+        let mut active_tx = self.active_transaction.lock().unwrap();
+        let checkpoint = match active_tx.as_mut() {
+            Some(tx) => tx.transaction.begin_statement()?,
+            None => false,
+        };
+        let result =
+            self.execute_insert_with_compiled_cache_inner(stmt, ctx, compiled_cache, active_tx);
+        if checkpoint {
+            if let Some(tx) = self.active_transaction.lock().unwrap().as_mut() {
+                tx.transaction.finish_statement(result.is_ok());
+            }
+        }
+        result
+    }
 
+    fn execute_insert_with_compiled_cache_inner(
+        &self,
+        stmt: &InsertStatement,
+        ctx: &ExecutionContext,
+        compiled_cache: &Arc<RwLock<CompiledExecution>>,
+        mut active_tx: std::sync::MutexGuard<'_, Option<super::ActiveTransaction>>,
+    ) -> Result<Box<dyn QueryResult>> {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
-
-        // Check if there's an active explicit transaction
-        let mut active_tx = self.active_transaction.lock().unwrap();
 
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
@@ -1727,6 +1754,14 @@ impl Executor {
         stmt: &UpdateStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        self.with_statement_rollback(|| self.execute_update_inner(stmt, ctx))
+    }
+
+    fn execute_update_inner(
+        &self,
+        stmt: &UpdateStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
         // A WITH clause is run first, so the subqueries can read it
         let ctx_with_ctes;
         let ctx = match &stmt.with {
@@ -2129,7 +2164,7 @@ impl Executor {
                             } else {
                                 evaluator.evaluate_bool(mem_where)
                             };
-                            if !matches!(held, Ok(true)) {
+                            if !held? {
                                 continue;
                             }
                         }
@@ -2225,7 +2260,7 @@ impl Executor {
                         } else {
                             evaluator.evaluate_bool(where_clause)
                         };
-                        if !matches!(held, Ok(true)) {
+                        if !held? {
                             outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
                             continue;
                         }
@@ -2235,34 +2270,28 @@ impl Executor {
                 // Evaluate all update expressions
                 let mut new_values: Vec<(usize, Value)> = Vec::with_capacity(update_indices.len());
                 for (idx, col_type, vec_dims, expr, is_correlated) in update_indices.iter() {
-                    let evaluated = if *is_correlated {
-                        // Process correlated expression - this executes the subquery
-                        match self.process_correlated_expression(expr, &correlated_ctx) {
-                            Ok(processed_expr) => {
-                                // Now evaluate the processed expression (subquery replaced with value)
-                                let mut eval = CompiledEvaluator::new(function_registry)
-                                    .with_context(&correlated_ctx);
-                                eval.init_columns_arc(CompactArc::clone(&column_names));
-                                eval.set_row_array(row);
-                                eval.evaluate(&processed_expr).ok()
-                            }
-                            Err(_) => None,
-                        }
+                    let new_value = if *is_correlated {
+                        // A failed subquery must abort the entire statement;
+                        // skipping its SET value would report a partial update.
+                        let processed_expr =
+                            self.process_correlated_expression(expr, &correlated_ctx)?;
+                        let mut eval =
+                            CompiledEvaluator::new(function_registry).with_context(&correlated_ctx);
+                        eval.init_columns_arc(CompactArc::clone(&column_names));
+                        eval.set_row_array(row);
+                        eval.evaluate(&processed_expr)?
                     } else {
-                        evaluator.evaluate(expr).ok()
+                        evaluator.evaluate(expr)?
                     };
-
-                    if let Some(new_value) = evaluated {
-                        let coerced = new_value.coerce_to_type(*col_type);
-                        validate_coercion(
-                            &new_value,
-                            &coerced,
-                            &schema.columns[*idx].name,
-                            *col_type,
-                            *vec_dims,
-                        )?;
-                        new_values.push((*idx, coerced));
-                    }
+                    let coerced = new_value.coerce_to_type(*col_type);
+                    validate_coercion(
+                        &new_value,
+                        &coerced,
+                        &schema.columns[*idx].name,
+                        *col_type,
+                        *vec_dims,
+                    )?;
+                    new_values.push((*idx, coerced));
                 }
 
                 // Take back the map for reuse (zero-copy transfer)
@@ -2271,6 +2300,9 @@ impl Executor {
                 if !new_values.is_empty() {
                     precomputed.insert(pk_value, new_values);
                 }
+            }
+            if let Some(error) = scanner.err() {
+                return Err(error.clone());
             }
             drop(scanner);
 
@@ -2481,7 +2513,7 @@ impl Executor {
                             } else {
                                 evaluator.evaluate_bool(where_expr)
                             };
-                            if !matches!(held, Ok(true)) {
+                            if !held? {
                                 return Ok((row, false));
                             }
                         }
@@ -2702,6 +2734,14 @@ impl Executor {
 
     /// Execute a DELETE statement
     pub(crate) fn execute_delete(
+        &self,
+        stmt: &DeleteStatement,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.with_statement_rollback(|| self.execute_delete_inner(stmt, ctx))
+    }
+
+    fn execute_delete_inner(
         &self,
         stmt: &DeleteStatement,
         ctx: &ExecutionContext,
@@ -2976,25 +3016,14 @@ impl Executor {
                             );
 
                             // Process correlated subquery with outer context
-                            match self.process_correlated_where(where_expr, &correlated_ctx) {
-                                Ok(processed) => {
-                                    // OPTIMIZATION: Take ownership instead of cloning
-                                    evaluator.set_outer_row_owned(
-                                        correlated_ctx.outer_row.take().unwrap_or_default(),
-                                    );
-                                    let result =
-                                        evaluator.evaluate_bool(&processed).unwrap_or(false);
-                                    // Take back map for reuse instead of clearing
-                                    outer_row_map = evaluator.take_outer_row();
-                                    result
-                                }
-                                Err(_) => {
-                                    // Take back map from context even on error
-                                    outer_row_map =
-                                        correlated_ctx.outer_row.take().unwrap_or_default();
-                                    false
-                                }
-                            }
+                            let processed =
+                                self.process_correlated_where(where_expr, &correlated_ctx)?;
+                            evaluator.set_outer_row_owned(
+                                correlated_ctx.outer_row.take().unwrap_or_default(),
+                            );
+                            let result = evaluator.evaluate_bool(&processed)?;
+                            outer_row_map = evaluator.take_outer_row();
+                            result
                         } else if let Some(ref program) = memory_where_program {
                             let mut exec_ctx =
                                 ExecuteContext::new(row).with_transaction_id(transaction_id);
@@ -3006,7 +3035,7 @@ impl Executor {
                             }
                             delete_vm.execute_bool(program, &exec_ctx)
                         } else {
-                            matches!(evaluator.evaluate_bool(where_expr), Ok(true))
+                            evaluator.evaluate_bool(where_expr)?
                         }
                     } else {
                         true
@@ -3037,6 +3066,9 @@ impl Executor {
                 }
             }
             // Drop scanner to release borrow
+            if let Some(error) = scanner.err() {
+                return Err(error.clone());
+            }
             drop(scanner);
 
             // FK enforcement: check/cascade referencing child tables before deleting
@@ -3674,6 +3706,9 @@ impl Executor {
             None
         };
 
+        if let Some(error) = scanner.err() {
+            return Err(error.clone());
+        }
         scanner.close()?;
         Ok(result)
     }

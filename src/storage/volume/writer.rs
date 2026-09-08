@@ -19,6 +19,7 @@
 //! pre-computed aggregate stats. This is done by a background thread during
 //! the seal operation.
 
+use std::io;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -39,6 +40,22 @@ use super::format::{
     COL_DICTIONARY,
 };
 use super::stats::VolumeAggregateStats;
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+#[derive(Debug)]
+struct ColumnReadError {
+    kind: io::ErrorKind,
+    message: String,
+}
+impl From<io::Error> for ColumnReadError {
+    fn from(e: io::Error) -> Self {
+        Self {
+            kind: e.kind(),
+            message: e.to_string(),
+        }
+    }
+}
 
 // =============================================================================
 // CompressedBlockStore: per-column per-row-group LZ4 blocks in RAM
@@ -92,10 +109,14 @@ impl CompressedBlockStore {
         col_idx: usize,
         group_idx: usize,
     ) -> std::io::Result<Arc<ColumnData>> {
-        super::group_cache::DECODED_GROUPS
-            .get_or_decode((self.id, col_idx as u32, group_idx as u32), || {
-                self.decompress_single_group(col_idx, group_idx)
-            })
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::check_cold_read()?;
+        let col_key = u32::try_from(col_idx).map_err(|_| invalid_data("column index overflow"))?;
+        let group_key =
+            u32::try_from(group_idx).map_err(|_| invalid_data("group index overflow"))?;
+        super::group_cache::DECODED_GROUPS.get_or_decode((self.id, col_key, group_key), || {
+            self.decompress_single_group(col_idx, group_idx)
+        })
     }
 
     /// Compress existing columns into per-group LZ4 blocks.
@@ -104,7 +125,7 @@ impl CompressedBlockStore {
         columns: &LazyColumns,
         col_data_types: &[DataType],
         row_count: usize,
-    ) -> Self {
+    ) -> io::Result<Self> {
         Self::compress_columns_opts(columns, col_data_types, row_count, true)
     }
 
@@ -116,7 +137,7 @@ impl CompressedBlockStore {
         col_data_types: &[DataType],
         row_count: usize,
         compress: bool,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let group_size = ROW_GROUP_SIZE;
         let col_count = columns.len();
         let num_groups = if row_count == 0 {
@@ -133,7 +154,7 @@ impl CompressedBlockStore {
         let mut col_ext_types = Vec::with_capacity(col_count);
 
         for col_idx in 0..col_count {
-            let col = &columns[col_idx];
+            let col = columns.get(col_idx)?;
             let type_tag = match col {
                 ColumnData::Int64 { .. } => super::format::COL_INT64,
                 ColumnData::Float64 { .. } => super::format::COL_FLOAT64,
@@ -155,7 +176,10 @@ impl CompressedBlockStore {
         }
 
         // Phase 2: Serialize column blocks (optionally LZ4-compressed).
-        let compress_blocks = |col: &ColumnData| -> (Vec<Vec<u8>>, Vec<usize>) {
+        let compress_blocks = |col: &ColumnData| -> io::Result<(Vec<Vec<u8>>, Vec<usize>)> {
+            if col.len() != row_count {
+                return Err(invalid_data("column row count mismatch"));
+            }
             let mut col_blocks = Vec::with_capacity(num_groups);
             let mut col_decomp_lens = Vec::with_capacity(num_groups);
             let mut start = 0;
@@ -175,7 +199,7 @@ impl CompressedBlockStore {
                 }
                 start = end;
             }
-            (col_blocks, col_decomp_lens)
+            Ok((col_blocks, col_decomp_lens))
         };
 
         #[cfg(feature = "parallel")]
@@ -183,8 +207,8 @@ impl CompressedBlockStore {
             use rayon::prelude::*;
             let results: Vec<(Vec<Vec<u8>>, Vec<usize>)> = (0..col_count)
                 .into_par_iter()
-                .map(|col_idx| compress_blocks(&columns[col_idx]))
-                .collect();
+                .map(|col_idx| compress_blocks(columns.get(col_idx)?))
+                .collect::<io::Result<_>>()?;
             let mut all_blocks = Vec::with_capacity(col_count);
             let mut all_decomp_lens = Vec::with_capacity(col_count);
             for (blocks, lens) in results {
@@ -199,7 +223,7 @@ impl CompressedBlockStore {
             let mut all_blocks = Vec::with_capacity(col_count);
             let mut all_decomp_lens = Vec::with_capacity(col_count);
             for col_idx in 0..col_count {
-                let (blocks, lens) = compress_blocks(&columns[col_idx]);
+                let (blocks, lens) = compress_blocks(columns.get(col_idx)?)?;
                 all_blocks.push(blocks);
                 all_decomp_lens.push(lens);
             }
@@ -210,7 +234,7 @@ impl CompressedBlockStore {
             .iter()
             .map(|(ci, start, end)| (*ci, Arc::from(&shared_dict[*start..*end])))
             .collect();
-        Self {
+        Ok(Self {
             blocks: all_blocks,
             decompressed_lens: all_decomp_lens,
             col_type_tags,
@@ -220,7 +244,7 @@ impl CompressedBlockStore {
             group_size,
             row_count,
             id: next_store_id(),
-        }
+        })
     }
 
     /// Build a CompressedBlockStore from pre-compressed blocks (V4 file read).
@@ -236,13 +260,62 @@ impl CompressedBlockStore {
         dict_ranges: Vec<(usize, usize, usize)>,
         group_size: usize,
         row_count: usize,
-    ) -> Self {
+    ) -> io::Result<Self> {
+        let col_count = blocks.len();
+        if group_size == 0
+            || col_type_tags.len() != col_count
+            || col_data_types.len() != col_count
+            || col_ext_types.len() != col_count
+            || decompressed_lens.len() != col_count
+        {
+            return Err(invalid_data("inconsistent block store column metadata"));
+        }
+        let groups = row_count.div_ceil(group_size);
+        for ci in 0..col_count {
+            if blocks[ci].len() != groups || decompressed_lens[ci].len() != groups {
+                return Err(invalid_data("inconsistent block store group count"));
+            }
+            if !(super::format::COL_INT64..=COL_BYTES).contains(&col_type_tags[ci]) {
+                return Err(invalid_data("unknown column type tag"));
+            }
+            if col_type_tags[ci] == COL_BYTES && DataType::from_u8(col_ext_types[ci]).is_none() {
+                return Err(invalid_data("invalid bytes extension type"));
+            }
+            for (gi, (block, &decoded)) in blocks[ci].iter().zip(&decompressed_lens[ci]).enumerate()
+            {
+                let rows = (row_count - gi * group_size).min(group_size);
+                let width = match col_type_tags[ci] {
+                    super::format::COL_INT64
+                    | super::format::COL_FLOAT64
+                    | super::format::COL_TIMESTAMP => Some(9usize),
+                    super::format::COL_BOOLEAN => Some(2),
+                    COL_DICTIONARY => Some(5),
+                    _ => None,
+                };
+                if block.is_empty()
+                    || decoded == 0
+                    || decoded > block.len().saturating_mul(255).saturating_add(16)
+                    || width.is_some_and(|w| rows.checked_mul(w) != Some(decoded))
+                {
+                    return Err(invalid_data("invalid block length"));
+                }
+            }
+        }
+        for &(ci, start, end) in &dict_ranges {
+            if ci >= col_count
+                || col_type_tags[ci] != COL_DICTIONARY
+                || start > end
+                || end > shared_dict.len()
+            {
+                return Err(invalid_data("invalid dictionary range"));
+            }
+        }
         let col_dicts: Vec<(usize, Arc<[SmartString]>)> = dict_ranges
             .iter()
             .map(|(ci, start, end)| (*ci, Arc::from(&shared_dict[*start..*end])))
             .collect();
         // shared_dict and dict_ranges are consumed — only col_dicts kept
-        Self {
+        Ok(Self {
             blocks,
             decompressed_lens,
             col_type_tags,
@@ -252,13 +325,16 @@ impl CompressedBlockStore {
             group_size,
             row_count,
             id: next_store_id(),
-        }
+        })
     }
 
     /// Decompress a single column from RAM. Concatenates all row-group blocks.
     /// Runs at ~4 GB/s (LZ4 from RAM), typically <1ms per column.
-    pub fn decompress_column(&self, col_idx: usize) -> ColumnData {
-        let col_blocks = &self.blocks[col_idx];
+    pub fn decompress_column(&self, col_idx: usize) -> io::Result<ColumnData> {
+        let col_blocks = self
+            .blocks
+            .get(col_idx)
+            .ok_or_else(|| invalid_data("column index out of bounds"))?;
         let type_tag = self.col_type_tags[col_idx];
         let ext_type = DataType::from_u8(self.col_ext_types[col_idx]).unwrap_or(DataType::Null);
 
@@ -273,39 +349,7 @@ impl CompressedBlockStore {
         };
 
         if col_blocks.len() == 1 {
-            let decomp_len = self.decompressed_lens[col_idx][0];
-            let group_rows = self.row_count.min(self.group_size);
-            if col_blocks[0].len() == decomp_len {
-                return deserialize_column_block(
-                    &col_blocks[0],
-                    type_tag,
-                    group_rows,
-                    dict,
-                    ext_type,
-                )
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "corrupt V4 block: col={}, raw, {} rows: {}",
-                        col_idx, group_rows, e
-                    )
-                });
-            }
-            let mut raw = vec![0u8; decomp_len];
-            lz4_flex::decompress_into(&col_blocks[0], &mut raw).unwrap_or_else(|e| {
-                panic!(
-                    "corrupt V4 block: col={}, {} bytes: {}",
-                    col_idx,
-                    col_blocks[0].len(),
-                    e
-                )
-            });
-            return deserialize_column_block(&raw, type_tag, group_rows, dict, ext_type)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "corrupt V4 block: col={}, {} rows: {}",
-                        col_idx, group_rows, e
-                    )
-                });
+            return self.decompress_single_group(col_idx, 0);
         }
 
         // Multiple groups — decompress each block directly into pre-allocated
@@ -318,7 +362,7 @@ impl CompressedBlockStore {
             .unwrap_or(0);
         let mut lz4_buf = Vec::with_capacity(max_decomp);
         let num_groups = col_blocks.len();
-        match type_tag {
+        let column = match type_tag {
             super::format::COL_INT64 => {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
@@ -337,8 +381,7 @@ impl CompressedBlockStore {
                         None,
                         None,
                         None,
-                    )
-                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
+                    )?;
                 }
                 ColumnData::Int64 {
                     values: all_values,
@@ -363,8 +406,7 @@ impl CompressedBlockStore {
                         None,
                         None,
                         None,
-                    )
-                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
+                    )?;
                 }
                 ColumnData::Float64 {
                     values: all_values,
@@ -389,8 +431,7 @@ impl CompressedBlockStore {
                         None,
                         None,
                         None,
-                    )
-                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
+                    )?;
                 }
                 ColumnData::TimestampNanos {
                     values: all_values,
@@ -415,8 +456,7 @@ impl CompressedBlockStore {
                         Some(&mut all_values),
                         None,
                         None,
-                    )
-                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
+                    )?;
                 }
                 ColumnData::Boolean {
                     values: all_values,
@@ -441,8 +481,7 @@ impl CompressedBlockStore {
                         None,
                         None,
                         None,
-                    )
-                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
+                    )?;
                 }
                 ColumnData::Dictionary {
                     ids: all_ids,
@@ -469,8 +508,7 @@ impl CompressedBlockStore {
                         None,
                         Some(&mut all_data),
                         Some(&mut all_offsets),
-                    )
-                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
+                    )?;
                 }
                 ColumnData::Bytes {
                     data: all_data,
@@ -479,18 +517,21 @@ impl CompressedBlockStore {
                     nulls: all_nulls,
                 }
             }
-            _ => self
-                .decompress_block(
-                    col_idx,
-                    0,
-                    &col_blocks[0],
-                    type_tag,
-                    num_groups,
-                    dict,
-                    ext_type,
-                )
-                .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}: {e}")),
+            _ => return Err(invalid_data("unknown column type tag")),
+        };
+        if let ColumnData::Dictionary {
+            ids,
+            nulls,
+            dictionary,
+        } = &column
+        {
+            for (id, is_null) in ids.iter().zip(nulls) {
+                if !is_null && (*id as usize) >= dictionary.len() {
+                    return Err(invalid_data("dictionary ID exceeds dictionary length"));
+                }
+            }
         }
+        Ok(column)
     }
 
     /// Decompress and deserialize a single block with context in error messages.
@@ -520,6 +561,9 @@ impl CompressedBlockStore {
                 )
             })?
         };
+        if raw_bytes.len() != decomp_len {
+            return Err(invalid_data("LZ4 decoded length mismatch"));
+        }
         deserialize_column_block(&raw_bytes, type_tag, group_rows, dict, ext_type)
     }
 
@@ -564,15 +608,19 @@ impl CompressedBlockStore {
         if lz4_buf.len() < decomp_len {
             lz4_buf.resize(decomp_len, 0);
         }
-        lz4_flex::decompress_into(block, &mut lz4_buf[..decomp_len]).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "corrupt V4 block: col={}, group={}/{}: {}",
-                    col_idx, gi, num_groups, e
-                ),
-            )
-        })?;
+        let written =
+            lz4_flex::decompress_into(block, &mut lz4_buf[..decomp_len]).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "corrupt V4 block: col={}, group={}/{}: {}",
+                        col_idx, gi, num_groups, e
+                    ),
+                )
+            })?;
+        if written != decomp_len {
+            return Err(invalid_data("LZ4 decoded length mismatch"));
+        }
         deserialize_column_block_into(
             &lz4_buf[..decomp_len],
             type_tag,
@@ -594,7 +642,14 @@ impl CompressedBlockStore {
         col_idx: usize,
         group_idx: usize,
     ) -> std::io::Result<ColumnData> {
-        let num_groups = self.blocks[col_idx].len();
+        let blocks = self
+            .blocks
+            .get(col_idx)
+            .ok_or_else(|| invalid_data("column index out of bounds"))?;
+        let block = blocks
+            .get(group_idx)
+            .ok_or_else(|| invalid_data("group index out of bounds"))?;
+        let num_groups = blocks.len();
         let type_tag = self.col_type_tags[col_idx];
         let ext_type = DataType::from_u8(self.col_ext_types[col_idx]).unwrap_or(DataType::Null);
         let dict: Option<Arc<[SmartString]>> = if type_tag == COL_DICTIONARY {
@@ -606,13 +661,7 @@ impl CompressedBlockStore {
             None
         };
         self.decompress_block(
-            col_idx,
-            group_idx,
-            &self.blocks[col_idx][group_idx],
-            type_tag,
-            num_groups,
-            dict,
-            ext_type,
+            col_idx, group_idx, block, type_tag, num_groups, dict, ext_type,
         )
     }
 
@@ -634,14 +683,13 @@ impl CompressedBlockStore {
     /// Binary search on a sorted column using row-group zone maps.
     /// Decompresses only the group(s) containing the target value.
     /// Returns global row index (same as ColumnData::binary_search_ge/gt),
-    /// or None when a block fails to decode: the caller must then keep the
-    /// range unnarrowed so the scan reaches the block and reports the error.
+    /// or Ok(None) when narrowing is unsupported. Decode failures are errors.
     pub fn binary_search_ge(
         &self,
         col_idx: usize,
         target: i64,
         row_groups: &[super::column::RowGroupMeta],
-    ) -> Option<usize> {
+    ) -> io::Result<Option<usize>> {
         self.binary_search_impl(col_idx, target, row_groups, false)
     }
 
@@ -650,7 +698,7 @@ impl CompressedBlockStore {
         col_idx: usize,
         target: i64,
         row_groups: &[super::column::RowGroupMeta],
-    ) -> Option<usize> {
+    ) -> io::Result<Option<usize>> {
         self.binary_search_impl(col_idx, target, row_groups, true)
     }
 
@@ -660,8 +708,18 @@ impl CompressedBlockStore {
         target: i64,
         row_groups: &[super::column::RowGroupMeta],
         strict: bool,
-    ) -> Option<usize> {
-        let num_groups = self.blocks[col_idx].len();
+    ) -> io::Result<Option<usize>> {
+        let num_groups = self
+            .blocks
+            .get(col_idx)
+            .ok_or_else(|| invalid_data("column index out of bounds"))?
+            .len();
+        if !matches!(
+            self.col_type_tags[col_idx],
+            super::format::COL_INT64 | super::format::COL_TIMESTAMP
+        ) {
+            return Ok(None);
+        }
 
         // Use zone maps to find the group containing the target.
         // When duplicates span group boundaries, continue to the next group
@@ -682,7 +740,7 @@ impl CompressedBlockStore {
                 if target > max_i64 {
                     continue;
                 }
-                let col = self.group_column(col_idx, gi).ok()?;
+                let col = self.group_column(col_idx, gi)?;
                 let group_rows = (rg.end_idx - rg.start_idx) as usize;
                 let local = if strict {
                     col.binary_search_gt(target)
@@ -690,23 +748,23 @@ impl CompressedBlockStore {
                     col.binary_search_ge(target)
                 };
                 if local < group_rows {
-                    return Some(rg.start_idx as usize + local);
+                    return Ok(Some(rg.start_idx as usize + local));
                 }
             }
-            return Some(self.row_count);
+            return Ok(Some(self.row_count));
         }
 
         if num_groups == 1 {
-            let col = self.group_column(col_idx, 0).ok()?;
-            return Some(if strict {
+            let col = self.group_column(col_idx, 0)?;
+            return Ok(Some(if strict {
                 col.binary_search_gt(target)
             } else {
                 col.binary_search_ge(target)
-            });
+            }));
         }
 
         // Fallback: full column (shouldn't happen for V4 with zone maps)
-        Some(self.row_count)
+        Ok(None)
     }
 
     /// Number of groups for a given column.
@@ -792,7 +850,7 @@ impl CompressedBlockStore {
 /// After OnceLock init, subsequent access is a pointer dereference (free).
 pub struct LazyColumns {
     /// Per-column OnceLock slots. Empty until first access.
-    slots: Vec<OnceLock<ColumnData>>,
+    slots: Vec<OnceLock<Result<ColumnData, ColumnReadError>>>,
     /// Compressed backing store. None for eagerly-loaded columns.
     /// Wrapped in Arc so warm-tier volumes can share the store cheaply.
     compressed_store: Option<Arc<CompressedBlockStore>>,
@@ -808,11 +866,11 @@ impl LazyColumns {
     /// Create from pre-loaded columns (VolumeBuilder::finish(), V4 eager load).
     /// All OnceLock slots are pre-initialized. No compressed store.
     pub fn eager(columns: Vec<ColumnData>, col_data_types: Vec<DataType>) -> Self {
-        let slots: Vec<OnceLock<ColumnData>> = columns
+        let slots: Vec<OnceLock<Result<ColumnData, ColumnReadError>>> = columns
             .into_iter()
             .map(|col| {
                 let cell = OnceLock::new();
-                let _ = cell.set(col);
+                let _ = cell.set(Ok(col));
                 cell
             })
             .collect();
@@ -854,7 +912,7 @@ impl LazyColumns {
     }
 
     /// Create columns with only data types (for cold-tier volumes).
-    /// No columns, no compressed store. Column access will panic;
+    /// No columns, no compressed store. Column access returns an error;
     /// the volume must be reloaded from disk before scanning.
     pub fn metadata_only(col_data_types: Vec<DataType>) -> Self {
         let col_count = col_data_types.len();
@@ -907,6 +965,38 @@ impl LazyColumns {
         self.col_data_types[idx]
     }
 
+    /// Fallible column access; eager access borrows the column without allocation.
+    #[inline]
+    pub fn get(&self, idx: usize) -> io::Result<&ColumnData> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::check_cold_read()?;
+        let slot = self
+            .slots
+            .get(idx)
+            .ok_or_else(|| invalid_data("column index out of bounds"))?;
+        if let Some(outcome) = slot.get() {
+            return outcome
+                .as_ref()
+                .map_err(|e| io::Error::new(e.kind, e.message.clone()));
+        }
+        let store = self
+            .compressed_store
+            .as_ref()
+            .ok_or_else(|| invalid_data("cold volume has no loaded column source"))?;
+        let outcome =
+            slot.get_or_init(|| store.decompress_column(idx).map_err(ColumnReadError::from));
+        let col = outcome
+            .as_ref()
+            .map_err(|e| io::Error::new(e.kind, e.message.clone()))?;
+        if !self.is_eager.load(std::sync::atomic::Ordering::Relaxed)
+            && self.slots.iter().all(|s| matches!(s.get(), Some(Ok(_))))
+        {
+            self.is_eager
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(col)
+    }
+
     /// Iterator over all columns (triggers decompression of unloaded columns).
     pub fn iter(&self) -> LazyColumnsIter<'_> {
         LazyColumnsIter {
@@ -924,7 +1014,7 @@ impl LazyColumns {
         }
         // Loaded (decompressed) columns
         for slot in &self.slots {
-            if let Some(col) = slot.get() {
+            if let Some(Ok(col)) = slot.get() {
                 size += col.memory_size();
             }
         }
@@ -951,7 +1041,12 @@ impl LazyColumns {
     /// Returns None for non-dictionary columns or cold-tier volumes.
     pub fn get_column_dictionary(&self, col_idx: usize) -> Option<Arc<[SmartString]>> {
         // Fast path: column already loaded in OnceLock
-        if let Some(col) = self.slots.get(col_idx).and_then(|s| s.get()) {
+        if let Some(col) = self
+            .slots
+            .get(col_idx)
+            .and_then(|s| s.get())
+            .and_then(|r| r.as_ref().ok())
+        {
             if let ColumnData::Dictionary { dictionary, .. } = col {
                 return Some(Arc::clone(dictionary));
             }
@@ -975,51 +1070,24 @@ impl LazyColumns {
 
     /// Take ownership of all loaded columns, consuming the LazyColumns.
     /// Used by compress_and_release to avoid cloning.
-    pub fn take_columns(self) -> Vec<ColumnData> {
+    pub fn take_columns(self) -> io::Result<Vec<ColumnData>> {
         let mut result = Vec::with_capacity(self.slots.len());
         for slot in self.slots {
             if let Some(col) = slot.into_inner() {
-                result.push(col);
+                result.push(col.map_err(|e| io::Error::new(e.kind, e.message))?);
             }
         }
-        result
+        Ok(result)
     }
 }
 
+#[cfg(test)]
 impl std::ops::Index<usize> for LazyColumns {
     type Output = ColumnData;
 
     #[inline]
     fn index(&self, idx: usize) -> &ColumnData {
-        // Fast path: already initialized
-        if let Some(col) = self.slots[idx].get() {
-            return col;
-        }
-        // Slow path: decompress on first access via get_or_init (runs closure
-        // exactly once per slot, even under concurrent access).
-        let col = self.slots[idx].get_or_init(|| {
-            self.compressed_store
-                .as_ref()
-                .map(|store| store.decompress_column(idx))
-                .unwrap_or_else(|| {
-                    panic!(
-                        "BUG: column {} accessed on cold volume (no compressed store). \
-                         A caller is missing is_cold() check before column access. \
-                         Run with RUST_BACKTRACE=1 to find the caller.",
-                        idx
-                    )
-                })
-        });
-        // Check if all slots are now populated. This is O(C) where C = column
-        // count, but only runs on the slow path (first access per column).
-        // Avoids the loaded_count race where concurrent threads double-increment.
-        if !self.is_eager.load(std::sync::atomic::Ordering::Relaxed)
-            && self.slots.iter().all(|s| s.get().is_some())
-        {
-            self.is_eager
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-        col
+        self.get(idx).expect("test column access")
     }
 }
 
@@ -1030,11 +1098,11 @@ pub struct LazyColumnsIter<'a> {
 }
 
 impl<'a> Iterator for LazyColumnsIter<'a> {
-    type Item = &'a ColumnData;
+    type Item = io::Result<&'a ColumnData>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.idx < self.columns.len() {
-            let col = &self.columns[self.idx];
+            let col = self.columns.get(self.idx);
             self.idx += 1;
             Some(col)
         } else {
@@ -1051,7 +1119,7 @@ impl<'a> Iterator for LazyColumnsIter<'a> {
 impl ExactSizeIterator for LazyColumnsIter<'_> {}
 
 impl<'a> IntoIterator for &'a LazyColumns {
-    type Item = &'a ColumnData;
+    type Item = io::Result<&'a ColumnData>;
     type IntoIter = LazyColumnsIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -1691,106 +1759,152 @@ pub fn compute_column_mapping_with_drops(
 }
 
 impl FrozenVolume {
-    /// Get a row using a precomputed column mapping.
-    /// Materializes all schema columns through the mapping.
-    pub fn get_row_mapped(&self, idx: usize, mapping: &ColumnMapping) -> Row {
-        let values: Vec<Value> = mapping
+    /// Fallible identity probe, including the absent-row case.
+    #[inline]
+    pub fn find_row_id(&self, row_id: i64) -> crate::core::Result<Option<usize>> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::check_cold_read()?;
+        Ok(self.meta.row_ids.binary_search(&row_id).ok())
+    }
+
+    #[inline]
+    pub fn row_id_at(&self, position: usize) -> crate::core::Result<i64> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::check_cold_read()?;
+        self.meta
+            .row_ids
+            .get(position)
+            .copied()
+            .ok_or_else(|| invalid_data("row identity position out of bounds").into())
+    }
+
+    #[inline]
+    fn check_row(&self, idx: usize) -> crate::core::Result<()> {
+        if idx >= self.meta.row_count {
+            return Err(invalid_data("row index out of bounds").into());
+        }
+        Ok(())
+    }
+
+    /// Fetch one checked value, propagating a missing or corrupt column source.
+    #[inline]
+    pub fn get_value(&self, col_idx: usize, row_idx: usize) -> crate::core::Result<Value> {
+        self.check_row(row_idx)?;
+        let col = self.columns.get(col_idx)?;
+        if row_idx >= col.len() {
+            return Err(invalid_data("column row count mismatch").into());
+        }
+        Ok(col.get_value(row_idx))
+    }
+
+    pub fn get_row_mapped(&self, idx: usize, mapping: &ColumnMapping) -> crate::core::Result<Row> {
+        self.check_row(idx)?;
+        let values = mapping
             .sources
             .iter()
             .map(|src| match src {
-                ColSource::Volume(vol_idx) => self.columns[*vol_idx].get_value(idx),
-                ColSource::Default(val) => val.clone(),
+                ColSource::Volume(ci) => self.get_value(*ci, idx),
+                ColSource::Default(value) => Ok(value.clone()),
             })
-            .collect();
-        Row::from_values(values)
+            .collect::<crate::core::Result<Vec<_>>>()?;
+        Ok(Row::from_values(values))
     }
 
-    /// Get specific columns of a row using a precomputed column mapping.
-    /// Only materializes the requested schema columns — skips the rest.
     pub fn get_row_mapped_projected(
         &self,
         idx: usize,
         mapping: &ColumnMapping,
         col_indices: &[usize],
-    ) -> Row {
-        let values: Vec<Value> = col_indices
+    ) -> crate::core::Result<Row> {
+        self.check_row(idx)?;
+        let values = col_indices
             .iter()
-            .map(|&ci| match &mapping.sources[ci] {
-                ColSource::Volume(vol_idx) => self.columns[*vol_idx].get_value(idx),
-                ColSource::Default(val) => val.clone(),
-            })
-            .collect();
-        Row::from_values(values)
-    }
-
-    /// Get a row materializing only columns marked true in the mask.
-    /// Other columns get typed Null (stack-only, zero allocation).
-    /// The row has full schema width so filter column indices work.
-    /// Uses LazyColumns::data_type() for unneeded columns to avoid decompression.
-    #[inline]
-    pub fn get_row_needed(&self, idx: usize, needed: &[bool]) -> Row {
-        let values: Vec<Value> = (0..self.columns.len())
             .map(|ci| {
-                if ci < needed.len() && needed[ci] {
-                    self.columns[ci].get_value(idx)
-                } else {
-                    Value::Null(self.columns.data_type(ci))
+                match mapping
+                    .sources
+                    .get(*ci)
+                    .ok_or_else(|| invalid_data("projection index out of bounds"))?
+                {
+                    ColSource::Volume(vi) => self.get_value(*vi, idx),
+                    ColSource::Default(value) => Ok(value.clone()),
                 }
             })
-            .collect();
-        Row::from_values(values)
+            .collect::<crate::core::Result<Vec<_>>>()?;
+        Ok(Row::from_values(values))
     }
 
-    /// Get a row using a mapping, materializing only needed columns.
-    /// Combines schema evolution (mapping) with column pruning (mask).
-    /// Uses LazyColumns::data_type() for unneeded columns to avoid decompression.
-    #[inline]
+    /// Materialize needed columns only; unused columns retain typed nulls.
+    pub fn get_row_needed(&self, idx: usize, needed: &[bool]) -> crate::core::Result<Row> {
+        self.check_row(idx)?;
+        let values = (0..self.columns.len())
+            .map(|ci| {
+                if needed.get(ci).copied().unwrap_or(false) {
+                    self.get_value(ci, idx)
+                } else {
+                    Ok(Value::Null(self.columns.data_type(ci)))
+                }
+            })
+            .collect::<crate::core::Result<Vec<_>>>()?;
+        Ok(Row::from_values(values))
+    }
+
     pub fn get_row_mapped_needed(
         &self,
         idx: usize,
         mapping: &ColumnMapping,
         needed: &[bool],
-    ) -> Row {
-        let values: Vec<Value> = mapping
+    ) -> crate::core::Result<Row> {
+        self.check_row(idx)?;
+        let values = mapping
             .sources
             .iter()
             .enumerate()
             .map(|(ci, src)| {
-                if ci < needed.len() && needed[ci] {
+                if needed.get(ci).copied().unwrap_or(false) {
                     match src {
-                        ColSource::Volume(vol_idx) => self.columns[*vol_idx].get_value(idx),
-                        ColSource::Default(val) => val.clone(),
+                        ColSource::Volume(vi) => self.get_value(*vi, idx),
+                        ColSource::Default(value) => Ok(value.clone()),
                     }
                 } else {
-                    match src {
-                        ColSource::Volume(vol_idx) => Value::Null(self.columns.data_type(*vol_idx)),
-                        ColSource::Default(val) => Value::Null(val.data_type()),
-                    }
+                    Ok(Value::Null(match src {
+                        ColSource::Volume(vi) => *self
+                            .meta
+                            .column_types
+                            .get(*vi)
+                            .ok_or_else(|| invalid_data("mapping index out of bounds"))?,
+                        ColSource::Default(value) => value.data_type(),
+                    }))
                 }
             })
-            .collect();
-        Row::from_values(values)
+            .collect::<crate::core::Result<Vec<_>>>()?;
+        Ok(Row::from_values(values))
     }
 
-    /// Get a row as a Vec of Values (for executor compatibility).
-    pub fn get_row(&self, idx: usize) -> Row {
-        let values: Vec<Value> = self.columns.iter().map(|col| col.get_value(idx)).collect();
-        Row::from_values(values)
+    pub fn get_row(&self, idx: usize) -> crate::core::Result<Row> {
+        self.check_row(idx)?;
+        let values = (0..self.columns.len())
+            .map(|ci| self.get_value(ci, idx))
+            .collect::<crate::core::Result<Vec<_>>>()?;
+        Ok(Row::from_values(values))
     }
 
-    /// Get specific columns of a row (projection pushdown).
-    pub fn get_row_projected(&self, idx: usize, col_indices: &[usize]) -> Row {
-        let values: Vec<Value> = col_indices
+    pub fn get_row_projected(&self, idx: usize, col_indices: &[usize]) -> crate::core::Result<Row> {
+        self.check_row(idx)?;
+        let values = col_indices
             .iter()
-            .map(|&col| self.columns[col].get_value(idx))
-            .collect();
-        Row::from_values(values)
+            .map(|ci| self.get_value(*ci, idx))
+            .collect::<crate::core::Result<Vec<_>>>()?;
+        Ok(Row::from_values(values))
     }
 
     /// Check if a column is sorted (enables binary search).
     #[inline]
     pub fn is_sorted(&self, col_idx: usize) -> bool {
-        self.meta.sorted_columns[col_idx]
+        self.meta
+            .sorted_columns
+            .get(col_idx)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Look up a composite unique key in this volume's per-volume hash index.
@@ -1805,114 +1919,80 @@ impl FrozenVolume {
         &self,
         col_indices: &[usize],
         values: &[&Value],
-        mut f: impl FnMut(u32) -> bool, // return true to stop early
-    ) {
+        mut f: impl FnMut(u32) -> bool,
+    ) -> crate::core::Result<()> {
         use std::hash::{Hash, Hasher};
-
-        if col_indices.iter().any(|&idx| idx >= self.columns.len()) {
-            return;
+        if col_indices.len() != values.len() {
+            return Err(invalid_data("unique key column/value count mismatch").into());
         }
-
-        // Compute hash of query values
+        self.prebuild_unique_index(col_indices)?;
+        // Resolve fallible columns before locking the index. A failed read never
+        // invokes the callback with a partial answer or publishes an incomplete index.
+        let columns = col_indices
+            .iter()
+            .map(|ci| self.columns.get(*ci))
+            .collect::<io::Result<Vec<_>>>()?;
         let mut hasher = ahash::AHasher::default();
-        for &val in values {
+        for val in values {
             val.hash(&mut hasher);
         }
         let hash = hasher.finish();
-
-        // Fast path: check if index is already built
-        {
-            let indices = self.unique_indices.read();
-            if let Some(sorted_idx) = indices.get(col_indices) {
-                // Binary search for the hash, then scan all entries with same hash
-                let pos = sorted_idx.partition_point(|&(h, _)| h < hash);
-                for &(h, row_idx) in &sorted_idx[pos..] {
-                    if h != hash {
-                        break;
-                    }
-                    let matches = col_indices.iter().zip(values.iter()).all(|(&ci, &val)| {
-                        let vol_val = self.columns[ci].get_value(row_idx as usize);
-                        !vol_val.is_null() && vol_val == *val
-                    });
-                    if matches && f(row_idx) {
-                        return;
-                    }
-                }
-                return;
-            }
-        }
-
-        // Build sorted index for this column set (first use)
-        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(self.meta.row_count);
-        for row_idx in 0..self.meta.row_count {
-            let mut row_hasher = ahash::AHasher::default();
-            let mut has_null = false;
-            for &ci in col_indices {
-                if self.columns[ci].is_null(row_idx) {
-                    has_null = true;
-                    break;
-                }
-                self.columns[ci].get_value(row_idx).hash(&mut row_hasher);
-            }
-            if has_null {
-                continue;
-            }
-            entries.push((row_hasher.finish(), row_idx as u32));
-        }
-        entries.sort_unstable_by_key(|&(h, _)| h);
-
-        // Look up before storing
+        let indices = self.unique_indices.read();
+        let entries = indices
+            .get(col_indices)
+            .ok_or_else(|| invalid_data("missing prepared unique index"))?;
         let pos = entries.partition_point(|&(h, _)| h < hash);
         for &(h, row_idx) in &entries[pos..] {
             if h != hash {
                 break;
             }
-            let matches = col_indices.iter().zip(values.iter()).all(|(&ci, &val)| {
-                let vol_val = self.columns[ci].get_value(row_idx as usize);
-                !vol_val.is_null() && vol_val == *val
+            let matches = columns.iter().zip(values).all(|(col, value)| {
+                let candidate = col.get_value(row_idx as usize);
+                !candidate.is_null() && candidate == **value
             });
             if matches && f(row_idx) {
                 break;
             }
         }
-
-        // Store the built index
-        self.unique_indices
-            .write()
-            .insert(col_indices.to_vec(), entries);
+        Ok(())
     }
 
-    /// Pre-build the unique sorted index for a set of column indices.
-    /// Called during seal/compaction so the first INSERT after seal doesn't
-    /// pay a ~60ms stall scanning all rows to build the index.
-    pub fn prebuild_unique_index(&self, col_indices: &[usize]) {
+    /// Build the immutable unique index only after all fallible reads succeed.
+    pub fn prebuild_unique_index(&self, col_indices: &[usize]) -> crate::core::Result<()> {
         use std::hash::{Hash, Hasher};
-        if col_indices.iter().any(|&idx| idx >= self.columns.len()) {
-            return;
+        if col_indices.iter().any(|&ci| ci >= self.columns.len()) {
+            return Err(invalid_data("unique column index out of bounds").into());
         }
         if self.unique_indices.read().contains_key(col_indices) {
-            return;
+            return Ok(());
         }
-        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(self.meta.row_count);
+        if self.meta.row_count > u32::MAX as usize {
+            return Err(invalid_data("unique index row position overflow").into());
+        }
+        let columns = col_indices
+            .iter()
+            .map(|ci| self.columns.get(*ci))
+            .collect::<io::Result<Vec<_>>>()?;
+        if columns.iter().any(|col| col.len() != self.meta.row_count) {
+            return Err(invalid_data("unique index column row count mismatch").into());
+        }
+        let mut entries = Vec::with_capacity(self.meta.row_count);
         for row_idx in 0..self.meta.row_count {
-            let mut row_hasher = ahash::AHasher::default();
-            let mut has_null = false;
-            for &ci in col_indices {
-                if self.columns[ci].is_null(row_idx) {
-                    has_null = true;
-                    break;
-                }
-                self.columns[ci].get_value(row_idx).hash(&mut row_hasher);
-            }
-            if has_null {
+            let mut hasher = ahash::AHasher::default();
+            if columns.iter().any(|col| col.is_null(row_idx)) {
                 continue;
             }
-            entries.push((row_hasher.finish(), row_idx as u32));
+            for col in &columns {
+                col.get_value(row_idx).hash(&mut hasher);
+            }
+            entries.push((hasher.finish(), row_idx as u32));
         }
-        entries.sort_unstable_by_key(|&(h, _)| h);
+        entries.sort_unstable_by_key(|&(hash, _)| hash);
         self.unique_indices
             .write()
-            .insert(col_indices.to_vec(), entries);
+            .entry(col_indices.to_vec())
+            .or_insert(entries);
+        Ok(())
     }
 
     /// Find the column index by name. O(1) via precomputed hashmap.
@@ -2009,6 +2089,110 @@ impl FrozenVolume {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn damaged_integer_store(groups: usize) -> CompressedBlockStore {
+        let mut blocks = vec![vec![0u8; 9]; groups];
+        blocks[groups - 1] = lz4_flex::compress(&[0u8; 8]);
+        CompressedBlockStore::from_raw_blocks(
+            vec![blocks],
+            vec![vec![9; groups]],
+            vec![super::super::format::COL_INT64],
+            vec![DataType::Integer],
+            vec![0],
+            vec![],
+            vec![],
+            1,
+            groups,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn fallible_columns_report_short_lz4_output_and_preserve_error_kind() {
+        let _guard = crate::test_failpoints::FailpointGuard::new();
+        for groups in [1, 2] {
+            let store = damaged_integer_store(groups);
+            assert!(store.decompress_column(0).is_err());
+            for _ in 0..2 {
+                let error = store.group_column(0, groups - 1).err().unwrap();
+                assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            }
+            assert!(store.group_column(1, 0).is_err());
+            assert!(store.group_column(0, groups).is_err());
+            let columns = LazyColumns::deferred(store, vec![DataType::Integer]);
+            assert!(columns.get(0).is_err());
+            assert!(columns.get(0).is_err());
+            assert!(!columns.is_eager());
+        }
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn cached_column_and_identity_reads_are_fallible() {
+        let _guard = crate::test_failpoints::FailpointGuard::new();
+        let schema = crate::core::SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(1, &Row::from_values(vec![Value::Integer(1)]));
+        let volume = builder.finish();
+        assert_eq!(volume.get_value(0, 0).unwrap(), Value::Integer(1));
+        crate::test_failpoints::fail_cold_read_on(1);
+        assert!(volume.get_row(0).is_err());
+        assert!(volume.get_row(0).is_ok());
+        crate::test_failpoints::fail_cold_read_on(1);
+        assert!(volume.find_row_id(99).is_err());
+        assert_eq!(volume.find_row_id(99).unwrap(), None);
+        assert!(volume.row_id_at(1).is_err());
+        assert!(volume.get_row_projected(0, &[1]).is_err());
+        assert!(volume.get_row(1).is_err());
+        let store =
+            CompressedBlockStore::compress_columns(&volume.columns, &[DataType::Integer], 1)
+                .unwrap();
+        assert!(store.group_column(0, 0).is_ok());
+        crate::test_failpoints::fail_cold_read_on(1);
+        assert!(store.group_column(0, 0).is_err());
+        assert!(store.group_column(0, 0).is_ok());
+        assert!(damaged_integer_store(1)
+            .binary_search_ge(0, 0, &[])
+            .is_err());
+        assert_eq!(
+            damaged_integer_store(2)
+                .binary_search_ge(0, 0, &[])
+                .unwrap(),
+            None
+        );
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn unique_index_failure_does_not_publish_partial_index_or_matches() {
+        let _guard = crate::test_failpoints::FailpointGuard::new();
+        let schema = crate::core::SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(1, &Row::from_values(vec![Value::Integer(1)]));
+        let volume = builder.finish();
+        crate::test_failpoints::fail_cold_read_on(1);
+        let mut called = false;
+        assert!(volume
+            .unique_lookup_all(&[0], &[&Value::Integer(1)], |_| {
+                called = true;
+                true
+            })
+            .is_err());
+        assert!(!called && volume.unique_indices.read().is_empty());
+        volume
+            .unique_lookup_all(&[0], &[&Value::Integer(1)], |_| {
+                called = true;
+                true
+            })
+            .unwrap();
+        assert!(called);
+        let missing_source = volume.to_cold();
+        assert!(missing_source.get_row(0).is_err());
+    }
     use crate::core::SchemaBuilder;
 
     fn test_schema() -> Schema {
@@ -2092,7 +2276,7 @@ mod tests {
         assert!(volume.is_sorted(1)); // time is sorted
 
         // Check row reconstruction
-        let row = volume.get_row(0);
+        let row = volume.get_row(0).unwrap();
         assert_eq!(row.get(0), Some(&Value::Integer(1)));
         assert_eq!(row.get(2), Some(&Value::text("binance")));
     }
@@ -2117,7 +2301,7 @@ mod tests {
         assert!(volume.columns[3].is_null(0));
         assert!(!volume.columns[0].is_null(0));
 
-        let row = volume.get_row(0);
+        let row = volume.get_row(0).unwrap();
         assert_eq!(row.get(0), Some(&Value::Integer(1)));
         assert!(row.get(1).unwrap().is_null());
     }
@@ -2166,7 +2350,7 @@ mod tests {
         let volume = builder.finish();
 
         // Project only id and price (columns 0 and 3)
-        let row = volume.get_row_projected(0, &[0, 3]);
+        let row = volume.get_row_projected(0, &[0, 3]).unwrap();
         assert_eq!(row.len(), 2);
         assert_eq!(row.get(0), Some(&Value::Integer(1)));
         assert_eq!(row.get(1), Some(&Value::Float(100.0)));

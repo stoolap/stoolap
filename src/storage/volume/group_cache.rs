@@ -35,7 +35,7 @@ pub const DEFAULT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 pub type GroupKey = (usize, u32, u32);
 
 struct Slot {
-    cell: OnceLock<Result<Arc<ColumnData>, String>>,
+    cell: OnceLock<Result<Arc<ColumnData>, (std::io::ErrorKind, String)>>,
     /// The decoder charges the entry's bytes once
     charged: AtomicBool,
 }
@@ -116,9 +116,11 @@ impl DecodedGroupCache {
                 }
             }
         };
-        let outcome = slot
-            .cell
-            .get_or_init(|| decode().map(Arc::new).map_err(|e| e.to_string()));
+        let outcome = slot.cell.get_or_init(|| {
+            decode()
+                .map(Arc::new)
+                .map_err(|e| (e.kind(), e.to_string()))
+        });
         match outcome {
             Ok(column) => {
                 if !slot.charged.swap(true, Ordering::AcqRel) {
@@ -126,10 +128,19 @@ impl DecodedGroupCache {
                 }
                 Ok(Arc::clone(column))
             }
-            Err(message) => {
+            Err((kind, message)) => {
                 // A block that does not decode is not kept; the next reader tries again
-                self.lock().entries.remove(&key);
-                Err(std::io::Error::other(message.clone()))
+                let mut inner = self.lock();
+                if inner
+                    .entries
+                    .get(&key)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.slot, &slot))
+                {
+                    if let Some(entry) = inner.entries.remove(&key) {
+                        inner.bytes -= entry.bytes;
+                    }
+                }
+                Err(std::io::Error::new(*kind, message.clone()))
             }
         }
     }

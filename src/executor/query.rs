@@ -2176,12 +2176,16 @@ impl Executor {
         }
 
         // Try to get distinct values from the index
-        let distinct_values = table.get_partition_values(&column_name).or_else(|| {
-            // Fallback: dictionary-based extraction from cold volumes
-            let schema = table.schema();
-            let col_idx = *schema.column_index_map().get(&column_name)?;
-            table.compute_distinct_values(col_idx)
-        });
+        let distinct_values = match table.get_partition_values(&column_name)? {
+            Some(values) => Some(values),
+            None => {
+                let schema = table.schema();
+                match schema.column_index_map().get(&column_name) {
+                    Some(&col_idx) => table.compute_distinct_values(col_idx)?,
+                    None => None,
+                }
+            }
+        };
 
         if let Some(distinct_values) = distinct_values {
             // Build output column name (use alias if present)
@@ -2331,9 +2335,12 @@ impl Executor {
             // Try storage-level GROUP BY aggregation (no WHERE clause)
             // This computes aggregates directly from arena without materializing Row objects
             if classification.has_group_by && !classification.has_where {
-                if let Some(result) =
-                    self.try_storage_aggregation(table.as_ref(), stmt, &all_columns, classification)
-                {
+                if let Some(result) = self.try_storage_aggregation(
+                    table.as_ref(),
+                    stmt,
+                    &all_columns,
+                    classification,
+                )? {
                     let columns = CompactArc::new(result.columns().to_vec());
                     return Ok((result, columns, false, None));
                 }
@@ -3432,6 +3439,9 @@ impl Executor {
                     while scanner.next() {
                         all_rows.push(scanner.take_row_with_id());
                     }
+                    if let Some(error) = scanner.err() {
+                        return Err(error.clone());
+                    }
                     all_rows
                 };
 
@@ -3677,6 +3687,9 @@ impl Executor {
                         }
                     }
                 }
+                if let Some(error) = scanner.err() {
+                    return Err(error.clone());
+                }
                 (rows, None, None)
             }
         } else if storage_expr.is_some() {
@@ -3736,18 +3749,18 @@ impl Executor {
                                         &all_columns,
                                         &partition_col,
                                         limit_val,
-                                    );
-                                if let Ok(query_result) = result {
+                                    )?;
+                                if let Some(query_result) = result {
                                     let columns = CompactArc::new(query_result.columns().to_vec());
                                     return Ok((query_result, columns, false, None));
                                 }
-                                // Fall through to regular path if optimization fails
+                                // Fall back only when this table does not support partition fetching.
                             }
                         }
 
                         // Regular path: Fetch rows grouped by partition (no hash grouping needed)
                         if let Some(grouped_data) =
-                            table.collect_rows_grouped_by_partition(&partition_col)
+                            table.collect_rows_grouped_by_partition(&partition_col)?
                         {
                             // Flatten rows and build partition map
                             let mut all_rows = RowVec::new();
@@ -3825,7 +3838,7 @@ impl Executor {
                             ascending,
                             fetch_limit,
                             0,
-                        ) {
+                        )? {
                             (
                                 sorted_rows,
                                 Some(WindowPreSortedState {

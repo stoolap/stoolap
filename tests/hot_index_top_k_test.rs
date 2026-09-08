@@ -502,15 +502,17 @@ fn test_top_k_during_a_commit_answers_from_the_visible_versions() {
     let name = index.name().to_string();
     let (stopped_tx, stopped_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
-    store.add_index(
-        name,
-        Arc::new(StopAfterIndexAdd {
-            inner: index,
-            armed: AtomicBool::new(true),
-            stopped: stopped_tx,
-            resume: Mutex::new(resume_rx),
-        }),
-    );
+    store
+        .add_index(
+            name,
+            Arc::new(StopAfterIndexAdd {
+                inner: index,
+                armed: AtomicBool::new(true),
+                stopped: stopped_tx,
+                resume: Mutex::new(resume_rx),
+            }),
+        )
+        .unwrap();
     let writer_db = db.clone();
     let writer = std::thread::spawn(move || {
         writer_db
@@ -614,15 +616,17 @@ fn test_top_k_stands_down_until_a_two_table_commit_is_visible() {
     let name = index.name().to_string();
     let (stopped_tx, stopped_rx) = mpsc::channel();
     let (resume_tx, resume_rx) = mpsc::channel();
-    second_store.add_index(
-        name,
-        Arc::new(StopAfterIndexAdd {
-            inner: index,
-            armed: AtomicBool::new(true),
-            stopped: stopped_tx,
-            resume: Mutex::new(resume_rx),
-        }),
-    );
+    second_store
+        .add_index(
+            name,
+            Arc::new(StopAfterIndexAdd {
+                inner: index,
+                armed: AtomicBool::new(true),
+                stopped: stopped_tx,
+                resume: Mutex::new(resume_rx),
+            }),
+        )
+        .unwrap();
     let writer_db = db.clone();
     let writer = std::thread::spawn(move || {
         writer_db.execute("BEGIN", ()).unwrap();

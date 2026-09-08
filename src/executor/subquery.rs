@@ -570,7 +570,7 @@ impl Executor {
         // If there's no additional predicate, check if at least one row is visible
         // Note: Index may contain row_ids for deleted rows, so we must verify visibility
         if correlation.additional_predicate.is_none() {
-            let row_fetcher = match self.get_or_create_row_fetcher(&correlation.inner_table) {
+            let row_fetcher = match self.get_or_create_row_fetcher(&correlation.inner_table)? {
                 Some(f) => f,
                 None => return Ok(None), // Fall back if fetcher creation fails
             };
@@ -678,7 +678,7 @@ impl Executor {
         let predicate_filter = predicate_filter.with_context(ctx);
 
         // Get or create a cached row fetcher for this table
-        let row_fetcher = match self.get_or_create_row_fetcher(&correlation.inner_table) {
+        let row_fetcher = match self.get_or_create_row_fetcher(&correlation.inner_table)? {
             Some(f) => f,
             None => return Ok(None), // Fall back if fetcher creation fails
         };
@@ -933,7 +933,7 @@ impl Executor {
             // Use row_counter for COUNT (avoids cloning row data)
             let row_counter = match get_cached_count_counter(&correlation.inner_table) {
                 Some(c) => c,
-                None => match self.get_or_create_row_counter(&correlation.inner_table) {
+                None => match self.get_or_create_row_counter(&correlation.inner_table)? {
                     Some(c) => c,
                     None => {
                         // Fall back to row_fetcher if counter not available
@@ -941,7 +941,7 @@ impl Executor {
                         {
                             Some(f) => f,
                             None => {
-                                match self.get_or_create_row_fetcher(&correlation.inner_table) {
+                                match self.get_or_create_row_fetcher(&correlation.inner_table)? {
                                     Some(f) => f,
                                     None => return Ok(None),
                                 }
@@ -953,7 +953,7 @@ impl Executor {
                 },
             };
             // Count visible rows without cloning
-            let count = row_counter(&row_ids);
+            let count = row_counter(&row_ids)?;
             return Ok(Some(count as i64));
         }
 
@@ -1280,17 +1280,13 @@ impl Executor {
     fn get_or_create_row_fetcher(
         &self,
         table_name: &str,
-    ) -> Option<std::sync::Arc<super::context::RowFetcher>> {
-        if let Some(f) = get_cached_exists_fetcher(table_name) {
-            return Some(f);
+    ) -> Result<Option<std::sync::Arc<super::context::RowFetcher>>> {
+        if let Some(cached) = get_cached_exists_fetcher(table_name) {
+            return Ok(Some(cached));
         }
-
-        let fetcher = match self.engine.get_row_fetcher(table_name) {
-            Ok(f) => f,
-            Err(_) => return None, // Fall back if fetcher creation fails
-        };
+        let fetcher = self.engine.get_row_fetcher(table_name)?;
         cache_exists_fetcher(table_name.to_string(), fetcher);
-        get_cached_exists_fetcher(table_name)
+        Ok(get_cached_exists_fetcher(table_name))
     }
 
     /// Get or create a cached row counter for a table.
@@ -1300,25 +1296,13 @@ impl Executor {
     fn get_or_create_row_counter(
         &self,
         table_name: &str,
-    ) -> Option<std::sync::Arc<super::context::RowCounter>> {
-        if let Some(c) = get_cached_count_counter(table_name) {
-            return Some(c);
+    ) -> Result<Option<std::sync::Arc<super::context::RowCounter>>> {
+        if let Some(cached) = get_cached_count_counter(table_name) {
+            return Ok(Some(cached));
         }
-
-        let counter = match self.engine.get_row_counter(table_name) {
-            Ok(c) => c,
-            Err(_e) => {
-                // Fall back to slower path if counter creation fails
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "[WARN] get_row_counter failed for '{}': {:?}",
-                    table_name, _e
-                );
-                return None;
-            }
-        };
+        let counter = self.engine.get_row_counter(table_name)?;
         cache_count_counter(table_name.to_string(), counter);
-        get_cached_count_counter(table_name)
+        Ok(get_cached_count_counter(table_name))
     }
 
     /// Extract correlation pair from two expressions.

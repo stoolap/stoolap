@@ -145,7 +145,7 @@ fn serialize_v4_opts(
         &vol.meta.column_types,
         vol.meta.row_count,
         compress,
-    );
+    )?;
 
     // 3. Compute total size for pre-allocation
     let all_blocks = store.raw_blocks();
@@ -203,10 +203,12 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
 
     let file = std::fs::File::open(path)
         .map_err(|e| crate::core::Error::internal(format!("V4 open {:?}: {}", path, e)))?;
-    let file_len = file
-        .metadata()
-        .map_err(|e| crate::core::Error::internal(format!("V4 stat {:?}: {}", path, e)))?
-        .len() as usize;
+    let file_len = usize::try_from(
+        file.metadata()
+            .map_err(|e| crate::core::Error::internal(format!("V4 stat {:?}: {}", path, e)))?
+            .len(),
+    )
+    .map_err(|_| inv("file length exceeds address space"))?;
     if file_len < 24 {
         return Err(inv("file too small"));
     }
@@ -239,6 +241,21 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     let num_groups = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
     let meta_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
 
+    let total_blocks = col_count
+        .checked_mul(num_groups)
+        .ok_or_else(|| inv("block count overflow"))?;
+    let index_bytes = total_blocks
+        .checked_mul(16)
+        .ok_or_else(|| inv("block index overflow"))?;
+    let data_start = 20usize
+        .checked_add(meta_len)
+        .and_then(|n| n.checked_add(index_bytes))
+        .filter(|&n| n <= file_len - 4)
+        .ok_or_else(|| inv("metadata/index exceeds file bounds"))?;
+    if meta_len < 4 {
+        return Err(inv("metadata too short for LZ4 size prefix"));
+    }
+
     // 2. Compressed metadata (read into temp buffer, decompress, drop)
     let mut meta_compressed = vec![0u8; meta_len];
     crc_read!(&mut meta_compressed);
@@ -247,9 +264,24 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     // to avoid lz4_flex::decompress_size_prepended allocating a fresh Vec.
     let meta_raw = if meta_compressed.len() >= 4 {
         let uncomp_size = u32::from_le_bytes(meta_compressed[..4].try_into().unwrap()) as usize;
-        let mut buf = vec![0u8; uncomp_size];
-        lz4_flex::decompress_into(&meta_compressed[4..], &mut buf)
+        if uncomp_size
+            > meta_compressed
+                .len()
+                .saturating_sub(4)
+                .saturating_mul(255)
+                .saturating_add(16)
+        {
+            return Err(inv("impossible metadata LZ4 decoded size"));
+        }
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(uncomp_size)
+            .map_err(|_| inv("metadata allocation failed"))?;
+        buf.resize(uncomp_size, 0);
+        let written = lz4_flex::decompress_into(&meta_compressed[4..], &mut buf)
             .map_err(|e| inv(&format!("metadata LZ4: {}", e)))?;
+        if written != uncomp_size {
+            return Err(inv("metadata LZ4 decoded length mismatch"));
+        }
         drop(meta_compressed);
         buf
     } else {
@@ -268,19 +300,52 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
         )));
     }
 
+    if meta.row_count.div_ceil(ROW_GROUP_SIZE) != num_groups {
+        return Err(inv("header row group count mismatch"));
+    }
     // 3. Block index: (compressed_len: u64, decompressed_len: u64) pairs
-    let total_blocks = col_count * num_groups;
-    let mut index_buf = vec![0u8; total_blocks * 16];
+    let mut index_buf = vec![0u8; index_bytes];
     crc_read!(&mut index_buf);
 
     let mut compressed_lens = Vec::with_capacity(total_blocks);
     let mut decompressed_lens_flat = Vec::with_capacity(total_blocks);
+    let mut block_end = data_start;
     for i in 0..total_blocks {
         let off = i * 16;
-        compressed_lens
-            .push(u64::from_le_bytes(index_buf[off..off + 8].try_into().unwrap()) as usize);
-        decompressed_lens_flat
-            .push(u64::from_le_bytes(index_buf[off + 8..off + 16].try_into().unwrap()) as usize);
+        let stored = usize::try_from(u64::from_le_bytes(
+            index_buf[off..off + 8].try_into().unwrap(),
+        ))
+        .map_err(|_| inv("stored block length exceeds address space"))?;
+        let decoded = usize::try_from(u64::from_le_bytes(
+            index_buf[off + 8..off + 16].try_into().unwrap(),
+        ))
+        .map_err(|_| inv("decoded block length exceeds address space"))?;
+        block_end = block_end
+            .checked_add(stored)
+            .filter(|&n| n <= file_len - 4)
+            .ok_or_else(|| inv("column block exceeds file bounds"))?;
+        if decoded == 0 || stored == 0 || decoded > stored.saturating_mul(255).saturating_add(16) {
+            return Err(inv("impossible column block decoded size"));
+        }
+        let ci = i / num_groups;
+        let gi = i % num_groups;
+        let rows = (meta.row_count - gi * ROW_GROUP_SIZE).min(ROW_GROUP_SIZE);
+        let width = match meta.col_type_tags[ci] {
+            super::format::COL_INT64
+            | super::format::COL_FLOAT64
+            | super::format::COL_TIMESTAMP => Some(9usize),
+            super::format::COL_BOOLEAN => Some(2),
+            super::format::COL_DICTIONARY => Some(5),
+            _ => None,
+        };
+        if width.is_some_and(|w| rows.checked_mul(w) != Some(decoded)) {
+            return Err(inv("fixed-width column block size mismatch"));
+        }
+        compressed_lens.push(stored);
+        decompressed_lens_flat.push(decoded);
+    }
+    if block_end != file_len - 4 {
+        return Err(inv("trailing or missing volume bytes"));
     }
     drop(index_buf);
 
@@ -347,7 +412,7 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
         dict_ranges,
         group_size,
         meta.row_count,
-    );
+    )?;
     let columns = LazyColumns::deferred(store, col_data_types);
 
     Ok(FrozenVolume {
@@ -738,6 +803,61 @@ mod tests {
     use crate::core::{DataType, Row, SchemaBuilder, Value};
 
     #[test]
+    fn malformed_v4_lengths_fail_before_allocating_or_decoding() {
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(1, &Row::from_values(vec![Value::Integer(1)]));
+        let volume = builder.finish();
+        let (original, _) = serialize_v4_public(&volume).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.vol");
+        let meta_len = u32::from_le_bytes(original[16..20].try_into().unwrap()) as usize;
+        let index = 20 + meta_len;
+        let mut cases = Vec::new();
+        let mut bad = original.clone();
+        bad[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push(bad);
+        let mut bad = original.clone();
+        bad[index..index + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        cases.push(bad);
+        let mut bad = original.clone();
+        bad[index + 8..index + 16].copy_from_slice(&u64::MAX.to_le_bytes());
+        cases.push(bad);
+        let mut bad = original.clone();
+        bad[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        cases.push(bad);
+        let mut bad = original;
+        bad.push(0);
+        cases.push(bad);
+        for bad in cases {
+            std::fs::write(&path, bad).unwrap();
+            assert!(read_volume_from_disk(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn v4_metadata_requires_exact_lz4_output_length() {
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(1, &Row::from_values(vec![Value::Integer(1)]));
+        let (mut bytes, _) = serialize_v4_public(&builder.finish()).unwrap();
+        let length = u32::from_le_bytes(bytes[20..24].try_into().unwrap());
+        bytes[20..24].copy_from_slice(&(length + 1).to_le_bytes());
+        let payload_end = bytes.len() - 4;
+        let checksum = crc32fast::hash(&bytes[..payload_end]);
+        bytes[payload_end..].copy_from_slice(&checksum.to_le_bytes());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.vol");
+        std::fs::write(&path, bytes).unwrap();
+        let error = read_volume_from_disk(&path).err().unwrap().to_string();
+        assert!(error.contains("decoded length mismatch"), "{error}");
+    }
+
+    #[test]
     fn test_write_and_read_volume() {
         let dir = tempfile::tempdir().unwrap();
         let schema = SchemaBuilder::new("test")
@@ -1077,7 +1197,7 @@ mod tests {
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
         let loaded = read_volume_from_disk(&path).unwrap();
 
-        let row = loaded.get_row(0);
+        let row = loaded.get_row(0).unwrap();
         assert_eq!(row.get(0), Some(&Value::Integer(42)));
         assert_eq!(row.get(1), Some(&Value::text("test")));
     }

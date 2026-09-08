@@ -377,7 +377,9 @@ fn test_top_k_reports_a_block_it_cannot_decode_instead_of_an_empty_answer() {
     let index_offset = 20 + meta_len;
     let mut bytes = original[..index_offset].to_vec();
     bytes.extend_from_slice(&1u64.to_le_bytes());
-    bytes.extend_from_slice(&100u64.to_le_bytes());
+    // Keep the decoded length consistent with the validated column layout.
+    // Only the compressed payload is corrupt, so failure occurs on access.
+    bytes.extend_from_slice(&original[index_offset + 8..index_offset + 16]);
     bytes.push(0xff);
     let crc = crc32fast::hash(&bytes);
     bytes.extend_from_slice(&crc.to_le_bytes());

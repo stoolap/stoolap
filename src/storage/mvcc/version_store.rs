@@ -507,12 +507,13 @@ impl PublishHold {
 
     /// Takes back the index updates of a commit that failed after applying
     /// them, so the indexes describe the rows that stayed visible
-    pub fn undo_index_updates(&self) {
+    pub fn undo_index_updates(&self) -> Result<(), Error> {
         for store in &self.stores {
             if let Ok(store) = store.read() {
-                store.undo_index_updates();
+                store.undo_index_updates()?;
             }
         }
+        Ok(())
     }
 }
 
@@ -578,6 +579,8 @@ pub struct VersionStore {
     upsert_mutex: Arc<parking_lot::Mutex<()>>,
     /// Commits between their index updates and their versions being visible
     publishing: AtomicUsize,
+    publication_keys: Mutex<ahash::AHashMap<PublicationKey, i64>>,
+    index_catalog: Arc<AtomicUsize>,
     /// Publishes completed
     publish_epoch: AtomicU64,
 }
@@ -616,6 +619,8 @@ impl VersionStore {
             committed_row_count: AtomicUsize::new(0),
             upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
             publishing: AtomicUsize::new(0),
+            publication_keys: Mutex::new(ahash::AHashMap::new()),
+            index_catalog: Arc::new(AtomicUsize::new(0)),
             publish_epoch: AtomicU64::new(0),
         }
     }
@@ -645,6 +650,8 @@ impl VersionStore {
             committed_row_count: AtomicUsize::new(0),
             upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
             publishing: AtomicUsize::new(0),
+            publication_keys: Mutex::new(ahash::AHashMap::new()),
+            index_catalog: Arc::new(AtomicUsize::new(0)),
             publish_epoch: AtomicU64::new(0),
         }
     }
@@ -4732,16 +4739,42 @@ impl VersionStore {
         parking_lot::Mutex::lock_arc(&self.upsert_mutex)
     }
 
-    /// Add an index
-    pub fn add_index(&self, name: String, index: Arc<dyn Index>) {
-        let mut indexes = self.indexes.write();
-        indexes.insert(name, index);
+    /// Exclude publishers for the complete index build, before scanning rows.
+    pub(crate) fn begin_index_build(&self) -> Result<IndexCatalogLease, Error> {
+        IndexCatalogLease::try_acquire(&self.index_catalog, true).ok_or_else(|| {
+            Error::internal("write conflict: index catalog has an unresolved publisher")
+        })
+    }
+
+    pub(crate) fn add_index_under_build(
+        &self,
+        name: String,
+        index: Arc<dyn Index>,
+        build: &IndexCatalogLease,
+    ) -> Result<(), Error> {
+        if !build.exclusive || !Arc::ptr_eq(&build.state, &self.index_catalog) {
+            return Err(Error::internal(
+                "index build lease belongs to another catalog",
+            ));
+        }
+        self.indexes.write().insert(name, index);
+        Ok(())
+    }
+
+    /// Add an already-built index during initialization or recovery.
+    pub fn add_index(&self, name: String, index: Arc<dyn Index>) -> Result<(), Error> {
+        let catalog = self.begin_index_build()?;
+        self.add_index_under_build(name, index, &catalog)
     }
 
     /// Remove an index
-    pub fn remove_index(&self, name: &str) -> Option<Arc<dyn Index>> {
+    pub fn remove_index(&self, name: &str) -> Result<Option<Arc<dyn Index>>, Error> {
+        let _catalog =
+            IndexCatalogLease::try_acquire(&self.index_catalog, true).ok_or_else(|| {
+                Error::internal("write conflict: index catalog has an unresolved publisher")
+            })?;
         let mut indexes = self.indexes.write();
-        indexes.remove(name)
+        Ok(indexes.remove(name))
     }
 
     /// Get an index by name
@@ -5056,7 +5089,7 @@ impl VersionStore {
     }
 
     /// Drop an index by name (alias for remove_index)
-    pub fn drop_index(&self, name: &str) -> Option<Arc<dyn Index>> {
+    pub fn drop_index(&self, name: &str) -> Result<Option<Arc<dyn Index>>, Error> {
         self.remove_index(name)
     }
 
@@ -5279,7 +5312,7 @@ impl VersionStore {
                 }
             }
 
-            self.add_index(meta.name.clone(), index);
+            self.add_index(meta.name.clone(), index)?;
         } else {
             // Multi-column index: use MultiColumnIndex
             let index = crate::storage::index::MultiColumnIndex::new(
@@ -5325,7 +5358,7 @@ impl VersionStore {
                 }
             }
 
-            self.add_index(meta.name.clone(), index);
+            self.add_index(meta.name.clone(), index)?;
         }
 
         Ok(())
@@ -5677,86 +5710,92 @@ impl VersionStore {
         // before removing it to prevent data loss.
         // Arena indices are read directly from the live entry under the write lock
         // to avoid index misalignment with the rows_to_delete vector.
-        let mut actually_deleted = Vec::with_capacity(rows_to_delete.len());
-        let mut actual_arena_indices = Vec::with_capacity(rows_to_delete.len());
-        {
-            let mut versions = self.versions.write();
-            for &row_id in &rows_to_delete {
-                // Re-check: the row must still exist AND still be deleted
-                if let Some(entry) = versions.get(row_id) {
-                    if entry.version.is_deleted() {
+        const SUB_BATCH_SIZE: usize = 2_000;
+        let mut deleted_count = 0;
+        let mut actually_deleted = Vec::with_capacity(rows_to_delete.len().min(SUB_BATCH_SIZE));
+        let mut actual_arena_indices = Vec::with_capacity(actually_deleted.capacity());
+        for chunk in rows_to_delete.chunks(SUB_BATCH_SIZE) {
+            actually_deleted.clear();
+            actual_arena_indices.clear();
+            // Claims outlive registry abort until publication undo is complete.
+            // Hold this guard through index and arena removal as well: otherwise
+            // an INSERT could claim the removed ID and have its new state cleared.
+            // Match truncate/seal ordering: claims -> versions -> index/arena.
+            let uncommitted = self.uncommitted_writes.read();
+            {
+                let mut live = self.versions.write();
+                for &row_id in chunk {
+                    if uncommitted.contains_key(row_id) {
+                        continue;
+                    }
+                    if let Some(entry) = live.get(row_id) {
+                        // Index cleanup below uses the candidate snapshot. Only
+                        // remove that exact head, never a newer DELETE of this ID.
+                        if !entry.version.is_deleted()
+                            || versions.get(row_id).is_none_or(|candidate| {
+                                candidate.version.txn_id != entry.version.txn_id
+                            })
+                            || !self.can_safely_remove(&entry.version)
+                        {
+                            continue;
+                        }
                         if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
                             actual_arena_indices.push(idx);
                         }
-                        versions.remove(row_id);
+                        live.remove(row_id);
                         actually_deleted.push(row_id);
                     }
                 }
             }
-        }
-
-        if actually_deleted.is_empty() {
-            return 0;
-        }
-
-        // Third pass: remove from indexes using batch operations (single lock per index)
-        // This runs AFTER the version store removal so we use the snapshot data
-        // (which is still valid for the rows we confirmed were deleted).
-        {
-            let indexes = self.indexes.read();
-
-            for index in indexes.values() {
-                let column_ids = index.column_ids();
-                if column_ids.is_empty() {
-                    continue;
-                }
-
-                // Collect all entries for this index
-                let mut entries: Vec<(i64, Vec<crate::core::Value>)> =
-                    Vec::with_capacity(actually_deleted.len());
-
-                for &row_id in &actually_deleted {
-                    if let Some(entry) = versions.get(row_id) {
-                        let version = &entry.version;
-                        if column_ids.len() == 1 {
-                            // Single-column index
-                            let col_id = column_ids[0] as usize;
-                            if let Some(value) = version.data.get(col_id) {
-                                entries.push((row_id, vec![value.clone()]));
-                            }
-                        } else {
-                            // Multi-column index
-                            let values: Vec<crate::core::Value> = column_ids
+            if actually_deleted.is_empty() {
+                continue;
+            }
+            {
+                let indexes = self.indexes.read();
+                for index in indexes.values() {
+                    let column_ids = index.column_ids();
+                    if column_ids.is_empty() {
+                        continue;
+                    }
+                    let entries: Vec<(i64, Vec<Value>)> = actually_deleted
+                        .iter()
+                        .filter_map(|&row_id| {
+                            let entry = versions.get(row_id)?;
+                            let values = column_ids
                                 .iter()
-                                .map(|&col_id| {
-                                    version.data.get(col_id as usize).cloned().unwrap_or(
-                                        crate::core::Value::Null(crate::core::DataType::Null),
-                                    )
+                                .map(|&column_id| {
+                                    entry
+                                        .version
+                                        .data
+                                        .get(column_id as usize)
+                                        .cloned()
+                                        .unwrap_or_else(Value::null_unknown)
                                 })
                                 .collect();
-                            entries.push((row_id, values));
-                        }
+                            Some((row_id, values))
+                        })
+                        .collect();
+                    if !entries.is_empty() {
+                        let batch: Vec<_> = entries
+                            .iter()
+                            .map(|(id, values)| (*id, values.as_slice()))
+                            .collect();
+                        let _ = index.remove_batch_slice(&batch);
                     }
                 }
-
-                if !entries.is_empty() {
-                    // Convert to slice format for remove_batch_slice
-                    let batch: Vec<(i64, &[crate::core::Value])> = entries
-                        .iter()
-                        .map(|(row_id, values)| (*row_id, values.as_slice()))
-                        .collect();
-                    let _ = index.remove_batch_slice(&batch);
-                }
-
-                // Let index-specific maintenance run (e.g., HNSW graph compaction)
+            }
+            self.arena.clear_batch(&actual_arena_indices);
+            deleted_count += actually_deleted.len() as i32;
+            drop(uncommitted);
+        }
+        // Index-specific maintenance does not remove row mappings, so it need
+        // not delay new row claims while compacting structures such as HNSW.
+        if deleted_count != 0 {
+            for index in self.indexes.read().values() {
                 let _ = index.cleanup();
             }
         }
-
-        // Clear arena slots only for rows we actually removed
-        self.arena.clear_batch(&actual_arena_indices);
-
-        actually_deleted.len() as i32
+        deleted_count
     }
 
     /// Check if a version can be safely removed (not visible to any active transaction)
@@ -5836,78 +5875,84 @@ impl VersionStore {
         // This prevents the race where a concurrent commit adds a new HEAD between
         // the snapshot read and the write — we always work on the current live entry.
         let mut cleaned = 0;
-        let mut versions = self.versions.write();
+        for chunk in candidate_row_ids.chunks(2_000) {
+            let uncommitted = self.uncommitted_writes.read();
+            let mut versions = self.versions.write();
 
-        for row_id in candidate_row_ids {
-            let Some(chain_entry) = versions.get(row_id) else {
-                continue; // Row was removed between passes
-            };
+            for &row_id in chunk {
+                if uncommitted.contains_key(row_id) {
+                    continue;
+                }
+                let Some(chain_entry) = versions.get(row_id) else {
+                    continue; // Row was removed between passes
+                };
 
-            // Collect previous versions from the LIVE entry
-            let mut prev_versions: Vec<Arc<VersionChainEntry>> = Vec::new();
-            let mut current = chain_entry.prev.as_ref();
-            while let Some(prev_entry) = current {
-                prev_versions.push(prev_entry.clone());
-                current = prev_entry.prev.as_ref();
-            }
+                // Collect previous versions from the LIVE entry
+                let mut prev_versions: Vec<Arc<VersionChainEntry>> = Vec::new();
+                let mut current = chain_entry.prev.as_ref();
+                while let Some(prev_entry) = current {
+                    prev_versions.push(prev_entry.clone());
+                    current = prev_entry.prev.as_ref();
+                }
 
-            if prev_versions.is_empty() {
-                continue;
-            }
+                if prev_versions.is_empty() {
+                    continue;
+                }
 
-            // Check each previous version independently — do NOT assume monotonic
-            // visibility. With rapid updates, a newer prev version may be invisible
-            // to an active txn while an older one IS visible (e.g., HEAD seq=120,
-            // prev_0 seq=110, prev_1 seq=80, active txn snapshot at seq=100 needs prev_1).
-            let mut keep_count = 0;
-            for (i, prev_entry) in prev_versions.iter().enumerate() {
-                let mut keep = false;
+                // Check each previous version independently — do NOT assume monotonic
+                // visibility. With rapid updates, a newer prev version may be invisible
+                // to an active txn while an older one IS visible (e.g., HEAD seq=120,
+                // prev_0 seq=110, prev_1 seq=80, active txn snapshot at seq=100 needs prev_1).
+                let mut keep_count = 0;
+                for (i, prev_entry) in prev_versions.iter().enumerate() {
+                    let mut keep = false;
 
-                // Rule 1: Keep if needed by any active transaction
-                for &txn_id in &active_txns {
-                    if checker.is_visible(prev_entry.version.txn_id, txn_id) {
+                    // Rule 1: Keep if needed by any active transaction
+                    for &txn_id in &active_txns {
+                        if checker.is_visible(prev_entry.version.txn_id, txn_id) {
+                            keep = true;
+                            break;
+                        }
+                    }
+
+                    // Rule 2: Keep if within retention period
+                    if !keep && prev_entry.version.create_time >= retention_cutoff {
                         keep = true;
-                        break;
+                    }
+
+                    if keep {
+                        // Keep this version and all newer ones (indices 0..=i)
+                        keep_count = i + 1;
                     }
                 }
 
-                // Rule 2: Keep if within retention period
-                if !keep && prev_entry.version.create_time >= retention_cutoff {
-                    keep = true;
-                }
+                // If we need to prune some versions, modify the live entry
+                if keep_count < prev_versions.len() {
+                    let to_remove = prev_versions.len() - keep_count;
+                    cleaned += to_remove as i32;
 
-                if keep {
-                    // Keep this version and all newer ones (indices 0..=i)
-                    keep_count = i + 1;
-                }
-            }
+                    // Clone the LIVE entry (not stale snapshot) and modify
+                    let mut modified_entry = chain_entry.clone();
 
-            // If we need to prune some versions, modify the live entry
-            if keep_count < prev_versions.len() {
-                let to_remove = prev_versions.len() - keep_count;
-                cleaned += to_remove as i32;
+                    if keep_count == 0 {
+                        modified_entry.prev = None;
+                    } else {
+                        // Rebuild chain with only kept versions
+                        let kept_versions: Vec<_> =
+                            prev_versions.into_iter().take(keep_count).collect();
 
-                // Clone the LIVE entry (not stale snapshot) and modify
-                let mut modified_entry = chain_entry.clone();
-
-                if keep_count == 0 {
-                    modified_entry.prev = None;
-                } else {
-                    // Rebuild chain with only kept versions
-                    let kept_versions: Vec<_> =
-                        prev_versions.into_iter().take(keep_count).collect();
-
-                    // Build chain from oldest to newest (reversed)
-                    let mut new_prev: Option<Arc<VersionChainEntry>> = None;
-                    for entry in kept_versions.into_iter().rev() {
-                        let mut cloned = (*entry).clone();
-                        cloned.prev = new_prev;
-                        new_prev = Some(Arc::new(cloned));
+                        // Build chain from oldest to newest (reversed)
+                        let mut new_prev: Option<Arc<VersionChainEntry>> = None;
+                        for entry in kept_versions.into_iter().rev() {
+                            let mut cloned = (*entry).clone();
+                            cloned.prev = new_prev;
+                            new_prev = Some(Arc::new(cloned));
+                        }
+                        modified_entry.prev = new_prev;
                     }
-                    modified_entry.prev = new_prev;
-                }
 
-                versions.insert(row_id, modified_entry);
+                    versions.insert(row_id, modified_entry);
+                }
             }
         }
 
@@ -6487,6 +6532,97 @@ impl fmt::Debug for VersionStore {
     }
 }
 
+/// One mutation's pre-statement state. Existing history owns the payloads.
+struct LocalMutationUndo {
+    row_id: i64,
+    versions_len: usize,
+    had_write: bool,
+}
+
+/// Reservations protect removed UNIQUE keys as well as additions until undo
+/// is no longer possible. Arc clones share the projected key allocation.
+type PublicationKey = (usize, Arc<[Value]>);
+
+/// Called with the ownership mutex held. A conflicting key leaves every
+/// reservation unchanged, including the common single-key INSERT case.
+#[inline]
+fn try_reserve_publication_keys(
+    owners: &mut AHashMap<PublicationKey, i64>,
+    keys: &[PublicationKey],
+    txn_id: i64,
+) -> bool {
+    if let [key] = keys {
+        return match owners.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get() == txn_id,
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(txn_id);
+                true
+            }
+        };
+    }
+    if keys
+        .iter()
+        .any(|key| owners.get(key).is_some_and(|owner| *owner != txn_id))
+    {
+        return false;
+    }
+    owners.reserve(keys.len());
+    for key in keys {
+        owners.insert(key.clone(), txn_id);
+    }
+    true
+}
+
+/// A movable, nonblocking DDL lease. Publishers share the low-bit count;
+/// index replacement requires the exclusive high bit and fails while any
+/// publisher can still undo. No thread-owned lock survives COMMIT I/O.
+pub(crate) struct IndexCatalogLease {
+    state: Arc<AtomicUsize>,
+    exclusive: bool,
+}
+
+impl IndexCatalogLease {
+    const EXCLUSIVE: usize = 1usize << (usize::BITS - 1);
+
+    fn try_acquire(state: &Arc<AtomicUsize>, exclusive: bool) -> Option<Self> {
+        if exclusive {
+            state
+                .compare_exchange(0, Self::EXCLUSIVE, Ordering::Acquire, Ordering::Relaxed)
+                .ok()?;
+        } else {
+            state
+                .fetch_update(Ordering::Acquire, Ordering::Relaxed, |current| {
+                    (current < Self::EXCLUSIVE - 1).then_some(current + 1)
+                })
+                .ok()?;
+        }
+        Some(Self {
+            state: Arc::clone(state),
+            exclusive,
+        })
+    }
+}
+
+impl Drop for IndexCatalogLease {
+    fn drop(&mut self) {
+        if self.exclusive {
+            self.state.store(0, Ordering::Release);
+        } else {
+            self.state.fetch_sub(1, Ordering::Release);
+        }
+    }
+}
+
+#[derive(Default)]
+struct TransactionMutation {
+    statement_undo: SmallVec<[LocalMutationUndo; 1]>,
+    publication_undo: SmallVec<[(i64, Option<VersionChainEntry>); 1]>,
+    publication_applied: bool,
+    reserved_keys: SmallVec<[PublicationKey; 2]>,
+    reserved_indexes: SmallVec<[Arc<dyn Index>; 4]>,
+    index_catalog_lease: Option<IndexCatalogLease>,
+}
+
 /// Transaction-local version store for uncommitted changes
 pub struct TransactionVersionStore {
     /// Local versions for this transaction - stores version history per row for savepoint support
@@ -6503,6 +6639,8 @@ pub struct TransactionVersionStore {
     write_set: Option<I64Map<WriteSetEntry>>,
     /// Index updates applied by commit, until the commit is visible or undone
     index_undo: Mutex<Vec<IndexUndo>>,
+    /// Read-only table handles pay one pointer, not inline write-side buffers.
+    mutation: Option<Box<TransactionMutation>>,
 }
 
 impl TransactionVersionStore {
@@ -6519,11 +6657,63 @@ impl TransactionVersionStore {
             txn_id,
             write_set: None,
             index_undo: Mutex::new(Vec::new()),
+            mutation: None,
         }
     }
 
+    pub fn statement_checkpoint(&self) -> usize {
+        self.mutation
+            .as_ref()
+            .map_or(0, |mutation| mutation.statement_undo.len())
+    }
+
+    fn record_local_mutation(&mut self, row_id: i64) {
+        let undo = LocalMutationUndo {
+            row_id,
+            versions_len: self
+                .local_versions
+                .as_ref()
+                .and_then(|v| v.get(row_id))
+                .map_or(0, |v| v.len()),
+            had_write: self
+                .write_set
+                .as_ref()
+                .is_some_and(|w| w.contains_key(row_id)),
+        };
+        self.mutation
+            .get_or_insert_with(|| Box::new(TransactionMutation::default()))
+            .statement_undo
+            .push(undo);
+    }
+
+    pub fn finish_statement(&mut self, checkpoint: usize, success: bool) {
+        let Some(mutation) = self.mutation.as_mut() else {
+            return;
+        };
+        if !success {
+            while mutation.statement_undo.len() > checkpoint {
+                let undo = mutation.statement_undo.pop().unwrap();
+                if let Some(local) = self.local_versions.as_mut() {
+                    if undo.versions_len == 0 {
+                        local.remove(undo.row_id);
+                    } else if let Some(versions) = local.get_mut(undo.row_id) {
+                        versions.truncate(undo.versions_len);
+                    }
+                }
+                if !undo.had_write {
+                    if let Some(write_set) = self.write_set.as_mut() {
+                        write_set.remove(undo.row_id);
+                    }
+                    self.parent_store
+                        .release_row_claim(undo.row_id, self.txn_id);
+                }
+            }
+        }
+        mutation.statement_undo.clear();
+    }
+
     /// Takes back the index updates of this transaction's commit, in reverse
-    pub fn undo_index_updates(&self) {
+    pub fn undo_index_updates(&self) -> Result<(), Error> {
         let undo: Vec<IndexUndo> = std::mem::take(&mut *self.index_undo.lock());
         for entry in undo.iter().rev() {
             if !entry.added.is_empty() {
@@ -6532,7 +6722,7 @@ impl TransactionVersionStore {
                     .iter()
                     .map(|(row_id, values)| (*row_id, values.as_slice()))
                     .collect();
-                let _ = entry.index.remove_batch_slice(&batch);
+                entry.index.remove_batch_slice(&batch)?;
             }
             if !entry.removed.is_empty() {
                 let batch: Vec<(i64, &[Value])> = entry
@@ -6540,9 +6730,10 @@ impl TransactionVersionStore {
                     .iter()
                     .map(|(row_id, values)| (*row_id, values.as_slice()))
                     .collect();
-                let _ = entry.index.add_batch_slice(&batch);
+                entry.index.add_batch_slice(&batch)?;
             }
         }
+        Ok(())
     }
 
     /// Returns the transaction ID
@@ -6576,6 +6767,7 @@ impl TransactionVersionStore {
 
     /// Put adds or updates a row in the transaction's local store
     pub fn put(&mut self, row_id: i64, data: Row, is_delete: bool) -> Result<(), Error> {
+        self.record_local_mutation(row_id);
         // Convert to Shared (Arc) storage immediately for efficient Arc sharing:
         // - get_arc() will return cheap Arc clones (no value cloning)
         // - into_arc() at commit time returns the existing Arc (no clone)
@@ -6662,6 +6854,7 @@ impl TransactionVersionStore {
         original_version: RowVersion,
         is_delete: bool,
     ) -> Result<(), Error> {
+        self.record_local_mutation(row_id);
         // Convert to Shared (Arc) storage immediately for efficient Arc sharing
         let data = Row::from_arc(data.into_arc());
 
@@ -6732,6 +6925,7 @@ impl TransactionVersionStore {
         let now = get_fast_timestamp();
 
         for (row_id, data, original_version) in rows {
+            self.record_local_mutation(row_id);
             // Convert to Shared (Arc) storage immediately for efficient Arc sharing
             let data = Row::from_arc(data.into_arc());
 
@@ -6792,6 +6986,7 @@ impl TransactionVersionStore {
         let timestamp = get_fast_timestamp();
 
         for (row_id, data) in rows {
+            self.record_local_mutation(row_id);
             // Check if we already have a local version
             let has_local = self
                 .local_versions
@@ -6859,6 +7054,7 @@ impl TransactionVersionStore {
         let timestamp = get_fast_timestamp();
 
         for (row_id, data, original_version) in rows {
+            self.record_local_mutation(row_id);
             // Create deleted row version with pre-computed timestamp
             let mut rv = RowVersion::new_with_timestamp(self.txn_id, data, timestamp);
             rv.deleted_at_txn_id = self.txn_id;
@@ -7073,55 +7269,253 @@ impl TransactionVersionStore {
     /// RowVersion values, avoiding expensive clones. The transaction is
     /// consumed after commit anyway, so this is safe.
     pub fn commit(&mut self) -> Result<(), Error> {
-        // OCC validation: detect concurrent write conflicts.
-        // Rows removed by seal (missing from hot B-tree) are not conflicts —
-        // they were moved to cold segments, not modified by another transaction.
+        if let Err(error) = self
+            .prepare_publication()
+            .and_then(|()| self.apply_prepared_publication())
+        {
+            self.finish_publication(false)?;
+            return Err(error);
+        }
+        self.finish_publication(true)
+    }
+
+    /// Prepares row and UNIQUE-key ownership and captures only changed heads.
+    /// The engine prepares every table before applying any of them.
+    pub fn prepare_publication(&mut self) -> Result<(), Error> {
+        if self.mutation.is_none() {
+            return Ok(());
+        }
+        let lease = self.index_catalog_lease()?;
+        self.mutation.as_mut().unwrap().index_catalog_lease = Some(lease);
+        if let Some(write_set) = self.write_set.as_ref() {
+            for row_id in write_set.keys() {
+                self.parent_store.try_claim_row(row_id, self.txn_id)?;
+            }
+        }
         self.detect_conflicts_safe()?;
+        let mut keys: SmallVec<[PublicationKey; 2]> = SmallVec::new();
+        let indexes = self.parent_store.get_all_indexes();
+        for index in &indexes {
+            if !index.is_unique() || index.index_type() == crate::core::IndexType::PrimaryKey {
+                continue;
+            }
+            let identity = Arc::as_ptr(index) as *const () as usize;
+            for (_, version, old_row) in self.iter_local_with_old() {
+                if !version.is_deleted()
+                    && old_row.is_some_and(|old| {
+                        index
+                            .column_ids()
+                            .iter()
+                            .all(|&id| old.get(id as usize) == version.data.get(id as usize))
+                    })
+                {
+                    continue;
+                }
+                for row in old_row
+                    .into_iter()
+                    .chain((!version.is_deleted()).then_some(&version.data))
+                {
+                    let values: Arc<[Value]> = index
+                        .column_ids()
+                        .iter()
+                        .map(|&id| {
+                            row.get(id as usize)
+                                .cloned()
+                                .unwrap_or_else(Value::null_unknown)
+                        })
+                        .collect();
+                    if values.iter().any(Value::is_null) {
+                        continue;
+                    }
+                    keys.push((identity, values));
+                }
+            }
+        }
+        if !keys.is_empty() {
+            let mut owners = self.parent_store.publication_keys.lock();
+            if !try_reserve_publication_keys(&mut owners, &keys, self.txn_id) {
+                return Err(Error::internal(
+                    "write conflict: unique key is being published",
+                ));
+            }
+        }
+        let versions = self.parent_store.versions.read();
+        let undo = self
+            .iter_local()
+            .map(|(row_id, _)| (row_id, versions.get(row_id).cloned()))
+            .collect();
+        let mutation = self.mutation.as_mut().unwrap();
+        mutation.reserved_keys = keys;
+        mutation.reserved_indexes = indexes;
+        mutation.publication_undo = undo;
+        Ok(())
+    }
 
-        // Update indexes BEFORE committing versions
-        self.update_indexes_on_commit()?;
+    fn index_catalog_lease(&self) -> Result<IndexCatalogLease, Error> {
+        IndexCatalogLease::try_acquire(&self.parent_store.index_catalog, false)
+            .ok_or_else(|| Error::internal("write conflict: index catalog is changing"))
+    }
 
-        // Commit local versions to parent store
-        if let Some(local_versions) = self.local_versions.as_mut() {
-            if local_versions.len() == 1 {
-                // Single-row fast path: avoid Vec allocation
-                if let Some((row_id, mut versions)) = local_versions.drain().next() {
-                    if let Some(version) = versions.pop() {
-                        self.parent_store.add_version_single(row_id, version);
+    pub fn requires_cold_unique_reservations(&self) -> bool {
+        self.mutation.as_ref().is_some_and(|mutation| {
+            mutation.reserved_indexes.iter().any(|index| {
+                index.is_unique() && index.index_type() != crate::core::IndexType::PrimaryKey
+            })
+        })
+    }
+
+    /// Cold-only deletes have no local version or hot predecessor. Reserve
+    /// their old keys before a pending tombstone can hide them from writers.
+    pub fn reserve_cold_unique_keys(&mut self, row: &Row) -> Result<(), Error> {
+        let mutation = self
+            .mutation
+            .as_mut()
+            .ok_or_else(|| Error::internal("cold reservation before prepare"))?;
+        let mut keys: SmallVec<[PublicationKey; 2]> = SmallVec::new();
+        for index in &mutation.reserved_indexes {
+            if !index.is_unique() || index.index_type() == crate::core::IndexType::PrimaryKey {
+                continue;
+            }
+            let values: Arc<[Value]> = index
+                .column_ids()
+                .iter()
+                .map(|&id| {
+                    row.get(id as usize)
+                        .cloned()
+                        .unwrap_or_else(Value::null_unknown)
+                })
+                .collect();
+            if values.iter().any(Value::is_null) {
+                continue;
+            }
+            keys.push((Arc::as_ptr(index) as *const () as usize, values));
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+        let mut owners = self.parent_store.publication_keys.lock();
+        if !try_reserve_publication_keys(&mut owners, &keys, self.txn_id) {
+            return Err(Error::internal(
+                "write conflict: cold unique key is being published",
+            ));
+        }
+        mutation.reserved_keys.extend(keys);
+        Ok(())
+    }
+
+    pub fn apply_prepared_publication(&mut self) -> Result<(), Error> {
+        let indexes = self
+            .mutation
+            .as_ref()
+            .map_or(&[][..], |mutation| mutation.reserved_indexes.as_slice());
+        self.update_indexes_on_commit(indexes)?;
+        if let Some(mutation) = self.mutation.as_mut() {
+            mutation.publication_applied = true;
+        }
+        let Some(local) = self.local_versions.as_ref() else {
+            return Ok(());
+        };
+        if local.len() == 1 {
+            if let Some((row_id, versions)) = local.iter().next() {
+                if let Some(version) = versions.last() {
+                    self.parent_store
+                        .add_version_single(row_id, version.clone());
+                }
+            }
+        } else {
+            let mut batch: Vec<_> = local
+                .iter()
+                .filter_map(|(row_id, versions)| {
+                    versions.last().map(|version| (row_id, version.clone()))
+                })
+                .collect();
+            batch.sort_unstable_by_key(|(row_id, _)| *row_id);
+            self.parent_store.add_versions_batch(batch);
+        }
+        Ok(())
+    }
+
+    pub fn finish_publication(&mut self, committed: bool) -> Result<(), Error> {
+        let Some(mut mutation) = self.mutation.take() else {
+            return Ok(());
+        };
+        if !committed {
+            if let Err(error) = self.undo_index_updates() {
+                self.mutation = Some(mutation);
+                return Err(error);
+            }
+            if mutation.publication_applied {
+                let mut versions = self.parent_store.versions.write();
+                for (row_id, previous) in mutation.publication_undo.drain(..) {
+                    let current = versions.get(row_id);
+                    if current.is_none_or(|entry| entry.version.txn_id != self.txn_id) {
+                        continue;
+                    }
+                    let current = current.unwrap();
+                    let current_live = !current.version.is_deleted();
+                    let current_slot = unpack_arena_idx(current.arena_idx);
+                    let previous_live = previous
+                        .as_ref()
+                        .is_some_and(|entry| !entry.version.is_deleted());
+                    let previous_slot = previous
+                        .as_ref()
+                        .and_then(|entry| unpack_arena_idx(entry.arena_idx));
+                    if let Some(slot) = current_slot.filter(|slot| Some(*slot) != previous_slot) {
+                        self.parent_store.arena.clear_at(slot);
+                    }
+                    if let Some(entry) = previous {
+                        if let Some(slot) = previous_slot {
+                            self.parent_store.arena.update_at(
+                                slot,
+                                row_id,
+                                entry.version.txn_id,
+                                entry.version.data.clone().into_arc(),
+                            );
+                            if entry.version.is_deleted() {
+                                self.parent_store
+                                    .arena
+                                    .mark_deleted(slot, entry.version.deleted_at_txn_id);
+                            }
+                        }
+                        versions.insert(row_id, entry);
+                    } else {
+                        versions.remove(row_id);
+                    }
+                    if current_live && !previous_live {
+                        self.parent_store
+                            .committed_row_count
+                            .fetch_sub(1, Ordering::Relaxed);
+                    } else if previous_live && !current_live {
+                        self.parent_store
+                            .committed_row_count
+                            .fetch_add(1, Ordering::Relaxed);
                     }
                 }
-            } else {
-                // Multi-row path: collect into Vec
-                let mut batch: Vec<(i64, RowVersion)> = local_versions
-                    .drain()
-                    .filter_map(|(row_id, mut versions)| versions.pop().map(|v| (row_id, v)))
-                    .collect();
-
-                // Sort by row_id to ensure deterministic locking order
-                batch.sort_by_key(|(row_id, _)| *row_id);
-
-                self.parent_store.add_versions_batch(batch);
             }
         }
-
-        // Release ALL claims from write_set (includes both local and external claims).
-        // Must drain the entire write_set — external claims from track_external_claim()
-        // have no corresponding local_versions entry.
-        if let Some(write_set) = self.write_set.as_mut() {
-            if write_set.len() == 1 {
-                // Single-claim fast path: avoid Vec allocation
-                if let Some((row_id, _)) = write_set.drain().next() {
-                    self.parent_store.release_row_claim(row_id, self.txn_id);
+        mutation.publication_undo.clear();
+        mutation.publication_applied = false;
+        self.index_undo.lock().clear();
+        if !mutation.reserved_keys.is_empty() {
+            let mut owners = self.parent_store.publication_keys.lock();
+            for key in mutation.reserved_keys.drain(..) {
+                if owners.get(&key) == Some(&self.txn_id) {
+                    owners.remove(&key);
                 }
-            } else {
-                let mut row_ids: Vec<i64> = write_set.drain().map(|(row_id, _)| row_id).collect();
-                // Sort by row_id to ensure deterministic locking order
-                row_ids.sort_unstable();
-                self.parent_store
-                    .release_row_claims_batch(&row_ids, self.txn_id);
             }
         }
-
+        mutation.reserved_indexes.clear();
+        self.release_all_claims();
+        // Drain only after the outcome and any undo. Besides dropping values,
+        // I64Map's drain releases capacity inherited from a much larger prior
+        // batch, so pooled maps do not tax every later single-row operation.
+        if let Some(write_set) = self.write_set.as_mut() {
+            drop(write_set.drain());
+        }
+        if let Some(local) = self.local_versions.as_mut() {
+            drop(local.drain());
+        }
+        mutation.statement_undo.clear();
         Ok(())
     }
 
@@ -7137,7 +7531,7 @@ impl TransactionVersionStore {
     /// - Multi-row batch path: Collects changes, then applies in batch (reduces lock acquisitions)
     ///
     /// Returns an error if a unique constraint is violated.
-    fn update_indexes_on_commit(&self) -> Result<(), Error> {
+    fn update_indexes_on_commit(&self, indexes: &[Arc<dyn Index>]) -> Result<(), Error> {
         // Early exit if no local changes
         let Some(local_versions) = self.local_versions.as_ref() else {
             return Ok(());
@@ -7147,9 +7541,7 @@ impl TransactionVersionStore {
             return Ok(());
         }
 
-        // Get all indexes - early exit if none
-        let indexes: SmallVec<[Arc<dyn Index>; 4]> =
-            self.parent_store.get_all_indexes().into_iter().collect();
+        // Apply exactly the catalog snapshot whose ownership was reserved.
         if indexes.is_empty() {
             return Ok(());
         }
@@ -7157,12 +7549,12 @@ impl TransactionVersionStore {
         // FAST PATH: Single-row commit (most common case for auto-commit INSERT/UPDATE/DELETE)
         // Uses SmallVec to avoid heap allocation for 1-2 column indexes
         if local_versions.len() == 1 {
-            return self.update_indexes_single_row(&indexes);
+            return self.update_indexes_single_row(indexes);
         }
 
         // BATCH PATH: Multi-row commit
         // Sort indexes by name for deterministic lock ordering (prevents deadlocks)
-        let mut indexes: Vec<_> = indexes.into_vec();
+        let mut indexes: Vec<_> = indexes.to_vec();
         indexes.sort_by(|a, b| a.name().cmp(b.name()));
 
         let num_indexes = indexes.len();
@@ -7583,10 +7975,15 @@ impl TransactionVersionStore {
                 })
                 .collect();
             let entry = vec![(row_id, values)];
+            let (added, removed) = if is_add {
+                (entry, Vec::new())
+            } else {
+                (Vec::new(), entry)
+            };
             undo.push(IndexUndo {
                 index: Arc::clone(index),
-                added: if is_add { entry.clone() } else { Vec::new() },
-                removed: if is_add { Vec::new() } else { entry },
+                added,
+                removed,
             });
         }
 
@@ -7679,6 +8076,7 @@ impl TransactionVersionStore {
     /// TransactionVersionStore's put methods. Without tracking, these claims
     /// leak because commit() only releases claims found in write_set.
     pub fn track_external_claim(&mut self, row_id: i64) {
+        self.record_local_mutation(row_id);
         let write_set = self.ensure_write_set();
         // Only add if not already tracked (idempotent).
         // Use empty read_version since this is a cold-only claim — the actual
@@ -7721,6 +8119,12 @@ impl TransactionVersionStore {
         let Some(write_set) = self.write_set.as_ref() else {
             return;
         };
+        if write_set.len() <= 1 {
+            if let Some(row_id) = write_set.keys().next() {
+                self.parent_store.release_row_claim(row_id, self.txn_id);
+            }
+            return;
+        }
         // OPTIMIZATION: Collect row_ids first, then batch release
         // Avoids holding write_set iterator while accessing parent_store
         let mut row_ids: Vec<i64> = write_set.keys().collect();
@@ -7733,6 +8137,16 @@ impl TransactionVersionStore {
 
 impl Drop for TransactionVersionStore {
     fn drop(&mut self) {
+        if let Some(mutation) = &self.mutation {
+            if !mutation.reserved_keys.is_empty() {
+                let mut owners = self.parent_store.publication_keys.lock();
+                for key in &mutation.reserved_keys {
+                    if owners.get(key) == Some(&self.txn_id) {
+                        owners.remove(key);
+                    }
+                }
+            }
+        }
         // Release any row claims still held by this transaction.
         // This is a safety net for cases where drop happens without explicit
         // commit/rollback (e.g., transaction panics, implicit drop on scope exit).
@@ -8777,7 +9191,7 @@ mod tests {
             false,
             0,
         ));
-        store.add_index("idx_test".to_string(), index);
+        store.add_index("idx_test".to_string(), index).unwrap();
 
         assert!(store.index_exists("idx_test"));
         assert_eq!(store.list_indexes().len(), 1);
@@ -8790,7 +9204,7 @@ mod tests {
         assert!(store.get_index_by_column("test_col").is_some());
 
         // Remove index
-        let removed = store.remove_index("idx_test");
+        let removed = store.remove_index("idx_test").unwrap();
         assert!(removed.is_some());
         assert!(!store.index_exists("idx_test"));
     }
@@ -9508,7 +9922,7 @@ mod tests {
             true, // is_unique
             0,
         ));
-        store.add_index("idx_u".to_string(), index);
+        store.add_index("idx_u".to_string(), index).unwrap();
 
         // Initial data: (1, 10), (2, 20)
         let mut txn1 = TransactionVersionStore::new(Arc::clone(&store), 1);
@@ -9542,6 +9956,197 @@ mod tests {
     }
 
     #[test]
+    fn publication_releases_oversized_maps_after_a_small_transaction() {
+        for committed in [false, true] {
+            let parent = Arc::new(VersionStore::with_visibility_checker(
+                "pooled_capacity",
+                test_schema(),
+                Arc::new(TestVisibilityChecker::new()),
+            ));
+            let mut bulk = TransactionVersionStore::new(Arc::clone(&parent), 1);
+            for id in 1..=512 {
+                bulk.put(id, Row::from(vec![Value::Integer(id)]), false)
+                    .unwrap();
+            }
+            bulk.commit().unwrap();
+            let old_capacity = bulk.local_versions.as_ref().unwrap().capacity();
+            assert!(old_capacity >= 512);
+            // Move the emptied maps exactly as the transaction pool does,
+            // without depending on other parallel tests' global pool traffic.
+            let mut small = TransactionVersionStore::new(Arc::clone(&parent), 2);
+            small.local_versions = bulk.local_versions.take();
+            small.write_set = bulk.write_set.take();
+            small
+                .put(1024, Row::from(vec![Value::Integer(1024)]), false)
+                .unwrap();
+            small.prepare_publication().unwrap();
+            small.apply_prepared_publication().unwrap();
+            // Publication still owns its undo and the maps before the outcome.
+            assert_eq!(
+                small.local_versions.as_ref().unwrap().capacity(),
+                old_capacity
+            );
+            small.finish_publication(committed).unwrap();
+            assert!(small.local_versions.as_ref().unwrap().capacity() < old_capacity);
+            assert!(small.write_set.as_ref().unwrap().capacity() < old_capacity);
+            assert_eq!(parent.committed_row_count(), 512 + usize::from(committed));
+            assert!(parent.try_claim_row(1024, 3).is_ok());
+        }
+    }
+
+    #[test]
+    fn statement_undo_releases_only_new_claims_and_restores_repeated_updates() {
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "statement_undo",
+            test_schema(),
+            Arc::new(TestVisibilityChecker::new()),
+        ));
+        let mut local = TransactionVersionStore::new(Arc::clone(&store), 10);
+        local
+            .put(1, Row::from(vec![Value::Integer(1)]), false)
+            .unwrap();
+        store.try_claim_row(11, 10).unwrap();
+        local.track_external_claim(11);
+        local.finish_statement(0, true);
+        let checkpoint = local.statement_checkpoint();
+        local
+            .put(1, Row::from(vec![Value::Integer(2)]), false)
+            .unwrap();
+        local
+            .put(1, Row::from(vec![Value::Integer(3)]), false)
+            .unwrap();
+        // The cold key read fails at this point, before any put/tombstone.
+        store.try_claim_row(12, 10).unwrap();
+        local.track_external_claim(12);
+        local.finish_statement(checkpoint, false);
+        assert_eq!(
+            local.get_latest_local(1).unwrap().data.get(0),
+            Some(&Value::Integer(1))
+        );
+        assert!(store.try_claim_row(12, 20).is_ok());
+        assert!(store.try_claim_row(11, 20).is_err());
+        assert_eq!(local.local_count(), 1);
+    }
+
+    #[test]
+    fn publication_key_conflict_preserves_free_prefix_and_existing_owners() {
+        let free_key: PublicationKey = (1, Arc::from([Value::Integer(30)]));
+        let conflicting_key: PublicationKey = (1, Arc::from([Value::Integer(10)]));
+        let unrelated_key: PublicationKey = (2, Arc::from([Value::Integer(10)]));
+        let mut owners = AHashMap::new();
+        owners.insert(conflicting_key.clone(), 10);
+        owners.insert(unrelated_key.clone(), 30);
+        let before = owners.clone();
+
+        // Explicit order catches an implementation that reserves its free
+        // prefix before discovering another transaction's conflicting key.
+        assert!(!try_reserve_publication_keys(
+            &mut owners,
+            &[free_key.clone(), conflicting_key.clone()],
+            20,
+        ));
+        assert_eq!(owners, before);
+        assert!(!try_reserve_publication_keys(
+            &mut owners,
+            std::slice::from_ref(&conflicting_key),
+            20,
+        ));
+        assert_eq!(owners, before);
+        assert!(try_reserve_publication_keys(
+            &mut owners,
+            std::slice::from_ref(&conflicting_key),
+            10,
+        ));
+        assert_eq!(owners, before);
+        assert!(try_reserve_publication_keys(
+            &mut owners,
+            std::slice::from_ref(&free_key),
+            20,
+        ));
+        let mut expected = before;
+        expected.insert(free_key, 20);
+        assert_eq!(owners, expected);
+    }
+
+    #[test]
+    fn publication_reserves_removed_unique_keys_until_undo_finishes() {
+        use crate::storage::index::HashIndex;
+        let schema = SchemaBuilder::new("reserved_keys")
+            .column("id", DataType::Integer, false, true)
+            .column("u", DataType::Integer, false, false)
+            .build();
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "reserved_keys",
+            schema,
+            Arc::new(TestVisibilityChecker::new()),
+        ));
+        let index = Arc::new(HashIndex::new(
+            "idx_u".into(),
+            "reserved_keys".into(),
+            vec!["u".into()],
+            vec![1],
+            vec![DataType::Integer],
+            true,
+            0,
+        ));
+        store.add_index("idx_u".into(), index.clone()).unwrap();
+        let mut seed = TransactionVersionStore::new(Arc::clone(&store), 1);
+        seed.put(1, Row::from(vec![1.into(), 10.into()]), false)
+            .unwrap();
+        seed.commit().unwrap();
+        let original_bytes = store.hot_bytes();
+        let mut first = TransactionVersionStore::new(Arc::clone(&store), 2);
+        first
+            .put(1, Row::from(vec![1.into(), 20.into()]), false)
+            .unwrap();
+        first.prepare_publication().unwrap();
+        // An unchanged cold key may also appear among the local replacement's
+        // keys; reserving it again must retain this transaction's ownership.
+        first
+            .reserve_cold_unique_keys(&Row::from(vec![1.into(), 20.into()]))
+            .unwrap();
+        first.apply_prepared_publication().unwrap();
+        assert!(
+            store.remove_index("idx_u").is_err(),
+            "DDL cannot replace the reserved catalog"
+        );
+        assert!(store.add_index("idx_u".into(), index.clone()).is_err());
+        assert!(index.get_row_ids_equal(&[10.into()]).is_empty());
+        let mut second = TransactionVersionStore::new(Arc::clone(&store), 3);
+        second
+            .put(2, Row::from(vec![2.into(), 10.into()]), false)
+            .unwrap();
+        second
+            .put(4, Row::from(vec![4.into(), 30.into()]), false)
+            .unwrap();
+        assert!(
+            second.prepare_publication().is_err(),
+            "another publisher cannot take the removed key"
+        );
+        let mut unrelated = TransactionVersionStore::new(Arc::clone(&store), 4);
+        unrelated
+            .put(3, Row::from(vec![3.into(), 30.into()]), false)
+            .unwrap();
+        // The failed two-key preparation must not reserve its free key.
+        unrelated.commit().unwrap();
+        first.finish_publication(false).unwrap();
+        assert_eq!(index.get_row_ids_equal(&[10.into()]).as_slice(), &[1]);
+        assert!(index.get_row_ids_equal(&[20.into()]).is_empty());
+        assert_eq!(
+            store.get_visible_version(1, 9).unwrap().data.get(1),
+            Some(&10.into())
+        );
+        assert_eq!(
+            store.get_visible_version(3, 9).unwrap().data.get(1),
+            Some(&30.into())
+        );
+        assert_eq!(store.committed_row_count(), 2);
+        assert_eq!(store.hot_bytes(), original_bytes * 2);
+        second.finish_publication(false).unwrap();
+        assert!(store.publication_keys.lock().is_empty());
+    }
+
+    #[test]
     fn test_unique_constraint_performance_bulk_update() {
         use crate::core::DataType;
         use crate::storage::index::HashIndex;
@@ -9570,7 +10175,7 @@ mod tests {
             true, // is_unique
             0,
         ));
-        store.add_index("idx_u".to_string(), index);
+        store.add_index("idx_u".to_string(), index).unwrap();
 
         let row_count = 30000;
         let mut txn1 = TransactionVersionStore::new(Arc::clone(&store), 1);

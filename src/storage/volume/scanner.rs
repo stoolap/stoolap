@@ -195,46 +195,48 @@ impl VolumeScanner {
     }
 
     /// True when the row at `idx` lies past the stop key
-    fn past_stop_key(&self, idx: usize) -> bool {
+    fn past_stop_key(&self, idx: usize) -> Result<bool> {
         let Some((col_idx, target, ascending)) = self.stop_key else {
-            return false;
+            return Ok(false);
         };
-        let (col, local) = self.col_and_idx(col_idx, idx);
+        let (col, local) = self.col_and_idx(col_idx, idx)?;
         if col.is_null(local) {
-            return false;
+            return Ok(false);
         }
         let key = col.get_i64(local);
-        if ascending {
+        Ok(if ascending {
             key > target
         } else {
             key < target
-        }
+        })
     }
 
     /// The rows in `[lo, hi)` that pass every dictionary filter, in one pass
     /// over the raw ids of the group; None when a filter column is not a
     /// dictionary column here and the rows must be tested one by one
-    fn dictionary_candidates(&self, lo: usize, hi: usize) -> Option<Vec<usize>> {
-        let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
-            .dict_filters
-            .iter()
-            .map(|&(col_idx, expected)| {
-                let (col, local_lo) = self.col_and_idx(col_idx, lo);
-                (col, local_lo, expected)
-            })
-            .collect();
+    fn dictionary_candidates(&self, lo: usize, hi: usize) -> Result<Option<Vec<usize>>> {
+        let mut filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> =
+            smallvec::SmallVec::with_capacity(self.dict_filters.len());
+        for &(col_idx, expected) in &self.dict_filters {
+            let (col, local_lo) = self.col_and_idx(col_idx, lo)?;
+            filters.push((col, local_lo, expected));
+        }
         let mut candidates = Vec::new();
-        super::column::ColumnData::dict_matching_offsets(&filters, hi - lo, &mut candidates)?;
+        if super::column::ColumnData::dict_matching_offsets(&filters, hi - lo, &mut candidates)
+            .is_none()
+        {
+            return Ok(None);
+        }
         for idx in &mut candidates {
             *idx += lo;
         }
-        Some(candidates)
+        Ok(Some(candidates))
     }
 
     /// The reverse walk: the newest row of the range first. Row groups are
     /// entered from their end; a pruned group is skipped whole; with
     /// dictionary filters the group's candidates are found in one pass.
-    fn next_reverse(&mut self) -> bool {
+    fn next_reverse(&mut self) -> Result<bool> {
         let use_group_cache = self.volume.columns.should_use_group_cache();
         while self.current_idx < self.end_idx {
             let idx = self.end_idx - 1;
@@ -252,13 +254,13 @@ impl VolumeScanner {
                     self.load_group_cache(group_idx);
                     if self.error.is_some() {
                         self.has_current = false;
-                        return false;
+                        return Ok(false);
                     }
                 }
             }
             if !self.dict_filters.is_empty() && self.candidates_group != Some(group_idx) {
                 let lo = group_start.max(self.current_idx);
-                match self.dictionary_candidates(lo, self.end_idx) {
+                match self.dictionary_candidates(lo, self.end_idx)? {
                     Some(candidates) => {
                         self.group_candidates = candidates;
                         self.candidates_group = Some(group_idx);
@@ -281,10 +283,10 @@ impl VolumeScanner {
             } else {
                 idx
             };
-            if self.past_stop_key(idx) {
+            if self.past_stop_key(idx)? {
                 self.end_idx = self.current_idx;
                 self.has_current = false;
-                return false;
+                return Ok(false);
             }
             self.end_idx = idx;
             if self.should_skip_row(idx) {
@@ -292,22 +294,22 @@ impl VolumeScanner {
             }
             if self.candidates_group != Some(group_idx)
                 && !self.dict_filters.is_empty()
-                && self.dict_filters_reject(idx)
+                && self.dict_filters_reject(idx)?
             {
                 continue;
             }
-            if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx) {
+            if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx)? {
                 continue;
             }
-            if !self.materialize_row(idx) {
+            if !self.materialize_row(idx)? {
                 continue;
             }
             self.current_rid = self.volume.meta.row_ids[idx];
             self.has_current = true;
-            return true;
+            return Ok(true);
         }
         self.has_current = false;
-        false
+        Ok(false)
     }
     /// Compute whether `project_cols` is an identity mapping over all volume columns.
     /// Extracted as a helper so both constructors share the same logic.
@@ -511,6 +513,16 @@ impl VolumeScanner {
     /// Set a predicate filter on this scanner.
     /// Automatically extracts dictionary-based fast filters for text equality predicates.
     pub fn set_filter(&mut self, filter: Box<dyn crate::storage::expression::Expression>) {
+        if let Err(error) = self.try_set_filter(filter) {
+            self.error = Some(error);
+            self.has_current = false;
+        }
+    }
+
+    fn try_set_filter(
+        &mut self,
+        filter: Box<dyn crate::storage::expression::Expression>,
+    ) -> Result<()> {
         // Extract dictionary filters for fast pre-filtering.
         // Uses CompressedBlockStore's shared dict when available (no column decompression).
         let comparisons = filter.collect_comparisons();
@@ -532,14 +544,14 @@ impl VolumeScanner {
                     let dict_id = if let Some(st) = store {
                         st.dict_lookup(col_idx, s.as_str())
                     } else {
-                        self.volume.columns[col_idx].dict_lookup(s.as_str())
+                        self.volume.columns.get(col_idx)?.dict_lookup(s.as_str())
                     };
                     if let Some(id) = dict_id {
                         self.dict_filters.push((col_idx, id));
                     } else {
                         self.current_idx = self.end_idx;
                         self.filter = Some(filter);
-                        return;
+                        return Ok(());
                     }
                 }
             }
@@ -564,22 +576,8 @@ impl VolumeScanner {
                         continue;
                     }
                     let mut group_cols = Vec::with_capacity(self.dict_filters.len());
-                    let mut corrupt = false;
                     for &(ci, _) in &self.dict_filters {
-                        match st.group_column(ci, gi) {
-                            Ok(col) => group_cols.push(col),
-                            Err(_) => {
-                                corrupt = true;
-                                break;
-                            }
-                        }
-                    }
-                    if corrupt {
-                        self.current_idx = self.end_idx;
-                        self.error =
-                            Some(Error::internal("corrupt V4 block during dictionary filter"));
-                        self.filter = Some(filter);
-                        return;
+                        group_cols.push(st.group_column(ci, gi)?);
                     }
                     let lo = gs.max(self.current_idx);
                     let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
@@ -630,8 +628,8 @@ impl VolumeScanner {
                     let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
                         .dict_filters
                         .iter()
-                        .map(|&(ci, eid)| (&self.volume.columns[ci], lo, eid))
-                        .collect();
+                        .map(|&(ci, eid)| Ok((self.volume.columns.get(ci)?, lo, eid)))
+                        .collect::<Result<_>>()?;
                     let first = m.len();
                     if super::column::ColumnData::dict_matching_offsets(&filters, hi - lo, &mut m)
                         .is_none()
@@ -648,10 +646,14 @@ impl VolumeScanner {
                 if !vectorized {
                     m.clear();
                     for i in self.current_idx..self.end_idx {
-                        let ok = self.dict_filters.iter().all(|&(ci, eid)| {
-                            !self.volume.columns[ci].is_null(i)
-                                && self.volume.columns[ci].get_dict_id(i) == eid
-                        });
+                        let mut ok = true;
+                        for &(ci, eid) in &self.dict_filters {
+                            let col = self.volume.columns.get(ci)?;
+                            if col.is_null(i) || col.get_dict_id(i) != eid {
+                                ok = false;
+                                break;
+                            }
+                        }
                         if ok {
                             m.push(i);
                         }
@@ -788,15 +790,16 @@ impl VolumeScanner {
         }
 
         self.filter = Some(filter);
+        Ok(())
     }
 
     /// Evaluate typed pre-filter predicates directly on column data.
     /// Returns false only if the row definitely does not match (safe rejection).
     /// NULL columns conservatively pass through (the full filter handles NULL logic).
     #[inline]
-    fn evaluate_typed_predicates(&self, idx: usize) -> bool {
+    fn evaluate_typed_predicates(&self, idx: usize) -> Result<bool> {
         for pred in &self.typed_predicates {
-            let (col, local) = self.col_and_idx(pred.col_idx, idx);
+            let (col, local) = self.col_and_idx(pred.col_idx, idx)?;
             if col.is_null(local) {
                 // NULL: conservatively pass through (might match under SQL NULL semantics).
                 // The full filter will handle it correctly.
@@ -837,10 +840,10 @@ impl VolumeScanner {
                 }
             };
             if !matches {
-                return false;
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     }
 
     /// Set a precomputed column mapping for schema-evolved volumes.
@@ -859,13 +862,13 @@ impl VolumeScanner {
         &self,
         col_idx: usize,
         global_idx: usize,
-    ) -> (&super::column::ColumnData, usize) {
+    ) -> Result<(&super::column::ColumnData, usize)> {
         if let Some(ref cache) = self.group_cache {
             if let Some(pair) = cache.col_and_local(col_idx, global_idx) {
-                return pair;
+                return Ok(pair);
             }
         }
-        (&self.volume.columns[col_idx], global_idx)
+        Ok((self.volume.columns.get(col_idx)?, global_idx))
     }
 
     /// Load group cache for a new row group. Decompresses only the columns
@@ -891,7 +894,7 @@ impl VolumeScanner {
                     match store.group_column(ci, group_idx) {
                         Ok(col) => columns[ci] = Some(col),
                         Err(e) => {
-                            self.error = Some(Error::internal(format!("corrupt V4 block: {}", e)));
+                            self.error = Some(e.into());
                             return;
                         }
                     }
@@ -903,7 +906,7 @@ impl VolumeScanner {
                     match store.group_column(ci, group_idx) {
                         Ok(col) => *slot = Some(col),
                         Err(e) => {
-                            self.error = Some(Error::internal(format!("corrupt V4 block: {}", e)));
+                            self.error = Some(e.into());
                             return;
                         }
                     }
@@ -956,21 +959,21 @@ impl VolumeScanner {
     /// does NOT match (should be skipped). Only called when dict_filters is
     /// non-empty.
     #[inline(always)]
-    fn dict_filters_reject(&self, idx: usize) -> bool {
+    fn dict_filters_reject(&self, idx: usize) -> Result<bool> {
         for &(col_idx, expected_id) in &self.dict_filters {
-            let (col, local) = self.col_and_idx(col_idx, idx);
+            let (col, local) = self.col_and_idx(col_idx, idx)?;
             if col.is_null(local) || col.get_dict_id(local) != expected_id {
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     /// Materialize a row at `idx`, evaluate the filter (if any), and write
     /// the result into `self.current_row`. Returns false if the filter
     /// rejects the row.
     #[inline(always)]
-    fn materialize_row(&mut self, idx: usize) -> bool {
+    fn materialize_row(&mut self, idx: usize) -> Result<bool> {
         // Per-group cache path: only when no schema mapping is needed.
         // Schema-evolved volumes require column_mapping which remaps positions.
         if self.group_cache.is_some() && self.column_mapping.is_none() {
@@ -980,14 +983,14 @@ impl VolumeScanner {
         if let Some(ref filter) = self.filter {
             let full_row = match (&self.needed_cols, &self.column_mapping) {
                 (Some(mask), Some(mapping)) => {
-                    self.volume.get_row_mapped_needed(idx, mapping, mask)
+                    self.volume.get_row_mapped_needed(idx, mapping, mask)?
                 }
-                (Some(mask), None) => self.volume.get_row_needed(idx, mask),
-                (None, Some(mapping)) => self.volume.get_row_mapped(idx, mapping),
-                (None, None) => self.volume.get_row(idx),
+                (Some(mask), None) => self.volume.get_row_needed(idx, mask)?,
+                (None, Some(mapping)) => self.volume.get_row_mapped(idx, mapping)?,
+                (None, None) => self.volume.get_row(idx)?,
             };
             if !filter.evaluate_fast(&full_row) {
-                return false;
+                return Ok(false);
             }
             if self.is_full_projection {
                 self.current_row = full_row;
@@ -1006,55 +1009,44 @@ impl VolumeScanner {
             }
         } else if let Some(ref mapping) = self.column_mapping {
             if self.is_full_projection {
-                self.current_row = self.volume.get_row_mapped(idx, mapping);
+                self.current_row = self.volume.get_row_mapped(idx, mapping)?;
             } else {
                 self.current_row =
                     self.volume
-                        .get_row_mapped_projected(idx, mapping, &self.project_cols);
+                        .get_row_mapped_projected(idx, mapping, &self.project_cols)?;
             }
         } else if self.is_full_projection {
-            self.current_row = self.volume.get_row(idx);
+            self.current_row = self.volume.get_row(idx)?;
         } else {
-            self.current_row = self.volume.get_row_projected(idx, &self.project_cols);
+            self.current_row = self.volume.get_row_projected(idx, &self.project_cols)?;
         }
-        true
+        Ok(true)
     }
 
     /// Build a row from the per-group column cache (avoids full-column decompression).
-    fn materialize_row_from_cache(&mut self, idx: usize) -> bool {
+    fn materialize_row_from_cache(&mut self, idx: usize) -> Result<bool> {
         let col_count = self.volume.columns.len();
-
-        // Build full-width row from cache
-        let full_row = if let Some(ref needed) = self.needed_cols {
-            let values: Vec<Value> = (0..col_count)
-                .map(|ci| {
-                    if ci < needed.len() && needed[ci] {
-                        let (col, local) = self.col_and_idx(ci, idx);
-                        col.get_value(local)
-                    } else {
-                        Value::Null(self.volume.columns.data_type(ci))
-                    }
-                })
-                .collect();
-            Row::from_values(values)
-        } else {
-            let values: Vec<Value> = (0..col_count)
-                .map(|ci| {
-                    let (col, local) = self.col_and_idx(ci, idx);
-                    col.get_value(local)
-                })
-                .collect();
-            Row::from_values(values)
-        };
-
-        // Apply filter if present
-        if let Some(ref filter) = self.filter {
-            if !filter.evaluate_fast(&full_row) {
-                return false;
+        let mut values = Vec::with_capacity(col_count);
+        for ci in 0..col_count {
+            if self
+                .needed_cols
+                .as_ref()
+                .is_none_or(|needed| ci < needed.len() && needed[ci])
+            {
+                let (col, local) = self.col_and_idx(ci, idx)?;
+                values.push(col.get_value(local));
+            } else {
+                values.push(Value::Null(self.volume.columns.data_type(ci)));
             }
         }
-
-        // Project
+        let full_row = Row::from_values(values);
+        if self
+            .filter
+            .as_ref()
+            .is_some_and(|filter| !filter.evaluate_fast(&full_row))
+        {
+            return Ok(false);
+        }
         if self.is_full_projection {
             self.current_row = full_row;
         } else {
@@ -1070,15 +1062,15 @@ impl VolumeScanner {
                     .collect(),
             );
         }
-        true
+        Ok(true)
     }
 }
 
-impl Scanner for VolumeScanner {
-    fn next(&mut self) -> bool {
+impl VolumeScanner {
+    fn try_next(&mut self) -> Result<bool> {
         if self.error.is_some() {
             self.has_current = false;
-            return false;
+            return Ok(false);
         }
         if self.reverse {
             return self.next_reverse();
@@ -1096,7 +1088,7 @@ impl Scanner for VolumeScanner {
                     }
                     _ => {
                         self.has_current = false;
-                        return false;
+                        return Ok(false);
                     }
                 };
 
@@ -1112,21 +1104,21 @@ impl Scanner for VolumeScanner {
                         self.load_group_cache(gi);
                         if self.error.is_some() {
                             self.has_current = false;
-                            return false;
+                            return Ok(false);
                         }
                     }
                 }
 
-                if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx) {
+                if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx)? {
                     continue;
                 }
-                if !self.materialize_row(idx) {
+                if !self.materialize_row(idx)? {
                     continue;
                 }
 
                 self.current_rid = self.volume.meta.row_ids[idx];
                 self.has_current = true;
-                return true;
+                return Ok(true);
             }
         }
 
@@ -1152,15 +1144,15 @@ impl Scanner for VolumeScanner {
                     self.load_group_cache(group_idx);
                     if self.error.is_some() {
                         self.has_current = false;
-                        return false;
+                        return Ok(false);
                     }
                 }
             }
 
-            if self.stop_key.is_some() && self.past_stop_key(self.current_idx) {
+            if self.stop_key.is_some() && self.past_stop_key(self.current_idx)? {
                 self.current_idx = self.end_idx;
                 self.has_current = false;
-                return false;
+                return Ok(false);
             }
 
             if self.should_skip_row(self.current_idx) {
@@ -1170,15 +1162,15 @@ impl Scanner for VolumeScanner {
 
             let idx = self.current_idx;
 
-            if !self.dict_filters.is_empty() && self.dict_filters_reject(idx) {
+            if !self.dict_filters.is_empty() && self.dict_filters_reject(idx)? {
                 self.current_idx += 1;
                 continue;
             }
-            if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx) {
+            if !self.typed_predicates.is_empty() && !self.evaluate_typed_predicates(idx)? {
                 self.current_idx += 1;
                 continue;
             }
-            if !self.materialize_row(idx) {
+            if !self.materialize_row(idx)? {
                 self.current_idx += 1;
                 continue;
             }
@@ -1186,11 +1178,24 @@ impl Scanner for VolumeScanner {
             self.current_rid = self.volume.meta.row_ids[idx];
             self.has_current = true;
             self.current_idx += 1;
-            return true;
+            return Ok(true);
         }
 
         self.has_current = false;
-        false
+        Ok(false)
+    }
+}
+
+impl Scanner for VolumeScanner {
+    fn next(&mut self) -> bool {
+        match self.try_next() {
+            Ok(value) => value,
+            Err(error) => {
+                self.error = Some(error);
+                self.has_current = false;
+                false
+            }
+        }
     }
 
     fn row(&self) -> &Row {

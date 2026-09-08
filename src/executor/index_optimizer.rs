@@ -193,7 +193,7 @@ impl Executor {
         }
 
         // Use table's row_count method (O(1) instead of O(n))
-        let count = table.row_count();
+        let count = table.row_count()?;
 
         // Build result - wrap columns in CompactArc once for zero-copy sharing
         let col_name = alias.unwrap_or_else(|| "COUNT(*)".to_string());
@@ -259,7 +259,7 @@ impl Executor {
 
         // Try to use index-ordered scan
         if let Some(rows) =
-            table.collect_rows_ordered_by_index(&column_name, ascending, limit, offset)
+            table.collect_rows_ordered_by_index(&column_name, ascending, limit, offset)?
         {
             // Project rows according to SELECT expressions
             let projected_rows = self.project_rows(&stmt.columns, rows, all_columns, ctx)?;
@@ -1163,7 +1163,7 @@ impl Executor {
 
                 // Iterate through row_ids and collect non-excluded ones
                 // Row IDs are typically 1-based and sequential
-                let row_count = table.row_count();
+                let row_count = table.row_count()?;
                 for row_id in 1..=(row_count as i64) {
                     if !exclusion_set.contains(row_id) {
                         all_row_ids.push(row_id);

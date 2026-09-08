@@ -1,6 +1,6 @@
 # Storage lifecycle contracts
 
-Status: Phase 0 design under review. Baseline: `9cf15ea4`.
+Status: Phase 0 independently reviewed and accepted. Baseline: `9cf15ea4`.
 The accepted scope and phase boundaries are in [plan.md](plan.md).
 This document selects the protocols used to implement K1–K8. It does not
 declare an unimplemented budget or benchmark target achieved.

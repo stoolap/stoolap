@@ -7,7 +7,7 @@ independently reviewable without claiming unmerged work is shipped.
 | Phase | Deliverable | Status | Review | PR |
 |---|---|---|---|---|
 | 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
-| 1 | Fallible access and complete statement rollback | Pending | Pending | — |
+| 1 | Fallible access and complete statement rollback | Implementing and validating | Independent review in progress | — |
 | 2 | Chunked arena and retained-hot accounting | Pending | Pending | — |
 | 3 | Coherent two-layer execution | Pending | Pending | — |
 | 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
@@ -45,3 +45,33 @@ with 20,000 rows/64-byte payloads and a 4,096-row/4,096-byte variant including
 concurrent ingest and analytics. These are baseline observations, not achieved
 performance gains or proof of the future budget. CI also runs for dependent
 storage PR branches so each phase receives its own checks.
+
+## Phase 1
+
+Required cold reads now return errors through point access, constraints,
+optimized aggregates, parallel workers, windows and correlated expressions.
+A failed statement rolls back only its own writes and claims. All-table
+publication retains row/index/counter/tombstone undo and old/new UNIQUE-key
+reservations until the outcome is known. Indeterminate durable COMMIT errors
+fence the engine until recovery. Index builders validate detached state before
+publishing it; first-seal generation tracking includes generation zero.
+
+Independent review reproduced and drove fixes for cold-key reservations,
+VACUUM racing publication undo, first-seal generation loss, partial index
+installation, and correlated-query error swallowing. Regression tests retain
+those cases. The default test targets completed across the full-suite run and
+its continuation; the corruption fixture was corrected to damage the encoded
+block while retaining a valid directory length, then passed. Final default
+unit tests: 2,050 passed. Serial feature-enabled volume tests: 69 passed.
+Clippy (all targets, test-failpoints and FFI), no-default compilation and the
+five enabled doctests passed. Failpoint unit tests are feature-gated and run
+serially, including coverage, so injections cannot hit unrelated unit tests.
+
+The first five-pair lifecycle comparison caught two avoidable regressions:
+repeated lazy-column access in the aggregate row loop, and oversized pooled
+transaction maps surviving terminal publication because clear bypassed the
+existing drain/shrink policy. Aggregate inputs now bind once on the first
+matching row; terminal map drainage restores the existing pool policy after
+undo is no longer needed. A capacity regression covers commit and abort.
+Final performance acceptance and PR publication are pending the repeated
+comparison and final review.

@@ -155,7 +155,7 @@ impl Executor {
         let schema = table.schema().clone();
 
         // Get row count
-        let row_count = table.row_count();
+        let row_count = table.row_count()?;
 
         // Collect all rows for zone map building (zone maps need complete data)
         let mut all_rows = table.collect_all_rows(None)?;
