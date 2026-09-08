@@ -3053,18 +3053,19 @@ impl Table for MVCCTable {
                 .map(|(value, inclusive)| (value, *inclusive)),
             ascending,
             &mut |row_id, key_value| {
+                // A version comes back only when it is visible and its
+                // deletion, if any, is not: the raw deleted flag may belong
+                // to an aborted or unfinished transaction
                 if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
-                    if !version.is_deleted() {
-                        let row = self.normalize_row_to_schema(version.data, schema);
-                        if row.get(col_idx) != Some(key_value) {
-                            stale = true;
-                            return false;
-                        }
-                        // The index may be ahead of this transaction's view of
-                        // the row, so the whole WHERE is checked on the row
-                        if expr.evaluate_fast(&row) {
-                            rows.push((row_id, row));
-                        }
+                    let row = self.normalize_row_to_schema(version.data, schema);
+                    if row.get(col_idx) != Some(key_value) {
+                        stale = true;
+                        return false;
+                    }
+                    // The index may be ahead of this transaction's view of
+                    // the row, so the whole WHERE is checked on the row
+                    if expr.evaluate_fast(&row) {
+                        rows.push((row_id, row));
                     }
                 }
                 rows.len() < needed
