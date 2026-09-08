@@ -193,6 +193,29 @@ fn hot_max_bytes_makes_commits_wait_for_the_seal() {
     assert_eq!(int(&db, "SELECT SUM(id) FROM w"), 30_000 * 30_001 / 2);
 }
 
+#[test]
+fn an_update_over_the_byte_limit_does_not_wait_on_its_own_claims() {
+    let dir = tempdir().expect("tempdir");
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600&hot_max_rows=0",
+        dir.path().display()
+    ))
+    .expect("open");
+    db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, t TEXT)", ())
+        .expect("create");
+    insert_batch(&db, "u", 1, 2000);
+    db.execute("PRAGMA HOT_MAX_BYTES = 1", ()).expect("limit");
+    let started = Instant::now();
+    db.execute("UPDATE u SET t = 'changed' WHERE id <= 1500", ())
+        .expect("update");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the UPDATE waited {:?} for a seal its own claims block",
+        started.elapsed()
+    );
+    assert_eq!(int(&db, "SELECT COUNT(*) FROM u WHERE t = 'changed'"), 1500);
+}
+
 /// Under `test-filedb` a memory DSN opens a file database, which can seal
 #[cfg(not(feature = "test-filedb"))]
 #[test]

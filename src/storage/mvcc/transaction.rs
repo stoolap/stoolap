@@ -150,6 +150,12 @@ pub trait TransactionEngineOperations: Send + Sync {
         let _ = txn_id;
     }
 
+    /// Asks for a seal when a table the now visible commit wrote is at the
+    /// hot row limit
+    fn request_seal_if_over(&self, hold: &super::version_store::PublishHold) {
+        let _ = hold;
+    }
+
     /// Discard the cold-row tombstones the transaction made after a timestamp
     /// (savepoint rollback). Engines without cold storage have none.
     fn rollback_tombstones_after(&self, _txn_id: i64, _timestamp: i64) {}
@@ -522,6 +528,9 @@ impl Transaction for MvccTransaction {
 
             // Phase 4: Complete commit - make changes visible in registry
             self.registry.complete_commit(self.id);
+            if let (Some(ops), Some(hold)) = (&self.engine_operations, &publish) {
+                ops.request_seal_if_over(hold);
+            }
         } else {
             // Read-only transaction - just mark as committed in registry
             self.registry.complete_commit(self.id);

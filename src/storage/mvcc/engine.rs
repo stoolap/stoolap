@@ -5122,7 +5122,12 @@ impl MVCCEngine {
             self.force_seal_all.store(false, Ordering::Release);
         }
 
-        self.hot_limits.admission.1.notify_all();
+        {
+            // Under the mutex, so a writer between its check and its wait
+            // cannot miss this wakeup
+            let _admission = self.hot_limits.admission.0.lock().unwrap();
+            self.hot_limits.admission.1.notify_all();
+        }
 
         // Step 3: Brief fence — block commits just long enough to check if all
         // hot buffers are empty and capture checkpoint_lsn. NO disk I/O inside
@@ -7664,12 +7669,6 @@ impl TransactionEngineOperations for EngineOperations {
             }
 
             any_committed = true;
-            let hot_max_rows = self.hot_limits.max_rows.load(Ordering::Relaxed);
-            if hot_max_rows > 0 && version_store.committed_row_count() >= hot_max_rows {
-                self.hot_limits
-                    .seal_requested
-                    .store(true, Ordering::Release);
-            }
         }
 
         // Always cleanup txn_version_stores to prevent memory leak,
@@ -7823,6 +7822,15 @@ impl TransactionEngineOperations for EngineOperations {
         Some(SealFenceGuard::new(Arc::clone(&self.seal_fence)))
     }
 
+    fn request_seal_if_over(&self, hold: &super::version_store::PublishHold) {
+        let max_rows = self.hot_limits.max_rows.load(Ordering::Relaxed);
+        if max_rows > 0 && hold.any_table_at(max_rows) {
+            self.hot_limits
+                .seal_requested
+                .store(true, Ordering::Release);
+        }
+    }
+
     fn wait_for_hot_admission(&self, txn_id: i64) {
         let limits = &self.hot_limits;
         let limit = limits.max_bytes.load(Ordering::Relaxed);
@@ -7835,6 +7843,8 @@ impl TransactionEngineOperations for EngineOperations {
         {
             return;
         }
+        // A table whose existing rows this transaction claimed is left out:
+        // the seal skips claimed rows, so the wait could not end
         let stores: Vec<Arc<VersionStore>> = {
             let cache = self.txn_version_stores().read().unwrap();
             let Some(txn_tables) = cache.get(txn_id) else {
@@ -7843,6 +7853,7 @@ impl TransactionEngineOperations for EngineOperations {
             let stores = self.version_stores().read().unwrap();
             txn_tables
                 .iter()
+                .filter(|(_, txn_store)| txn_store.read().is_ok_and(|s| !s.holds_hot_rows()))
                 .filter_map(|(table_name, _)| stores.get(table_name.as_str()).cloned())
                 .collect()
         };
