@@ -28,9 +28,24 @@
 //! - Guarantee atomic insert operations
 
 use parking_lot::{Mutex, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::common::CompactArc;
 use crate::core::{Row, Value};
+
+/// Bytes a row holds: the values in place plus what text and extension
+/// values keep on the heap
+pub fn row_bytes(values: &[Value]) -> usize {
+    let mut bytes = 16 + std::mem::size_of_val(values);
+    for value in values {
+        match value {
+            Value::Text(s) if s.is_heap() => bytes += 40 + s.len(),
+            Value::Extension(bytes_ref) => bytes += 16 + bytes_ref.len(),
+            _ => {}
+        }
+    }
+    bytes
+}
 
 /// Metadata for a row stored in the arena
 ///
@@ -79,6 +94,8 @@ pub struct RowArena {
     /// Free list of cleared slot indices for reuse (separate lock, write-path only)
     /// This prevents unbounded arena growth during insert/delete cycles
     free_list: Mutex<Vec<usize>>,
+    /// Bytes of the rows in live slots, kept exact by every mutation
+    bytes: AtomicUsize,
 }
 
 impl RowArena {
@@ -98,6 +115,7 @@ impl RowArena {
                 meta: Vec::new(),
             }),
             free_list: Mutex::new(Vec::new()),
+            bytes: AtomicUsize::new(0),
         }
     }
 
@@ -109,6 +127,7 @@ impl RowArena {
                 meta: Vec::with_capacity(row_capacity),
             }),
             free_list: Mutex::new(Vec::new()),
+            bytes: AtomicUsize::new(0),
         }
     }
 
@@ -125,6 +144,7 @@ impl RowArena {
 
         // Convert values to CompactArc<[Value]>
         let arc_data: CompactArc<[Value]> = CompactArc::from(values.to_vec());
+        self.bytes.fetch_add(row_bytes(values), Ordering::Relaxed);
 
         let meta = ArenaRowMeta {
             row_id,
@@ -166,6 +186,8 @@ impl RowArena {
                 CompactArc::from(values)
             }
         };
+        self.bytes
+            .fetch_add(row_bytes(&arc_data), Ordering::Relaxed);
 
         let meta = ArenaRowMeta {
             row_id,
@@ -211,6 +233,8 @@ impl RowArena {
                 CompactArc::from(values)
             }
         };
+        self.bytes
+            .fetch_add(row_bytes(&arc_data), Ordering::Relaxed);
 
         let meta = ArenaRowMeta {
             row_id,
@@ -241,6 +265,8 @@ impl RowArena {
         let reuse_idx = self.free_list.lock().pop();
 
         let mut inner = self.inner.write();
+        self.bytes
+            .fetch_add(row_bytes(&arc_data), Ordering::Relaxed);
 
         let meta = ArenaRowMeta {
             row_id,
@@ -280,6 +306,8 @@ impl RowArena {
         let cleared = {
             let mut inner = self.inner.write();
             if arena_idx < inner.meta.len() {
+                self.bytes
+                    .fetch_sub(row_bytes(&inner.data[arena_idx]), Ordering::Relaxed);
                 // Replace data with empty Arc to release memory
                 inner.data[arena_idx] = CompactArc::from(Vec::<Value>::new());
                 // Mark metadata as cleared (txn_id = 0 is the cleared sentinel;
@@ -319,13 +347,16 @@ impl RowArena {
                 deleted_at_txn_id: 0,
             };
 
+            let mut freed = 0usize;
             for &arena_idx in arena_indices {
                 if arena_idx < inner.meta.len() {
+                    freed += row_bytes(&inner.data[arena_idx]);
                     inner.data[arena_idx] = CompactArc::clone(&empty_data);
                     inner.meta[arena_idx] = cleared_meta;
                     cleared_indices.push(arena_idx);
                 }
             }
+            self.bytes.fetch_sub(freed, Ordering::Relaxed);
         }
 
         // Add to free list for reuse (separate lock, after releasing inner lock)
@@ -353,6 +384,10 @@ impl RowArena {
     ) -> bool {
         let mut inner = self.inner.write();
         if arena_idx < inner.meta.len() {
+            let old = row_bytes(&inner.data[arena_idx]);
+            self.bytes
+                .fetch_add(row_bytes(&arc_data), Ordering::Relaxed);
+            self.bytes.fetch_sub(old, Ordering::Relaxed);
             inner.data[arena_idx] = arc_data;
             inner.meta[arena_idx] = ArenaRowMeta {
                 row_id,
@@ -373,12 +408,26 @@ impl RowArena {
         inner.data = Vec::new();
         inner.meta = Vec::new();
         self.free_list.lock().clear();
+        self.bytes.store(0, Ordering::Relaxed);
     }
 
     /// Get the number of rows (including deleted)
     #[inline]
     pub fn len(&self) -> usize {
         self.inner.read().meta.len()
+    }
+
+    /// Bytes of the rows in live slots
+    #[inline]
+    pub fn bytes(&self) -> usize {
+        self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Bytes the slot vectors reserve, used or not
+    pub fn capacity_bytes(&self) -> usize {
+        let inner = self.inner.read();
+        inner.data.capacity() * std::mem::size_of::<CompactArc<[Value]>>()
+            + inner.meta.capacity() * std::mem::size_of::<ArenaRowMeta>()
     }
 
     /// Check if the arena is empty
@@ -466,6 +515,33 @@ impl<'a> ArenaReadGuard<'a> {
 mod tests {
     use super::*;
     use crate::core::Value;
+
+    #[test]
+    fn bytes_follow_inserts_updates_and_clears() {
+        let arena = RowArena::new();
+        assert_eq!(arena.bytes(), 0);
+        let short = vec![Value::Integer(1), Value::text("inline")];
+        let long = vec![
+            Value::Integer(1),
+            Value::text("a text value that lives on the heap"),
+        ];
+        let idx = arena.insert(1, 1, &short);
+        assert_eq!(arena.bytes(), row_bytes(&short));
+        assert!(row_bytes(&long) > row_bytes(&short));
+        arena.update_at(idx, 1, 2, CompactArc::from(long.clone()));
+        assert_eq!(arena.bytes(), row_bytes(&long));
+        let other = arena.insert(2, 2, &short);
+        assert_eq!(arena.bytes(), row_bytes(&long) + row_bytes(&short));
+        arena.clear_batch(&[idx]);
+        assert_eq!(arena.bytes(), row_bytes(&short));
+        assert!(arena.clear_at(other));
+        assert_eq!(arena.bytes(), 0);
+        let reused = arena.insert(3, 3, &long);
+        assert_eq!(arena.bytes(), row_bytes(&long));
+        arena.clear_all();
+        assert_eq!(arena.bytes(), 0);
+        assert!(reused < 2);
+    }
 
     #[test]
     fn test_arena_insert_and_iterate() {

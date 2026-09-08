@@ -144,6 +144,12 @@ pub trait TransactionEngineOperations: Send + Sync {
         super::version_store::PublishHold::default()
     }
 
+    /// Waits while a table the transaction writes holds more hot bytes than
+    /// its limit allows, so a seal can bring it back under. No fence is held.
+    fn wait_for_hot_admission(&self, txn_id: i64) {
+        let _ = txn_id;
+    }
+
     /// Discard the cold-row tombstones the transaction made after a timestamp
     /// (savepoint rollback). Engines without cold storage have none.
     fn rollback_tombstones_after(&self, _txn_id: i64, _timestamp: i64) {}
@@ -445,6 +451,9 @@ impl Transaction for MvccTransaction {
 
         // Two-phase commit protocol
         if !is_read_only {
+            if let Some(ops) = &self.engine_operations {
+                ops.wait_for_hot_admission(self.id);
+            }
             // Acquire seal fence shared lock. This signals to the checkpoint
             // micro-seal that a commit is in-flight. The micro-seal waits for
             // all in-flight commits to finish before draining hot rows.

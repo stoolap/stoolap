@@ -2026,6 +2026,27 @@ impl VersionStore {
         self.committed_row_count.load(Ordering::Relaxed)
     }
 
+    /// Bytes of the rows the arena holds, kept exact by every mutation
+    #[inline]
+    pub fn hot_bytes(&self) -> usize {
+        self.arena.bytes()
+    }
+
+    /// Arena slots in use (deleted and cleared ones included) and the bytes
+    /// its slot vectors reserve
+    pub fn arena_footprint(&self) -> (usize, usize) {
+        (self.arena.len(), self.arena.capacity_bytes())
+    }
+
+    /// Previous versions kept alive by the version chains
+    pub fn chain_entries(&self) -> usize {
+        let versions = self.versions.read().clone();
+        versions
+            .iter()
+            .map(|(_, chain)| count_chain_depth(chain).saturating_sub(1))
+            .sum()
+    }
+
     /// Check if a row_id exists in the committed version store (B-tree).
     /// Used during WAL replay to distinguish sealed INSERTs from post-seal UPDATEs.
     pub fn has_committed_row(&self, row_id: i64) -> bool {
