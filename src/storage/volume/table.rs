@@ -3924,13 +3924,19 @@ impl Table for SegmentedTable {
             return Ok(None);
         }
         // Without volumes the hot store answers alone, from its index or not
-        // at all. No seal fence here: a seal registers its volume before it
-        // removes a hot row, so a table seen without volumes still has every
-        // row hot, and a query must not wait out a seal.
+        // at all. No seal fence here, a query must not wait out a seal: a seal
+        // registers its volume before it removes a hot row, so an answer taken
+        // while the generation held saw every row hot; if a seal registered
+        // meanwhile, the path below reads hot and volumes together.
         if !self.segment_mgr.has_segments() {
-            return self
+            let generation = self.segment_mgr.seal_generation();
+            let answer = self
                 .hot
-                .scan_top_k(where_expr, column_name, ascending, limit, offset);
+                .scan_top_k(where_expr, column_name, ascending, limit, offset)?;
+            if self.segment_mgr.seal_generation() == generation && !self.segment_mgr.has_segments()
+            {
+                return Ok(answer);
+            }
         }
         let needed = limit.saturating_add(offset);
         if needed == 0 {

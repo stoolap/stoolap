@@ -130,7 +130,10 @@ pub struct MultiColumnIndex {
 
     /// Per prefix group, its rows ordered by the column after the prefix:
     /// built when a walk first asks for the group, kept up to date by single
-    /// adds and removes, dropped by a large batch and rebuilt on the next walk
+    /// adds and removes, dropped by a large batch and rebuilt on the next walk.
+    /// Writers touch it last, after the prefix indexes a build reads, and a
+    /// build holds its write lock from that read to the insert, so a row is
+    /// either in the group when it is built or added to it afterwards.
     walk_orders: RwLock<FxHashMap<CompositeKey, BTreeSet<(Value, i64)>>>,
 }
 
@@ -494,13 +497,6 @@ impl Index for MultiColumnIndex {
         drop(value_to_rows);
         drop(row_to_key);
 
-        if self.orders_built() {
-            if let Some(ref old_arc_values) = old_key_for_cleanup {
-                self.order_remove_arcs(old_arc_values, row_id);
-            }
-            self.order_insert(values, row_id);
-        }
-
         // Update BTree only if it was already built
         if btree_needs_update {
             let mut sorted_values = self.sorted_values.write();
@@ -558,6 +554,13 @@ impl Index for MultiColumnIndex {
             }
         }
 
+        if self.orders_built() {
+            if let Some(ref old_arc_values) = old_key_for_cleanup {
+                self.order_remove_arcs(old_arc_values, row_id);
+            }
+            self.order_insert(values, row_id);
+        }
+
         Ok(())
     }
 
@@ -594,10 +597,6 @@ impl Index for MultiColumnIndex {
             row_to_key.remove(row_id);
         }
 
-        if self.orders_built() {
-            self.order_remove(values, row_id);
-        }
-
         // Only update BTree if it was built (row_ids are sorted, use binary search)
         if self.btree_built.load(AtomicOrdering::Acquire) {
             let mut sorted_values = self.sorted_values.write();
@@ -626,6 +625,10 @@ impl Index for MultiColumnIndex {
                     }
                 }
             }
+        }
+
+        if self.orders_built() {
+            self.order_remove(values, row_id);
         }
 
         Ok(())
@@ -761,19 +764,6 @@ impl Index for MultiColumnIndex {
         drop(value_to_rows);
         drop(row_to_key);
 
-        if self.orders_built() {
-            if entries.len() >= Self::WALK_ORDER_BATCH_DROP {
-                self.walk_orders.write().clear();
-            } else {
-                for (row_id, existing_arc_values) in &updates_to_old_key {
-                    self.order_remove_arcs(existing_arc_values, *row_id);
-                }
-                for &(row_id, values) in entries {
-                    self.order_insert(values, row_id);
-                }
-            }
-        }
-
         // Update BTree only if it was already built
         if btree_needs_update {
             let mut sorted_values = self.sorted_values.write();
@@ -835,6 +825,19 @@ impl Index for MultiColumnIndex {
             }
         }
 
+        if self.orders_built() {
+            if entries.len() >= Self::WALK_ORDER_BATCH_DROP {
+                self.walk_orders.write().clear();
+            } else {
+                for (row_id, existing_arc_values) in &updates_to_old_key {
+                    self.order_remove_arcs(existing_arc_values, *row_id);
+                }
+                for &(row_id, values) in entries {
+                    self.order_insert(values, row_id);
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -869,16 +872,6 @@ impl Index for MultiColumnIndex {
             }
         }
 
-        if self.orders_built() {
-            if entries.len() >= Self::WALK_ORDER_BATCH_DROP {
-                self.walk_orders.write().clear();
-            } else {
-                for &(row_id, values) in entries {
-                    self.order_remove(values, row_id);
-                }
-            }
-        }
-
         // The sorted and prefix structures are subtracted one key at a time:
         // a removal per row is quadratic in the rows per key.
         if self.btree_built.load(AtomicOrdering::Acquire) {
@@ -906,6 +899,16 @@ impl Index for MultiColumnIndex {
                             prefix_index.remove(&key);
                         }
                     }
+                }
+            }
+        }
+
+        if self.orders_built() {
+            if entries.len() >= Self::WALK_ORDER_BATCH_DROP {
+                self.walk_orders.write().clear();
+            } else {
+                for &(row_id, values) in entries {
+                    self.order_remove(values, row_id);
                 }
             }
         }
@@ -1077,7 +1080,7 @@ impl Index for MultiColumnIndex {
         lower: Option<(&Value, bool)>,
         upper: Option<(&Value, bool)>,
         ascending: bool,
-        visit: &mut dyn FnMut(i64) -> bool,
+        visit: &mut dyn FnMut(i64, &Value) -> bool,
     ) -> bool {
         let walked = prefix.len();
         if self.closed.load(AtomicOrdering::Acquire)
@@ -1087,13 +1090,13 @@ impl Index for MultiColumnIndex {
             return false;
         }
         let group = CompositeKey(prefix.to_vec());
-        if !self.walk_orders.read().contains_key(&group) {
-            // Built under the row map's read lock, so a row added or removed
-            // meanwhile reaches the order after it is in place. The prefix
-            // index is built first: its build takes the same lock.
-            self.ensure_prefix_built(walked);
-            let row_to_key = self.row_to_key.read();
+        // The prefix index is built outside the row map's lock: its build
+        // takes that lock too
+        self.ensure_prefix_built(walked);
+        let mut orders = self.walk_orders.write();
+        if !orders.contains_key(&group) {
             let ids = self.get_row_ids_equal(prefix);
+            let row_to_key = self.row_to_key.read();
             let mut entries: Vec<(Value, i64)> = Vec::with_capacity(ids.len());
             for row_id in ids.iter() {
                 if let Some(key) = row_to_key.get(*row_id) {
@@ -1103,13 +1106,9 @@ impl Index for MultiColumnIndex {
                 }
             }
             entries.sort_unstable();
-            let order: BTreeSet<(Value, i64)> = entries.into_iter().collect();
-            self.walk_orders
-                .write()
-                .entry(group.clone())
-                .or_insert(order);
+            orders.insert(group.clone(), entries.into_iter().collect());
         }
-        let orders = self.walk_orders.read();
+        let orders = parking_lot::RwLockWriteGuard::downgrade(orders);
         let Some(order) = orders.get(&group) else {
             return true;
         };
@@ -1123,16 +1122,27 @@ impl Index for MultiColumnIndex {
             Some((value, false)) => Bound::Excluded((value.clone(), i64::MIN)),
             None => Bound::Unbounded,
         };
+        // Bounds that cross, or meet with one side open, hold nothing
+        if let (
+            Bound::Included(low) | Bound::Excluded(low),
+            Bound::Included(high) | Bound::Excluded(high),
+        ) = (&start, &end)
+        {
+            let open = matches!(start, Bound::Excluded(_)) || matches!(end, Bound::Excluded(_));
+            if low > high || (low == high && open) {
+                return true;
+            }
+        }
         let range = order.range((start, end));
         if ascending {
-            for (_, row_id) in range {
-                if !visit(*row_id) {
+            for (value, row_id) in range {
+                if !visit(*row_id, value) {
                     break;
                 }
             }
         } else {
-            for (_, row_id) in range.rev() {
-                if !visit(*row_id) {
+            for (value, row_id) in range.rev() {
+                if !visit(*row_id, value) {
                     break;
                 }
             }
@@ -1401,5 +1411,57 @@ mod tests {
         assert!(k1 < k2);
         assert!(k2 < k3);
         assert!(k1 < k3);
+    }
+
+    /// A group built while an add is between the row map and the prefix
+    /// index must still end up holding the added row: the add enters it
+    /// into the group once it gets to the orders, which come last
+    #[test]
+    fn test_walk_order_built_during_an_add_keeps_the_added_row() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let index = Arc::new(MultiColumnIndex::new(
+            "idx".into(),
+            "c".into(),
+            vec!["g".into(), "k".into(), "t".into()],
+            vec![0, 1, 2],
+            vec![DataType::Integer; 3],
+            false,
+            0,
+        ));
+        let row = |t: i64| vec![Value::Integer(1), Value::Integer(2), Value::Integer(t)];
+        index.add(&row(10), 1, 0).unwrap();
+        index.ensure_btree_built();
+        index.ensure_prefix_built(2);
+
+        // The writer stops before the prefix update while this range reader
+        // holds the sorted structure it updates first
+        let range_reader = index.sorted_values.read();
+        let writer_index = Arc::clone(&index);
+        let writer = std::thread::spawn(move || {
+            writer_index.add(&row(20), 2, 0).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while index.row_to_key.read().get(2).is_none() {
+            if Instant::now() > deadline {
+                drop(range_reader);
+                writer.join().unwrap();
+                panic!("the writer did not reach the row map");
+            }
+            std::thread::yield_now();
+        }
+        let prefix = [Value::Integer(1), Value::Integer(2)];
+        assert!(index.walk_prefix_ordered(&prefix, None, None, true, &mut |_, _| true));
+        drop(range_reader);
+        writer.join().unwrap();
+
+        let mut ordered = Vec::new();
+        assert!(
+            index.walk_prefix_ordered(&prefix, None, None, true, &mut |id, _| {
+                ordered.push(id);
+                true
+            })
+        );
+        assert_eq!(ordered, vec![1, 2]);
     }
 }

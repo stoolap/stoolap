@@ -3001,8 +3001,11 @@ impl Table for MVCCTable {
         if needed == 0 {
             return Ok(Some(RowVec::new()));
         }
-        // Rows this transaction wrote are not in the shared indexes yet
-        if self.txn_versions.read().unwrap().has_local_changes() {
+        // Rows this transaction wrote are not in the shared indexes yet, and
+        // a snapshot may see older versions than the keys the index holds
+        if self.txn_versions.read().unwrap().has_local_changes()
+            || self.version_store.needs_snapshot_isolation(self.txn_id)
+        {
             return Ok(None);
         }
         let Some(expr) = where_expr else {
@@ -3016,15 +3019,24 @@ impl Table for MVCCTable {
         }
         let schema = &self.cached_schema;
         let column_lower = column_name.to_lowercase();
-        let Some(column) = schema.columns.iter().find(|c| c.name_lower == column_lower) else {
+        let Some(col_idx) = schema
+            .columns
+            .iter()
+            .position(|c| c.name_lower == column_lower)
+        else {
             return Ok(None);
         };
+        let column = &schema.columns[col_idx];
         // NULL and NaN sort by rules the key order does not follow
         if column.nullable || column.data_type == DataType::Float {
             return Ok(None);
         }
 
         let mut rows = RowVec::with_capacity(needed.min(1024));
+        // A row whose visible order value differs from its key was changed
+        // between the index and the version this transaction sees: the walk
+        // order does not hold for it, and the full scan answers instead
+        let mut stale = false;
         let walked = plan.index.walk_prefix_ordered(
             &plan.prefix,
             plan.lower
@@ -3034,12 +3046,16 @@ impl Table for MVCCTable {
                 .as_ref()
                 .map(|(value, inclusive)| (value, *inclusive)),
             ascending,
-            &mut |row_id| {
+            &mut |row_id, key_value| {
                 if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
                     if !version.is_deleted() {
+                        let row = self.normalize_row_to_schema(version.data, schema);
+                        if row.get(col_idx) != Some(key_value) {
+                            stale = true;
+                            return false;
+                        }
                         // The index may be ahead of this transaction's view of
                         // the row, so the whole WHERE is checked on the row
-                        let row = self.normalize_row_to_schema(version.data, schema);
                         if expr.evaluate_fast(&row) {
                             rows.push((row_id, row));
                         }
@@ -3048,7 +3064,7 @@ impl Table for MVCCTable {
                 rows.len() < needed
             },
         );
-        if !walked {
+        if !walked || stale {
             return Ok(None);
         }
         Ok(Some(rows.into_iter().skip(offset).take(limit).collect()))

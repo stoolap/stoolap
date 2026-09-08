@@ -19,6 +19,11 @@
 //! same transaction, duplicate keys in a non-unique index, and hot rows
 //! mixed with sealed ones.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use stoolap::core::{Operator, Result, Row, Schema, Value};
+use stoolap::storage::expression::{ComparisonExpr, Expression};
+use stoolap::storage::traits::Engine;
 use stoolap::Database;
 
 fn ids(db: &Database, sql: &str) -> Vec<i64> {
@@ -255,4 +260,127 @@ fn test_top_k_over_hot_and_sealed_rows_of_one_key() {
     db.execute("INSERT INTO c (t, g, k, v) VALUES (1004, 'a', 'k3', 6)", ())
         .unwrap();
     check_shapes(&db);
+}
+
+#[test]
+fn test_hot_top_k_with_bounds_that_hold_nothing_is_empty() {
+    let db = Database::open("memory://hot_top_k_empty_bounds").unwrap();
+    fill(&db);
+    for where_clause in [
+        "WHERE g = 'a' AND k = 'k3' AND t > 100 AND t < 50",
+        "WHERE g = 'a' AND k = 'k3' AND t > 50 AND t < 50",
+        "WHERE g = 'a' AND k = 'k3' AND t >= 50 AND t < 50",
+        "WHERE g = 'a' AND k = 'k3' AND t > 50 AND t <= 50",
+    ] {
+        for desc in [true, false] {
+            check(&db, where_clause, desc, 3, 0);
+        }
+    }
+    check(
+        &db,
+        "WHERE g = 'a' AND k = 'k3' AND t >= 50 AND t <= 50",
+        true,
+        3,
+        0,
+    );
+}
+
+/// A snapshot sees the versions of its start; the index holds the keys of
+/// the latest commits, so the walk does not answer for it
+#[test]
+fn test_snapshot_orders_by_the_values_it_sees() {
+    let db = Database::open("memory://hot_top_k_snapshot").unwrap();
+    fill(&db);
+    let reader = db.clone();
+    reader
+        .execute("BEGIN TRANSACTION ISOLATION LEVEL SNAPSHOT", ())
+        .unwrap();
+    check(&reader, "WHERE g = 'a' AND k = 'k3'", true, 3, 0);
+    // The newest row of the series moves to the front of time
+    db.execute(
+        "UPDATE c SET t = 0 WHERE g = 'a' AND k = 'k3' AND t = 1000",
+        (),
+    )
+    .unwrap();
+    check(&reader, "WHERE g = 'a' AND k = 'k3'", true, 3, 0);
+    check(
+        &reader,
+        "WHERE g = 'a' AND k = 'k3' AND t > 900",
+        false,
+        3,
+        0,
+    );
+    reader.execute("ROLLBACK", ()).unwrap();
+    check(&db, "WHERE g = 'a' AND k = 'k3'", true, 3, 0);
+}
+
+/// Runs the first checkpoint from inside the WHERE, at the point where a
+/// concurrent seal can run: after the table saw no volumes, before the hot
+/// index is walked
+#[derive(Clone)]
+struct SealInsideWhere {
+    inner: ComparisonExpr,
+    db: Database,
+    fired: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for SealInsideWhere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SealInsideWhere")
+    }
+}
+
+impl Expression for SealInsideWhere {
+    fn evaluate(&self, row: &Row) -> Result<bool> {
+        self.inner.evaluate(row)
+    }
+    fn evaluate_fast(&self, row: &Row) -> bool {
+        self.inner.evaluate_fast(row)
+    }
+    fn with_aliases(&self, _: &rustc_hash::FxHashMap<String, String>) -> Box<dyn Expression> {
+        self.clone_box()
+    }
+    fn prepare_for_schema(&mut self, schema: &Schema) {
+        self.inner.prepare_for_schema(schema);
+    }
+    fn is_prepared(&self) -> bool {
+        self.inner.is_prepared()
+    }
+    fn clone_box(&self) -> Box<dyn Expression> {
+        Box::new(self.clone())
+    }
+    fn get_comparison_info(&self) -> Option<(&str, Operator, &Value)> {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            self.db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        self.inner.get_comparison_info()
+    }
+}
+
+#[test]
+fn test_first_seal_during_the_hot_top_k_keeps_the_series() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}/seal", dir.path().display());
+    let db = Database::open(&dsn).unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, k TEXT NOT NULL, t INTEGER NOT NULL, UNIQUE(k, t))",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO c VALUES (1, 'a', 100), (2, 'a', 50)", ())
+        .unwrap();
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let table = tx.get_table("c").unwrap();
+    let fired = Arc::new(AtomicBool::new(false));
+    let mut expr = SealInsideWhere {
+        inner: ComparisonExpr::new("k", Operator::Eq, Value::text("a")),
+        db: db.clone(),
+        fired: Arc::clone(&fired),
+    };
+    expr.prepare_for_schema(table.schema());
+    let answer = table.scan_top_k(Some(&expr), "t", false, 1, 0).unwrap();
+    assert!(fired.load(Ordering::SeqCst));
+    let got: Option<Vec<i64>> = answer.map(|rows| rows.into_iter().map(|(id, _)| id).collect());
+    assert_eq!(got, Some(vec![1]));
+    tx.rollback().unwrap();
 }
