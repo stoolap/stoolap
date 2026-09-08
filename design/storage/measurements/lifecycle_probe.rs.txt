@@ -1,0 +1,593 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Temporary, deterministic storage lifecycle probe. JSON Lines on stdout.
+//! cargo run --release --example storage_lifecycle_probe -- --rows 20000
+//!     --payload-size 64 --iterations 200 --seed 42 [--concurrent]
+//!
+//! This instruments requested live heap bytes, not RSS or allocator internals.
+//! Allocation snapshots are process-wide, including storage background threads.
+//! Timed phases exclude fixture construction, preparation, correctness queries,
+//! latency sorting and JSON rendering. Individual operations include API costs.
+//! Reopen first touch does NOT imply an empty operating-system file cache.
+
+use serde_json::{json, Value as Json};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::time::Instant;
+use stoolap::{Database, Value};
+
+type ProbeResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Clone, Copy, Default)]
+struct Counts {
+    alloc: u64,
+    zeroed: u64,
+    realloc: u64,
+    dealloc: u64,
+    requested: u64,
+    released: u64,
+    live: u64,
+    peak: u64,
+}
+
+struct Meter {
+    locked: AtomicBool,
+    counts: UnsafeCell<Counts>,
+}
+
+// Access to counts is serialized by the non-allocating lock below.
+unsafe impl Sync for Meter {}
+
+static METER: Meter = Meter {
+    locked: AtomicBool::new(false),
+    counts: UnsafeCell::new(Counts {
+        alloc: 0,
+        zeroed: 0,
+        realloc: 0,
+        dealloc: 0,
+        requested: 0,
+        released: 0,
+        live: 0,
+        peak: 0,
+    }),
+};
+
+impl Meter {
+    fn with<T>(&self, f: impl FnOnce(&mut Counts) -> T) -> T {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            std::hint::spin_loop();
+        }
+        // No callback here allocates, blocks, recurses into the allocator or panics.
+        let result = f(unsafe { &mut *self.counts.get() });
+        self.locked.store(false, Ordering::Release);
+        result
+    }
+
+    fn start(&self) -> Counts {
+        self.with(|c| {
+            c.peak = c.live;
+            *c
+        })
+    }
+
+    fn snapshot(&self) -> Counts {
+        self.with(|c| *c)
+    }
+}
+
+struct CountingSystem;
+
+#[global_allocator]
+static ALLOCATOR: CountingSystem = CountingSystem;
+
+unsafe impl GlobalAlloc for CountingSystem {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc(layout) };
+        METER.with(|c| {
+            c.alloc += 1;
+            if !ptr.is_null() {
+                c.requested += layout.size() as u64;
+                c.live += layout.size() as u64;
+                c.peak = c.peak.max(c.live);
+            }
+        });
+        ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        let ptr = unsafe { System.alloc_zeroed(layout) };
+        METER.with(|c| {
+            c.zeroed += 1;
+            if !ptr.is_null() {
+                c.requested += layout.size() as u64;
+                c.live += layout.size() as u64;
+                c.peak = c.peak.max(c.live);
+            }
+        });
+        ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { System.dealloc(ptr, layout) };
+        METER.with(|c| {
+            c.dealloc += 1;
+            c.released += layout.size() as u64;
+            c.live -= layout.size() as u64;
+        });
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let next = unsafe { System.realloc(ptr, layout, new_size) };
+        METER.with(|c| {
+            c.realloc += 1;
+            // Failed realloc retains the old allocation. Successful realloc
+            // replaces its requested size; counting it as another alloc leaks
+            // the old size in live-byte accounting.
+            if !next.is_null() {
+                c.requested += new_size as u64;
+                c.released += layout.size() as u64;
+                c.live = c.live - layout.size() as u64 + new_size as u64;
+                c.peak = c.peak.max(c.live);
+            }
+        });
+        next
+    }
+}
+
+fn check_allocator() {
+    // Before any database/background threads exist, verify that growth,
+    // shrinkage, zeroed allocation and release balance exactly.
+    let before = METER.snapshot();
+    unsafe {
+        let original = Layout::from_size_align(128, 8).unwrap();
+        let mut ptr = ALLOCATOR.alloc(original);
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(original);
+        }
+        let zeroed_layout = Layout::from_size_align(64, 8).unwrap();
+        let zeroed = ALLOCATOR.alloc_zeroed(zeroed_layout);
+        if zeroed.is_null() {
+            std::alloc::handle_alloc_error(zeroed_layout);
+        }
+        assert!(std::slice::from_raw_parts(zeroed, 64)
+            .iter()
+            .all(|&b| b == 0));
+        ptr = ALLOCATOR.realloc(ptr, original, 512);
+        let grown = Layout::from_size_align(512, 8).unwrap();
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(grown);
+        }
+        ptr = ALLOCATOR.realloc(ptr, grown, 32);
+        let shrunk = Layout::from_size_align(32, 8).unwrap();
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(shrunk);
+        }
+        ALLOCATOR.dealloc(ptr, shrunk);
+        ALLOCATOR.dealloc(zeroed, zeroed_layout);
+    }
+    let after = METER.snapshot();
+    assert_eq!(after.live, before.live);
+    assert_eq!(after.alloc - before.alloc, 1);
+    assert_eq!(after.zeroed - before.zeroed, 1);
+    assert_eq!(after.realloc - before.realloc, 2);
+    assert_eq!(after.dealloc - before.dealloc, 2);
+    assert_eq!(after.requested - before.requested, 736);
+    assert_eq!(after.released - before.released, 736);
+}
+
+#[derive(serde::Serialize)]
+struct Config {
+    rows: usize,
+    payload_size: usize,
+    iterations: usize,
+    seed: u64,
+    concurrent: bool,
+    group_cache_mb: usize,
+}
+
+fn config() -> ProbeResult<Config> {
+    let mut config = Config {
+        rows: 20_000,
+        payload_size: 64,
+        iterations: 200,
+        seed: 42,
+        concurrent: false,
+        group_cache_mb: 64,
+    };
+    let mut args = std::env::args().skip(1);
+    while let Some(flag) = args.next() {
+        if flag == "--concurrent" {
+            config.concurrent = true;
+            continue;
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| format!("missing value for {flag}"))?;
+        match flag.as_str() {
+            "--rows" => config.rows = value.parse()?,
+            "--payload-size" => config.payload_size = value.parse()?,
+            "--iterations" => config.iterations = value.parse()?,
+            "--seed" => config.seed = value.parse()?,
+            "--group-cache-mb" => config.group_cache_mb = value.parse()?,
+            _ => return Err(format!("unknown option {flag}").into()),
+        }
+    }
+    if config.rows < 32
+        || config.iterations == 0
+        || config
+            .rows
+            .saturating_add(config.iterations.saturating_mul(2))
+            > i32::MAX as usize
+    {
+        return Err("rows must be >=32, iterations >0, and total rows <=i32::MAX".into());
+    }
+    Ok(config)
+}
+
+fn emit(value: Json) {
+    println!("{value}");
+}
+
+fn allocation_json(before: Counts, after: Counts) -> Json {
+    json!({
+        "alloc_calls": after.alloc - before.alloc,
+        "alloc_zeroed_calls": after.zeroed - before.zeroed,
+        "realloc_calls": after.realloc - before.realloc,
+        "dealloc_calls": after.dealloc - before.dealloc,
+        "requested_bytes": after.requested - before.requested,
+        "released_bytes": after.released - before.released,
+        "live_before_bytes": before.live,
+        "live_after_bytes": after.live,
+        "retained_delta_bytes": after.live as i128 - before.live as i128,
+        "peak_live_bytes": after.peak,
+        "peak_extra_bytes": after.peak.saturating_sub(before.live),
+    })
+}
+
+fn measure(
+    name: &str,
+    iterations: usize,
+    mut action: impl FnMut(usize) -> ProbeResult<()>,
+) -> ProbeResult<()> {
+    let mut latency = Vec::with_capacity(iterations);
+    let before = METER.start();
+    let start = Instant::now();
+    for i in 0..iterations {
+        let op_start = Instant::now();
+        action(i)?;
+        latency.push(op_start.elapsed().as_nanos() as u64);
+    }
+    let elapsed = start.elapsed();
+    let after = METER.snapshot();
+    latency.sort_unstable();
+    let percentile = |p: usize| {
+        latency[(iterations * p)
+            .div_ceil(100)
+            .saturating_sub(1)
+            .min(iterations - 1)]
+    };
+    emit(
+        json!({"type":"phase", "phase":name, "operations":iterations,
+        "elapsed_ns":elapsed.as_nanos(), "p50_ns":percentile(50), "p95_ns":percentile(95),
+        "p99_ns":percentile(99), "max_ns":latency[iterations - 1], "allocator":allocation_json(before, after)}),
+    );
+    Ok(())
+}
+
+fn memory_stats(db: &Database, label: &str) -> ProbeResult<()> {
+    let mut tables = Vec::new();
+    for row in db.query("PRAGMA MEMORY_STATS", ())? {
+        let row = row?;
+        tables.push(
+            json!({"table":row.get::<String>(0)?, "hot_rows":row.get::<i64>(1)?,
+            "hot_bytes":row.get::<i64>(2)?, "arena_slots":row.get::<i64>(3)?,
+            "arena_capacity_bytes":row.get::<i64>(4)?, "chain_entries":row.get::<i64>(5)?,
+            "volume_bytes":row.get::<i64>(6)?, "admission_waits":row.get::<i64>(7)?}),
+        );
+    }
+    emit(json!({"type":"memory_stats", "label":label, "tables":tables}));
+    Ok(())
+}
+
+fn random(state: &mut u64) -> u64 {
+    // A nonzero deterministic stream even for seed=0.
+    *state = state.wrapping_add(0x9e3779b97f4a7c15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
+}
+
+fn payload(id: usize, size: usize, seed: u64) -> String {
+    let mut state = seed ^ id as u64;
+    (0..size)
+        .map(|_| (b'a' + (random(&mut state) % 26) as u8) as char)
+        .collect()
+}
+
+const INSERT: &str =
+    "INSERT INTO candles (id,tick,exchange,symbol,price,payload) VALUES ($1,$2,$3,$4,$5,$6)";
+const AGGREGATE: &str = "SELECT SUM(price) FROM candles WHERE exchange = 'e0' AND symbol = 's00'";
+
+fn row_params(id: usize, config: &Config) -> Vec<Value> {
+    vec![
+        Value::Integer(id as i64),
+        Value::Integer(id as i64),
+        Value::text(format!("e{}", id % 2)),
+        Value::text(format!("s{:02}", id % 32)),
+        Value::Integer((id % 1000) as i64),
+        Value::text(payload(id, config.payload_size, config.seed)),
+    ]
+}
+
+fn expected_pair(prices: &[i64]) -> i64 {
+    prices
+        .iter()
+        .enumerate()
+        .filter(|(id, _)| *id > 0 && id % 32 == 0)
+        .map(|(_, value)| *value)
+        .sum()
+}
+
+fn verify(db: &Database, prices: &[i64]) -> ProbeResult<()> {
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT COUNT(*) FROM candles", ())?,
+        (prices.len() - 1) as i64
+    );
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT SUM(price) FROM candles", ())?,
+        prices.iter().sum::<i64>()
+    );
+    assert_eq!(
+        db.query_one::<i64, _>(AGGREGATE, ())?,
+        expected_pair(prices)
+    );
+    Ok(())
+}
+
+fn concurrent(db: &Database, config: &Config, prices: &mut Vec<i64>) -> ProbeResult<()> {
+    let first = prices.len();
+    let params: Vec<_> = (first..first + config.iterations)
+        .map(|id| row_params(id, config))
+        .collect();
+    let reader_db = db.clone();
+    let writer_db = db.clone();
+    let reader = reader_db.prepare(AGGREGATE)?;
+    let writer = writer_db.prepare(INSERT)?;
+    let barrier = Arc::new(Barrier::new(3));
+    let initial_sum = expected_pair(prices);
+    let final_sum = initial_sum
+        + (first..first + config.iterations)
+            .filter(|id| id % 32 == 0)
+            .map(|id| (id % 1000) as i64)
+            .sum::<i64>();
+    let iterations = config.iterations;
+    let mut writer_latency = Vec::with_capacity(iterations);
+    let mut reader_latency = Vec::with_capacity(iterations);
+    std::thread::scope(|scope| -> ProbeResult<()> {
+        let reader_barrier = Arc::clone(&barrier);
+        let read = scope.spawn(move || -> ProbeResult<Vec<u64>> {
+            reader_barrier.wait();
+            for _ in 0..iterations {
+                let start = Instant::now();
+                let sum = reader.query_one::<i64, _>(())?;
+                reader_latency.push(start.elapsed().as_nanos() as u64);
+                assert!((initial_sum..=final_sum).contains(&sum));
+            }
+            // Worker teardown is included in the process-wide allocation
+            // sample, but excluded from the individual operation timings.
+            std::hint::black_box(&reader_db);
+            Ok(reader_latency)
+        });
+        let writer_barrier = Arc::clone(&barrier);
+        let write = scope.spawn(move || -> ProbeResult<Vec<u64>> {
+            writer_barrier.wait();
+            for row in params {
+                let start = Instant::now();
+                assert_eq!(writer.execute(row.as_slice())?, 1);
+                writer_latency.push(start.elapsed().as_nanos() as u64);
+            }
+            std::hint::black_box(&writer_db);
+            Ok(writer_latency)
+        });
+        let before = METER.start();
+        let started = Instant::now();
+        barrier.wait();
+        let mut writer_latency = write.join().expect("writer panicked")?;
+        let mut reader_latency = read.join().expect("reader panicked")?;
+        let elapsed = started.elapsed();
+        let after = METER.snapshot();
+        writer_latency.sort_unstable();
+        reader_latency.sort_unstable();
+        let summary = |latency: &[u64]| {
+            json!({"operations":iterations,
+            "p50_ns":latency[(iterations * 50).div_ceil(100) - 1],
+            "p95_ns":latency[(iterations * 95).div_ceil(100) - 1],
+            "p99_ns":latency[(iterations * 99).div_ceil(100) - 1], "max_ns":latency[iterations - 1]})
+        };
+        emit(
+            json!({"type":"phase", "phase":"concurrent_ingest_and_aggregate", "elapsed_ns":elapsed.as_nanos(),
+            "writer":summary(&writer_latency), "reader":summary(&reader_latency), "allocator":allocation_json(before, after),
+            "allocation_scope":"both workers including worker teardown; not per-statement attribution"}),
+        );
+        Ok(())
+    })?;
+    prices.extend((first..first + iterations).map(|id| (id % 1000) as i64));
+    verify(db, prices)?;
+    Ok(())
+}
+
+fn run() -> ProbeResult<()> {
+    check_allocator();
+    let config = config()?;
+    emit(
+        json!({"type":"config", "probe_version":1, "parameters":config,
+        "allocator":"instrumented System; requested heap bytes, not RSS; serialization outside phases",
+        "storage":"file; sync_mode=none; background checkpoint=3600s; automatic hot triggers disabled",
+        "first_touch":"reopened engine, decoded group cache cleared; OS file cache uncontrolled"}),
+    );
+    let temp = tempfile::tempdir()?;
+    let dsn = format!(
+        "file://{}?sync_mode=none&checkpoint_interval=3600&hot_max_rows=0&hot_max_bytes=0",
+        temp.path().display()
+    );
+    let db = Database::open(&dsn)?;
+    db.execute(
+        &format!("PRAGMA GROUP_CACHE_MB = {}", config.group_cache_mb),
+        (),
+    )?;
+    db.execute("CREATE TABLE candles (id INTEGER PRIMARY KEY, tick INTEGER NOT NULL, exchange TEXT NOT NULL, symbol TEXT NOT NULL, price INTEGER NOT NULL, payload TEXT NOT NULL, UNIQUE(exchange,symbol,tick))", ())?;
+
+    // SQL fixture generation and all setup ingestion are deliberately untimed.
+    for first in (1..=config.rows).step_by(256) {
+        let end = (first + 256).min(config.rows + 1);
+        let values: Vec<_> = (first..end)
+            .map(|id| {
+                format!(
+                    "({id},{id},'e{}','s{:02}',{},'{}')",
+                    id % 2,
+                    id % 32,
+                    id % 1000,
+                    payload(id, config.payload_size, config.seed)
+                )
+            })
+            .collect();
+        assert_eq!(
+            db.execute(
+                &format!("INSERT INTO candles VALUES {}", values.join(",")),
+                ()
+            )?,
+            (end - first) as i64
+        );
+    }
+    let mut prices: Vec<i64> = (0..=config.rows).map(|id| (id % 1000) as i64).collect();
+    verify(&db, &prices)?;
+    memory_stats(&db, "setup_hot")?;
+
+    let select = db.prepare("SELECT price FROM candles WHERE id = $1")?;
+    let mut state = config.seed;
+    let ids: Vec<usize> = (0..config.iterations)
+        .map(|_| random(&mut state) as usize % config.rows + 1)
+        .collect();
+    for &id in ids.iter().take(10) {
+        assert_eq!(select.query_one::<i64, _>((id as i64,))?, prices[id]);
+    }
+    measure("hot_pk_lookup", config.iterations, |i| {
+        assert_eq!(
+            select.query_one::<i64, _>((ids[i] as i64,))?,
+            prices[ids[i]]
+        );
+        Ok(())
+    })?;
+    let update = db.prepare("UPDATE candles SET price = price + 1 WHERE id = $1")?;
+    measure("hot_update", config.iterations, |i| {
+        assert_eq!(update.execute((ids[i] as i64,))?, 1);
+        prices[ids[i]] += 1;
+        Ok(())
+    })?;
+    let inserted: Vec<_> = (config.rows + 1..=config.rows + config.iterations)
+        .map(|id| row_params(id, &config))
+        .collect();
+    let insert = db.prepare(INSERT)?;
+    measure("hot_insert", config.iterations, |i| {
+        assert_eq!(insert.execute(inserted[i].as_slice())?, 1);
+        Ok(())
+    })?;
+    prices.extend((config.rows + 1..=config.rows + config.iterations).map(|id| (id % 1000) as i64));
+    verify(&db, &prices)?;
+    drop((select, update, insert, inserted));
+    memory_stats(&db, "before_forced_checkpoint")?;
+    measure("forced_checkpoint", 1, |_| {
+        db.execute("PRAGMA CHECKPOINT", ())?;
+        Ok(())
+    })?;
+    memory_stats(&db, "after_forced_checkpoint")?;
+    verify(&db, &prices)?;
+
+    db.close()?;
+    drop(db);
+    let mut reopened = None;
+    measure("reopen", 1, |_| {
+        reopened = Some(Database::open(&dsn)?);
+        Ok(())
+    })?;
+    let db = reopened.expect("reopened database");
+    // Empty the process-global decoded cache explicitly. This does not flush
+    // the operating-system cache or imply physically cold disk reads.
+    db.execute("PRAGMA GROUP_CACHE_MB = 0", ())?;
+    db.execute(
+        &format!("PRAGMA GROUP_CACHE_MB = {}", config.group_cache_mb),
+        (),
+    )?;
+    let aggregate = db.prepare(AGGREGATE)?;
+    let expected = expected_pair(&prices);
+    measure("aggregate_first_touch_after_reopen", 1, |_| {
+        assert_eq!(aggregate.query_one::<i64, _>(())?, expected);
+        Ok(())
+    })?;
+    // Warm CPU/dispatch as well as column residency before comparing short
+    // queries. Keep at least 10,000 measured queries, independently of DML count.
+    for _ in 0..1_000 {
+        assert_eq!(aggregate.query_one::<i64, _>(())?, expected);
+    }
+    measure(
+        "aggregate_warm_repeat",
+        config.iterations.max(10_000),
+        |_| {
+            assert_eq!(aggregate.query_one::<i64, _>(())?, expected);
+            Ok(())
+        },
+    )?;
+    drop(aggregate);
+    let select = db.prepare("SELECT price FROM candles WHERE id = $1")?;
+    measure("sealed_pk_lookup", config.iterations, |i| {
+        assert_eq!(
+            select.query_one::<i64, _>((ids[i] as i64,))?,
+            prices[ids[i]]
+        );
+        Ok(())
+    })?;
+    drop(select);
+    memory_stats(&db, "after_aggregate")?;
+    verify(&db, &prices)?;
+    if config.concurrent {
+        concurrent(&db, &config, &mut prices)?;
+    }
+    db.close()?;
+    drop(db);
+    // Reopen and verify persisted values, including concurrent inserts.
+    let db = Database::open(&dsn)?;
+    verify(&db, &prices)?;
+    db.close()?;
+    emit(
+        json!({"type":"correctness", "status":"passed", "rows":prices.len() - 1,
+        "sum":prices.iter().sum::<i64>(), "pair_sum":expected_pair(&prices),
+        "checks":["hot PK values", "affected row counts", "row count", "sum", "pair sum", "reopen persistence"]}),
+    );
+    Ok(())
+}
+
+fn main() {
+    if let Err(error) = run() {
+        emit(json!({"type":"error", "message":error.to_string()}));
+        std::process::exit(1);
+    }
+}

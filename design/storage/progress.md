@@ -7,7 +7,7 @@ independently reviewable without claiming unmerged work is shipped.
 | Phase | Deliverable | Status | Review | PR |
 |---|---|---|---|---|
 | 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
-| 1 | Fallible access and complete statement rollback | Final performance gate in progress | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) (draft) |
+| 1 | Fallible access and complete statement rollback | Implemented; local gates passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
 | 2 | Chunked arena and retained-hot accounting | Pending | Pending | — |
 | 3 | Coherent two-layer execution | Pending | Pending | — |
 | 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
@@ -62,7 +62,7 @@ installation, and correlated-query error swallowing. Regression tests retain
 those cases. The default test targets completed across the full-suite run and
 its continuation; the corruption fixture was corrected to damage the encoded
 block while retaining a valid directory length, then passed. Final default
-unit tests: 2,050 passed. Serial feature-enabled volume tests: 69 passed.
+unit tests: 2,050 passed. Serial feature-enabled volume tests: 71 passed after the final filter change.
 Clippy (all targets, test-failpoints and FFI), no-default compilation and the
 five enabled doctests passed. Failpoint unit tests are feature-gated and run
 serially, including coverage, so injections cannot hit unrelated unit tests.
@@ -73,5 +73,18 @@ transaction maps surviving terminal publication because clear bypassed the
 existing drain/shrink policy. Aggregate inputs now bind once on the first
 matching row; terminal map drainage restores the existing pool policy after
 undo is no longer needed. A capacity regression covers commit and abort.
-Final performance acceptance and PR publication are pending the repeated
-comparison and final review.
+A profiled dictionary filter now tests eight leading IDs at a time and uses
+an exact full-mask path for dense matches. Checked windows cover both IDs and
+NULL flags before any output is appended. Independent review and exhaustive
+mask/offset/partial-block tests passed.
+
+Final five-pair measurements passed the acceptance gate. Warm aggregate p50
+changed by +0.59% on narrow rows and +2.73% on wide rows. INSERT allocations
+fell 15.9%; UPDATE allocations fell 11.75–12.10%. The short narrow INSERT p50
+was +6.07% (124 ns), below twice its run range; a longer, otherwise matched
+10,000-operation comparison measured +4.15% p50 and +4.19% total time. Wide
+INSERT p50 was unchanged. Retained and peak requested heap bytes stayed near
+baseline. No hard memory bound or competitor claim follows from this probe.
+The exact fixture, source digest, medians, ranges and limitations are recorded
+in [measurements](measurements/README.md). Clippy with FFI and failpoints,
+no-default compilation and final targeted tests passed.
