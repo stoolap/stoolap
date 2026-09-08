@@ -106,7 +106,9 @@ jobs:
       run: cargo test --test differential_oracle_test --features sqlite
 
     - name: Volume reader unit tests with failpoints
-      run: cargo test --lib --features test-failpoints storage::volume:: -- --test-threads=1
+      run: >-
+        cargo test --lib --features test-failpoints storage::volume::
+        -- --test-threads=1
 
     - name: Failpoint I/O tests
       run: >-

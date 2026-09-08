@@ -7,7 +7,7 @@ independently reviewable without claiming unmerged work is shipped.
 | Phase | Deliverable | Status | Review | PR |
 |---|---|---|---|---|
 | 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
-| 1 | Fallible access and complete statement rollback | Implementing and validating | Independent review in progress | — |
+| 1 | Fallible access and complete statement rollback | Final performance gate in progress | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) (draft) |
 | 2 | Chunked arena and retained-hot accounting | Pending | Pending | — |
 | 3 | Coherent two-layer execution | Pending | Pending | — |
 | 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
