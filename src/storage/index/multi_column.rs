@@ -356,25 +356,6 @@ impl MultiColumnIndex {
         grouped
     }
 
-    /// Remove the sorted `ids` from the sorted `rows`, touching only the rows
-    /// from the first removed id onwards: taking the newest rows off a large
-    /// group stays cheap, taking the whole group is one pass.
-    fn subtract_sorted(rows: &mut CompactVec<i64>, ids: &[i64]) {
-        let Some(&first) = ids.first() else {
-            return;
-        };
-        let start = rows.binary_search(&first).unwrap_or_else(|pos| pos);
-        let slice = rows.as_mut_slice();
-        let mut keep = start;
-        for read in start..slice.len() {
-            if ids.binary_search(&slice[read]).is_err() {
-                slice[keep] = slice[read];
-                keep += 1;
-            }
-        }
-        rows.truncate(keep);
-    }
-
     /// Check uniqueness constraint (must be called while holding write lock on value_to_rows)
     fn check_unique_constraint_locked(
         &self,
@@ -860,7 +841,7 @@ impl Index for MultiColumnIndex {
 
             for (key, ids) in removed {
                 if let Some(rows) = value_to_rows.get_mut(&key) {
-                    Self::subtract_sorted(rows, &ids);
+                    super::subtract_sorted(rows, &ids);
                     if rows.is_empty() {
                         value_to_rows.remove(&key);
                     }
@@ -878,7 +859,7 @@ impl Index for MultiColumnIndex {
             let mut sorted_values = self.sorted_values.write();
             for (key, ids) in removed {
                 if let Some(rows) = sorted_values.get_mut(&key) {
-                    Self::subtract_sorted(rows, &ids);
+                    super::subtract_sorted(rows, &ids);
                     if rows.is_empty() {
                         sorted_values.remove(&key);
                     }
@@ -893,7 +874,7 @@ impl Index for MultiColumnIndex {
                 let mut prefix_index = self.prefix_indexes[idx].write();
                 for (key, ids) in removed {
                     if let Some(rows) = prefix_index.get_mut(&key) {
-                        Self::subtract_sorted(rows, &ids);
+                        super::subtract_sorted(rows, &ids);
                         if rows.is_empty() {
                             prefix_index.remove(&key);
                         }

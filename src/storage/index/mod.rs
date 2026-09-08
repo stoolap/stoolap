@@ -30,6 +30,25 @@ pub mod hnsw;
 pub mod multi_column;
 pub mod pk;
 
+/// Removes the sorted `ids` from the sorted `rows`, touching only the rows
+/// from the first removed id onwards: taking the newest rows off a large
+/// group stays cheap, taking the whole group is one pass.
+pub(crate) fn subtract_sorted(rows: &mut crate::common::CompactVec<i64>, ids: &[i64]) {
+    let Some(&first) = ids.first() else {
+        return;
+    };
+    let start = rows.binary_search(&first).unwrap_or_else(|pos| pos);
+    let slice = rows.as_mut_slice();
+    let mut keep = start;
+    for read in start..slice.len() {
+        if ids.binary_search(&slice[read]).is_err() {
+            slice[keep] = slice[read];
+            keep += 1;
+        }
+    }
+    rows.truncate(keep);
+}
+
 // Re-export main types
 pub use bitmap::BitmapIndex;
 pub use btree::{

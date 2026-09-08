@@ -576,7 +576,7 @@ impl Index for HashIndex {
             ids.sort_unstable();
             if let Some(val_entries) = hash_to_values.get_mut(&hash) {
                 for (_, bucket) in val_entries.iter_mut() {
-                    bucket.retain(|id| ids.binary_search(id).is_err());
+                    super::subtract_sorted(bucket, &ids);
                 }
                 val_entries.retain(|(_, bucket)| !bucket.is_empty());
                 if val_entries.is_empty() {

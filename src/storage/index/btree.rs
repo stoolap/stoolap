@@ -116,8 +116,8 @@ pub struct BTreeIndex {
 }
 
 impl BTreeIndex {
-    /// Removes `row_ids` (sorted) grouped by key: one linear pass per key
-    /// instead of a shift of the key's row list per row
+    /// Removes `row_ids` (sorted) grouped by key: one pass per key from its
+    /// first removed id instead of a shift of the key's row list per row
     fn remove_sorted_ids(&self, row_ids: &[i64]) -> Result<()> {
         if row_ids.is_empty() {
             return Ok(());
@@ -137,7 +137,7 @@ impl BTreeIndex {
         for (arc_value, ids) in by_key {
             if let Some(rows) = sorted_values.get_mut(&arc_value) {
                 let before = rows.len();
-                rows.retain(|id| ids.binary_search(id).is_err());
+                super::subtract_sorted(rows, &ids);
                 any_removed |= rows.len() != before;
                 if rows.is_empty() {
                     sorted_values.remove(&arc_value);
