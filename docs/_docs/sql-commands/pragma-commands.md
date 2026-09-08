@@ -47,6 +47,16 @@ Stoolap currently supports the following PRAGMA commands:
 | `wal_flush_trigger` | Read current WAL flush trigger (read-only, set via DSN) | 32768 |
 | `volume_stats` | Show per-volume storage statistics | - |
 
+### Memory and Hot Store
+
+| PRAGMA | Description | Default |
+|--------|-------------|---------|
+| `hot_max_rows` | Committed hot rows per table that request an early seal (0 = off) | 262144 |
+| `hot_max_bytes` | Hot row bytes per table above which commits wait for a seal (0 = off) | 0 |
+| `group_cache_mb` | Budget of the decoded row group cache in MB (0 = bypass) | 64 |
+| `group_cache_stats` | Show the decoded row group cache's budget, size and hit counts | - |
+| `memory_stats` | Show per-table hot and cold memory figures | - |
+
 #### checkpoint_interval
 
 Controls how often the background checkpoint cycle runs (in seconds). The checkpoint seals hot buffer rows into immutable cold volumes, persists manifests, and truncates the WAL. Default: 60.
@@ -116,6 +126,62 @@ Controls the target number of rows per cold volume. Compaction splits output int
 ```sql
 PRAGMA target_volume_rows = 1048576;
 PRAGMA target_volume_rows;          -- read current value
+```
+
+#### hot_max_rows
+
+A commit that takes a table's committed hot rows past this value asks for a seal right away. The checkpoint thread runs the seal cycle on its next tick (within 100 ms) instead of waiting for `checkpoint_interval`, and the seal's own row thresholds are bounded by the same value. The trigger keeps the hot store of a bulk load bounded at the cost of running the seal more often during the load. 0 turns it off. Default: 262,144 (four row groups).
+
+```sql
+PRAGMA hot_max_rows = 262144;
+PRAGMA hot_max_rows = 0;            -- seal only at the checkpoint interval
+PRAGMA hot_max_rows;                -- read current value
+```
+
+#### hot_max_bytes
+
+When a table holds at least this many hot row bytes, a commit that writes to it requests a seal and waits, before it takes the seal fence, until the seal brings the table back under the limit. The wait is bounded at 10 seconds and counted (see `memory_stats`). A transaction that updates or deletes existing hot rows does not wait, since the seal skips rows it has claimed. In-memory databases never wait because nothing can seal. 0 turns the wait off. Default: 0.
+
+```sql
+PRAGMA hot_max_bytes = 268435456;   -- 256 MB per table
+PRAGMA hot_max_bytes;               -- read current value
+```
+
+#### group_cache_mb
+
+Sets the budget of the decoded row group cache shared by all cold volumes in the process. Queries over warm volumes decode the row groups they need from the in-memory compressed blocks; the cache keeps decoded groups so repeated queries do not decode them again. When a workload's groups exceed the budget, every query decodes again: a `SELECT` that scans a few million warm rows with several projected columns needs a few hundred MB. Raising the budget trades memory for repeat query time; 0 bypasses the cache. Default: 64.
+
+```sql
+PRAGMA group_cache_mb = 512;
+PRAGMA group_cache_mb;              -- read current value in MB
+```
+
+#### group_cache_stats
+
+Returns one row with the cache's budget, current size, entry count and hit and miss counters since the process started.
+
+```sql
+PRAGMA group_cache_stats;
+-- budget_bytes | bytes | entries | hits | misses
+```
+
+#### memory_stats
+
+Returns one row per table and a final `*` row with the totals.
+
+| Column | Meaning |
+|--------|---------|
+| `table_name` | Table, or `*` for the totals |
+| `hot_rows` | Committed rows in the hot store |
+| `hot_bytes` | Bytes of the rows the hot arena holds, heap text and extension payloads included |
+| `arena_slots` | Arena slots in use, deleted and cleared ones included |
+| `arena_capacity_bytes` | Bytes the arena's slot vectors reserve |
+| `chain_entries` | Previous row versions kept alive by version chains |
+| `volume_bytes` | Memory of the table's loaded cold volumes |
+| `admission_waits` | On the `*` row: commits that waited for a seal under `hot_max_bytes` |
+
+```sql
+PRAGMA memory_stats;
 ```
 
 ### Manual Snapshot and Checkpoint Control
@@ -235,8 +301,10 @@ PRAGMA vacuum;
 All PRAGMA values can also be set via the connection string:
 
 ```
-file:///path/to/db?checkpoint_interval=60&compact_threshold=4&keep_snapshots=3&sync_mode=normal
+file:///path/to/db?checkpoint_interval=60&compact_threshold=4&keep_snapshots=3&sync_mode=normal&hot_max_rows=262144
 ```
+
+`group_cache_mb` has no connection string form; the cache is process-wide and is set with the PRAGMA.
 
 Legacy parameter names are accepted for backward compatibility:
 - `snapshot_interval` maps to `checkpoint_interval`

@@ -372,6 +372,8 @@ file:///path/to/database?sync_mode=2&checkpoint_interval=60&compact_threshold=4&
 | compact_threshold | Sub-target volumes per table before merging | 4 | PRAGMA |
 | target_volume_rows | Target rows per cold volume (min 65536) | 1048576 | PRAGMA |
 | keep_snapshots | Backup snapshots to retain per table | 3 | PRAGMA |
+| hot_max_rows | Committed hot rows per table that request an early seal (0 = off) | 262144 | PRAGMA |
+| hot_max_bytes | Hot row bytes per table above which commits wait for a seal (0 = off) | 0 | PRAGMA |
 | checkpoint_on_close | Seal all hot rows on clean shutdown | on | DSN only |
 
 Legacy parameter names are accepted for backward compatibility:
