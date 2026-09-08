@@ -215,30 +215,18 @@ impl VolumeScanner {
     /// over the raw ids of the group; None when a filter column is not a
     /// dictionary column here and the rows must be tested one by one
     fn dictionary_candidates(&self, lo: usize, hi: usize) -> Option<Vec<usize>> {
-        let mut slices: Vec<(&[u32], &[bool], usize, u32)> =
-            Vec::with_capacity(self.dict_filters.len());
-        for &(col_idx, expected) in &self.dict_filters {
-            let (col, local_lo) = self.col_and_idx(col_idx, lo);
-            let (ids, nulls) = col.dict_ids()?;
-            if local_lo + (hi - lo) > ids.len() {
-                return None;
-            }
-            slices.push((ids, nulls, local_lo, expected));
-        }
+        let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
+            .dict_filters
+            .iter()
+            .map(|&(col_idx, expected)| {
+                let (col, local_lo) = self.col_and_idx(col_idx, lo);
+                (col, local_lo, expected)
+            })
+            .collect();
         let mut candidates = Vec::new();
-        let (first_ids, first_nulls, first_lo, first_expected) = slices[0];
-        for offset in 0..hi - lo {
-            let local = first_lo + offset;
-            if first_nulls[local] || first_ids[local] != first_expected {
-                continue;
-            }
-            let others_match = slices[1..].iter().all(|&(ids, nulls, base, expected)| {
-                let local = base + offset;
-                !nulls[local] && ids[local] == expected
-            });
-            if others_match {
-                candidates.push(lo + offset);
-            }
+        super::column::ColumnData::dict_matching_offsets(&filters, hi - lo, &mut candidates)?;
+        for idx in &mut candidates {
+            *idx += lo;
         }
         Some(candidates)
     }
@@ -593,13 +581,32 @@ impl VolumeScanner {
                         self.filter = Some(filter);
                         return;
                     }
-                    for i in gs.max(self.current_idx)..ge {
-                        let local = i - gs;
-                        let ok = self.dict_filters.iter().zip(group_cols.iter()).all(
-                            |(&(_, eid), col)| !col.is_null(local) && col.get_dict_id(local) == eid,
-                        );
-                        if ok {
-                            m.push(i);
+                    let lo = gs.max(self.current_idx);
+                    let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
+                        .dict_filters
+                        .iter()
+                        .zip(group_cols.iter())
+                        .map(|(&(_, eid), col)| (&**col, lo - gs, eid))
+                        .collect();
+                    let first = m.len();
+                    if super::column::ColumnData::dict_matching_offsets(&filters, ge - lo, &mut m)
+                        .is_none()
+                    {
+                        m.truncate(first);
+                        for i in lo..ge {
+                            let local = i - gs;
+                            let ok = self.dict_filters.iter().zip(group_cols.iter()).all(
+                                |(&(_, eid), col)| {
+                                    !col.is_null(local) && col.get_dict_id(local) == eid
+                                },
+                            );
+                            if ok {
+                                m.push(i);
+                            }
+                        }
+                    } else {
+                        for idx in &mut m[first..] {
+                            *idx += lo;
                         }
                     }
                     if m.len() > selectivity_cap {
@@ -614,16 +621,34 @@ impl VolumeScanner {
                 }
             } else {
                 let mut m = Vec::new();
-                for i in self.current_idx..self.end_idx {
-                    let ok = self.dict_filters.iter().all(|&(ci, eid)| {
-                        !self.volume.columns[ci].is_null(i)
-                            && self.volume.columns[ci].get_dict_id(i) == eid
-                    });
-                    if ok {
-                        m.push(i);
+                let lo = self.current_idx;
+                let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = self
+                    .dict_filters
+                    .iter()
+                    .map(|&(ci, eid)| (&self.volume.columns[ci], lo, eid))
+                    .collect();
+                if super::column::ColumnData::dict_matching_offsets(
+                    &filters,
+                    self.end_idx - lo,
+                    &mut m,
+                )
+                .is_some()
+                {
+                    for idx in &mut m {
+                        *idx += lo;
                     }
-                    if m.len() > selectivity_cap {
-                        break;
+                } else {
+                    for i in self.current_idx..self.end_idx {
+                        let ok = self.dict_filters.iter().all(|&(ci, eid)| {
+                            !self.volume.columns[ci].is_null(i)
+                                && self.volume.columns[ci].get_dict_id(i) == eid
+                        });
+                        if ok {
+                            m.push(i);
+                        }
+                        if m.len() > selectivity_cap {
+                            break;
+                        }
                     }
                 }
                 if m.len() > selectivity_cap {
