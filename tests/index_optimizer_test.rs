@@ -913,3 +913,91 @@ fn test_in_list_pk_decision_follows_the_extracted_list() {
         vec![8]
     );
 }
+
+#[test]
+fn test_ordered_storage_scan_does_not_order_by_a_shadowed_select_alias() {
+    let db = Database::open("memory://ordered_shadowed_alias").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX t_n ON t(n)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)", ())
+        .unwrap();
+    for (query, expected) in [
+        ("SELECT -n AS n FROM t ORDER BY n ASC LIMIT 2", vec![-3, -2]),
+        (
+            "SELECT -n AS n FROM t ORDER BY n DESC LIMIT 1 OFFSET 1",
+            vec![-2],
+        ),
+        ("SELECT id AS n FROM t ORDER BY n DESC LIMIT 2", vec![3, 2]),
+        ("SELECT n AS n FROM t ORDER BY n DESC LIMIT 2", vec![3, 2]),
+        (
+            "SELECT -id AS id FROM t WHERE id > 0 ORDER BY id ASC LIMIT 2",
+            vec![-3, -2],
+        ),
+    ] {
+        let actual: Vec<i64> = db
+            .query(query, ())
+            .unwrap()
+            .map(|row| row.unwrap().get(0).unwrap())
+            .collect();
+        assert_eq!(actual, expected, "{query}");
+    }
+}
+
+#[test]
+fn test_captured_float_window_preserves_order_limit_and_future_dependencies() {
+    use std::sync::Arc;
+    use stoolap::executor::{ExecutionContext, Executor};
+    use stoolap::storage::mvcc::engine::MVCCEngine;
+    use stoolap::Value;
+
+    let engine = Arc::new(MVCCEngine::in_memory());
+    engine.open_engine().unwrap();
+    let executor = Executor::new(engine.clone());
+    executor
+        .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, price FLOAT NOT NULL)")
+        .unwrap();
+    executor
+        .execute("CREATE INDEX t_price ON t(price)")
+        .unwrap();
+    executor
+        .execute("INSERT INTO t VALUES (1, 30.0), (2, 10.0), (3, 20.0)")
+        .unwrap();
+    executor
+        .execute_with_params(
+            "INSERT INTO t VALUES (4, $1)",
+            smallvec::smallvec![Value::Float(f64::NAN)],
+        )
+        .unwrap();
+    let ctx = ExecutionContext::new().with_read_epoch(engine.registry().capture_read_epoch());
+    executor.execute("UPDATE t SET price = -price").unwrap();
+    executor
+        .execute("INSERT INTO t VALUES (5, -100.0)")
+        .unwrap();
+    for (query, expected) in [
+        (
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY price) FROM t LIMIT 2 OFFSET 1",
+            vec![(3, 2), (1, 3)],
+        ),
+        (
+            "SELECT id, ROW_NUMBER() OVER (ORDER BY price DESC) FROM t LIMIT 2",
+            vec![(4, 1), (1, 2)],
+        ),
+        (
+            "SELECT id, LEAD(id) OVER (ORDER BY price) FROM t LIMIT 2",
+            vec![(2, 3), (3, 1)],
+        ),
+    ] {
+        let mut result = executor.execute_with_context(query, &ctx).unwrap();
+        let mut actual = Vec::new();
+        while result.next() {
+            let row = result.take_row();
+            actual.push((row[0].as_int64().unwrap(), row[1].as_int64().unwrap()));
+        }
+        assert!(result.last_error().is_none());
+        assert_eq!(actual, expected, "{query}");
+    }
+}

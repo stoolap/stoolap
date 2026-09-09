@@ -163,9 +163,13 @@ jobs:
 
     - name: Check License Headers
       run: |
-        # Check that all .rs files have the Apache license header
+        # Vendored roaring retains its upstream copyright and dual license.
+        # Verify those files separately; never relabel upstream source as ours.
+        test -s vendor/roaring/LICENSE-APACHE
+        test -s vendor/roaring/LICENSE-MIT
+        # Check that first-party .rs files have the project license header.
         missing_license=""
-        for file in $(find . -name "*.rs" -not -path "./target/*" -not -path "./.git/*"); do
+        for file in $(find . -name "*.rs" -not -path "./target/*" -not -path "./.git/*" -not -path "./vendor/roaring/*"); do
           if ! grep -q "Copyright.*Stoolap Contributors" "$file"; then
             missing_license="$missing_license\n$file"
           fi

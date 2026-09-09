@@ -30,7 +30,8 @@
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::common::{I64Map, I64Set};
+use super::memory::{reserve_vec, IndexMemory};
+use crate::common::{I64Map, I64Set, MemoryAccount, MemoryCharge};
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::Index;
@@ -55,6 +56,7 @@ struct PkIndexInner {
     /// Separate flag for i64::MIN which I64Set cannot store (used as sentinel).
     /// Exact count of present entries.
     count: usize,
+    words_charge: Option<MemoryCharge>,
 }
 
 impl PkIndexInner {
@@ -63,6 +65,7 @@ impl PkIndexInner {
             words: Vec::new(),
             overflow: I64Set::new(),
             count: 0,
+            words_charge: None,
         }
     }
 
@@ -82,7 +85,10 @@ impl PkIndexInner {
     #[inline]
     fn insert(&mut self, id: i64) -> bool {
         if let Some((word_idx, mask)) = to_word_bit(id) {
-            ensure_capacity(&mut self.words, word_idx);
+            reserve_vec(&mut self.words, word_idx + 1, &mut self.words_charge);
+            if word_idx >= self.words.len() {
+                self.words.resize(word_idx + 1, 0);
+            }
             if (self.words[word_idx] & mask) == 0 {
                 self.words[word_idx] |= mask;
                 self.count += 1;
@@ -126,7 +132,10 @@ impl PkIndexInner {
     /// Reset everything.
     fn clear(&mut self) {
         self.words.clear();
-        self.overflow = I64Set::new();
+        self.overflow = match self.words_charge.as_ref() {
+            Some(charge) => I64Set::new_in(charge.account()),
+            None => I64Set::new(),
+        };
         self.count = 0;
     }
 }
@@ -145,14 +154,6 @@ fn to_word_bit(row_id: i64) -> Option<(usize, u64)> {
         }
     }
     None
-}
-
-/// Grow `words` so that `word_idx` is valid.
-#[inline]
-fn ensure_capacity(words: &mut Vec<u64>, word_idx: usize) {
-    if word_idx >= words.len() {
-        words.resize(word_idx + 1, 0);
-    }
 }
 
 /// Total bit capacity of a word slice.
@@ -290,6 +291,7 @@ pub struct PkIndex {
     column_name: String,
     data: RwLock<PkIndexInner>,
     closed: AtomicBool,
+    memory: IndexMemory,
 }
 
 impl PkIndex {
@@ -301,6 +303,7 @@ impl PkIndex {
             column_name,
             data: RwLock::new(PkIndexInner::new()),
             closed: AtomicBool::new(false),
+            memory: IndexMemory::default(),
         }
     }
 
@@ -340,6 +343,27 @@ impl PkIndex {
 // ---------------------------------------------------------------------------
 
 impl Index for PkIndex {
+    fn attach_memory_account(&mut self, account: &MemoryAccount) -> Result<()> {
+        if !self.memory.needs_attachment(account)? {
+            return Ok(());
+        }
+        let metadata =
+            self.name.capacity() + self.table_name.capacity() + self.column_name.capacity();
+        self.memory.attach::<Self>(account, metadata);
+        let account = self.memory.account().unwrap();
+        let inner = self.data.get_mut();
+        inner.words_charge = Some(MemoryCharge::new(
+            account,
+            inner.words.capacity() * std::mem::size_of::<u64>(),
+        ));
+        inner.overflow.attach_memory_account(account);
+        Ok(())
+    }
+
+    fn memory_account(&self) -> Option<&MemoryAccount> {
+        self.memory.account()
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -944,6 +968,58 @@ impl Index for PkIndex {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    #[test]
+    fn attached_pk_buffers_follow_the_final_index_owner() {
+        let root = MemoryAccount::new();
+        let baseline = root.snapshot().accounted_bytes;
+        let mut index = PkIndex::new("pk".into(), "t".into(), 0, "id".into());
+        index.attach_memory_account(&root).unwrap();
+        let initial = root.snapshot().retained_bytes;
+        index.add(&[Value::Integer(1)], 1, 1).unwrap();
+        let bitset_bytes = index.data.read().words.capacity() * std::mem::size_of::<u64>();
+        assert_eq!(root.snapshot().retained_bytes, initial + bitset_bytes);
+        let before_overflow = index.data.read().overflow.allocation_size();
+        for row in -500..0 {
+            index.add(&[Value::Integer(row)], row, row).unwrap();
+        }
+        assert_eq!(
+            root.snapshot().retained_bytes,
+            initial + bitset_bytes + index.data.read().overflow.allocation_size() - before_overflow
+        );
+        index.attach_memory_account(&root).unwrap();
+        assert!(index.attach_memory_account(&MemoryAccount::new()).is_err());
+        let owner = std::sync::Arc::new(index);
+        let alias = owner.clone();
+        let retained = root.snapshot().accounted_bytes;
+        drop(owner);
+        assert_eq!(root.snapshot().accounted_bytes, retained);
+        alias.clear().unwrap();
+        assert_eq!(root.snapshot().retained_bytes, initial + bitset_bytes);
+        drop(alias);
+        assert_eq!(root.snapshot().retained_bytes, 0);
+        assert_eq!(root.snapshot().accounted_bytes, baseline);
+    }
+
+    #[test]
+    fn populated_pk_attaches_existing_capacity_without_changing_membership() {
+        let root = MemoryAccount::new();
+        let baseline = root.snapshot().accounted_bytes;
+        let mut index = PkIndex::new("pk".into(), "t".into(), 0, "id".into());
+        index.add(&[Value::Integer(1)], 1, 1).unwrap();
+        index.add(&[Value::Integer(-1)], -1, 1).unwrap();
+        index.attach_memory_account(&root).unwrap();
+        assert!(root.snapshot().accounted_bytes > baseline);
+        assert!(index.data.read().contains(1));
+        assert!(index.data.read().contains(-1));
+        drop(index);
+        assert_eq!(root.snapshot().accounted_bytes, baseline);
+    }
+}
 
 #[cfg(test)]
 mod tests {

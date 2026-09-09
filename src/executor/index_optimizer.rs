@@ -219,12 +219,9 @@ impl Executor {
         all_columns: &[String],
         ctx: &ExecutionContext,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
-        // Get the ORDER BY column name
         let order_by = &stmt.order_by[0];
-        let column_name = match &order_by.expression {
-            Expression::Identifier(id) => id.value.clone(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
-            _ => return Ok(None), // Can't optimize complex ORDER BY expressions
+        let Some(column_name) = Self::storage_order_column(stmt) else {
+            return Ok(None);
         };
 
         // Determine sort order
@@ -259,7 +256,7 @@ impl Executor {
 
         // Try to use index-ordered scan
         if let Some(rows) =
-            table.collect_rows_ordered_by_index(&column_name, ascending, limit, offset)?
+            table.collect_rows_ordered_by_index(column_name, ascending, limit, offset)?
         {
             // Project rows according to SELECT expressions
             let projected_rows = self.project_rows(&stmt.columns, rows, all_columns, ctx)?;
@@ -293,29 +290,9 @@ impl Executor {
         ctx: &ExecutionContext,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
         let order_by = &stmt.order_by[0];
-        let column_name = match &order_by.expression {
-            Expression::Identifier(id) => id.value.clone(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
-            _ => return Ok(None),
+        let Some(column_name) = Self::storage_order_column(stmt) else {
+            return Ok(None);
         };
-        // The name may be a select-list alias for another expression; only a
-        // bare column under that alias still orders by the table column
-        for item in &stmt.columns {
-            if let Expression::Aliased(aliased) = item {
-                if aliased.alias.value.eq_ignore_ascii_case(&column_name) {
-                    let same_column = match &*aliased.expression {
-                        Expression::Identifier(id) => id.value.eq_ignore_ascii_case(&column_name),
-                        Expression::QualifiedIdentifier(qid) => {
-                            qid.name.value.eq_ignore_ascii_case(&column_name)
-                        }
-                        _ => false,
-                    };
-                    if !same_column {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
         let ascending = order_by.ascending;
 
         let limit = match stmt.limit.as_ref().and_then(|e| {
@@ -336,7 +313,7 @@ impl Executor {
             None => 0,
         };
 
-        let Some(rows) = table.scan_top_k(storage_expr, &column_name, ascending, limit, offset)?
+        let Some(rows) = table.scan_top_k(storage_expr, column_name, ascending, limit, offset)?
         else {
             return Ok(None);
         };
@@ -347,6 +324,34 @@ impl Executor {
         let result =
             ExecutorResult::with_arc_columns(CompactArc::clone(&output_columns), projected_rows);
         Ok(Some((Box::new(result), output_columns)))
+    }
+
+    /// Storage ordering reads a table column before projection. A SELECT alias
+    /// can instead name an expression, even when it shadows a real column.
+    /// Both ordered collection and top-k must decline that case.
+    fn storage_order_column(stmt: &SelectStatement) -> Option<&str> {
+        let name = match &stmt.order_by.first()?.expression {
+            Expression::Identifier(id) => id.value.as_str(),
+            Expression::QualifiedIdentifier(id) => id.name.value.as_str(),
+            _ => return None,
+        };
+        for item in &stmt.columns {
+            if let Expression::Aliased(aliased) = item {
+                if aliased.alias.value.eq_ignore_ascii_case(name) {
+                    let same_column = match &*aliased.expression {
+                        Expression::Identifier(id) => id.value.eq_ignore_ascii_case(name),
+                        Expression::QualifiedIdentifier(id) => {
+                            id.name.value.eq_ignore_ascii_case(name)
+                        }
+                        _ => false,
+                    };
+                    if !same_column {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(name)
     }
 
     /// Keyset pagination optimization for PRIMARY KEY columns
@@ -372,10 +377,8 @@ impl Executor {
 
         // Get the ORDER BY column name - must be single column
         let order_by = &stmt.order_by[0];
-        let order_column = match &order_by.expression {
-            Expression::Identifier(id) => id.value.clone(),
-            Expression::QualifiedIdentifier(qid) => qid.name.value.clone(),
-            _ => return Ok(None),
+        let Some(order_column) = Self::storage_order_column(stmt) else {
+            return Ok(None);
         };
 
         // Must be ascending order (most common case for keyset pagination)

@@ -674,6 +674,13 @@ pub struct ColumnBloomFilter {
 }
 
 impl ColumnBloomFilter {
+    /// V4 hashes include scalar type tags and raw floating bits. A negative
+    /// probe is conclusive only when SQL equality cannot cross those encodings.
+    #[inline]
+    pub(crate) fn equality_hash_compatible(data_type: DataType, value: &Value) -> bool {
+        data_type == value.data_type() && !matches!(value, Value::Float(value) if *value == 0.0)
+    }
+
     /// Estimate in-memory size of this bloom filter in bytes.
     pub fn memory_size(&self) -> usize {
         self.bits.len() * 8 + 8

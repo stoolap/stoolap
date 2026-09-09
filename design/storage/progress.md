@@ -7,11 +7,11 @@ independently reviewable without claiming unmerged work is shipped.
 | Phase | Deliverable | Status | Review | PR |
 |---|---|---|---|---|
 | 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
-| 1 | Fallible access and complete statement rollback | Implemented; local gates passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
-| 2 | Chunked arena and retained-hot accounting | Pending | Pending | — |
-| 3 | Coherent two-layer execution | Pending | Pending | — |
+| 1 | Fallible access and complete statement rollback | Implemented; local gates and CI passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
+| 2 | Chunked arena and retained-hot accounting | Implemented; local gates passed; final CI running | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) (draft) |
+| 3 | Coherent two-layer execution | Implemented; final parent validation running | Passed after corrections | [#118](https://github.com/stoolap/stoolap/pull/118) (draft) |
 | 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
-| 5 | Remover, durable WAL/catalog and pressure seal | Catalog foundations implemented; lifecycle integration pending | Foundations passed independent review | — |
+| 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |
 | 6 | Paged reads, four ledgers and DML preflight | Pending | Pending | — |
 | 7 | Explicit clustering and compatibility fallback | Pending | Pending | — |
 | 8 | Identity-first compaction and bounded migration | Pending | Pending | — |
@@ -88,6 +88,106 @@ baseline. No hard memory bound or competitor claim follows from this probe.
 The exact fixture, source digest, medians, ranges and limitations are recorded
 in [measurements](measurements/README.md). Clippy with FFI and failpoints,
 no-default compilation and final targeted tests passed.
+
+## Phase 2
+
+The current accounting scope covers owned hot row payloads, arena and COW
+capacity, retained previous versions, hot index storage, transaction histories,
+publication undo and key reservations, pending cold tombstones, registry records
+and engine-owned idle/leased transaction and index scratch buffers. Charges
+follow shared allocation owners and remain after a table or engine handle drops
+while a reader still holds the allocation. Requested capacity and conservative
+structural bounds are reported separately; neither is a process RSS estimate.
+
+Resident schema/catalog containers (including the index directory), decoded cold
+columns and cold metadata, query results/scratch and maintenance buffers are not
+part of this Phase 2 scope. Their complete lifetime accounting and reservation
+belong to the later ledger stages; the computed minimum budget must include
+resident catalog and root capacity before the full-engine limit is enabled.
+MEMORY_STATS names these exclusions and reports hard_limit_enforced=false.
+Phase 2 does not claim a hard limit or a complete inventory of engine memory.
+
+The arena uses fixed 262,144-slot chunks and monotonic, non-reused chunk
+identities. Runtime seal thresholds do not affect address decoding. Empty chunks
+release their row and metadata buffers, while LSN receipts can outlive a chunk
+until the publication that needs its WAL records reaches a terminal outcome.
+Source LSN minima survive update, delete and rollback instead of being inferred
+from the newest commit marker.
+
+Payload accounts follow CompactArc and SmartString allocation ownership through
+cloning, mutable detachment and final destruction. Row ingress certifies the
+complete payload graph once; an allocation belonging to another engine is copied
+into the destination account. COW roots keep their structural and payload charges
+while readers retain them. Index accounting covers hash buckets, conservative
+B-tree nodes, bitmap storage and HNSW buffers. Transaction history, publication
+undo and UNIQUE-key claims keep their charge until their actual backing is freed.
+
+Independent review required explicit replacement buffers for arena and receipt
+growth: a moving allocator can keep both old and new buffers live during growth.
+Unchanged allocator probes now report 459,592 actual peak bytes versus 459,608
+accounted bytes for the arena, and 93,604 versus 93,620 for 1,024 same-chunk pins.
+The 16-byte difference is the account object's existing conservative allowance.
+Retained totals are unchanged; the fix accounts the temporary overlap. Single-pin
+receipts remain inline, and partial promotion failure preserves the original pin.
+
+The integrated full-suite run passed 5,444 tests and exposed two transparent
+index-wrapper fixture failures; forwarding the underlying allocation account
+fixed both, and all 11 tests in that target passed. The resulting revision also
+passes the complete Linux, macOS and Windows CI test jobs. Final counter/inline
+owner changes pass all 2,136 serial failpoint-enabled library tests, all-target/
+all-feature Clippy, Rust 1.88 all-feature and no-default compilation. Their
+remote CI rerun remains the final readiness gate.
+
+Five alternating pairs for each lifecycle case pass the predeclared latency
+and noise rule. INSERT allocation calls fall 2.69–2.70%, while warm aggregate
+p50 changes by +0.29% narrow and -0.71% wide. The longer INSERT median retains
+a +6.05% cost (126 ns, below its 166 ns twice-range threshold), reduced from
+the prior +12.19% failing attempt by eliminating account-reference churn for
+inline transaction buffers. The report preserves that failed attempt and the
+residual cost. Hot point lookup and short INSERT percentiles also rise within
+the measured noise gate; this phase does not claim every hot operation is faster.
+
+Concurrent wide writer p50/p99 improve 25.41%/20.73%. Short INSERT peak heap
+increases 14.51–15.94%; checkpoint releases more capacity, leaving total requested
+heap 3.07% lower on narrow rows and 0.32% lower on wide rows. Exact ranges,
+allocation counts, source/binary/fixture identities and portable moving-allocator
+proofs are in [measurements](measurements/README.md).
+
+## Phase 3 (in progress)
+
+Statements bind one fixed read epoch to a captured hot root, cold generation
+and private-write overlay. Visible hot values and delete markers establish
+authority before predicate evaluation. A newer invisible hot version leaves
+an older visible cold value available. Registry leases preserve cutoff and
+in-flight exclusions together; history pruning respects the oldest live lease.
+
+Typed aggregation and ordered traversal consume that view under snapshot
+isolation and seal overlap. Composite dictionary keys compare typed values,
+not unrelated local codes. Result ownership releases its epoch on exhaustion,
+close and error. Index construction reads canonical committed state and maps
+older cold columns through current schema defaults. DML target capture and
+fallible RETURNING projection preserve statement rollback boundaries.
+
+Result-cache entries retain the original visibility proof. Commit and immediate
+logical mutations invalidate it; an old result cannot acquire a later proof
+when insertion into the cache is delayed. Public committed mutation paths and
+catalog changes participate in the same invalidation protocol. Independent
+review reproduced the raw-version-store escape and verified its correction.
+
+Cold generations retain file identities without a persistent descriptor for
+every volume. Positioned reads acquire a short verified lease; rename and
+replacement keep aliases tied to the original identity. Destructive DDL prepares
+fresh native indexes and accounted hot/cold maps before publication. Detached
+storage owners are destroyed after the transfer fence. A paired weak cache
+handle retains the cache allocation's charge through the final weak owner.
+
+Independent source review and re-review passed after visibility, cache-proof,
+file-identity and allocation-lifetime corrections. Integrated library tests pass
+2,242/2,242, and 21 SQL/file/atomicity targets pass 166/166. The complete integration run passes 5,619 tests across 284 harnesses, with
+63 existing ignored doctests and no failures. All-target/all-feature Clippy
+passes after three test-only slice-reference simplifications. Fresh lifecycle
+comparisons against the final Phase 2 source and remote CI remain pending;
+this stage is not yet marked ready.
 
 ## Phase 5 catalog foundations
 

@@ -20,6 +20,7 @@
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
+use super::registry::ReadEpoch;
 use crate::core::{Error, IsolationLevel, Result, Schema, SchemaColumn};
 use crate::storage::mvcc::{get_fast_timestamp, TransactionRegistry};
 use crate::storage::traits::{QueryResult, Table, Transaction};
@@ -97,6 +98,17 @@ pub struct MvccTransaction {
 pub trait TransactionEngineOperations: Send + Sync {
     /// Get a table by name, initializing transaction-local version store
     fn get_table_for_transaction(&self, txn_id: i64, table_name: &str) -> Result<Box<dyn Table>>;
+
+    fn get_table_for_transaction_in_epoch(
+        &self,
+        txn_id: i64,
+        table_name: &str,
+        epoch: &ReadEpoch,
+    ) -> Result<Box<dyn Table>> {
+        let mut table = self.get_table_for_transaction(txn_id, table_name)?;
+        table.set_read_epoch(epoch.clone())?;
+        Ok(table)
+    }
 
     /// Create a new table
     fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn Table>>;
@@ -237,7 +249,7 @@ impl MvccTransaction {
             id,
             state: TransactionState::Active,
             tables: FxHashMap::default(),
-            isolation_level: None,
+            isolation_level: Some(registry.get_isolation_level(id)),
             registry,
             begin_seq,
             last_table_name: None,
@@ -449,6 +461,17 @@ impl MvccTransaction {
 }
 
 impl Transaction for MvccTransaction {
+    fn capture_read_epoch(&self) -> Result<Option<ReadEpoch>> {
+        self.check_active()?;
+        Ok(self.registry.read_epoch_for_transaction(self.id))
+    }
+
+    fn get_table_in_epoch(&self, name: &str, epoch: &ReadEpoch) -> Result<Box<dyn Table>> {
+        self.check_active()?;
+        self.get_engine_ops()?
+            .get_table_for_transaction_in_epoch(self.id, name, epoch)
+    }
+
     fn id(&self) -> i64 {
         self.id
     }
@@ -502,6 +525,10 @@ impl Transaction for MvccTransaction {
             if let Some(ops) = &self.engine_operations {
                 let (_, error) = ops.commit_all_tables(self.id);
                 if let Some(error) = error {
+                    // Cold tombstones carry a commit sequence: removing its
+                    // registry exclusion before undo must not authorize shared
+                    // results from that provisional physical state.
+                    let _logical_undo = self.registry.begin_logical_mutation();
                     self.registry.abort_transaction(self.id);
                     if let Err(undo_error) = ops.finish_publication(self.id, false) {
                         ops.handle_publication_undo_failure(&undo_error);
@@ -509,6 +536,7 @@ impl Transaction for MvccTransaction {
                         return Err(undo_error);
                     }
                     ops.rollback_all_tables(self.id);
+                    self.registry.acknowledge_rollback(self.id);
                     self.state = TransactionState::RolledBack;
                     self.cleanup();
                     return Err(error);
@@ -526,6 +554,7 @@ impl Transaction for MvccTransaction {
                         // Engine health fencing prevents reads/writes until recovery.
                         return Err(error);
                     }
+                    let _logical_undo = self.registry.begin_logical_mutation();
                     self.registry.abort_transaction(self.id);
                     if let Err(undo_error) = ops.finish_publication(self.id, false) {
                         ops.handle_publication_undo_failure(&undo_error);
@@ -533,6 +562,7 @@ impl Transaction for MvccTransaction {
                         return Err(undo_error);
                     }
                     ops.rollback_all_tables(self.id);
+                    self.registry.acknowledge_rollback(self.id);
                     self.state = TransactionState::RolledBack;
                     self.cleanup();
                     return Err(error);
@@ -586,6 +616,8 @@ impl Transaction for MvccTransaction {
             // Clean up txn_version_stores entry to prevent memory leak
             ops.rollback_all_tables(self.id);
         }
+
+        self.registry.acknowledge_rollback(self.id);
 
         // Record in WAL if not read-only
         if !is_read_only {
@@ -714,9 +746,8 @@ impl Transaction for MvccTransaction {
         // For now, always get from engine (engine will handle caching internally).
         // The tables HashMap is used for tracking which tables were accessed for commit/rollback.
 
-        // Get from engine
-        let ops = self.get_engine_ops()?;
-        ops.get_table_for_transaction(self.id, name)
+        let epoch = self.capture_read_epoch()?.ok_or(Error::TransactionClosed)?;
+        self.get_table_in_epoch(name, &epoch)
     }
 
     fn list_tables(&self) -> Result<Vec<String>> {
@@ -893,6 +924,7 @@ impl Drop for MvccTransaction {
                 // but are dropped without explicit commit/rollback
                 ops.rollback_all_tables(self.id);
             }
+            self.registry.acknowledge_rollback(self.id);
 
             self.cleanup();
         }

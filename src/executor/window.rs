@@ -3677,6 +3677,30 @@ impl Executor {
         Ordering::Equal
     }
 
+    /// Preserve the indexed window input order when a captured table declines
+    /// its storage ordering shortcut (for example, FLOAT keys with NaNs).
+    /// Sort the retained rows in place, using the window comparator itself.
+    pub(crate) fn sort_captured_window_rows(
+        rows: &mut [(i64, Row)],
+        column: usize,
+        ascending: bool,
+    ) {
+        rows.sort_unstable_by(|(left_id, left), (right_id, right)| {
+            let left = left
+                .get(column)
+                .unwrap_or(&Value::Null(crate::core::DataType::Null));
+            let right = right
+                .get(column)
+                .unwrap_or(&Value::Null(crate::core::DataType::Null));
+            let order = Self::compare_values_fast(left, right).then(left_id.cmp(right_id));
+            if ascending {
+                order
+            } else {
+                order.reverse()
+            }
+        });
+    }
+
     /// Fast value comparison with type-specific paths
     #[inline]
     fn compare_values_fast(a: &Value, b: &Value) -> Ordering {
