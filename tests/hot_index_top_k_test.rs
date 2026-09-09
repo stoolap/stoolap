@@ -319,14 +319,22 @@ fn test_snapshot_orders_by_the_values_it_sees() {
     check(&db, "WHERE g = 'a' AND k = 'k3'", true, 3, 0);
 }
 
-/// Runs the first checkpoint from inside the WHERE, at the point where a
-/// concurrent seal can run: after the table saw no volumes, before the hot
-/// index is walked
+/// Runs the first checkpoint from inside the WHERE. The legacy index path
+/// inspects comparison metadata; a captured scan instead evaluates the frozen
+/// hot rows. Both hooks exercise the same first-seal interleaving.
 #[derive(Clone)]
 struct SealInsideWhere {
     inner: ComparisonExpr,
     db: Database,
     fired: Arc<AtomicBool>,
+}
+
+impl SealInsideWhere {
+    fn seal_once(&self) {
+        if !self.fired.swap(true, Ordering::SeqCst) {
+            self.db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+    }
 }
 
 impl std::fmt::Debug for SealInsideWhere {
@@ -337,9 +345,11 @@ impl std::fmt::Debug for SealInsideWhere {
 
 impl Expression for SealInsideWhere {
     fn evaluate(&self, row: &Row) -> Result<bool> {
+        self.seal_once();
         self.inner.evaluate(row)
     }
     fn evaluate_fast(&self, row: &Row) -> bool {
+        self.seal_once();
         self.inner.evaluate_fast(row)
     }
     fn with_aliases(&self, _: &rustc_hash::FxHashMap<String, String>) -> Box<dyn Expression> {
@@ -355,9 +365,7 @@ impl Expression for SealInsideWhere {
         Box::new(self.clone())
     }
     fn get_comparison_info(&self) -> Option<(&str, Operator, &Value)> {
-        if !self.fired.swap(true, Ordering::SeqCst) {
-            self.db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-        }
+        self.seal_once();
         self.inner.get_comparison_info()
     }
 }
@@ -401,6 +409,10 @@ struct StopAfterIndexAdd {
 }
 
 impl Index for StopAfterIndexAdd {
+    fn memory_account(&self) -> Option<&stoolap::common::MemoryAccount> {
+        self.inner.memory_account()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }

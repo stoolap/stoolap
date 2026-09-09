@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::{Arc, RwLock};
+use stoolap::common::CompactArc;
 use stoolap::core::{DataType, Row, SchemaBuilder};
 use stoolap::storage::index::HashIndex;
 use stoolap::storage::mvcc::{
@@ -82,7 +83,7 @@ fn cold_deleted_unique_key_stays_reserved_until_terminal_outcome() {
         if evolved_schema {
             manager.invalidate_mappings(&schema);
         }
-        let first_local = Arc::new(RwLock::new(TransactionVersionStore::new(
+        let first_local = CompactArc::new(RwLock::new(TransactionVersionStore::new(
             parent.clone(),
             10,
         )));
@@ -116,7 +117,7 @@ fn cold_deleted_unique_key_stays_reserved_until_terminal_outcome() {
             .unwrap();
         manager.commit_pending_tombstones(10, 20);
         // T1 is paused immediately before recording COMMIT, matching engine ordering.
-        let second_local = Arc::new(RwLock::new(TransactionVersionStore::new(
+        let second_local = CompactArc::new(RwLock::new(TransactionVersionStore::new(
             parent.clone(),
             11,
         )));

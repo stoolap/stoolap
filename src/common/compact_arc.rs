@@ -21,23 +21,23 @@
 //!
 //! **Use for DSTs** (`str`, `[T]`) when you have many clones sharing one allocation:
 //! - Stack pointer: 8 bytes (thin) vs std::Arc's 16 bytes (fat)
-//! - Heap header: 16 bytes vs std::Arc's 16 bytes
+//! - Heap header: 24 bytes, including an optional allocation account
 //! - Net savings: 8 bytes per clone (thin pointer)
 //!
 //! **Avoid for sized types** (`i64`, `String`, structs):
 //! - Stack pointer: 8 bytes (same as std::Arc)
-//! - Heap header: 16 bytes (same as std::Arc)
+//! - Heap header: 24 bytes, including an optional allocation account
 //! - No advantage over std::Arc
 //!
 //! ## Memory Layout
 //!
-//! All types use a compact 16-byte header. Type-specific drop logic is resolved
+//! All types use a compact 24-byte header on 64-bit targets. Type-specific drop logic is resolved
 //! at compile time via monomorphization (no stored function pointer needed):
 //!
 //! ```text
 //! Stack:  [ptr: 8 bytes] ──────────────────┐
 //!                                          ▼
-//! Heap:   [refcount: 8][len: 8][data...]
+//! Heap:   [refcount: 8][len: 8][account: 8][data...]
 //! ```
 //!
 //! ## Pointer Sizes (All Thin!)
@@ -59,10 +59,11 @@ use std::ops::Deref;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-use super::CompactVec;
+use super::memory::AccountSlot;
+use super::{CompactVec, MemoryAccount, MemoryAdoption, MemoryCharge};
 
 // ============================================================================
-// Unified Header - 16 bytes (no stored function pointer!)
+// Unified Header - three pointer words (no stored function pointer!)
 // ============================================================================
 
 /// Unified header for all CompactArc allocations.
@@ -73,6 +74,7 @@ struct Header {
     count: AtomicUsize,
     /// Length of data. For sized types: 0 (or metadata). For str: byte length. For [T]: element count.
     len: usize,
+    account: AccountSlot,
     // Data follows immediately after, aligned appropriately
 }
 
@@ -103,66 +105,123 @@ const fn data_offset_for<T>() -> usize {
 /// header+data allocation using the correct Layout. This trait is
 /// auto-implemented for all types used with CompactArc.
 pub unsafe trait CompactArcDrop {
-    /// Drop the contained data and deallocate the header+data allocation.
+    /// Layout of the live header and data allocation.
     ///
     /// # Safety
+    /// `ptr` must be a live allocation for this exact CompactArc type.
+    unsafe fn allocation_layout(ptr: *mut u8) -> Layout;
+
+    /// Drop data and deallocate its exclusively owned header allocation.
     ///
-    /// `ptr` must point to a valid, exclusively-owned CompactArc allocation
-    /// (starting at the Header) that was created by CompactArc's constructors.
+    /// # Safety
+    /// `ptr` must be a valid final-owned CompactArc allocation of this type.
     unsafe fn drop_and_dealloc(ptr: *mut u8);
 }
 
-// SAFETY: Correctly drops a single T at the computed data offset, then deallocates
-// the header+data allocation with the matching Layout.
+// Retain the charge while destructors run, releasing it only after the backing
+// allocation is freed. This guard also runs during a destructor unwind.
+struct AllocationGuard {
+    ptr: *mut u8,
+    layout: Layout,
+    _charge: Option<MemoryCharge>,
+}
+
+impl AllocationGuard {
+    unsafe fn new(ptr: *mut u8, layout: Layout) -> Self {
+        let charge = (*(ptr as *mut Header)).account.take(layout.size());
+        Self {
+            ptr,
+            layout,
+            _charge: charge,
+        }
+    }
+}
+
+impl Drop for AllocationGuard {
+    fn drop(&mut self) {
+        // SAFETY: this guard has final ownership and the original allocation
+        // layout. Rust drops _charge after this method frees the allocation.
+        unsafe {
+            dealloc(self.ptr, self.layout);
+        }
+    }
+}
+
+// Array construction owns only its initialized prefix until publication. Field
+// drop releases the backing even if an initialized element's destructor unwinds.
+struct SliceInitGuard<T> {
+    data_ptr: *mut T,
+    written: usize,
+    ptr: *mut u8,
+    layout: Layout,
+}
+
+impl<T> Drop for SliceInitGuard<T> {
+    fn drop(&mut self) {
+        // The header remains installed during construction. Take its charge
+        // only during failed construction, retaining it through element Drop
+        // and physical deallocation even if an element destructor unwinds.
+        let _allocation = unsafe { AllocationGuard::new(self.ptr, self.layout) };
+        // SAFETY: written is advanced only after each successful ptr::write.
+        unsafe {
+            ptr::drop_in_place(ptr::slice_from_raw_parts_mut(self.data_ptr, self.written));
+        }
+    }
+}
+
+// SAFETY: the layout matches the sized constructor and data is dropped once.
 unsafe impl<T> CompactArcDrop for T {
     #[inline]
+    unsafe fn allocation_layout(_ptr: *mut u8) -> Layout {
+        Layout::from_size_align_unchecked(
+            data_offset_for::<T>() + mem::size_of::<T>(),
+            mem::align_of::<T>().max(mem::align_of::<Header>()),
+        )
+    }
+
+    #[inline]
     unsafe fn drop_and_dealloc(ptr: *mut u8) {
-        let data_offset = data_offset_for::<T>();
-        let align = mem::align_of::<T>().max(mem::align_of::<Header>());
-
-        // Drop the data
-        let data_ptr = ptr.add(data_offset) as *mut T;
-        ptr::drop_in_place(data_ptr);
-
-        // Deallocate
-        let layout = Layout::from_size_align_unchecked(data_offset + mem::size_of::<T>(), align);
-        dealloc(ptr, layout);
+        let _allocation = AllocationGuard::new(ptr, Self::allocation_layout(ptr));
+        ptr::drop_in_place(ptr.add(data_offset_for::<T>()) as *mut T);
     }
 }
 
-// SAFETY: str bytes (u8) don't need dropping. Reads len from header to compute
-// the correct deallocation Layout, then deallocates.
+// SAFETY: immutable length and byte alignment match the str constructor.
 unsafe impl CompactArcDrop for str {
     #[inline]
+    unsafe fn allocation_layout(ptr: *mut u8) -> Layout {
+        Layout::from_size_align_unchecked(
+            data_offset_for::<u8>() + (*(ptr as *mut Header)).len,
+            mem::align_of::<Header>(),
+        )
+    }
+
+    #[inline]
     unsafe fn drop_and_dealloc(ptr: *mut u8) {
-        let header = ptr as *mut Header;
-        let len = (*header).len;
-        let data_offset = data_offset_for::<u8>(); // str has align 1
-        let total_size = data_offset + len;
-        let layout = Layout::from_size_align_unchecked(total_size, mem::align_of::<Header>());
-        dealloc(ptr, layout);
+        let _allocation = AllocationGuard::new(ptr, Self::allocation_layout(ptr));
     }
 }
 
-#[allow(clippy::manual_slice_size_calculation)]
-// SAFETY: Reads len from header to reconstruct the slice, drops all len elements
-// via drop_in_place, then deallocates the header+data allocation with the matching Layout.
+// SAFETY: constructors checked the length/layout; initialized elements are
+// dropped through a slice, with allocation cleanup protected against unwind.
 unsafe impl<T> CompactArcDrop for [T] {
     #[inline]
+    unsafe fn allocation_layout(ptr: *mut u8) -> Layout {
+        let len = (*(ptr as *mut Header)).len;
+        Layout::from_size_align_unchecked(
+            data_offset_for::<T>() + mem::size_of::<T>() * len,
+            mem::align_of::<T>().max(mem::align_of::<Header>()),
+        )
+    }
+
+    #[inline]
     unsafe fn drop_and_dealloc(ptr: *mut u8) {
-        let header = ptr as *mut Header;
-        let len = (*header).len;
-        let data_offset = data_offset_for::<T>();
-        let align = mem::align_of::<T>().max(mem::align_of::<Header>());
-
-        // Drop elements
-        let data_ptr = ptr.add(data_offset) as *mut T;
-        ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(data_ptr, len));
-
-        // Deallocate
-        let layout =
-            Layout::from_size_align_unchecked(data_offset + mem::size_of::<T>() * len, align);
-        dealloc(ptr, layout);
+        let len = (*(ptr as *mut Header)).len;
+        let _allocation = AllocationGuard::new(ptr, Self::allocation_layout(ptr));
+        ptr::drop_in_place(ptr::slice_from_raw_parts_mut(
+            ptr.add(data_offset_for::<T>()) as *mut T,
+            len,
+        ));
     }
 }
 
@@ -174,7 +233,7 @@ unsafe impl<T> CompactArcDrop for [T] {
 ///
 /// `CompactArc<T>` provides shared ownership of a value of type `T`, allocated
 /// on the heap. It saves memory compared to `std::sync::Arc`:
-/// - 8 bytes less per allocation (no weak count)
+/// - One optional allocation account without growing the pointer handle
 /// - Thin pointers for DSTs (8 bytes instead of 16 for `str` and `[T]`)
 ///
 /// # Pointer Sizes
@@ -251,6 +310,52 @@ impl<T: ?Sized + CompactArcDrop> Clone for CompactArc<T> {
 // ============================================================================
 
 impl<T: ?Sized + CompactArcDrop> CompactArc<T> {
+    // Only constructors call this, before their fresh allocation is exposed.
+    fn account_new_allocation(&mut self, account: &MemoryAccount) {
+        let bytes = self.allocation_size();
+        // SAFETY: every caller owns the only reference to a new untracked
+        // header. Exclusive initialization needs no shared-adoption CAS.
+        unsafe {
+            (*self.ptr.as_ptr()).account.install_new(account, bytes);
+        }
+    }
+
+    /// Requested bytes of this allocation only, excluding heaps owned by T.
+    pub fn allocation_size(&self) -> usize {
+        // SAFETY: self keeps this correctly typed allocation alive.
+        unsafe { T::allocation_layout(self.ptr.as_ptr() as *mut u8).size() }
+    }
+
+    pub fn memory_account(&self) -> Option<MemoryAccount> {
+        // SAFETY: self retains the allocation and its account owner.
+        unsafe { (*self.ptr.as_ptr()).account.get() }
+    }
+
+    pub fn belongs_to(&self, account: &MemoryAccount) -> bool {
+        unsafe { (*self.ptr.as_ptr()).account.belongs_to(account) }
+    }
+
+    /// Adopt this allocation only; this does not certify ownership of T's heaps.
+    pub fn try_adopt_shallow(&self, account: &MemoryAccount) -> MemoryAdoption {
+        // SAFETY: self retains the allocation throughout account publication.
+        unsafe {
+            (*self.ptr.as_ptr())
+                .account
+                .adopt(account, self.allocation_size())
+        }
+    }
+
+    pub(crate) fn is_fully_accounted(&self) -> bool {
+        unsafe { (*self.ptr.as_ptr()).account.is_fully_accounted() }
+    }
+
+    /// Call only after the container's ingress accounted for all nested owners.
+    pub(crate) fn mark_fully_accounted(&self) {
+        unsafe {
+            (*self.ptr.as_ptr()).account.mark_fully_accounted();
+        }
+    }
+
     /// Returns `true` if the two `CompactArc`s point to the same allocation.
     #[inline]
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
@@ -302,6 +407,13 @@ impl<T: CompactArcDrop> CompactArc<T> {
         Self::new_with_meta(data, 0)
     }
 
+    /// Charge this allocation before returning; nested T ownership is separate.
+    pub fn new_in(data: T, account: &MemoryAccount) -> Self {
+        let mut value = Self::new(data);
+        value.account_new_allocation(account);
+        value
+    }
+
     /// Creates a new `CompactArc<T>` containing the given value and metadata.
     /// The metadata is stored in the header's `len` field, which is unused for Sized types.
     #[inline]
@@ -328,6 +440,7 @@ impl<T: CompactArcDrop> CompactArc<T> {
                 header,
                 Header {
                     count: AtomicUsize::new(1),
+                    account: AccountSlot::new(),
                     len: meta,
                 },
             );
@@ -373,7 +486,7 @@ impl<T: CompactArcDrop> CompactArc<T> {
                 let align = mem::align_of::<T>().max(mem::align_of::<Header>());
                 let layout =
                     Layout::from_size_align_unchecked(data_offset + mem::size_of::<T>(), align);
-                dealloc(header as *mut u8, layout);
+                drop(AllocationGuard::new(header as *mut u8, layout));
 
                 Ok(data)
             }
@@ -393,6 +506,7 @@ impl<T: CompactArcDrop> CompactArc<T> {
             // exclusive access. this.ptr is valid and data_offset_for<T>() gives the
             // correct offset to the properly aligned T.
             unsafe {
+                (*this.ptr.as_ptr()).account.clear_fully_accounted();
                 let data_ptr = (this.ptr.as_ptr() as *mut u8).add(data_offset_for::<T>()) as *mut T;
                 Some(&mut *data_ptr)
             }
@@ -412,8 +526,14 @@ impl<T: CompactArcDrop> CompactArc<T> {
         // Check if we're the only reference (uses Acquire ordering)
         if !Self::is_unique(this) {
             let meta = Self::meta(this);
-            // Clone the data since there are other references
-            *this = CompactArc::new_with_meta((**this).clone(), meta);
+            let account = this.memory_account();
+            let mut replacement = CompactArc::new_with_meta((**this).clone(), meta);
+            if let Some(account) = &account {
+                replacement.account_new_allocation(account);
+            }
+            // Generic T::clone may create nested heaps; certification stays clear
+            // until the container's audited ingress checks those owners.
+            *this = replacement;
         }
         // SAFETY: After the above, we're guaranteed to be the only reference
         Self::get_mut(this).unwrap()
@@ -547,6 +667,12 @@ impl<T: CompactArcDrop> From<T> for CompactArc<T> {
 // ============================================================================
 
 impl CompactArc<str> {
+    pub fn from_str_slice_in(value: &str, account: &MemoryAccount) -> Self {
+        let mut value = Self::from_str_slice(value);
+        value.account_new_allocation(account);
+        value
+    }
+
     /// Creates a new `CompactArc<str>` from a string slice.
     ///
     /// The pointer is only 8 bytes (thin), with length stored in heap header.
@@ -554,7 +680,7 @@ impl CompactArc<str> {
     pub fn from_str_slice(s: &str) -> Self {
         let len = s.len();
         let data_offset = data_offset_for::<u8>(); // str has align 1
-        let total_size = data_offset + len;
+        let total_size = data_offset.checked_add(len).expect("layout overflow");
         let layout = Layout::from_size_align(total_size, mem::align_of::<Header>())
             .expect("layout overflow");
 
@@ -573,6 +699,7 @@ impl CompactArc<str> {
                 header,
                 Header {
                     count: AtomicUsize::new(1),
+                    account: AccountSlot::new(),
                     len,
                 },
             );
@@ -696,6 +823,82 @@ impl AsRef<str> for CompactArc<str> {
 // ============================================================================
 
 impl<T> CompactArc<[T]> {
+    /// Build one charged array without an intermediate Vec. ExactSizeIterator
+    /// supplies a capacity hint, not an unsafe promise: both directions of a
+    /// dishonest length panic with initialized-prefix cleanup.
+    pub(crate) fn from_exact_iter_in<I>(mut values: I, account: &MemoryAccount) -> Self
+    where
+        I: ExactSizeIterator<Item = T>,
+    {
+        let len = values.len();
+        let data_offset = data_offset_for::<T>();
+        let data_size = mem::size_of::<T>()
+            .checked_mul(len)
+            .expect("layout overflow");
+        let align = mem::align_of::<T>().max(mem::align_of::<Header>());
+        let layout = Layout::from_size_align(
+            data_offset.checked_add(data_size).expect("layout overflow"),
+            align,
+        )
+        .expect("layout overflow");
+        // SAFETY: the checked layout fits len values. Nothing is exposed until
+        // every slot is initialized and the iterator has returned no extra item.
+        unsafe {
+            let ptr = alloc(layout);
+            if ptr.is_null() {
+                handle_alloc_error(layout);
+            }
+            let header = ptr as *mut Header;
+            ptr::write(
+                header,
+                Header {
+                    count: AtomicUsize::new(1),
+                    len,
+                    account: AccountSlot::new(),
+                },
+            );
+            let data_ptr = ptr.add(data_offset) as *mut T;
+            let mut guard = SliceInitGuard {
+                data_ptr,
+                written: 0,
+                ptr,
+                layout,
+            };
+            // Iterator callbacks can retain nested allocations or inspect the
+            // account. Charge the already allocated array before invoking them.
+            (*header).account.install_new(account, layout.size());
+            for index in 0..len {
+                let value = values
+                    .next()
+                    .expect("exact iterator returned too few values");
+                ptr::write(data_ptr.add(index), value);
+                guard.written += 1;
+            }
+            assert!(
+                values.next().is_none(),
+                "exact iterator returned too many values"
+            );
+            drop(values);
+            mem::forget(guard);
+            CompactArc {
+                ptr: NonNull::new_unchecked(header),
+                _marker: PhantomData,
+            }
+        }
+    }
+
+    pub fn from_vec_in(values: Vec<T>, account: &MemoryAccount) -> Self {
+        let mut values = Self::from_vec(values);
+        values.account_new_allocation(account);
+        values
+    }
+
+    pub fn from_compact_vec_in(values: CompactVec<T>, account: &MemoryAccount) -> Self {
+        let mut values = Self::from_compact_vec(values);
+        values.account_new_allocation(account);
+        values
+    }
+
     /// Creates a new `CompactArc<[T]>` by moving elements from a Vec.
     ///
     /// This is more efficient than `from_slice` as it moves elements instead of cloning.
@@ -704,9 +907,14 @@ impl<T> CompactArc<[T]> {
         let len = vec.len();
         let data_offset = data_offset_for::<T>();
         let align = mem::align_of::<T>().max(mem::align_of::<Header>());
-        let data_size = mem::size_of::<T>() * len;
-        let layout =
-            Layout::from_size_align(data_offset + data_size, align).expect("layout overflow");
+        let data_size = mem::size_of::<T>()
+            .checked_mul(len)
+            .expect("layout overflow");
+        let layout = Layout::from_size_align(
+            data_offset.checked_add(data_size).expect("layout overflow"),
+            align,
+        )
+        .expect("layout overflow");
 
         // SAFETY: We allocate memory with the correct layout for Header + [T].
         // We copy (move) the elements from vec into the allocation, then set vec's len to 0
@@ -724,6 +932,7 @@ impl<T> CompactArc<[T]> {
                 header,
                 Header {
                     count: AtomicUsize::new(1),
+                    account: AccountSlot::new(),
                     len,
                 },
             );
@@ -751,9 +960,14 @@ impl<T> CompactArc<[T]> {
         let len = vec.len();
         let data_offset = data_offset_for::<T>();
         let align = mem::align_of::<T>().max(mem::align_of::<Header>());
-        let data_size = mem::size_of::<T>() * len;
-        let layout =
-            Layout::from_size_align(data_offset + data_size, align).expect("layout overflow");
+        let data_size = mem::size_of::<T>()
+            .checked_mul(len)
+            .expect("layout overflow");
+        let layout = Layout::from_size_align(
+            data_offset.checked_add(data_size).expect("layout overflow"),
+            align,
+        )
+        .expect("layout overflow");
 
         // SAFETY: We allocate memory with the correct layout for Header + [T].
         // We copy (move) the elements from vec into the allocation, then set vec's len to 0
@@ -771,6 +985,7 @@ impl<T> CompactArc<[T]> {
                 header,
                 Header {
                     count: AtomicUsize::new(1),
+                    account: AccountSlot::new(),
                     len,
                 },
             );
@@ -791,6 +1006,10 @@ impl<T> CompactArc<[T]> {
 }
 
 impl<T: Clone> CompactArc<[T]> {
+    pub fn from_slice_in(values: &[T], account: &MemoryAccount) -> Self {
+        Self::from_exact_iter_in(values.iter().cloned(), account)
+    }
+
     /// Creates a new `CompactArc<[T]>` from a slice by cloning elements.
     ///
     /// The pointer is only 8 bytes (thin), with length stored in heap header.
@@ -804,8 +1023,13 @@ impl<T: Clone> CompactArc<[T]> {
         let len = slice.len();
         let data_offset = data_offset_for::<T>();
         let align = mem::align_of::<T>().max(mem::align_of::<Header>());
-        let layout = Layout::from_size_align(data_offset + mem::size_of_val(slice), align)
-            .expect("layout overflow");
+        let layout = Layout::from_size_align(
+            data_offset
+                .checked_add(mem::size_of_val(slice))
+                .expect("layout overflow"),
+            align,
+        )
+        .expect("layout overflow");
 
         // SAFETY: We allocate memory with the correct layout for Header + [T].
         // We use a CloneGuard for panic safety - if any clone() panics, the guard
@@ -823,6 +1047,7 @@ impl<T: Clone> CompactArc<[T]> {
                 header,
                 Header {
                     count: AtomicUsize::new(1),
+                    account: AccountSlot::new(),
                     len,
                 },
             );
@@ -843,11 +1068,10 @@ impl<T: Clone> CompactArc<[T]> {
                     // are initialized. We drop those elements, then deallocate the memory
                     // using the stored layout. This is only called on panic during clone.
                     unsafe {
+                        let _allocation = AllocationGuard::new(self.alloc_ptr, self.layout);
                         // Drop all successfully written elements
                         let slice = ptr::slice_from_raw_parts_mut(self.data_ptr, self.written);
                         ptr::drop_in_place(slice);
-                        // Deallocate the memory
-                        dealloc(self.alloc_ptr, self.layout);
                     }
                 }
             }
@@ -989,6 +1213,343 @@ mod tests {
     use super::*;
 
     #[test]
+    fn from_slice_in_accounts_clone_callbacks_and_peak_overlap() {
+        use std::cell::Cell;
+
+        struct Probe<'a> {
+            account: &'a MemoryAccount,
+            clone_retained: &'a Cell<usize>,
+        }
+        impl Clone for Probe<'_> {
+            fn clone(&self) -> Self {
+                self.clone_retained
+                    .set(self.account.snapshot().retained_bytes);
+                // A nested allocation can disappear before construction ends;
+                // its peak must still overlap the destination array's charge.
+                let temporary = MemoryCharge::new(self.account, 4096);
+                drop(temporary);
+                Self {
+                    account: self.account,
+                    clone_retained: self.clone_retained,
+                }
+            }
+        }
+
+        let account = MemoryAccount::new();
+        let clone_retained = Cell::new(0);
+        let source = [Probe {
+            account: &account,
+            clone_retained: &clone_retained,
+        }];
+        let values = CompactArc::from_slice_in(&source, &account);
+        let destination_bytes = values.allocation_size();
+        let snapshot = account.snapshot();
+        assert_eq!(clone_retained.get(), destination_bytes);
+        assert_eq!(snapshot.retained_bytes, destination_bytes);
+        assert_eq!(
+            snapshot.peak_accounted_bytes,
+            snapshot.conservative_bytes + destination_bytes + 4096
+        );
+        drop(values);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn from_slice_in_keeps_charge_through_clone_panic_cleanup() {
+        use std::cell::Cell;
+
+        struct Probe<'a> {
+            account: &'a MemoryAccount,
+            clones: &'a Cell<usize>,
+            drops: &'a Cell<usize>,
+            drop_retained: &'a Cell<usize>,
+            is_clone: bool,
+        }
+        impl Clone for Probe<'_> {
+            fn clone(&self) -> Self {
+                self.clones.set(self.clones.get() + 1);
+                assert_ne!(self.clones.get(), 2, "second clone fails");
+                Self {
+                    account: self.account,
+                    clones: self.clones,
+                    drops: self.drops,
+                    drop_retained: self.drop_retained,
+                    is_clone: true,
+                }
+            }
+        }
+        impl Drop for Probe<'_> {
+            fn drop(&mut self) {
+                if self.is_clone {
+                    self.drops.set(self.drops.get() + 1);
+                    // Record instead of asserting while unwinding: the test
+                    // must report missing accounting without a double panic.
+                    self.drop_retained
+                        .set(self.account.snapshot().retained_bytes);
+                }
+            }
+        }
+
+        let account = MemoryAccount::new();
+        let clones = Cell::new(0);
+        let drops = Cell::new(0);
+        let drop_retained = Cell::new(0);
+        let source = std::array::from_fn::<_, 3, _>(|_| Probe {
+            account: &account,
+            clones: &clones,
+            drops: &drops,
+            drop_retained: &drop_retained,
+            is_clone: false,
+        });
+        let destination_bytes = data_offset_for::<Probe<'_>>() + mem::size_of_val(&source);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CompactArc::from_slice_in(&source, &account)
+        }));
+        assert!(result.is_err());
+        assert_eq!(clones.get(), 2);
+        assert_eq!(drops.get(), 1);
+        assert_eq!(drop_retained.get(), destination_bytes);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn exact_iterator_has_one_array_and_checks_dishonest_lengths() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::Arc;
+        struct Item(Arc<AtomicUsize>);
+        impl Drop for Item {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        struct Liar {
+            values: std::vec::IntoIter<Item>,
+            advertised: usize,
+            panic_after: Option<usize>,
+            seen: usize,
+        }
+        impl Iterator for Liar {
+            type Item = Item;
+            fn next(&mut self) -> Option<Item> {
+                if self.panic_after == Some(self.seen) {
+                    panic!("iterator next panic");
+                }
+                self.seen += 1;
+                self.values.next()
+            }
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                (self.advertised, Some(self.advertised))
+            }
+        }
+        impl ExactSizeIterator for Liar {}
+        let account = MemoryAccount::new();
+        for (actual, advertised, panic_after) in [(2, 4, None), (4, 2, None), (3, 3, Some(1))] {
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let values = (0..actual)
+                .map(|_| Item(dropped.clone()))
+                .collect::<Vec<_>>();
+            let iterator = Liar {
+                values: values.into_iter(),
+                advertised,
+                panic_after,
+                seen: 0,
+            };
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                CompactArc::from_exact_iter_in(iterator, &account);
+            }))
+            .is_err());
+            assert_eq!(dropped.load(AtomicOrdering::Relaxed), actual);
+            assert_eq!(account.snapshot().retained_bytes, 0);
+        }
+        let values = CompactArc::from_exact_iter_in([1usize, 2, 3].into_iter(), &account);
+        assert_eq!(&*values, &[1, 2, 3]);
+        assert!(!values.is_fully_accounted());
+        assert_eq!(account.snapshot().retained_bytes, values.allocation_size());
+        drop(values);
+        let empty = CompactArc::<[usize]>::from_exact_iter_in([].into_iter(), &account);
+        assert!(empty.is_empty());
+        drop(empty);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn exact_iterator_accounts_callbacks_and_destructor_unwind() {
+        use std::sync::Arc;
+        let account = MemoryAccount::new();
+        let values = [1usize, 2, 3].into_iter().inspect(|_| {
+            assert!(account.snapshot().retained_bytes > 0);
+        });
+        let array = CompactArc::from_exact_iter_in(values, &account);
+        assert_eq!(account.snapshot().retained_bytes, array.allocation_size());
+        drop(array);
+
+        struct Item(MemoryAccount, Arc<AtomicUsize>);
+        impl Drop for Item {
+            fn drop(&mut self) {
+                assert!(self.0.snapshot().retained_bytes > 0);
+                self.1.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+        }
+        struct PanicDrop(std::vec::IntoIter<Item>);
+        impl Iterator for PanicDrop {
+            type Item = Item;
+            fn next(&mut self) -> Option<Item> {
+                self.0.next()
+            }
+            fn size_hint(&self) -> (usize, Option<usize>) {
+                self.0.size_hint()
+            }
+        }
+        impl ExactSizeIterator for PanicDrop {}
+        impl Drop for PanicDrop {
+            fn drop(&mut self) {
+                panic!("iterator drop panic");
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let values = (0..3)
+            .map(|_| Item(account.clone(), dropped.clone()))
+            .collect::<Vec<_>>();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CompactArc::from_exact_iter_in(PanicDrop(values.into_iter()), &account);
+        }))
+        .is_err());
+        assert_eq!(dropped.load(AtomicOrdering::Relaxed), 3);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn charged_str_and_high_alignment_raw_owners_release_exactly() {
+        #[repr(align(128))]
+        #[derive(Clone, Debug, PartialEq)]
+        struct Aligned([u8; 129]);
+        let account = MemoryAccount::new();
+        let value = CompactArc::new_in(Aligned([7; 129]), &account);
+        let bytes = value.allocation_size();
+        let raw = CompactArc::into_raw(value);
+        assert_eq!(raw.addr() % 128, 0);
+        let restored = unsafe { CompactArc::from_raw(raw) };
+        assert_eq!(account.snapshot().retained_bytes, bytes);
+        assert_eq!(CompactArc::try_unwrap(restored).unwrap(), Aligned([7; 129]));
+        assert_eq!(account.snapshot().retained_bytes, 0);
+        let text = CompactArc::from_str_slice_in("charged UTF-8: İstanbul", &account);
+        let bytes = text.allocation_size();
+        let other = text.clone();
+        drop(text);
+        assert_eq!(account.snapshot().retained_bytes, bytes);
+        assert_eq!(&*other, "charged UTF-8: İstanbul");
+        drop(other);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn charged_cow_and_unwrap_keep_nested_heap_aliases() {
+        #[derive(Clone, Debug)]
+        struct Container {
+            child: super::super::SmartString,
+        }
+        let account = MemoryAccount::new();
+        let child = super::super::SmartString::new("nested child survives COW and unwrap")
+            .into_hot(&account);
+        let child_bytes = account.snapshot().retained_bytes;
+        let mut value = CompactArc::new_in(Container { child }, &account);
+        let outer_bytes = value.allocation_size();
+        value.mark_fully_accounted();
+        let previous = value.clone();
+        assert_eq!(
+            CompactArc::make_mut(&mut value).child.as_str(),
+            "nested child survives COW and unwrap"
+        );
+        assert!(!value.is_fully_accounted());
+        assert_eq!(
+            account.snapshot().retained_bytes,
+            child_bytes + 2 * outer_bytes
+        );
+        let owned = CompactArc::try_unwrap(value).unwrap();
+        drop(previous);
+        assert_eq!(account.snapshot().retained_bytes, child_bytes);
+        assert_eq!(owned.child.as_str(), "nested child survives COW and unwrap");
+        drop(owned);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn accounted_aliases_release_only_final_allocation() {
+        let account = MemoryAccount::new();
+        let values = CompactArc::from_vec_in(vec![1u64, 2, 3], &account);
+        let bytes = values.allocation_size();
+        assert_eq!(account.snapshot().retained_bytes, bytes);
+        let alias = values.clone();
+        drop(values);
+        assert_eq!(account.snapshot().retained_bytes, bytes);
+        assert_eq!(&*alias, &[1, 2, 3]);
+        drop(alias);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn raw_round_trip_unwrap_and_mutable_escape_keep_correct_charge() {
+        let account = MemoryAccount::new();
+        let mut value = CompactArc::new_in(42usize, &account);
+        let bytes = value.allocation_size();
+        value.mark_fully_accounted();
+        assert!(value.is_fully_accounted());
+        *CompactArc::get_mut(&mut value).unwrap() = 43;
+        assert!(!value.is_fully_accounted());
+        value.mark_fully_accounted();
+        let raw = CompactArc::into_raw(value);
+        let mut value = unsafe { CompactArc::from_raw(raw) };
+        assert!(value.is_fully_accounted());
+        let previous = value.clone();
+        *CompactArc::make_mut(&mut value) = 44;
+        assert!(!value.is_fully_accounted());
+        assert!(previous.is_fully_accounted());
+        assert_eq!(account.snapshot().retained_bytes, 2 * bytes);
+        assert_eq!(CompactArc::try_unwrap(value).unwrap(), 44);
+        assert_eq!(account.snapshot().retained_bytes, bytes);
+        drop(previous);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+        let mut unique = CompactArc::new_in(1usize, &account);
+        unique.mark_fully_accounted();
+        CompactArc::make_mut(&mut unique);
+        assert!(!unique.is_fully_accounted());
+    }
+
+    #[test]
+    fn panicking_destructor_still_frees_header_and_charge() {
+        struct Panicking;
+        impl Drop for Panicking {
+            fn drop(&mut self) {
+                panic!("expected destructor panic");
+            }
+        }
+        let account = MemoryAccount::new();
+        let value = CompactArc::new_in(Panicking, &account);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(value))).is_err());
+        assert_eq!(account.snapshot().retained_bytes, 0);
+        let values = CompactArc::from_vec_in(vec![Panicking], &account);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(values))).is_err());
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn nested_string_alias_outlives_parent_array() {
+        let account = MemoryAccount::new();
+        let text = super::super::SmartString::new("nested heap backing remains retained")
+            .into_hot(&account);
+        let string_bytes = account.snapshot().retained_bytes;
+        let alias = text.clone();
+        let values = CompactArc::from_vec_in(vec![text], &account);
+        assert!(!values.is_fully_accounted());
+        values.mark_fully_accounted();
+        assert!(values.is_fully_accounted());
+        drop(values);
+        assert_eq!(account.snapshot().retained_bytes, string_bytes);
+        drop(alias);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
     fn test_new_and_deref() {
         let arc = CompactArc::new(42);
         assert_eq!(*arc, 42);
@@ -1120,8 +1681,11 @@ mod tests {
 
     #[test]
     fn test_header_size() {
-        // Header should be exactly 16 bytes (refcount + len, no dropper)
-        assert_eq!(std::mem::size_of::<Header>(), 16);
+        // Three pointer words: refcount, length, optional account.
+        assert_eq!(
+            std::mem::size_of::<Header>(),
+            3 * std::mem::size_of::<usize>()
+        );
     }
 
     #[test]

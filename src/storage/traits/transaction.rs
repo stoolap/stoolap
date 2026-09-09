@@ -46,6 +46,23 @@ use crate::storage::traits::{QueryResult, Table};
 /// tx.commit()?;
 /// ```
 pub trait Transaction: Send {
+    /// Capture one statement lease: a fresh cutoff for read committed, or
+    /// the transaction's original begin cutoff for snapshot isolation.
+    fn capture_read_epoch(&self) -> Result<Option<crate::storage::mvcc::registry::ReadEpoch>> {
+        Ok(None)
+    }
+
+    /// Get a table using the caller's already registered statement lease.
+    fn get_table_in_epoch(
+        &self,
+        name: &str,
+        epoch: &crate::storage::mvcc::registry::ReadEpoch,
+    ) -> Result<Box<dyn Table>> {
+        let mut table = self.get_table(name)?;
+        table.set_read_epoch(epoch.clone())?;
+        Ok(table)
+    }
+
     /// Begins the transaction
     fn begin(&mut self) -> Result<()>;
 

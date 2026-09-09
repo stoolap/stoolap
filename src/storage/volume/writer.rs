@@ -1191,6 +1191,9 @@ impl VolumeMeta {
 /// This is the in-memory representation. Serialization to/from disk
 /// is handled by io.rs (V4 format).
 pub struct FrozenVolume {
+    /// Shared file identity/retention lease, without an idle file descriptor.
+    /// Set before publication and preserved across every residency transition.
+    pub(crate) backing: std::sync::OnceLock<Arc<super::io::VolumeFile>>,
     /// Column data stored as typed arrays with lazy decompression
     pub columns: LazyColumns,
     /// Shared metadata (zone maps, bloom filters, stats, row IDs, etc.)
@@ -1646,6 +1649,7 @@ impl VolumeBuilder {
         };
 
         FrozenVolume {
+            backing: std::sync::OnceLock::new(),
             columns: LazyColumns::eager(columns, column_types.clone()),
             meta: Arc::new(VolumeMeta {
                 zone_maps: self.zone_maps,
@@ -2053,12 +2057,25 @@ impl FrozenVolume {
         !self.columns.is_eager() && !self.columns.has_compressed_store()
     }
 
+    /// Reload this exact captured identity, retaining runtime schema aliases
+    /// and the existing unique-index cache. Called outside transfer fences.
+    pub(crate) fn reload_from_backing(&self) -> crate::core::Result<FrozenVolume> {
+        let backing = self.backing.get().ok_or_else(|| {
+            crate::core::Error::internal("cold volume has no captured file backing")
+        })?;
+        let mut loaded = super::io::read_volume_file(backing.clone())?;
+        loaded.meta = self.meta.clone();
+        loaded.unique_indices = self.unique_indices.clone();
+        Ok(loaded)
+    }
+
     /// Create a warm-tier volume: shares metadata via Arc (zero copy),
     /// shares compressed store via Arc, drops decompressed columns.
     /// Scanners use per-group decompression from RAM (~1ms per column per group).
     pub fn to_warm(&self) -> Option<FrozenVolume> {
         let store = self.columns.compressed_store_arc()?.clone();
         Some(FrozenVolume {
+            backing: self.backing.clone(),
             columns: LazyColumns::deferred_shared(store, self.meta.column_types.clone()),
             meta: Arc::clone(&self.meta),
             unique_indices: Arc::clone(&self.unique_indices),
@@ -2074,6 +2091,7 @@ impl FrozenVolume {
     /// Must reload from disk to scan.
     pub fn to_cold(&self) -> FrozenVolume {
         FrozenVolume {
+            backing: self.backing.clone(),
             columns: LazyColumns::metadata_only(self.meta.column_types.clone()),
             meta: Arc::clone(&self.meta),
             unique_indices: Arc::clone(&self.unique_indices),

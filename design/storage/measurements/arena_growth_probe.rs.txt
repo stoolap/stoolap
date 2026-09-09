@@ -1,0 +1,81 @@
+// Copyright 2026 Stoolap Contributors
+// Licensed under the Apache License, Version 2.0.
+
+use stoolap::storage::mvcc::arena;
+use stoolap::{common, core};
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+struct Moving;
+static ENABLED: AtomicBool = AtomicBool::new(false);
+static LIVE: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+fn add(n: usize) {
+    if ENABLED.load(Ordering::Relaxed) {
+        let total = LIVE.fetch_add(n as isize, Ordering::Relaxed) + n as isize;
+        PEAK.fetch_max(total.max(0) as usize, Ordering::Relaxed);
+    }
+}
+fn sub(n: usize) {
+    if ENABLED.load(Ordering::Relaxed) {
+        LIVE.fetch_sub(n as isize, Ordering::Relaxed);
+    }
+}
+unsafe impl GlobalAlloc for Moving {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc(l) };
+        if !p.is_null() {
+            add(l.size());
+        }
+        p
+    }
+    unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        let p = unsafe { System.alloc_zeroed(l) };
+        if !p.is_null() {
+            add(l.size());
+        }
+        p
+    }
+    unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        unsafe { System.dealloc(p, l) };
+        sub(l.size());
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
+        let next = Layout::from_size_align(n, l.align()).unwrap();
+        let q = unsafe { System.alloc(next) };
+        if !q.is_null() {
+            add(n);
+            unsafe {
+                std::ptr::copy_nonoverlapping(p, q, l.size().min(n));
+                System.dealloc(p, l)
+            };
+            sub(l.size());
+        }
+        q
+    }
+}
+#[global_allocator]
+static ALLOC: Moving = Moving;
+fn main() {
+    use common::{CompactArc, MemoryAccount};
+    let data = CompactArc::from_slice(&[core::Value::integer(1)]);
+    ENABLED.store(true, Ordering::Relaxed);
+    let account = MemoryAccount::new();
+    let arena = arena::RowArena::with_account(0, &account);
+    for row in 0..4097 {
+        arena.insert_arc(row, 1, data.clone(), None).unwrap();
+    }
+    let allocation_peak = PEAK.load(Ordering::Relaxed);
+    let live = LIVE.load(Ordering::Relaxed);
+    let snapshot = account.snapshot();
+    ENABLED.store(false, Ordering::Relaxed);
+    println!("allocation_live={live} allocation_peak={allocation_peak} retained={} accounted={} account_peak={}",snapshot.retained_bytes,snapshot.accounted_bytes,snapshot.peak_accounted_bytes);
+    assert!(
+        snapshot.accounted_bytes >= live as usize,
+        "retained count must cover live allocation"
+    );
+    assert!(
+        snapshot.peak_accounted_bytes >= allocation_peak,
+        "recorded hot peak misses moving-realloc overlap"
+    );
+}

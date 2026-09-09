@@ -149,6 +149,7 @@ impl Executor {
         stmt: &CreateTableStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _logical_change = self.engine.begin_logical_mutation();
         let table_name = &stmt.table_name.value;
 
         // Check if table already exists
@@ -601,6 +602,7 @@ impl Executor {
         stmt: &DropTableStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _logical_change = self.engine.begin_logical_mutation();
         let table_name = &stmt.table_name.value;
 
         // Check if table exists
@@ -649,6 +651,7 @@ impl Executor {
         stmt: &CreateIndexStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _logical_change = self.engine.begin_logical_mutation();
         let table_name = &stmt.table_name.value;
         let index_name = &stmt.index_name.value;
 
@@ -875,6 +878,7 @@ impl Executor {
         stmt: &DropIndexStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _logical_change = self.engine.begin_logical_mutation();
         let index_name = &stmt.index_name.value;
 
         // Get table name if specified
@@ -922,6 +926,7 @@ impl Executor {
         stmt: &AlterTableStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _logical_change = self.engine.begin_logical_mutation();
         let table_name = &stmt.table_name.value;
 
         // Check if table exists
@@ -1129,6 +1134,7 @@ impl Executor {
         stmt: &CreateViewStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _logical_change = self.engine.begin_logical_mutation();
         let view_name = &stmt.view_name.value;
 
         // Check if a table with the same name exists
@@ -1152,6 +1158,7 @@ impl Executor {
         stmt: &DropViewStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _logical_change = self.engine.begin_logical_mutation();
         let view_name = &stmt.view_name.value;
 
         // Drop the view (engine handles if_exists logic)

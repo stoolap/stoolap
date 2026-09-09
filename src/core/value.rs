@@ -104,6 +104,34 @@ pub enum Value {
 pub const NULL_VALUE: Value = Value::Null(DataType::Null);
 
 impl Value {
+    /// Adopt independently shared immutable backings without changing this
+    /// Value. Foreign backing needs an owned replacement in the caller.
+    pub(crate) fn try_adopt_hot(&self, account: &crate::common::memory::MemoryAccount) -> bool {
+        use crate::common::memory::MemoryAdoption;
+        match self {
+            Self::Text(text) => text.try_adopt_hot(account) != MemoryAdoption::ForeignEngine,
+            Self::Extension(bytes) => {
+                bytes.try_adopt_shallow(account) != MemoryAdoption::ForeignEngine
+            }
+            _ => true,
+        }
+    }
+
+    pub(crate) fn into_hot(self, account: &crate::common::memory::MemoryAccount) -> Self {
+        use crate::common::memory::MemoryAdoption;
+        match self {
+            Self::Text(text) => Self::Text(text.into_hot(account)),
+            Self::Extension(bytes) => {
+                if bytes.try_adopt_shallow(account) == MemoryAdoption::ForeignEngine {
+                    Self::Extension(CompactArc::from_slice_in(bytes.as_ref(), account))
+                } else {
+                    Self::Extension(bytes)
+                }
+            }
+            value => value,
+        }
+    }
+
     // =========================================================================
     // Constructors
     // =========================================================================
@@ -1513,6 +1541,63 @@ fn compare_floats(a: f64, b: f64) -> Ordering {
 mod tests {
     use super::*;
     use chrono::{Datelike, Timelike};
+
+    #[test]
+    fn hot_inline_values_need_no_retained_allocation() {
+        let account = crate::common::MemoryAccount::new();
+        let before = account.snapshot();
+        for value in [
+            Value::null_unknown(),
+            Value::integer(4),
+            Value::float(1.5),
+            Value::boolean(true),
+            Value::text("inline"),
+        ] {
+            let expected = value.clone();
+            assert!(value.try_adopt_hot(&account));
+            assert_eq!(value.into_hot(&account), expected);
+        }
+        assert_eq!(account.snapshot(), before);
+    }
+
+    #[test]
+    fn hot_extension_copy_keeps_type_bytes_and_final_owner_charge() {
+        use crate::common::MemoryAccount;
+        for source in [
+            Value::json(r#"{"n":123}"#),
+            Value::vector(vec![1.0, -2.5, 0.0]),
+        ] {
+            let first = MemoryAccount::new();
+            let second = MemoryAccount::new();
+            let first_value = source.clone().into_hot(&first);
+            let second_value = source.clone().into_hot(&second);
+            assert_eq!(source, first_value);
+            assert_eq!(source, second_value);
+            assert_eq!(source.data_type(), second_value.data_type());
+            let Value::Extension(first_bytes) = first_value else {
+                unreachable!()
+            };
+            let Value::Extension(second_bytes) = second_value else {
+                unreachable!()
+            };
+            assert!(!CompactArc::ptr_eq(&first_bytes, &second_bytes));
+            assert_eq!(
+                first.snapshot().retained_bytes,
+                first_bytes.allocation_size()
+            );
+            assert_eq!(
+                second.snapshot().retained_bytes,
+                second_bytes.allocation_size()
+            );
+            drop(first_bytes);
+            assert!(first.snapshot().retained_bytes > 0);
+            drop(source);
+            assert_eq!(first.snapshot().retained_bytes, 0);
+            assert!(second.snapshot().retained_bytes > 0);
+            drop(second_bytes);
+            assert_eq!(second.snapshot().retained_bytes, 0);
+        }
+    }
 
     // =========================================================================
     // Size verification tests

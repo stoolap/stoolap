@@ -29,6 +29,7 @@ pub mod cow_btree;
 pub mod cow_hashmap;
 pub mod i64_map;
 pub mod maps;
+pub mod memory;
 pub mod smart_string;
 pub mod time_compat;
 pub mod version;
@@ -43,6 +44,7 @@ pub use i64_map::{I64Map, I64Set};
 pub use maps::{
     new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CowBTreeMap, StringMap, StringSet,
 };
+pub use memory::{MemoryAccount, MemoryAdoption, MemoryCharge, MemorySnapshot};
 pub use smart_string::SmartString;
 pub use version::{version, version_info, SemVer, BUILD_TIME, GIT_COMMIT, MAJOR, MINOR, PATCH};
 
