@@ -10,7 +10,7 @@ independently reviewable without claiming unmerged work is shipped.
 | 1 | Fallible access and complete statement rollback | Implemented; local gates passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
 | 2 | Chunked arena and retained-hot accounting | Pending | Pending | — |
 | 3 | Coherent two-layer execution | Pending | Pending | — |
-| 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
+| 4 | V5 envelope and bounded streaming seal | Format foundations implemented; seal integration pending | Foundations passed independent review | — |
 | 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |
 | 6 | Paged reads, four ledgers and DML preflight | Pending | Pending | — |
 | 7 | Explicit clustering and compatibility fallback | Pending | Pending | — |
@@ -88,3 +88,33 @@ baseline. No hard memory bound or competitor claim follows from this probe.
 The exact fixture, source digest, medians, ranges and limitations are recorded
 in [measurements](measurements/README.md). Clippy with FFI and failpoints,
 no-default compilation and final targeted tests passed.
+
+## Phase 4 foundations
+
+The V5 envelope, bounded directory codecs, positioned page I/O, directory
+lookup/walker, column payloads, explicit group ranges and row/source identity
+pages are implemented. Production emission remains disabled. Payloads retain
+borrowed typed access, including a lossless timestamp path: ordinary timestamps
+use eight-byte nanoseconds; wide dates and leap seconds use twelve-byte
+seconds/subseconds. Group-local text dictionaries and plain text are supported.
+
+Directory construction accepts sorted descriptors with fixed caller scratch.
+An external descriptor sorter now supplies that order without retaining every
+descriptor: caller-sized in-place runs, two scratch streams, fixed read/write
+batches and deterministic adjacent merge passes. Logical spool lengths exclude
+stale tails; each record has a checksum. File ownership, reservations and
+durability remain the caller's responsibility. No module opens or deletes files.
+
+Independent review and re-review passed after fixing UTF-8 rescans, exact deep
+directory validation, timestamp range/leap preservation and mixed legacy/new
+source conversion. Current V5 tests pass 73/73. Allocation integrations pass
+6/6 for shared envelope/directory/identity operations, 2/2 for columns and 1/1
+for external descriptor sorting, all with zero allocation calls inside the
+measured codec operations. Caller-owned scratch and test backing storage are
+outside those allocation meters; these results do not prove an engine budget.
+All-target clippy with test failpoints passes.
+
+The stage remains incomplete: bounded payload capture/spill, actual streaming
+seal integration, reservation ownership, durable identity activation and
+replacement of the eager V4 readback path are still required. The actual cold
+reader and engine-wide admission guarantee remain later integration gates.
