@@ -23,8 +23,10 @@
 //! Group bytes mean the SUM of decoded column pages plus the actual group
 //! metadata page (64 bytes), row-ID page (32+8*n) and source page (32+8*n).
 //! Directory pages are separately reserved. Plain variable encoding is explicit;
-//! dictionary inputs are never silently converted. Initial emission uses Raw
-//! pages and requires their full decoded sizes to fit stored-page limits too.
+//! dictionary inputs are never silently converted. Emission uses Raw
+//! pages or explicit caller-reserved LZ4 compression with an incompressible Raw
+//! fallback. Planning conservatively requires full decoded sizes to fit stored
+//! page limits even when compression is requested.
 //! Candidate sizing scans each bounded batch once: exact per-row payload/lane
 //! costs and rounded group overhead, with conservative 12-byte timestamp lanes.
 //! Final groups are encoded-sized exactly. Timestamp groups may be smaller than
@@ -45,11 +47,13 @@ use std::fmt;
 use std::io::{Seek, SeekFrom, Write};
 
 use chrono::{DateTime, Utc};
+use lz4_flex::block::CompressTable;
 
 use super::column_block::{
     ColumnEncodePlan, ColumnError, ColumnExpectation, ColumnIdentity, ColumnLimits, MAX_BLOCK_ROWS,
     MAX_DECODED_BYTES,
 };
+use super::compression::{CompressionError, CompressionPlan};
 use super::directory::{Layout, RowBounds, VolumeShape, ROOT_SUMMARY_BYTES};
 use super::directory_writer::ENCODING_BYTES;
 use super::envelope::{Header, ReadLimits};
@@ -74,6 +78,7 @@ const GROUP_LANE_BYTES: u64 = 16;
 pub enum CoordinatorError {
     Spool(SpoolError),
     Column(ColumnError),
+    Compression(CompressionError),
     Payload(PayloadError),
     Configuration,
     BufferTooSmall,
@@ -99,6 +104,11 @@ impl From<SpoolError> for CoordinatorError {
 impl From<ColumnError> for CoordinatorError {
     fn from(v: ColumnError) -> Self {
         Self::Column(v)
+    }
+}
+impl From<CompressionError> for CoordinatorError {
+    fn from(v: CompressionError) -> Self {
+        Self::Compression(v)
     }
 }
 impl From<PayloadError> for CoordinatorError {
@@ -483,6 +493,13 @@ fn exact_group_bytes<R: ReadAt + ?Sized>(
     Ok(decoded)
 }
 
+/// Optional column compression reuses a caller-reserved output and LZ4 table.
+/// The decoded column, output and table coexist and all belong in the budget.
+pub struct CompressionScratch<'a> {
+    pub output: &'a mut [u8],
+    pub table: &'a mut CompressTable,
+}
+
 pub struct EmissionScratch<'a> {
     pub positions: &'a mut [RowPosition],
     pub row_ids: &'a mut [i64],
@@ -491,10 +508,12 @@ pub struct EmissionScratch<'a> {
     pub payload_window: &'a mut [u8],
     pub plan_input: &'a mut [u8],
     pub encoding: &'a mut [u8],
+    pub compression: Option<CompressionScratch<'a>>,
     pub column: ColumnScratch<'a>,
 }
 
-/// Emit planned Raw payload pages. The caller's destination must be empty at
+/// Emit planned payload pages with optional caller-reserved compression.
+/// The caller's destination must be empty at
 /// offset zero, and the descriptor sink exclusive and empty. Later directory
 /// completion/publication remains the existing separate checked operation.
 #[allow(clippy::too_many_arguments)]
@@ -549,6 +568,22 @@ pub fn emit_payloads<
             .group_decoded_bytes
             .min(plan.config.columns.decoded_bytes),
     )?;
+    if !spool.binding().columns.is_empty() {
+        if let Some(compression) = scratch.compression.as_ref() {
+            // Reserve for the configured maximum before emitting the header.
+            // Per-page compression must never grow its output or upgrade its
+            // table after planning has accepted the caller's reservation.
+            let bound =
+                CompressionPlan::new(plan.config.columns.decoded_bytes, &plan.config.pages)?;
+            if compression.output.len() < bound.output_capacity() {
+                return Err(CompressionError::OutputTooShort.into());
+            }
+            if bound.requires_large_table() && matches!(compression.table, CompressTable::Small(_))
+            {
+                return Err(CompressionError::LargeTableRequired.into());
+            }
+        }
+    }
     let mut sorted = SortedRows::new(sorted_source, plan.runs, scratch.sorted_io)?;
     let mut reader = SpoolReader::new(payload_source, spool, scratch.payload_window)?;
     let mut groups = PlanReader {
@@ -619,7 +654,17 @@ pub fn emit_payloads<
                     .encoded_len() as u64,
                 )
                 .ok_or(CoordinatorError::Overflow)?;
-            writer.write_column(gathered.nulls, gathered.input, scratch.encoding)?;
+            if let Some(compression) = scratch.compression.as_mut() {
+                writer.write_column_compressed(
+                    gathered.nulls,
+                    gathered.input,
+                    scratch.encoding,
+                    compression.output,
+                    compression.table,
+                )?;
+            } else {
+                writer.write_column(gathered.nulls, gathered.input, scratch.encoding)?;
+            }
         }
         if decoded != group.decoded_bytes {
             return Err(CoordinatorError::Coverage);

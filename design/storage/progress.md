@@ -300,8 +300,8 @@ Rounded NULL maps and fixed overhead stay exact; timestamps and a lower column
 cap may conservatively underpack. Exact one-row sizing preserves fitting narrow
 timestamps. Oversized existing rows fail before V5 emission and remain retained.
 
-All 117 V5 units pass; two actual-file allocation/reopen tests process an
-8,193-row, 64,282,760-byte spool using 2,795,416 or 3,229,080 bytes of reserved
+The original 117 V5 units pass; the two Raw actual-file allocation/reopen tests
+process an 8,193-row, 64,282,760-byte spool using 2,795,544 or 3,229,208 bytes of reserved
 caller scratch, within their 16/64 MiB caps. The measured pipeline performs zero
 allocation calls after preparation. Reverse physical order still amplifies reads:
 planning reads about 593–595 MB and emission about 464–465 MB. This cost is
@@ -313,8 +313,19 @@ corrected using the repository edition. The Windows rename fixture now verifies
 old aliases after an open-handle PermissionDenied and retries after lease release;
 its Windows runtime gate remains CI because local C cross dependencies lack GCC.
 
+Optional coordinator compression now reserves its maximum output and reusable
+LZ4 table before emitting the header. No dependency table upgrade or output growth
+can occur inside the operation. Incompressible pages retain the Raw fallback.
+Two new unit tests cover unchanged output on insufficient reservations and exact
+Raw/compressed payload equivalence including random vectors and NULL. A third
+actual-file allocation/reopen test uses 3,965,381 bytes of caller scratch and zero
+allocation calls for the same 64 MB spool. The highly repetitive fixture produces
+a 475,572-byte complete file; this is not a general compression or latency claim.
+Independent source review passes. The final 119 V5 units with test failpoints,
+three allocation/reopen tests, all-target/all-feature Clippy and Rust 1.88
+all-target/all-feature compilation pass.
+
 The stage remains incomplete: actual hot capture, job reservation ownership,
 durable identity activation and replacement of the eager V4 seal call path are
-still required. Plain/raw coordinator emission is explicit; compression and
-large-value integration remain activation work. Actual cold readers and the
+still required. Large-value integration remains activation work. Actual cold readers and the
 engine-wide admission guarantee remain later integration gates.

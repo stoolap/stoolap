@@ -184,6 +184,7 @@ impl Scratch {
             payload_window: &mut self.window,
             plan_input: &mut self.plan,
             encoding: &mut self.encoding,
+            compression: None,
             column: ColumnScratch {
                 spans: &mut self.spans,
                 nulls: &mut self.nulls,
@@ -218,6 +219,146 @@ fn planned(bytes: &[u8]) -> Vec<PlannedGroup> {
         .iter()
         .map(|b| PlannedGroup::decode(b).unwrap())
         .collect()
+}
+
+#[test]
+fn compression_reservations_fail_before_header_or_descriptor_io() {
+    let columns = specs(&[DataType::Integer]);
+    let (payload, sorted, runs) = fixture(&columns, &[(1, vec![Value::Integer(7)])]);
+    let mut config = config(1, 8192);
+    config.columns.decoded_bytes = 65_535;
+    config.pages.page_stored_bytes = 65_535;
+    config.pages.page_decoded_bytes = 65_535;
+    let mut scratch = Scratch::new(1);
+    scratch.encoding.resize(65_535, 0);
+    let mut boundary = Cursor::new(Vec::new());
+    let plan = plan_groups(
+        &Bytes(&sorted),
+        &Bytes(&payload),
+        &mut boundary,
+        runs,
+        config,
+        &mut scratch.planning(),
+    )
+    .unwrap();
+    let capacity = CompressionPlan::new(config.columns.decoded_bytes, &config.pages)
+        .unwrap()
+        .output_capacity();
+    let mut output = vec![0xa5; capacity];
+    let mut table = CompressTable::small();
+    for (len, expected) in [
+        (capacity - 1, CompressionError::OutputTooShort),
+        (capacity, CompressionError::LargeTableRequired),
+    ] {
+        let mut file = vec![7; 19];
+        let mut entries = Entries::default();
+        let mut emission = scratch.emission();
+        emission.compression = Some(CompressionScratch {
+            output: &mut output[..len],
+            table: &mut table,
+        });
+        assert!(matches!(
+            emit_payloads(&Bytes(&sorted), &Bytes(&payload), &Bytes(boundary.get_ref()),
+                &mut file, header(), None, plan, &mut entries, &mut emission),
+            Err(CoordinatorError::Compression(error)) if error == expected
+        ));
+        assert_eq!(file, [7; 19]);
+        assert!(entries.0.is_empty());
+        assert!(output.iter().all(|&byte| byte == 0xa5));
+        assert!(matches!(table, CompressTable::Small(_)));
+    }
+}
+
+#[test]
+fn compressed_and_incompressible_columns_match_raw_payloads_exactly() {
+    use super::super::envelope::Codec;
+    let columns = specs(&[DataType::Vector]);
+    let mut state = 0x1234_5678_9abc_def0u64;
+    let random = (0..16_384)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            f32::from_bits(state as u32)
+        })
+        .collect();
+    let rows = [
+        (1, vec![Value::vector(vec![0.; 16_384])]),
+        (2, vec![Value::vector(random)]),
+        (3, vec![Value::Null(DataType::Vector)]),
+    ];
+    let (payload, sorted, runs) = fixture(&columns, &rows);
+    let mut config = config(1, 131_072);
+    config.columns.decoded_bytes = 131_072;
+    config.pages.page_stored_bytes = 131_072;
+    config.pages.page_decoded_bytes = 131_072;
+    let mut scratch = Scratch::new(1);
+    scratch.encoding.resize(131_072, 0);
+    scratch.bytes.resize(131_072, 0);
+    let mut boundary = Cursor::new(Vec::new());
+    let plan = plan_groups(
+        &Bytes(&sorted),
+        &Bytes(&payload),
+        &mut boundary,
+        runs,
+        config,
+        &mut scratch.planning(),
+    )
+    .unwrap();
+    let mut output = vec![
+        0;
+        CompressionPlan::new(config.columns.decoded_bytes, &config.pages)
+            .unwrap()
+            .output_capacity()
+    ];
+    let mut table = CompressTable::large();
+    let mut files = [Vec::new(), Vec::new()];
+    let mut descriptors = [Entries::default(), Entries::default()];
+    for compress in [false, true] {
+        let mut emission = scratch.emission();
+        if compress {
+            emission.compression = Some(CompressionScratch {
+                output: &mut output,
+                table: &mut table,
+            });
+        }
+        emit_payloads(
+            &Bytes(&sorted),
+            &Bytes(&payload),
+            &Bytes(boundary.get_ref()),
+            &mut files[usize::from(compress)],
+            header(),
+            None,
+            plan,
+            &mut descriptors[usize::from(compress)],
+            &mut emission,
+        )
+        .unwrap();
+    }
+    assert_eq!(descriptors[0].0.len(), descriptors[1].0.len());
+    let mut decoded = vec![0; 131_072];
+    for (raw, compressed) in descriptors[0].0.iter().zip(&descriptors[1].0) {
+        assert_eq!(raw.key, compressed.key);
+        assert_eq!(raw.page.decoded_len, compressed.page.decoded_len);
+        let expected = page(&files[0], raw);
+        let bytes = &files[1][compressed.page.offset as usize
+            ..(compressed.page.offset + compressed.page.stored_len) as usize];
+        assert_eq!(crc32fast::hash(bytes), compressed.page.stored_checksum);
+        match compressed.page.codec {
+            Codec::Raw => assert_eq!(bytes, expected),
+            Codec::Lz4Block => {
+                let len = lz4_flex::block::decompress_into(bytes, &mut decoded).unwrap();
+                assert_eq!(&decoded[..len], expected);
+            }
+        }
+        if raw.key.section == Section::ColumnBlocks as u16 {
+            match raw.key.ordinal {
+                0 => assert_eq!(compressed.page.codec, Codec::Lz4Block),
+                1 => assert_eq!(compressed.page.codec, Codec::Raw),
+                _ => {}
+            }
+        }
+    }
 }
 
 #[test]

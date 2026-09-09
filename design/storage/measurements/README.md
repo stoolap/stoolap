@@ -212,4 +212,12 @@ its 16 MiB/64 MiB test caps. These caps cover that caller scratch, not engine
 memory or RSS. Planning and emission still read roughly 1.06 GB combined because
 of reverse-order gather amplification; bounded memory is not sequential I/O.
 The late-large-column fixture checks linear work rather than repeated suffix
-validation. The coordinator is inactive and emits plain/raw pages explicitly.
+validation. The coordinator remains inactive. Optional LZ4 emission uses separately reserved
+output and a reusable table, with Raw fallback for incompressible pages. The same
+16 MiB-cap case reserves 3,965,381 bytes including the table’s measured 16,384-byte
+heap allocation, and performs zero allocations after preparation. The complete
+file is 475,572 bytes versus 63,433,362 bytes with Raw; the highly repetitive Text
+fixture makes this ratio specific to this input. It is not a latency measurement.
+All pages are reopened and decoded against independent expected values; a separate
+random-vector case proves Raw fallback and exact decoded equivalence. Old Raw-only
+measurements and their source hashes remain in the component record.

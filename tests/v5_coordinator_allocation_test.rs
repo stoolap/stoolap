@@ -17,9 +17,11 @@ use std::cell::Cell;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::num::NonZeroU64;
 
+use lz4_flex::block::CompressTable;
 use std::fs::File;
 use stoolap::core::{DataType, Value};
 use stoolap::storage::volume::v5::column_block::{ColumnBlockRef, ColumnCell, ColumnLimits};
+use stoolap::storage::volume::v5::compression::CompressionPlan;
 use stoolap::storage::volume::v5::directory::{
     DirectoryKey, LeafEntry, Section, GLOBAL_COLUMN, KEY_REQUIRED,
 };
@@ -44,27 +46,29 @@ use stoolap::storage::volume::v5::row_spool::{
 thread_local! {
     static TRACK: Cell<bool> = const { Cell::new(false) };
     static CALLS: Cell<usize> = const { Cell::new(0) };
+    static REQUESTED: Cell<usize> = const { Cell::new(0) };
 }
 struct Counting;
-fn count() {
+fn count(bytes: usize) {
     let _ = TRACK.try_with(|track| {
         if track.get() {
             CALLS.with(|calls| calls.set(calls.get() + 1));
+            REQUESTED.with(|requested| requested.set(requested.get() + bytes));
         }
     });
 }
 // Test-only shim forwards the exact allocation/deallocation to System.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        count();
+        count(layout.size());
         unsafe { System.alloc(layout) }
     }
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        count();
+        count(layout.size());
         unsafe { System.alloc_zeroed(layout) }
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, n: usize) -> *mut u8 {
-        count();
+        count(n);
         unsafe { System.realloc(ptr, layout, n) }
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -133,20 +137,26 @@ impl ReadAt for FileSource<'_> {
 }
 
 use stoolap::storage::volume::v5::coordinator::{
-    emit_payloads, plan_groups, BuildConfig, ColumnScratch, EmissionScratch, PlanningScratch,
+    emit_payloads, plan_groups, BuildConfig, ColumnScratch, CompressionScratch, EmissionScratch,
+    PlanningScratch,
 };
 use stoolap::storage::volume::v5::metadata_runs::{merge_pass as merge_descriptors, MergeScratch};
 
 #[test]
 fn files_stream_through_coordinator_within_16_mib_caller_scratch() {
-    pipeline(16 * 1024 * 1024, 512);
+    pipeline(16 * 1024 * 1024, 512, false);
 }
 #[test]
 fn files_stream_through_coordinator_within_64_mib_caller_scratch() {
-    pipeline(64 * 1024 * 1024, 4096);
+    pipeline(64 * 1024 * 1024, 4096, false);
 }
 
-fn pipeline(scratch_limit: usize, batch: usize) {
+#[test]
+fn files_compress_through_coordinator_within_16_mib_caller_scratch() {
+    pipeline(16 * 1024 * 1024, 512, true);
+}
+
+fn pipeline(scratch_limit: usize, batch: usize, compress: bool) {
     const ROWS: usize = 8193;
     const CAP: usize = 1024 * 1024;
     // File opening, schema, a SINGLE reusable captured value, and all caller
@@ -198,6 +208,29 @@ fn pipeline(scratch_limit: usize, batch: usize) {
     let mut strings = vec![0; CAP];
     let mut offsets = vec![(0, 0); batch];
     let mut encoding = vec![0; CAP];
+    let pages = ReadLimits {
+        root_stored_bytes: 128,
+        root_decoded_bytes: 128,
+        page_stored_bytes: CAP as u64,
+        page_decoded_bytes: CAP as u64,
+    };
+    let mut compressed = vec![
+        0;
+        if compress {
+            CompressionPlan::new(CAP, &pages).unwrap().output_capacity()
+        } else {
+            0
+        }
+    ];
+    // Measure the dependency's actual table reservation, then reset the meter
+    // before the complete producer operation. No assumed table layout/size.
+    REQUESTED.with(|n| n.set(0));
+    CALLS.with(|n| n.set(0));
+    TRACK.with(|t| t.set(true));
+    let mut table = compress.then(CompressTable::large);
+    TRACK.with(|t| t.set(false));
+    let table_heap = REQUESTED.with(Cell::get);
+    assert_eq!(CALLS.with(Cell::get), usize::from(compress));
     let dummy = LeafEntry {
         key: DirectoryKey {
             section: Section::RowIds as u16,
@@ -252,14 +285,11 @@ fn pipeline(scratch_limit: usize, batch: usize) {
         .sum::<usize>()
         + size_of::<MergeScratch>()
         + size_of::<DirectoryScratch>()
+        + compressed.capacity()
+        + table_heap
+        + size_of::<Option<CompressTable>>()
         + 4096; // reserved margin; compiler call-stack/RSS is outside this scratch bound
     assert!(reserved <= scratch_limit, "{reserved} > {scratch_limit}");
-    let pages = ReadLimits {
-        root_stored_bytes: 128,
-        root_decoded_bytes: 128,
-        page_stored_bytes: CAP as u64,
-        page_decoded_bytes: CAP as u64,
-    };
     let config = BuildConfig {
         rows: batch as u32,
         group_decoded_bytes: CAP,
@@ -371,6 +401,10 @@ fn pipeline(scratch_limit: usize, batch: usize) {
             payload_window: &mut read_window,
             plan_input: &mut plan_io,
             encoding: &mut encoding,
+            compression: table.as_mut().map(|table| CompressionScratch {
+                output: &mut compressed,
+                table,
+            }),
             column: ColumnScratch {
                 spans: &mut spans,
                 nulls: &mut nulls,
@@ -413,8 +447,9 @@ fn pipeline(scratch_limit: usize, batch: usize) {
         summary.byte_len().div_ceil(write_buffer.len() as u64)
     );
     eprintln!(
-        "coordinator scratch cap={scratch_limit}, reserved={reserved}, rows={ROWS}, groups={}, allocations=0; spool={} bytes / {} writes; planning={} reads / {} bytes; emission={} reads / {} bytes",
+        "coordinator compress={compress}, scratch cap={scratch_limit}, reserved={reserved}, table_heap={table_heap}, rows={ROWS}, groups={}, allocations=0; volume={} bytes; spool={} bytes / {} writes; planning={} reads / {} bytes; emission={} reads / {} bytes",
         shape.group_count,
+        volume.metadata().unwrap().len(),
         summary.byte_len(),
         payload.writes,
         planning_calls,
@@ -441,6 +476,7 @@ fn pipeline(scratch_limit: usize, batch: usize) {
     let mut lookup =
         DirectoryLookup::new(&source, opened.footer, root, pages, &mut nodes, &mut []).unwrap();
     let mut seen = 0u64;
+    let mut compressed_pages = 0;
     for group in 0..shape.group_count {
         let entry = lookup
             .find(KeyIdentity {
@@ -519,9 +555,10 @@ fn pipeline(scratch_limit: usize, batch: usize) {
                 .unwrap()
                 .unwrap();
             decoded_sum += entry.page.decoded_len;
+            compressed_pages += usize::from(entry.page.codec == Codec::Lz4Block);
             let bytes = PageReadPlan::for_page(&opened.footer, entry.page, &pages)
                 .unwrap()
-                .read_into(&source, &mut encoding, &mut [])
+                .read_into(&source, &mut encoding, &mut strings)
                 .unwrap();
             let expected = expected
                 .column(column as u32, spec.data_type, spec.vector_dimensions)
@@ -542,4 +579,5 @@ fn pipeline(scratch_limit: usize, batch: usize) {
     }
 
     assert_eq!(seen, ROWS as u64);
+    assert_eq!(compressed_pages > 0, compress);
 }
