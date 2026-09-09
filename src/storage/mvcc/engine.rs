@@ -8529,16 +8529,26 @@ impl TransactionEngineOperations for EngineOperations {
         limits.admission_waits.fetch_add(1, Ordering::Relaxed);
         limits.seal_requested.store(true, Ordering::Release);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let retry_interval = std::time::Duration::from_millis(100);
+        let mut next_request = std::time::Instant::now() + retry_interval;
         let mut guard = limits.admission.0.lock().unwrap();
         while over() {
             let now = std::time::Instant::now();
             if now >= deadline {
                 break;
             }
+            // A checkpoint can consume the request without freeing enough
+            // rows while an older read/build lease is alive. Lease release
+            // does not notify admission, so retry until the existing deadline.
+            // Rate-limit requests even when no-progress checkpoints wake us.
+            if now >= next_request {
+                limits.seal_requested.store(true, Ordering::Release);
+                next_request = now + retry_interval;
+            }
             guard = limits
                 .admission
                 .1
-                .wait_timeout(guard, deadline - now)
+                .wait_timeout(guard, (deadline - now).min(next_request - now))
                 .unwrap()
                 .0;
         }
@@ -8549,6 +8559,84 @@ impl TransactionEngineOperations for EngineOperations {
 mod tests {
     use super::*;
     use crate::core::{DataType, IndexType, Row, SchemaBuilder, Value};
+
+    #[test]
+    fn hot_admission_retries_after_a_pinning_reader_releases() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::Database::open(&format!(
+            "file://{}?checkpoint_interval=3600&hot_max_rows=0&hot_max_bytes=200000",
+            dir.path().display()
+        ))
+        .unwrap();
+        let engine = Arc::clone(db.engine());
+        // Drive the first background checkpoint synchronously so its consumed
+        // request and no-progress notification cannot race reader release.
+        if let Some(mut handle) = engine.cleanup_handle.lock().unwrap().take() {
+            handle.stop();
+        }
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, body TEXT)", ())
+            .unwrap();
+        let epoch = engine.registry.capture_read_epoch();
+        db.execute("INSERT INTO t VALUES (1, ?)", ("x".repeat(220_000),))
+            .unwrap();
+        let store = engine.get_version_store("t").unwrap();
+        let pinned_bytes = store.hot_bytes();
+        assert!(pinned_bytes >= 200_000);
+
+        let writer_db = db.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            sender
+                .send(writer_db.execute("INSERT INTO t VALUES (2, 'later')", ()))
+                .unwrap();
+        });
+        let started = Instant::now();
+        while engine.hot_limits.admission_waits.load(Ordering::Relaxed) == 0 {
+            assert!(started.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(engine
+            .hot_limits
+            .seal_requested
+            .swap(false, Ordering::AcqRel));
+        engine.checkpoint_cycle_inner(false).unwrap();
+        assert_eq!(store.hot_bytes(), pinned_bytes);
+        assert!(engine.volume_stats().is_empty());
+        assert!(receiver.try_recv().is_err());
+
+        drop(epoch);
+        engine.start_cleanup();
+        let progress = receiver.recv_timeout(Duration::from_secs(3));
+        if progress.is_err() {
+            // Let the original implementation's waiter exit promptly after a
+            // failure, instead of leaving a detached ten-second commit behind.
+            engine
+                .hot_limits
+                .seal_requested
+                .store(true, Ordering::Release);
+            receiver
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+        }
+        writer.join().unwrap();
+        progress
+            .expect("reader release must trigger another seal before the ten-second fallback")
+            .unwrap();
+        assert!(store.hot_bytes() < 200_000);
+        assert_eq!(
+            db.query("SELECT COUNT(*) FROM t", ())
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .get::<i64>(0)
+                .unwrap(),
+            2
+        );
+    }
 
     #[test]
     fn retained_store_truncate_coordinator_does_not_retain_transaction_cache() {

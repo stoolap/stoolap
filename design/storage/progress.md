@@ -8,7 +8,7 @@ independently reviewable without claiming unmerged work is shipped.
 |---|---|---|---|---|
 | 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
 | 1 | Fallible access and complete statement rollback | Implemented; local gates and CI passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
-| 2 | Chunked arena and retained-hot accounting | Implemented; local gates passed; final CI running | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) (draft) |
+| 2 | Chunked arena and retained-hot accounting | Implemented; local gates and CI passed | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) |
 | 3 | Coherent two-layer execution | Implemented; local gates passed; final CI running | Passed after corrections | [#118](https://github.com/stoolap/stoolap/pull/118) (draft) |
 | 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
 | 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |
@@ -135,8 +135,8 @@ index-wrapper fixture failures; forwarding the underlying allocation account
 fixed both, and all 11 tests in that target passed. The resulting revision also
 passes the complete Linux, macOS and Windows CI test jobs. Final counter/inline
 owner changes pass all 2,136 serial failpoint-enabled library tests, all-target/
-all-feature Clippy, Rust 1.88 all-feature and no-default compilation. Their
-remote CI rerun remains the final readiness gate.
+all-feature Clippy, Rust 1.88 all-feature and no-default compilation. All final remote CI checks pass, including Linux, macOS, Windows, coverage,
+MSRV, lint, feature and release checks; PR #117 is ready for review.
 
 Five alternating pairs for each lifecycle case pass the predeclared latency
 and noise rule. INSERT allocation calls fall 2.69–2.70%, while warm aggregate
@@ -196,4 +196,17 @@ residual costs (+11.11% short narrow, +3.80% long p50), retained with the measur
 noise ranges rather than hidden by the aggregate improvements. The failed
 pre-optimization warm-query comparison remains in the report. Exact source,
 raw measurements and memory tradeoffs are in [measurements](measurements/README.md).
-Final remote CI remains the readiness gate.
+Remote CI then exposed a consumed pressure-seal request while an older reader
+prevented progress. Releasing the reader did not rearm the request. A bounded
+100 ms retry fixes the actual admission loop without relaxing fixed cutoffs,
+the existing deadline or test limits. Its deterministic regression failed
+before the correction and passes in default/failpoint configurations afterward;
+70 unchanged hot-limit test executions and the fixed-build regression pass.
+Independent source review and all-target/all-feature Clippy pass.
+
+Independent recalculation of all raw summaries and final source/binary/fixture
+identities passes. All three final-source five-pair comparisons pass again. Warm aggregate p50
+improves 24.65–29.74%, with 41.94% fewer allocation calls. INSERT p50 changes
++7.24% narrow, -3.92% wide and +1.90% long. Concurrent writer and cold-start
+residual costs remain in the report with their noise ranges; both earlier
+comparisons are preserved. The remote CI rerun remains the readiness gate.
