@@ -22,6 +22,8 @@
 
 use std::mem::MaybeUninit;
 
+use super::{MemoryAccount, MemoryAdoption, MemoryCharge};
+
 const MIN_CAPACITY: usize = 8;
 const LOAD_FACTOR_NUM: usize = 3;
 const LOAD_FACTOR_DEN: usize = 4;
@@ -52,11 +54,13 @@ pub struct I64Map<V> {
     /// beside the table. Callers hand this map keys derived from user
     /// data, so the full i64 range must be storable.
     min_slot: Option<V>,
+    // The slots and their values are freed before releasing this buffer charge.
+    charge: Option<MemoryCharge>,
 }
 
 impl<V: Clone> Clone for I64Map<V> {
     fn clone(&self) -> Self {
-        let mut new_map = Self::with_capacity(self.len);
+        let mut new_map = Self::with_optional_account(self.len, self.memory_account());
         for (key, value) in self.iter() {
             new_map.insert(key, value.clone());
         }
@@ -105,6 +109,18 @@ impl<V> I64Map<V> {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_optional_account(capacity, None)
+    }
+
+    pub fn new_in(account: &MemoryAccount) -> Self {
+        Self::with_capacity_in(0, account)
+    }
+
+    pub fn with_capacity_in(capacity: usize, account: &MemoryAccount) -> Self {
+        Self::with_optional_account(capacity, Some(account))
+    }
+
+    fn with_optional_account(capacity: usize, account: Option<&MemoryAccount>) -> Self {
         let cap = if capacity == 0 {
             MIN_CAPACITY
         } else {
@@ -122,12 +138,40 @@ impl<V> I64Map<V> {
             })
             .collect();
 
+        let slots = slots.into_boxed_slice();
+        let charge =
+            account.map(|account| MemoryCharge::new(account, std::mem::size_of_val(&*slots)));
         Self {
-            slots: slots.into_boxed_slice(),
+            slots,
             len: 0,
             mask: cap - 1,
             min_slot: None,
+            charge,
         }
+    }
+
+    /// Bytes in the physical slot buffer; values' separate allocations retain
+    /// their own ownership accounting. Unused capacity is included.
+    #[inline]
+    pub fn allocation_size(&self) -> usize {
+        std::mem::size_of_val(&*self.slots)
+    }
+
+    pub fn memory_account(&self) -> Option<&MemoryAccount> {
+        self.charge.as_ref().map(MemoryCharge::account)
+    }
+
+    /// Attach only the physical buffer; values own their separate allocations.
+    pub fn attach_memory_account(&mut self, account: &MemoryAccount) -> MemoryAdoption {
+        if let Some(origin) = self.memory_account() {
+            return if origin.same_engine(account) {
+                MemoryAdoption::AlreadyOwned
+            } else {
+                MemoryAdoption::ForeignEngine
+            };
+        }
+        self.charge = Some(MemoryCharge::new(account, self.allocation_size()));
+        MemoryAdoption::Adopted
     }
 
     #[inline(always)]
@@ -173,7 +217,13 @@ impl<V> I64Map<V> {
             })
             .collect();
 
-        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
+        let new_slots = new_slots.into_boxed_slice();
+        // Charge both buffers during rehash and release the original charge after its slots.
+        let new_charge = self
+            .memory_account()
+            .map(|account| MemoryCharge::new(account, std::mem::size_of_val(&*new_slots)));
+        let old_slots = std::mem::replace(&mut self.slots, new_slots);
+        let old_charge = std::mem::replace(&mut self.charge, new_charge);
         let old_len = self.len;
         self.len = 0;
         self.mask = new_mask;
@@ -186,6 +236,8 @@ impl<V> I64Map<V> {
             }
         }
 
+        drop(old_slots);
+        drop(old_charge);
         debug_assert_eq!(self.len, old_len);
     }
 
@@ -413,7 +465,13 @@ impl<V> I64Map<V> {
             })
             .collect();
 
-        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
+        let new_slots = new_slots.into_boxed_slice();
+        // Charge both buffers during rehash and release the original charge after its slots.
+        let new_charge = self
+            .memory_account()
+            .map(|account| MemoryCharge::new(account, std::mem::size_of_val(&*new_slots)));
+        let old_slots = std::mem::replace(&mut self.slots, new_slots);
+        let old_charge = std::mem::replace(&mut self.charge, new_charge);
         let old_len = self.len;
         self.len = 0;
         self.mask = new_mask;
@@ -426,6 +484,7 @@ impl<V> I64Map<V> {
             }
         }
 
+        drop(old_charge);
         debug_assert_eq!(self.len, old_len);
     }
 
@@ -463,7 +522,13 @@ impl<V> I64Map<V> {
             })
             .collect();
 
-        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
+        let new_slots = new_slots.into_boxed_slice();
+        // Charge both buffers during rehash and release the original charge after its slots.
+        let new_charge = self
+            .memory_account()
+            .map(|account| MemoryCharge::new(account, std::mem::size_of_val(&*new_slots)));
+        let old_slots = std::mem::replace(&mut self.slots, new_slots);
+        let old_charge = std::mem::replace(&mut self.charge, new_charge);
         let old_len = self.len;
         self.len = 0;
         self.mask = new_mask;
@@ -476,6 +541,7 @@ impl<V> I64Map<V> {
             }
         }
 
+        drop(old_charge);
         debug_assert_eq!(self.len, old_len);
     }
 
@@ -949,6 +1015,8 @@ pub struct IntoIter<V> {
     pos: usize,
     min_slot: Option<V>,
     remaining: usize,
+    // Owning iteration transfers the buffer and its final-drop obligation.
+    _charge: Option<MemoryCharge>,
 }
 
 impl<V> Iterator for IntoIter<V> {
@@ -1015,6 +1083,7 @@ impl<V> IntoIterator for I64Map<V> {
             pos: 0,
             min_slot,
             remaining,
+            _charge: self.charge.take(),
         }
     }
 }
@@ -1044,11 +1113,12 @@ pub struct I64Set {
     /// of band. Callers pass user data (join keys, IN lists), so the set
     /// must accept the full i64 range instead of panicking.
     has_min: bool,
+    charge: Option<MemoryCharge>,
 }
 
 impl Clone for I64Set {
     fn clone(&self) -> Self {
-        let mut new_set = Self::with_capacity(self.len);
+        let mut new_set = Self::with_optional_account(self.len, self.memory_account());
         for key in self.iter() {
             new_set.insert(key);
         }
@@ -1076,6 +1146,18 @@ impl I64Set {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_optional_account(capacity, None)
+    }
+
+    pub fn new_in(account: &MemoryAccount) -> Self {
+        Self::with_capacity_in(0, account)
+    }
+
+    pub fn with_capacity_in(capacity: usize, account: &MemoryAccount) -> Self {
+        Self::with_optional_account(capacity, Some(account))
+    }
+
+    fn with_optional_account(capacity: usize, account: Option<&MemoryAccount>) -> Self {
         let cap = if capacity == 0 {
             MIN_CAPACITY
         } else {
@@ -1088,12 +1170,37 @@ impl I64Set {
 
         let slots: Vec<i64> = vec![EMPTY; cap];
 
+        let slots = slots.into_boxed_slice();
+        let charge =
+            account.map(|account| MemoryCharge::new(account, std::mem::size_of_val(&*slots)));
         Self {
-            slots: slots.into_boxed_slice(),
+            slots,
             len: 0,
             mask: cap - 1,
             has_min: false,
+            charge,
         }
+    }
+
+    pub fn allocation_size(&self) -> usize {
+        std::mem::size_of_val(&*self.slots)
+    }
+
+    pub fn memory_account(&self) -> Option<&MemoryAccount> {
+        self.charge.as_ref().map(MemoryCharge::account)
+    }
+
+    /// Attach only the physical buffer; values own their separate allocations.
+    pub fn attach_memory_account(&mut self, account: &MemoryAccount) -> MemoryAdoption {
+        if let Some(origin) = self.memory_account() {
+            return if origin.same_engine(account) {
+                MemoryAdoption::AlreadyOwned
+            } else {
+                MemoryAdoption::ForeignEngine
+            };
+        }
+        self.charge = Some(MemoryCharge::new(account, self.allocation_size()));
+        MemoryAdoption::Adopted
     }
 
     #[inline(always)]
@@ -1133,7 +1240,12 @@ impl I64Set {
         let new_mask = new_cap - 1;
 
         let new_slots: Vec<i64> = vec![EMPTY; new_cap];
-        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
+        let new_slots = new_slots.into_boxed_slice();
+        let new_charge = self
+            .memory_account()
+            .map(|account| MemoryCharge::new(account, std::mem::size_of_val(&*new_slots)));
+        let old_slots = std::mem::replace(&mut self.slots, new_slots);
+        let old_charge = std::mem::replace(&mut self.charge, new_charge);
         let old_len = self.len;
         self.len = 0;
         self.mask = new_mask;
@@ -1144,6 +1256,8 @@ impl I64Set {
             }
         }
 
+        drop(old_slots);
+        drop(old_charge);
         debug_assert_eq!(self.len, old_len);
     }
 
@@ -1298,7 +1412,12 @@ impl I64Set {
         let new_mask = new_cap - 1;
 
         let new_slots: Vec<i64> = vec![EMPTY; new_cap];
-        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
+        let new_slots = new_slots.into_boxed_slice();
+        let new_charge = self
+            .memory_account()
+            .map(|account| MemoryCharge::new(account, std::mem::size_of_val(&*new_slots)));
+        let old_slots = std::mem::replace(&mut self.slots, new_slots);
+        let old_charge = std::mem::replace(&mut self.charge, new_charge);
         let old_len = self.len;
         self.len = 0;
         self.mask = new_mask;
@@ -1309,6 +1428,8 @@ impl I64Set {
             }
         }
 
+        drop(old_slots);
+        drop(old_charge);
         debug_assert_eq!(self.len, old_len);
     }
 
@@ -1340,7 +1461,12 @@ impl I64Set {
         let new_mask = new_cap - 1;
 
         let new_slots: Vec<i64> = vec![EMPTY; new_cap];
-        let old_slots = std::mem::replace(&mut self.slots, new_slots.into_boxed_slice());
+        let new_slots = new_slots.into_boxed_slice();
+        let new_charge = self
+            .memory_account()
+            .map(|account| MemoryCharge::new(account, std::mem::size_of_val(&*new_slots)));
+        let old_slots = std::mem::replace(&mut self.slots, new_slots);
+        let old_charge = std::mem::replace(&mut self.charge, new_charge);
         let old_len = self.len;
         self.len = 0;
         self.mask = new_mask;
@@ -1351,6 +1477,8 @@ impl I64Set {
             }
         }
 
+        drop(old_slots);
+        drop(old_charge);
         debug_assert_eq!(self.len, old_len);
     }
 
@@ -1383,18 +1511,21 @@ impl I64Set {
         // Hand the storage to the iterator instead of clearing lazily:
         // a drain dropped half-way used to leave the slots populated
         // while len said the set was empty, so contains() still matched
-        let old_slots = std::mem::replace(
-            &mut self.slots,
-            vec![EMPTY; MIN_CAPACITY].into_boxed_slice(),
-        );
+        let new_slots = vec![EMPTY; MIN_CAPACITY].into_boxed_slice();
+        let new_charge = self
+            .memory_account()
+            .map(|account| MemoryCharge::new(account, std::mem::size_of_val(&*new_slots)));
+        let old_slots = std::mem::replace(&mut self.slots, new_slots);
+        let old_charge = std::mem::replace(&mut self.charge, new_charge);
         let had_min = std::mem::replace(&mut self.has_min, false);
         self.len = 0;
         self.mask = MIN_CAPACITY - 1;
-        old_slots
-            .into_vec()
-            .into_iter()
-            .filter(|&slot| slot != EMPTY)
-            .chain(if had_min { Some(EMPTY) } else { None })
+        I64SetIntoIter {
+            slots: old_slots,
+            pos: 0,
+            has_min: had_min,
+            _charge: old_charge,
+        }
     }
 }
 
@@ -1407,6 +1538,7 @@ impl IntoIterator for I64Set {
             slots: self.slots,
             pos: 0,
             has_min: self.has_min,
+            _charge: self.charge,
         }
     }
 }
@@ -1416,6 +1548,7 @@ pub struct I64SetIntoIter {
     slots: Box<[i64]>,
     pos: usize,
     has_min: bool,
+    _charge: Option<MemoryCharge>,
 }
 
 impl Iterator for I64SetIntoIter {
@@ -1517,7 +1650,7 @@ impl<V> Drop for Drain<'_, V> {
         // for that batch.
         let cap = self.map.slots.len();
         if cap > MIN_SHRINK_CAPACITY && self.start_len < cap / SHRINK_DIVISOR {
-            *self.map = I64Map::with_capacity(self.start_len);
+            *self.map = I64Map::with_optional_account(self.start_len, self.map.memory_account());
         }
     }
 }
@@ -2475,5 +2608,177 @@ mod tests {
         set.clear();
         assert!(set.is_empty());
         assert!(!set.contains(i64::MIN));
+    }
+}
+
+#[cfg(test)]
+mod allocation_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn set_attachment_growth_drain_and_iterator_preserve_ownership() {
+        let root = MemoryAccount::new();
+        let baseline = root.snapshot().accounted_bytes;
+        let origin = root.child();
+        let mut set = I64Set::new();
+        assert_eq!(set.attach_memory_account(&origin), MemoryAdoption::Adopted);
+        assert_eq!(
+            set.attach_memory_account(&origin),
+            MemoryAdoption::AlreadyOwned
+        );
+        assert_eq!(
+            set.attach_memory_account(&MemoryAccount::new()),
+            MemoryAdoption::ForeignEngine
+        );
+        for key in [1, 2, i64::MIN] {
+            set.insert(key);
+        }
+        let before = root.snapshot().accounted_bytes;
+        set.reserve(1000);
+        assert_eq!(root.snapshot().retained_bytes, set.allocation_size());
+        assert_eq!(
+            root.snapshot().peak_accounted_bytes,
+            before + set.allocation_size()
+        );
+        let clone = set.clone();
+        let cloned_bytes = clone.allocation_size();
+        let old_bytes = set.allocation_size();
+        {
+            let mut drain = set.drain();
+            assert!(drain.next().is_some());
+            assert_eq!(
+                root.snapshot().retained_bytes,
+                old_bytes + cloned_bytes + MIN_CAPACITY * std::mem::size_of::<i64>()
+            );
+        }
+        assert_eq!(
+            root.snapshot().retained_bytes,
+            set.allocation_size() + cloned_bytes
+        );
+        drop(set);
+        let mut iterator = clone.into_iter();
+        drop(origin);
+        for _ in iterator.by_ref() {}
+        assert_eq!(root.snapshot().retained_bytes, cloned_bytes);
+        drop(iterator);
+        assert_eq!(root.snapshot().accounted_bytes, baseline);
+    }
+
+    #[test]
+    fn buffers_keep_origin_through_growth_clone_drain_and_owning_iteration() {
+        let root = MemoryAccount::new();
+        let root_baseline = root.snapshot().accounted_bytes;
+        let origin = root.child();
+        let mut map = I64Map::new_in(&origin);
+        let old_bytes = map.allocation_size();
+        let before_growth = root.snapshot().accounted_bytes;
+        for key in [0, 1, i64::MIN] {
+            map.insert(key, key);
+        }
+        assert_eq!(root.snapshot().retained_bytes, old_bytes);
+        map.reserve(1000);
+        let grown_bytes = map.allocation_size();
+        assert_eq!(root.snapshot().retained_bytes, grown_bytes);
+        assert_eq!(
+            root.snapshot().peak_accounted_bytes,
+            before_growth + grown_bytes
+        );
+        assert_eq!(map.get(i64::MIN), Some(&i64::MIN));
+        let copy = map.clone();
+        assert!(copy.memory_account().unwrap().same_origin(&origin));
+        assert_eq!(
+            root.snapshot().retained_bytes,
+            grown_bytes + copy.allocation_size()
+        );
+        // A mostly unused pooled map releases its oversized allocation, retaining
+        // its origin for the small replacement buffer and subsequent growth.
+        drop(map.drain());
+        assert!(map.allocation_size() < grown_bytes);
+        assert!(map.memory_account().unwrap().same_origin(&origin));
+        assert_eq!(
+            root.snapshot().retained_bytes,
+            map.allocation_size() + copy.allocation_size()
+        );
+        let copy_bytes = copy.allocation_size();
+        let mut iterator = copy.into_iter();
+        assert!(iterator.next().is_some());
+        drop(map);
+        drop(origin);
+        assert_eq!(root.snapshot().retained_bytes, copy_bytes);
+        // Even an exhausted iterator keeps its slot allocation until Drop.
+        for _ in iterator.by_ref() {}
+        assert_eq!(root.snapshot().retained_bytes, copy_bytes);
+        drop(iterator);
+        assert_eq!(root.snapshot().retained_bytes, 0);
+        assert_eq!(root.snapshot().accounted_bytes, root_baseline);
+    }
+
+    #[test]
+    fn shrink_accounts_old_and_replacement_buffers_together() {
+        let root = MemoryAccount::new();
+        let mut map = I64Map::with_capacity_in(1000, &root);
+        map.insert(3, 3);
+        let old_bytes = map.allocation_size();
+        let before_shrink = root.snapshot().accounted_bytes;
+        map.shrink_to_fit();
+        assert!(map.allocation_size() < old_bytes);
+        assert_eq!(root.snapshot().retained_bytes, map.allocation_size());
+        assert_eq!(
+            root.snapshot().peak_accounted_bytes,
+            before_shrink + map.allocation_size()
+        );
+        assert_eq!(map.get(3), Some(&3));
+        let unchanged = root.snapshot();
+        map.insert(4, 4);
+        map.insert(3, 30);
+        map.remove(4);
+        map.clear();
+        let after = root.snapshot();
+        assert_eq!(after.retained_bytes, unchanged.retained_bytes);
+        assert_eq!(after.peak_accounted_bytes, unchanged.peak_accounted_bytes);
+        drop(map);
+        assert_eq!(root.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn final_map_and_iterator_value_drops_keep_the_buffer_charged() {
+        #[derive(Clone)]
+        struct Observe {
+            account: MemoryAccount,
+            count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl Drop for Observe {
+            fn drop(&mut self) {
+                assert!(
+                    self.account.snapshot().retained_bytes
+                        >= MIN_CAPACITY * std::mem::size_of::<Slot<Self>>()
+                );
+                self.count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let root = MemoryAccount::new();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for consume in [false, true] {
+            let mut map = I64Map::new_in(&root);
+            for key in [0, 1, i64::MIN] {
+                map.insert(
+                    key,
+                    Observe {
+                        account: root.clone(),
+                        count: count.clone(),
+                    },
+                );
+            }
+            if consume {
+                let mut iterator = map.into_iter();
+                drop(iterator.next());
+                drop(iterator);
+            } else {
+                drop(map);
+            }
+            assert_eq!(root.snapshot().retained_bytes, 0);
+        }
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 6);
     }
 }

@@ -38,7 +38,9 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use crate::common::{CompactArc, CompactVec, I64Map};
+use super::accounted_map::TrackedBTree;
+use super::memory::IndexMemory;
+use crate::common::{CompactArc, CompactVec, I64Map, MemoryAccount};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Index;
@@ -96,7 +98,7 @@ pub struct BTreeIndex {
     /// Sorted value to row IDs mapping (main index for range and equality queries)
     /// BTreeMap provides O(log n) lookups and efficient range iteration
     /// Uses CompactArc<Value> to share references with ValueArena (8 bytes per entry)
-    sorted_values: RwLock<BTreeMap<CompactArc<Value>, RowIdSet>>,
+    sorted_values: RwLock<TrackedBTree<CompactArc<Value>, RowIdSet>>,
 
     /// Row ID to value mapping (for removal operations)
     /// Uses I64Map for fast O(1) lookups with CompactArc<Value> (8 bytes per entry)
@@ -113,6 +115,7 @@ pub struct BTreeIndex {
 
     /// Reference ID counter
     next_ref_id: RwLock<i64>,
+    memory: IndexMemory,
 }
 
 impl BTreeIndex {
@@ -135,14 +138,12 @@ impl BTreeIndex {
         }
         let mut any_removed = false;
         for (arc_value, ids) in by_key {
-            if let Some(rows) = sorted_values.get_mut(&arc_value) {
+            sorted_values.mutate_remove_if(&arc_value, |rows| {
                 let before = rows.len();
                 super::subtract_sorted(rows, &ids);
                 any_removed |= rows.len() != before;
-                if rows.is_empty() {
-                    sorted_values.remove(&arc_value);
-                }
-            }
+                rows.is_empty()
+            });
         }
 
         drop(sorted_values);
@@ -176,7 +177,7 @@ impl BTreeIndex {
             data_type,
             unique,
             closed: AtomicBool::new(false),
-            sorted_values: RwLock::new(BTreeMap::new()),
+            sorted_values: RwLock::new(TrackedBTree::new()),
             row_to_value: RwLock::new(if expected_rows > 0 {
                 I64Map::with_capacity(expected_rows)
             } else {
@@ -186,6 +187,7 @@ impl BTreeIndex {
             cached_max: RwLock::new(None),
             cache_valid: AtomicBool::new(true),
             next_ref_id: RwLock::new(0),
+            memory: IndexMemory::default(),
         }
     }
 
@@ -425,6 +427,37 @@ impl BTreeIndex {
 }
 
 impl Index for BTreeIndex {
+    fn attach_memory_account(&mut self, account: &MemoryAccount) -> Result<()> {
+        if !self.memory.needs_attachment(account)? {
+            return Ok(());
+        }
+        for value in self.sorted_values.get_mut().keys() {
+            IndexMemory::adopt_value_arc(value, account)?;
+        }
+        for value in self.row_to_value.get_mut().values() {
+            IndexMemory::adopt_value_arc(value, account)?;
+        }
+        for value in [
+            self.cached_min.get_mut().as_ref(),
+            self.cached_max.get_mut().as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            IndexMemory::adopt_value_arc(value, account)?;
+        }
+        let metadata =
+            self.name.capacity() + self.table_name.capacity() + self.column_name.capacity();
+        self.memory.attach::<Self>(account, metadata);
+        self.sorted_values.get_mut().attach(account);
+        self.row_to_value.get_mut().attach_memory_account(account);
+        Ok(())
+    }
+
+    fn memory_account(&self) -> Option<&MemoryAccount> {
+        self.memory.account()
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -463,14 +496,12 @@ impl Index for BTreeIndex {
             }
             // Different value - remove old entry from sorted index
             let old_arc = old_arc.clone();
-            if let Some(rows) = sorted_values.get_mut(&old_arc) {
+            sorted_values.mutate_remove_if(&old_arc, |rows| {
                 if let Ok(pos) = rows.binary_search(&row_id) {
                     rows.remove(pos);
                 }
-                if rows.is_empty() {
-                    sorted_values.remove(&old_arc);
-                }
-            }
+                rows.is_empty()
+            });
         }
 
         // Check uniqueness constraint using BTreeMap O(log n) lookup
@@ -496,17 +527,18 @@ impl Index for BTreeIndex {
             CompactArc::clone(existing_arc)
         } else {
             // New unique value - create Arc once
-            CompactArc::new(value.clone())
+            self.memory.value_arc(value)
         };
 
         // Add to sorted index (for O(log n) range and equality queries)
         // Insert in sorted order for O(N+M) intersection/union without re-sorting
-        let btree_rows = sorted_values
+        let mut btree_rows = sorted_values
             .entry(CompactArc::clone(&arc_value))
             .or_default();
         if let Err(pos) = btree_rows.binary_search(&row_id) {
             btree_rows.insert(pos, row_id);
         }
+        drop(btree_rows);
 
         // Add to row -> value mapping (stores Arc reference)
         row_to_value.insert(row_id, arc_value);
@@ -540,14 +572,12 @@ impl Index for BTreeIndex {
         // Check if the row exists and remove atomically
         if let Some(arc_value) = row_to_value.remove(row_id) {
             // Remove from sorted index (row_ids are sorted, use binary search)
-            if let Some(rows) = sorted_values.get_mut(&arc_value) {
+            sorted_values.mutate_remove_if(&arc_value, |rows| {
                 if let Ok(pos) = rows.binary_search(&row_id) {
                     rows.remove(pos);
                 }
-                if rows.is_empty() {
-                    sorted_values.remove(&arc_value);
-                }
-            }
+                rows.is_empty()
+            });
 
             // Drop locks before invalidating cache
             drop(sorted_values);
@@ -651,30 +681,29 @@ impl Index for BTreeIndex {
                 }
                 // Different value - remove old entry
                 let old_arc = old_arc.clone();
-                if let Some(rows) = sorted_values.get_mut(&old_arc) {
+                sorted_values.mutate_remove_if(&old_arc, |rows| {
                     if let Ok(pos) = rows.binary_search(&row_id) {
                         rows.remove(pos);
                     }
-                    if rows.is_empty() {
-                        sorted_values.remove(&old_arc);
-                    }
-                }
+                    rows.is_empty()
+                });
             }
 
             // Try to reuse existing Arc if value exists (memory deduplication)
             let arc_value = if let Some((existing_arc, _)) = sorted_values.get_key_value(value) {
                 CompactArc::clone(existing_arc)
             } else {
-                CompactArc::new(value.clone())
+                self.memory.value_arc(value)
             };
 
             // Add to sorted index (sorted insertion)
-            let btree_rows = sorted_values
+            let mut btree_rows = sorted_values
                 .entry(CompactArc::clone(&arc_value))
                 .or_default();
             if let Err(pos) = btree_rows.binary_search(&row_id) {
                 btree_rows.insert(pos, row_id);
             }
+            drop(btree_rows);
 
             // Add to row_to_value
             row_to_value.insert(row_id, arc_value);

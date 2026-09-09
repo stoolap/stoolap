@@ -48,10 +48,113 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
 use ahash::AHashMap;
 use roaring::RoaringTreemap;
 
-use crate::common::{CompactArc, I64Map};
+use super::accounted_map::{btree_bound, HeapBytes, PrivateHeap, TrackedHash};
+use super::memory::IndexMemory;
+use crate::common::{CompactArc, I64Map, MemoryAccount, MemoryCharge};
+type BitmapMap = TrackedHash<CompactArc<Value>, AccountedBitmap, ahash::RandomState>;
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Index;
+
+/// Conservative bounds for a bitmap built only by point insertion and removal.
+#[derive(Default)]
+struct AccountedBitmap {
+    data: RoaringTreemap,
+    rows: usize,
+    blocks: usize,
+    groups: usize,
+    insert_allowance: usize,
+    directory_allowance: usize,
+}
+impl std::ops::Deref for AccountedBitmap {
+    type Target = RoaringTreemap;
+    fn deref(&self) -> &RoaringTreemap {
+        &self.data
+    }
+}
+impl PrivateHeap for AccountedBitmap {
+    const MUTATION_BOUND_SUPPLIED: bool = true;
+    fn private_heap(&self) -> HeapBytes {
+        let stores = self.blocks.saturating_mul(8192).min(self.insert_allowance);
+        let directories = self
+            .groups
+            .saturating_mul(65536 * 64)
+            .min(self.directory_allowance);
+        HeapBytes {
+            retained: 0,
+            conservative: stores
+                .saturating_add(directories)
+                .saturating_add(btree_bound::<u32, roaring::RoaringBitmap>(
+                    self.groups,
+                    self.rows != 0,
+                )),
+        }
+    }
+}
+impl AccountedBitmap {
+    fn contains_prefix(&self, value: u64, bits: u32) -> bool {
+        let mut values = self.data.iter();
+        values.advance_to((value >> bits) << bits);
+        values
+            .next()
+            .is_some_and(|next| next >> bits == value >> bits)
+    }
+
+    fn mutate(&mut self, value: u64, inserting: bool, account: Option<&MemoryAccount>) -> bool {
+        let new_block = inserting && !self.contains_prefix(value, 16);
+        let new_group = new_block && !self.contains_prefix(value, 32);
+        let mut extra: usize = if inserting { 24 * 1024 } else { 8 * 1024 };
+        if new_block {
+            extra = extra.saturating_add(
+                self.directory_allowance
+                    .saturating_mul(2)
+                    .saturating_add(256)
+                    .min(65536 * 64),
+            );
+        }
+        if new_group {
+            extra = extra.saturating_add(btree_bound::<u32, roaring::RoaringBitmap>(
+                self.groups.saturating_add(1),
+                true,
+            ));
+        }
+        let temporary = account.map(|account| MemoryCharge::conservative(account, extra));
+        let changed = if inserting {
+            self.data.insert(value)
+        } else {
+            self.data.remove(value)
+        };
+        if changed {
+            if inserting {
+                self.rows += 1;
+                self.blocks += usize::from(new_block);
+                self.groups += usize::from(new_group);
+                self.insert_allowance = self.insert_allowance.saturating_add(8);
+                if new_block {
+                    self.directory_allowance = self.directory_allowance.saturating_add(256);
+                }
+            } else {
+                self.rows -= 1;
+                if self.rows == 0 {
+                    *self = Self::default();
+                } else if !self.contains_prefix(value, 16) {
+                    self.blocks -= 1;
+                    if !self.contains_prefix(value, 32) {
+                        self.groups -= 1;
+                    }
+                }
+            }
+        }
+        drop(temporary);
+        changed
+    }
+    fn insert(&mut self, value: u64, account: Option<&MemoryAccount>) -> bool {
+        self.mutate(value, true, account)
+    }
+    fn remove(&mut self, value: u64, account: Option<&MemoryAccount>) -> bool {
+        self.mutate(value, false, account)
+    }
+}
 
 /// Warning threshold for cardinality
 const HIGH_CARDINALITY_WARNING_THRESHOLD: usize = 1000;
@@ -89,7 +192,7 @@ pub struct BitmapIndex {
     /// Maps CompactArc<Value> -> RoaringTreemap of row IDs (supports full u64 range)
     /// Uses CompactArc<Value> keys for memory efficiency (8 bytes per key)
     /// AHash for HashDoS resistance (user-controlled indexed values)
-    bitmaps: RwLock<AHashMap<CompactArc<Value>, RoaringTreemap>>,
+    bitmaps: RwLock<BitmapMap>,
 
     /// Reverse mapping: row_id -> CompactArc<Value> for efficient removal
     /// Uses I64Map for fast O(1) lookups and CompactArc<Value> (8 bytes per entry)
@@ -97,6 +200,7 @@ pub struct BitmapIndex {
 
     /// Track cardinality for warnings
     distinct_count: AtomicUsize,
+    memory: IndexMemory,
 }
 
 impl std::fmt::Debug for BitmapIndex {
@@ -139,13 +243,14 @@ impl BitmapIndex {
             data_types,
             is_unique,
             closed: AtomicBool::new(false),
-            bitmaps: RwLock::new(AHashMap::default()),
+            bitmaps: RwLock::new(BitmapMap::default()),
             row_to_value: RwLock::new(if expected_rows > 0 {
                 I64Map::with_capacity(expected_rows)
             } else {
                 I64Map::new()
             }),
             distinct_count: AtomicUsize::new(0),
+            memory: IndexMemory::default(),
         }
     }
 
@@ -164,7 +269,7 @@ impl BitmapIndex {
         // Intern value to get Arc for lookup
         let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
         let bitmaps = self.bitmaps.read();
-        bitmaps.get(&arc_key).cloned()
+        bitmaps.get(&arc_key).map(|bitmap| bitmap.data.clone())
     }
 
     /// Perform AND operation on multiple values (for multi-predicate queries)
@@ -177,8 +282,8 @@ impl BitmapIndex {
             let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
             if let Some(bitmap) = bitmaps.get(&arc_key) {
                 result = Some(match result {
-                    Some(r) => r & bitmap,
-                    None => bitmap.clone(),
+                    Some(r) => r & &bitmap.data,
+                    None => bitmap.data.clone(),
                 });
             } else {
                 // Value not found - result is empty
@@ -198,7 +303,7 @@ impl BitmapIndex {
         for value in values {
             let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
             if let Some(bitmap) = bitmaps.get(&arc_key) {
-                result |= bitmap;
+                result |= &bitmap.data;
             }
         }
 
@@ -215,12 +320,12 @@ impl BitmapIndex {
         // Get all row IDs (union of all bitmaps)
         let mut all_rows = RoaringTreemap::new();
         for bitmap in bitmaps.values() {
-            all_rows |= bitmap;
+            all_rows |= &bitmap.data;
         }
 
         // Subtract the matching bitmap
         if let Some(bitmap) = bitmaps.get(&arc_key) {
-            all_rows - bitmap
+            all_rows - &bitmap.data
         } else {
             all_rows
         }
@@ -247,6 +352,21 @@ impl BitmapIndex {
         }
     }
 
+    /// The lookup wrapper is fresh and uniquely owned. Reuse its allocation
+    /// when it becomes retained; only foreign nested backing needs a copy.
+    fn retain_fresh_key(&self, mut key: CompactArc<Value>) -> CompactArc<Value> {
+        if let Some(account) = self.memory.account() {
+            let Some(value) = CompactArc::get_mut(&mut key) else {
+                unreachable!("fresh bitmap key is uniquely owned");
+            };
+            let owned = std::mem::replace(value, Value::Null(DataType::Null));
+            *value = owned.into_hot(account);
+            let adoption = key.try_adopt_shallow(account);
+            debug_assert_ne!(adoption, crate::common::MemoryAdoption::ForeignEngine);
+        }
+        key
+    }
+
     /// Slow path for multi-column indexes (rare case)
     /// Creates composite key and handles add operation
     #[cold]
@@ -255,7 +375,7 @@ impl BitmapIndex {
         values: &[Value],
         row_id: i64,
         row_id_u64: u64,
-        mut bitmaps: parking_lot::RwLockWriteGuard<'_, AHashMap<CompactArc<Value>, RoaringTreemap>>,
+        mut bitmaps: parking_lot::RwLockWriteGuard<'_, BitmapMap>,
         mut row_to_value: parking_lot::RwLockWriteGuard<'_, I64Map<CompactArc<Value>>>,
     ) -> Result<()> {
         // Create composite key for multi-column lookup
@@ -286,21 +406,22 @@ impl BitmapIndex {
 
         // Check if row already exists with a different value
         if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
-            if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
-                if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
-                    old_bitmap.remove(row_id_u64);
-                    if old_bitmap.is_empty() {
-                        bitmaps.remove(&old_arc_key);
-                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                    }
-                }
+            if !CompactArc::ptr_eq(&old_arc_key, &arc_key)
+                && bitmaps.mutate_remove_if(&old_arc_key, |old_bitmap| {
+                    old_bitmap.remove(row_id_u64, self.memory.account());
+                    old_bitmap.is_empty()
+                })
+            {
+                self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
             }
         }
 
+        let arc_key = self.retain_fresh_key(arc_key);
         // Add to bitmap
         let is_new_value = !bitmaps.contains_key(&arc_key);
-        let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
-        bitmap.insert(row_id_u64);
+        let mut bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
+        bitmap.insert(row_id_u64, self.memory.account());
+        drop(bitmap);
 
         // Update reverse mapping
         row_to_value.insert(row_id, arc_key);
@@ -314,6 +435,35 @@ impl BitmapIndex {
 }
 
 impl Index for BitmapIndex {
+    fn attach_memory_account(&mut self, account: &MemoryAccount) -> Result<()> {
+        if !self.memory.needs_attachment(account)? {
+            return Ok(());
+        }
+        for key in self.bitmaps.get_mut().keys() {
+            IndexMemory::adopt_value_arc(key, account)?;
+        }
+        for key in self.row_to_value.get_mut().values() {
+            IndexMemory::adopt_value_arc(key, account)?;
+        }
+        let metadata = self.name.capacity()
+            + self.table_name.capacity()
+            + self.column_names.capacity() * std::mem::size_of::<String>()
+            + self
+                .column_names
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
+            + self.column_ids.capacity() * std::mem::size_of::<i32>()
+            + self.data_types.capacity() * std::mem::size_of::<DataType>();
+        self.memory.attach::<Self>(account, metadata);
+        self.bitmaps.get_mut().attach(account);
+        self.row_to_value.get_mut().attach_memory_account(account);
+        Ok(())
+    }
+    fn memory_account(&self) -> Option<&MemoryAccount> {
+        self.memory.account()
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -389,7 +539,7 @@ impl Index for BitmapIndex {
                 (CompactArc::clone(existing_arc), false)
             } else {
                 // New unique value - create Arc once
-                (CompactArc::new(lookup_value.clone()), true)
+                (self.memory.value_arc(lookup_value), true)
             };
 
         // Check if row already exists with a different value (for updates)
@@ -397,19 +547,19 @@ impl Index for BitmapIndex {
             // Compare Arc pointers - if same Arc, same value
             if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
                 // Remove from old bitmap
-                if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
-                    old_bitmap.remove(row_id_u64);
-                    if old_bitmap.is_empty() {
-                        bitmaps.remove(&old_arc_key);
-                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                    }
+                if bitmaps.mutate_remove_if(&old_arc_key, |old_bitmap| {
+                    old_bitmap.remove(row_id_u64, self.memory.account());
+                    old_bitmap.is_empty()
+                }) {
+                    self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
                 }
             }
         }
 
         // Add to bitmap
-        let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
-        bitmap.insert(row_id_u64);
+        let mut bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
+        bitmap.insert(row_id_u64, self.memory.account());
+        drop(bitmap);
 
         // Update reverse mapping with Arc reference
         row_to_value.insert(row_id, arc_key);
@@ -450,12 +600,11 @@ impl Index for BitmapIndex {
         let mut row_to_value = self.row_to_value.write();
 
         // Remove from bitmap
-        if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
-            bitmap.remove(row_id_u64);
-            if bitmap.is_empty() {
-                bitmaps.remove(&arc_key);
-                self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-            }
+        if bitmaps.mutate_remove_if(&arc_key, |bitmap| {
+            bitmap.remove(row_id_u64, self.memory.account());
+            bitmap.is_empty()
+        }) {
+            self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
         }
 
         // Remove from reverse mapping
@@ -559,27 +708,27 @@ impl Index for BitmapIndex {
                 if let Some((existing_arc, _)) = bitmaps.get_key_value(&arc_key) {
                     (CompactArc::clone(existing_arc), false)
                 } else {
-                    (arc_key, true)
+                    (self.retain_fresh_key(arc_key), true)
                 };
 
             // Handle update case - remove from old bitmap
             if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
-                if !CompactArc::ptr_eq(&old_arc_key, &final_arc_key) {
-                    if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
-                        old_bitmap.remove(row_id_u64);
-                        if old_bitmap.is_empty() {
-                            bitmaps.remove(&old_arc_key);
-                            self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                        }
-                    }
+                if !CompactArc::ptr_eq(&old_arc_key, &final_arc_key)
+                    && bitmaps.mutate_remove_if(&old_arc_key, |old_bitmap| {
+                        old_bitmap.remove(row_id_u64, self.memory.account());
+                        old_bitmap.is_empty()
+                    })
+                {
+                    self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
                 }
             }
 
             // Add to bitmap
-            let bitmap = bitmaps
+            let mut bitmap = bitmaps
                 .entry(CompactArc::clone(&final_arc_key))
                 .or_default();
-            bitmap.insert(row_id_u64);
+            bitmap.insert(row_id_u64, self.memory.account());
+            drop(bitmap);
 
             // Update reverse mapping
             row_to_value.insert(row_id, final_arc_key);
@@ -615,12 +764,11 @@ impl Index for BitmapIndex {
             let arc_key = self.value_to_arc_key(values);
 
             // Remove from bitmap
-            if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
-                bitmap.remove(row_id_u64);
-                if bitmap.is_empty() {
-                    bitmaps.remove(&arc_key);
-                    self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                }
+            if bitmaps.mutate_remove_if(&arc_key, |bitmap| {
+                bitmap.remove(row_id_u64, self.memory.account());
+                bitmap.is_empty()
+            }) {
+                self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
             }
 
             // Remove from reverse mapping
@@ -641,12 +789,11 @@ impl Index for BitmapIndex {
                 continue;
             }
             if let Some(arc_key) = row_to_value.remove(row_id) {
-                if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
-                    bitmap.remove(row_id as u64);
-                    if bitmap.is_empty() {
-                        bitmaps.remove(&arc_key);
-                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                    }
+                if bitmaps.mutate_remove_if(&arc_key, |bitmap| {
+                    bitmap.remove(row_id as u64, self.memory.account());
+                    bitmap.is_empty()
+                }) {
+                    self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
                 }
             }
         }
@@ -790,7 +937,7 @@ impl Index for BitmapIndex {
         let bitmaps = self.bitmaps.read();
         let mut all_rows = RoaringTreemap::new();
         for bitmap in bitmaps.values() {
-            all_rows |= bitmap;
+            all_rows |= &bitmap.data;
         }
         let _ = expr;
         let collected: Vec<i64> = all_rows.iter().map(|id| id as i64).collect();
@@ -1174,5 +1321,98 @@ mod tests {
         // Removal of negative row ID should also be rejected
         let result = index.remove(&[Value::Text("pending".into())], -1, 0);
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+    #[test]
+    fn sparse_dense_and_high_group_changes_preserve_conservative_bounds() {
+        let account = MemoryAccount::new();
+        let baseline = account.snapshot().conservative_bytes;
+        let mut maps = BitmapMap::default();
+        maps.attach(&account);
+        let key = CompactArc::new(Value::Integer(1));
+        for row in 0..4097u64 {
+            maps.entry(key.clone())
+                .or_default()
+                .insert(row, Some(&account));
+        }
+        maps.entry(key.clone())
+            .or_default()
+            .insert(1u64 << 48, Some(&account));
+        let bitmap = maps.get(&key).unwrap();
+        let bound = bitmap.private_heap().conservative;
+        // Roaring 0.11.3 reports u16 array slots as u32 bytes and bitsets in bits.
+        let reported: usize = bitmap
+            .data
+            .bitmaps()
+            .map(|(_, group)| {
+                let stats = group.statistics();
+                (stats.n_bytes_array_containers / 2 + stats.n_bytes_bitset_containers / 8) as usize
+            })
+            .sum();
+        assert!(bound >= reported);
+        assert_eq!((bitmap.rows, bitmap.blocks, bitmap.groups), (4098, 2, 2));
+        assert_eq!(account.snapshot().retained_bytes, maps.allocation_size());
+        maps.get_mut(&key)
+            .unwrap()
+            .remove(1u64 << 48, Some(&account));
+        maps.get_mut(&key).unwrap().remove(4096, Some(&account));
+        let bitmap = maps.get(&key).unwrap();
+        assert_eq!((bitmap.rows, bitmap.blocks, bitmap.groups), (4096, 1, 1));
+        assert!(bitmap.private_heap().conservative < bound);
+        for row in 0..4096u64 {
+            maps.get_mut(&key).unwrap().remove(row, Some(&account));
+        }
+        assert_eq!(maps.get(&key).unwrap().private_heap().conservative, 0);
+        maps.clear();
+        assert_eq!(account.snapshot().retained_bytes, maps.allocation_size());
+        drop(maps);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+        assert_eq!(account.snapshot().conservative_bytes, baseline);
+    }
+
+    #[test]
+    fn bitmap_bounds_cover_retained_arrays_and_repeated_group_churn() {
+        let mut bitmap = AccountedBitmap::default();
+        bitmap.insert(0, None);
+        let singleton = bitmap.private_heap().conservative;
+        assert!(singleton < 1024);
+        assert!(!bitmap.insert(0, None));
+        assert!(!bitmap.remove(1, None));
+        assert_eq!(bitmap.private_heap().conservative, singleton);
+        for group in 1..8u64 {
+            let start = group << 32;
+            for value in start..start + 4097 {
+                bitmap.insert(value, None);
+            }
+            for _ in 0..3 {
+                bitmap.remove(start + 4096, None);
+                bitmap.insert(start + 4096, None);
+            }
+            for value in start + 1..start + 4097 {
+                bitmap.remove(value, None);
+            }
+            let reported: usize = bitmap
+                .data
+                .bitmaps()
+                .map(|(_, group)| {
+                    let stats = group.statistics();
+                    (stats.n_bytes_array_containers / 2 + stats.n_bytes_bitset_containers / 8)
+                        as usize
+                })
+                .sum();
+            assert!(bitmap.private_heap().conservative >= reported);
+        }
+        for group in 1..8u64 {
+            bitmap.remove(group << 32, None);
+        }
+        assert_eq!((bitmap.rows, bitmap.blocks, bitmap.groups), (1, 1, 1));
+        bitmap.remove(0, None);
+        assert_eq!(bitmap.private_heap().conservative, 0);
+        bitmap.insert(0, None);
+        assert_eq!(bitmap.private_heap().conservative, singleton);
     }
 }

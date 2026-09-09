@@ -82,7 +82,7 @@ radsort = "0.1"  # Radix sort - O(n) for integer keys
 rand = "0.9"  # Random number generation for RANDOM() function
 ahash = "0.8"  # Fast hash for hash indexes (DOS-resistant)
 hashbrown = "0.16"  # HashMap with raw_entry API for efficient group-by
-roaring = "0.11"  # Compressed bitmap indexes (used by Lucene, Druid, Spark)
+roaring = "=0.11.3"  # Point-mutation memory bounds are verified against this version.
 lru = "0.16"  # O(1) LRU cache for compiled expression programs
 
 # Optional benchmark dependencies (for comparison benchmarks)

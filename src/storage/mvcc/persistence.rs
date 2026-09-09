@@ -486,9 +486,9 @@ impl PersistenceManager {
         row_id: i64,
         op: WALOperationType,
         version: &RowVersion,
-    ) -> Result<()> {
+    ) -> Result<Option<std::num::NonZeroU64>> {
         if !self.is_enabled() {
-            return Ok(());
+            return Ok(None);
         }
 
         let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
@@ -498,8 +498,7 @@ impl PersistenceManager {
 
         let entry = WALEntry::new(txn_id, table_name.to_string(), row_id, op, data);
 
-        wal.append_entry(entry)?;
-        Ok(())
+        Ok(std::num::NonZeroU64::new(wal.append_entry(entry)?))
     }
 
     /// Record a transaction commit

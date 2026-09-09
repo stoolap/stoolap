@@ -61,7 +61,14 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use rustc_hash::FxHashMap;
 
-use crate::common::{CompactArc, CompactVec, I64Map};
+use super::accounted_map::TrackedHash;
+use super::memory::IndexMemory;
+use crate::common::{CompactArc, CompactVec, I64Map, MemoryAccount};
+type HashValues = TrackedHash<
+    u64,
+    Vec<(Vec<CompactArc<Value>>, CompactVec<i64>)>,
+    std::hash::BuildHasherDefault<rustc_hash::FxHasher>,
+>;
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::{ComparisonExpr, Expression, InListExpr};
 use crate::storage::traits::Index;
@@ -119,7 +126,8 @@ pub struct HashIndex {
     /// Maps hash -> (values as CompactArc<Value>, row_ids) for collision resolution
     /// Uses CompactArc<Value> to share references with ValueArena (8 bytes per value)
     #[allow(clippy::type_complexity)]
-    hash_to_values: RwLock<FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, CompactVec<i64>)>>>,
+    hash_to_values: RwLock<HashValues>,
+    memory: IndexMemory,
 }
 
 impl std::fmt::Debug for HashIndex {
@@ -163,11 +171,11 @@ impl HashIndex {
             } else {
                 I64Map::new()
             }),
-            hash_to_values: RwLock::new(if expected_rows > 0 {
-                FxHashMap::with_capacity_and_hasher(expected_rows, Default::default())
-            } else {
-                FxHashMap::default()
-            }),
+            hash_to_values: RwLock::new(HashValues::with_capacity_and_hasher(
+                expected_rows,
+                Default::default(),
+            )),
+            memory: IndexMemory::default(),
         }
     }
 
@@ -178,7 +186,7 @@ impl HashIndex {
         values: &[Value],
         row_id: i64,
         hash: u64,
-        hash_to_values: &FxHashMap<u64, Vec<(Vec<CompactArc<Value>>, CompactVec<i64>)>>,
+        hash_to_values: &HashValues,
     ) -> Result<()> {
         if !self.is_unique {
             return Ok(());
@@ -242,6 +250,36 @@ impl HashIndex {
 }
 
 impl Index for HashIndex {
+    fn attach_memory_account(&mut self, account: &MemoryAccount) -> Result<()> {
+        if !self.memory.needs_attachment(account)? {
+            return Ok(());
+        }
+        for entries in self.hash_to_values.get_mut().values() {
+            for (values, _) in entries {
+                for value in values {
+                    IndexMemory::adopt_value_arc(value, account)?;
+                }
+            }
+        }
+        let metadata = self.name.capacity()
+            + self.table_name.capacity()
+            + self.column_names.capacity() * std::mem::size_of::<String>()
+            + self
+                .column_names
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
+            + self.column_ids.capacity() * std::mem::size_of::<i32>()
+            + self.data_types.capacity() * std::mem::size_of::<DataType>();
+        self.memory.attach::<Self>(account, metadata);
+        self.hash_to_values.get_mut().attach(account);
+        self.row_to_hash.get_mut().attach_memory_account(account);
+        Ok(())
+    }
+    fn memory_account(&self) -> Option<&MemoryAccount> {
+        self.memory.account()
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -294,15 +332,13 @@ impl Index for HashIndex {
 
             // Different hash (or same hash with different values) - remove old entry
             // Remove from values storage
-            if let Some(entries) = hash_to_values.get_mut(&old_hash) {
+            hash_to_values.mutate_remove_if(&old_hash, |entries| {
                 for (_, row_ids) in entries.iter_mut() {
                     row_ids.retain(|id| *id != row_id);
                 }
                 entries.retain(|(_, row_ids)| !row_ids.is_empty());
-                if entries.is_empty() {
-                    hash_to_values.remove(&old_hash);
-                }
-            }
+                entries.is_empty()
+            });
         }
 
         // Check uniqueness constraint
@@ -313,7 +349,7 @@ impl Index for HashIndex {
 
         // Add to hash_to_values for collision handling
         // Use CompactArc<Value> via arena for memory efficiency
-        let entries = hash_to_values.entry(hash).or_default();
+        let mut entries = hash_to_values.entry(hash).or_default();
         let mut found = false;
         for (stored_values, row_ids) in entries.iter_mut() {
             // Compare CompactArc<Value> contents with input values
@@ -329,7 +365,7 @@ impl Index for HashIndex {
         if !found {
             // Wrap values in Arc for O(1) cloning
             let arc_values: Vec<CompactArc<Value>> =
-                values.iter().map(|v| CompactArc::new(v.clone())).collect();
+                values.iter().map(|v| self.memory.value_arc(v)).collect();
             let mut row_ids = CompactVec::new();
             row_ids.push(row_id); // First element, already sorted
             entries.push((arc_values, row_ids));
@@ -359,7 +395,7 @@ impl Index for HashIndex {
         row_to_hash.remove(row_id);
 
         // Remove from hash_to_values (row_ids are sorted, use binary search)
-        if let Some(entries) = hash_to_values.get_mut(&hash) {
+        hash_to_values.mutate_remove_if(&hash, |entries| {
             for (stored_values, row_ids) in entries.iter_mut() {
                 // Compare CompactArc<Value> contents with input values
                 if Self::values_match(stored_values, values) {
@@ -370,10 +406,8 @@ impl Index for HashIndex {
                 }
             }
             entries.retain(|(_, row_ids)| !row_ids.is_empty());
-            if entries.is_empty() {
-                hash_to_values.remove(&hash);
-            }
-        }
+            entries.is_empty()
+        });
 
         Ok(())
     }
@@ -478,22 +512,20 @@ impl Index for HashIndex {
                 }
 
                 // Different hash (or same hash with different values) - remove old entry
-                if let Some(val_entries) = hash_to_values.get_mut(&old_hash) {
+                hash_to_values.mutate_remove_if(&old_hash, |val_entries| {
                     for (_, row_ids) in val_entries.iter_mut() {
                         row_ids.retain(|id| *id != row_id);
                     }
                     val_entries.retain(|(_, row_ids)| !row_ids.is_empty());
-                    if val_entries.is_empty() {
-                        hash_to_values.remove(&old_hash);
-                    }
-                }
+                    val_entries.is_empty()
+                });
             }
 
             // Add to row_to_hash
             row_to_hash.insert(row_id, hash);
 
             // Add to hash_to_values
-            let val_entries = hash_to_values.entry(hash).or_default();
+            let mut val_entries = hash_to_values.entry(hash).or_default();
             let mut found = false;
             for (stored_values, row_ids) in val_entries.iter_mut() {
                 if Self::values_match(stored_values, values) {
@@ -506,7 +538,7 @@ impl Index for HashIndex {
             }
             if !found {
                 let arc_values: Vec<CompactArc<Value>> =
-                    values.iter().map(|v| CompactArc::new(v.clone())).collect();
+                    values.iter().map(|v| self.memory.value_arc(v)).collect();
                 let mut row_ids = CompactVec::new();
                 row_ids.push(row_id);
                 val_entries.push((arc_values, row_ids));
@@ -539,7 +571,7 @@ impl Index for HashIndex {
             row_to_hash.remove(row_id);
 
             // Remove from hash_to_values
-            if let Some(val_entries) = hash_to_values.get_mut(&hash) {
+            hash_to_values.mutate_remove_if(&hash, |val_entries| {
                 for (stored_values, row_ids) in val_entries.iter_mut() {
                     if Self::values_match(stored_values, values) {
                         if let Ok(pos) = row_ids.binary_search(&row_id) {
@@ -549,10 +581,8 @@ impl Index for HashIndex {
                     }
                 }
                 val_entries.retain(|(_, row_ids)| !row_ids.is_empty());
-                if val_entries.is_empty() {
-                    hash_to_values.remove(&hash);
-                }
-            }
+                val_entries.is_empty()
+            });
         }
 
         Ok(())
@@ -574,15 +604,13 @@ impl Index for HashIndex {
         }
         for (hash, mut ids) in by_hash {
             ids.sort_unstable();
-            if let Some(val_entries) = hash_to_values.get_mut(&hash) {
+            hash_to_values.mutate_remove_if(&hash, |val_entries| {
                 for (_, bucket) in val_entries.iter_mut() {
                     super::subtract_sorted(bucket, &ids);
                 }
                 val_entries.retain(|(_, bucket)| !bucket.is_empty());
-                if val_entries.is_empty() {
-                    hash_to_values.remove(&hash);
-                }
-            }
+                val_entries.is_empty()
+            });
         }
         Some(Ok(()))
     }

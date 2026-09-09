@@ -32,6 +32,53 @@
 
 use stoolap::Database;
 
+#[test]
+fn empty_arena_releases_capacity_after_sql_vacuum() {
+    let db = Database::open("memory://empty_arena_releases_capacity_after_sql_vacuum").unwrap();
+    db.execute("PRAGMA HOT_MAX_ROWS = 0", ()).unwrap();
+    db.execute(
+        "CREATE TABLE chunks (id INTEGER PRIMARY KEY, value INTEGER)",
+        (),
+    )
+    .unwrap();
+    let capacity = || {
+        db.query("PRAGMA MEMORY_STATS", ())
+            .unwrap()
+            .map(|row| row.unwrap())
+            .find(|row| row.get::<String>(0).unwrap() == "chunks")
+            .unwrap()
+            .get::<i64>(4)
+            .unwrap()
+    };
+    let initial = capacity();
+    let values = (1..=4000)
+        .map(|id| format!("({id},{id})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    db.execute(&format!("INSERT INTO chunks VALUES {values}"), ())
+        .unwrap();
+    let populated = capacity();
+    assert!(populated > initial + 64_000);
+    db.execute("DELETE FROM chunks", ()).unwrap();
+    db.execute("VACUUM", ()).unwrap();
+    let empty = capacity();
+    assert!(
+        empty <= initial + 4096,
+        "arena kept {empty} of {populated} bytes"
+    );
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT COUNT(*) FROM chunks", ())
+            .unwrap(),
+        0
+    );
+    db.execute("INSERT INTO chunks VALUES (1, 77)", ()).unwrap();
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT value FROM chunks WHERE id = 1", ())
+            .unwrap(),
+        77
+    );
+}
+
 /// Test that AS OF queries return historical data after UPDATE
 ///
 /// This test verifies that snapshot isolation is preserved:

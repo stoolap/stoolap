@@ -19,7 +19,6 @@
 
 use crate::common::{CompactArc, I64Map, SmartString, StringMap};
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
@@ -56,12 +55,12 @@ use crate::storage::mvcc::{
 use crate::storage::traits::{Engine, Index, Table, Transaction};
 
 /// Type alias for a single table entry in the transaction version store
-type TxnTableEntry = (SmartString, Arc<RwLock<TransactionVersionStore>>);
+type TxnTableEntry = (SmartString, CompactArc<RwLock<TransactionVersionStore>>);
 
 /// Type alias for the transaction version store map
 /// Structured as txn_id -> [(table_name, store)] for efficient lookup per transaction
 /// Uses SmallVec<[T; 2]> since most transactions access 1-2 tables, avoiding heap allocation
-type TxnVersionStoreMap = I64Map<SmallVec<[TxnTableEntry; 2]>>;
+type TxnVersionStoreMap = I64Map<super::accounting::RetainedSmallVec<[TxnTableEntry; 2]>>;
 
 /// Helper to get registry as the visibility checker type expected by VersionStore.
 /// In production: returns concrete Arc<TransactionRegistry> (zero-cost, inlined).
@@ -442,12 +441,21 @@ pub struct MemoryStat {
     pub chain_entries: usize,
     pub volume_bytes: usize,
     pub admission_waits: u64,
+    /// Allocation lifetime counters. `hot_bytes` above retains its legacy
+    /// committed-slot scope for admission until the pressure seal is enabled.
+    pub retained_hot_bytes: usize,
+    pub conservative_hot_bytes: usize,
+    pub pending_hot_bytes: usize,
+    pub accounted_hot_bytes: usize,
+    pub peak_accounted_hot_bytes: usize,
 }
 
 /// MVCC Storage Engine
 ///
 /// Provides multi-version concurrency control with snapshot isolation.
 pub struct MVCCEngine {
+    txn_map_pools: CompactArc<super::version_store::TxnMapPools>,
+    memory: crate::common::memory::MemoryAccount,
     /// Database path (empty for in-memory)
     path: String,
     /// Configuration
@@ -465,7 +473,7 @@ pub struct MVCCEngine {
     execution_failed: Arc<AtomicBool>,
     /// Cache of transaction version stores per (txn_id, table_name) for proper commit/rollback
     /// (Arc-wrapped for safe sharing with transactions)
-    txn_version_stores: Arc<RwLock<TxnVersionStoreMap>>,
+    txn_version_stores: CompactArc<RwLock<TxnVersionStoreMap>>,
     /// View definitions (Arc for cheap cloning on lookup)
     views: RwLock<FxHashMap<String, Arc<ViewDefinition>>>,
     /// Persistence manager for WAL and snapshot operations (Arc-wrapped for safe sharing)
@@ -542,6 +550,7 @@ fn get_or_create_segment_manager(
     >,
     persistence: &Option<PersistenceManager>,
     table_name: &str,
+    memory: &crate::common::memory::MemoryAccount,
 ) -> Arc<crate::storage::volume::manifest::SegmentManager> {
     // Fast path: read lock (common case during WAL replay — manager already exists)
     {
@@ -555,8 +564,10 @@ fn get_or_create_segment_manager(
     mgrs.entry(table_name.to_string())
         .or_insert_with(|| {
             let vol_dir = persistence.as_ref().map(|pm| pm.path().join("volumes"));
-            Arc::new(crate::storage::volume::manifest::SegmentManager::new(
-                table_name, vol_dir,
+            Arc::new(crate::storage::volume::manifest::SegmentManager::new_in(
+                table_name,
+                vol_dir,
+                memory.child(),
             ))
         })
         .clone()
@@ -581,7 +592,11 @@ impl MVCCEngine {
             None
         };
 
+        let memory = crate::common::memory::MemoryAccount::new();
+        let txn_map_pools = super::version_store::TxnMapPools::new_in(&memory);
         Self {
+            txn_map_pools,
+            memory: memory.clone(),
             path: if path.is_empty() {
                 "memory://".to_string()
             } else {
@@ -590,10 +605,10 @@ impl MVCCEngine {
             config: RwLock::new(config),
             schemas: Arc::new(RwLock::new(FxHashMap::default())),
             version_stores: Arc::new(RwLock::new(FxHashMap::default())),
-            registry: Arc::new(TransactionRegistry::new()),
+            registry: Arc::new(TransactionRegistry::new_in(&memory)),
             open: AtomicBool::new(false),
             execution_failed: Arc::new(AtomicBool::new(false)),
-            txn_version_stores: Arc::new(RwLock::new(I64Map::new())),
+            txn_version_stores: CompactArc::new_in(RwLock::new(I64Map::new_in(&memory)), &memory),
             views: RwLock::new(FxHashMap::default()),
             persistence: Arc::new(persistence),
             loading_from_disk: Arc::new(AtomicBool::new(false)),
@@ -1106,24 +1121,34 @@ impl MVCCEngine {
         let table_name_lower = schema.table_name_lower.clone();
 
         // Create the version store
-        let version_store = Arc::new(VersionStore::with_visibility_checker(
+        let version_store = Arc::new(VersionStore::with_capacity_and_pools(
             schema.table_name.clone(),
             schema.clone(),
-            registry_as_visibility_checker(&self.registry),
+            Some(registry_as_visibility_checker(&self.registry)),
+            0,
+            self.memory.child(),
+            self.txn_map_pools.clone(),
         ));
 
         // Register virtual PkIndex for INTEGER PRIMARY KEY
         register_pk_index(&schema, &version_store)?;
 
-        // Load all rows from the snapshot
+        // Load all rows from the snapshot; stop on the first arena failure.
+        let mut apply_error = None;
         reader.for_each(|row_id, mut version| {
             // Snapshot versions have txn_id = -1, we need to use the recovery txn_id
             version.txn_id = super::RECOVERY_TRANSACTION_ID;
 
             // Apply to version store
-            version_store.apply_recovered_version(row_id, version);
+            if let Err(error) = version_store.apply_recovered_version(row_id, version) {
+                apply_error = Some(error);
+                return false;
+            }
             true
         })?;
+        if let Some(error) = apply_error {
+            return Err(error);
+        }
 
         // Store the schema and version store
         {
@@ -1167,10 +1192,13 @@ impl MVCCEngine {
             let table_name_lower = schema.table_name_lower.clone();
 
             // Create empty version store (hot buffer for WAL data only)
-            let version_store = Arc::new(VersionStore::with_visibility_checker(
+            let version_store = Arc::new(VersionStore::with_capacity_and_pools(
                 schema.table_name.clone(),
                 schema.clone(),
-                registry_as_visibility_checker(&self.registry),
+                Some(registry_as_visibility_checker(&self.registry)),
+                0,
+                self.memory.child(),
+                self.txn_map_pools.clone(),
             ));
             register_pk_index(&schema, &version_store)?;
 
@@ -1208,10 +1236,13 @@ impl MVCCEngine {
         let table_name_lower = schema.table_name_lower.clone();
 
         // Create an empty version store (hot buffer for WAL data only)
-        let version_store = Arc::new(VersionStore::with_visibility_checker(
+        let version_store = Arc::new(VersionStore::with_capacity_and_pools(
             schema.table_name.clone(),
             schema.clone(),
-            registry_as_visibility_checker(&self.registry),
+            Some(registry_as_visibility_checker(&self.registry)),
+            0,
+            self.memory.child(),
+            self.txn_map_pools.clone(),
         ));
         register_pk_index(&schema, &version_store)?;
 
@@ -1619,10 +1650,13 @@ impl MVCCEngine {
                 // Deserialize schema from entry data
                 if let Ok(schema) = self.deserialize_schema(&entry.data) {
                     // Create the table (version store)
-                    let version_store = Arc::new(VersionStore::with_visibility_checker(
+                    let version_store = Arc::new(VersionStore::with_capacity_and_pools(
                         schema.table_name.clone(),
                         schema.clone(),
-                        registry_as_visibility_checker(&self.registry),
+                        Some(registry_as_visibility_checker(&self.registry)),
+                        0,
+                        self.memory.child(),
+                        self.txn_map_pools.clone(),
                     ));
 
                     // Register virtual PkIndex for INTEGER PRIMARY KEY
@@ -1771,14 +1805,22 @@ impl MVCCEngine {
                             // in the cumulative skip set at scan time). No tombstone
                             // needed here — the hot version IS the dedup mechanism.
                             if let Ok(store) = self.get_version_store(&table_name) {
-                                store.apply_recovered_version(entry.row_id, row_version);
+                                store.apply_recovered_version_with_lsn(
+                                    entry.row_id,
+                                    row_version,
+                                    std::num::NonZeroU64::new(entry.lsn),
+                                )?;
                             }
                         }
                         // else: sealed INSERT, volume has authoritative data → skip
                     } else {
                         // Row not in any volume: standard hot insert
                         if let Ok(store) = self.get_version_store(&table_name) {
-                            store.apply_recovered_version(entry.row_id, row_version);
+                            store.apply_recovered_version_with_lsn(
+                                entry.row_id,
+                                row_version,
+                                std::num::NonZeroU64::new(entry.lsn),
+                            )?;
                         }
                     }
                 }
@@ -1787,7 +1829,11 @@ impl MVCCEngine {
                 // For deletes, mark the row as deleted in the hot store.
                 let table_name = entry.table_name.to_lowercase();
                 if let Ok(store) = self.get_version_store(&table_name) {
-                    store.mark_deleted(entry.row_id, entry.txn_id);
+                    store.mark_deleted_with_lsn(
+                        entry.row_id,
+                        entry.txn_id,
+                        std::num::NonZeroU64::new(entry.lsn),
+                    )?;
                 }
                 // If the deleted row_id lives in a cold segment, add a tombstone
                 // so it is excluded from scans and point lookups.
@@ -2196,6 +2242,7 @@ impl MVCCEngine {
             *file_lock = None;
         }
 
+        self.txn_map_pools.trim();
         Ok(())
     }
 
@@ -2290,14 +2337,38 @@ impl MVCCEngine {
                 .collect()
         };
         let mut result = Vec::with_capacity(stores.len() + 1);
+        let engine_memory = self.memory.snapshot();
         let mut total = MemoryStat {
+            retained_hot_bytes: engine_memory.retained_bytes,
+            conservative_hot_bytes: engine_memory.conservative_bytes,
+            pending_hot_bytes: engine_memory.pending_bytes,
+            accounted_hot_bytes: engine_memory.accounted_bytes,
+            peak_accounted_hot_bytes: engine_memory.peak_accounted_bytes,
             table_name: "*".to_string(),
             admission_waits: self.hot_limits.admission_waits.load(Ordering::Relaxed),
             ..Default::default()
         };
         for (name, store) in stores {
             let (arena_slots, arena_capacity_bytes) = store.arena_footprint();
+            let memory = store.memory_account().snapshot();
+            let cold_writes = {
+                let Ok(managers) = self.segment_managers.read() else {
+                    panic!("segment manager catalog is poisoned while reading memory statistics");
+                };
+                managers
+                    .get(&name)
+                    .map(|manager| manager.hot_memory_account().snapshot())
+                    .unwrap_or_default()
+            };
             let stat = MemoryStat {
+                retained_hot_bytes: memory.retained_bytes + cold_writes.retained_bytes,
+                conservative_hot_bytes: memory.conservative_bytes + cold_writes.conservative_bytes,
+                pending_hot_bytes: memory.pending_bytes + cold_writes.pending_bytes,
+                accounted_hot_bytes: memory.accounted_bytes + cold_writes.accounted_bytes,
+                // Per-table component peaks form an upper bound; the '*' row
+                // uses the engine root's directly observed aggregate peak.
+                peak_accounted_hot_bytes: memory.peak_accounted_bytes
+                    + cold_writes.peak_accounted_bytes,
                 hot_rows: store.committed_row_count(),
                 hot_bytes: store.hot_bytes(),
                 arena_slots,
@@ -2772,10 +2843,13 @@ impl MVCCEngine {
         self.validate_schema(&schema)?;
 
         // Create version store for this table
-        let version_store = Arc::new(VersionStore::with_visibility_checker(
+        let version_store = Arc::new(VersionStore::with_capacity_and_pools(
             schema.table_name.clone(),
             schema.clone(),
-            registry_as_visibility_checker(&self.registry),
+            Some(registry_as_visibility_checker(&self.registry)),
+            0,
+            self.memory.child(),
+            self.txn_map_pools.clone(),
         ));
 
         // Register virtual PkIndex for INTEGER PRIMARY KEY
@@ -3056,7 +3130,12 @@ impl MVCCEngine {
         &self,
         table_name: &str,
     ) -> Arc<crate::storage::volume::manifest::SegmentManager> {
-        get_or_create_segment_manager(&self.segment_managers, &self.persistence, table_name)
+        get_or_create_segment_manager(
+            &self.segment_managers,
+            &self.persistence,
+            table_name,
+            &self.memory,
+        )
     }
 
     /// Clean up stale .dv files from disk left over by previous versions.
@@ -3184,9 +3263,10 @@ impl MVCCEngine {
             let table_name = entry.file_name().to_string_lossy().to_lowercase();
 
             // Try to load manifest from this table directory
-            match crate::storage::volume::manifest::SegmentManager::load_from_disk(
+            match crate::storage::volume::manifest::SegmentManager::load_from_disk_in(
                 &table_name,
                 &vol_dir,
+                self.memory.child(),
             ) {
                 Ok(Some(mgr)) => {
                     let lsn = mgr.manifest().checkpoint_lsn;
@@ -6874,6 +6954,8 @@ impl Drop for CleanupHandle {
 /// Holds Arc references to shared engine state, allowing safe access
 /// from transactions without raw pointers.
 struct EngineOperations {
+    txn_map_pools: CompactArc<super::version_store::TxnMapPools>,
+    memory: crate::common::memory::MemoryAccount,
     execution_failed: Arc<AtomicBool>,
     /// Shared reference to schemas (each schema is Arc-wrapped to avoid cloning on lookup)
     schemas: Arc<RwLock<FxHashMap<String, CompactArc<Schema>>>>,
@@ -6882,7 +6964,7 @@ struct EngineOperations {
     /// Shared reference to registry
     registry: Arc<TransactionRegistry>,
     /// Shared reference to transaction version stores cache
-    txn_version_stores: Arc<RwLock<TxnVersionStoreMap>>,
+    txn_version_stores: CompactArc<RwLock<TxnVersionStoreMap>>,
     /// Shared reference to persistence manager (optional)
     persistence: Arc<Option<PersistenceManager>>,
     /// Shared reference to loading_from_disk flag
@@ -6901,11 +6983,13 @@ struct EngineOperations {
 impl EngineOperations {
     fn new(engine: &MVCCEngine) -> Self {
         Self {
+            txn_map_pools: engine.txn_map_pools.clone(),
+            memory: engine.memory.clone(),
             execution_failed: Arc::clone(&engine.execution_failed),
             schemas: Arc::clone(&engine.schemas),
             version_stores: Arc::clone(&engine.version_stores),
             registry: Arc::clone(&engine.registry),
-            txn_version_stores: Arc::clone(&engine.txn_version_stores),
+            txn_version_stores: engine.txn_version_stores.clone(),
             persistence: Arc::clone(&engine.persistence),
             loading_from_disk: Arc::clone(&engine.loading_from_disk),
             segment_managers: Arc::clone(&engine.segment_managers),
@@ -6941,7 +7025,7 @@ impl EngineOperations {
     fn validate_pending_against_cold(
         &self,
         txn_id: i64,
-        txn_store: &Arc<RwLock<TransactionVersionStore>>,
+        txn_store: &CompactArc<RwLock<TransactionVersionStore>>,
         version_store: &Arc<VersionStore>,
         mgr: &Arc<crate::storage::volume::manifest::SegmentManager>,
     ) -> Result<()> {
@@ -7143,7 +7227,8 @@ impl EngineOperations {
                     WALOperationType::Insert
                 };
 
-                pm.record_dml_operation(txn_id, table_name, row_id, op, &version)?;
+                let lsn = pm.record_dml_operation(txn_id, table_name, row_id, op, &version)?;
+                table.record_source_lsn(row_id, lsn);
             }
         }
         Ok(())
@@ -7204,7 +7289,7 @@ impl TransactionEngineOperations for EngineOperations {
                 txn_tables
                     .iter()
                     .find(|(name, _)| name == &*table_name_lower)
-                    .map(|(_, cached)| Arc::clone(cached))
+                    .map(|(_, cached)| CompactArc::clone(cached))
             } else {
                 None
             };
@@ -7215,21 +7300,30 @@ impl TransactionEngineOperations for EngineOperations {
             } else {
                 // Upgrade to write lock and re-check (another thread may have inserted)
                 let mut cache = self.txn_version_stores().write().unwrap();
-                let txn_tables = cache.entry(txn_id).or_default();
+                let txn_tables = cache
+                    .entry(txn_id)
+                    .or_insert_with(super::accounting::RetainedSmallVec::new);
                 if let Some((_, cached)) = txn_tables
                     .iter()
                     .find(|(name, _)| name == &*table_name_lower)
                 {
-                    Arc::clone(cached)
+                    CompactArc::clone(cached)
                 } else {
-                    let new_store = Arc::new(RwLock::new(TransactionVersionStore::new(
-                        Arc::clone(&version_store),
-                        txn_id,
-                    )));
-                    txn_tables.push((
-                        table_name_lower.clone().into_owned().into(),
-                        Arc::clone(&new_store),
-                    ));
+                    let new_store = CompactArc::new_in(
+                        RwLock::new(TransactionVersionStore::new(
+                            Arc::clone(&version_store),
+                            txn_id,
+                        )),
+                        version_store.memory_account(),
+                    );
+                    txn_tables.push(
+                        (
+                            SmartString::from(table_name_lower.clone().into_owned())
+                                .into_hot(&self.memory),
+                            CompactArc::clone(&new_store),
+                        ),
+                        &self.memory,
+                    );
                     new_store
                 }
             }
@@ -7248,6 +7342,7 @@ impl TransactionEngineOperations for EngineOperations {
                 &self.segment_managers,
                 &self.persistence,
                 &table_name_lower,
+                &self.memory,
             )
         } else {
             let mgrs = self.segment_managers.read().unwrap();
@@ -7275,10 +7370,13 @@ impl TransactionEngineOperations for EngineOperations {
         let table_name = name.to_lowercase();
 
         // Create version store for this table (before acquiring locks)
-        let version_store = Arc::new(VersionStore::with_visibility_checker(
+        let version_store = Arc::new(VersionStore::with_capacity_and_pools(
             schema.table_name.clone(),
             schema.clone(),
-            registry_as_visibility_checker(&self.registry),
+            Some(registry_as_visibility_checker(&self.registry)),
+            0,
+            self.memory.child(),
+            self.txn_map_pools.clone(),
         ));
 
         // Register PkIndex if table has a primary key
@@ -7493,7 +7591,8 @@ impl TransactionEngineOperations for EngineOperations {
                         WALOperationType::Insert
                     };
 
-                    pm.record_dml_operation(txn_id, table_name, row_id, op, &version)?;
+                    let lsn = pm.record_dml_operation(txn_id, table_name, row_id, op, &version)?;
+                    table.record_source_lsn(row_id, lsn);
                 }
             }
         }
@@ -7561,7 +7660,7 @@ impl TransactionEngineOperations for EngineOperations {
                         let table = MVCCTable::new_with_shared_store(
                             txn_id,
                             Arc::clone(&version_store),
-                            Arc::clone(txn_store),
+                            CompactArc::clone(txn_store),
                         );
 
                         tables.push(Box::new(table) as Box<dyn Table>);
@@ -7725,7 +7824,7 @@ impl TransactionEngineOperations for EngineOperations {
                     stores.get(name.as_str()).map(|parent| {
                         (
                             name.clone(),
-                            Arc::clone(local),
+                            CompactArc::clone(local),
                             Arc::clone(parent),
                             managers.get(name.as_str()).cloned(),
                         )
@@ -7763,7 +7862,7 @@ impl TransactionEngineOperations for EngineOperations {
                     let table = MVCCTable::new_with_shared_store(
                         txn_id,
                         Arc::clone(parent),
-                        Arc::clone(local),
+                        CompactArc::clone(local),
                     );
                     self.record_table_to_wal(txn_id, &table)?;
                 }
@@ -7836,7 +7935,7 @@ impl TransactionEngineOperations for EngineOperations {
                     continue;
                 }
                 if let Some(version_store) = stores.get(table_name.as_str()) {
-                    hold.add(version_store, Arc::clone(txn_store));
+                    hold.add(version_store, CompactArc::clone(txn_store));
                 }
             }
         }
@@ -7875,14 +7974,14 @@ impl TransactionEngineOperations for EngineOperations {
         let touched: smallvec::SmallVec<
             [(
                 crate::common::SmartString,
-                Arc<RwLock<TransactionVersionStore>>,
+                CompactArc<RwLock<TransactionVersionStore>>,
             ); 4],
         > = cache
             .get(txn_id)
             .map(|tables| {
                 tables
                     .iter()
-                    .map(|(name, store)| (name.clone(), Arc::clone(store)))
+                    .map(|(name, store)| (name.clone(), CompactArc::clone(store)))
                     .collect()
             })
             .unwrap_or_default();

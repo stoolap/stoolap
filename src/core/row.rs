@@ -529,6 +529,43 @@ impl Row {
         matches!(self.storage, RowStorage::Owned(_))
     }
 
+    /// Retain this row in a hot account. The certification bit is installed
+    /// only after every independently shared backing belongs to this engine.
+    pub(crate) fn into_hot(self, account: &crate::common::memory::MemoryAccount) -> Self {
+        use crate::common::memory::{MemoryAdoption, MemoryCharge};
+        match self.storage {
+            RowStorage::Owned(mut values) => {
+                let source_charge =
+                    MemoryCharge::new(account, values.capacity() * std::mem::size_of::<Value>());
+                for value in values.iter_mut() {
+                    *value = std::mem::take(value).into_hot(account);
+                }
+                let data = CompactArc::from_compact_vec_in(values, account);
+                drop(source_charge);
+                data.mark_fully_accounted();
+                Self::from_arc(data)
+            }
+            RowStorage::Shared(data) => {
+                if data.is_fully_accounted() && data.belongs_to(account) {
+                    return Self::from_arc(data);
+                }
+                if data.iter().all(|value| value.try_adopt_hot(account))
+                    && data.try_adopt_shallow(account) != MemoryAdoption::ForeignEngine
+                {
+                    data.mark_fully_accounted();
+                    return Self::from_arc(data);
+                }
+                // Copy the outer array and foreign nested allocations, preserving their original charges.
+                let copied = CompactArc::from_exact_iter_in(
+                    data.iter().cloned().map(|value| value.into_hot(account)),
+                    account,
+                );
+                copied.mark_fully_accounted();
+                Self::from_arc(copied)
+            }
+        }
+    }
+
     /// Convert Row to CompactArc<[Value]>, consuming self
     /// - Shared: returns the CompactArc directly (O(1))
     /// - Owned: creates new Arc (O(n))
@@ -815,6 +852,258 @@ macro_rules! row {
     ($($value:expr),+ $(,)?) => {
         $crate::core::Row::from_values(vec![$($crate::core::Value::from($value)),+])
     };
+}
+
+#[cfg(test)]
+mod hot_accounting_tests {
+    use super::*;
+    use crate::common::{MemoryAccount, SmartString};
+    use std::collections::HashSet;
+
+    fn text_bytes(text: &SmartString) -> usize {
+        if text.is_heap() {
+            text.heap_capacity() + std::mem::size_of::<String>() + 2 * std::mem::size_of::<usize>()
+        } else {
+            0
+        }
+    }
+
+    fn values() -> Vec<Value> {
+        let mut text = String::with_capacity(96);
+        text.push_str("retained nested text with spare capacity");
+        vec![
+            Value::text(text),
+            Value::json(r#"{"nested":[1,2,3]}"#),
+            Value::integer(7),
+        ]
+    }
+
+    fn assert_hot_graph(row: &Row, account: &MemoryAccount) {
+        let RowStorage::Shared(outer) = &row.storage else {
+            panic!("hot row must be shared")
+        };
+        assert!(outer.is_fully_accounted());
+        assert!(outer.belongs_to(account));
+        for value in row.iter() {
+            match value {
+                Value::Text(text) if text.is_heap() => {
+                    assert!(text.memory_account().unwrap().same_engine(account));
+                }
+                Value::Extension(bytes) => assert!(bytes.belongs_to(account)),
+                _ => {}
+            }
+        }
+    }
+
+    // Count physical allocations once across aliases, independently of origin
+    // labels. The same engine may own source children retained by another row.
+    fn owned_bytes(rows: &[&Row], account: &MemoryAccount) -> usize {
+        let mut seen = HashSet::new();
+        let mut total = 0;
+        for row in rows {
+            if let RowStorage::Shared(outer) = &row.storage {
+                if outer.belongs_to(account) && seen.insert(row.as_slice().as_ptr() as usize) {
+                    total += outer.allocation_size();
+                }
+            }
+            for value in row.iter() {
+                match value {
+                    Value::Text(text) if text.is_heap() => {
+                        if text
+                            .memory_account()
+                            .is_some_and(|owner| owner.same_engine(account))
+                            && seen.insert(text.as_str().as_ptr() as usize)
+                        {
+                            total += text_bytes(text);
+                        }
+                    }
+                    Value::Extension(bytes)
+                        if bytes.belongs_to(account) && seen.insert(bytes.as_ptr() as usize) =>
+                    {
+                        total += bytes.allocation_size();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn nested_owners_outlive_row_and_origin_with_exact_charges() {
+        let root = MemoryAccount::new();
+        let base = root.snapshot().accounted_bytes;
+        let origin = root.child();
+        let source = values();
+        let text = source[0].clone();
+        let extension = source[1].clone();
+        let row = Row::from_values(source).into_hot(&origin);
+        assert_hot_graph(&row, &root);
+        assert_eq!(root.snapshot().retained_bytes, owned_bytes(&[&row], &root));
+        let Value::Text(text) = text else {
+            unreachable!()
+        };
+        let Value::Extension(extension) = extension else {
+            unreachable!()
+        };
+        let Value::Text(row_text) = &row[0] else {
+            unreachable!()
+        };
+        let Value::Extension(row_extension) = &row[1] else {
+            unreachable!()
+        };
+        assert_eq!(text.as_str().as_ptr(), row_text.as_str().as_ptr());
+        assert!(CompactArc::ptr_eq(&extension, row_extension));
+        let text_charge = text_bytes(&text);
+        let extension_charge = extension.allocation_size();
+        drop((row, origin));
+        assert_eq!(
+            root.snapshot().retained_bytes,
+            text_charge + extension_charge
+        );
+        drop(text);
+        assert_eq!(root.snapshot().retained_bytes, extension_charge);
+        drop(extension);
+        assert_eq!(root.snapshot().accounted_bytes, base);
+    }
+
+    #[test]
+    fn shallow_outer_account_does_not_certify_nested_ownership() {
+        let account = MemoryAccount::new();
+        let outer = CompactArc::from_vec_in(values(), &account);
+        assert!(!outer.is_fully_accounted());
+        let pointer = outer.as_ptr();
+        assert_eq!(account.snapshot().retained_bytes, outer.allocation_size());
+        let row = Row::from_arc(outer).into_hot(&account);
+        assert_eq!(row.as_slice().as_ptr(), pointer);
+        assert_hot_graph(&row, &account);
+        assert_eq!(
+            account.snapshot().retained_bytes,
+            owned_bytes(&[&row], &account)
+        );
+        drop(row);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn same_engine_origins_reuse_the_whole_graph() {
+        let root = MemoryAccount::new();
+        let first = root.child();
+        let second = root.child();
+        let row = Row::from_values(values()).into_hot(&first);
+        let before = root.snapshot();
+        let alias = row.clone().into_hot(&second);
+        assert_eq!(row.as_slice().as_ptr(), alias.as_slice().as_ptr());
+        assert_eq!(root.snapshot(), before);
+        let RowStorage::Shared(outer) = &alias.storage else {
+            unreachable!()
+        };
+        assert!(outer.memory_account().unwrap().same_origin(&first));
+        assert_hot_graph(&alias, &second);
+        drop((row, alias));
+        assert_eq!(root.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn foreign_engine_copies_outer_and_foreign_children() {
+        let first = MemoryAccount::new();
+        let second = MemoryAccount::new();
+        let source = Row::from_values(values()).into_hot(&first);
+        let before = first.snapshot();
+        let copied = source.clone().into_hot(&second);
+        assert_eq!(source, copied);
+        assert_ne!(source.as_slice().as_ptr(), copied.as_slice().as_ptr());
+        let (Value::Text(a), Value::Text(b)) = (&source[0], &copied[0]) else {
+            unreachable!()
+        };
+        assert_ne!(a.as_str().as_ptr(), b.as_str().as_ptr());
+        let (Value::Extension(a), Value::Extension(b)) = (&source[1], &copied[1]) else {
+            unreachable!()
+        };
+        assert!(!CompactArc::ptr_eq(a, b));
+        assert_hot_graph(&source, &first);
+        assert_hot_graph(&copied, &second);
+        assert_eq!(first.snapshot(), before);
+        assert_eq!(
+            second.snapshot().retained_bytes,
+            owned_bytes(&[&copied], &second)
+        );
+        drop(source);
+        assert_eq!(first.snapshot().retained_bytes, 0);
+        assert_hot_graph(&copied, &second);
+        drop(copied);
+        assert_eq!(second.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn concurrent_engine_adoption_never_certifies_a_foreign_child() {
+        use std::sync::Barrier;
+        for pre_split in [false, true] {
+            for _ in 0..16 {
+                let first = MemoryAccount::new();
+                let second = MemoryAccount::new();
+                let source = Row::from_arc(CompactArc::from_vec(values()));
+                if pre_split {
+                    assert!(source[0].try_adopt_hot(&first));
+                    assert!(source[1].try_adopt_hot(&second));
+                }
+                let start = Barrier::new(2);
+                let (left, right) = std::thread::scope(|scope| {
+                    let a = source.clone();
+                    let b = source.clone();
+                    let left = scope.spawn(|| {
+                        start.wait();
+                        a.into_hot(&first)
+                    });
+                    let right = scope.spawn(|| {
+                        start.wait();
+                        b.into_hot(&second)
+                    });
+                    (left.join().unwrap(), right.join().unwrap())
+                });
+                assert_eq!(source, left);
+                assert_eq!(source, right);
+                assert_hot_graph(&left, &first);
+                assert_hot_graph(&right, &second);
+                for account in [&first, &second] {
+                    assert_eq!(account.snapshot().pending_bytes, 0);
+                    assert_eq!(
+                        account.snapshot().retained_bytes,
+                        owned_bytes(&[&source, &left, &right], account)
+                    );
+                }
+                drop((source, left, right));
+                assert_eq!(first.snapshot().retained_bytes, 0);
+                assert_eq!(second.snapshot().retained_bytes, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn row_mutation_loses_the_old_graph_certificate() {
+        let account = MemoryAccount::new();
+        let original = Row::from_values(values()).into_hot(&account);
+        for mutation in 0..3 {
+            let mut changed = original.clone();
+            let replacement = Value::text("new untracked text inserted after hot sharing");
+            match mutation {
+                0 => changed.set(0, replacement).unwrap(),
+                1 => *changed.get_mut(0).unwrap() = replacement,
+                _ => *changed.iter_mut().next().unwrap() = replacement,
+            }
+            assert!(changed.is_owned());
+            assert_hot_graph(&original, &account);
+            let changed = changed.into_hot(&account);
+            assert_hot_graph(&changed, &account);
+            assert_eq!(
+                account.snapshot().retained_bytes,
+                owned_bytes(&[&original, &changed], &account)
+            );
+            assert_ne!(original[0], changed[0]);
+        }
+        drop(original);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
 }
 
 #[cfg(test)]

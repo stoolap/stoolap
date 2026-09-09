@@ -25,15 +25,14 @@
 
 use crate::common::CompactArc;
 use crate::core::{Row, Value};
-use crate::storage::mvcc::arena::ArenaReadGuard;
+use crate::storage::mvcc::arena::{ArenaId, ArenaReadGuard};
 
 /// Pre-computed visible row information for zero-copy iteration
 #[derive(Clone, Copy)]
 pub struct VisibleRowInfo {
     pub row_id: i64,
-    /// Arena index for rows in the arena, OR `arena_len + fallback_index` for
-    /// chain entries not in the arena (visible under snapshot isolation).
-    pub arena_idx: usize,
+    /// Stable arena address. None consumes the next historical fallback row.
+    pub arena_idx: Option<ArenaId>,
 }
 
 /// Zero-copy streaming result that yields references to arena data
@@ -42,18 +41,19 @@ pub struct VisibleRowInfo {
 /// allowing it to yield row references without any cloning.
 ///
 /// For rows whose visible version is a chain entry (not in the arena),
-/// the data is stored in `fallback_data` and referenced via indices
-/// starting at `arena_len`.
+/// the data is stored in `fallback_data` in the order of absent arena IDs.
+/// Sparse addresses never overlap the historical-row representation.
 pub struct StreamingResult<'a> {
     /// Unified arena guard (single lock for both data and metadata)
     arena_guard: ArenaReadGuard<'a>,
     /// Pre-sorted list of visible row indices
     visible_indices: Vec<VisibleRowInfo>,
     /// Fallback data for chain entries not in arena (snapshot isolation).
-    /// Indexed by `arena_idx - arena_len` when `arena_idx >= arena_len`.
+    /// Consumed sequentially for absent arena IDs.
     fallback_data: Vec<CompactArc<[Value]>>,
-    /// Length of the arena at construction time (boundary between arena and fallback)
-    arena_len: usize,
+    fallback_pos: usize,
+    /// Directory positions remain stable while the read guard is held.
+    chunk_cache: usize,
     /// Current position in visible_indices
     current_pos: usize,
     /// Column names
@@ -71,12 +71,12 @@ impl<'a> StreamingResult<'a> {
         visible_indices: Vec<VisibleRowInfo>,
         columns: Vec<String>,
     ) -> Self {
-        let arena_len = arena_guard.len();
         Self {
             arena_guard,
             visible_indices,
             fallback_data: Vec::new(),
-            arena_len,
+            fallback_pos: 0,
+            chunk_cache: usize::MAX,
             current_pos: 0,
             columns,
             current_row: Row::new(),
@@ -93,12 +93,12 @@ impl<'a> StreamingResult<'a> {
         fallback_data: Vec<CompactArc<[Value]>>,
         columns: Vec<String>,
     ) -> Self {
-        let arena_len = arena_guard.len();
         Self {
             arena_guard,
             visible_indices,
             fallback_data,
-            arena_len,
+            fallback_pos: 0,
+            chunk_cache: usize::MAX,
             current_pos: 0,
             columns,
             current_row: Row::new(),
@@ -119,33 +119,24 @@ impl<'a> StreamingResult<'a> {
     #[inline]
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> bool {
-        if self.current_pos < self.visible_indices.len() {
+        while self.current_pos < self.visible_indices.len() {
             let info = &self.visible_indices[self.current_pos];
-
-            if info.arena_idx < self.arena_len {
-                // Arena path: O(1) Arc clone - no data copying
-                if let Some(arc) = self.arena_guard.data().get(info.arena_idx) {
-                    self.current_row = Row::from_arc(CompactArc::clone(arc));
-                    self.current_arc = Some(CompactArc::clone(arc));
-                } else {
-                    self.current_arc = None;
-                }
-            } else {
-                // Fallback path: chain entry data stored in fallback_data
-                let fb_idx = info.arena_idx - self.arena_len;
-                if let Some(arc) = self.fallback_data.get(fb_idx) {
-                    self.current_row = Row::from_arc(CompactArc::clone(arc));
-                    self.current_arc = Some(CompactArc::clone(arc));
-                } else {
-                    self.current_arc = None;
-                }
-            }
-
             self.current_pos += 1;
-            true
-        } else {
-            false
+            if let Some(arc) = visible_row(
+                &self.arena_guard,
+                &self.fallback_data,
+                info,
+                &mut self.fallback_pos,
+                &mut self.chunk_cache,
+            ) {
+                self.current_row = Row::from_arc(CompactArc::clone(arc));
+                self.current_arc = Some(CompactArc::clone(arc));
+                return true;
+            }
         }
+        self.current_arc = None;
+        self.current_row = Row::new();
+        false
     }
 
     /// Get current row as Arc slice (for efficient access)
@@ -184,7 +175,10 @@ impl<'a> StreamingResult<'a> {
     /// Reset to beginning
     pub fn reset(&mut self) {
         self.current_pos = 0;
+        self.fallback_pos = 0;
+        self.chunk_cache = usize::MAX;
         self.current_arc = None;
+        self.current_row = Row::new();
     }
 
     /// Create an AggregationScanner for fast direct aggregations
@@ -193,64 +187,83 @@ impl<'a> StreamingResult<'a> {
     /// - Zero allocations during computation
     /// - Direct memory access to arena data
     /// - Single pass through visible rows
-    pub fn as_aggregation_scanner(&self) -> AggregationScanner<'_> {
+    pub fn as_aggregation_scanner(&self) -> AggregationScanner<'_, 'a> {
         AggregationScanner::new(
-            self.arena_guard.data(),
+            &self.arena_guard,
             &self.visible_indices,
             &self.fallback_data,
-            self.arena_len,
         )
     }
 }
 
-/// Fast aggregation helper that works directly on arena data
-///
-/// Enables aggregations in a single pass over contiguous memory with
-/// zero allocations during the scan. Supports both arena and fallback data.
-pub struct AggregationScanner<'a> {
-    arena_data: &'a [CompactArc<[Value]>],
-    visible_indices: &'a [VisibleRowInfo],
-    fallback_data: &'a [CompactArc<[Value]>],
-    arena_len: usize,
+/// Resolve one visible row without allocating or searching the directory again
+/// while successive handles refer to the same chunk.
+#[inline]
+fn visible_row<'a>(
+    arena: &'a ArenaReadGuard<'_>,
+    fallback: &'a [CompactArc<[Value]>],
+    info: &VisibleRowInfo,
+    fallback_pos: &mut usize,
+    chunk_cache: &mut usize,
+) -> Option<&'a CompactArc<[Value]>> {
+    match info.arena_idx {
+        Some(id) => arena
+            .get_entry_cached(id, chunk_cache)
+            .filter(|(meta, _)| meta.row_id == info.row_id)
+            .map(|(_, data)| data),
+        None => {
+            let data = fallback.get(*fallback_pos);
+            *fallback_pos += 1;
+            data
+        }
+    }
 }
 
-impl<'a> AggregationScanner<'a> {
+/// Allocation-free aggregation over stable arena addresses and historical rows.
+pub struct AggregationScanner<'a, 'arena> {
+    arena: &'a ArenaReadGuard<'arena>,
+    visible_indices: &'a [VisibleRowInfo],
+    fallback_data: &'a [CompactArc<[Value]>],
+}
+
+impl<'a, 'arena> AggregationScanner<'a, 'arena> {
     pub fn new(
-        arena_data: &'a [CompactArc<[Value]>],
+        arena: &'a ArenaReadGuard<'arena>,
         visible_indices: &'a [VisibleRowInfo],
         fallback_data: &'a [CompactArc<[Value]>],
-        arena_len: usize,
     ) -> Self {
         Self {
-            arena_data,
+            arena,
             visible_indices,
             fallback_data,
-            arena_len,
         }
     }
 
-    /// Get the row data for a given VisibleRowInfo (arena or fallback)
-    #[inline(always)]
-    fn get_row(&self, info: &VisibleRowInfo) -> Option<&CompactArc<[Value]>> {
-        if info.arena_idx < self.arena_len {
-            self.arena_data.get(info.arena_idx)
-        } else {
-            self.fallback_data.get(info.arena_idx - self.arena_len)
-        }
+    #[inline]
+    fn rows(&self) -> impl Iterator<Item = &CompactArc<[Value]>> {
+        let mut fallback_pos = 0;
+        let mut chunk_cache = usize::MAX;
+        self.visible_indices.iter().filter_map(move |info| {
+            visible_row(
+                self.arena,
+                self.fallback_data,
+                info,
+                &mut fallback_pos,
+                &mut chunk_cache,
+            )
+        })
     }
 
     /// Sum a column (for INTEGER/FLOAT columns)
     #[inline]
     pub fn sum_column(&self, col_idx: usize) -> f64 {
         let mut sum = 0.0f64;
-        for info in self.visible_indices {
-            if let Some(row) = self.get_row(info) {
-                if let Some(val) = row.get(col_idx) {
-                    match val {
-                        Value::Integer(i) => sum += *i as f64,
-                        Value::Float(f) => sum += *f,
-                        _ => {}
-                    }
+        for row in self.rows() {
+            if let Some(val) = row.get(col_idx) {
+                match val {
+                    Value::Integer(i) => sum += *i as f64,
+                    Value::Float(f) => sum += *f,
+                    _ => {}
                 }
             }
         }
@@ -260,19 +273,17 @@ impl<'a> AggregationScanner<'a> {
     /// Count rows
     #[inline]
     pub fn count(&self) -> usize {
-        self.visible_indices.len()
+        self.rows().count()
     }
 
     /// Count non-null values in a column
     #[inline]
     pub fn count_column(&self, col_idx: usize) -> usize {
         let mut count = 0;
-        for info in self.visible_indices {
-            if let Some(row) = self.get_row(info) {
-                if let Some(val) = row.get(col_idx) {
-                    if !val.is_null() {
-                        count += 1;
-                    }
+        for row in self.rows() {
+            if let Some(val) = row.get(col_idx) {
+                if !val.is_null() {
+                    count += 1;
                 }
             }
         }
@@ -282,17 +293,15 @@ impl<'a> AggregationScanner<'a> {
     /// Get min value in a column
     pub fn min_column(&self, col_idx: usize) -> Option<Value> {
         let mut min: Option<Value> = None;
-        for info in self.visible_indices {
-            if let Some(row) = self.get_row(info) {
-                if let Some(val) = row.get(col_idx) {
-                    if !val.is_null() {
-                        match &min {
-                            None => min = Some(val.clone()),
-                            Some(current) => {
-                                if let Ok(ord) = val.compare(current) {
-                                    if ord == std::cmp::Ordering::Less {
-                                        min = Some(val.clone());
-                                    }
+        for row in self.rows() {
+            if let Some(val) = row.get(col_idx) {
+                if !val.is_null() {
+                    match &min {
+                        None => min = Some(val.clone()),
+                        Some(current) => {
+                            if let Ok(ord) = val.compare(current) {
+                                if ord == std::cmp::Ordering::Less {
+                                    min = Some(val.clone());
                                 }
                             }
                         }
@@ -306,17 +315,15 @@ impl<'a> AggregationScanner<'a> {
     /// Get max value in a column
     pub fn max_column(&self, col_idx: usize) -> Option<Value> {
         let mut max: Option<Value> = None;
-        for info in self.visible_indices {
-            if let Some(row) = self.get_row(info) {
-                if let Some(val) = row.get(col_idx) {
-                    if !val.is_null() {
-                        match &max {
-                            None => max = Some(val.clone()),
-                            Some(current) => {
-                                if let Ok(ord) = val.compare(current) {
-                                    if ord == std::cmp::Ordering::Greater {
-                                        max = Some(val.clone());
-                                    }
+        for row in self.rows() {
+            if let Some(val) = row.get(col_idx) {
+                if !val.is_null() {
+                    match &max {
+                        None => max = Some(val.clone()),
+                        Some(current) => {
+                            if let Ok(ord) = val.compare(current) {
+                                if ord == std::cmp::Ordering::Greater {
+                                    max = Some(val.clone());
                                 }
                             }
                         }
@@ -332,33 +339,43 @@ impl<'a> AggregationScanner<'a> {
 mod tests {
     use super::*;
     use crate::core::types::DataType;
-    use crate::storage::mvcc::arena::RowArena;
+    use crate::storage::mvcc::arena::{ChunkId, RowArena};
+
+    fn first_chunk_slot(slot: usize) -> Option<ArenaId> {
+        Some(ArenaId::from_parts(ChunkId::new(0).unwrap(), slot).unwrap())
+    }
 
     #[test]
     fn test_aggregation_scanner() {
         // Create test data using RowArena
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Integer(1), Value::Float(10.0)]);
-        arena.insert(2, 1, &[Value::Integer(2), Value::Float(20.0)]);
-        arena.insert(3, 1, &[Value::Integer(3), Value::Float(30.0)]);
+        arena
+            .insert(1, 1, &[Value::Integer(1), Value::Float(10.0)], None)
+            .unwrap();
+        arena
+            .insert(2, 1, &[Value::Integer(2), Value::Float(20.0)], None)
+            .unwrap();
+        arena
+            .insert(3, 1, &[Value::Integer(3), Value::Float(30.0)], None)
+            .unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 2,
-                arena_idx: 1,
+                arena_idx: first_chunk_slot(1),
             },
             VisibleRowInfo {
                 row_id: 3,
-                arena_idx: 2,
+                arena_idx: first_chunk_slot(2),
             },
         ];
 
-        let scanner = AggregationScanner::new(guard.data(), &visible, &[], guard.len());
+        let scanner = AggregationScanner::new(&guard, &visible, &[]);
 
         assert_eq!(scanner.count(), 3);
         assert_eq!(scanner.sum_column(0), 6.0); // 1 + 2 + 3
@@ -385,23 +402,29 @@ mod tests {
     #[test]
     fn test_streaming_result_iteration() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Integer(100), Value::Text("a".into())]);
-        arena.insert(2, 1, &[Value::Integer(200), Value::Text("b".into())]);
-        arena.insert(3, 1, &[Value::Integer(300), Value::Text("c".into())]);
+        arena
+            .insert(1, 1, &[Value::Integer(100), Value::Text("a".into())], None)
+            .unwrap();
+        arena
+            .insert(2, 1, &[Value::Integer(200), Value::Text("b".into())], None)
+            .unwrap();
+        arena
+            .insert(3, 1, &[Value::Integer(300), Value::Text("c".into())], None)
+            .unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 2,
-                arena_idx: 1,
+                arena_idx: first_chunk_slot(1),
             },
             VisibleRowInfo {
                 row_id: 3,
-                arena_idx: 2,
+                arena_idx: first_chunk_slot(2),
             },
         ];
         let columns = vec!["id".to_string(), "name".to_string()];
@@ -440,18 +463,18 @@ mod tests {
     #[test]
     fn test_streaming_result_reset() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Integer(1)]);
-        arena.insert(2, 1, &[Value::Integer(2)]);
+        arena.insert(1, 1, &[Value::Integer(1)], None).unwrap();
+        arena.insert(2, 1, &[Value::Integer(2)], None).unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 2,
-                arena_idx: 1,
+                arena_idx: first_chunk_slot(1),
             },
         ];
         let columns = vec!["id".to_string()];
@@ -477,12 +500,12 @@ mod tests {
     #[test]
     fn test_streaming_result_row_id_edge_cases() {
         let arena = RowArena::new();
-        arena.insert(100, 1, &[Value::Integer(1)]);
+        arena.insert(100, 1, &[Value::Integer(1)], None).unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![VisibleRowInfo {
             row_id: 100,
-            arena_idx: 0,
+            arena_idx: first_chunk_slot(0),
         }];
         let columns = vec!["id".to_string()];
 
@@ -504,23 +527,23 @@ mod tests {
     #[test]
     fn test_streaming_result_row_id_with_many_rows() {
         let arena = RowArena::new();
-        arena.insert(10, 1, &[Value::Integer(1)]);
-        arena.insert(20, 1, &[Value::Integer(2)]);
-        arena.insert(30, 1, &[Value::Integer(3)]);
+        arena.insert(10, 1, &[Value::Integer(1)], None).unwrap();
+        arena.insert(20, 1, &[Value::Integer(2)], None).unwrap();
+        arena.insert(30, 1, &[Value::Integer(3)], None).unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 10,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 20,
-                arena_idx: 1,
+                arena_idx: first_chunk_slot(1),
             },
             VisibleRowInfo {
                 row_id: 30,
-                arena_idx: 2,
+                arena_idx: first_chunk_slot(2),
             },
         ];
         let columns = vec!["id".to_string()];
@@ -548,12 +571,14 @@ mod tests {
     #[test]
     fn test_streaming_result_row_slice_and_row() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Integer(42), Value::Float(3.5)]);
+        arena
+            .insert(1, 1, &[Value::Integer(42), Value::Float(3.5)], None)
+            .unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![VisibleRowInfo {
             row_id: 1,
-            arena_idx: 0,
+            arena_idx: first_chunk_slot(0),
         }];
         let columns = vec!["num".to_string(), "val".to_string()];
 
@@ -577,20 +602,21 @@ mod tests {
     #[test]
     fn test_streaming_result_invalid_arena_index() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Integer(1)]);
+        arena.insert(1, 1, &[Value::Integer(1)], None).unwrap();
 
         let guard = arena.read_guard();
         // Invalid arena_idx (999 doesn't exist)
         let visible = vec![VisibleRowInfo {
             row_id: 1,
-            arena_idx: 999,
+            arena_idx: first_chunk_slot(999),
         }];
         let columns = vec!["id".to_string()];
 
         let mut result = StreamingResult::new(guard, visible, columns);
 
-        // Should still advance but current_arc will be None
-        assert!(result.next());
+        // Missing addresses never produce a phantom empty row.
+        assert!(!result.next());
+        assert_eq!(result.remaining(), 0);
         assert!(result.current_arc.is_none());
         assert!(result.row_arc_slice().is_none());
     }
@@ -598,18 +624,18 @@ mod tests {
     #[test]
     fn test_streaming_result_as_aggregation_scanner() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Integer(10)]);
-        arena.insert(2, 1, &[Value::Integer(20)]);
+        arena.insert(1, 1, &[Value::Integer(10)], None).unwrap();
+        arena.insert(2, 1, &[Value::Integer(20)], None).unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 2,
-                arena_idx: 1,
+                arena_idx: first_chunk_slot(1),
             },
         ];
         let columns = vec!["value".to_string()];
@@ -627,7 +653,7 @@ mod tests {
         let guard = arena.read_guard();
         let visible: Vec<VisibleRowInfo> = vec![];
 
-        let scanner = AggregationScanner::new(guard.data(), &visible, &[], guard.len());
+        let scanner = AggregationScanner::new(&guard, &visible, &[]);
 
         assert_eq!(scanner.count(), 0);
         assert_eq!(scanner.sum_column(0), 0.0);
@@ -639,27 +665,43 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_with_nulls() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Integer(10), Value::Null(DataType::Integer)]);
-        arena.insert(2, 1, &[Value::Null(DataType::Integer), Value::Integer(20)]);
-        arena.insert(3, 1, &[Value::Integer(30), Value::Integer(30)]);
+        arena
+            .insert(
+                1,
+                1,
+                &[Value::Integer(10), Value::Null(DataType::Integer)],
+                None,
+            )
+            .unwrap();
+        arena
+            .insert(
+                2,
+                1,
+                &[Value::Null(DataType::Integer), Value::Integer(20)],
+                None,
+            )
+            .unwrap();
+        arena
+            .insert(3, 1, &[Value::Integer(30), Value::Integer(30)], None)
+            .unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 2,
-                arena_idx: 1,
+                arena_idx: first_chunk_slot(1),
             },
             VisibleRowInfo {
                 row_id: 3,
-                arena_idx: 2,
+                arena_idx: first_chunk_slot(2),
             },
         ];
 
-        let scanner = AggregationScanner::new(guard.data(), &visible, &[], guard.len());
+        let scanner = AggregationScanner::new(&guard, &visible, &[]);
 
         // count() returns all visible rows
         assert_eq!(scanner.count(), 3);
@@ -676,27 +718,33 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_all_nulls() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Null(DataType::Integer)]);
-        arena.insert(2, 1, &[Value::Null(DataType::Integer)]);
-        arena.insert(3, 1, &[Value::Null(DataType::Integer)]);
+        arena
+            .insert(1, 1, &[Value::Null(DataType::Integer)], None)
+            .unwrap();
+        arena
+            .insert(2, 1, &[Value::Null(DataType::Integer)], None)
+            .unwrap();
+        arena
+            .insert(3, 1, &[Value::Null(DataType::Integer)], None)
+            .unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 2,
-                arena_idx: 1,
+                arena_idx: first_chunk_slot(1),
             },
             VisibleRowInfo {
                 row_id: 3,
-                arena_idx: 2,
+                arena_idx: first_chunk_slot(2),
             },
         ];
 
-        let scanner = AggregationScanner::new(guard.data(), &visible, &[], guard.len());
+        let scanner = AggregationScanner::new(&guard, &visible, &[]);
 
         assert_eq!(scanner.count(), 3);
         assert_eq!(scanner.count_column(0), 0);
@@ -708,32 +756,34 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_min_max() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Integer(50)]);
-        arena.insert(2, 1, &[Value::Integer(10)]);
-        arena.insert(3, 1, &[Value::Integer(30)]);
-        arena.insert(4, 1, &[Value::Null(DataType::Integer)]);
+        arena.insert(1, 1, &[Value::Integer(50)], None).unwrap();
+        arena.insert(2, 1, &[Value::Integer(10)], None).unwrap();
+        arena.insert(3, 1, &[Value::Integer(30)], None).unwrap();
+        arena
+            .insert(4, 1, &[Value::Null(DataType::Integer)], None)
+            .unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 2,
-                arena_idx: 1,
+                arena_idx: first_chunk_slot(1),
             },
             VisibleRowInfo {
                 row_id: 3,
-                arena_idx: 2,
+                arena_idx: first_chunk_slot(2),
             },
             VisibleRowInfo {
                 row_id: 4,
-                arena_idx: 3,
+                arena_idx: first_chunk_slot(3),
             },
         ];
 
-        let scanner = AggregationScanner::new(guard.data(), &visible, &[], guard.len());
+        let scanner = AggregationScanner::new(&guard, &visible, &[]);
 
         assert_eq!(scanner.min_column(0), Some(Value::Integer(10)));
         assert_eq!(scanner.max_column(0), Some(Value::Integer(50)));
@@ -742,27 +792,27 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_min_max_floats() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Float(3.15)]);
-        arena.insert(2, 1, &[Value::Float(2.72)]);
-        arena.insert(3, 1, &[Value::Float(1.42)]);
+        arena.insert(1, 1, &[Value::Float(3.15)], None).unwrap();
+        arena.insert(2, 1, &[Value::Float(2.72)], None).unwrap();
+        arena.insert(3, 1, &[Value::Float(1.42)], None).unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 2,
-                arena_idx: 1,
+                arena_idx: first_chunk_slot(1),
             },
             VisibleRowInfo {
                 row_id: 3,
-                arena_idx: 2,
+                arena_idx: first_chunk_slot(2),
             },
         ];
 
-        let scanner = AggregationScanner::new(guard.data(), &visible, &[], guard.len());
+        let scanner = AggregationScanner::new(&guard, &visible, &[]);
 
         assert_eq!(scanner.min_column(0), Some(Value::Float(1.42)));
         assert_eq!(scanner.max_column(0), Some(Value::Float(3.15)));
@@ -771,27 +821,33 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_min_max_text() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Text("banana".into())]);
-        arena.insert(2, 1, &[Value::Text("apple".into())]);
-        arena.insert(3, 1, &[Value::Text("cherry".into())]);
+        arena
+            .insert(1, 1, &[Value::Text("banana".into())], None)
+            .unwrap();
+        arena
+            .insert(2, 1, &[Value::Text("apple".into())], None)
+            .unwrap();
+        arena
+            .insert(3, 1, &[Value::Text("cherry".into())], None)
+            .unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 2,
-                arena_idx: 1,
+                arena_idx: first_chunk_slot(1),
             },
             VisibleRowInfo {
                 row_id: 3,
-                arena_idx: 2,
+                arena_idx: first_chunk_slot(2),
             },
         ];
 
-        let scanner = AggregationScanner::new(guard.data(), &visible, &[], guard.len());
+        let scanner = AggregationScanner::new(&guard, &visible, &[]);
 
         assert_eq!(scanner.min_column(0), Some(Value::Text("apple".into())));
         assert_eq!(scanner.max_column(0), Some(Value::Text("cherry".into())));
@@ -800,27 +856,29 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_sum_non_numeric() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Text("hello".into())]);
-        arena.insert(2, 1, &[Value::Boolean(true)]);
-        arena.insert(3, 1, &[Value::Integer(10)]);
+        arena
+            .insert(1, 1, &[Value::Text("hello".into())], None)
+            .unwrap();
+        arena.insert(2, 1, &[Value::Boolean(true)], None).unwrap();
+        arena.insert(3, 1, &[Value::Integer(10)], None).unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 2,
-                arena_idx: 1,
+                arena_idx: first_chunk_slot(1),
             },
             VisibleRowInfo {
                 row_id: 3,
-                arena_idx: 2,
+                arena_idx: first_chunk_slot(2),
             },
         ];
 
-        let scanner = AggregationScanner::new(guard.data(), &visible, &[], guard.len());
+        let scanner = AggregationScanner::new(&guard, &visible, &[]);
 
         // sum_column only sums Integer and Float, ignores others
         assert_eq!(scanner.sum_column(0), 10.0);
@@ -829,27 +887,27 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_mixed_numeric() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Integer(10)]);
-        arena.insert(2, 1, &[Value::Float(20.5)]);
-        arena.insert(3, 1, &[Value::Integer(30)]);
+        arena.insert(1, 1, &[Value::Integer(10)], None).unwrap();
+        arena.insert(2, 1, &[Value::Float(20.5)], None).unwrap();
+        arena.insert(3, 1, &[Value::Integer(30)], None).unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 2,
-                arena_idx: 1,
+                arena_idx: first_chunk_slot(1),
             },
             VisibleRowInfo {
                 row_id: 3,
-                arena_idx: 2,
+                arena_idx: first_chunk_slot(2),
             },
         ];
 
-        let scanner = AggregationScanner::new(guard.data(), &visible, &[], guard.len());
+        let scanner = AggregationScanner::new(&guard, &visible, &[]);
 
         assert_eq!(scanner.sum_column(0), 60.5);
     }
@@ -857,15 +915,15 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_invalid_column() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Integer(10)]);
+        arena.insert(1, 1, &[Value::Integer(10)], None).unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![VisibleRowInfo {
             row_id: 1,
-            arena_idx: 0,
+            arena_idx: first_chunk_slot(0),
         }];
 
-        let scanner = AggregationScanner::new(guard.data(), &visible, &[], guard.len());
+        let scanner = AggregationScanner::new(&guard, &visible, &[]);
 
         // Column 99 doesn't exist
         assert_eq!(scanner.sum_column(99), 0.0);
@@ -877,56 +935,156 @@ mod tests {
     #[test]
     fn test_aggregation_scanner_invalid_arena_index() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Integer(10)]);
+        arena.insert(1, 1, &[Value::Integer(10)], None).unwrap();
 
         let guard = arena.read_guard();
         // Include an invalid arena index
         let visible = vec![
             VisibleRowInfo {
                 row_id: 1,
-                arena_idx: 0,
+                arena_idx: first_chunk_slot(0),
             },
             VisibleRowInfo {
                 row_id: 2,
-                arena_idx: 999,
+                arena_idx: first_chunk_slot(999),
             }, // Invalid
         ];
 
-        let scanner = AggregationScanner::new(guard.data(), &visible, &[], guard.len());
+        let scanner = AggregationScanner::new(&guard, &visible, &[]);
 
-        // Should gracefully skip invalid indices
-        assert_eq!(scanner.count(), 2);
+        // Every aggregation skips absent addresses, including COUNT(*).
+        assert_eq!(scanner.count(), 1);
         assert_eq!(scanner.sum_column(0), 10.0); // Only valid row counted
         assert_eq!(scanner.count_column(0), 1); // Only valid row counted
     }
 
     #[test]
     fn test_visible_row_info_clone_copy() {
+        assert_eq!(std::mem::size_of::<VisibleRowInfo>(), 16);
         let info = VisibleRowInfo {
             row_id: 42,
-            arena_idx: 5,
+            arena_idx: first_chunk_slot(5),
         };
 
         // Test Copy trait
         let copied = info;
         assert_eq!(copied.row_id, 42);
-        assert_eq!(copied.arena_idx, 5);
+        assert_eq!(copied.arena_idx, first_chunk_slot(5));
 
         // Test Clone trait (use Clone::clone to avoid clone_on_copy warning)
         let cloned = Clone::clone(&info);
         assert_eq!(cloned.row_id, 42);
-        assert_eq!(cloned.arena_idx, 5);
+        assert_eq!(cloned.arena_idx, first_chunk_slot(5));
+    }
+
+    #[test]
+    fn stale_address_cannot_read_the_replacement_rows_payload() {
+        let arena = RowArena::new();
+        let anchor = arena.insert(99, 1, &[Value::Integer(99)], None).unwrap();
+        let old = arena.insert(1, 1, &[Value::Integer(11)], None).unwrap();
+        assert!(arena.clear_at(old, 1, 1));
+        let replacement = arena.insert(2, 2, &[Value::Integer(222)], None).unwrap();
+        assert_eq!(replacement, old, "active slot was actually reused");
+        let visible = vec![
+            VisibleRowInfo {
+                row_id: 1,
+                arena_idx: Some(old),
+            },
+            VisibleRowInfo {
+                row_id: 2,
+                arena_idx: Some(replacement),
+            },
+            VisibleRowInfo {
+                row_id: 99,
+                arena_idx: Some(anchor),
+            },
+        ];
+        let mut result = StreamingResult::new(arena.read_guard(), visible, vec!["value".into()]);
+        let scanner = result.as_aggregation_scanner();
+        assert_eq!(scanner.count(), 2);
+        assert_eq!(scanner.sum_column(0), 321.0);
+        assert!(result.next());
+        assert_eq!(result.row_id(), 2);
+        assert_eq!(result.get(0), Some(&Value::Integer(222)));
+        assert!(result.next());
+        assert_eq!(result.row_id(), 99);
+        assert!(!result.next());
+    }
+
+    #[test]
+    fn historical_rows_keep_sequence_across_chunk_holes_and_reset() {
+        let arena = RowArena::new();
+        let left = arena.insert(10, 1, &[Value::Integer(10)], None).unwrap();
+        arena.freeze_active().unwrap();
+        let hole = arena.insert(20, 1, &[Value::Integer(20)], None).unwrap();
+        arena.freeze_active().unwrap();
+        let right = arena.insert(30, 1, &[Value::Integer(30)], None).unwrap();
+        assert!(arena.clear_at(hole, 20, 1));
+        let visible = vec![
+            VisibleRowInfo {
+                row_id: 5,
+                arena_idx: None,
+            },
+            VisibleRowInfo {
+                row_id: 10,
+                arena_idx: Some(left),
+            },
+            VisibleRowInfo {
+                row_id: 20,
+                arena_idx: Some(hole),
+            },
+            VisibleRowInfo {
+                row_id: 25,
+                arena_idx: None,
+            },
+            VisibleRowInfo {
+                row_id: 30,
+                arena_idx: Some(right),
+            },
+            VisibleRowInfo {
+                row_id: 40,
+                arena_idx: None,
+            },
+        ];
+        let fallback = [50, 250, 400].map(|value| CompactArc::from(vec![Value::Integer(value)]));
+        let mut result = StreamingResult::new_with_fallback(
+            arena.read_guard(),
+            visible,
+            fallback.to_vec(),
+            vec!["value".into()],
+        );
+        assert!(result.next());
+        assert!(result.next());
+        // Aggregations have independent fallback/cached-chunk cursors even
+        // when called after partial streaming or a previous aggregation.
+        let scanner = result.as_aggregation_scanner();
+        assert_eq!(scanner.count(), 5);
+        assert_eq!(scanner.sum_column(0), 740.0);
+        assert_eq!(scanner.count_column(0), 5);
+        assert_eq!(scanner.min_column(0), Some(Value::Integer(10)));
+        assert_eq!(scanner.max_column(0), Some(Value::Integer(400)));
+        assert_eq!(scanner.sum_column(0), 740.0);
+        for _ in 0..2 {
+            result.reset();
+            let mut actual = Vec::new();
+            while result.next() {
+                actual.push((result.row_id(), result.get(0).cloned().unwrap()));
+            }
+            let expected = [(5, 50), (10, 10), (25, 250), (30, 30), (40, 400)]
+                .map(|(row, value)| (row, Value::Integer(value)));
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]
     fn test_streaming_result_single_row() {
         let arena = RowArena::new();
-        arena.insert(1, 1, &[Value::Integer(42)]);
+        arena.insert(1, 1, &[Value::Integer(42)], None).unwrap();
 
         let guard = arena.read_guard();
         let visible = vec![VisibleRowInfo {
             row_id: 1,
-            arena_idx: 0,
+            arena_idx: first_chunk_slot(0),
         }];
         let columns = vec!["value".to_string()];
 

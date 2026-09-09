@@ -3966,6 +3966,10 @@ impl Table for SegmentedTable {
         self.hot.has_local_changes() || self.segment_mgr.has_pending_tombstones(self.txn_id())
     }
 
+    fn record_source_lsn(&self, row_id: i64, lsn: Option<std::num::NonZeroU64>) {
+        self.hot.record_source_lsn(row_id, lsn);
+    }
+
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
         self.hot.get_pending_versions()
     }

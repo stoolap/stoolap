@@ -9846,6 +9846,13 @@ impl Executor {
                     "chain_entries".to_string(),
                     "volume_bytes".to_string(),
                     "admission_waits".to_string(),
+                    "retained_hot_bytes".to_string(),
+                    "conservative_hot_bytes".to_string(),
+                    "pending_hot_bytes".to_string(),
+                    "accounted_hot_bytes".to_string(),
+                    "peak_accounted_hot_bytes".to_string(),
+                    "accounting_scope".to_string(),
+                    "hard_limit_enforced".to_string(),
                 ];
 
                 let stats = self.engine.memory_stats();
@@ -9862,6 +9869,13 @@ impl Executor {
                             Value::Integer(stat.chain_entries as i64),
                             Value::Integer(stat.volume_bytes as i64),
                             Value::Integer(stat.admission_waits as i64),
+                            Value::Integer(stat.retained_hot_bytes as i64),
+                            Value::Integer(stat.conservative_hot_bytes as i64),
+                            Value::Integer(stat.pending_hot_bytes as i64),
+                            Value::Integer(stat.accounted_hot_bytes as i64),
+                            Value::Integer(stat.peak_accounted_hot_bytes as i64),
+                            Value::text("hot_owned; accounting_only; excludes_catalog_query_cold_maintenance"),
+                            Value::Boolean(false),
                         ]),
                     ));
                 }

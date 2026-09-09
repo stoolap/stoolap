@@ -18,7 +18,7 @@
 //! through niche optimization. The design:
 //!
 //! - **Inline**: strings ≤15 bytes stored inline (no heap allocation)
-//! - **Heap**: strings >15 bytes stored as Arc<String> for O(1) clone
+//! - **Heap**: strings >15 bytes use counted backing for O(1) clone
 //!
 //! ## Memory Layout (16 bytes, 8-byte aligned)
 //!
@@ -28,11 +28,11 @@
 //!   tag = 0-15 (encodes length)
 //!
 //! Heap (>15 bytes) on 64-bit:
-//!   [tag: 1 byte] [pad: 7 bytes] [Arc<String>: 8 bytes]
+//!   [tag: 1 byte] [pad: 7 bytes] [HeapString*: 8 bytes]
 //!   tag = 16 (heap marker), pointer at data[7..15]
 //!
 //! Heap (>15 bytes) on 32-bit:
-//!   [tag: 1 byte] [pad: 11 bytes] [Arc<String>: 4 bytes]
+//!   [tag: 1 byte] [pad: 11 bytes] [HeapString*: 4 bytes]
 //!   tag = 16 (heap marker), pointer at data[11..15]
 //! ```
 //!
@@ -46,8 +46,54 @@ use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::mem::{self, ManuallyDrop};
 use std::ops::Deref;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+use super::memory::AccountSlot;
+use super::{MemoryAccount, MemoryAdoption};
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_STRING_UNIQUE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
 use std::sync::Arc;
+
+/// No weak references: the account replaces Arc's weak-count word, preserving
+/// the old Arc<String> backing size (40 bytes on 64-bit) and allocation count.
+#[repr(C)]
+struct HeapString {
+    strong: AtomicUsize,
+    account: AccountSlot,
+    text: ManuallyDrop<String>,
+}
+
+impl Deref for HeapString {
+    type Target = String;
+    fn deref(&self) -> &String {
+        &self.text
+    }
+}
+
+impl HeapString {
+    fn allocation_size(&self) -> usize {
+        // String capacity is bounded by isize::MAX, leaving room for this header.
+        mem::size_of::<Self>() + self.text.capacity()
+    }
+
+    unsafe fn release(pointer: *mut Self) {
+        // SAFETY: each string owns a reference; release/acquire orders accesses before final drop.
+        if (*pointer).strong.fetch_sub(1, AtomicOrdering::Release) == 1 {
+            std::sync::atomic::fence(AtomicOrdering::Acquire);
+            let bytes = (*pointer).allocation_size();
+            let charge = (*pointer).account.take(bytes);
+            ManuallyDrop::drop(&mut (*pointer).text);
+            drop(Box::from_raw(pointer));
+            // The text buffer and its header have both been freed.
+            drop(charge);
+        }
+    }
+}
 
 /// Maximum inline string length (15 bytes)
 pub const MAX_INLINE_LEN: usize = 15;
@@ -171,8 +217,12 @@ impl SmartString {
     /// Create a SmartString from an owned String (heap case)
     #[inline]
     fn new_heap(s: String) -> Self {
-        let arc = Arc::new(s);
-        let ptr = Arc::into_raw(arc) as usize;
+        let backing = Box::new(HeapString {
+            strong: AtomicUsize::new(1),
+            account: AccountSlot::new(),
+            text: ManuallyDrop::new(s),
+        });
+        let ptr = Box::into_raw(backing) as usize;
         let mut data = [0u8; 15];
         let end = ptr_layout::OFFSET + ptr_layout::SIZE;
         data[ptr_layout::OFFSET..end].copy_from_slice(&ptr.to_ne_bytes());
@@ -232,12 +282,12 @@ impl SmartString {
             // SAFETY: SmartString only stores valid UTF-8
             unsafe { std::str::from_utf8_unchecked(&self.data[..len]) }
         } else {
-            // Heap case: Arc<String> pointer at platform-specific offset
+            // Heap case: HeapString pointer at platform-specific offset
             let end = ptr_layout::OFFSET + ptr_layout::SIZE;
             let ptr_bytes: ptr_layout::Bytes =
                 self.data[ptr_layout::OFFSET..end].try_into().unwrap();
-            let ptr = usize::from_ne_bytes(ptr_bytes) as *const String;
-            // SAFETY: We only store valid Arc<String> pointers
+            let ptr = usize::from_ne_bytes(ptr_bytes) as *mut HeapString;
+            // SAFETY: We only store valid HeapString pointers
             unsafe { (*ptr).as_str() }
         }
     }
@@ -247,8 +297,8 @@ impl SmartString {
     #[inline]
     pub fn heap_capacity(&self) -> usize {
         if self.tag.is_heap() {
-            // SAFETY: heap strings hold a valid Arc<String> pointer
-            unsafe { (*self.get_arc_ptr()).capacity() }
+            // SAFETY: heap strings hold a valid HeapString pointer
+            unsafe { (*self.get_heap_ptr()).capacity() }
         } else {
             0
         }
@@ -279,13 +329,54 @@ impl SmartString {
         self.tag.is_heap()
     }
 
-    /// Get the raw Arc<String> pointer for heap strings
+    /// Get the raw HeapString pointer for heap strings
     #[inline]
-    fn get_arc_ptr(&self) -> *const String {
+    fn get_heap_ptr(&self) -> *mut HeapString {
         debug_assert!(self.tag.is_heap());
         let end = ptr_layout::OFFSET + ptr_layout::SIZE;
         let ptr_bytes: ptr_layout::Bytes = self.data[ptr_layout::OFFSET..end].try_into().unwrap();
-        usize::from_ne_bytes(ptr_bytes) as *const String
+        usize::from_ne_bytes(ptr_bytes) as *mut HeapString
+    }
+
+    pub fn memory_account(&self) -> Option<MemoryAccount> {
+        if self.tag.is_inline() {
+            return None;
+        }
+        // SAFETY: self retains the immutable backing and its installed account.
+        unsafe { (*self.get_heap_ptr()).account.get() }
+    }
+
+    /// Adopt immutable backing without changing Value/SmartString aliases.
+    /// Inline strings have no heap allocation to adopt.
+    pub fn try_adopt_hot(&self, account: &MemoryAccount) -> MemoryAdoption {
+        if self.tag.is_inline() {
+            return MemoryAdoption::AlreadyOwned;
+        }
+        // SAFETY: the non-inline string keeps its immutable backing alive through adoption.
+        unsafe {
+            let backing = &*self.get_heap_ptr();
+            backing.account.adopt(account, backing.allocation_size())
+        }
+    }
+
+    /// Reuse same-engine backing, adopting unowned bytes once. Foreign backing
+    /// is copied so each physical allocation has one engine owner.
+    pub fn into_hot(self, account: &MemoryAccount) -> Self {
+        if self.try_adopt_hot(account) != MemoryAdoption::ForeignEngine {
+            return self;
+        }
+        let replacement = Self::from_string(self.as_str().to_owned());
+        replacement.try_adopt_hot(account);
+        replacement
+    }
+
+    fn replacement(&self, string: String) -> Self {
+        let replacement = Self::from_string(string);
+        if let Some(account) = self.memory_account() {
+            replacement.into_hot(&account)
+        } else {
+            replacement
+        }
     }
 
     /// Convert to a version that will use Arc for future clones (no-op now, kept for API compat)
@@ -322,7 +413,7 @@ impl SmartString {
         // Need to go to heap or already on heap
         let mut s = self.as_str().to_string();
         s.push(ch);
-        *self = Self::from_string(s);
+        *self = self.replacement(s);
     }
 
     /// Appends a string slice to the string.
@@ -346,7 +437,7 @@ impl SmartString {
         // Need to go to heap or already on heap
         let mut s = self.as_str().to_string();
         s.push_str(string);
-        *self = Self::from_string(s);
+        *self = self.replacement(s);
     }
 
     /// Lowercase copy. An inline ASCII string, which is what nearly every
@@ -362,7 +453,7 @@ impl SmartString {
                 return copy;
             }
         }
-        SmartString::from_string(self.as_str().to_lowercase())
+        self.replacement(self.as_str().to_lowercase())
     }
 
     /// Uppercase copy, with the same inline ASCII fast path as
@@ -376,7 +467,7 @@ impl SmartString {
                 return copy;
             }
         }
-        SmartString::from_string(self.as_str().to_uppercase())
+        self.replacement(self.as_str().to_uppercase())
     }
 
     #[inline]
@@ -391,7 +482,7 @@ impl SmartString {
         } else {
             let mut s = self.as_str().to_string();
             s.make_ascii_uppercase();
-            *self = Self::from_string(s);
+            *self = self.replacement(s);
         }
     }
 
@@ -402,26 +493,46 @@ impl SmartString {
         } else {
             let mut s = self.as_str().to_string();
             s.make_ascii_lowercase();
-            *self = Self::from_string(s);
+            *self = self.replacement(s);
         }
     }
 
     #[inline]
     pub fn into_string(self) -> String {
         if self.tag.is_inline() {
-            self.as_str().to_owned()
-        } else {
-            // Take ownership of the Arc without incrementing refcount
-            let ptr = self.get_arc_ptr();
-            std::mem::forget(self); // Prevent Drop from decrementing
-                                    // SAFETY: ptr is a valid Arc<String> pointer, and we've prevented
-                                    // self's Drop from running, so we're taking over its ownership
-            let arc = unsafe { Arc::from_raw(ptr) };
-            match Arc::try_unwrap(arc) {
-                Ok(s) => s,
-                Err(arc) => (*arc).clone(),
+            return self.as_str().to_owned();
+        }
+        let pointer = self.get_heap_ptr();
+        #[cfg(test)]
+        BEFORE_STRING_UNIQUE.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+        // SAFETY: self retains the backing; the CAS acquires exclusive ownership before charge removal.
+        unsafe {
+            if (*pointer)
+                .strong
+                .compare_exchange(1, 0, AtomicOrdering::Acquire, AtomicOrdering::Relaxed)
+                .is_ok()
+            {
+                mem::forget(self);
+                let mut backing = Box::from_raw(pointer);
+                let bytes = backing.allocation_size();
+                let charge = backing.account.take(bytes);
+                let text = ManuallyDrop::take(&mut backing.text);
+                drop(backing);
+                if charge.is_some() {
+                    // Keep the moved buffer charged until destruction; the returned String owns a copy.
+                    let copy = text.clone();
+                    drop(text);
+                    drop(charge);
+                    return copy;
+                }
+                return text;
             }
         }
+        self.as_str().to_owned()
     }
 
     #[inline]
@@ -500,9 +611,14 @@ impl Clone for SmartString {
     fn clone(&self) -> Self {
         if self.tag.is_heap() {
             // Heap: increment Arc refcount to balance the new owner's Drop
-            // SAFETY: get_arc_ptr() returns a valid Arc<String> pointer
+            // SAFETY: get_heap_ptr() returns a valid HeapString pointer
             unsafe {
-                Arc::increment_strong_count(self.get_arc_ptr());
+                let previous = (*self.get_heap_ptr())
+                    .strong
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                if previous > isize::MAX as usize {
+                    std::process::abort();
+                }
             }
         }
         // Data bytes already contain the correct content (inline bytes or pointer)
@@ -518,10 +634,10 @@ impl Drop for SmartString {
     fn drop(&mut self) {
         if self.tag.is_heap() {
             // Heap: decrement Arc refcount
-            let ptr = self.get_arc_ptr();
-            // SAFETY: We only store valid Arc<String> pointers
+            let ptr = self.get_heap_ptr();
+            // SAFETY: We only store valid HeapString pointers
             unsafe {
-                Arc::from_raw(ptr);
+                HeapString::release(ptr);
             }
         }
     }
@@ -717,6 +833,89 @@ impl fmt::Write for SmartString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heap_accounting_keeps_compact_layout_and_alias_lifetime() {
+        assert_eq!(mem::size_of::<SmartString>(), 16);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(mem::size_of::<HeapString>(), 40);
+        let account = MemoryAccount::new();
+        let mut buffer = String::with_capacity(200);
+        buffer.push_str("heap string retained by several aliases");
+        let value = SmartString::from_string(buffer).into_hot(&account);
+        let expected = 200 + mem::size_of::<HeapString>();
+        assert_eq!(account.snapshot().retained_bytes, expected);
+        let alias = value.clone();
+        drop(value);
+        assert_eq!(alias.as_str(), "heap string retained by several aliases");
+        assert_eq!(account.snapshot().retained_bytes, expected);
+        drop(alias);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn charged_string_conversion_and_mutation_keep_real_owners_charged() {
+        let account = MemoryAccount::new();
+        let mut value = SmartString::new("tracked text with heap backing").into_hot(&account);
+        let original = value.clone();
+        let original_bytes = account.snapshot().retained_bytes;
+        value.push_str(" and more");
+        assert!(value.memory_account().unwrap().same_engine(&account));
+        assert!(account.snapshot().retained_bytes > original_bytes);
+        let plain = value.into_string();
+        assert_eq!(plain, "tracked text with heap backing and more");
+        assert_eq!(account.snapshot().retained_bytes, original_bytes);
+        drop(original);
+        assert_eq!(account.snapshot().retained_bytes, 0);
+        assert_eq!(plain, "tracked text with heap backing and more");
+    }
+
+    #[test]
+    fn cross_engine_string_adoption_copies_only_foreign_backing() {
+        let first = MemoryAccount::new();
+        let second = MemoryAccount::new();
+        let a = SmartString::new("a string too long to store inline").into_hot(&first);
+        assert_eq!(a.try_adopt_hot(&second), MemoryAdoption::ForeignEngine);
+        let b = a.clone().into_hot(&second);
+        assert_ne!(a.as_str().as_ptr(), b.as_str().as_ptr());
+        assert_eq!(a, b);
+        let bytes = second.snapshot().retained_bytes;
+        drop(a);
+        assert_eq!(first.snapshot().retained_bytes, 0);
+        assert_eq!(second.snapshot().retained_bytes, bytes);
+        drop(b);
+        assert_eq!(second.snapshot().retained_bytes, 0);
+    }
+
+    #[test]
+    fn adoption_before_string_unique_cas_cannot_escape_charge() {
+        use std::sync::Barrier;
+        let account = MemoryAccount::new();
+        let value = SmartString::new("shared string adopted during conversion");
+        let other = value.clone();
+        let paused = Arc::new(Barrier::new(2));
+        let resume = Arc::new(Barrier::new(2));
+        let ready = paused.clone();
+        let release = resume.clone();
+        let consumer = std::thread::spawn(move || {
+            BEFORE_STRING_UNIQUE.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    ready.wait();
+                    release.wait();
+                }))
+            });
+            value.into_string()
+        });
+        paused.wait();
+        assert_eq!(other.try_adopt_hot(&account), MemoryAdoption::Adopted);
+        assert!(account.snapshot().retained_bytes > 0);
+        drop(other);
+        resume.wait();
+        let text = consumer.join().unwrap();
+        assert_eq!(text, "shared string adopted during conversion");
+        assert_eq!(account.snapshot().retained_bytes, 0);
+    }
+
     use std::collections::HashMap;
     use std::mem::size_of;
 

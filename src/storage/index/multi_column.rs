@@ -35,13 +35,17 @@
 //! - `prefix_indexes` are built on first partial query per prefix length
 
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use rustc_hash::FxHashMap;
 
-use crate::common::{CompactArc, CompactVec, I64Map};
+use super::accounted_map::{HeapBytes, PrivateHeap, TrackedBTree, TrackedHash};
+use super::memory::IndexMemory;
+use crate::common::{CompactArc, CompactVec, I64Map, MemoryAccount, MemoryAdoption};
+type KeyMap<V> = TrackedHash<CompositeKey, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+type SharedKey = CompactArc<[CompactArc<Value>]>;
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::traits::Index;
@@ -54,6 +58,14 @@ use crate::storage::traits::Index;
 /// Wraps Vec<Value> with proper Ord implementation
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompositeKey(pub Vec<Value>);
+impl PrivateHeap for CompositeKey {
+    fn private_heap(&self) -> HeapBytes {
+        HeapBytes {
+            retained: self.0.capacity() * std::mem::size_of::<Value>(),
+            conservative: 0,
+        }
+    }
+}
 
 impl PartialOrd for CompositeKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -113,20 +125,20 @@ pub struct MultiColumnIndex {
     closed: AtomicBool,
 
     /// Main BTree index for range queries - LAZY built on first range query
-    sorted_values: RwLock<BTreeMap<CompositeKey, CompactVec<i64>>>,
+    sorted_values: RwLock<TrackedBTree<CompositeKey, CompactVec<i64>>>,
     btree_built: AtomicBool,
 
     /// Hash index for exact lookups (full key) - always maintained
-    value_to_rows: RwLock<FxHashMap<CompositeKey, CompactVec<i64>>>,
+    value_to_rows: RwLock<KeyMap<CompactVec<i64>>>,
 
     /// Prefix indexes: LAZY built on first partial query
     /// Index 0 = first column, Index 1 = first two columns, etc.
-    prefix_indexes: Vec<RwLock<FxHashMap<CompositeKey, CompactVec<i64>>>>,
+    prefix_indexes: Vec<RwLock<KeyMap<CompactVec<i64>>>>,
     prefix_built: Vec<AtomicBool>,
 
     /// Reverse mapping for removal - uses Vec<CompactArc<Value>> for memory efficiency
     /// Arc references are shared with ValueArena (8 bytes per value)
-    row_to_key: RwLock<I64Map<Vec<CompactArc<Value>>>>,
+    row_to_key: RwLock<I64Map<SharedKey>>,
 
     /// Per prefix group, its rows ordered by the column after the prefix:
     /// built when a walk first asks for the group, kept up to date by single
@@ -134,7 +146,8 @@ pub struct MultiColumnIndex {
     /// Writers touch it last, after the prefix indexes a build reads, and a
     /// build holds its write lock from that read to the insert, so a row is
     /// either in the group when it is built or added to it afterwards.
-    walk_orders: RwLock<FxHashMap<CompositeKey, BTreeSet<(Value, i64)>>>,
+    walk_orders: RwLock<KeyMap<BTreeSet<(Value, i64)>>>,
+    memory: IndexMemory,
 }
 
 impl std::fmt::Debug for MultiColumnIndex {
@@ -168,7 +181,7 @@ impl MultiColumnIndex {
         let mut prefix_indexes = Vec::with_capacity(num_cols);
         let mut prefix_built = Vec::with_capacity(num_cols);
         for _ in 0..num_cols {
-            prefix_indexes.push(RwLock::new(FxHashMap::default()));
+            prefix_indexes.push(RwLock::new(KeyMap::default()));
             prefix_built.push(AtomicBool::new(false));
         }
 
@@ -180,13 +193,12 @@ impl MultiColumnIndex {
             data_types,
             is_unique,
             closed: AtomicBool::new(false),
-            sorted_values: RwLock::new(BTreeMap::new()),
+            sorted_values: RwLock::new(TrackedBTree::new()),
             btree_built: AtomicBool::new(false),
-            value_to_rows: RwLock::new(if expected_rows > 0 {
-                FxHashMap::with_capacity_and_hasher(expected_rows, Default::default())
-            } else {
-                FxHashMap::default()
-            }),
+            value_to_rows: RwLock::new(KeyMap::with_capacity_and_hasher(
+                expected_rows,
+                Default::default(),
+            )),
             prefix_indexes,
             prefix_built,
             row_to_key: RwLock::new(if expected_rows > 0 {
@@ -194,7 +206,40 @@ impl MultiColumnIndex {
             } else {
                 I64Map::new()
             }),
-            walk_orders: RwLock::new(FxHashMap::default()),
+            walk_orders: RwLock::new(KeyMap::default()),
+            memory: IndexMemory::default(),
+        }
+    }
+
+    fn owned_key(&self, values: &[Value]) -> CompositeKey {
+        CompositeKey(
+            values
+                .iter()
+                .map(|value| self.memory.value(value))
+                .collect(),
+        )
+    }
+    fn shared_key(&self, values: &[Value]) -> SharedKey {
+        match self.memory.account() {
+            Some(account) => CompactArc::from_exact_iter_in(
+                values.iter().map(|value| self.memory.value_arc(value)),
+                account,
+            ),
+            None => CompactArc::from_vec(
+                values
+                    .iter()
+                    .map(|value| self.memory.value_arc(value))
+                    .collect(),
+            ),
+        }
+    }
+    fn adopt_key(key: &CompositeKey, account: &MemoryAccount) -> Result<()> {
+        if key.0.iter().all(|value| value.try_adopt_hot(account)) {
+            Ok(())
+        } else {
+            Err(Error::internal(
+                "prebuilt index key belongs to another engine",
+            ))
         }
     }
 
@@ -209,8 +254,8 @@ impl MultiColumnIndex {
     fn order_insert(&self, values: &[Value], row_id: i64) {
         let mut orders = self.walk_orders.write();
         for prefix_len in 1..values.len() {
-            if let Some(order) = orders.get_mut(&CompositeKey(values[..prefix_len].to_vec())) {
-                order.insert((values[prefix_len].clone(), row_id));
+            if let Some(mut order) = orders.get_mut(&CompositeKey(values[..prefix_len].to_vec())) {
+                order.insert((self.memory.value(&values[prefix_len]), row_id));
             }
         }
     }
@@ -218,7 +263,7 @@ impl MultiColumnIndex {
     fn order_remove(&self, values: &[Value], row_id: i64) {
         let mut orders = self.walk_orders.write();
         for prefix_len in 1..values.len() {
-            if let Some(order) = orders.get_mut(&CompositeKey(values[..prefix_len].to_vec())) {
+            if let Some(mut order) = orders.get_mut(&CompositeKey(values[..prefix_len].to_vec())) {
                 order.remove(&(values[prefix_len].clone(), row_id));
             }
         }
@@ -361,7 +406,7 @@ impl MultiColumnIndex {
         &self,
         key: &CompositeKey,
         row_id: i64,
-        value_to_rows: &FxHashMap<CompositeKey, CompactVec<i64>>,
+        value_to_rows: &KeyMap<CompactVec<i64>>,
     ) -> Result<()> {
         if !self.is_unique {
             return Ok(());
@@ -389,6 +434,68 @@ impl MultiColumnIndex {
 }
 
 impl Index for MultiColumnIndex {
+    fn attach_memory_account(&mut self, account: &MemoryAccount) -> Result<()> {
+        if !self.memory.needs_attachment(account)? {
+            return Ok(());
+        }
+        for key in self.value_to_rows.get_mut().keys() {
+            Self::adopt_key(key, account)?;
+        }
+        for key in self.sorted_values.get_mut().keys() {
+            Self::adopt_key(key, account)?;
+        }
+        for prefix in &mut self.prefix_indexes {
+            for key in prefix.get_mut().keys() {
+                Self::adopt_key(key, account)?;
+            }
+        }
+        for (key, order) in self.walk_orders.get_mut().iter() {
+            Self::adopt_key(key, account)?;
+            for (value, _) in order {
+                if !value.try_adopt_hot(account) {
+                    return Err(Error::internal(
+                        "prebuilt index key belongs to another engine",
+                    ));
+                }
+            }
+        }
+        for key in self.row_to_key.get_mut().values() {
+            for value in key.iter() {
+                IndexMemory::adopt_value_arc(value, account)?;
+            }
+            if key.try_adopt_shallow(account) == MemoryAdoption::ForeignEngine {
+                return Err(Error::internal(
+                    "prebuilt index key belongs to another engine",
+                ));
+            }
+        }
+        let metadata = self.name.capacity()
+            + self.table_name.capacity()
+            + self.column_names.capacity() * std::mem::size_of::<String>()
+            + self
+                .column_names
+                .iter()
+                .map(String::capacity)
+                .sum::<usize>()
+            + self.column_ids.capacity() * std::mem::size_of::<i32>()
+            + self.data_types.capacity() * std::mem::size_of::<DataType>()
+            + self.prefix_indexes.capacity()
+                * std::mem::size_of::<RwLock<KeyMap<CompactVec<i64>>>>()
+            + self.prefix_built.capacity() * std::mem::size_of::<AtomicBool>();
+        self.memory.attach::<Self>(account, metadata);
+        self.sorted_values.get_mut().attach(account);
+        self.value_to_rows.get_mut().attach(account);
+        for prefix in &mut self.prefix_indexes {
+            prefix.get_mut().attach(account);
+        }
+        self.walk_orders.get_mut().attach(account);
+        self.row_to_key.get_mut().attach_memory_account(account);
+        Ok(())
+    }
+    fn memory_account(&self) -> Option<&MemoryAccount> {
+        self.memory.account()
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -415,10 +522,10 @@ impl Index for MultiColumnIndex {
             )));
         }
 
-        let key = CompositeKey(values.to_vec());
+        let key = self.owned_key(values);
 
         // Track old key if this is an update (for BTree/prefix cleanup after releasing locks)
-        let mut old_key_for_cleanup: Option<Vec<CompactArc<Value>>> = None;
+        let mut old_key_for_cleanup: Option<SharedKey> = None;
 
         // Acquire BOTH write locks FIRST to prevent race conditions during updates
         // Lock order: value_to_rows → row_to_key (same as remove())
@@ -442,12 +549,10 @@ impl Index for MultiColumnIndex {
                 CompositeKey(existing_arc_values.iter().map(|a| (**a).clone()).collect());
 
             // Remove old entry from value_to_rows
-            if let Some(rows) = value_to_rows.get_mut(&existing_key) {
+            value_to_rows.mutate_remove_if(&existing_key, |rows| {
                 rows.retain(|id| *id != row_id);
-                if rows.is_empty() {
-                    value_to_rows.remove(&existing_key);
-                }
-            }
+                rows.is_empty()
+            });
             // Note: row_to_key will be overwritten below, no need to remove here
         }
 
@@ -458,17 +563,17 @@ impl Index for MultiColumnIndex {
         let btree_needs_update = self.btree_built.load(AtomicOrdering::Acquire);
 
         // Wrap values in Arc for O(1) cloning in row_to_key
-        let arc_values: Vec<CompactArc<Value>> =
-            values.iter().map(|v| CompactArc::new(v.clone())).collect();
+        let arc_values = self.shared_key(values);
 
         // Add to hash index (for exact lookups) - ALWAYS maintained
         // Clone key once for hash index, keep original for BTree
         // Insert in sorted order for O(N+M) merge operations
         let key_for_hash = key.clone();
-        let hash_rows = value_to_rows.entry(key_for_hash).or_default();
+        let mut hash_rows = value_to_rows.entry(key_for_hash).or_default();
         if let Err(pos) = hash_rows.binary_search(&row_id) {
             hash_rows.insert(pos, row_id);
         }
+        drop(hash_rows);
 
         // Store CompactArc<Value> references in row_to_key (memory efficient)
         row_to_key.insert(row_id, arc_values);
@@ -486,16 +591,14 @@ impl Index for MultiColumnIndex {
             if let Some(ref old_arc_values) = old_key_for_cleanup {
                 let existing_key =
                     CompositeKey(old_arc_values.iter().map(|a| (**a).clone()).collect());
-                if let Some(rows) = sorted_values.get_mut(&existing_key) {
+                sorted_values.mutate_remove_if(&existing_key, |rows| {
                     rows.retain(|id| *id != row_id);
-                    if rows.is_empty() {
-                        sorted_values.remove(&existing_key);
-                    }
-                }
+                    rows.is_empty()
+                });
             }
 
             // Then add new entry
-            let btree_rows = sorted_values.entry(key).or_default();
+            let mut btree_rows = sorted_values.entry(key).or_default();
             if let Err(pos) = btree_rows.binary_search(&row_id) {
                 btree_rows.insert(pos, row_id);
             }
@@ -517,18 +620,16 @@ impl Index for MultiColumnIndex {
                                 .map(|a| (**a).clone())
                                 .collect(),
                         );
-                        if let Some(rows) = prefix_index.get_mut(&old_prefix_key) {
+                        prefix_index.mutate_remove_if(&old_prefix_key, |rows| {
                             rows.retain(|id| *id != row_id);
-                            if rows.is_empty() {
-                                prefix_index.remove(&old_prefix_key);
-                            }
-                        }
+                            rows.is_empty()
+                        });
                     }
                 }
 
                 // Then add new entry
-                let prefix_key = CompositeKey(values[..prefix_len].to_vec());
-                let prefix_rows = prefix_index.entry(prefix_key).or_default();
+                let prefix_key = self.owned_key(&values[..prefix_len]);
+                let mut prefix_rows = prefix_index.entry(prefix_key).or_default();
                 if let Err(pos) = prefix_rows.binary_search(&row_id) {
                     prefix_rows.insert(pos, row_id);
                 }
@@ -565,14 +666,12 @@ impl Index for MultiColumnIndex {
             let mut row_to_key = self.row_to_key.write();
 
             // Remove from hash index (row_ids are sorted, use binary search)
-            if let Some(rows) = value_to_rows.get_mut(&key) {
+            value_to_rows.mutate_remove_if(&key, |rows| {
                 if let Ok(pos) = rows.binary_search(&row_id) {
                     rows.remove(pos);
                 }
-                if rows.is_empty() {
-                    value_to_rows.remove(&key);
-                }
-            }
+                rows.is_empty()
+            });
 
             // Remove reverse mapping - ALWAYS maintained
             row_to_key.remove(row_id);
@@ -581,14 +680,12 @@ impl Index for MultiColumnIndex {
         // Only update BTree if it was built (row_ids are sorted, use binary search)
         if self.btree_built.load(AtomicOrdering::Acquire) {
             let mut sorted_values = self.sorted_values.write();
-            if let Some(rows) = sorted_values.get_mut(&key) {
+            sorted_values.mutate_remove_if(&key, |rows| {
                 if let Ok(pos) = rows.binary_search(&row_id) {
                     rows.remove(pos);
                 }
-                if rows.is_empty() {
-                    sorted_values.remove(&key);
-                }
-            }
+                rows.is_empty()
+            });
         }
 
         // Only update prefix indexes if they were built (row_ids are sorted, use binary search)
@@ -597,14 +694,12 @@ impl Index for MultiColumnIndex {
             if self.prefix_built[idx].load(AtomicOrdering::Acquire) {
                 let prefix_key = CompositeKey(values[..prefix_len].to_vec());
                 let mut prefix_index = self.prefix_indexes[idx].write();
-                if let Some(rows) = prefix_index.get_mut(&prefix_key) {
+                prefix_index.mutate_remove_if(&prefix_key, |rows| {
                     if let Ok(pos) = rows.binary_search(&row_id) {
                         rows.remove(pos);
                     }
-                    if rows.is_empty() {
-                        prefix_index.remove(&prefix_key);
-                    }
-                }
+                    rows.is_empty()
+                });
             }
         }
 
@@ -668,7 +763,7 @@ impl Index for MultiColumnIndex {
                     continue;
                 }
 
-                let key = CompositeKey(values.to_vec());
+                let key = self.owned_key(values);
 
                 // Check intra-batch duplicates
                 if let Some(&existing_row_id) = batch_keys.get(&key) {
@@ -702,15 +797,14 @@ impl Index for MultiColumnIndex {
 
         // Collect old keys for rows that need updating (to remove from BTree/prefix later)
         // We need to collect these before modifying row_to_key
-        let mut updates_to_old_key: Vec<(i64, Vec<CompactArc<Value>>)> = Vec::new();
+        let mut updates_to_old_key: Vec<(i64, SharedKey)> = Vec::new();
 
         // Now add all entries
         for &(row_id, values) in entries {
-            let key = CompositeKey(values.to_vec());
+            let key = self.owned_key(values);
 
             // Wrap values in Arc for O(1) cloning in row_to_key
-            let arc_values: Vec<CompactArc<Value>> =
-                values.iter().map(|v| CompactArc::new(v.clone())).collect();
+            let arc_values = self.shared_key(values);
 
             // Check if row already exists with different key (for updates)
             if let Some(existing_arc_values) = row_to_key.get(row_id) {
@@ -722,17 +816,15 @@ impl Index for MultiColumnIndex {
                     let existing_key =
                         CompositeKey(existing_arc_values.iter().map(|a| (**a).clone()).collect());
 
-                    if let Some(rows) = value_to_rows.get_mut(&existing_key) {
+                    value_to_rows.mutate_remove_if(&existing_key, |rows| {
                         rows.retain(|id| *id != row_id);
-                        if rows.is_empty() {
-                            value_to_rows.remove(&existing_key);
-                        }
-                    }
+                        rows.is_empty()
+                    });
                 }
             }
 
             // Add to hash index - insert in sorted order
-            let hash_rows = value_to_rows.entry(key).or_default();
+            let mut hash_rows = value_to_rows.entry(key).or_default();
             if let Err(pos) = hash_rows.binary_search(&row_id) {
                 hash_rows.insert(pos, row_id);
             }
@@ -753,18 +845,16 @@ impl Index for MultiColumnIndex {
             for (row_id, existing_arc_values) in &updates_to_old_key {
                 let existing_key =
                     CompositeKey(existing_arc_values.iter().map(|a| (**a).clone()).collect());
-                if let Some(rows) = sorted_values.get_mut(&existing_key) {
+                sorted_values.mutate_remove_if(&existing_key, |rows| {
                     rows.retain(|id| *id != *row_id);
-                    if rows.is_empty() {
-                        sorted_values.remove(&existing_key);
-                    }
-                }
+                    rows.is_empty()
+                });
             }
 
             // Then add new entries
             for &(row_id, values) in entries {
-                let key = CompositeKey(values.to_vec());
-                let btree_rows = sorted_values.entry(key).or_default();
+                let key = self.owned_key(values);
+                let mut btree_rows = sorted_values.entry(key).or_default();
                 if let Err(pos) = btree_rows.binary_search(&row_id) {
                     btree_rows.insert(pos, row_id);
                 }
@@ -786,19 +876,17 @@ impl Index for MultiColumnIndex {
                                 .map(|a| (**a).clone())
                                 .collect(),
                         );
-                        if let Some(rows) = prefix_index.get_mut(&prefix_key) {
+                        prefix_index.mutate_remove_if(&prefix_key, |rows| {
                             rows.retain(|id| *id != *row_id);
-                            if rows.is_empty() {
-                                prefix_index.remove(&prefix_key);
-                            }
-                        }
+                            rows.is_empty()
+                        });
                     }
                 }
 
                 // Then add new entries
                 for &(row_id, values) in entries {
-                    let prefix_key = CompositeKey(values[..prefix_len].to_vec());
-                    let prefix_rows = prefix_index.entry(prefix_key).or_default();
+                    let prefix_key = self.owned_key(&values[..prefix_len]);
+                    let mut prefix_rows = prefix_index.entry(prefix_key).or_default();
                     if let Err(pos) = prefix_rows.binary_search(&row_id) {
                         prefix_rows.insert(pos, row_id);
                     }
@@ -840,12 +928,10 @@ impl Index for MultiColumnIndex {
             let mut row_to_key = self.row_to_key.write();
 
             for (key, ids) in removed {
-                if let Some(rows) = value_to_rows.get_mut(&key) {
+                value_to_rows.mutate_remove_if(&key, |rows| {
                     super::subtract_sorted(rows, &ids);
-                    if rows.is_empty() {
-                        value_to_rows.remove(&key);
-                    }
-                }
+                    rows.is_empty()
+                });
             }
             for &(row_id, _) in chunk {
                 row_to_key.remove(row_id);
@@ -858,12 +944,10 @@ impl Index for MultiColumnIndex {
             let removed = Self::group_removed_by_key(entries, self.column_ids.len());
             let mut sorted_values = self.sorted_values.write();
             for (key, ids) in removed {
-                if let Some(rows) = sorted_values.get_mut(&key) {
+                sorted_values.mutate_remove_if(&key, |rows| {
                     super::subtract_sorted(rows, &ids);
-                    if rows.is_empty() {
-                        sorted_values.remove(&key);
-                    }
-                }
+                    rows.is_empty()
+                });
             }
         }
 
@@ -873,12 +957,10 @@ impl Index for MultiColumnIndex {
                 let removed = Self::group_removed_by_key(entries, prefix_len);
                 let mut prefix_index = self.prefix_indexes[idx].write();
                 for (key, ids) in removed {
-                    if let Some(rows) = prefix_index.get_mut(&key) {
+                    prefix_index.mutate_remove_if(&key, |rows| {
                         super::subtract_sorted(rows, &ids);
-                        if rows.is_empty() {
-                            prefix_index.remove(&key);
-                        }
-                    }
+                        rows.is_empty()
+                    });
                 }
             }
         }
@@ -1117,7 +1199,7 @@ impl Index for MultiColumnIndex {
                         }
                     }
                     entries.sort_unstable();
-                    orders.insert(group.clone(), entries.into_iter().collect());
+                    orders.insert(self.owned_key(prefix), entries.into_iter().collect());
                 }
                 parking_lot::RwLockWriteGuard::downgrade(orders)
             }
@@ -1476,5 +1558,49 @@ mod tests {
             })
         );
         assert_eq!(ordered, vec![1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+    #[test]
+    fn reverse_key_alias_and_lazy_structures_keep_exact_owners() {
+        let account = MemoryAccount::new();
+        let mut index = MultiColumnIndex::new(
+            "m".into(),
+            "t".into(),
+            vec!["a".into(), "b".into()],
+            vec![0, 1],
+            vec![DataType::Integer, DataType::Text],
+            false,
+            0,
+        );
+        index.attach_memory_account(&account).unwrap();
+        for row in 0..300 {
+            index
+                .add(
+                    &[
+                        Value::Integer(row % 3),
+                        Value::text(format!("retained long indexed text {row:05}")),
+                    ],
+                    row,
+                    0,
+                )
+                .unwrap();
+        }
+        let alias = index.row_to_key.read().get(4).unwrap().clone();
+        let before_lazy = account.snapshot().retained_bytes;
+        index.ensure_btree_built();
+        index.ensure_prefix_built(1);
+        index.walk_prefix_ordered(&[Value::Integer(1)], None, None, true, &mut |_, _| true);
+        assert!(account.snapshot().retained_bytes > before_lazy);
+        index.remove_batch_ids(&[4]).unwrap().unwrap();
+        assert_eq!(alias[0].as_ref(), &Value::Integer(1));
+        index.clear().unwrap();
+        drop(index);
+        assert!(account.snapshot().retained_bytes >= alias.allocation_size());
+        drop(alias);
+        assert_eq!(account.snapshot().retained_bytes, 0);
     }
 }

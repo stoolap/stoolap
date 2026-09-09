@@ -39,7 +39,7 @@ pub struct MVCCTable {
     /// Reference to the version store
     version_store: Arc<VersionStore>,
     /// Transaction-local version store (shared between multiple MVCCTable instances for same txn+table)
-    txn_versions: Arc<RwLock<TransactionVersionStore>>,
+    txn_versions: CompactArc<RwLock<TransactionVersionStore>>,
     /// Cached schema for returning references (Arc clone from version_store - O(1) instead of cloning)
     cached_schema: CompactArc<Schema>,
 }
@@ -82,10 +82,12 @@ impl MVCCTable {
     ) -> Self {
         // CompactArc clone - O(1) reference count increment, not full schema clone
         let cached_schema = version_store.schema().clone();
+        let txn_versions =
+            CompactArc::new_in(RwLock::new(txn_versions), version_store.memory_account());
         Self {
             txn_id,
             version_store,
-            txn_versions: Arc::new(RwLock::new(txn_versions)),
+            txn_versions,
             cached_schema,
         }
     }
@@ -95,7 +97,7 @@ impl MVCCTable {
     pub fn new_with_shared_store(
         txn_id: i64,
         version_store: Arc<VersionStore>,
-        txn_versions: Arc<RwLock<TransactionVersionStore>>,
+        txn_versions: CompactArc<RwLock<TransactionVersionStore>>,
     ) -> Self {
         // CompactArc clone - O(1) reference count increment, not full schema clone
         let cached_schema = version_store.schema().clone();
@@ -118,7 +120,7 @@ impl MVCCTable {
     }
 
     /// Returns a reference to the shared transaction version store
-    pub fn txn_versions(&self) -> &Arc<RwLock<TransactionVersionStore>> {
+    pub fn txn_versions(&self) -> &CompactArc<RwLock<TransactionVersionStore>> {
         &self.txn_versions
     }
 
@@ -3208,6 +3210,13 @@ impl Table for MVCCTable {
         self.txn_versions.read().unwrap().has_local_changes()
     }
 
+    fn record_source_lsn(&self, row_id: i64, lsn: Option<std::num::NonZeroU64>) {
+        let Ok(mut versions) = self.txn_versions.write() else {
+            panic!("transaction store is poisoned while recording its source LSN");
+        };
+        versions.record_source_lsn(row_id, lsn);
+    }
+
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
         let txn_versions = self.txn_versions.read().unwrap();
         txn_versions
@@ -3349,7 +3358,7 @@ impl Table for MVCCTable {
         let expected_rows = self.version_store.row_count();
 
         // Create the appropriate index type with capacity hint
-        let index: Arc<dyn Index> = match chosen_type {
+        let mut index: Arc<dyn Index> = match chosen_type {
             IndexType::Hash => Arc::new(HashIndex::new(
                 name.to_string(),
                 self.name().to_string(),
@@ -3450,6 +3459,8 @@ impl Table for MVCCTable {
                 Arc::new(hnsw)
             }
         };
+
+        self.version_store.attach_index_memory(&mut index)?;
 
         // Populate the index with existing data using batch_slice for better performance
         // Collect all entries first, then add in a single batch operation
@@ -3598,7 +3609,8 @@ impl Table for MVCCTable {
             metric,
         );
         hnsw.set_unique(is_unique);
-        let index: Arc<dyn Index> = Arc::new(hnsw);
+        let mut index: Arc<dyn Index> = Arc::new(hnsw);
+        self.version_store.attach_index_memory(&mut index)?;
 
         // Populate with existing data
         let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
@@ -3807,7 +3819,7 @@ impl Table for MVCCTable {
 
         // Create the btree index with capacity hint
         let expected_rows = self.version_store.row_count();
-        let index = BTreeIndex::new(
+        let mut index = BTreeIndex::new(
             index_name.clone(),
             self.name().to_string(),
             col.id as i32,
@@ -3816,6 +3828,8 @@ impl Table for MVCCTable {
             is_unique,
             expected_rows,
         );
+
+        index.attach_memory_account(self.version_store.memory_account())?;
 
         // Populate the index with existing data using batch_slice
         let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
@@ -3922,7 +3936,7 @@ impl Table for MVCCTable {
 
         // Create the multi-column index with capacity hint
         let expected_rows = self.version_store.row_count();
-        let index = MultiColumnIndex::new(
+        let mut index = MultiColumnIndex::new(
             name.to_string(),
             self.name().to_string(),
             column_names,
@@ -3931,6 +3945,8 @@ impl Table for MVCCTable {
             is_unique,
             expected_rows,
         );
+
+        index.attach_memory_account(self.version_store.memory_account())?;
 
         // Populate the index with existing data using batch_slice
         let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
