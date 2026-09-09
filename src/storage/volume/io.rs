@@ -112,7 +112,7 @@ impl VolumeFile {
         }))
     }
 
-    fn open_reader(self: &Arc<Self>) -> std::io::Result<VolumeReadLease> {
+    pub(crate) fn open_reader(self: &Arc<Self>) -> std::io::Result<VolumeReadLease> {
         // A managed rename holds the write guard through rename + path update.
         // The active file handle then remains valid independently of the path.
         let path = self.path.read();
@@ -132,9 +132,40 @@ impl VolumeFile {
 
 /// One decoder owns one open handle. Its backing owner also prevents a
 /// retirement sweep from unlinking the file until this read has completed.
-struct VolumeReadLease {
+pub(crate) struct VolumeReadLease {
     file: std::fs::File,
     backing: Arc<VolumeFile>,
+}
+
+impl VolumeReadLease {
+    pub(crate) fn capture(path: &Path, file: std::fs::File) -> std::io::Result<Self> {
+        let backing = VolumeFile::from_file(path, &file)?;
+        Ok(Self { file, backing })
+    }
+
+    pub(crate) fn backing(&self) -> &Arc<VolumeFile> {
+        &self.backing
+    }
+
+    pub(crate) fn file_length(&self) -> u64 {
+        self.backing.identity.length
+    }
+
+    pub(crate) fn read_at(&self, offset: u64, bytes: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_at(&self.file, bytes, offset)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::FileExt::seek_read(&self.file, bytes, offset)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (offset, bytes);
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    }
 }
 
 struct RetiredVolume {

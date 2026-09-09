@@ -21,6 +21,7 @@ pub mod directory;
 pub mod directory_reader;
 pub mod directory_writer;
 pub mod envelope;
+pub mod file_backed;
 pub mod group_metadata;
 pub mod metadata_runs;
 pub mod page_io;

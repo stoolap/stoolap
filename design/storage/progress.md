@@ -8,7 +8,7 @@ independently reviewable without claiming unmerged work is shipped.
 |---|---|---|---|---|
 | 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
 | 1 | Fallible access and complete statement rollback | Implemented; local gates and CI passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
-| 2 | Chunked arena and retained-hot accounting | Implemented; local gates passed; final CI running | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) (draft) |
+| 2 | Chunked arena and retained-hot accounting | Implemented; local gates and CI passed | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) |
 | 3 | Coherent two-layer execution | Implemented; local gates passed; final CI running | Passed after corrections | [#118](https://github.com/stoolap/stoolap/pull/118) (draft) |
 | 4 | V5 envelope and bounded streaming seal | Format, row spool and sort implemented; seal integration pending | Foundations passed independent review | — |
 | 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |
@@ -135,8 +135,8 @@ index-wrapper fixture failures; forwarding the underlying allocation account
 fixed both, and all 11 tests in that target passed. The resulting revision also
 passes the complete Linux, macOS and Windows CI test jobs. Final counter/inline
 owner changes pass all 2,136 serial failpoint-enabled library tests, all-target/
-all-feature Clippy, Rust 1.88 all-feature and no-default compilation. Their
-remote CI rerun remains the final readiness gate.
+all-feature Clippy, Rust 1.88 all-feature and no-default compilation. All final remote CI checks pass, including Linux, macOS, Windows, coverage,
+MSRV, lint, feature and release checks; PR #117 is ready for review.
 
 Five alternating pairs for each lifecycle case pass the predeclared latency
 and noise rule. INSERT allocation calls fall 2.69–2.70%, while warm aggregate
@@ -267,7 +267,19 @@ with caller-owned buffers, and every emitted row/source/column page is reopened
 and verified. This does not claim sequential gather IO or an engine memory cap.
 All-target/all-feature Clippy passes.
 
+A file-backed V5 handle now reuses the existing physical identity and retirement
+owner. Opening reads only the header, footer and bounded root; active short
+leases verify the file and perform positioned reads into caller-owned buffers.
+Writer attachment compares its exact completion without eager V4 readback.
+Independent source review passed. Five focused tests cover lazy corruption,
+identity replacement, buffer bounds and rename/retirement ownership. Actual
+1 MiB and 32 MiB file fixtures both open with two allocation calls / 143 requested
+bytes, and reverse page reads perform zero allocations after caller preparation.
+All-target/all-feature Clippy, Windows no-default compilation and Rust 1.88
+no-default compilation pass. This is file-layer evidence; typed coverage,
+reservations and engine-wide accounting remain activation requirements.
+
 The stage remains incomplete: actual hot capture, byte-capped group planning,
-file-backed handle integration, reservation ownership, durable identity
+reservation ownership, durable identity
 activation and replacement of the eager V4 readback path are still required. The actual cold
 reader and engine-wide admission guarantee remain later integration gates.
