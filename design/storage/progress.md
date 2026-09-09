@@ -9,8 +9,8 @@ independently reviewable without claiming unmerged work is shipped.
 | 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
 | 1 | Fallible access and complete statement rollback | Implemented; local gates and CI passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
 | 2 | Chunked arena and retained-hot accounting | Implemented; local gates and CI passed | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) |
-| 3 | Coherent two-layer execution | Implemented; local gates passed; final CI running | Passed after corrections | [#118](https://github.com/stoolap/stoolap/pull/118) (draft) |
-| 4 | V5 envelope and bounded streaming seal | Format, row spool and sort implemented; seal integration pending | Foundations passed independent review | [#119](https://github.com/stoolap/stoolap/pull/119) (draft) |
+| 3 | Coherent two-layer execution | Capture correction verified; abort correction pending application | Passed after corrections | [#118](https://github.com/stoolap/stoolap/pull/118) (draft) |
+| 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
 | 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |
 | 6 | Paged reads, four ledgers and DML preflight | Pending | Pending | — |
 | 7 | Explicit clustering and compatibility fallback | Pending | Pending | — |
@@ -210,6 +210,24 @@ improves 24.65–29.74%, with 41.94% fewer allocation calls. INSERT p50 changes
 +7.24% narrow, -3.92% wide and +1.90% long. Concurrent writer and cold-start
 residual costs remain in the report with their noise ranges; both earlier
 comparisons are preserved. The remote CI rerun remains the readiness gate.
+
+
+The follow-up capture correction permits reads alongside ordinary DML holding
+the shared physical-transfer fence. It revalidates exact physical membership
+and mappings; tombstone-only churn refreshes a private immutable shell outside
+the fence instead of exhausting physical-change retries. Prior readers keep
+their original generation, and final old owners are dropped after unlocking.
+Independent source reviews pass, as do four generation tests, five concurrent
+cold-update executions, eleven all-feature file-database top-k tests and 24
+fixed-epoch/DDL cases. All-target/all-feature Clippy passes.
+
+A separate abort/undo visibility correction is prepared and independently
+reviewed but remains unapplied. Its real cold scan reproduction, 330 MVCC tests,
+Clippy and Rust 1.88 pass in an isolated one-module candidate. Exact successful
+undo must retain the provisional sequence exclusion until acknowledgment.
+Phase 3 remains draft until that correction is applied and the combined branch
+completes final tests, performance provenance and CI. Previously recorded
+performance describes the earlier admission-retry source, not this follow-up.
 
 ## Phase 4 foundations
 
