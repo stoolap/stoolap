@@ -191,6 +191,19 @@ impl TableSchemaHistory {
 
     pub fn lookup(&self, identity: TableIdentity, version: u64) -> Result<&SchemaRevision> {
         self.check_identity(identity)?;
+        self.lookup_version(version)
+    }
+
+    /// Ordered, borrowed schema metadata for catalog validation and encoding.
+    pub fn revisions(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &SchemaRevision> + DoubleEndedIterator {
+        self.revisions.values().map(Arc::as_ref)
+    }
+
+    // Only the catalog may authorize a historical incarnation before looking
+    // up its exact version in this shared TableId history.
+    pub(super) fn lookup_version(&self, version: u64) -> Result<&SchemaRevision> {
         self.revisions
             .get(&version)
             .map(Arc::as_ref)
