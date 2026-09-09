@@ -9492,23 +9492,6 @@ impl Executor {
         // Check if this is a ROLLBACK TO SAVEPOINT
         if let Some(ref savepoint_name) = stmt.savepoint_name {
             if let Some(ref mut tx_state) = *active_tx {
-                // Get the savepoint timestamp first
-                let timestamp = tx_state
-                    .transaction
-                    .get_savepoint_timestamp(&savepoint_name.value)
-                    .ok_or_else(|| {
-                        Error::invalid_argument(format!(
-                            "savepoint '{}' does not exist",
-                            savepoint_name.value
-                        ))
-                    })?;
-
-                // Rollback each table's local changes that occurred after the savepoint
-                for table in tx_state.tables.values() {
-                    table.rollback_to_timestamp(timestamp);
-                }
-
-                // Rollback to savepoint in the transaction (removes the savepoint and any after it)
                 tx_state
                     .transaction
                     .rollback_to_savepoint(&savepoint_name.value)?;

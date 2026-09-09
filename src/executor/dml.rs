@@ -41,6 +41,39 @@ use super::utils::dummy_token_clone;
 use super::Executor;
 use std::sync::RwLock;
 
+struct StatementRollback<'a> {
+    engine: &'a crate::storage::mvcc::MVCCEngine,
+    checkpoint: Option<(i64, i64)>,
+}
+
+impl<'a> StatementRollback<'a> {
+    fn new(
+        engine: &'a crate::storage::mvcc::MVCCEngine,
+        active: Option<&super::ActiveTransaction>,
+    ) -> Self {
+        Self {
+            engine,
+            checkpoint: active
+                .map(|tx| (tx.transaction.id(), crate::storage::mvcc::last_timestamp())),
+        }
+    }
+
+    fn finish<T>(mut self, result: Result<T>) -> Result<T> {
+        if result.is_ok() {
+            self.checkpoint = None;
+        }
+        result
+    }
+}
+
+impl Drop for StatementRollback<'_> {
+    fn drop(&mut self) {
+        if let Some((txn_id, timestamp)) = self.checkpoint {
+            self.engine.rollback_dml_after(txn_id, timestamp);
+        }
+    }
+}
+
 /// Check whether a constraint violation matches the ON CONFLICT target columns.
 /// Returns true if the conflict should be handled (DO UPDATE / DO NOTHING).
 /// Returns false if the violation is on a different constraint, meaning the
@@ -464,6 +497,8 @@ impl Executor {
             }
             None => ctx,
         };
+
+        let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
@@ -906,15 +941,16 @@ impl Executor {
 
             // Handle RETURNING clause for INSERT...SELECT
             if has_returning {
-                return self.build_returning_result(
+                return statement_rollback.finish(self.build_returning_result(
                     &stmt.returning,
                     returning_rows,
                     schema_column_names_arc.as_ref().unwrap(),
                     ctx,
-                );
+                ));
             }
 
-            return Ok(Box::new(ExecResult::with_rows_affected(rows_affected)));
+            return statement_rollback
+                .finish(Ok(Box::new(ExecResult::with_rows_affected(rows_affected))));
         }
 
         // Process each row of values - use fast path for normal INSERT, slow path for conflict handling
@@ -1260,15 +1296,15 @@ impl Executor {
 
         // Handle RETURNING clause
         if has_returning {
-            return self.build_returning_result(
+            return statement_rollback.finish(self.build_returning_result(
                 &stmt.returning,
                 returning_rows,
                 schema_column_names_arc.as_ref().unwrap(),
                 ctx,
-            );
+            ));
         }
 
-        Ok(Box::new(ExecResult::with_rows_affected(rows_affected)))
+        statement_rollback.finish(Ok(Box::new(ExecResult::with_rows_affected(rows_affected))))
     }
 
     /// Execute an INSERT statement with compiled cache support
@@ -1290,6 +1326,7 @@ impl Executor {
 
         // Check if there's an active explicit transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
+        let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
@@ -1679,15 +1716,15 @@ impl Executor {
 
         // Handle RETURNING clause
         if has_returning {
-            return self.build_returning_result(
+            return statement_rollback.finish(self.build_returning_result(
                 &stmt.returning,
                 returning_rows,
                 schema_column_names_arc.as_ref().unwrap(),
                 ctx,
-            );
+            ));
         }
 
-        Ok(Box::new(ExecResult::with_rows_affected(rows_affected)))
+        statement_rollback.finish(Ok(Box::new(ExecResult::with_rows_affected(rows_affected))))
     }
 
     /// Execute an UPDATE statement
@@ -1742,6 +1779,7 @@ impl Executor {
 
         // Check if there's an active explicit transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
+        let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
@@ -2664,12 +2702,17 @@ impl Executor {
         // Handle RETURNING clause
         if has_returning {
             let rows = returning_rows.into_inner();
-            return self.build_returning_result(&stmt.returning, rows, &column_names, ctx);
+            return statement_rollback.finish(self.build_returning_result(
+                &stmt.returning,
+                rows,
+                &column_names,
+                ctx,
+            ));
         }
 
-        Ok(Box::new(ExecResult::with_rows_affected(
+        statement_rollback.finish(Ok(Box::new(ExecResult::with_rows_affected(
             rows_affected as i64,
-        )))
+        ))))
     }
 
     /// Try to extract a constant value from a SET expression for FK pre-validation.
@@ -2727,6 +2770,7 @@ impl Executor {
 
         // Check if there's an active explicit transaction
         let mut active_tx = self.active_transaction.lock().unwrap();
+        let statement_rollback = StatementRollback::new(&self.engine, active_tx.as_ref());
 
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
@@ -3165,17 +3209,17 @@ impl Executor {
 
         // Handle RETURNING clause
         if has_returning {
-            return self.build_returning_result(
+            return statement_rollback.finish(self.build_returning_result(
                 &stmt.returning,
                 returning_rows,
                 &column_names_owned,
                 ctx,
-            );
+            ));
         }
 
-        Ok(Box::new(ExecResult::with_rows_affected(
+        statement_rollback.finish(Ok(Box::new(ExecResult::with_rows_affected(
             rows_affected as i64,
-        )))
+        ))))
     }
 
     /// Execute a TRUNCATE statement

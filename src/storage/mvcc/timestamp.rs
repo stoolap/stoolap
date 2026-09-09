@@ -25,6 +25,11 @@ use crate::common::time_compat::{SystemTime, UNIX_EPOCH};
 /// Global state for timestamp generation - tracks last issued timestamp
 static LAST_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
 
+/// Latest issued timestamp for a serialized statement boundary.
+pub(crate) fn last_timestamp() -> i64 {
+    LAST_TIMESTAMP.load(Ordering::Acquire)
+}
+
 /// Returns a monotonically increasing timestamp suitable for transaction
 /// ordering and version tracking.
 ///

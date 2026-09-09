@@ -3855,6 +3855,11 @@ impl MVCCEngine {
         Arc::new(EngineOperations::new(self))
     }
 
+    /// Undo one failed statement without changing its transaction or savepoints.
+    pub(crate) fn rollback_dml_after(&self, txn_id: i64, timestamp: i64) {
+        EngineOperations::new(self).rollback_dml_after(txn_id, timestamp);
+    }
+
     // --- View Management Methods ---
 
     /// Create a new view
@@ -7429,39 +7434,6 @@ impl TransactionEngineOperations for EngineOperations {
         Ok(())
     }
 
-    fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn Table>>> {
-        let mut tables = Vec::new();
-
-        // O(1) lookup for this transaction's tables (hot changes)
-        let cache = self.txn_version_stores().read().unwrap();
-
-        if let Some(txn_tables) = cache.get(txn_id) {
-            for (table_name, txn_store) in txn_tables.iter() {
-                let has_hot = {
-                    let store = txn_store.read().unwrap();
-                    store.has_local_changes()
-                };
-
-                if has_hot {
-                    let stores = self.version_stores().read().unwrap();
-                    if let Some(version_store) = stores.get(table_name.as_str()).cloned() {
-                        drop(stores);
-
-                        let table = MVCCTable::new_with_shared_store(
-                            txn_id,
-                            Arc::clone(&version_store),
-                            Arc::clone(txn_store),
-                        );
-
-                        tables.push(Box::new(table) as Box<dyn Table>);
-                    }
-                }
-            }
-        }
-
-        Ok(tables)
-    }
-
     fn has_pending_dml_changes(&self, txn_id: i64) -> bool {
         // Check hot-side DML changes
         let cache = self.txn_version_stores().read().unwrap();
@@ -7784,9 +7756,7 @@ impl TransactionEngineOperations for EngineOperations {
         }
     }
 
-    fn rollback_tombstones_after(&self, txn_id: i64, timestamp: i64) {
-        // Same lock order as rollback_all_tables: the txn cache is released
-        // before the segment managers are read.
+    fn rollback_dml_after(&self, txn_id: i64, timestamp: i64) {
         let cache = self.txn_version_stores().read().unwrap();
         let touched: smallvec::SmallVec<
             [(
@@ -7804,17 +7774,24 @@ impl TransactionEngineOperations for EngineOperations {
             .unwrap_or_default();
         drop(cache);
 
-        if touched.is_empty() {
-            return;
-        }
-        let mgrs = self.segment_managers.read().unwrap();
         for (name, txn_store) in &touched {
-            if let Some(mgr) = mgrs.get(name.as_str()) {
-                let discarded = mgr.rollback_pending_tombstones_after(txn_id, timestamp);
-                if !discarded.is_empty() {
-                    txn_store.write().unwrap().release_claims(&discarded);
-                }
-            }
+            let mgr = self
+                .segment_managers
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(name.as_str())
+                .cloned();
+            let mut pending = if let Some(mgr) = mgr {
+                mgr.rollback_pending_tombstones_after(txn_id, timestamp);
+                mgr.get_pending_tombstones(txn_id)
+            } else {
+                Vec::new()
+            };
+            pending.sort_unstable();
+            txn_store
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .rollback_to_timestamp_with_pending(timestamp, &pending);
         }
     }
 

@@ -3197,11 +3197,11 @@ impl Table for MVCCTable {
         self.txn_versions.write().unwrap().rollback();
     }
 
-    fn rollback_to_timestamp(&self, timestamp: i64) {
+    fn rollback_to_timestamp_with_pending(&self, timestamp: i64, pending: &[i64]) {
         self.txn_versions
             .write()
             .unwrap()
-            .rollback_to_timestamp(timestamp);
+            .rollback_to_timestamp_with_pending(timestamp, pending);
     }
 
     fn has_local_changes(&self) -> bool {

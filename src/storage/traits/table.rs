@@ -592,7 +592,12 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `timestamp` - The timestamp to roll back to (in nanoseconds since epoch)
-    fn rollback_to_timestamp(&self, timestamp: i64);
+    fn rollback_to_timestamp(&self, timestamp: i64) {
+        self.rollback_to_timestamp_with_pending(timestamp, &[]);
+    }
+
+    /// Roll back local versions while retaining sorted pending cold-row claims.
+    fn rollback_to_timestamp_with_pending(&self, timestamp: i64, pending: &[i64]);
 
     /// Returns true if this table has uncommitted local changes
     ///
