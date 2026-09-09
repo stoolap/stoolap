@@ -12,7 +12,7 @@ independently reviewable without claiming unmerged work is shipped.
 | 3 | Coherent two-layer execution | Pending | Pending | — |
 | 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
 | 5 | Remover, durable WAL/catalog and pressure seal | Catalog foundations implemented; lifecycle integration pending | Foundations passed independent review | — |
-| 6 | Paged reads, four ledgers and DML preflight | Bounded legacy decompression implemented; reader and admission integration pending | Decoder passed independent review | — |
+| 6 | Paged reads, four ledgers and DML preflight | Bounded legacy decompression and column subdivision implemented; reader and admission integration pending | Decoder and adapter passed independent review | — |
 | 7 | Explicit clustering and compatibility fallback | Pending | Pending | — |
 | 8 | Identity-first compaction and bounded migration | Pending | Pending | — |
 | 9 | Index ownership, write batching and allocation reduction | Pending | Pending | — |
@@ -130,8 +130,24 @@ during decoding; every output byte was verified. This raw fixture does not yet
 exercise actual V4 column conversion. Rust 1.88 all-feature compilation and
 no-default/failpoint clippy pass.
 
-Actual V4 column subdivision and paged dictionaries, outer checksum validation,
-V5 reader activation, managed file ownership, the four retained-memory ledgers
-and bounded DML admission remain required. Scratch reservations and temporary
-file lifetime belong to that later coordinator; this decoder neither installs
-files nor establishes an engine-wide memory bound.
+The decoded-spool adapter now validates all six V4 column encodings and gathers
+byte-capped physical row ranges into caller-owned buffers. Noncanonical valid
+Bytes offsets and NULL dictionary IDs preserve existing decoder behavior.
+Preflight lengths remain u64 until compared with actual buffer capacity;
+capacity errors leave output unchanged. Partial I/O and panics abort the handle.
+Borrowed row metadata occupies two machine words, including distinct NULL and
+non-NULL empty values, without an extra flag word.
+
+Nine adapter units and the allocation test pass in author and independent runs.
+The actual V4 Vector fixture has 65,536 rows and 34,668,560 decoded bytes. Raw
+LZ4 decoding, spool validation, subdivision and every value/NULL check use zero
+allocation calls in the measured interval. Decoder/adapter buffers total 152 KiB;
+the verification cell adds 512 bytes. Fixture construction, file backing and OS
+memory are outside that working-buffer statement. Rust 1.88 all-feature
+compilation and focused no-default/failpoint clippy pass.
+
+Paged V4 metadata/dictionaries, oversized-cell streaming, outer checksum
+validation, V5 reader activation, managed file ownership, the four retained-memory
+ledgers and bounded DML admission remain required. Scratch reservations and
+temporary file lifetime belong to that later coordinator; these modules neither
+install files nor establish an engine-wide memory bound.
