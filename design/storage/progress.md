@@ -8,9 +8,9 @@ independently reviewable without claiming unmerged work is shipped.
 |---|---|---|---|---|
 | 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
 | 1 | Fallible access and complete statement rollback | Implemented; local gates and CI passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
-| 2 | Chunked arena and retained-hot accounting | Implemented; local gates passed; final CI running | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) (draft) |
-| 3 | Coherent two-layer execution | Implemented; final parent validation running | Passed after corrections | [#118](https://github.com/stoolap/stoolap/pull/118) (draft) |
-| 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
+| 2 | Chunked arena and retained-hot accounting | Implemented; local gates and CI passed | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) |
+| 3 | Coherent two-layer execution | Implemented; local gates passed; final CI running | Passed after corrections | [#118](https://github.com/stoolap/stoolap/pull/118) (draft) |
+| 4 | V5 envelope and bounded streaming seal | Format, row spool and sort implemented; seal integration pending | Foundations passed independent review | [#119](https://github.com/stoolap/stoolap/pull/119) (draft) |
 | 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |
 | 6 | Paged reads, four ledgers and DML preflight | Pending | Pending | — |
 | 7 | Explicit clustering and compatibility fallback | Pending | Pending | — |
@@ -135,8 +135,8 @@ index-wrapper fixture failures; forwarding the underlying allocation account
 fixed both, and all 11 tests in that target passed. The resulting revision also
 passes the complete Linux, macOS and Windows CI test jobs. Final counter/inline
 owner changes pass all 2,136 serial failpoint-enabled library tests, all-target/
-all-feature Clippy, Rust 1.88 all-feature and no-default compilation. Their
-remote CI rerun remains the final readiness gate.
+all-feature Clippy, Rust 1.88 all-feature and no-default compilation. All final remote CI checks pass, including Linux, macOS, Windows, coverage,
+MSRV, lint, feature and release checks; PR #117 is ready for review.
 
 Five alternating pairs for each lifecycle case pass the predeclared latency
 and noise rule. INSERT allocation calls fall 2.69–2.70%, while warm aggregate
@@ -183,11 +183,119 @@ handle retains the cache allocation's charge through the final weak owner.
 
 Independent source review and re-review passed after visibility, cache-proof,
 file-identity and allocation-lifetime corrections. Integrated library tests pass
-2,242/2,242, and 21 SQL/file/atomicity targets pass 166/166. The complete integration run passes 5,619 tests across 284 harnesses, with
+2,247/2,247 after the final parent merge, and 21 SQL/file/atomicity targets pass 166/166. The complete integration run passes 5,619 tests across 284 harnesses, with
 63 existing ignored doctests and no failures. All-target/all-feature Clippy
-passes after three test-only slice-reference simplifications. Fresh lifecycle
-comparisons against the final Phase 2 source and remote CI remain pending;
-this stage is not yet marked ready.
+passes after three test-only slice-reference simplifications. Final-parent Rust 1.88 all-feature/no-default and Windows compilation pass.
+A subsequent bounded dictionary-selection optimization passes 12 focused
+aggregation regressions and all-target/all-feature Clippy after independent
+review. Independent volume failpoint tests pass 115/115, final Rust 1.88
+all-feature compilation passes, and the raw measurement summaries match an
+independent recalculation. All three fresh five-pair lifecycle comparisons pass. Warm aggregate
+p50 improves 27.39–29.74%; UPDATE and point lookup also improve. INSERT has
+residual costs (+11.11% short narrow, +3.80% long p50), retained with the measured
+noise ranges rather than hidden by the aggregate improvements. The failed
+pre-optimization warm-query comparison remains in the report. Exact source,
+raw measurements and memory tradeoffs are in [measurements](measurements/README.md).
+Remote CI then exposed a consumed pressure-seal request while an older reader
+prevented progress. Releasing the reader did not rearm the request. A bounded
+100 ms retry fixes the actual admission loop without relaxing fixed cutoffs,
+the existing deadline or test limits. Its deterministic regression failed
+before the correction and passes in default/failpoint configurations afterward;
+70 unchanged hot-limit test executions and the fixed-build regression pass.
+Independent source review and all-target/all-feature Clippy pass.
+
+Independent recalculation of all raw summaries and final source/binary/fixture
+identities passes. All three final-source five-pair comparisons pass again. Warm aggregate p50
+improves 24.65–29.74%, with 41.94% fewer allocation calls. INSERT p50 changes
++7.24% narrow, -3.92% wide and +1.90% long. Concurrent writer and cold-start
+residual costs remain in the report with their noise ranges; both earlier
+comparisons are preserved. The remote CI rerun remains the readiness gate.
+
+## Phase 4 foundations
+
+The V5 envelope, bounded directory codecs, positioned page I/O, directory
+lookup/walker, column payloads, explicit group ranges and row/source identity
+pages are implemented. Production emission remains disabled. Payloads retain
+borrowed typed access, including a lossless timestamp path: ordinary timestamps
+use eight-byte nanoseconds; wide dates and leap seconds use twelve-byte
+seconds/subseconds. Group-local text dictionaries and plain text are supported.
+
+Directory construction accepts sorted descriptors with fixed caller scratch.
+An external descriptor sorter now supplies that order without retaining every
+descriptor: caller-sized in-place runs, two scratch streams, fixed read/write
+batches and deterministic adjacent merge passes. Logical spool lengths exclude
+stale tails; each record has a checksum. File ownership, reservations and
+durability remain the caller's responsibility. No module opens or deletes files.
+
+Independent review and re-review passed after fixing UTF-8 rescans, exact deep
+directory validation, timestamp range/leap preservation and mixed legacy/new
+source conversion. The original format foundation tests pass 90/90. Allocation integrations pass
+6/6 for shared envelope/directory/identity operations, 3/3 for columns and
+compression, 1/1 for external descriptor sorting and 1/1 for complete payload
+emission, plus 1/1 for borrowed dictionaries, all with zero allocation calls inside the
+measured codec operations. Caller-owned scratch and test backing storage are
+outside those allocation meters; these results do not prove an engine budget.
+All-target clippy with test failpoints and Rust 1.88 all-feature compilation pass.
+
+Logical volume shape is now checked before a directory exists. The staged
+writer's checkpoint assertion is separate from installed-file read evidence;
+encoding does not authorize legacy decoding or acknowledge durability. This
+separation passed independent review, wire regressions and unchanged allocation
+gates. Completed roots still require their actual directory and exact counts.
+
+The payload producer now emits each RowId-layout group, its identity/source
+pages and one column at a time directly into the file sink and descriptor
+sorter. Completion checks exact group/column coverage and the sorted descriptor
+sequence before writing the directory, root and footer. I/O errors or unwinding
+callbacks poison the producer; pure input/scratch failures remain retryable
+before any output is written. The descriptor spool belongs exclusively to that
+build; its records alone do not authenticate a substituted same-shaped file.
+
+Page compression reuses a caller-owned LZ4 table and exposes the output scratch
+reservation in advance. Incompressible input is borrowed as Raw bytes. The
+producer can encode a column larger than the stored-page cap when its compressed
+representation fits. Independent review and fresh tests cover both Raw and LZ4,
+empty volumes, zero-column groups, 65-group directory boundaries, fault and
+panic handling, and zero allocations during the complete emission loops.
+
+Group-local dictionaries can now borrow a single UTF-8 blob and offset array.
+A checked immutable view validates offsets, character boundaries and sorted
+uniqueness once; planning and encoding reuse that proof without constructing a
+SmartString for every key. Existing dictionary wire bytes and NULL-ID behavior
+are preserved. Four independent compatibility/limit tests and a zero-allocation
+test pass, including 4,096 rows and 4,096 distinct entries. The input enum remains
+40 bytes on 64-bit targets. The full V5 suite and Rust 1.88 compilation pass.
+
+A checksummed captured-row spool now carries signed identity, creator and source
+LSN with immutable payload positions through bounded external sorting. A
+prepared row group verifies metadata once before gathering one column at a time.
+Cross-row write buffering avoids one syscall per row; unsuccessful final flush
+cannot produce the finished-spool capability required by the sort output.
+Independent framing/gather and sort/merge reviews passed; 13 focused unit tests
+and an actual-file allocation/reopen proof pass independently. The 1,025-row
+capture uses 39 writes for 158,875 bytes with 4 KiB scratch. The prepared reverse
+gather uses 214 reads / 1,723,298 bytes with an 8 KiB window. The complete
+capture/sort/gather/payload/directory loop performs zero measured allocations
+with caller-owned buffers, and every emitted row/source/column page is reopened
+and verified. This does not claim sequential gather IO or an engine memory cap.
+All-target/all-feature Clippy passes.
+
+A file-backed V5 handle now reuses the existing physical identity and retirement
+owner. Opening reads only the header, footer and bounded root; active short
+leases verify the file and perform positioned reads into caller-owned buffers.
+Writer attachment compares its exact completion without eager V4 readback.
+Independent source review passed. Five focused tests cover lazy corruption,
+identity replacement, buffer bounds and rename/retirement ownership. Actual
+1 MiB and 32 MiB file fixtures both open with two allocation calls / 143 requested
+bytes, and reverse page reads perform zero allocations after caller preparation.
+All-target/all-feature Clippy, Windows no-default compilation and Rust 1.88
+no-default compilation pass. This is file-layer evidence; typed coverage,
+reservations and engine-wide accounting remain activation requirements.
+
+The stage remains incomplete: actual hot capture, byte-capped group planning,
+reservation ownership, durable identity
+activation and replacement of the eager V4 readback path are still required. The actual cold
+reader and engine-wide admission guarantee remain later integration gates.
 
 ## Phase 5 catalog foundations
 
