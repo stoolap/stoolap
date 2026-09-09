@@ -243,3 +243,73 @@ fn selected_plain_text_rows_do_not_rebuild_a_large_unsorted_source_dictionary() 
     }
     assert_eq!(CALLS.with(Cell::get), 0);
 }
+
+#[test]
+fn reused_compression_tables_never_allocate_or_upgrade_in_the_page_loop() {
+    use lz4_flex::block::CompressTable;
+    use stoolap::storage::volume::v5::compression::{CompressionError, CompressionPlan};
+    use stoolap::storage::volume::v5::envelope::{Codec, ReadLimits};
+
+    let limits = ReadLimits {
+        root_stored_bytes: 128,
+        root_decoded_bytes: 128,
+        page_stored_bytes: MAX_DECODED_BYTES as u64,
+        page_decoded_bytes: MAX_DECODED_BYTES as u64,
+    };
+    let input: Vec<u8> = (0..MAX_DECODED_BYTES).map(|i| (i % 13) as u8).collect();
+    let mut output = vec![
+        0;
+        CompressionPlan::new(input.len(), &limits)
+            .unwrap()
+            .output_capacity()
+    ];
+    let mut decoded = vec![0; input.len()];
+    let mut small = CompressTable::small();
+    let mut large = CompressTable::large();
+    // Backing buffers and table construction are outside the operation meter.
+    CALLS.with(|calls| calls.set(0));
+    TRACK.with(|track| track.set(true));
+    {
+        let _stop = Stop;
+        for _ in 0..4 {
+            for length in [1, 4096, 65_534, 65_535, MAX_DECODED_BYTES, 17] {
+                let plan = CompressionPlan::new(length, &limits).unwrap();
+                if plan.requires_large_table() {
+                    assert!(matches!(
+                        plan.compress(&input[..length], &mut output, &mut small),
+                        Err(CompressionError::LargeTableRequired)
+                    ));
+                    assert!(matches!(small, CompressTable::Small(_)));
+                } else {
+                    black_box(
+                        plan.compress(&input[..length], &mut output, &mut small)
+                            .unwrap(),
+                    );
+                }
+                let block = plan
+                    .compress(&input[..length], &mut output, &mut large)
+                    .unwrap();
+                match block.codec() {
+                    Codec::Raw => assert_eq!(block.bytes().as_ptr(), input.as_ptr()),
+                    Codec::Lz4Block => {
+                        assert_eq!(
+                            lz4_flex::block::decompress_into(block.bytes(), &mut decoded[..length])
+                                .unwrap(),
+                            length
+                        );
+                        assert_eq!(decoded[..length], input[..length]);
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(CALLS.with(Cell::get), 0);
+    // Positive control: the dependency's convenience API allocates its table.
+    CALLS.with(|calls| calls.set(0));
+    TRACK.with(|track| track.set(true));
+    {
+        let _stop = Stop;
+        black_box(lz4_flex::block::compress_into(&input, &mut output).unwrap());
+    }
+    assert!(CALLS.with(Cell::get) > 0);
+}

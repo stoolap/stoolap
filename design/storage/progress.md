@@ -107,18 +107,34 @@ durability remain the caller's responsibility. No module opens or deletes files.
 
 Independent review and re-review passed after fixing UTF-8 rescans, exact deep
 directory validation, timestamp range/leap preservation and mixed legacy/new
-source conversion. Current V5 tests pass 75/75. Allocation integrations pass
-6/6 for shared envelope/directory/identity operations, 2/2 for columns and 1/1
-for external descriptor sorting, all with zero allocation calls inside the
+source conversion. Current V5 tests pass 86/86. Allocation integrations pass
+6/6 for shared envelope/directory/identity operations, 3/3 for columns and
+compression, 1/1 for external descriptor sorting and 1/1 for complete payload
+emission, all with zero allocation calls inside the
 measured codec operations. Caller-owned scratch and test backing storage are
 outside those allocation meters; these results do not prove an engine budget.
-All-target clippy with test failpoints passes.
+All-target clippy with test failpoints and Rust 1.88 all-feature compilation pass.
 
 Logical volume shape is now checked before a directory exists. The staged
 writer's checkpoint assertion is separate from installed-file read evidence;
 encoding does not authorize legacy decoding or acknowledge durability. This
 separation passed independent review, wire regressions and unchanged allocation
 gates. Completed roots still require their actual directory and exact counts.
+
+The payload producer now emits each RowId-layout group, its identity/source
+pages and one column at a time directly into the file sink and descriptor
+sorter. Completion checks exact group/column coverage and the sorted descriptor
+sequence before writing the directory, root and footer. I/O errors or unwinding
+callbacks poison the producer; pure input/scratch failures remain retryable
+before any output is written. The descriptor spool belongs exclusively to that
+build; its records alone do not authenticate a substituted same-shaped file.
+
+Page compression reuses a caller-owned LZ4 table and exposes the output scratch
+reservation in advance. Incompressible input is borrowed as Raw bytes. The
+producer can encode a column larger than the stored-page cap when its compressed
+representation fits. Independent review and fresh tests cover both Raw and LZ4,
+empty volumes, zero-column groups, 65-group directory boundaries, fault and
+panic handling, and zero allocations during the complete emission loops.
 
 The stage remains incomplete: bounded payload capture/spill, actual streaming
 seal integration, reservation ownership, durable identity activation and

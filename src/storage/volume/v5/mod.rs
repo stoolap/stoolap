@@ -16,6 +16,7 @@
 //! durable identity, catalog bootstrap and remover protocol land together.
 
 pub mod column_block;
+pub mod compression;
 pub mod directory;
 pub mod directory_reader;
 pub mod directory_writer;
@@ -23,4 +24,5 @@ pub mod envelope;
 pub mod group_metadata;
 pub mod metadata_runs;
 pub mod page_io;
+pub mod payload_writer;
 pub mod row_identity;
