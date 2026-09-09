@@ -1033,7 +1033,7 @@ fn validate_effect(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::core::{ForeignKeyConstraint, Schema, SchemaColumn, Value};
 
@@ -1108,7 +1108,7 @@ mod tests {
         }
     }
 
-    fn parts() -> CatalogParts {
+    pub(in crate::storage::catalog) fn parts() -> CatalogParts {
         let mut parent_schema = Schema::new(
             "Parent",
             vec![

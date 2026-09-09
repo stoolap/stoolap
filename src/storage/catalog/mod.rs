@@ -18,6 +18,7 @@
 //! acknowledge WAL coverage. Schema column positions remain separate from the
 //! stable identities used to interpret historical rows.
 
+pub mod codec;
 pub mod generation;
 pub mod history;
 pub mod identity;

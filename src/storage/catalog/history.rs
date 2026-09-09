@@ -121,6 +121,82 @@ pub struct TableSchemaHistory {
     column_high_water_mark: u64,
 }
 
+/// Private streaming reconstruction. Unlike repeated `with_revision`, this
+/// owns each growing map until the final immutable history is published.
+pub(super) struct HistoryBuilder {
+    identity: TableIdentity,
+    revisions: BTreeMap<u64, Arc<SchemaRevision>>,
+    origins: BTreeMap<ColumnId, ColumnOrigin>,
+    high_water_mark: u64,
+}
+
+impl HistoryBuilder {
+    pub(super) fn new(identity: TableIdentity) -> Self {
+        Self {
+            identity,
+            revisions: BTreeMap::new(),
+            origins: BTreeMap::new(),
+            high_water_mark: 0,
+        }
+    }
+
+    pub(super) fn push(
+        &mut self,
+        version: u64,
+        schema: Schema,
+        columns: Vec<ColumnId>,
+    ) -> Result<()> {
+        let revision = SchemaRevision::new(version, schema, columns)?;
+        let previous = self.revisions.last_key_value();
+        if previous.is_some_and(|(&last, _)| version <= last) {
+            return Err(Error::internal(
+                "catalog schema versions are not increasing",
+            ));
+        }
+        let live: BTreeSet<_> = previous
+            .into_iter()
+            .flat_map(|(_, revision)| revision.columns.iter().copied())
+            .collect();
+        for (position, &id) in revision.columns.iter().enumerate() {
+            if !live.contains(&id) {
+                if id.get() <= self.high_water_mark {
+                    return Err(Error::internal("catalog column identity was reused"));
+                }
+                self.origins.insert(id, ColumnOrigin { version, position });
+            }
+        }
+        self.high_water_mark = self.high_water_mark.max(
+            revision
+                .columns
+                .iter()
+                .map(|id| id.get())
+                .max()
+                .unwrap_or(0),
+        );
+        self.revisions.insert(version, Arc::new(revision));
+        Ok(())
+    }
+
+    pub(super) fn finish(
+        self,
+        current_version: u64,
+        high_water_mark: u64,
+    ) -> Result<TableSchemaHistory> {
+        if self.revisions.last_key_value().map(|(&v, _)| v) != Some(current_version)
+            || high_water_mark < self.high_water_mark
+        {
+            return Err(Error::internal("invalid catalog history terminal metadata"));
+        }
+        Ok(TableSchemaHistory {
+            identity: self.identity,
+            current_version,
+            revisions: Arc::new(self.revisions),
+            origins: Arc::new(self.origins),
+            column_high_water_mark: high_water_mark,
+        })
+    }
+}
+
 impl TableSchemaHistory {
     pub fn new(
         identity: TableIdentity,
