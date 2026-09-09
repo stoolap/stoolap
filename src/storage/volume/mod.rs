@@ -57,6 +57,8 @@
 //!   uses hot buffer + frozen volumes. The executor sees the same Table/Scanner
 //!   traits regardless.
 
+pub(crate) mod captured_aggregate;
+pub(crate) mod captured_scanner;
 pub mod column;
 pub mod format;
 pub mod group_cache;
@@ -68,4 +70,5 @@ pub mod scanner;
 pub mod seal;
 pub mod stats;
 pub mod table;
+pub mod v5;
 pub mod writer;

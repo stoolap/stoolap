@@ -225,6 +225,10 @@ impl Scanner for MVCCScanner {
         self.rows[self.current_index as usize].0
     }
 
+    fn take_row_with_id(&mut self) -> (i64, Row) {
+        (self.current_row_id(), self.take_row())
+    }
+
     fn estimated_count(&self) -> Option<usize> {
         Some(self.rows.len())
     }

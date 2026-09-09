@@ -181,3 +181,73 @@ fn test_signed_zero_group_membership_is_stable_per_shape() {
     assert_eq!(groups("SELECT v, COUNT(*) FROM t GROUP BY v"), 3);
     assert_eq!(groups("SELECT v, SUM(w * 1) FROM t GROUP BY v"), 3);
 }
+
+#[test]
+fn signed_zero_and_nan_payload_groups_survive_cold_and_updated_row_paths() {
+    use std::collections::BTreeMap;
+    const NAN_A: u64 = 0x7ff8_0000_0000_0001;
+    const NAN_B: u64 = 0xfff8_0000_0000_0002;
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?checkpoint_interval=3600",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k FLOAT, w INTEGER)",
+        (),
+    )
+    .unwrap();
+    let insert = db.prepare("INSERT INTO t VALUES ($1, $2, 1)").unwrap();
+    let mut values = vec![
+        Some(0.0f64.to_bits()),
+        Some((-0.0f64).to_bits()),
+        Some(NAN_A),
+        Some(NAN_B),
+        Some(0.0f64.to_bits()),
+        Some(NAN_A),
+        Some(1.0f64.to_bits()),
+        None,
+    ];
+    for (id, bits) in values.iter().enumerate() {
+        insert
+            .execute((id as i64 + 1, bits.map(f64::from_bits)))
+            .unwrap();
+    }
+    for stage in ["hot", "cold", "updated"] {
+        if stage == "cold" {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        if stage == "updated" {
+            db.execute("UPDATE t SET k = $1 WHERE id = 2", (f64::from_bits(NAN_B),))
+                .unwrap();
+            db.execute("UPDATE t SET k = $1 WHERE id = 4", (0.0f64,))
+                .unwrap();
+            insert.execute((9i64, -0.0f64)).unwrap();
+            values[1] = Some(NAN_B);
+            values[3] = Some(0.0f64.to_bits());
+            values.push(Some((-0.0f64).to_bits()));
+        }
+        let mut expected = BTreeMap::<Option<u64>, i64>::new();
+        for bits in &values {
+            *expected.entry(*bits).or_default() += 1;
+        }
+        for aggregate in ["SUM(w)", "COUNT(*)", "SUM(w * 1)"] {
+            let query = format!("SELECT k, {aggregate} FROM t GROUP BY k");
+            let mut result = Vec::new();
+            for row in db.query(&query, ()).unwrap() {
+                let row = row.unwrap();
+                result.push((
+                    row.get::<Option<f64>>(0).unwrap().map(f64::to_bits),
+                    row.get::<i64>(1).unwrap(),
+                ));
+            }
+            assert_eq!(result.len(), expected.len(), "{stage}: {aggregate}");
+            assert_eq!(
+                result.into_iter().collect::<BTreeMap<_, _>>(),
+                expected,
+                "{stage}: {aggregate}"
+            );
+        }
+    }
+}

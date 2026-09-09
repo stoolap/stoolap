@@ -41,6 +41,26 @@ use crate::storage::traits::{Index, Transaction};
 /// engine.close()?;
 /// ```
 pub trait Engine: Send + Sync {
+    /// An immediate schema/namespace mutation, including its mapping updates.
+    fn begin_logical_mutation(
+        &self,
+    ) -> Option<crate::storage::mvcc::registry::LogicalMutationGuard> {
+        None
+    }
+
+    /// Authorize shared results only for this engine and an unchanged bound view.
+    fn cache_provenance(
+        &self,
+        _epoch: &crate::storage::mvcc::registry::ReadEpoch,
+    ) -> Option<crate::storage::mvcc::registry::CacheProvenance> {
+        None
+    }
+
+    /// Register a fixed read-committed statement epoch before capturing data.
+    fn capture_read_epoch(&self) -> Result<Option<crate::storage::mvcc::registry::ReadEpoch>> {
+        Ok(None)
+    }
+
     /// Check whether execution can safely observe the current engine state.
     /// Implementations with uncertain durable transaction outcomes fail closed.
     fn check_health(&self) -> Result<()> {

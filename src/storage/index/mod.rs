@@ -23,10 +23,12 @@
 //! - [`MultiColumnIndex`] - Composite index for multi-column queries
 //! - [`PkIndex`] - Primary key index (virtual, auto-created)
 
+pub(crate) mod accounted_map;
 pub mod bitmap;
 pub mod btree;
 pub mod hash;
 pub mod hnsw;
+mod memory;
 pub mod multi_column;
 pub mod pk;
 

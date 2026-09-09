@@ -111,7 +111,7 @@ impl Executor {
                         // Fast path: extract PK value and execute
                         let pk_value =
                             self.extract_pk_value_from_source(&delete.pk_value_source, ctx)?;
-                        return Some(self.execute_compiled_pk_delete(delete, pk_value));
+                        return Some(self.execute_compiled_pk_delete(delete, pk_value, ctx));
                     }
                     // Epoch changed - fall through to recompile
                 }
@@ -282,6 +282,7 @@ impl Executor {
         &self,
         _stmt: &UpdateStatement,
         params: &[Value],
+        ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Try read lock first - check if already compiled
@@ -326,7 +327,7 @@ impl Executor {
                         pk_value,
                         updates,
                         &[],
-                        &ExecutionContext::new(),
+                        ctx,
                     ));
                 }
                 None // Epoch changed, use normal path
@@ -341,6 +342,7 @@ impl Executor {
         &self,
         _stmt: &DeleteStatement,
         params: &[Value],
+        ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Try read lock first - check if already compiled
@@ -362,6 +364,7 @@ impl Executor {
                         &pk_column_name,
                         &schema,
                         pk_value,
+                        ctx,
                     ));
                 }
                 None // Epoch changed, use normal path
@@ -390,7 +393,7 @@ impl Executor {
     ) -> Result<Box<dyn QueryResult>> {
         // Create auto-commit transaction
         let tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(table_name)?;
+        let mut table = ctx.get_table(tx.as_ref(), table_name)?;
 
         // Build WHERE expression for PK lookup
         let mut pk_expr = ComparisonExpr::new(
@@ -466,10 +469,11 @@ impl Executor {
         pk_column_name: &str,
         schema: &CompactArc<Schema>,
         pk_value: i64,
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         // Create auto-commit transaction
         let tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(table_name)?;
+        let mut table = ctx.get_table(tx.as_ref(), table_name)?;
 
         // Build WHERE expression for PK lookup
         let mut pk_expr = ComparisonExpr::new(
@@ -571,12 +575,14 @@ impl Executor {
         &self,
         compiled: &CompiledPkDelete,
         pk_value: i64,
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         self.execute_pk_delete_minimal(
             &compiled.table_name,
             &compiled.pk_column_name,
             &compiled.schema,
             pk_value,
+            ctx,
         )
     }
 
@@ -750,7 +756,7 @@ impl Executor {
             }
             CompiledExecution::PkDelete(delete) => {
                 let pk_value = self.extract_pk_value_from_source(&delete.pk_value_source, ctx)?;
-                return Some(self.execute_compiled_pk_delete(delete, pk_value));
+                return Some(self.execute_compiled_pk_delete(delete, pk_value, ctx));
             }
             CompiledExecution::NotOptimizable(_) | CompiledExecution::Unknown => {} // Epoch changed or first run - recompile
             _ => return None,
@@ -809,7 +815,7 @@ impl Executor {
         drop(compiled_guard);
 
         // Execute
-        Some(self.execute_compiled_pk_delete(&compiled_delete, pk_value))
+        Some(self.execute_compiled_pk_delete(&compiled_delete, pk_value, ctx))
     }
 
     /// Extract value source (literal or parameter) from expression

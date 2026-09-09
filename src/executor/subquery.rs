@@ -465,6 +465,12 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Option<bool>> {
+        // Live secondary indexes may already have removed keys visible to
+        // this epoch. Filtering their candidate IDs cannot recover omissions.
+        if ctx.read_epoch().is_some() {
+            return Ok(None);
+        }
+
         // Probing the index answers whether a matching row is there, which
         // is the whole question EXISTS asks only when the WHERE decides the
         // rows. The extractor below is shared with the paths that read a
@@ -825,6 +831,12 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Option<i64>> {
+        // Live secondary indexes may already have removed keys visible to
+        // this epoch. Filtering their candidate IDs cannot recover omissions.
+        if ctx.read_epoch().is_some() {
+            return Ok(None);
+        }
+
         // Need outer row context for correlated subquery
         let outer_row = match ctx.outer_row() {
             Some(row) => row,
@@ -1027,6 +1039,7 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Option<crate::core::Value> {
+        super::context::ensure_statement_cache_epoch(ctx);
         // Need outer row context for correlated subquery
         let outer_row = ctx.outer_row()?;
 
@@ -1145,6 +1158,7 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Option<CompactArc<ValueMap<Value>>>> {
+        super::context::ensure_statement_cache_epoch(ctx);
         // Must have single aggregate column
         if subquery.columns.len() != 1 {
             return Ok(None);
@@ -1827,6 +1841,7 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<crate::core::Value> {
+        super::context::ensure_statement_cache_epoch(ctx);
         // Check if this is a non-correlated subquery (no outer row context)
         // Non-correlated subqueries can be cached since they return the same result
         let is_non_correlated =
@@ -1953,6 +1968,7 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Vec<crate::core::Value>> {
+        super::context::ensure_statement_cache_epoch(ctx);
         // Check if this is a non-correlated subquery (no outer row context)
         // Non-correlated subqueries can be cached since they return the same result
         let is_non_correlated =
@@ -2846,6 +2862,7 @@ impl Executor {
         subquery: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Option<String> {
+        super::context::ensure_statement_cache_epoch(ctx);
         use std::fmt::Write;
         let mut key = subquery.to_string();
         if key.contains('?') {
@@ -4274,6 +4291,7 @@ impl Executor {
         info: &SemiJoinInfo,
         ctx: &ExecutionContext,
     ) -> Result<CompactArc<ValueSet>> {
+        super::context::ensure_statement_cache_epoch(ctx);
         // Build cache key hash from inner table, column, and WHERE predicate hash
         // Uses u64 hash to avoid any string allocation
         let pred_hash = info
@@ -4394,11 +4412,9 @@ impl Executor {
         info: &SemiJoinInfo,
         outer_rows: CompactArc<Vec<crate::core::Row>>,
         outer_columns: &[String],
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<crate::core::RowVec> {
-        // Direct table access - much faster than going through execute_select
-        let txn = self.engine.begin_transaction()?;
-        let inner_table = txn.get_table(&info.inner_table)?;
+        let inner_table = self.table_in_context(&info.inner_table, ctx)?;
 
         // Convert non-correlated WHERE to storage expression for pushdown
         let storage_expr = info
@@ -4627,7 +4643,9 @@ impl Executor {
                 if let Some(info) = Self::try_extract_semi_join_info(exists, false, outer_tables) {
                     // Check if index-nested-loop would be more efficient
                     // (index exists + no additional predicates, OR index exists + small LIMIT)
-                    if self.should_use_index_nested_loop(&info, outer_limit) {
+                    if ctx.read_epoch().is_none()
+                        && self.should_use_index_nested_loop(&info, outer_limit)
+                    {
                         return Ok(None); // Skip semi-join, use index probing per row
                     }
                     // Semi-join optimization: execute inner query once, collect into hash set
@@ -4643,7 +4661,9 @@ impl Executor {
                     if let Some(info) = Self::try_extract_semi_join_info(exists, true, outer_tables)
                     {
                         // Check if index-nested-loop would be more efficient
-                        if self.should_use_index_nested_loop(&info, outer_limit) {
+                        if ctx.read_epoch().is_none()
+                            && self.should_use_index_nested_loop(&info, outer_limit)
+                        {
                             return Ok(None); // Skip semi-join, use index probing per row
                         }
                         let hash_set = self.execute_semi_join_optimization(&info, ctx)?;

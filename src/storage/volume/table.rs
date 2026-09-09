@@ -26,7 +26,7 @@
 //! This is the Table trait implementation that makes the executor unaware
 //! of whether data lives in memory or frozen segments.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -178,6 +178,9 @@ pub struct SegmentedTable {
     /// preserving the snapshot's point-in-time view of cold data.
     /// None for auto-commit transactions (all tombstones visible).
     snapshot_seq: Option<u64>,
+    read_epoch: Option<crate::storage::mvcc::registry::ReadEpoch>,
+    cold_generation: Option<Arc<super::manifest::ColdGeneration>>,
+    captured_pending: OnceLock<Arc<FxHashSet<i64>>>,
 }
 
 impl SegmentedTable {
@@ -187,6 +190,9 @@ impl SegmentedTable {
             hot,
             segment_mgr,
             snapshot_seq: None,
+            read_epoch: None,
+            cold_generation: None,
+            captured_pending: OnceLock::new(),
         }
     }
 
@@ -201,6 +207,9 @@ impl SegmentedTable {
             hot,
             segment_mgr,
             snapshot_seq: Some(snapshot_seq),
+            read_epoch: None,
+            cold_generation: None,
+            captured_pending: OnceLock::new(),
         }
     }
 
@@ -210,6 +219,9 @@ impl SegmentedTable {
             segment_mgr: Arc::new(SegmentManager::new("", None)),
             hot,
             snapshot_seq: None,
+            read_epoch: None,
+            cold_generation: None,
+            captured_pending: OnceLock::new(),
         }
     }
 
@@ -218,11 +230,407 @@ impl SegmentedTable {
     /// hot rows in between. None once segments exist. Readers that merge hot
     /// and cold values hold the fence for their whole body instead.
     fn unsealed<T>(&self, f: impl FnOnce(&dyn Table) -> T) -> Option<T> {
+        if let Some(generation) = &self.cold_generation {
+            return generation
+                .segment_ids_newest_first
+                .is_empty()
+                .then(|| f(&*self.hot));
+        }
         let _seal_guard = self.segment_mgr.acquire_seal_read();
         if self.segment_mgr.has_segments() {
             return None;
         }
         Some(f(&*self.hot))
+    }
+
+    fn captured_pending(&self) -> &Arc<FxHashSet<i64>> {
+        self.captured_pending.get_or_init(|| {
+            let mut pending = FxHashSet::default();
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut pending);
+            Arc::new(pending)
+        })
+    }
+
+    fn captured_scan(
+        &self,
+        columns: &[usize],
+        filter: Option<&dyn Expression>,
+    ) -> Result<Option<Box<dyn Scanner>>> {
+        let Some(generation) = &self.cold_generation else {
+            return Ok(None);
+        };
+        let Some(view) = self.hot.captured_hot_view() else {
+            return Err(crate::core::Error::internal(
+                "captured cold generation has no hot view",
+            ));
+        };
+        if generation.segment_ids_newest_first.is_empty() {
+            return self.hot.scan(columns, filter).map(Some);
+        }
+        let prepared = filter.map(|filter| {
+            let mut filter = filter.clone_box();
+            filter.prepare_for_schema(self.hot.schema());
+            filter
+        });
+        let hot = self.hot.scan(columns, prepared.as_deref())?;
+        let columns = if columns.is_empty() {
+            (0..self.hot.schema().columns.len()).collect()
+        } else {
+            columns.to_vec()
+        };
+        let cold = super::captured_scanner::CapturedColdScanner::new(
+            generation.clone(),
+            view,
+            self.captured_pending().clone(),
+            columns,
+            prepared,
+            self.hot.schema(),
+        );
+        Ok(Some(Box::new(super::scanner::MergingScanner::new(vec![
+            Box::new(cold),
+            hot,
+        ]))))
+    }
+
+    fn collect_captured(
+        &self,
+        filter: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
+        let mut result = RowVec::new();
+        if limit == 0 {
+            return Ok(result);
+        }
+        let mut scanner = self
+            .captured_scan(&[], filter)?
+            .ok_or_else(|| crate::core::Error::internal("missing captured table view"))?;
+        let mut skipped = 0;
+        while scanner.next() {
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            result.push(scanner.take_row_with_id());
+            if result.len() == limit {
+                break;
+            }
+        }
+        if let Some(error) = scanner.err() {
+            return Err(error.clone());
+        }
+        scanner.close()?;
+        Ok(result)
+    }
+
+    fn captured_row(&self, row_id: i64) -> Result<Option<Row>> {
+        use crate::storage::mvcc::version_store::CapturedHotRow;
+        let generation = self
+            .cold_generation
+            .as_ref()
+            .ok_or_else(|| crate::core::Error::internal("missing captured cold generation"))?;
+        let view = self.hot.captured_hot_view().ok_or_else(|| {
+            crate::core::Error::internal("captured cold generation has no hot view")
+        })?;
+        match view.row_state(row_id) {
+            CapturedHotRow::Value(source) => {
+                let schema = self.hot.schema();
+                let mut row = source.clone();
+                if row.len() < schema.columns.len() {
+                    for column in &schema.columns[row.len()..] {
+                        row.push(
+                            column
+                                .default_value
+                                .clone()
+                                .unwrap_or_else(|| Value::null(column.data_type)),
+                        );
+                    }
+                } else if row.len() > schema.columns.len() {
+                    row.truncate(schema.columns.len());
+                }
+                return Ok(Some(row));
+            }
+            CapturedHotRow::Deleted => return Ok(None),
+            CapturedHotRow::NoVisibleVersion => (),
+        }
+        let Some((id, index)) = self.captured_cold_location(row_id)? else {
+            return Ok(None);
+        };
+        let loaded = generation.load_segment(id)?;
+        let row = if loaded.mapping.is_identity {
+            loaded.volume.get_row(index)?
+        } else {
+            loaded.volume.get_row_mapped(index, &loaded.mapping)?
+        };
+        Ok(Some(row))
+    }
+
+    /// Metadata-only cold identity lookup; caller resolves hot authority first.
+    fn captured_cold_location(&self, row_id: i64) -> Result<Option<(u64, usize)>> {
+        let generation = self
+            .cold_generation
+            .as_ref()
+            .ok_or_else(|| crate::core::Error::internal("missing captured cold generation"))?;
+        if self.captured_pending().contains(&row_id)
+            || self.is_row_tombstoned(&generation.tombstones, row_id)
+        {
+            return Ok(None);
+        }
+        for &id in &generation.segment_ids_newest_first {
+            let segment = generation.segments.get(&id).ok_or_else(|| {
+                crate::core::Error::internal(format!("captured generation has no segment {id}"))
+            })?;
+            if let Ok(index) = segment.volume.meta.row_ids.binary_search(&row_id) {
+                if !segment.is_visible(index) {
+                    continue;
+                }
+                return Ok(Some((id, index)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Aggregate one logical column without constructing rows or loading other
+    /// columns. Fully visible immutable volumes can answer from captured stats.
+    fn captured_column_stats(
+        &self,
+        column: usize,
+    ) -> Result<Option<super::stats::ColumnAggregateStats>> {
+        use super::writer::ColSource;
+        let Some(schema_column) = self.hot.schema().columns.get(column) else {
+            return Ok(None);
+        };
+        let Some(generation) = &self.cold_generation else {
+            return Ok(None);
+        };
+        let view = self.hot.captured_hot_view().ok_or_else(|| {
+            crate::core::Error::internal("captured cold generation has no hot view")
+        })?;
+        let pending = self.captured_pending();
+        let default = schema_column
+            .default_value
+            .clone()
+            .unwrap_or_else(|| Value::null(schema_column.data_type));
+        let mut stats = super::stats::ColumnAggregateStats::default();
+        view.for_each_visible(|_, row| stats.accumulate(row.get(column).unwrap_or(&default)));
+        for &id in &generation.segment_ids_newest_first {
+            let segment = generation.segments.get(&id).ok_or_else(|| {
+                crate::core::Error::internal(format!("captured generation has no segment {id}"))
+            })?;
+            let count = super::captured_scanner::CapturedColdScanner::visible_count(
+                segment, generation, &view, pending, false,
+            );
+            if count == 0 {
+                continue;
+            }
+            let default_source = ColSource::Default(default.clone());
+            let physical = match segment
+                .mapping
+                .sources
+                .get(column)
+                .unwrap_or(&default_source)
+            {
+                ColSource::Default(value) => {
+                    let mut contribution = super::stats::ColumnAggregateStats::default();
+                    contribution.accumulate(value);
+                    contribution.sum_int *= count as i128;
+                    contribution.sum_float *= count as f64;
+                    contribution.numeric_count *= count as u64;
+                    contribution.non_null_count *= count as u64;
+                    stats.merge(&contribution);
+                    continue;
+                }
+                ColSource::Volume(physical) => *physical,
+            };
+            // Older volumes predate Boolean SUM stats. Their Boolean values
+            // must still be read; all other fully visible stats are compatible.
+            if count == segment.volume.meta.row_count
+                && schema_column.data_type != DataType::Boolean
+            {
+                if let Some(contribution) = segment.volume.meta.stats.columns.get(physical) {
+                    stats.merge(contribution);
+                    continue;
+                }
+            }
+            let loaded = generation.load_segment(id)?;
+            let grouped = loaded.volume.columns.should_use_group_cache();
+            let store = grouped
+                .then(|| loaded.volume.columns.compressed_store())
+                .flatten();
+            let mut cached_group = None;
+            let mut error = None;
+            super::captured_scanner::CapturedColdScanner::for_each_visible(
+                segment,
+                generation,
+                &view,
+                pending,
+                |index, _| {
+                    let outcome = (|| -> Result<()> {
+                        let (data, local) = if let Some(store) = store {
+                            let group = index / super::column::ROW_GROUP_SIZE;
+                            if cached_group
+                                .as_ref()
+                                .is_none_or(|(cached, _)| *cached != group)
+                            {
+                                cached_group = None;
+                                cached_group = Some((group, store.group_column(physical, group)?));
+                            }
+                            (
+                                cached_group.as_ref().unwrap().1.as_ref(),
+                                index % super::column::ROW_GROUP_SIZE,
+                            )
+                        } else {
+                            (loaded.volume.columns.get(physical)?, index)
+                        };
+                        stats.accumulate(&data.get_value(local));
+                        Ok(())
+                    })();
+                    if let Err(failure) = outcome {
+                        error = Some(failure);
+                        return false;
+                    }
+                    true
+                },
+            );
+            if let Some(error) = error {
+                return Err(error);
+            }
+        }
+        Ok(Some(stats))
+    }
+
+    fn captured_top_k(
+        &self,
+        filter: Option<&dyn Expression>,
+        column_name: &str,
+        ascending: bool,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<RowVec>> {
+        let Some(generation) = &self.cold_generation else {
+            return Ok(None);
+        };
+        let schema = self.hot.schema();
+        let Some((column, definition)) = schema.find_column(column_name) else {
+            return Ok(None);
+        };
+        if definition.nullable || definition.data_type == DataType::Float {
+            return Ok(None);
+        }
+        if limit == 0 {
+            return Ok(Some(RowVec::new()));
+        }
+        let view = self.hot.captured_hot_view().ok_or_else(|| {
+            crate::core::Error::internal("captured cold generation has no hot view")
+        })?;
+        let pending = self.captured_pending();
+        let mut ordered = Vec::with_capacity(generation.segment_ids_newest_first.len());
+        for &id in &generation.segment_ids_newest_first {
+            let segment = generation.segments.get(&id).ok_or_else(|| {
+                crate::core::Error::internal(format!("captured generation has no segment {id}"))
+            })?;
+            let (physical, bound) = match segment.mapping.sources.get(column) {
+                Some(super::writer::ColSource::Volume(physical)) => {
+                    let Some(zone) = segment.volume.meta.zone_maps.get(*physical) else {
+                        return Ok(None);
+                    };
+                    if zone.null_count != 0 {
+                        return Ok(None);
+                    }
+                    (
+                        Some(*physical),
+                        if ascending {
+                            zone.min.clone()
+                        } else {
+                            zone.max.clone()
+                        },
+                    )
+                }
+                Some(super::writer::ColSource::Default(value)) => (None, value.clone()),
+                None => (None, self.column_default(column)),
+            };
+            if bound.is_null() && segment.volume.meta.row_count != 0 {
+                return Ok(None);
+            }
+            ordered.push((id, physical, bound));
+        }
+        ordered.sort_unstable_by(|a, b| {
+            if ascending {
+                a.2.cmp(&b.2)
+            } else {
+                b.2.cmp(&a.2)
+            }
+        });
+        let needed = limit.saturating_add(offset);
+        let Some(hot_rows) = self
+            .hot
+            .scan_top_k(filter, column_name, ascending, needed, 0)?
+        else {
+            return Ok(None);
+        };
+        let mut keep = TopK::new(needed, column, ascending);
+        for (id, row) in hot_rows {
+            keep.offer(id, row);
+        }
+        let prepared = filter.map(|filter| {
+            let mut filter = filter.clone_box();
+            filter.prepare_for_schema(schema);
+            filter
+        });
+        let columns: Vec<_> = (0..schema.columns.len()).collect();
+        for (id, physical, bound) in ordered {
+            if keep.cannot_improve(&bound) {
+                break;
+            }
+            let segment = &generation.segments[&id];
+            if super::captured_scanner::CapturedColdScanner::visible_count(
+                segment, generation, &view, pending, true,
+            ) == 0
+            {
+                continue;
+            }
+            let loaded = generation.load_segment(id)?;
+            let sorted = physical.is_none_or(|physical| loaded.volume.is_sorted(physical));
+            let mut scanner = VolumeScanner::new(loaded.volume, columns.clone(), None);
+            scanner.set_column_mapping(loaded.mapping);
+            scanner.set_visibility_bitmap(loaded.visible);
+            scanner.set_skip_sets(generation.tombstones.clone(), pending.clone());
+            scanner.set_captured_visibility(view.clone(), pending.clone());
+            if sorted {
+                scanner.set_ordered_walk(ascending);
+            }
+            if let Some(filter) = &prepared {
+                scanner.set_filter(filter.clone_box());
+            }
+            if sorted {
+                if let (Some(physical), Some(worst)) = (physical, keep.worst_key()) {
+                    scanner.set_stop_key(physical, worst, ascending);
+                }
+            }
+            while scanner.next() {
+                if sorted
+                    && scanner
+                        .row()
+                        .get(column)
+                        .is_some_and(|key| keep.cannot_improve(key))
+                {
+                    break;
+                }
+                let (id, row) = scanner.take_row_with_id();
+                keep.offer(id, row);
+                if sorted {
+                    if let (Some(physical), Some(worst)) = (physical, keep.worst_key()) {
+                        scanner.set_stop_key(physical, worst, ascending);
+                    }
+                }
+            }
+            if let Some(error) = scanner.err() {
+                return Err(error.clone());
+            }
+            scanner.close()?;
+        }
+        Ok(Some(keep.into_rows(offset)))
     }
 
     /// Get the transaction ID for per-txn tombstone tracking.
@@ -237,6 +645,10 @@ impl SegmentedTable {
     /// so the original cold row remains visible to the older snapshot.
     #[inline]
     fn is_tombstone_visible(&self, commit_seq: u64) -> bool {
+        if let Some(epoch) = &self.read_epoch {
+            return i64::try_from(commit_seq)
+                .is_ok_and(|sequence| epoch.admits_commit_sequence(sequence));
+        }
         self.snapshot_seq.is_none_or(|ss| commit_seq <= ss)
     }
 
@@ -1103,6 +1515,338 @@ impl SegmentedTable {
         Ok(rows)
     }
 
+    /// DML reads current own writes but never freezes the complete transaction
+    /// overlay. Global authority comes exclusively from the bound hot root.
+    fn captured_dml_hot_authority(&self, row_id: i64) -> Result<bool> {
+        self.hot
+            .captured_mutation_has_hot_authority(row_id)
+            .ok_or_else(|| {
+                crate::core::Error::internal("captured cold DML has no bound hot authority")
+            })
+    }
+
+    /// Preload selected old rows from retained file handles before changing any
+    /// write set. Phase 6 replaces this statement staging with bounded preflight.
+    fn captured_cold_dml_targets(
+        &self,
+        row_ids: Option<&[i64]>,
+        predicate: Option<&dyn Expression>,
+    ) -> Result<Vec<(u64, i64, Row)>> {
+        let generation = self
+            .cold_generation
+            .as_ref()
+            .expect("bound cold generation");
+        let mut targets = Vec::new();
+        if generation.segment_ids_newest_first.is_empty() {
+            return Ok(targets);
+        }
+        // Keep a PK predicate on the point path even when immutable files exist.
+        let point_id = predicate.and_then(|expression| {
+            let (name, operator, value) = expression.get_comparison_info()?;
+            let keys = self.hot.schema().primary_key_indices();
+            if keys.len() != 1 || operator != crate::core::Operator::Eq {
+                return None;
+            }
+            let column = &self.hot.schema().columns[keys[0]];
+            if column.data_type != DataType::Integer || !column.name.eq_ignore_ascii_case(name) {
+                return None;
+            }
+            match value {
+                Value::Integer(id) => Some([*id]),
+                _ => None,
+            }
+        });
+        let row_ids = row_ids.or_else(|| point_id.as_ref().map(|ids| ids.as_slice()));
+        let eligible = |row_id| -> Result<bool> {
+            Ok(!self.captured_dml_hot_authority(row_id)?
+                && !self.is_row_tombstoned(&generation.tombstones, row_id)
+                && !self.segment_mgr.is_pending_tombstone(self.txn_id(), row_id))
+        };
+        if let Some(row_ids) = row_ids {
+            // One retained loaded segment per visited file, with no whole-table
+            // scan or full own-write overlay for a point mutation.
+            let mut loaded: smallvec::SmallVec<[(u64, super::manifest::ColdSegment); 1]> =
+                smallvec::SmallVec::new();
+            for &row_id in row_ids {
+                if !eligible(row_id)? {
+                    continue;
+                }
+                for &id in &generation.segment_ids_newest_first {
+                    let segment = generation.segments.get(&id).ok_or_else(|| {
+                        crate::core::Error::internal(format!(
+                            "captured generation has no segment {id}"
+                        ))
+                    })?;
+                    let Ok(offset) = segment.volume.meta.row_ids.binary_search(&row_id) else {
+                        continue;
+                    };
+                    if !segment.is_visible(offset) {
+                        continue;
+                    }
+                    let position = match loaded.iter().position(|(loaded_id, _)| *loaded_id == id) {
+                        Some(position) => position,
+                        None => {
+                            loaded.push((id, generation.load_segment(id)?));
+                            loaded.len() - 1
+                        }
+                    };
+                    let segment = &loaded[position].1;
+                    let row = segment.volume.get_row_mapped(offset, &segment.mapping)?;
+                    if let Some(predicate) = predicate {
+                        if !predicate.evaluate(&row)? {
+                            break;
+                        }
+                    }
+                    targets.push((id, row_id, row));
+                    break;
+                }
+            }
+            return Ok(targets);
+        }
+        let comparisons = predicate
+            .map(|expr| expr.collect_comparisons())
+            .unwrap_or_default();
+        let hashes = Self::precompute_bloom_hashes(&comparisons);
+        for &id in &generation.segment_ids_newest_first {
+            let segment = generation.segments.get(&id).ok_or_else(|| {
+                crate::core::Error::internal(format!("captured generation has no segment {id}"))
+            })?;
+            // Resolve the logical predicate through this generation's mapping.
+            // A dropped/re-added name can refer to a default, while the old
+            // file still has a physical column with unrelated zone maps.
+            // Only resident metadata is inspected before hot-authority checks.
+            let pruned = comparisons
+                .iter()
+                .zip(&hashes)
+                .any(|(&(name, operator, value), hash)| {
+                    let Some((logical, _)) = self.hot.schema().find_column(name) else {
+                        return false;
+                    };
+                    let Some(super::writer::ColSource::Volume(physical)) =
+                        segment.mapping.sources.get(logical)
+                    else {
+                        return false;
+                    };
+                    let Some(zone) = segment.volume.meta.zone_maps.get(*physical) else {
+                        return false;
+                    };
+                    match operator {
+                        crate::core::Operator::Eq => {
+                            !zone.may_contain_eq(value)
+                                || hash.is_some_and(|hash| {
+                                    segment.volume.meta.column_types.get(*physical).is_some_and(
+                                    |&data_type| {
+                                        super::column::ColumnBloomFilter::equality_hash_compatible(
+                                            data_type, value,
+                                        )
+                                    },
+                                ) && segment
+                                    .volume
+                                    .meta
+                                    .bloom_filters
+                                    .get(*physical)
+                                    .is_some_and(|bloom| !bloom.might_contain_hash(hash))
+                                })
+                        }
+                        crate::core::Operator::Gt | crate::core::Operator::Gte => {
+                            !zone.may_contain_gte(value)
+                        }
+                        crate::core::Operator::Lt | crate::core::Operator::Lte => {
+                            !zone.may_contain_lte(value)
+                        }
+                        _ => false,
+                    }
+                });
+            if pruned {
+                continue;
+            }
+            let mut loaded = None;
+            for (offset, &row_id) in segment.volume.meta.row_ids.iter().enumerate() {
+                if !segment.is_visible(offset) || !eligible(row_id)? {
+                    continue;
+                }
+                let loaded = match &loaded {
+                    Some(loaded) => loaded,
+                    None => loaded.insert(generation.load_segment(id)?),
+                };
+                let row = loaded.volume.get_row_mapped(offset, &loaded.mapping)?;
+                if let Some(predicate) = predicate {
+                    if !predicate.evaluate(&row)? {
+                        continue;
+                    }
+                }
+                targets.push((id, row_id, row));
+            }
+        }
+        Ok(targets)
+    }
+
+    /// The row claim excludes competing row publishers; the caller also holds
+    /// the short transfer fence while checking source identity and publishing
+    /// its staged hot write. All checks here are resident metadata only.
+    fn validate_captured_cold_source(&self, row_id: i64, source: u64) -> Result<()> {
+        self.hot.validate_cold_mutation(row_id)?;
+        let conflict = || {
+            crate::core::Error::internal(format!(
+                "write conflict: cold row {row_id} changed after the statement read epoch"
+            ))
+        };
+        let manifest = self.segment_mgr.manifest();
+        let segments = self.segment_mgr.segments_raw();
+        if self.segment_mgr.tombstone_set_arc().contains_key(&row_id) {
+            return Err(conflict());
+        }
+        for meta in manifest.segments.iter().rev() {
+            let segment = segments.get(&meta.segment_id).ok_or_else(conflict)?;
+            if let Ok(offset) = segment.volume.meta.row_ids.binary_search(&row_id) {
+                if segment.is_visible(offset) {
+                    return if meta.segment_id == source {
+                        Ok(())
+                    } else {
+                        Err(conflict())
+                    };
+                }
+            }
+        }
+        Err(conflict())
+    }
+
+    fn validate_cold_constraint_snapshot(
+        &self,
+        snapshot: Option<&super::manifest::StatementSnapshot>,
+    ) -> Result<()> {
+        if let Some(snapshot) = snapshot {
+            if !Arc::ptr_eq(&snapshot.segs, &self.segment_mgr.segments_raw())
+                || !Arc::ptr_eq(&snapshot.tombstones, &self.segment_mgr.tombstone_set_arc())
+            {
+                return Err(crate::core::Error::internal(
+                    "write conflict: cold constraints changed during statement preflight",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn captured_update(
+        &mut self,
+        row_ids: Option<&[i64]>,
+        predicate: Option<&dyn Expression>,
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+    ) -> Result<i32> {
+        let generation = self.segment_mgr.seal_generation();
+        let targets = self.captured_cold_dml_targets(row_ids, predicate)?;
+        let constraints = if !targets.is_empty() && self.hot.has_unique_non_pk_indexes() {
+            Some(self.segment_mgr.statement_snapshot()?)
+        } else {
+            None
+        };
+        let mut count = if let Some(ids) = row_ids {
+            // Unknown IDs must not become phantom writes. A captured Deleted
+            // still routes hot so the underlying DML can return zero.
+            let mut hot_ids: smallvec::SmallVec<[i64; 1]> = smallvec::SmallVec::new();
+            for &id in ids {
+                if self.captured_dml_hot_authority(id)? {
+                    hot_ids.push(id);
+                }
+            }
+            if hot_ids.is_empty() {
+                0
+            } else {
+                self.hot.update_by_row_ids(&hot_ids, setter)?
+            }
+        } else {
+            self.hot.update(predicate, setter)?
+        };
+        let has_int_pk = self
+            .hot
+            .schema()
+            .columns
+            .iter()
+            .any(|column| column.primary_key && column.data_type == DataType::Integer);
+        for (source, row_id, old_row) in targets {
+            let (new_row, changed) = setter(old_row.clone())?;
+            if !changed {
+                continue;
+            }
+            if constraints.is_some() {
+                self.check_cold_unique_for_update(&new_row, row_id, constraints.as_ref())?;
+            }
+            self.hot.try_claim_row(row_id)?;
+            let manager = self.segment_mgr.clone();
+            let _fence = manager.acquire_seal_read();
+            self.validate_captured_cold_source(row_id, source)?;
+            self.validate_cold_constraint_snapshot(constraints.as_ref())?;
+            if has_int_pk {
+                self.hot.insert_discard(old_row)?;
+                let mut staged = Some(new_row);
+                let changed = self.hot.update_by_row_ids(&[row_id], &mut |_| {
+                    Ok((staged.take().expect("one staged cold mutation"), true))
+                })?;
+                if changed != 1 {
+                    return Err(crate::core::Error::internal(
+                        "write conflict: mirrored cold update lost its target",
+                    ));
+                }
+            } else {
+                self.hot.insert_discard(new_row)?;
+            }
+            manager.add_pending_tombstone(self.txn_id(), row_id);
+            count += 1;
+        }
+        if count != 0 {
+            self.segment_mgr
+                .record_txn_seal_generation_at(self.txn_id(), generation);
+        }
+        Ok(count)
+    }
+
+    fn captured_delete(
+        &mut self,
+        row_ids: Option<&[i64]>,
+        predicate: Option<&dyn Expression>,
+    ) -> Result<i32> {
+        let generation = self.segment_mgr.seal_generation();
+        let targets = self.captured_cold_dml_targets(row_ids, predicate)?;
+        let mut count = if let Some(ids) = row_ids {
+            let mut hot_ids: smallvec::SmallVec<[i64; 1]> = smallvec::SmallVec::new();
+            for &id in ids {
+                if self.captured_dml_hot_authority(id)? {
+                    hot_ids.push(id);
+                }
+            }
+            if hot_ids.is_empty() {
+                0
+            } else {
+                self.hot.delete_by_row_ids(&hot_ids)?
+            }
+        } else {
+            self.hot.delete(predicate)?
+        };
+        let has_int_pk = self
+            .hot
+            .schema()
+            .columns
+            .iter()
+            .any(|column| column.primary_key && column.data_type == DataType::Integer);
+        for (source, row_id, _) in targets {
+            self.hot.try_claim_row(row_id)?;
+            let manager = self.segment_mgr.clone();
+            let _fence = manager.acquire_seal_read();
+            self.validate_captured_cold_source(row_id, source)?;
+            if has_int_pk && self.hot.delete_by_row_ids(&[row_id])? != 1 {
+                return Err(crate::core::Error::internal(
+                    "write conflict: cold delete lost its target",
+                ));
+            }
+            manager.add_pending_tombstone(self.txn_id(), row_id);
+            count += 1;
+        }
+        if count != 0 {
+            self.segment_mgr
+                .record_txn_seal_generation_at(self.txn_id(), generation);
+        }
+        Ok(count)
+    }
     /// Find a row in segments by row_id. Returns (volume, local_offset) if found
     /// and not tombstoned or hot-shadowed. Uses manifest min/max for fast segment
     /// identification, then binary search within the segment.
@@ -1317,6 +2061,33 @@ impl SegmentedTable {
 }
 
 impl Table for SegmentedTable {
+    fn begin_logical_mutation(
+        &self,
+    ) -> Option<crate::storage::mvcc::registry::LogicalMutationGuard> {
+        self.hot.begin_logical_mutation()
+    }
+
+    fn set_read_epoch(&mut self, epoch: crate::storage::mvcc::registry::ReadEpoch) -> Result<()> {
+        if self
+            .read_epoch
+            .as_ref()
+            .is_some_and(|current| current.same_epoch(&epoch))
+        {
+            return Ok(());
+        }
+        let (root, generation) = self
+            .segment_mgr
+            .capture_with_hot(|| self.hot.capture_hot_root())?;
+        self.hot.set_read_epoch(epoch.clone())?;
+        if let Some(root) = root {
+            self.hot.replace_hot_root(root)?;
+        }
+        self.cold_generation = Some(generation);
+        self.captured_pending.take();
+        self.snapshot_seq = Some(epoch.cutoff() as u64);
+        self.read_epoch = Some(epoch);
+        Ok(())
+    }
     // =========================================================================
     // Metadata
     // =========================================================================
@@ -1360,6 +2131,7 @@ impl Table for SegmentedTable {
         default_expr: Option<String>,
         default_value: Option<Value>,
     ) -> Result<()> {
+        let _logical_change = self.hot.begin_logical_mutation();
         self.hot.create_column_with_default_value(
             name,
             column_type,
@@ -1370,6 +2142,7 @@ impl Table for SegmentedTable {
     }
 
     fn drop_column(&mut self, name: &str) -> Result<()> {
+        let _logical_change = self.hot.begin_logical_mutation();
         self.hot.drop_column(name)
     }
 
@@ -1419,6 +2192,9 @@ impl Table for SegmentedTable {
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
+        if self.cold_generation.is_some() {
+            return self.captured_update(None, where_expr, setter);
+        }
         let _seal_guard = self.segment_mgr.acquire_seal_read();
         // Capture a verified all-warm segment snapshot BEFORE mutating the
         // hot buffer and use it for the entire statement: eviction CoWs
@@ -1560,6 +2336,9 @@ impl Table for SegmentedTable {
         row_ids: &[i64],
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
+        if self.cold_generation.is_some() {
+            return self.captured_update(Some(row_ids), None, setter);
+        }
         let _seal_guard = self.segment_mgr.acquire_seal_read();
         // Capture a verified all-warm segment snapshot BEFORE mutating the
         // hot buffer and use it for the entire statement: eviction CoWs
@@ -1659,6 +2438,9 @@ impl Table for SegmentedTable {
     }
 
     fn delete_by_row_ids(&mut self, row_ids: &[i64]) -> Result<i32> {
+        if self.cold_generation.is_some() {
+            return self.captured_delete(Some(row_ids), None);
+        }
         let _seal_guard = self.segment_mgr.acquire_seal_read();
         // Capture a verified all-warm segment snapshot BEFORE mutating the
         // hot buffer and use it for the entire statement: eviction CoWs
@@ -1708,6 +2490,30 @@ impl Table for SegmentedTable {
     }
 
     fn get_active_row_ids(&self) -> Result<Vec<i64>> {
+        if let Some(generation) = &self.cold_generation {
+            let view = self.hot.captured_hot_view().ok_or_else(|| {
+                crate::core::Error::internal("captured cold generation has no hot view")
+            })?;
+            let pending = self.captured_pending();
+            let mut ids = Vec::new();
+            for &id in generation.segment_ids_newest_first.iter().rev() {
+                let segment = generation.segments.get(&id).ok_or_else(|| {
+                    crate::core::Error::internal(format!("captured generation has no segment {id}"))
+                })?;
+                super::captured_scanner::CapturedColdScanner::for_each_visible(
+                    segment,
+                    generation,
+                    &view,
+                    pending,
+                    |_, row_id| {
+                        ids.push(row_id);
+                        true
+                    },
+                );
+            }
+            view.for_each_visible(|id, _| ids.push(id));
+            return Ok(ids);
+        }
         let hot_ids = self.hot.get_active_row_ids()?;
 
         if !self.segment_mgr.has_segments() {
@@ -1744,6 +2550,9 @@ impl Table for SegmentedTable {
     }
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
+        if self.cold_generation.is_some() {
+            return self.captured_delete(None, where_expr);
+        }
         let _seal_guard = self.segment_mgr.acquire_seal_read();
         // Capture a verified all-warm segment snapshot BEFORE mutating the
         // hot buffer and use it for the entire statement: eviction CoWs
@@ -1926,12 +2735,13 @@ impl Table for SegmentedTable {
     }
 
     fn truncate(&mut self) -> Result<i32> {
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        let seg_rows = self.segment_mgr.total_row_count() as i32;
-        // Clear pending tombstones for this txn (segments are being dropped)
-        self.segment_mgr.rollback_pending_tombstones(self.txn_id());
-        self.segment_mgr.clear();
-        Ok(self.hot.truncate()? + seg_rows)
+        // The engine coordinator owns maintenance/registry ordering, WAL, and
+        // both hot/cold publication. Never hold a seal read guard over WAL.
+        let rows = self.hot.truncate_with_outer_epoch(&mut self.read_epoch)?;
+        self.cold_generation = None;
+        self.captured_pending.take();
+        self.snapshot_seq = None;
+        Ok(rows)
     }
 
     // =========================================================================
@@ -1943,6 +2753,9 @@ impl Table for SegmentedTable {
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
+        if let Some(scanner) = self.captured_scan(column_indices, where_expr)? {
+            return Ok(scanner);
+        }
         if let Some(result) = self.unsealed(|hot| hot.scan(column_indices, where_expr)) {
             return result;
         }
@@ -1976,6 +2789,9 @@ impl Table for SegmentedTable {
     }
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
+        if self.cold_generation.is_some() {
+            return self.collect_captured(where_expr, usize::MAX, 0);
+        }
         if let Some(result) = self.unsealed(|hot| hot.collect_all_rows(where_expr)) {
             return result;
         }
@@ -2002,6 +2818,9 @@ impl Table for SegmentedTable {
     }
 
     fn collect_all_rows_unsorted(&self) -> Result<RowVec> {
+        if self.cold_generation.is_some() {
+            return self.collect_captured(None, usize::MAX, 0);
+        }
         if let Some(result) = self.unsealed(|hot| hot.collect_all_rows_unsorted()) {
             return result;
         }
@@ -2024,6 +2843,15 @@ impl Table for SegmentedTable {
     }
 
     fn collect_rows_by_ids(&self, row_ids: &[i64]) -> Result<RowVec> {
+        if self.cold_generation.is_some() {
+            let mut rows = RowVec::with_capacity(row_ids.len());
+            for &id in row_ids {
+                if let Some(row) = self.captured_row(id)? {
+                    rows.push((id, row));
+                }
+            }
+            return Ok(rows);
+        }
         if let Some(result) = self.unsealed(|hot| hot.collect_rows_by_ids(row_ids)) {
             return result;
         }
@@ -2082,6 +2910,22 @@ impl Table for SegmentedTable {
         filter: &dyn Expression,
         buffer: &mut RowVec,
     ) -> Result<()> {
+        if self.cold_generation.is_some() {
+            let prepared = (!filter.is_prepared()).then(|| {
+                let mut prepared = filter.clone_box();
+                prepared.prepare_for_schema(self.hot.schema());
+                prepared
+            });
+            let filter = prepared.as_deref().unwrap_or(filter);
+            for &id in row_ids {
+                if let Some(row) = self.captured_row(id)? {
+                    if filter.evaluate(&row)? {
+                        buffer.push((id, row));
+                    }
+                }
+            }
+            return Ok(());
+        }
         if let Some(result) =
             self.unsealed(|hot| hot.fetch_rows_by_ids_into(row_ids, filter, buffer))
         {
@@ -2135,6 +2979,9 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
+        if self.cold_generation.is_some() {
+            return self.collect_captured(where_expr, limit, offset);
+        }
         if let Some(result) =
             self.unsealed(|hot| hot.collect_rows_with_limit(where_expr, limit, offset))
         {
@@ -2248,6 +3095,9 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
+        if self.cold_generation.is_some() {
+            return self.collect_captured(where_expr, limit, offset);
+        }
         if let Some(result) =
             self.unsealed(|hot| hot.collect_rows_with_limit_unordered(where_expr, limit, offset))
         {
@@ -2388,6 +3238,15 @@ impl Table for SegmentedTable {
         }) {
             return result;
         }
+        if self.read_epoch.is_some() {
+            if let Some(column) = self.hot.schema().columns.get(sort_col_idx) {
+                if let Some(rows) =
+                    self.captured_top_k(None, &column.name, ascending, limit, offset)?
+                {
+                    return Ok(rows.into_iter().map(|(_, row)| row).collect());
+                }
+            }
+        }
         // Collect all merged rows, sort, take limit
         let mut rows = self.collect_all_rows(None)?;
         rows.sort_by(|(_, a), (_, b)| {
@@ -2414,6 +3273,19 @@ impl Table for SegmentedTable {
     }
 
     fn has_row_id(&self, row_id: i64) -> Result<bool> {
+        if self.cold_generation.is_some() {
+            use crate::storage::mvcc::version_store::CapturedHotRow;
+            let view = self.hot.captured_hot_view().ok_or_else(|| {
+                crate::core::Error::internal("captured cold generation has no hot view")
+            })?;
+            return match view.row_state(row_id) {
+                CapturedHotRow::Value(_) => Ok(true),
+                CapturedHotRow::Deleted => Ok(false),
+                CapturedHotRow::NoVisibleVersion => {
+                    Ok(self.captured_cold_location(row_id)?.is_some())
+                }
+            };
+        }
         if self.hot.has_row_id(row_id)? {
             return Ok(true);
         }
@@ -2441,6 +3313,22 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn row_count(&self) -> Result<usize> {
+        if let Some(generation) = &self.cold_generation {
+            let view = self.hot.captured_hot_view().ok_or_else(|| {
+                crate::core::Error::internal("captured cold generation has no hot view")
+            })?;
+            let mut count = self.hot.row_count()?;
+            let pending = self.captured_pending();
+            for &id in &generation.segment_ids_newest_first {
+                let segment = generation.segments.get(&id).ok_or_else(|| {
+                    crate::core::Error::internal(format!("captured generation has no segment {id}"))
+                })?;
+                count += super::captured_scanner::CapturedColdScanner::visible_count(
+                    segment, generation, &view, pending, false,
+                );
+            }
+            return Ok(count);
+        }
         // Snapshot isolation: deduped_row_count and the fast path subtract ALL
         // tombstones, but a snapshot may not see newer ones. Use full scan.
         if self.snapshot_seq.is_some() {
@@ -2466,6 +3354,9 @@ impl Table for SegmentedTable {
     }
 
     fn fast_row_count(&self) -> Result<Option<usize>> {
+        if self.cold_generation.is_some() {
+            return self.row_count().map(Some);
+        }
         // Snapshot isolation: deduped_row_count subtracts ALL tombstones, but
         // this snapshot may not see newer tombstones. Fall back to scan which
         // correctly filters by snapshot_seq.
@@ -2492,6 +3383,11 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn sum_column(&self, col_idx: usize) -> Result<Option<(f64, usize)>> {
+        if self.cold_generation.is_some() {
+            return Ok(self
+                .captured_column_stats(col_idx)?
+                .map(|stats| (stats.sum_as_f64(), stats.numeric_count as usize)));
+        }
         // Snapshot isolation: cold aggregation uses tombstones without snapshot
         // filtering. Bail so the executor falls back to full scan.
         if self.snapshot_seq.is_some() {
@@ -2640,6 +3536,11 @@ impl Table for SegmentedTable {
     }
 
     fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+        if self.cold_generation.is_some() {
+            return Ok(self
+                .captured_column_stats(col_idx)?
+                .map(|stats| (!stats.min.is_null()).then_some(stats.min)));
+        }
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
@@ -2946,6 +3847,11 @@ impl Table for SegmentedTable {
     }
 
     fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+        if self.cold_generation.is_some() {
+            return Ok(self
+                .captured_column_stats(col_idx)?
+                .map(|stats| (!stats.max.is_null()).then_some(stats.max)));
+        }
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
@@ -3246,6 +4152,11 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
+        if self.read_epoch.is_some() {
+            return Ok(self
+                .get_partition_values(column_name)?
+                .map(|values| values.into_iter().filter(|value| !value.is_null()).count()));
+        }
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
@@ -3320,6 +4231,34 @@ impl Table for SegmentedTable {
     }
 
     fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
+        if let Some(generation) = &self.cold_generation {
+            let schema = self.hot.schema();
+            let Some((column, _)) = schema.find_column(column_name) else {
+                return Ok(None);
+            };
+            let view = self.hot.captured_hot_view().ok_or_else(|| {
+                crate::core::Error::internal("captured distinct generation has no hot view")
+            })?;
+            return Ok(super::captured_aggregate::grouped(
+                schema,
+                &view,
+                Some((generation, self.captured_pending())),
+                &[column],
+                &[],
+            )?
+            .map(|groups| {
+                groups
+                    .into_iter()
+                    .map(|group| {
+                        group
+                            .group_values
+                            .into_iter()
+                            .next()
+                            .expect("one group column")
+                    })
+                    .collect()
+            }));
+        }
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
@@ -3390,6 +4329,15 @@ impl Table for SegmentedTable {
     }
 
     fn compute_distinct_values(&self, col_idx: usize) -> Result<Option<Vec<Value>>> {
+        if self.read_epoch.is_some() {
+            let Some(column) = self.hot.schema().columns.get(col_idx) else {
+                return Ok(None);
+            };
+            return Ok(self.get_partition_values(&column.name)?.map(|mut values| {
+                values.retain(|value| !value.is_null());
+                values
+            }));
+        }
         // Bail for snapshot isolation — tombstone visibility is snapshot-dependent
         if self.snapshot_seq.is_some() {
             return Ok(None);
@@ -3717,6 +4665,9 @@ impl Table for SegmentedTable {
         }) {
             return result;
         }
+        if self.read_epoch.is_some() {
+            return self.captured_top_k(None, column_name, ascending, limit, offset);
+        }
 
         // Snapshot isolation: the merge path doesn't filter by snapshot_seq.
         // Fall back to the full scan + sort path which handles MVCC correctly.
@@ -3940,10 +4891,19 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn close(&mut self) -> Result<()> {
-        self.hot.close()
+        self.hot.close()?;
+        let txn_id = self.txn_id();
+        self.segment_mgr.rollback_pending_tombstones(txn_id);
+        self.segment_mgr.clear_txn_seal_generation(txn_id);
+        self.cold_generation = None;
+        self.read_epoch = None;
+        self.captured_pending.take();
+        self.snapshot_seq = None;
+        Ok(())
     }
 
     fn commit(&mut self) -> Result<()> {
+        let _logical_change = self.hot.begin_logical_mutation();
         self.hot.commit()?;
         // Apply pending tombstones to the shared tombstone set.
         // commit_seq=0 means "always visible to all snapshots". This is safe because
@@ -3970,6 +4930,10 @@ impl Table for SegmentedTable {
         self.hot.has_local_changes() || self.segment_mgr.has_pending_tombstones(self.txn_id())
     }
 
+    fn record_source_lsn(&self, row_id: i64, lsn: Option<std::num::NonZeroU64>) {
+        self.hot.record_source_lsn(row_id, lsn);
+    }
+
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
         self.hot.get_pending_versions()
     }
@@ -3988,6 +4952,9 @@ impl Table for SegmentedTable {
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
+        if self.cold_generation.is_some() {
+            return self.captured_top_k(where_expr, column_name, ascending, limit, offset);
+        }
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
@@ -4369,6 +5336,9 @@ impl Table for SegmentedTable {
     }
 
     fn get_index_min_value(&self, column_name: &str) -> Option<Value> {
+        if self.cold_generation.is_some() {
+            return None;
+        }
         if let Some(result) = self.unsealed(|hot| hot.get_index_min_value(column_name)) {
             return result;
         }
@@ -4410,6 +5380,9 @@ impl Table for SegmentedTable {
     }
 
     fn get_index_max_value(&self, column_name: &str) -> Option<Value> {
+        if self.cold_generation.is_some() {
+            return None;
+        }
         if let Some(result) = self.unsealed(|hot| hot.get_index_max_value(column_name)) {
             return result;
         }
@@ -4455,10 +5428,12 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()> {
+        let _logical_change = self.hot.begin_logical_mutation();
         self.hot.rename_column(old_name, new_name)
     }
 
     fn modify_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
+        let _logical_change = self.hot.begin_logical_mutation();
         self.hot.modify_column(name, column_type, nullable)
     }
 
@@ -4639,6 +5614,18 @@ impl Table for SegmentedTable {
         aggregates: &[(AggregateOp, usize)],
         where_expr: &dyn Expression,
     ) -> Result<Option<Vec<Value>>> {
+        if let Some(generation) = &self.cold_generation {
+            let view = self.hot.captured_hot_view().ok_or_else(|| {
+                crate::core::Error::internal("captured aggregate has no hot view")
+            })?;
+            return super::captured_aggregate::filtered(
+                self.hot.schema(),
+                &view,
+                Some((generation, self.captured_pending())),
+                aggregates,
+                where_expr,
+            );
+        }
         // Bail out: snapshot isolation requires tombstone filtering by snapshot_seq
         if self.snapshot_seq.is_some() {
             return Ok(None);
@@ -5525,6 +6512,18 @@ impl Table for SegmentedTable {
         group_by_indices: &[usize],
         aggregates: &[(AggregateOp, usize)],
     ) -> Result<Option<Vec<GroupedAggregateResult>>> {
+        if let Some(generation) = &self.cold_generation {
+            let view = self.hot.captured_hot_view().ok_or_else(|| {
+                crate::core::Error::internal("captured aggregate has no hot view")
+            })?;
+            return super::captured_aggregate::grouped(
+                self.hot.schema(),
+                &view,
+                Some((generation, self.captured_pending())),
+                group_by_indices,
+                aggregates,
+            );
+        }
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
@@ -6373,6 +7372,250 @@ mod tests {
             None,
         );
         mgr
+    }
+
+    /// Minimal test table for the hot buffer
+    #[test]
+    fn captured_merge_preserves_authority_and_generation_after_mutation() {
+        use crate::core::Operator;
+        use crate::storage::expression::ComparisonExpr;
+        use crate::storage::mvcc::version_store::{
+            RowVersion, TransactionVersionStore, VersionStore,
+        };
+        use crate::storage::mvcc::{MVCCTable, TransactionRegistry};
+
+        let schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .column("g", DataType::Integer, false, false)
+            .build();
+        let row = |id, value| Row::from_values(vec![Value::Integer(id), Value::Integer(value)]);
+        let manager = make_segment_mgr(
+            &schema,
+            &[
+                (1, row(1, 10)),
+                (2, row(2, 10)),
+                (3, row(3, 30)),
+                (4, row(4, 40)),
+            ],
+        );
+        let registry = Arc::new(TransactionRegistry::new());
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "test",
+            schema,
+            registry.clone(),
+        ));
+        let (committed, _) = registry.begin_transaction();
+        registry.start_commit(committed);
+        store
+            .add_version(1, RowVersion::new(committed, row(1, 20)))
+            .unwrap();
+        let mut deleted = RowVersion::new(committed, row(2, 10));
+        deleted.deleted_at_txn_id = committed;
+        store.add_version(2, deleted).unwrap();
+        registry.complete_commit(committed);
+        let (inflight, _) = registry.begin_transaction();
+        registry.start_commit(inflight);
+        store
+            .add_version(3, RowVersion::new(inflight, row(3, 300)))
+            .unwrap();
+        let (reader, _) = registry.begin_transaction();
+        let hot = MVCCTable::new(
+            reader,
+            store.clone(),
+            TransactionVersionStore::new(store.clone(), reader),
+        );
+        let mut table = SegmentedTable::new(Box::new(hot), manager.clone());
+        manager.add_pending_tombstone(reader, 4);
+        table.set_read_epoch(registry.capture_read_epoch()).unwrap();
+        registry.complete_commit(inflight);
+        assert_eq!(table.row_count().unwrap(), 2);
+        assert_eq!(table.sum_column(1).unwrap(), Some((50.0, 2)));
+        assert_eq!(table.min_column(1).unwrap(), Some(Some(Value::Integer(20))));
+        assert_eq!(table.max_column(1).unwrap(), Some(Some(Value::Integer(30))));
+        assert_eq!(
+            table
+                .collect_rows_by_ids(&[1, 2, 3, 4])
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![(1, row(1, 20)), (3, row(3, 30))]
+        );
+        let filter = ComparisonExpr::new("g", Operator::Eq, Value::Integer(10));
+        assert!(
+            table.collect_all_rows(Some(&filter)).unwrap().is_empty(),
+            "a hot value rejected by the predicate and a hot delete must both shadow old cold rows"
+        );
+        for (value, expected_id) in [(20, 1), (30, 3)] {
+            let filter = ComparisonExpr::new("g", Operator::Eq, Value::Integer(value));
+            let rows = table.collect_all_rows(Some(&filter)).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].0, expected_id);
+        }
+        for projection in [
+            vec![0],
+            vec![1],
+            vec![1, 0],
+            vec![0, 0, 1],
+            vec![0, 1],
+            vec![],
+        ] {
+            for filter in [
+                None,
+                Some(ComparisonExpr::new("id", Operator::Eq, Value::Integer(1))),
+            ] {
+                let mut scanner = table
+                    .scan(&projection, filter.as_ref().map(|f| f as &dyn Expression))
+                    .unwrap();
+                let mut actual = Vec::new();
+                while scanner.next() {
+                    actual.push(scanner.take_row_with_id());
+                }
+                assert!(scanner.err().is_none());
+                actual.sort_by_key(|(id, _)| *id);
+                let expected: Vec<_> = [(1, row(1, 20)), (3, row(3, 30))]
+                    .into_iter()
+                    .filter(|(id, _)| filter.is_none() || *id == 1)
+                    .map(|(id, row)| {
+                        let row = if projection.is_empty() {
+                            row
+                        } else {
+                            Row::from_values(
+                                projection
+                                    .iter()
+                                    .map(|&column| row[column].clone())
+                                    .collect(),
+                            )
+                        };
+                        (id, row)
+                    })
+                    .collect();
+                assert_eq!(
+                    actual,
+                    expected,
+                    "projection {projection:?}, filtered {}",
+                    filter.is_some()
+                );
+            }
+        }
+        let mut scanner = table.scan(&[1], None).unwrap();
+        manager.rollback_pending_tombstones(reader);
+        manager.clear();
+        store
+            .add_version(1, RowVersion::new(inflight, row(1, 999)))
+            .unwrap();
+        let mut actual = Vec::new();
+        while scanner.next() {
+            actual.push(scanner.take_row_with_id());
+        }
+        assert!(scanner.err().is_none(), "{:?}", scanner.err());
+        actual.sort_by_key(|(id, _)| *id);
+        assert_eq!(
+            actual,
+            vec![
+                (1, Row::from_values(vec![Value::Integer(20)])),
+                (3, Row::from_values(vec![Value::Integer(30)]))
+            ]
+        );
+        assert_eq!(table.collect_rows_with_limit(None, 1, 1).unwrap().len(), 1);
+        assert!(table
+            .collect_rows_with_limit(None, 0, usize::MAX)
+            .unwrap()
+            .is_empty());
+        let old_epoch = table.read_epoch.clone().unwrap();
+        manager.manifest_mut().segments.push(SegmentMeta {
+            segment_id: 999,
+            file_path: PathBuf::from("missing.vol"),
+            row_count: 1,
+            min_row_id: 1,
+            max_row_id: 1,
+            schema_version: 0,
+            creation_lsn: 0,
+            seal_seq: 0,
+        });
+        assert!(table.set_read_epoch(registry.capture_read_epoch()).is_err());
+        table.set_read_epoch(old_epoch).unwrap();
+        assert_eq!(
+            table.collect_rows_by_ids(&[1]).unwrap()[0].1,
+            row(1, 20),
+            "a failed rebind must retain the previous hot and cold generation together"
+        );
+    }
+
+    #[test]
+    fn captured_merge_skips_hidden_cold_file_and_keeps_load_error_sticky() {
+        use crate::storage::mvcc::version_store::{
+            RowVersion, TransactionVersionStore, VersionStore,
+        };
+        use crate::storage::mvcc::{MVCCTable, TransactionRegistry};
+        let schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let row = Row::from_values(vec![Value::Integer(1)]);
+        let source = make_segment_mgr(&schema, &[(1, row.clone())]);
+        let cold = Arc::new(source.segments_raw()[&1].volume.to_cold());
+        let meta = source.manifest().segments[0].clone();
+        let manager = Arc::new(SegmentManager::new("test", None));
+        manager.register_segment(1, cold, meta, None);
+        let registry = Arc::new(TransactionRegistry::new());
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "test",
+            schema,
+            registry.clone(),
+        ));
+        let (reader, _) = registry.begin_transaction();
+        let make_hot = || {
+            MVCCTable::new(
+                reader,
+                store.clone(),
+                TransactionVersionStore::new(store.clone(), reader),
+            )
+        };
+        let mut visible = SegmentedTable::new(Box::new(make_hot()), manager.clone());
+        visible
+            .set_read_epoch(registry.capture_read_epoch())
+            .unwrap();
+        assert!(visible.has_row_id(1).unwrap());
+        assert_eq!(visible.get_active_row_ids().unwrap(), vec![1]);
+        assert_eq!(visible.row_count().unwrap(), 1);
+        assert_eq!(visible.sum_column(0).unwrap(), Some((1.0, 1)));
+        assert_eq!(
+            visible.min_column(0).unwrap(),
+            Some(Some(Value::Integer(1)))
+        );
+        let nonmatching = crate::storage::expression::ComparisonExpr::eq("id", Value::Integer(99));
+        assert!(
+            visible
+                .collect_all_rows(Some(&nonmatching))
+                .unwrap()
+                .is_empty(),
+            "metadata pruning must run before loading a cold file"
+        );
+        let mut scanner = visible.scan(&[], None).unwrap();
+        assert!(!scanner.next());
+        assert!(scanner
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("no captured file backing"));
+        assert!(!scanner.next());
+        assert!(scanner.err().is_some());
+        scanner.close().unwrap();
+        assert!(!scanner.next());
+        assert!(scanner.err().is_some());
+        let (writer, _) = registry.begin_transaction();
+        registry.start_commit(writer);
+        store.add_version(1, RowVersion::new(writer, row)).unwrap();
+        registry.complete_commit(writer);
+        let mut hidden = SegmentedTable::new(Box::new(make_hot()), manager);
+        hidden
+            .set_read_epoch(registry.capture_read_epoch())
+            .unwrap();
+        let rows = hidden.collect_all_rows(None).unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a wholly shadowed cold file requires no backing read"
+        );
     }
 
     /// Minimal test table for the hot buffer

@@ -15,7 +15,7 @@
 //! Index trait for database indexes
 //!
 
-use crate::common::I64Map;
+use crate::common::{I64Map, MemoryAccount};
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 
@@ -30,6 +30,21 @@ use crate::storage::expression::Expression;
 /// - **Bitmap**: For low-cardinality columns (< 5% unique values)
 /// - **BTree**: For range queries and ordered access
 pub trait Index: Send + Sync {
+    /// Attach an exclusively owned index before publication. Normal factories
+    /// attach while empty, before hot or cold population. Public prebuilt indexes
+    /// and deserialized graphs may perform one startup-only adoption traversal;
+    /// ordinary DML never attaches or reparents an index.
+    /// Implementations retain their origin until the final allocation owner drops.
+    fn attach_memory_account(&mut self, _account: &MemoryAccount) -> Result<()> {
+        Err(crate::core::Error::internal(
+            "index does not support memory accounting",
+        ))
+    }
+
+    fn memory_account(&self) -> Option<&MemoryAccount> {
+        None
+    }
+
     /// Returns the name of the index
     fn name(&self) -> &str;
 

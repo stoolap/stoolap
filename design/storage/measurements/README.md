@@ -49,3 +49,154 @@ reported separately from warm-query latency.
 
 Phase 1 does not enforce an engine memory budget. Later phases must repeat
 these checks and add their own retention, pressure and durability schedules.
+
+## Phase 2
+
+[Phase 2 results](phase-02.json) compare the final Phase 1 production source
+with chunked hot storage and allocation-lifetime accounting. The source digest
+also includes the pinned vendor tree. The same fixture, allocator, parameters
+and five alternating pairs are used. Every latency gate passes under the
+predeclared 5%-and-twice-range rule. This includes a residual latency cost;
+it does not establish that every hot operation became faster.
+
+| Metric | Narrow | Wide | 10,000-operation case |
+|---|---:|---:|---:|
+| Warm aggregate p50 | +0.29% | -0.71% | +0.22% |
+| INSERT p50 | +7.86% | +7.07% | +6.05% |
+| INSERT p99 | +8.78% | +14.29% | +9.22% |
+| INSERT allocation calls | -2.70% | -2.69% | -2.70% |
+| UPDATE p50 | +0.16% | +1.37% | -0.72% |
+| Hot PK p50 | +6.42% | +10.63% | +6.64% |
+| Extra heap peak during checkpoint | -15.56% | 0.00% | -5.51% |
+
+The long INSERT median is 2,083 ns baseline versus 2,209 ns candidate: a
+126 ns difference, below twice the larger 83 ns run range. Its total time
+is +6.66%; full ranges and every writer sample are retained in the report.
+The earlier counter-only attempt produced a stable +12.19% long INSERT p50
+and failed readiness. Inline transaction buffers now acquire an allocation
+account only when they spill. Their previous zero-byte owners performed
+unnecessary account-reference increments/decrements. A simpler counter layout
+also removes a redundant retained-byte atomic while keeping the single total
+authoritative. Both earlier comparisons, including the failed one, are preserved.
+
+Concurrent wide ingest/aggregation completes 12.56% sooner. Writer p50/p99
+change by -25.41%/-20.73%, and reader p50/p99 by +1.47%/-33.79%. These are
+instrumented local comparisons, not maximum throughput or competitor claims.
+
+Memory tradeoffs are explicit: extra heap peak during short INSERT phases is
+14.51% higher on narrow rows and 15.94% higher on wide rows; the long case is
+0.53% lower. More storage is released at checkpoint. Total requested heap still
+live immediately afterward falls from 39,863,320 to 38,639,896 bytes on narrow
+rows (-3.07%), from 95,375,833 to 95,066,073 on wide rows (-0.32%), and from
+43,721,723 to 42,426,299 in the long case (-2.96%). The percentage change of a
+negative retained delta describes additional released bytes, not the percentage
+reduction of the engine's total memory. The hot account excludes cold/query/
+maintenance memory and does not enforce a hard limit in this phase.
+
+Separate [arena](arena_growth_probe.rs.txt) and
+[receipt](receipt_growth_probe.rs.txt) probes force reallocations to move while
+both old and new buffers remain live. They preserve the original independent
+proof's operations and assertions, using the actual public engine types instead
+of absolute source includes. Copy them to examples as arena_growth_probe.rs
+and receipt_growth_probe.rs, then run with the same release profile. The arena
+peak is 459,592 actual versus 459,608 accounted bytes; 1,024 receipt pins peak
+at 93,604 versus 93,620. The 16-byte excess is the conservative account-object
+allowance. The test-owned payload and receipt-handle vector are allocated before
+the measured interval so these probes isolate structural arena/receipt capacity.
+They do not time allocations or claim to measure RSS.
+
+
+## Phase 3
+
+The first table below records the dictionary optimization before the CI-driven
+admission correction. The final-source rerun is recorded afterward; both full
+comparisons and the preceding failed optimization are preserved in the JSON.
+
+[Phase 3 results](phase-03.json) compare the final Phase 2 source against fixed
+read epochs, coherent hot/cold execution and verified file leases. The fixture
+and release settings are unchanged; all three five-pair comparisons pass the
+same latency/noise gate. Raw records for every measured phase, including
+allocator counters and both concurrent workers, are preserved with source and
+binary hashes. Allocation-call percentages below refer specifically to `alloc`;
+`alloc_zeroed` and `realloc` have separate counters in the raw data.
+
+| Metric | Narrow | Wide | 10,000-operation case |
+|---|---:|---:|---:|
+| Warm aggregate p50 | -28.49% | -27.39% | -29.74% |
+| Warm aggregate alloc calls | -41.94% | -41.94% | -41.94% |
+| Warm aggregate requested bytes | -65.92% | -51.66% | -65.92% |
+| Hot PK p50 | -17.64% | -10.80% | -12.93% |
+| UPDATE p50 | -96.90% | -74.32% | -97.11% |
+| UPDATE alloc calls | -13.30% | -10.31% | -13.33% |
+| INSERT p50 | +11.11% | +5.49% | +3.80% |
+| INSERT p99 | +2.82% | +13.72% | +19.57% |
+| Sealed PK p50 | -95.22% | -82.60% | -95.77% |
+
+The UPDATE and sealed-PK improvements reflect avoiding broad row selection for
+single-PK statements in this fixture. They are not a general throughput claim.
+INSERT alloc calls are unchanged. Its short narrow median increases from
+2,250 to 2,500 ns; the 250 ns difference stays below its 418 ns twice-range
+threshold. Concurrent wide writer p50/p99 increase 10.26%/15.26%, within that
+run's noise gate, while reader p50/p99 change -1.66%/-0.57%. The report retains
+these costs; it does not claim every operation is faster.
+
+An earlier long warm-aggregate comparison failed: +5.51% p50 and +6.32% total
+time exceeded the stated noise thresholds. Profiling the actual release crate
+identified dictionary selection as the dominant CPU cost. The captured group
+now binds its infallible leading equality filters once and uses a bounded
+64-row sample to choose the leading filter. The sample changes only execution
+order; it never proves absence or changes scalar-predicate error ordering.
+A misleading-zero-hit-sample regression verifies later-window matches, NULLs
+and visibility against scalar evaluation. The failed comparison is retained.
+
+UPDATE retained deltas increase 12.94–22.08%, while extra requested heap peaks
+fall 7.07–61.54%. Post-checkpoint total requested live heap is 37,981,017 bytes
+narrow, 95,052,058 wide and 42,226,172 long, versus 38,639,896, 95,066,073 and
+42,426,299 in the matched baseline. A positive change of the negative checkpoint
+retained delta means less memory released during that phase, not a larger final
+engine total. Reopen/first-touch observations remain OS-cache uncontrolled.
+These measurements neither establish RSS nor activate the later hard budgets.
+
+### Final source after pressure-admission correction
+
+A no-progress checkpoint could consume a waiting writer's seal request while a
+reader retained the needed history. Reader release did not rearm it, so the
+writer waited until the existing ten-second soft fallback. Admission now
+retries at most every 100 ms while over the limit. The deterministic real-engine
+regression failed before the fix and passes afterward; all 70 unchanged
+hot-limit test executions pass at two parallelism settings. Fixed read/build
+cutoffs and the existing admission deadline are preserved.
+
+The complete release source was rebuilt and measured in another five alternating
+pairs per case, with the identical Phase 2 baseline and fixture. Canonical source
+SHA-256 is `695550b33d056ae55bc38f229277cbb291808ac9dda0223b494aa9e783175e29`;
+binary SHA-256 is `2f21c2cb9c5c85c40e56d822d5821869902bcb69e8074138f9c3f3abeebd6662`.
+Every predeclared latency/noise gate passes. The fixture disables the byte limit,
+so it measures the final executable's unaffected hot/query paths, not the
+pressure retry's timing. The correctness regression separately exercises retry.
+
+| Metric | Narrow | Wide | 10,000-operation case |
+|---|---:|---:|---:|
+| Warm aggregate p50 | -29.07% | -24.65% | -29.74% |
+| Warm aggregate alloc calls | -41.94% | -41.94% | -41.94% |
+| Hot PK p50 | -20.61% | -17.29% | -10.00% |
+| UPDATE p50 | -97.01% | -75.68% | -97.20% |
+| INSERT p50 | +7.24% | -3.92% | +1.90% |
+| INSERT p99 | +7.43% | -11.66% | +0.02% |
+| Sealed PK p50 | -95.18% | -82.37% | -95.80% |
+| Reopen p50 | +6.34% | +2.49% | +18.05% |
+| First aggregate after reopen p50 | +19.96% | -13.77% | +35.39% |
+
+Narrow INSERT increases 166 ns (2,292 to 2,458), below its 416 ns twice-range
+threshold. Concurrent wide writer p50/p99 increase 9.02%/6.09%; reader p50/p99
+fall 3.29%/1.76%, all within the gate. INSERT allocation calls remain unchanged.
+The long reopen increase is 1,256,083 ns, below the 1,842,166 ns noise allowance;
+first-touch aggregation increases 94,542 ns, below its 124,500 ns allowance.
+These cold-start costs are retained explicitly and OS-cache state is uncontrolled.
+Five repetitions do not establish a noise distribution or guarantee cold latency.
+
+Warm aggregate requested bytes remain 65.92% lower on narrow/long and 51.66%
+lower on wide rows. UPDATE retained deltas still rise 12.94–22.08%, with lower
+peak extra bytes. Short narrow INSERT peak extra bytes rise 7.37%; concurrent
+wide peak extra bytes rise 0.27%. The raw records retain all memory and allocator
+counters. No RSS, global hard-budget or competitor performance claim is made.
