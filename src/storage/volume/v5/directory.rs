@@ -525,6 +525,63 @@ pub struct DirectoryRoot {
     pub depth: u8,
     pub page: PageDescriptor,
 }
+/// Logical shape known before payload/directory emission. A builder can validate
+/// its groups without inventing a directory pointer or a completed root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VolumeShape {
+    pub layout: Layout,
+    pub row_count: u64,
+    pub column_count: u32,
+    pub group_count: u64,
+    pub rows: Option<RowBounds>,
+    pub window: Option<WindowBounds>,
+}
+impl VolumeShape {
+    pub fn validate(&self) -> Result<()> {
+        match self.rows {
+            None if self.row_count == 0 && self.group_count == 0 => (),
+            Some(bounds)
+                if self.row_count != 0
+                    && self.group_count != 0
+                    && self.group_count <= self.row_count =>
+            {
+                if bounds.min > bounds.max
+                    || u128::from(self.row_count)
+                        > (i128::from(bounds.max) - i128::from(bounds.min) + 1) as u128
+                {
+                    return Err(DirectoryError::RowBounds);
+                }
+            }
+            _ => return Err(DirectoryError::RootState),
+        }
+        if self.window.is_some_and(|w| w.lower > w.upper) {
+            return Err(DirectoryError::WindowBounds);
+        }
+        Ok(())
+    }
+    /// Structural completion only; PageWriter also checks that this directory
+    /// was actually written, and the lifecycle layer establishes durability.
+    pub fn into_root(
+        self,
+        entry_count: u64,
+        directory: Option<DirectoryRoot>,
+        legacy_base: Option<LegacyBase>,
+    ) -> Result<RootSummary> {
+        let root = RootSummary {
+            layout: self.layout,
+            row_count: self.row_count,
+            column_count: self.column_count,
+            group_count: self.group_count,
+            rows: self.rows,
+            window: self.window,
+            entry_count,
+            directory,
+            legacy_base,
+        };
+        root.validate()?;
+        Ok(root)
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RootSummary {
     pub layout: Layout,
@@ -539,6 +596,16 @@ pub struct RootSummary {
     pub legacy_base: Option<LegacyBase>,
 }
 impl RootSummary {
+    pub const fn shape(&self) -> VolumeShape {
+        VolumeShape {
+            layout: self.layout,
+            row_count: self.row_count,
+            column_count: self.column_count,
+            group_count: self.group_count,
+            rows: self.rows,
+            window: self.window,
+        }
+    }
     pub fn encode(&self) -> Result<[u8; ROOT_SUMMARY_BYTES]> {
         self.validate()?;
         let mut bytes = [0; ROOT_SUMMARY_BYTES];
@@ -681,25 +748,7 @@ impl RootSummary {
         Ok(())
     }
     pub(crate) fn validate(&self) -> Result<()> {
-        match self.rows {
-            None if self.row_count == 0 && self.group_count == 0 => (),
-            Some(bounds)
-                if self.row_count != 0
-                    && self.group_count != 0
-                    && self.group_count <= self.row_count =>
-            {
-                if bounds.min > bounds.max
-                    || u128::from(self.row_count)
-                        > (i128::from(bounds.max) - i128::from(bounds.min) + 1) as u128
-                {
-                    return Err(DirectoryError::RowBounds);
-                }
-            }
-            _ => return Err(DirectoryError::RootState),
-        }
-        if self.window.is_some_and(|w| w.lower > w.upper) {
-            return Err(DirectoryError::WindowBounds);
-        }
+        self.shape().validate()?;
         match self.directory {
             None if self.entry_count == 0 && self.row_count == 0 => (),
             Some(root) if self.entry_count != 0 && (1..=MAX_DEPTH).contains(&root.depth) => {

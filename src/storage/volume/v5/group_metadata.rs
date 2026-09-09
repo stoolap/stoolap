@@ -35,7 +35,7 @@
 use std::fmt;
 
 use super::column_block::{ColumnExpectation, ColumnIdentity, MAX_BLOCK_ROWS};
-use super::directory::{DirectoryError, Layout, RootSummary, RowBounds};
+use super::directory::{DirectoryError, Layout, RootSummary, RowBounds, VolumeShape};
 use super::envelope::{Footer, PageDescriptor, ReadLimits};
 use super::page_io::{PageIoError, PageReadPlan};
 use crate::core::DataType;
@@ -97,6 +97,10 @@ pub struct GroupExpectation {
 impl GroupExpectation {
     pub fn new(root: &RootSummary, group: u64, record: GroupRecord) -> Result<Self> {
         root.validate()?;
+        Self::for_shape(&root.shape(), group, record)
+    }
+    pub fn for_shape(root: &VolumeShape, group: u64, record: GroupRecord) -> Result<Self> {
+        root.validate()?;
         validate_record(root, group, record)?;
         Ok(Self {
             group,
@@ -137,12 +141,16 @@ impl GroupExpectation {
 
 #[derive(Clone, Copy, Debug)]
 pub struct GroupPageExpectation {
-    root: RootSummary,
+    root: VolumeShape,
     first_group: u64,
     count: u16,
 }
 impl GroupPageExpectation {
     pub fn new(root: &RootSummary, first_group: u64, count: u16) -> Result<Self> {
+        root.validate()?;
+        Self::for_shape(&root.shape(), first_group, count)
+    }
+    pub fn for_shape(root: &VolumeShape, first_group: u64, count: u16) -> Result<Self> {
         root.validate()?;
         if !(1..=MAX_GROUP_RECORDS).contains(&count) {
             return Err(GroupError::Count);
@@ -295,7 +303,7 @@ impl GroupMetadataRef<'_> {
 /// Scalar, sticky-error validation of explicit complete group coverage. Call
 /// finish after all pages; a yielded prefix never proves complete coverage.
 pub struct GroupRangeValidator {
-    root: RootSummary,
+    root: VolumeShape,
     next_group: u64,
     next_row: u64,
     rows: Option<RowBounds>,
@@ -305,6 +313,10 @@ pub struct GroupRangeValidator {
 }
 impl GroupRangeValidator {
     pub fn new(root: &RootSummary) -> Result<Self> {
+        root.validate()?;
+        Self::for_shape(&root.shape())
+    }
+    pub fn for_shape(root: &VolumeShape) -> Result<Self> {
         root.validate()?;
         Ok(Self {
             root: *root,
@@ -372,7 +384,7 @@ impl GroupRangeValidator {
     }
 }
 
-fn validate_record(root: &RootSummary, group: u64, record: GroupRecord) -> Result<()> {
+fn validate_record(root: &VolumeShape, group: u64, record: GroupRecord) -> Result<()> {
     if group >= root.group_count {
         return Err(GroupError::Identity);
     }
@@ -463,6 +475,51 @@ pub(crate) mod tests {
             row_count: count,
             column_count: 2,
             rows: RowBounds { min, max },
+        }
+    }
+    #[test]
+    fn staged_groups_validate_before_a_directory_exists() {
+        let completed = root(Layout::RowId, 3, 2, RowBounds { min: -1, max: 1 });
+        let shape = completed.shape();
+        let page = GroupPageExpectation::for_shape(&shape, 0, 2).unwrap();
+        let mut bytes = [0; 96];
+        page.encode(&[record(0, 2, -1, 0), record(2, 1, 1, 1)], &mut bytes)
+            .unwrap();
+        let mut coverage = GroupRangeValidator::for_shape(&shape).unwrap();
+        for group in page.decode(&bytes).unwrap().iter() {
+            coverage.push(group).unwrap();
+        }
+        coverage.finish().unwrap();
+        assert_eq!(
+            shape.into_root(0, None, None),
+            Err(DirectoryError::RootState)
+        );
+        assert_eq!(
+            shape.into_root(1, completed.directory, None).unwrap(),
+            completed
+        );
+
+        for invalid in [
+            VolumeShape {
+                group_count: 4,
+                ..shape
+            },
+            VolumeShape {
+                row_count: 4,
+                ..shape
+            },
+            VolumeShape {
+                rows: None,
+                ..shape
+            },
+            VolumeShape {
+                window: Some(super::super::directory::WindowBounds { lower: 2, upper: 1 }),
+                ..shape
+            },
+        ] {
+            assert!(GroupPageExpectation::for_shape(&invalid, 0, 1).is_err());
+            assert!(GroupExpectation::for_shape(&invalid, 0, record(0, 2, -1, 0)).is_err());
+            assert!(GroupRangeValidator::for_shape(&invalid).is_err());
         }
     }
     #[test]

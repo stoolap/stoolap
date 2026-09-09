@@ -46,7 +46,9 @@ use std::fmt;
 use std::num::NonZeroU64;
 
 use super::directory::{DirectoryError, Layout, RootSummary, RowBounds};
-use super::envelope::{FileIdentity, Footer, Header, LegacyBase, PageDescriptor, ReadLimits};
+use super::envelope::{
+    FileIdentity, Footer, Header, LegacyBase, PageDescriptor, ReadLimits, REQUIRED_LEGACY_BASE,
+};
 use super::group_metadata::{layout_tag, GroupExpectation};
 use super::page_io::{PageIoError, PageReadPlan};
 
@@ -106,6 +108,68 @@ impl VerifiedLegacyBase {
     }
 }
 
+/// Encoding-only assertion: the lifecycle coordinator assigned this file to
+/// the complete canonical checkpoint captured through G under generation E.
+/// The checkpoint may still be staged. This is not installed/durable evidence
+/// and cannot authorize a source-page decoder.
+#[derive(Clone, Copy, Debug)]
+pub struct PlannedCheckpoint {
+    identity: FileIdentity,
+    base: LegacyBase,
+}
+impl PlannedCheckpoint {
+    /// The caller must have captured the complete quiescent checkpoint and its
+    /// exact E/G identity. Encoding alone does not complete or publish it.
+    pub const fn assert_captured_checkpoint(identity: FileIdentity, base: LegacyBase) -> Self {
+        Self { identity, base }
+    }
+}
+
+/// Source policy for emission, separate from installed-file read authorization.
+/// No directory/root pointer is required before the payloads are written.
+#[derive(Clone, Copy, Debug)]
+pub struct SourceEncodingContext {
+    base: Option<LegacyBase>,
+}
+impl SourceEncodingContext {
+    pub fn for_staged_file(
+        header: &Header,
+        checkpoint: Option<&PlannedCheckpoint>,
+    ) -> Result<Self> {
+        header.validate_features().map_err(DirectoryError::from)?;
+        match (
+            header.required_features & REQUIRED_LEGACY_BASE != 0,
+            checkpoint,
+        ) {
+            (false, None) => Ok(Self { base: None }),
+            (false, Some(_)) => Err(IdentityError::UnexpectedEvidence),
+            (true, None) => Err(IdentityError::MissingEvidence),
+            (true, Some(checkpoint)) if checkpoint.identity == header.identity => Ok(Self {
+                base: Some(checkpoint.base),
+            }),
+            _ => Err(IdentityError::EvidenceMismatch),
+        }
+    }
+    pub const fn legacy_base(self) -> Option<LegacyBase> {
+        self.base
+    }
+    #[inline]
+    fn validate_source(self, source: RowSource) -> Result<u64> {
+        match source {
+            RowSource::LegacyBase => self.base.map(|_| 0).ok_or(IdentityError::MissingLegacyBase),
+            RowSource::Dml(lsn) if self.base.is_some_and(|base| lsn.get() <= base.barrier_lsn) => {
+                Err(IdentityError::LsnBeforeBarrier)
+            }
+            RowSource::Dml(lsn) => Ok(lsn.get()),
+        }
+    }
+}
+impl From<SourceContext> for SourceEncodingContext {
+    fn from(context: SourceContext) -> Self {
+        Self { base: context.base }
+    }
+}
+
 /// Bound source interpretation for one already identity-checked volume. The
 /// supplied header/root and each following page must be from that same file.
 #[derive(Clone, Copy, Debug)]
@@ -135,13 +199,7 @@ impl SourceContext {
         self.base
     }
     fn validate_source(self, source: RowSource) -> Result<u64> {
-        match source {
-            RowSource::LegacyBase => self.base.map(|_| 0).ok_or(IdentityError::MissingLegacyBase),
-            RowSource::Dml(lsn) if self.base.is_some_and(|base| lsn.get() <= base.barrier_lsn) => {
-                Err(IdentityError::LsnBeforeBarrier)
-            }
-            RowSource::Dml(lsn) => Ok(lsn.get()),
-        }
+        SourceEncodingContext::from(self).validate_source(source)
     }
 }
 
@@ -151,7 +209,7 @@ impl SourceContext {
 pub enum RowSource {
     Dml(NonZeroU64),
     /// Explicit bootstrap/retained-provenance assertion relative to the bound
-    /// SourceContext. Never derive this marker from a missing new-row LSN.
+    /// read or encoding context. Never derive this marker from a missing new-row LSN.
     LegacyBase,
 }
 
@@ -219,10 +277,11 @@ impl IdentityPageExpectation {
     pub fn encode_sources(
         self,
         sources: &[RowSource],
-        context: SourceContext,
+        context: impl Into<SourceEncodingContext>,
         output: &mut [u8],
     ) -> Result<usize> {
         self.preflight(sources.len(), output.len())?;
+        let context = context.into();
         for source in sources {
             context.validate_source(*source)?;
         }
@@ -250,10 +309,11 @@ impl IdentityPageExpectation {
     pub fn encode_sources_from_page(
         self,
         source: SourceLsnPageRef<'_>,
-        context: SourceContext,
+        context: impl Into<SourceEncodingContext>,
         output: &mut [u8],
     ) -> Result<usize> {
         self.preflight(source.bytes.len() / IDENTITY_LANE_BYTES, output.len())?;
+        let context = context.into();
         if source.context.base.is_some() && source.context.base != context.base {
             return Err(IdentityError::BaseContextMismatch);
         }
@@ -439,6 +499,77 @@ mod tests {
         let evidence = VerifiedLegacyBase::assert_verified_checkpoint(header.identity, base);
         let context = SourceContext::bind(&header, &root, Some(&evidence)).unwrap();
         (header, root, evidence, context)
+    }
+    #[test]
+    fn staged_checkpoint_encoding_does_not_supply_installed_read_evidence() {
+        let (root, expected) = expected(Layout::RowId);
+        let mut header = Header::new(FileIdentity::new(11, 1, 22).unwrap());
+        let plain = SourceEncodingContext::for_staged_file(&header, None).unwrap();
+        let base = LegacyBase {
+            generation: nz(7),
+            barrier_lsn: 7,
+        };
+        let checkpoint = PlannedCheckpoint::assert_captured_checkpoint(header.identity, base);
+        assert!(matches!(
+            SourceEncodingContext::for_staged_file(&header, Some(&checkpoint)),
+            Err(IdentityError::UnexpectedEvidence)
+        ));
+        header.required_features |= REQUIRED_LEGACY_BASE;
+        assert!(matches!(
+            SourceEncodingContext::for_staged_file(&header, None),
+            Err(IdentityError::MissingEvidence)
+        ));
+        let staged = SourceEncodingContext::for_staged_file(&header, Some(&checkpoint)).unwrap();
+        assert_eq!(staged.legacy_base(), Some(base));
+        let sources = [
+            RowSource::LegacyBase,
+            RowSource::Dml(nz(8)),
+            RowSource::Dml(nz(u64::MAX)),
+        ];
+        let mut output = [0x5a; 56];
+        expected
+            .encode_sources(&sources, staged, &mut output)
+            .unwrap();
+        let with_base = RootSummary {
+            legacy_base: Some(base),
+            ..root
+        };
+        assert!(matches!(
+            SourceContext::bind(&header, &with_base, None),
+            Err(IdentityError::MissingEvidence)
+        ));
+        let evidence = VerifiedLegacyBase::assert_verified_checkpoint(header.identity, base);
+        let installed = SourceContext::bind(&header, &with_base, Some(&evidence)).unwrap();
+        assert!(expected
+            .decode_sources(&output, installed)
+            .unwrap()
+            .iter()
+            .eq(sources));
+        for context in [plain, staged] {
+            output.fill(0x5a);
+            let invalid = if context.legacy_base().is_some() {
+                RowSource::Dml(nz(7))
+            } else {
+                RowSource::LegacyBase
+            };
+            assert!(expected
+                .encode_sources(&[invalid; 3], context, &mut output)
+                .is_err());
+            assert_eq!(output, [0x5a; 56]);
+        }
+        for identity in [
+            FileIdentity::new(12, 1, 22).unwrap(),
+            FileIdentity::new(11, 2, 22).unwrap(),
+            FileIdentity::new(11, 1, 23).unwrap(),
+        ] {
+            let wrong = PlannedCheckpoint::assert_captured_checkpoint(identity, base);
+            assert!(matches!(
+                SourceEncodingContext::for_staged_file(&header, Some(&wrong)),
+                Err(IdentityError::EvidenceMismatch)
+            ));
+        }
+        header.required_features |= 1 << 63;
+        assert!(SourceEncodingContext::for_staged_file(&header, Some(&checkpoint)).is_err());
     }
     #[test]
     fn identity_independent_wire_goldens_and_signed_zero_extrema() {
