@@ -32,7 +32,7 @@
 //! - Clone: O(1) - just increments reference counts
 //! - Memory: Shared nodes between snapshots
 
-use super::CompactArc;
+use super::{CompactArc, MemoryAccount};
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Bound;
@@ -162,12 +162,15 @@ impl<V: Clone> NodePtr<V> {
         Self::keys_offset() + ((MAX_KEYS + 1) * 8)
     }
 
-    fn new_leaf() -> Self {
+    fn new_leaf_in(account: Option<&MemoryAccount>) -> Self {
         let size = Self::values_offset() + ((MAX_KEYS + 1) * mem::size_of::<V>());
-        let vec = vec![0u8; size];
-
         let mut ptr = NodePtr {
-            ptr: CompactArc::from_vec(vec),
+            ptr: match account {
+                Some(account) => {
+                    CompactArc::from_exact_iter_in(std::iter::repeat_n(0u8, size), account)
+                }
+                None => CompactArc::from_vec(vec![0u8; size]),
+            },
             _marker: PhantomData,
         };
 
@@ -179,12 +182,15 @@ impl<V: Clone> NodePtr<V> {
         ptr
     }
 
-    fn new_internal() -> Self {
+    fn new_internal_in(account: Option<&MemoryAccount>) -> Self {
         let size = Self::children_offset() + ((MAX_KEYS + 2) * mem::size_of::<NodePtr<V>>());
-        let vec = vec![0u8; size];
-
         let mut ptr = NodePtr {
-            ptr: CompactArc::from_vec(vec),
+            ptr: match account {
+                Some(account) => {
+                    CompactArc::from_exact_iter_in(std::iter::repeat_n(0u8, size), account)
+                }
+                None => CompactArc::from_vec(vec![0u8; size]),
+            },
             _marker: PhantomData,
         };
 
@@ -216,7 +222,7 @@ impl<V: Clone> NodePtr<V> {
         let len = self.len();
 
         if self.is_leaf() {
-            let mut new_node = NodePtr::new_leaf();
+            let mut new_node = NodePtr::new_leaf_in(self.ptr.memory_account().as_ref());
             // Do NOT set len yet to ensure exception safety!
             // If V::clone() panics, new_node.drop() will only drop 0 elements.
 
@@ -246,7 +252,7 @@ impl<V: Clone> NodePtr<V> {
 
             new_node
         } else {
-            let mut new_node = NodePtr::new_internal();
+            let mut new_node = NodePtr::new_internal_in(self.ptr.memory_account().as_ref());
             new_node.set_len(len);
 
             // Copy keys (i64 is Copy)
@@ -458,7 +464,7 @@ impl<V: Clone> NodePtr<V> {
         let len = self.len();
         let mid = len / 2;
         let med_key = self.keys()[mid];
-        let mut right = NodePtr::new_internal();
+        let mut right = NodePtr::new_internal_in(self.ptr.memory_account().as_ref());
         let right_keys_count = len - mid - 1;
         let right_children_count = right_keys_count + 1;
 
@@ -495,7 +501,7 @@ impl<V: Clone> NodePtr<V> {
         // Median is the last key - it goes to parent
         let med_key = self.keys()[len - 1];
 
-        let mut right = NodePtr::new_internal();
+        let mut right = NodePtr::new_internal_in(self.ptr.memory_account().as_ref());
 
         // SAFETY: self is an internal node with MAX_KEYS + 1 keys (MAX_KEYS + 2 children).
         // We move only the last child to right. Children are moved via ptr::read then ptr::write.
@@ -805,7 +811,7 @@ impl<V: Clone> NodePtr<V> {
         let mid = self.len() / 2;
         let right_count = self.len() - mid;
 
-        let mut right = NodePtr::new_leaf();
+        let mut right = NodePtr::new_leaf_in(self.ptr.memory_account().as_ref());
 
         // SAFETY: Both self and right are leaf nodes. We copy keys from indices [mid..len)
         // and values from indices [mid..len) of self into the start of right. The source
@@ -840,7 +846,7 @@ impl<V: Clone> NodePtr<V> {
             "split_leaf_rightmost expects overflow node"
         );
 
-        let mut right = NodePtr::new_leaf();
+        let mut right = NodePtr::new_leaf_in(self.ptr.memory_account().as_ref());
 
         // SAFETY: self is a leaf with MAX_KEYS + 1 elements. We move only the last
         // key/value to right. The key is Copy (i64). The value is moved via ptr::read
@@ -930,6 +936,9 @@ impl NodePath {
 
 pub struct CowBTree<V: Clone> {
     root: Option<NodePtr<V>>,
+    /// Constructor policy for fresh roots, retained even after clear. Shared
+    /// nodes carry their own allocation charge in CompactArc's header.
+    account: Option<MemoryAccount>,
     /// Cached maximum key in the tree. Valid if root.is_some().
     max_key: i64,
     /// Number of elements in the tree
@@ -948,6 +957,7 @@ impl<V: Clone> Clone for CowBTree<V> {
     fn clone(&self) -> Self {
         Self {
             root: self.root.clone(),
+            account: self.account.clone(),
             max_key: self.max_key,
             len: self.len,
         }
@@ -963,9 +973,22 @@ impl<V: Clone> CowBTree<V> {
         );
         Self {
             root: None,
+            account: None,
             max_key: 0,
             len: 0,
         }
+    }
+
+    /// Account every newly allocated fixed node. Cloning the tree shares the
+    /// existing node charges; only a split or COW copy creates another charge.
+    pub fn new_in(account: MemoryAccount) -> Self {
+        let mut tree = Self::new();
+        tree.account = Some(account);
+        tree
+    }
+
+    pub fn memory_account(&self) -> Option<&MemoryAccount> {
+        self.account.as_ref()
     }
 
     #[inline]
@@ -1034,7 +1057,7 @@ impl<V: Clone> CowBTree<V> {
     /// Insert a key-value pair. Returns old value if key existed.
     pub fn insert(&mut self, key: i64, value: V) -> Option<V> {
         if self.root.is_none() {
-            let mut node = NodePtr::new_leaf();
+            let mut node = NodePtr::new_leaf_in(self.account.as_ref());
             node.push_leaf(key, value);
             self.root = Some(node);
             self.max_key = key;
@@ -1057,7 +1080,7 @@ impl<V: Clone> CowBTree<V> {
                 }
                 InsertResult::Split(median, right) => {
                     let old_root = self.root.take().unwrap();
-                    let mut new_root = NodePtr::new_internal();
+                    let mut new_root = NodePtr::new_internal_in(self.account.as_ref());
 
                     // SAFETY: new_root is a freshly created internal node with len=0.
                     // We write old_root to children[0]. Internal nodes have len+1 children,
@@ -1096,7 +1119,7 @@ impl<V: Clone> CowBTree<V> {
             }
             InsertResult::Split(median, right) => {
                 let old_root = self.root.take().unwrap();
-                let mut new_root = NodePtr::new_internal();
+                let mut new_root = NodePtr::new_internal_in(self.account.as_ref());
                 // SAFETY: new_root is a freshly created internal node with len=0.
                 // We write old_root to children[0]. Internal nodes have len+1 children,
                 // so with len=0 we have space for 1 child at index 0. old_root is moved
@@ -1546,7 +1569,7 @@ impl<V: Clone> CowBTree<V> {
             }
             InsertResult::Split(median, right) => {
                 let old_root = self.root.take().unwrap();
-                let mut new_root = NodePtr::new_internal();
+                let mut new_root = NodePtr::new_internal_in(self.account.as_ref());
                 // SAFETY: new_root is a freshly created internal node with len=0.
                 // We write old_root to children[0]. Internal nodes have len+1 children,
                 // so with len=0 we have space for 1 child at index 0. old_root is moved
@@ -1630,7 +1653,7 @@ impl<V: Clone> CowBTree<V> {
             }
             InsertResult::Split(median, right) => {
                 let old_root = self.root.take().unwrap();
-                let mut new_root = NodePtr::new_internal();
+                let mut new_root = NodePtr::new_internal_in(self.account.as_ref());
                 // SAFETY: new_root is a freshly created internal node with len=0.
                 // We write old_root to children[0]. Internal nodes have len+1 children,
                 // so with len=0 we have space for 1 child at index 0. old_root is moved
@@ -2410,7 +2433,8 @@ mod tests {
 
     #[test]
     fn test_memory_size() {
-        assert!(std::mem::size_of::<CowBTree<i64>>() <= 24);
+        // One thin root, length, rightmost-key cache, and origin account.
+        assert!(std::mem::size_of::<CowBTree<i64>>() <= 24 + std::mem::size_of::<usize>());
     }
 
     #[test]
@@ -4053,5 +4077,88 @@ mod tests {
             result,
             vec![10_009, 10_008, 10_007, 10_006, 10_005, 10_004, 10_003, 10_002, 10_001, 10_000]
         );
+    }
+}
+
+#[cfg(test)]
+mod allocation_accounting_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn distinct_node_bytes(
+        node: &NodePtr<i64>,
+        seen: &mut HashSet<usize>,
+        account: &MemoryAccount,
+    ) -> usize {
+        if !seen.insert(node.ptr.data_ptr_mut() as usize) {
+            return 0;
+        }
+        assert!(node.ptr.memory_account().unwrap().same_origin(account));
+        let mut bytes = node.ptr.allocation_size();
+        if !node.is_leaf() {
+            for child in node.children() {
+                bytes += distinct_node_bytes(child, seen, account);
+            }
+        }
+        bytes
+    }
+
+    fn expected_bytes(trees: &[&CowBTree<i64>], account: &MemoryAccount) -> usize {
+        let mut seen = HashSet::new();
+        trees
+            .iter()
+            .filter_map(|tree| tree.root.as_ref())
+            .map(|root| distinct_node_bytes(root, &mut seen, account))
+            .sum()
+    }
+
+    #[test]
+    fn node_charges_survive_snapshots_cow_splits_merges_and_clear() {
+        let root = MemoryAccount::new();
+        let baseline = root.snapshot().accounted_bytes;
+        let origin = root.child();
+        let mut tree = CowBTree::new_in(origin.clone());
+        assert_eq!(root.snapshot().retained_bytes, 0);
+        // Non-monotonic order exercises ordinary and rightmost leaf/internal
+        // splits while keeping enough nodes to exercise merges on removal.
+        for index in 0..5000 {
+            let key = index * 2;
+            tree.insert(key, key);
+        }
+        for index in (0..5000).rev() {
+            let key = index * 2 + 1;
+            tree.insert(key, key);
+        }
+        let before_clone = root.snapshot().retained_bytes;
+        assert_eq!(before_clone, expected_bytes(&[&tree], &origin));
+        let snapshot = tree.clone();
+        assert_eq!(root.snapshot().retained_bytes, before_clone);
+        tree.insert(123, -1);
+        assert_eq!(snapshot.get(123), Some(&123));
+        assert_eq!(tree.get(123), Some(&-1));
+        assert_eq!(
+            root.snapshot().retained_bytes,
+            expected_bytes(&[&tree, &snapshot], &origin)
+        );
+        for key in 0..9000 {
+            assert!(tree.remove(key).is_some());
+        }
+        assert_eq!(
+            root.snapshot().retained_bytes,
+            expected_bytes(&[&tree, &snapshot], &origin)
+        );
+        tree.clear();
+        assert_eq!(root.snapshot().retained_bytes, before_clone);
+        tree.insert(-1, 42);
+        assert_eq!(
+            root.snapshot().retained_bytes,
+            expected_bytes(&[&tree, &snapshot], &origin)
+        );
+        drop(tree);
+        drop(origin);
+        assert_eq!(root.snapshot().retained_bytes, before_clone);
+        drop(snapshot);
+        assert_eq!(root.snapshot().retained_bytes, 0);
+        assert_eq!(root.snapshot().accounted_bytes, baseline);
     }
 }

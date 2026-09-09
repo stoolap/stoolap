@@ -214,6 +214,8 @@ pub struct TransactionRegistry {
 
     /// Whether new transactions are being accepted.
     accepting: AtomicBool,
+    // The std::Arc control block is opaque; keep its allowance conservative.
+    _object_charge: Option<crate::common::memory::MemoryCharge>,
 }
 
 impl TransactionRegistry {
@@ -234,7 +236,20 @@ impl TransactionRegistry {
             override_count: AtomicUsize::new(0),
             active_txn_count: AtomicUsize::new(0),
             accepting: AtomicBool::new(true),
+            _object_charge: None,
         }
+    }
+
+    pub(crate) fn new_in(account: &crate::common::memory::MemoryAccount) -> Self {
+        let mut registry = Self::with_capacity(0);
+        registry.transactions = Mutex::new(I64Map::with_capacity_in(16, account));
+        registry.snapshot_seqs = Mutex::new(I64Map::new_in(account));
+        registry.isolation_overrides = Mutex::new(I64Map::new_in(account));
+        registry._object_charge = Some(crate::common::memory::MemoryCharge::conservative(
+            account,
+            std::mem::size_of::<Self>() + 4 * std::mem::size_of::<usize>(),
+        ));
+        registry
     }
 
     #[inline(always)]

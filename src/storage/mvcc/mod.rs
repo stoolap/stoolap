@@ -35,6 +35,7 @@
 //! ```
 //!
 
+pub(crate) mod accounting;
 pub mod arena;
 pub mod engine;
 pub mod file_lock;
@@ -58,6 +59,10 @@ pub use crate::storage::index::{
 };
 
 // Re-export main types
+pub use arena::{
+    ArenaCapacity, ArenaChunkRef, ArenaId, ArenaLsnPin, ArenaReadGuard, ArenaRowMeta, ChunkId,
+    RowArena, ARENA_CHUNK_MASK, ARENA_CHUNK_ROWS, ARENA_CHUNK_SHIFT,
+};
 pub use engine::{CleanupHandle, MVCCEngine};
 pub use persistence::{
     deserialize_row_version, deserialize_value, serialize_row_version, serialize_value,
