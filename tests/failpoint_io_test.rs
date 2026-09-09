@@ -728,3 +728,72 @@ fn test_wal_sync_failure_on_a_delete_keeps_the_row_everywhere() {
     assert!(ids("SELECT id FROM fp_del WHERE k = 'a' AND t = 150").is_empty());
     assert!(ids("SELECT id FROM fp_del WHERE t = 150").is_empty());
 }
+
+#[test]
+fn indeterminate_commit_fences_cached_reads_writes_and_checkpoint_until_reopen() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let dsn = format!("file://{}?sync_mode=full", dir.path().display());
+    let db = Database::open(&dsn).unwrap();
+    db.execute(
+        "CREATE TABLE uncertain (id INTEGER PRIMARY KEY, val INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO uncertain VALUES (1, 10)", ())
+        .unwrap();
+    // Populate cached point-lookup and count execution paths before the failure.
+    for sql in [
+        "SELECT val FROM uncertain WHERE id = 1",
+        "SELECT COUNT(*) FROM uncertain",
+    ] {
+        db.query_one::<i64, _>(sql, ()).unwrap();
+        db.query_one::<i64, _>(sql, ()).unwrap();
+    }
+    db.execute("BEGIN", ()).unwrap();
+    db.execute("UPDATE uncertain SET val = 20 WHERE id = 1", ())
+        .unwrap();
+    test_failpoints::WAL_SYNC_FAIL.store(true, Ordering::Release);
+    test_failpoints::WAL_ROLLBACK_FAIL.store(true, Ordering::Release);
+    let error = db.execute("COMMIT", ()).unwrap_err();
+    assert!(error.to_string().contains("indeterminate"), "{error}");
+    test_failpoints::WAL_SYNC_FAIL.store(false, Ordering::Release);
+    test_failpoints::WAL_ROLLBACK_FAIL.store(false, Ordering::Release);
+    for sql in [
+        "SELECT val FROM uncertain WHERE id = 1",
+        "SELECT COUNT(*) FROM uncertain",
+        "SELECT SUM(val) FROM uncertain",
+    ] {
+        assert!(
+            db.query_one::<i64, _>(sql, ()).is_err(),
+            "query escaped execution fence: {sql}"
+        );
+    }
+    for sql in [
+        "INSERT INTO uncertain VALUES (2, 30)",
+        "UPDATE uncertain SET val = 99 WHERE id = 1",
+        "PRAGMA CHECKPOINT",
+        "BEGIN",
+    ] {
+        assert!(
+            db.execute(sql, ()).is_err(),
+            "operation escaped execution fence: {sql}"
+        );
+    }
+    // Closing must not checkpoint an in-memory decision over the unresolved WAL.
+    let _ = db.close();
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT val FROM uncertain WHERE id = 1", ())
+            .unwrap(),
+        20,
+        "the injected rollback failure leaves a complete commit marker for recovery"
+    );
+    db.execute("INSERT INTO uncertain VALUES (2, 30)", ())
+        .unwrap();
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT COUNT(*) FROM uncertain", ())
+            .unwrap(),
+        2
+    );
+}

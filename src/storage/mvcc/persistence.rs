@@ -377,6 +377,13 @@ impl PersistenceManager {
         self.enabled.load(Ordering::Acquire)
     }
 
+    /// A failed WAL suffix rollback requires recovery before further reads.
+    pub fn has_indeterminate_commit(&self) -> bool {
+        self.wal
+            .as_ref()
+            .is_some_and(WALManager::has_indeterminate_commit)
+    }
+
     /// Start persistence operations
     pub fn start(&self) -> Result<()> {
         if !self.is_enabled() {

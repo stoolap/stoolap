@@ -7,7 +7,7 @@ with no engine caller does not count as an implemented phase.
 | Phase | Deliverable | Status | PR |
 |---|---|---|---|
 | 0 | Lifecycle contracts and validation rules | Design accepted | [#115](https://github.com/stoolap/stoolap/pull/115) |
-| 1 | Fallible cold access and statement rollback | Engine implementation present; cleanup verification in progress | [#116](https://github.com/stoolap/stoolap/pull/116) |
+| 1 | Fallible cold access and statement rollback | Cleanup verified; SQL statement rollback proven against parent | [#116](https://github.com/stoolap/stoolap/pull/116) |
 | 2 | Releasable chunks and retained hot accounting | Engine implementation present; dependency cleanup and verification in progress | [#117](https://github.com/stoolap/stoolap/pull/117) |
 | 3 | Coherent hot/cold reads | Draft; cleanup and final abort-publication correction remain | [#118](https://github.com/stoolap/stoolap/pull/118) |
 | 4 | Bounded streaming seal | Incomplete; unintegrated V5 prototype withdrawn | [#119](https://github.com/stoolap/stoolap/pull/119) |

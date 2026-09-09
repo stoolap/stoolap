@@ -304,7 +304,8 @@ mod invariants {
         };
         assert!(column.memory_size() < 2 * 1024 * 1024);
         let columns = LazyColumns::eager(vec![column], vec![DataType::Text]);
-        let store = CompressedBlockStore::compress_columns(&columns, &[DataType::Text], rows);
+        let store =
+            CompressedBlockStore::compress_columns(&columns, &[DataType::Text], rows).unwrap();
         DECODED_GROUPS.set_budget_bytes(2 * 1024 * 1024);
         let first = store.group_column(0, 0).unwrap();
         let _second = store.group_column(0, 1).unwrap();

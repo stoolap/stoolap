@@ -575,6 +575,9 @@ fn compute_visibility_bitmaps(
     }
 }
 
+type PendingTombstoneUndo = FxHashMap<i64, Vec<(i64, Option<i64>)>>;
+type PublishedTombstoneUndo = FxHashMap<i64, (u64, Vec<(i64, Option<u64>)>)>;
+
 /// Per-table segment manager.
 ///
 /// Owns the manifest, loaded segments, and tombstone set for one table.
@@ -641,6 +644,8 @@ pub struct SegmentManager {
     /// Each row_id carries the timestamp it was tombstoned at, so a savepoint
     /// rollback can discard the tombstones made after the savepoint.
     pending_txn_tombstones: RwLock<FxHashMap<i64, FxHashMap<i64, i64>>>,
+    pending_tombstone_undo: RwLock<PendingTombstoneUndo>,
+    published_tombstone_undo: RwLock<PublishedTombstoneUndo>,
     // Unique constraint checks use per-volume hash indices (on FrozenVolume).
     // No global cache needed. Each volume builds its index lazily on first
     // unique check and never invalidates (volumes are immutable).
@@ -684,6 +689,8 @@ impl SegmentManager {
             reloading: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(FxHashMap::default())),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
+            pending_tombstone_undo: RwLock::new(FxHashMap::default()),
+            published_tombstone_undo: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_fence: RwLock::new(()),
             visibility_seen: parking_lot::Mutex::new(rustc_hash::FxHashSet::default()),
@@ -708,6 +715,8 @@ impl SegmentManager {
             reloading: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(tombstone_map)),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
+            pending_tombstone_undo: RwLock::new(FxHashMap::default()),
+            published_tombstone_undo: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_fence: RwLock::new(()),
             visibility_seen: parking_lot::Mutex::new(rustc_hash::FxHashSet::default()),
@@ -974,7 +983,7 @@ impl SegmentManager {
     ) -> crate::core::Result<Option<crate::core::Value>> {
         for seg_id in seg_ids {
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                if let Some(idx) = cold.volume.find_row_id(row_id)? {
                     let pi = if cold.mapping.is_identity {
                         col_idx
                     } else if col_idx < cold.mapping.sources.len() {
@@ -987,12 +996,12 @@ impl SegmentManager {
                     };
                     if cold.volume.is_cold() {
                         if let Some(vol) = self.ensure_volume(*seg_id)? {
-                            return Ok(Some(vol.columns[pi].get_value(idx)));
+                            return Ok(Some(vol.columns.get(pi)?.get_value(idx)));
                         }
                         return Ok(None);
                     }
                     cold.volume.mark_accessed();
-                    return Ok(Some(cold.volume.columns[pi].get_value(idx)));
+                    return Ok(Some(cold.volume.columns.get(pi)?.get_value(idx)));
                 }
             }
         }
@@ -1056,9 +1065,9 @@ impl SegmentManager {
             };
             if let Some(target) = target {
                 if vol.is_sorted(pi) {
-                    let start = vol.columns[pi].binary_search_ge(target);
+                    let start = vol.columns.get(pi)?.binary_search_ge(target);
                     let mut i = start;
-                    while i < vol.meta.row_count && vol.columns[pi].get_i64(i) == target {
+                    while i < vol.meta.row_count && vol.columns.get(pi)?.get_i64(i) == target {
                         let rid = vol.meta.row_ids[i];
                         if seen.insert(rid) && !ts.contains_key(&rid) {
                             if seg_ids.len() > 1 {
@@ -1081,8 +1090,8 @@ impl SegmentManager {
                         if !seen.insert(rid) {
                             continue;
                         }
-                        if !vol.columns[pi].is_null(i)
-                            && vol.columns[pi].get_i64(i) == target
+                        if !vol.columns.get(pi)?.is_null(i)
+                            && vol.columns.get(pi)?.get_i64(i) == target
                             && !ts.contains_key(&rid)
                         {
                             if seg_ids.len() > 1 {
@@ -1268,7 +1277,7 @@ impl SegmentManager {
                     } else {
                         false
                     }
-                });
+                })?;
             } else {
                 // Schema-evolved volume: some columns missing (default matches).
                 // Check only the columns that exist in the volume.
@@ -1283,10 +1292,14 @@ impl SegmentManager {
                     if ts.contains_key(&rid) || !seen.insert(rid) {
                         continue;
                     }
-                    let matches = present_cols.iter().all(|&(val_idx, ci)| {
-                        let v = vol.columns[ci].get_value(i);
-                        !v.is_null() && v == *values[val_idx]
-                    });
+                    let mut matches = true;
+                    for &(val_idx, ci) in &present_cols {
+                        let v = vol.columns.get(ci)?.get_value(i);
+                        if v.is_null() || v != *values[val_idx] {
+                            matches = false;
+                            break;
+                        }
+                    }
                     if matches {
                         vol_result = Some(rid);
                         break;
@@ -1795,11 +1808,95 @@ impl SegmentManager {
     /// Track a cold row_id as pending tombstone for a transaction.
     /// Called during DML (UPDATE/DELETE of cold rows).
     pub fn add_pending_tombstone(&self, txn_id: i64, row_id: i64) {
-        self.pending_txn_tombstones
-            .write()
+        let mut pending = self.pending_txn_tombstones.write();
+        let previous = pending
             .entry(txn_id)
             .or_default()
             .insert(row_id, get_fast_timestamp());
+        self.pending_tombstone_undo
+            .write()
+            .entry(txn_id)
+            .or_default()
+            .push((row_id, previous));
+    }
+
+    pub fn pending_statement_checkpoint(&self, txn_id: i64) -> usize {
+        self.pending_tombstone_undo
+            .read()
+            .get(&txn_id)
+            .map_or(0, Vec::len)
+    }
+
+    pub fn finish_pending_statement(&self, txn_id: i64, checkpoint: usize, success: bool) {
+        let mut pending = self.pending_txn_tombstones.write();
+        if let Some(journal) = self.pending_tombstone_undo.write().remove(&txn_id) {
+            if !success {
+                let rows = pending.entry(txn_id).or_default();
+                for (row_id, previous) in journal.into_iter().skip(checkpoint).rev() {
+                    match previous {
+                        Some(timestamp) => {
+                            rows.insert(row_id, timestamp);
+                        }
+                        None => {
+                            rows.remove(&row_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Capture only this transaction's tombstones before any table publishes.
+    pub fn prepare_tombstone_publication(&self, txn_id: i64, commit_seq: u64) {
+        let pending = self.pending_txn_tombstones.read();
+        let Some(rows) = pending.get(&txn_id) else {
+            return;
+        };
+        let committed = self.tombstones.read();
+        let undo = rows
+            .keys()
+            .map(|&row_id| (row_id, committed.get(&row_id).copied()))
+            .collect();
+        self.published_tombstone_undo
+            .write()
+            .insert(txn_id, (commit_seq, undo));
+    }
+
+    /// Sequence matching preserves unrelated concurrent tombstone updates.
+    pub fn finish_tombstone_publication(&self, txn_id: i64, success: bool) {
+        if !success {
+            self.rollback_pending_tombstones(txn_id);
+        }
+        let Some((sequence, undo)) = self.published_tombstone_undo.write().remove(&txn_id) else {
+            return;
+        };
+        if success {
+            return;
+        }
+        let mut manifest = self.manifest.write();
+        let mut guard = self.tombstones.write();
+        let tombstones = Arc::make_mut(&mut *guard);
+        for (row_id, previous) in undo {
+            if tombstones.get(&row_id) != Some(&sequence) {
+                continue;
+            }
+            match previous {
+                Some(old) => {
+                    tombstones.insert(row_id, old);
+                    if let Some(entry) =
+                        manifest.tombstones.iter_mut().find(|(id, _)| *id == row_id)
+                    {
+                        entry.1 = old;
+                    }
+                }
+                None => {
+                    tombstones.remove(&row_id);
+                    manifest.tombstones.retain(|(id, _)| *id != row_id);
+                }
+            }
+        }
+        self.cached_deduped_count
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Get pending tombstone row_ids for a transaction (for WAL recording).
@@ -1846,6 +1943,7 @@ impl SegmentManager {
     /// isolation: older snapshots won't see these tombstones.
     pub fn commit_pending_tombstones(&self, txn_id: i64, commit_seq: u64) {
         let pending = self.pending_txn_tombstones.write().remove(&txn_id);
+        self.pending_tombstone_undo.write().remove(&txn_id);
         if let Some(ids) = pending {
             if !ids.is_empty() {
                 let id_vec: Vec<i64> = ids.into_keys().collect();
@@ -1857,6 +1955,7 @@ impl SegmentManager {
     /// Rollback pending tombstones: discard without applying.
     pub fn rollback_pending_tombstones(&self, txn_id: i64) {
         self.pending_txn_tombstones.write().remove(&txn_id);
+        self.pending_tombstone_undo.write().remove(&txn_id);
     }
 
     /// Discard the pending tombstones made after a timestamp (savepoint rollback)
@@ -1891,10 +1990,10 @@ impl SegmentManager {
     /// Check if a row_id exists in any segment (not tombstoned).
     ///
     /// Used for constraint checking (PK/UNIQUE).
-    pub fn row_exists(&self, row_id: i64) -> bool {
+    pub fn row_exists(&self, row_id: i64) -> crate::core::Result<bool> {
         let ts = Arc::clone(&*self.tombstones.read());
         if ts.contains_key(&row_id) {
-            return false;
+            return Ok(false);
         }
         // Metadata-only check (binary search on row_ids). Does not access
         // column data, so no mark_accessed — should not pin volumes.
@@ -1913,12 +2012,12 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if cold.volume.meta.row_ids.binary_search(&row_id).is_ok() {
-                    return true;
+                if cold.volume.find_row_id(row_id)?.is_some() {
+                    return Ok(true);
                 }
             }
         }
-        false
+        Ok(false)
     }
 
     /// Get a cold row by row_id. Returns the Row if found and not tombstoned.
@@ -1945,16 +2044,16 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                if let Some(idx) = cold.volume.find_row_id(row_id)? {
                     if cold.volume.is_cold() {
                         if let Some(vol) = self.ensure_volume(*seg_id)? {
-                            return Ok(Some(vol.get_row(idx)));
+                            return Ok(Some(vol.get_row(idx)?));
                         }
                         // Segment removed by compaction — retry with fresh state.
                         return self.get_cold_row_retry(row_id);
                     }
                     cold.volume.mark_accessed();
-                    return Ok(Some(cold.volume.get_row(idx)));
+                    return Ok(Some(cold.volume.get_row(idx)?));
                 }
             }
         }
@@ -1977,7 +2076,7 @@ impl SegmentManager {
         };
         for seg_id in &seg_ids {
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                if let Some(idx) = cold.volume.find_row_id(row_id)? {
                     if cold.volume.is_cold() {
                         return Err(crate::core::Error::Internal {
                             message: format!(
@@ -1988,7 +2087,7 @@ impl SegmentManager {
                         });
                     }
                     cold.volume.mark_accessed();
-                    return Ok(Some(cold.volume.get_row(idx)));
+                    return Ok(Some(cold.volume.get_row(idx)?));
                 }
             }
         }
@@ -2025,7 +2124,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                if let Some(idx) = cold.volume.find_row_id(row_id)? {
                     let vol = if cold.volume.is_cold() {
                         match self.ensure_volume(*seg_id)? {
                             Some(v) => v,
@@ -2040,9 +2139,9 @@ impl SegmentManager {
                     };
                     let mapping = self.get_volume_mapping(*seg_id, schema);
                     if mapping.is_identity {
-                        return Ok(Some(vol.get_row(idx)));
+                        return Ok(Some(vol.get_row(idx)?));
                     }
-                    return Ok(Some(vol.get_row_mapped(idx, &mapping)));
+                    return Ok(Some(vol.get_row_mapped(idx, &mapping)?));
                 }
             }
         }
@@ -2069,7 +2168,7 @@ impl SegmentManager {
         };
         for seg_id in &seg_ids {
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                if let Some(idx) = cold.volume.find_row_id(row_id)? {
                     if cold.volume.is_cold() {
                         return Err(crate::core::Error::Internal {
                             message: format!(
@@ -2082,9 +2181,9 @@ impl SegmentManager {
                     cold.volume.mark_accessed();
                     let mapping = self.get_volume_mapping(*seg_id, schema);
                     if mapping.is_identity {
-                        return Ok(Some(cold.volume.get_row(idx)));
+                        return Ok(Some(cold.volume.get_row(idx)?));
                     }
-                    return Ok(Some(cold.volume.get_row_mapped(idx, &mapping)));
+                    return Ok(Some(cold.volume.get_row_mapped(idx, &mapping)?));
                 }
             }
         }
@@ -2094,7 +2193,7 @@ impl SegmentManager {
     /// Check if a row_id actually exists in any loaded volume.
     /// Does NOT check tombstones. Used for idempotent WAL replay.
     /// Uses binary search on the volume's row_ids for O(log n) per segment.
-    pub fn is_row_id_in_volume(&self, row_id: i64) -> bool {
+    pub fn is_row_id_in_volume(&self, row_id: i64) -> crate::core::Result<bool> {
         let (seg_ids, segments) = {
             let manifest = self.manifest.read();
             let seg_ids: Vec<(u64, i64, i64)> = manifest
@@ -2110,12 +2209,12 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if cold.volume.meta.row_ids.binary_search(&row_id).is_ok() {
-                    return true;
+                if cold.volume.find_row_id(row_id)?.is_some() {
+                    return Ok(true);
                 }
             }
         }
-        false
+        Ok(false)
     }
 
     /// Get the total live row count across all segments (minus tombstones).
@@ -2977,8 +3076,8 @@ mod tests {
 
         assert_eq!(mgr.segment_count(), 1);
         assert_eq!(mgr.total_row_count(), 10);
-        assert!(mgr.row_exists(5));
-        assert!(!mgr.row_exists(11));
+        assert!(mgr.row_exists(5).unwrap());
+        assert!(!mgr.row_exists(11).unwrap());
     }
 
     #[test]
@@ -3014,16 +3113,16 @@ mod tests {
 
         // Tombstone row_id=5 (commit_seq=1)
         mgr.add_tombstones(&[5], 1);
-        assert!(!mgr.row_exists(5));
-        assert!(mgr.row_exists(4));
-        assert!(mgr.row_exists(6));
+        assert!(!mgr.row_exists(5).unwrap());
+        assert!(mgr.row_exists(4).unwrap());
+        assert!(mgr.row_exists(6).unwrap());
         assert_eq!(mgr.total_row_count(), 9);
         assert!(mgr.is_tombstoned(5));
         assert!(!mgr.is_tombstoned(4));
 
         // Clear tombstones
         mgr.clear_tombstones();
-        assert!(mgr.row_exists(5));
+        assert!(mgr.row_exists(5).unwrap());
         assert_eq!(mgr.total_row_count(), 10);
     }
 
@@ -3151,7 +3250,7 @@ mod tests {
         {
             let vols = mgr.get_volumes_newest_first().unwrap();
             let (_, cs) = &vols[0];
-            let row = cs.volume.get_row(0);
+            let row = cs.volume.get_row(0).unwrap();
             assert_eq!(row[0], Value::Integer(1));
         }
 
@@ -3207,7 +3306,7 @@ mod tests {
         {
             let vols = mgr.get_volumes_newest_first().unwrap();
             let (_, cs) = &vols[0];
-            let row = cs.volume.get_row(49);
+            let row = cs.volume.get_row(49).unwrap();
             assert_eq!(row[0], Value::Integer(50));
         }
 
@@ -3257,7 +3356,10 @@ mod tests {
         }
 
         // Metadata still accessible on cold volumes.
-        assert!(mgr.row_exists(50), "metadata (row_ids) should work on cold");
+        assert!(
+            mgr.row_exists(50).unwrap(),
+            "metadata (row_ids) should work on cold"
+        );
         assert_eq!(mgr.total_row_count(), 100);
 
         // Volume is still in the map (not removed).
@@ -3392,7 +3494,7 @@ mod tests {
         let vols = snap.volumes_newest_first();
         assert_eq!(vols.len(), 1, "snapshot must not lose its segment");
         assert_eq!(vols[0].0, 1);
-        assert_eq!(vols[0].1.volume.get_row(0)[0], Value::Integer(1));
+        assert_eq!(vols[0].1.volume.get_row(0).unwrap()[0], Value::Integer(1));
     }
     #[test]
     fn test_unique_lookup_uses_statement_snapshot_not_live_state() {
@@ -3464,5 +3566,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(found, Some(5), "snapshot lookup must succeed");
+    }
+}
+
+#[cfg(test)]
+mod publication_undo_tests {
+    use super::*;
+
+    #[test]
+    fn failed_prepare_discards_pending_tombstones_without_an_undo_receipt() {
+        let manager = SegmentManager::new("pending_undo", None);
+        manager.add_pending_tombstone(7, 1);
+        let checkpoint = manager.pending_statement_checkpoint(7);
+        let original = manager.pending_txn_tombstones.read()[&7][&1];
+        manager.add_pending_tombstone(7, 1);
+        manager.add_pending_tombstone(7, 2);
+        manager.finish_pending_statement(7, checkpoint, false);
+        assert_eq!(manager.pending_txn_tombstones.read()[&7][&1], original);
+        assert!(!manager.is_pending_tombstone(7, 2));
+        // Failure before prepare_tombstone_publication creates any receipt.
+        manager.finish_tombstone_publication(7, false);
+        assert_eq!(manager.pending_tombstone_count(7), 0);
+        assert!(!manager.pending_txn_tombstones.read().contains_key(&7));
+        assert!(!manager.pending_tombstone_undo.read().contains_key(&7));
+    }
+
+    #[test]
+    fn tombstone_undo_restores_prior_sequences_and_preserves_unrelated_writes() {
+        let manager = SegmentManager::new("committed_undo", None);
+        manager.add_tombstones(&[1], 5);
+        manager.add_pending_tombstone(7, 1);
+        manager.add_pending_tombstone(7, 2);
+        manager.prepare_tombstone_publication(7, 10);
+        manager.commit_pending_tombstones(7, 10);
+        manager.add_tombstones(&[3], 11);
+        manager.finish_tombstone_publication(7, false);
+        let tombstones = manager.tombstone_set_arc();
+        assert_eq!(tombstones.get(&1), Some(&5));
+        assert!(!tombstones.contains_key(&2));
+        assert_eq!(tombstones.get(&3), Some(&11));
+        assert!(manager.published_tombstone_undo.read().is_empty());
     }
 }

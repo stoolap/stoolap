@@ -335,6 +335,9 @@ impl Executor {
         sql: &str,
         params: &[Value],
     ) -> Option<Result<Box<dyn QueryResult>>> {
+        if let Err(error) = self.engine.check_health() {
+            return Some(Err(error));
+        }
         // Quick reject: if in explicit transaction, skip fast path
         {
             let active_tx = match self.active_transaction.try_lock() {
@@ -398,6 +401,7 @@ impl Executor {
     /// If found, it uses the cached AST. Otherwise, it parses the query
     /// and caches the result for future use.
     fn execute_cached(&self, sql: &str, ctx: &ExecutionContext) -> Result<Box<dyn QueryResult>> {
+        self.engine.check_health()?;
         // Try to get from cache
         if let Some(cached) = self.query_cache.get(sql) {
             // Validate parameter count if query has parameters
@@ -616,6 +620,7 @@ impl Executor {
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,
     ) -> Result<Box<dyn QueryResult>> {
+        self.engine.check_health()?;
         // If there's an active transaction, inject the transaction ID into the context
         // This enables CURRENT_TRANSACTION_ID() function to return the correct value
         let ctx_with_txn;
@@ -678,6 +683,34 @@ impl Executor {
             Statement::Vacuum(stmt) => self.execute_vacuum(stmt, ctx),
             Statement::Copy(stmt) => self.execute_copy(stmt, ctx),
         }
+    }
+
+    /// Explicit transactions retain earlier successful statements on an error.
+    /// Autocommit already owns an entire disposable storage transaction.
+    fn with_statement_rollback<F>(&self, action: F) -> Result<Box<dyn QueryResult>>
+    where
+        F: FnOnce() -> Result<Box<dyn QueryResult>>,
+    {
+        let checkpoint = {
+            let mut active = self
+                .active_transaction
+                .lock()
+                .map_err(|_| Error::internal("active transaction lock is poisoned"))?;
+            match active.as_mut() {
+                Some(tx) => tx.transaction.begin_statement()?,
+                None => false,
+            }
+        };
+        let result = action();
+        if checkpoint {
+            let Ok(mut active) = self.active_transaction.lock() else {
+                panic!("active transaction lock is poisoned during statement cleanup");
+            };
+            if let Some(tx) = active.as_mut() {
+                tx.transaction.finish_statement(result.is_ok());
+            }
+        }
+        result
     }
 
     /// Install an external storage transaction as the active transaction.
@@ -753,6 +786,7 @@ impl Executor {
         plan: &CachedPlanRef,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        self.engine.check_health()?;
         // Validate parameter count
         if plan.has_params {
             let provided = ctx.params().len();

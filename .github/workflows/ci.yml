@@ -105,8 +105,20 @@ jobs:
     - name: Differential oracle tests (Stoolap vs SQLite)
       run: cargo test --test differential_oracle_test --features sqlite
 
+    - name: Volume reader unit tests with failpoints
+      run: >-
+        cargo test --lib --features test-failpoints storage::volume::
+        -- --test-threads=1
+
     - name: Failpoint I/O tests
-      run: cargo test --test failpoint_io_test --features test-failpoints -- --test-threads=1
+      run: >-
+        cargo test --features test-failpoints
+        --test failpoint_io_test
+        --test cold_read_error_test
+        --test statement_atomicity_test
+        --test phase1_review_correlated_error_test
+        --test phase1_review_grouped_error_test
+        -- --test-threads=1
 
   coverage:
     name: Code Coverage
@@ -134,7 +146,7 @@ jobs:
       uses: taiki-e/install-action@cargo-llvm-cov
 
     - name: Generate coverage
-      run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+      run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info -- --test-threads=1
 
     - name: Upload coverage to Codecov
       uses: codecov/codecov-action@v5

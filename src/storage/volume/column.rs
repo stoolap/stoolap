@@ -33,7 +33,7 @@ pub type DictFilter<'a> = (&'a ColumnData, usize, u32);
 
 /// A dictionary column's raw ids and nulls, the local index its window
 /// starts at, and the id looked for
-type DictSlice<'a> = (&'a [u32], &'a [bool], usize, u32);
+type DictSlice<'a> = (&'a [u32], &'a [bool], u32);
 
 /// Typed column data stored contiguously for cache-friendly access.
 ///
@@ -547,8 +547,8 @@ impl ColumnData {
 
     /// Appends to `out` the offsets in `0..count` whose rows, read at
     /// `local + offset` in every column of `filters`, carry the expected
-    /// dictionary id and are not null. One tight pass over the first
-    /// column's raw ids; the other columns are only read for its matches.
+    /// dictionary id and are not null. Compare the leading column in small
+    /// blocks; read the other columns only for its matches.
     /// None when a filter column is not a dictionary column.
     pub fn dict_matching_offsets(
         filters: &[DictFilter<'_>],
@@ -559,25 +559,55 @@ impl ColumnData {
             smallvec::SmallVec::with_capacity(filters.len());
         for &(col, local, expected) in filters {
             let (ids, nulls) = col.dict_ids()?;
-            if local + count > ids.len() {
-                return None;
-            }
-            slices.push((ids, nulls, local, expected));
+            let end = local.checked_add(count)?;
+            slices.push((ids.get(local..end)?, nulls.get(local..end)?, expected));
         }
-        let Some(&(first_ids, first_nulls, first_local, first_expected)) = slices.first() else {
+        let Some(&(ids, nulls, expected)) = slices.first() else {
             out.extend(0..count);
             return Some(());
         };
-        let window = &first_ids[first_local..first_local + count];
-        for (offset, &id) in window.iter().enumerate() {
-            if id != first_expected || first_nulls[first_local + offset] {
+        let others = &slices[1..];
+        // Compare eight leading IDs together. Sparse masks avoid entering the
+        // remaining-predicate loop for rejected rows; dense masks use a straight
+        // scan instead of extracting individual bits. Offsets stay in input order.
+        let mut base = 0;
+        for chunk in ids.as_chunks::<8>().0 {
+            let flags = &nulls[base..base + 8];
+            let mut mask = 0u8;
+            for lane in 0..8 {
+                mask |= u8::from((chunk[lane] == expected) & !flags[lane]) << lane;
+            }
+            if mask == u8::MAX {
+                for offset in base..base + 8 {
+                    if others
+                        .iter()
+                        .all(|&(ids, nulls, expected)| ids[offset] == expected && !nulls[offset])
+                    {
+                        out.push(offset);
+                    }
+                }
+                base += 8;
                 continue;
             }
-            let others = slices[1..].iter().all(|&(ids, nulls, local, expected)| {
-                let at = local + offset;
-                ids[at] == expected && !nulls[at]
-            });
-            if others {
+            while mask != 0 {
+                let offset = base + mask.trailing_zeros() as usize;
+                mask &= mask - 1;
+                if others
+                    .iter()
+                    .all(|&(ids, nulls, expected)| ids[offset] == expected && !nulls[offset])
+                {
+                    out.push(offset);
+                }
+            }
+            base += 8;
+        }
+        for offset in base..count {
+            if ids[offset] == expected
+                && !nulls[offset]
+                && others
+                    .iter()
+                    .all(|&(ids, nulls, expected)| ids[offset] == expected && !nulls[offset])
+            {
                 out.push(offset);
             }
         }
@@ -1025,5 +1055,88 @@ mod tests {
         assert!(zm.may_contain_eq(&Value::Integer(50)));
         assert!(!zm.may_contain_eq(&Value::Integer(5)));
         assert!(!zm.may_contain_eq(&Value::Integer(101)));
+    }
+    #[test]
+    fn dict_block_masks_match_scalar_with_nulls_offsets_and_partial_blocks() {
+        // Every mask shape, including zero/full masks, at each block boundary.
+        for mask in 0..=u8::MAX {
+            let columns: Vec<_> = (0..6)
+                .map(|column| {
+                    let ids = (0..40)
+                        .map(|i| {
+                            if column == 0 {
+                                u32::from(mask & (1 << (i % 8)) == 0)
+                            } else {
+                                u32::from((i * (column + 1) + column) % 5 == 0)
+                            }
+                        })
+                        .collect();
+                    let nulls = (0..40).map(|i| (i + column * 3) % 11 == 0).collect();
+                    ColumnData::Dictionary {
+                        dictionary: vec!["yes".into(), "no".into()].into(),
+                        ids,
+                        nulls,
+                    }
+                })
+                .collect();
+            for filter_count in 0..=6 {
+                let filters: Vec<_> = columns
+                    .iter()
+                    .take(filter_count)
+                    .enumerate()
+                    .map(|(i, col)| (col, i, 0))
+                    .collect();
+                for count in 0..=33 {
+                    let mut expected = vec![usize::MAX];
+                    expected.extend((0..count).filter(|&offset| {
+                        filters.iter().all(|&(col, local, id)| {
+                            let (ids, nulls) = col.dict_ids().unwrap();
+                            ids[local + offset] == id && !nulls[local + offset]
+                        })
+                    }));
+                    let mut actual = vec![usize::MAX];
+                    assert_eq!(
+                        ColumnData::dict_matching_offsets(&filters, count, &mut actual),
+                        Some(())
+                    );
+                    assert_eq!(
+                        actual, expected,
+                        "mask={mask} filters={filter_count} count={count}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dict_block_invalid_windows_leave_output_unchanged() {
+        let valid = ColumnData::Dictionary {
+            dictionary: vec!["yes".into()].into(),
+            ids: vec![0; 16],
+            nulls: vec![false; 16],
+        };
+        let short_nulls = ColumnData::Dictionary {
+            dictionary: vec!["yes".into()].into(),
+            ids: vec![0; 16],
+            nulls: vec![false; 7],
+        };
+        let not_dict = ColumnData::Int64 {
+            values: vec![0; 16],
+            nulls: vec![false; 16],
+        };
+        for (filters, count) in [
+            (vec![(&valid, usize::MAX, 0)], 2),
+            (vec![(&valid, 17, 0)], 0),
+            (vec![(&valid, 8, 0)], 9),
+            (vec![(&valid, 0, 0), (&short_nulls, 0, 0)], 8),
+            (vec![(&valid, 0, 0), (&not_dict, 0, 0)], 8),
+        ] {
+            let mut actual = vec![42];
+            assert_eq!(
+                ColumnData::dict_matching_offsets(&filters, count, &mut actual),
+                None
+            );
+            assert_eq!(actual, [42]);
+        }
     }
 }

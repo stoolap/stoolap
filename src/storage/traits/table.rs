@@ -23,6 +23,12 @@ use crate::storage::expression::Expression;
 use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
 use crate::storage::traits::{Index, QueryResult, Scanner};
 
+/// Completes a detached index under the catalog build lease. Cold storage
+/// validates/populates first, then invokes installation under a short
+/// generation fence. Any error before installation leaves the catalog intact.
+pub type IndexBuildFinalizer<'a> =
+    dyn FnMut(&std::sync::Arc<dyn Index>, &mut dyn FnMut() -> Result<()>) -> Result<()> + 'a;
+
 /// Describes the access method that will be used for a table scan
 ///
 /// This is used by EXPLAIN to show users how their queries will be executed.
@@ -399,8 +405,8 @@ pub trait Table: Send + Sync {
 
     /// Check if a specific row_id exists in the hot buffer.
     /// O(log n) lookup instead of collecting all row_ids.
-    fn has_row_id(&self, _row_id: i64) -> bool {
-        false
+    fn has_row_id(&self, _row_id: i64) -> Result<bool> {
+        Ok(false)
     }
 
     /// Claim a row for update to prevent concurrent cold-row modifications.
@@ -646,6 +652,61 @@ pub trait Table: Send + Sync {
         self.create_index(name, columns, is_unique)
     }
 
+    /// Build a detached index, then let the storage wrapper finish it before installation.
+    fn create_index_with_type_and_finalizer(
+        &self,
+        _name: &str,
+        _columns: &[&str],
+        _is_unique: bool,
+        _index_type: Option<IndexType>,
+        _finalize: &mut IndexBuildFinalizer<'_>,
+    ) -> Result<()> {
+        Err(Error::internal(
+            "table does not support detached index construction",
+        ))
+    }
+
+    fn create_btree_index_with_finalizer(
+        &self,
+        _column_name: &str,
+        _is_unique: bool,
+        _custom_name: Option<&str>,
+        _finalize: &mut IndexBuildFinalizer<'_>,
+    ) -> Result<()> {
+        Err(Error::internal(
+            "table does not support detached BTree construction",
+        ))
+    }
+
+    fn create_multi_column_index_with_finalizer(
+        &self,
+        _name: &str,
+        _columns: &[&str],
+        _is_unique: bool,
+        _finalize: &mut IndexBuildFinalizer<'_>,
+    ) -> Result<()> {
+        Err(Error::internal(
+            "table does not support detached multi-column index construction",
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn create_hnsw_index_with_finalizer(
+        &self,
+        _name: &str,
+        _column: &str,
+        _is_unique: bool,
+        _m: usize,
+        _ef_construction: usize,
+        _ef_search: usize,
+        _metric: crate::storage::index::HnswDistanceMetric,
+        _finalize: &mut IndexBuildFinalizer<'_>,
+    ) -> Result<()> {
+        Err(Error::internal(
+            "table does not support detached HNSW construction",
+        ))
+    }
+
     /// Creates an HNSW index with custom parameters
     ///
     /// # Arguments
@@ -865,8 +926,8 @@ pub trait Table: Send + Sync {
     ///
     /// # Returns
     /// The number of visible rows in the table
-    fn row_count(&self) -> usize {
-        0 // Default implementation - override in concrete tables
+    fn row_count(&self) -> Result<usize> {
+        Ok(0) // Default implementation - override in concrete tables
     }
 
     /// Fast O(1) row count hint for optimizer decisions
@@ -874,7 +935,7 @@ pub trait Table: Send + Sync {
     /// Returns an upper bound estimate without expensive visibility checks.
     /// Use for cache eligibility and similar decisions where exact count isn't needed.
     fn row_count_hint(&self) -> usize {
-        self.row_count() // Default falls back to row_count
+        0 // Metadata hint only; exact row_count may require fallible reads
     }
 
     /// Fast O(1) exact row count for COUNT(*) queries
@@ -884,8 +945,8 @@ pub trait Table: Send + Sync {
     ///
     /// This is different from row_count_hint() because it returns the EXACT count,
     /// not an estimate. It's designed for COUNT(*) without WHERE clause.
-    fn fast_row_count(&self) -> Option<usize> {
-        None // Default: no fast path available
+    fn fast_row_count(&self) -> Result<Option<usize>> {
+        Ok(None) // Default: no fast path available
     }
 
     /// Collects rows sorted by an indexed column with limit (ORDER BY + LIMIT pushdown)
@@ -908,9 +969,9 @@ pub trait Table: Send + Sync {
         ascending: bool,
         limit: usize,
         offset: usize,
-    ) -> Option<RowVec> {
+    ) -> Result<Option<RowVec>> {
         let _ = (column_name, ascending, limit, offset);
-        None // Default implementation - override in concrete tables
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// The first `limit` rows after `offset` in the order of `column_name`,
@@ -966,9 +1027,12 @@ pub trait Table: Send + Sync {
     /// # Returns
     /// Some(Vec<(Value, RowVec)>) where each tuple is (partition_value, rows_in_partition)
     /// Returns None if the column has no index
-    fn collect_rows_grouped_by_partition(&self, column_name: &str) -> Option<Vec<(Value, RowVec)>> {
+    fn collect_rows_grouped_by_partition(
+        &self,
+        column_name: &str,
+    ) -> Result<Option<Vec<(Value, RowVec)>>> {
         let _ = column_name;
-        None // Default implementation - override in concrete tables
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Get distinct partition values from an indexed column.
@@ -979,9 +1043,9 @@ pub trait Table: Send + Sync {
     ///
     /// # Returns
     /// Some(Vec<Value>) with distinct values, or None if column has no index
-    fn get_partition_values(&self, column_name: &str) -> Option<Vec<Value>> {
+    fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
         let _ = column_name;
-        None // Default implementation - override in concrete tables
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Compute distinct non-null values for a column by exploiting cold volume
@@ -994,8 +1058,8 @@ pub trait Table: Send + Sync {
     ///
     /// # Returns
     /// Some(Vec<Value>) with distinct non-null values, or None if fast path unavailable
-    fn compute_distinct_values(&self, _col_idx: usize) -> Option<Vec<Value>> {
-        None
+    fn compute_distinct_values(&self, _col_idx: usize) -> Result<Option<Vec<Value>>> {
+        Ok(None)
     }
 
     /// Get the count of distinct non-null values from an indexed column.
@@ -1006,9 +1070,9 @@ pub trait Table: Send + Sync {
     ///
     /// # Returns
     /// Some(count) excluding NULL values, or None if column has no index
-    fn get_partition_count(&self, column_name: &str) -> Option<usize> {
+    fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
         let _ = column_name;
-        None // Default implementation - override in concrete tables
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Get rows for a specific partition value.
@@ -1196,8 +1260,8 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `col_idx` - Column index to sum
-    fn sum_column(&self, _col_idx: usize) -> Option<(f64, usize)> {
-        None // Default implementation - override in concrete tables
+    fn sum_column(&self, _col_idx: usize) -> Result<Option<(f64, usize)>> {
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Compute AVG of a column without materializing rows (deferred aggregation)
@@ -1207,7 +1271,7 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `col_idx` - Column index to average
-    fn avg_column(&self, _col_idx: usize) -> Option<(f64, usize)> {
+    fn avg_column(&self, _col_idx: usize) -> Result<Option<(f64, usize)>> {
         // Default: use sum_column if available
         self.sum_column(_col_idx)
     }
@@ -1219,8 +1283,8 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `col_idx` - Column index to find minimum
-    fn min_column(&self, _col_idx: usize) -> Option<Option<Value>> {
-        None // Default implementation - override in concrete tables
+    fn min_column(&self, _col_idx: usize) -> Result<Option<Option<Value>>> {
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Compute MAX of a column without materializing rows (deferred aggregation)
@@ -1230,8 +1294,8 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `col_idx` - Column index to find maximum
-    fn max_column(&self, _col_idx: usize) -> Option<Option<Value>> {
-        None // Default implementation - override in concrete tables
+    fn max_column(&self, _col_idx: usize) -> Result<Option<Option<Value>>> {
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Compute aggregates with a WHERE filter at the storage level.
@@ -1250,8 +1314,8 @@ pub trait Table: Send + Sync {
         &self,
         _aggregates: &[(AggregateOp, usize)],
         _where_expr: &dyn Expression,
-    ) -> Option<Vec<crate::core::Value>> {
-        None // Default: not supported
+    ) -> Result<Option<Vec<crate::core::Value>>> {
+        Ok(None) // Default: not supported
     }
 
     /// Compute grouped aggregates at the storage level.
@@ -1269,8 +1333,8 @@ pub trait Table: Send + Sync {
         &self,
         _group_by_indices: &[usize],
         _aggregates: &[(AggregateOp, usize)],
-    ) -> Option<Vec<GroupedAggregateResult>> {
-        None // Default: not supported
+    ) -> Result<Option<Vec<GroupedAggregateResult>>> {
+        Ok(None) // Default: not supported
     }
 }
 

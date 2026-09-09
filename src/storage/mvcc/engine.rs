@@ -175,7 +175,7 @@ fn try_parse_default_literal(expr: &str, data_type: DataType) -> Option<Value> {
 
 /// Register a virtual PkIndex on an INTEGER PRIMARY KEY column.
 /// This allows the optimizer to find the PK index via `get_index_by_column()`.
-fn register_pk_index(schema: &Schema, version_store: &Arc<VersionStore>) {
+fn register_pk_index(schema: &Schema, version_store: &Arc<VersionStore>) -> Result<()> {
     if let Some(pk_idx) = schema.pk_column_index() {
         let pk_col = &schema.columns[pk_idx];
         let index_name = format!("__pk_{}_{}", schema.table_name_lower, pk_col.name);
@@ -185,8 +185,9 @@ fn register_pk_index(schema: &Schema, version_store: &Arc<VersionStore>) {
             pk_col.id as i32,
             pk_col.name.clone(),
         ));
-        version_store.add_index(index_name, pk_index);
+        version_store.add_index(index_name, pk_index)?;
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -460,6 +461,8 @@ pub struct MVCCEngine {
     registry: Arc<TransactionRegistry>,
     /// Whether the engine is open
     open: AtomicBool,
+    /// Shared terminal failure gate for publication undo failures.
+    execution_failed: Arc<AtomicBool>,
     /// Cache of transaction version stores per (txn_id, table_name) for proper commit/rollback
     /// (Arc-wrapped for safe sharing with transactions)
     txn_version_stores: Arc<RwLock<TxnVersionStoreMap>>,
@@ -589,6 +592,7 @@ impl MVCCEngine {
             version_stores: Arc::new(RwLock::new(FxHashMap::default())),
             registry: Arc::new(TransactionRegistry::new()),
             open: AtomicBool::new(false),
+            execution_failed: Arc::new(AtomicBool::new(false)),
             txn_version_stores: Arc::new(RwLock::new(I64Map::new())),
             views: RwLock::new(FxHashMap::default()),
             persistence: Arc::new(persistence),
@@ -1109,7 +1113,7 @@ impl MVCCEngine {
         ));
 
         // Register virtual PkIndex for INTEGER PRIMARY KEY
-        register_pk_index(&schema, &version_store);
+        register_pk_index(&schema, &version_store)?;
 
         // Load all rows from the snapshot
         reader.for_each(|row_id, mut version| {
@@ -1168,7 +1172,7 @@ impl MVCCEngine {
                 schema.clone(),
                 registry_as_visibility_checker(&self.registry),
             ));
-            register_pk_index(&schema, &version_store);
+            register_pk_index(&schema, &version_store)?;
 
             // Store schema and version store
             {
@@ -1209,7 +1213,7 @@ impl MVCCEngine {
             schema.clone(),
             registry_as_visibility_checker(&self.registry),
         ));
-        register_pk_index(&schema, &version_store);
+        register_pk_index(&schema, &version_store)?;
 
         // Build a frozen volume from the snapshot rows
         let mut builder = crate::storage::volume::writer::VolumeBuilder::new(&schema);
@@ -1505,7 +1509,7 @@ impl MVCCEngine {
                             let mut has_null = false;
                             for &ci in col_indices {
                                 let v = if ci < vol.columns.len() {
-                                    vol.columns[ci].get_value(i)
+                                    vol.columns.get(ci)?.get_value(i)
                                 } else {
                                     crate::core::Value::Null(crate::core::DataType::Null)
                                 };
@@ -1622,7 +1626,7 @@ impl MVCCEngine {
                     ));
 
                     // Register virtual PkIndex for INTEGER PRIMARY KEY
-                    register_pk_index(&schema, &version_store);
+                    register_pk_index(&schema, &version_store)?;
 
                     let table_name = schema.table_name_lower.clone();
 
@@ -1731,7 +1735,7 @@ impl MVCCEngine {
                 if let Ok(index_name) = String::from_utf8(entry.data.clone()) {
                     let table_name = entry.table_name.to_lowercase();
                     if let Ok(store) = self.get_version_store(&table_name) {
-                        let _ = store.drop_index(&index_name);
+                        store.drop_index(&index_name)?;
                     }
                 }
             }
@@ -1740,7 +1744,7 @@ impl MVCCEngine {
                 if let Ok(row_version) = deserialize_row_version(&entry.data) {
                     let table_name = entry.table_name.to_lowercase();
                     let mgr = self.get_or_create_segment_manager(&table_name);
-                    let in_volume = mgr.is_row_id_in_volume(entry.row_id);
+                    let in_volume = mgr.is_row_id_in_volume(entry.row_id)?;
 
                     if in_volume {
                         // Row exists in a cold volume. Two cases:
@@ -1788,7 +1792,7 @@ impl MVCCEngine {
                 // If the deleted row_id lives in a cold segment, add a tombstone
                 // so it is excluded from scans and point lookups.
                 let mgr = self.get_or_create_segment_manager(&table_name);
-                if mgr.is_row_id_in_volume(entry.row_id) {
+                if mgr.is_row_id_in_volume(entry.row_id)? {
                     // Recovery tombstones get commit_seq=0, which is always visible
                     // to all new snapshots (any begin_seq > 0). This is correct:
                     // these tombstones were committed before the restart.
@@ -2133,7 +2137,7 @@ impl MVCCEngine {
         // in volumes so startup is fast and doesn't depend on WAL replay.
         // Skipped when checkpoint_on_close is false (crash simulation in tests).
         let checkpoint_on_close = self.config.read().unwrap().persistence.checkpoint_on_close;
-        if checkpoint_on_close {
+        if checkpoint_on_close && self.check_execution_health().is_ok() {
             if let Some(ref pm) = *self.persistence {
                 if pm.is_enabled() {
                     // Retry checkpoint until all hot buffers are empty.
@@ -2198,6 +2202,21 @@ impl MVCCEngine {
     /// Returns whether the engine is open
     pub fn is_open(&self) -> bool {
         self.open.load(Ordering::Acquire)
+    }
+
+    fn check_execution_health(&self) -> Result<()> {
+        if self.execution_failed.load(Ordering::Acquire)
+            || self
+                .persistence
+                .as_ref()
+                .as_ref()
+                .is_some_and(PersistenceManager::has_indeterminate_commit)
+        {
+            return Err(Error::internal(
+                "transaction outcome is unresolved; close and reopen the database",
+            ));
+        }
+        Ok(())
     }
 
     /// Per-table, per-volume statistics for PRAGMA VOLUME_STATS.
@@ -2742,6 +2761,7 @@ impl MVCCEngine {
 
     /// Creates a new table
     pub fn create_table(&self, schema: Schema) -> Result<Schema> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2759,7 +2779,7 @@ impl MVCCEngine {
         ));
 
         // Register virtual PkIndex for INTEGER PRIMARY KEY
-        register_pk_index(&schema, &version_store);
+        register_pk_index(&schema, &version_store)?;
 
         // Prepare WAL data before locks (avoids holding lock during serialization)
         let schema_data = Self::serialize_schema(&schema);
@@ -2793,6 +2813,7 @@ impl MVCCEngine {
 
     /// Drops a table
     pub fn drop_table_internal(&self, name: &str) -> Result<()> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2852,6 +2873,7 @@ impl MVCCEngine {
 
     /// Gets a version store for a table
     pub fn get_version_store(&self, name: &str) -> Result<Arc<VersionStore>> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2873,6 +2895,7 @@ impl MVCCEngine {
         data_type: DataType,
         nullable: bool,
     ) -> Result<()> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2938,6 +2961,7 @@ impl MVCCEngine {
         default_expr: Option<String>,
         vector_dimensions: u16,
     ) -> Result<()> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2998,6 +3022,7 @@ impl MVCCEngine {
     /// Refresh the engine's schema cache for a table from the version store
     /// This is used after DDL operations that modify the table's schema directly
     pub fn refresh_schema_cache(&self, table_name: &str) -> Result<()> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3450,6 +3475,7 @@ impl MVCCEngine {
 
     /// Drops a column from a table
     pub fn drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3507,6 +3533,7 @@ impl MVCCEngine {
 
     /// Renames a column in a table
     pub fn rename_column(&self, table_name: &str, old_name: &str, new_name: &str) -> Result<()> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3601,6 +3628,7 @@ impl MVCCEngine {
         data_type: DataType,
         nullable: bool,
     ) -> Result<()> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3661,6 +3689,7 @@ impl MVCCEngine {
         nullable: bool,
         vector_dimensions: u16,
     ) -> Result<()> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3714,6 +3743,7 @@ impl MVCCEngine {
 
     /// Renames a table
     pub fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3861,6 +3891,7 @@ impl MVCCEngine {
     pub fn create_view(&self, name: &str, query: String, if_not_exists: bool) -> Result<()> {
         use crate::storage::mvcc::wal_manager::WALOperationType;
 
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3907,6 +3938,7 @@ impl MVCCEngine {
     pub fn drop_view(&self, name: &str, if_exists: bool) -> Result<()> {
         use crate::storage::mvcc::wal_manager::WALOperationType;
 
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3939,6 +3971,7 @@ impl MVCCEngine {
     /// Use this when you already have a lowercase name to avoid allocation
     #[inline]
     pub fn view_exists_lowercase(&self, name_lower: &str) -> Result<bool> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3957,6 +3990,7 @@ impl MVCCEngine {
     /// Returns Arc clone (cheap pointer copy, no data clone).
     #[inline]
     pub fn get_view_lowercase(&self, name_lower: &str) -> Result<Option<Arc<ViewDefinition>>> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3967,6 +4001,7 @@ impl MVCCEngine {
 
     /// List all view names
     pub fn list_views(&self) -> Result<Vec<String>> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3989,6 +4024,7 @@ impl MVCCEngine {
     /// timestamped snapshot files. The keep_snapshots config limits how many backup
     /// files are retained per table.
     fn create_backup_snapshot(&self) -> Result<()> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -4196,9 +4232,9 @@ impl MVCCEngine {
                         }
 
                         let mut row = if mapping.is_identity {
-                            vol.get_row(i)
+                            vol.get_row(i)?
                         } else {
-                            vol.get_row_mapped(i, &mapping)
+                            vol.get_row_mapped(i, &mapping)?
                         };
 
                         if row.len() < schema_cols {
@@ -4608,6 +4644,7 @@ impl MVCCEngine {
 
     /// Restore the database from a backup snapshot, replacing all current data.
     fn restore_from_snapshot(&self, timestamp: Option<&str>) -> Result<String> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -5078,6 +5115,7 @@ impl MVCCEngine {
     /// regardless of threshold (used by PRAGMA CHECKPOINT and close_engine).
     /// When false, respects the normal seal thresholds (used by background thread).
     fn checkpoint_cycle_inner(&self, force: bool) -> Result<()> {
+        self.check_execution_health()?;
         if let Some(ref pm) = *self.persistence {
             if !pm.is_enabled() {
                 return Ok(());
@@ -5516,21 +5554,20 @@ impl MVCCEngine {
                     .iter()
                     .map(|&i| manifest.segments[i].segment_id)
                     .collect();
-                let mut vols: Vec<(u64, Arc<crate::storage::volume::writer::FrozenVolume>)> =
-                    merge_indices
-                        .iter()
-                        .filter_map(|&i| {
-                            let seg = &manifest.segments[i];
-                            let vol = segs.get(&seg.segment_id)?;
-                            if vol.volume.is_cold() {
-                                // Load only this merge candidate from disk.
-                                let loaded = mgr.ensure_volume(seg.segment_id).ok()??;
-                                Some((seg.segment_id, loaded))
-                            } else {
-                                Some((seg.segment_id, Arc::clone(&vol.volume)))
-                            }
-                        })
-                        .collect();
+                let mut vols = Vec::with_capacity(merge_indices.len());
+                for &i in &merge_indices {
+                    let seg = &manifest.segments[i];
+                    let Some(vol) = segs.get(&seg.segment_id) else {
+                        continue;
+                    };
+                    if vol.volume.is_cold() {
+                        if let Some(loaded) = mgr.ensure_volume(seg.segment_id)? {
+                            vols.push((seg.segment_id, loaded));
+                        }
+                    } else {
+                        vols.push((seg.segment_id, Arc::clone(&vol.volume)));
+                    }
+                }
                 drop(segs);
 
                 // Every manifest entry must have a loaded volume.
@@ -5666,9 +5703,9 @@ impl MVCCEngine {
                     let vol = &volumes[vol_idx].1;
                     let mapping = &vol_mappings[vol_idx];
                     let row = if mapping.is_identity {
-                        vol.get_row(row_idx)
+                        vol.get_row(row_idx)?
                     } else {
-                        vol.get_row_mapped(row_idx, mapping)
+                        vol.get_row_mapped(row_idx, mapping)?
                     };
                     builder.add_row(row_id, &row);
                 }
@@ -5690,7 +5727,7 @@ impl MVCCEngine {
                             let stores = self.version_stores.read().unwrap();
                             if let Some(store) = stores.get(table_name) {
                                 for (col_indices, _) in store.get_unique_non_pk_index_columns() {
-                                    compacted.prebuild_unique_index(&col_indices);
+                                    compacted.prebuild_unique_index(&col_indices)?;
                                 }
                             }
                         }
@@ -5978,7 +6015,7 @@ impl MVCCEngine {
                         if let Some(store) = stores.get(&table_name) {
                             for (col_indices, _) in store.get_unique_non_pk_index_columns() {
                                 for (vol, _, _) in &sealed_volumes {
-                                    vol.prebuild_unique_index(&col_indices);
+                                    vol.prebuild_unique_index(&col_indices)?;
                                 }
                             }
                         }
@@ -6091,6 +6128,10 @@ impl MVCCEngine {
 }
 
 impl Engine for MVCCEngine {
+    fn check_health(&self) -> Result<()> {
+        self.check_execution_health()
+    }
+
     fn open(&mut self) -> Result<()> {
         MVCCEngine::open_engine(self)
     }
@@ -6104,6 +6145,7 @@ impl Engine for MVCCEngine {
     }
 
     fn begin_transaction_with_level(&self, level: IsolationLevel) -> Result<Box<dyn Transaction>> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6140,6 +6182,7 @@ impl Engine for MVCCEngine {
     }
 
     fn table_exists(&self, table_name: &str) -> Result<bool> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6150,6 +6193,7 @@ impl Engine for MVCCEngine {
     }
 
     fn index_exists(&self, index_name: &str, table_name: &str) -> Result<bool> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6159,6 +6203,7 @@ impl Engine for MVCCEngine {
     }
 
     fn get_index(&self, table_name: &str, index_name: &str) -> Result<Box<dyn Index>> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6180,6 +6225,7 @@ impl Engine for MVCCEngine {
     }
 
     fn get_table_schema(&self, table_name: &str) -> Result<CompactArc<Schema>> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6198,6 +6244,7 @@ impl Engine for MVCCEngine {
     }
 
     fn list_table_indexes(&self, table_name: &str) -> Result<FxHashMap<String, String>> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6211,6 +6258,7 @@ impl Engine for MVCCEngine {
     }
 
     fn get_all_indexes(&self, table_name: &str) -> Result<Vec<std::sync::Arc<dyn Index>>> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6235,6 +6283,7 @@ impl Engine for MVCCEngine {
     }
 
     fn set_isolation_level(&mut self, level: IsolationLevel) -> Result<()> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6542,6 +6591,7 @@ impl Engine for MVCCEngine {
     }
 
     fn fetch_rows_by_ids(&self, table_name: &str, row_ids: &[i64]) -> Result<crate::core::RowVec> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6573,6 +6623,7 @@ impl Engine for MVCCEngine {
         &self,
         table_name: &str,
     ) -> Result<Box<dyn Fn(&[i64]) -> Result<crate::core::RowVec> + Send + Sync>> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6582,7 +6633,19 @@ impl Engine for MVCCEngine {
         let schema = store.schema().clone();
         let read_txn_id = INVALID_TRANSACTION_ID + 1;
 
+        let execution_failed = Arc::clone(&self.execution_failed);
+        let persistence = Arc::clone(&self.persistence);
         Ok(Box::new(move |row_ids: &[i64]| {
+            if execution_failed.load(Ordering::Acquire)
+                || persistence
+                    .as_ref()
+                    .as_ref()
+                    .is_some_and(PersistenceManager::has_indeterminate_commit)
+            {
+                return Err(Error::internal(
+                    "transaction outcome is unresolved; reopen the database",
+                ));
+            }
             let mut result = store.get_visible_versions_batch(row_ids, read_txn_id);
             if result.len() < row_ids.len() && mgr.has_segments() {
                 let found_ids: rustc_hash::FxHashSet<i64> =
@@ -6604,7 +6667,8 @@ impl Engine for MVCCEngine {
     fn get_row_counter(
         &self,
         table_name: &str,
-    ) -> Result<Box<dyn Fn(&[i64]) -> usize + Send + Sync>> {
+    ) -> Result<Box<dyn Fn(&[i64]) -> Result<usize> + Send + Sync>> {
+        self.check_execution_health()?;
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6613,16 +6677,28 @@ impl Engine for MVCCEngine {
         let mgr = self.get_or_create_segment_manager(table_name);
         let read_txn_id = INVALID_TRANSACTION_ID + 1;
 
+        let execution_failed = Arc::clone(&self.execution_failed);
+        let persistence = Arc::clone(&self.persistence);
         Ok(Box::new(move |row_ids: &[i64]| {
+            if execution_failed.load(Ordering::Acquire)
+                || persistence
+                    .as_ref()
+                    .as_ref()
+                    .is_some_and(PersistenceManager::has_indeterminate_commit)
+            {
+                return Err(Error::internal(
+                    "transaction outcome is unresolved; reopen the database",
+                ));
+            }
             let mut count = store.count_visible_versions_batch(row_ids, read_txn_id);
             if count < row_ids.len() && mgr.has_segments() {
                 for &rid in row_ids {
-                    if !store.has_committed_row(rid) && mgr.row_exists(rid) {
+                    if !store.has_committed_row(rid) && mgr.row_exists(rid)? {
                         count += 1;
                     }
                 }
             }
-            count
+            Ok(count)
         }))
     }
 }
@@ -6798,6 +6874,7 @@ impl Drop for CleanupHandle {
 /// Holds Arc references to shared engine state, allowing safe access
 /// from transactions without raw pointers.
 struct EngineOperations {
+    execution_failed: Arc<AtomicBool>,
     /// Shared reference to schemas (each schema is Arc-wrapped to avoid cloning on lookup)
     schemas: Arc<RwLock<FxHashMap<String, CompactArc<Schema>>>>,
     /// Shared reference to version stores
@@ -6824,6 +6901,7 @@ struct EngineOperations {
 impl EngineOperations {
     fn new(engine: &MVCCEngine) -> Self {
         Self {
+            execution_failed: Arc::clone(&engine.execution_failed),
             schemas: Arc::clone(&engine.schemas),
             version_stores: Arc::clone(&engine.version_stores),
             registry: Arc::clone(&engine.registry),
@@ -7073,6 +7151,39 @@ impl EngineOperations {
 }
 
 impl TransactionEngineOperations for EngineOperations {
+    fn check_health(&self) -> Result<()> {
+        if self.execution_failed.load(Ordering::Acquire)
+            || self
+                .persistence
+                .as_ref()
+                .as_ref()
+                .is_some_and(PersistenceManager::has_indeterminate_commit)
+        {
+            return Err(Error::internal(
+                "transaction outcome is unresolved; close and reopen the database",
+            ));
+        }
+        Ok(())
+    }
+
+    fn handle_commit_marker_failure(&self, _error: &Error) -> bool {
+        let unresolved = self
+            .persistence
+            .as_ref()
+            .as_ref()
+            .is_some_and(PersistenceManager::has_indeterminate_commit);
+        if unresolved {
+            self.execution_failed.store(true, Ordering::Release);
+            self.registry.stop_accepting_transactions();
+        }
+        unresolved
+    }
+
+    fn handle_publication_undo_failure(&self, _error: &Error) {
+        self.execution_failed.store(true, Ordering::Release);
+        self.registry.stop_accepting_transactions();
+    }
+
     fn get_table_for_transaction(&self, txn_id: i64, table_name: &str) -> Result<Box<dyn Table>> {
         // Use Cow to avoid allocation when table_name is already lowercase (common case)
         let table_name_lower = to_lowercase_cow(table_name);
@@ -7171,7 +7282,7 @@ impl TransactionEngineOperations for EngineOperations {
         ));
 
         // Register PkIndex if table has a primary key
-        register_pk_index(&schema, &version_store);
+        register_pk_index(&schema, &version_store)?;
 
         // Atomically check-and-insert under write lock to prevent TOCTOU race
         {
@@ -7502,244 +7613,217 @@ impl TransactionEngineOperations for EngineOperations {
         false
     }
 
-    fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>) {
-        // Get the commit_seq for this transaction. start_commit() was called before us,
-        // so the commit_seq is in the registry. Used for versioned tombstones: snapshot
-        // isolation transactions only see tombstones with commit_seq <= their begin_seq.
-        let commit_seq = self.registry.get_committing_sequence(txn_id) as u64;
-
-        // Collect table data under the read lock, then drop the lock before WAL I/O.
-        // This prevents blocking concurrent get_table_for_transaction (which needs
-        // a write lock on txn_version_stores) during potentially slow WAL writes.
-        let tables_to_commit: Vec<(
-            crate::common::SmartString,
-            Arc<RwLock<TransactionVersionStore>>,
-            Arc<VersionStore>,
-        )>;
-        {
-            let cache = self.txn_version_stores().read().unwrap();
-            tables_to_commit = if let Some(txn_tables) = cache.get(txn_id) {
-                let stores = self.version_stores().read().unwrap();
-                txn_tables
-                    .iter()
-                    .filter(|(_, txn_store)| {
-                        let store = txn_store.read().unwrap();
-                        store.has_local_changes()
-                    })
-                    .filter_map(|(table_name, txn_store)| {
-                        stores
-                            .get(table_name.as_str())
-                            .cloned()
-                            .map(|vs| (table_name.clone(), Arc::clone(txn_store), vs))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            // cache (read lock) and stores (read lock) dropped here
+    fn statement_checkpoint(&self, txn_id: i64) -> Result<super::transaction::StatementCheckpoint> {
+        let mut checkpoint = super::transaction::StatementCheckpoint::default();
+        let cache = self
+            .txn_version_stores()
+            .read()
+            .map_err(|_| Error::internal("transaction store cache is poisoned"))?;
+        let managers = self
+            .segment_managers
+            .read()
+            .map_err(|_| Error::internal("segment manager catalog is poisoned"))?;
+        if let Some(tables) = cache.get(txn_id) {
+            for (name, store) in tables {
+                checkpoint.tables.push((
+                    name.clone(),
+                    store
+                        .read()
+                        .map_err(|_| Error::internal("transaction store is poisoned"))?
+                        .statement_checkpoint(),
+                    managers
+                        .get(name.as_str())
+                        .map_or(0, |mgr| mgr.pending_statement_checkpoint(txn_id)),
+                ));
+            }
         }
+        Ok(checkpoint)
+    }
 
-        let mut commit_error: Option<crate::core::Error> = None;
-        let mut any_committed = false;
-        let mut tombstones_wal_recorded: rustc_hash::FxHashSet<String> =
-            rustc_hash::FxHashSet::default();
+    fn finish_statement(
+        &self,
+        txn_id: i64,
+        checkpoint: super::transaction::StatementCheckpoint,
+        success: bool,
+    ) {
+        let Ok(cache) = self.txn_version_stores().read() else {
+            panic!("transaction store cache is poisoned during statement cleanup");
+        };
+        let Ok(managers) = self.segment_managers.read() else {
+            panic!("segment manager catalog is poisoned during statement cleanup");
+        };
+        if let Some(tables) = cache.get(txn_id) {
+            // Build one checkpoint lookup only when table order changed during the statement.
+            let reordered = checkpoint
+                .tables
+                .iter()
+                .zip(tables.iter())
+                .any(|((before, _, _), (current, _))| before != current);
+            let lookup: Option<rustc_hash::FxHashMap<_, _>> = reordered.then(|| {
+                checkpoint
+                    .tables
+                    .iter()
+                    .map(|(name, hot, cold)| (name.as_str(), (*hot, *cold)))
+                    .collect()
+            });
+            for (position, (name, store)) in tables.iter().enumerate() {
+                let (hot, cold) = match &lookup {
+                    Some(lookup) => lookup.get(name.as_str()).copied().unwrap_or((0, 0)),
+                    None => checkpoint
+                        .tables
+                        .get(position)
+                        .map_or((0, 0), |(_, hot, cold)| (*hot, *cold)),
+                };
+                if let Some(mgr) = managers.get(name.as_str()) {
+                    mgr.finish_pending_statement(txn_id, cold, success);
+                }
+                let Ok(mut store) = store.write() else {
+                    panic!("transaction store is poisoned during statement cleanup");
+                };
+                store.finish_statement(hot, success);
+            }
+        }
+    }
 
-        // Check if WAL recording is needed (persistence enabled and not in recovery)
-        let should_record_wal = !self.should_skip_wal()
-            && self
-                .persistence()
-                .as_ref()
-                .is_some_and(|pm| pm.is_enabled());
+    fn finish_publication(&self, txn_id: i64, committed: bool) -> Result<()> {
+        let Ok(cache) = self.txn_version_stores().read() else {
+            panic!("transaction store cache is poisoned during publication cleanup");
+        };
+        let Ok(managers) = self.segment_managers.read() else {
+            panic!("segment manager catalog is poisoned during publication cleanup");
+        };
+        if let Some(tables) = cache.get(txn_id) {
+            for (name, store) in tables {
+                // Undo cold state before releasing its row claims.
+                if let Some(mgr) = managers.get(name.as_str()) {
+                    mgr.finish_tombstone_publication(txn_id, committed);
+                    mgr.clear_txn_seal_generation(txn_id);
+                }
+                let Ok(mut store) = store.write() else {
+                    panic!("transaction store is poisoned during publication cleanup");
+                };
+                store.finish_publication(committed)?;
+            }
+        }
+        drop(managers);
+        drop(cache);
+        self.txn_version_stores().write().unwrap().remove(txn_id);
+        Ok(())
+    }
 
-        // Collect Arc clones of segment managers, then drop the read lock
-        // before WAL I/O to avoid blocking seal/compaction writes.
-        let commit_mgrs: ahash::AHashMap<
-            String,
-            Arc<crate::storage::volume::manifest::SegmentManager>,
-        > = {
-            let mgrs = self.segment_managers.read().unwrap();
-            mgrs.iter()
-                .map(|(k, v)| (k.clone(), Arc::clone(v)))
+    fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>) {
+        let commit_seq = self.registry.get_committing_sequence(txn_id) as u64;
+        let mut tables: smallvec::SmallVec<[_; 1]> = {
+            let cache = self.txn_version_stores().read().unwrap();
+            let stores = self.version_stores().read().unwrap();
+            let managers = self.segment_managers.read().unwrap();
+            cache
+                .get(txn_id)
+                .into_iter()
+                .flat_map(|tables| tables.iter())
+                .filter_map(|(name, local)| {
+                    stores.get(name.as_str()).map(|parent| {
+                        (
+                            name.clone(),
+                            Arc::clone(local),
+                            Arc::clone(parent),
+                            managers.get(name.as_str()).cloned(),
+                        )
+                    })
+                })
                 .collect()
         };
-
-        // WAL I/O and table commits happen here with NO lock on txn_version_stores
-        for (table_name, txn_store, version_store) in &tables_to_commit {
-            // Record cold tombstone DELETEs to WAL FIRST.
-            // These must come before hot INSERTs so that on replay,
-            // the tombstone marks the cold row as superseded BEFORE
-            // the new hot version is encountered.
-            if should_record_wal {
-                if let Some(mgr) = commit_mgrs.get(table_name.as_str()) {
-                    let pending = mgr.get_pending_tombstones(txn_id);
-                    if !pending.is_empty() {
-                        if let Some(ref pm) = *self.persistence() {
-                            for &row_id in &pending {
-                                let version = crate::storage::mvcc::version_store::RowVersion {
-                                    txn_id,
-                                    deleted_at_txn_id: txn_id,
-                                    data: crate::core::Row::new(),
-                                    create_time: 0,
-                                };
-                                if let Err(e) = pm.record_dml_operation(
-                                    txn_id,
-                                    table_name,
-                                    row_id,
-                                    crate::storage::mvcc::wal_manager::WALOperationType::Delete,
-                                    &version,
-                                ) {
-                                    commit_error = Some(e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                if commit_error.is_some() {
-                    break;
-                }
-            }
-
-            // Create table and commit through it (updates indexes)
-            let mut table = MVCCTable::new_with_shared_store(
-                txn_id,
-                Arc::clone(version_store),
-                Arc::clone(txn_store),
-            );
-
-            // Record hot pending versions to WAL (after tombstone DELETEs)
-            if should_record_wal {
-                if let Err(e) = self.record_table_to_wal(txn_id, &table) {
-                    commit_error = Some(e);
-                    break;
-                }
-            }
-
-            // Commit-time seal coordination:
-            // 1. Always take fence for tables with segments (prevents concurrent
-            //    seal from removing index entries during commit validation).
-            // 2. If seal_generation changed since our INSERT, revalidate pending
-            //    rows against cold (catches rows sealed before this commit).
-            // Fall back to live lookup if the manager was created after our snapshot
-            // (first seal on a previously hot-only table).
-            let mgr_for_commit = commit_mgrs.get(table_name.as_str()).cloned().or_else(|| {
-                self.segment_managers
-                    .read()
-                    .unwrap()
-                    .get(table_name.as_str())
-                    .cloned()
-            });
-            // Always take fence if manager exists — even before first seal
-            // completes, the manager may exist without has_segments() being
-            // true yet (created before register_volume publishes the flag).
-            let _seal_guard = mgr_for_commit.as_ref().map(|mgr| mgr.acquire_seal_read());
-
-            // Cold revalidation: only when a seal happened since our INSERT.
-            if let Some(mgr) = mgr_for_commit.as_ref() {
-                let recorded = mgr.get_txn_seal_generation(txn_id);
-                let needs_recheck = match recorded {
-                    Some(gen) => gen != mgr.seal_generation(),
-                    // No recorded generation but segments exist: txn started
-                    // before first seal or used hot-only path. Must recheck.
-                    None => mgr.has_segments(),
-                };
-                if needs_recheck {
-                    if let Err(e) =
-                        self.validate_pending_against_cold(txn_id, txn_store, version_store, mgr)
-                    {
-                        commit_error = Some(e);
-                        break;
-                    }
-                }
-            }
-
-            if let Err(e) = table.commit() {
-                commit_error = Some(e);
-                break;
-            }
-
-            // txn_seal_gens cleanup handled in the tail loop below
-
-            // Mark tombstones as WAL-recorded ONLY after table.commit() succeeds.
-            // Before this fix, the mark was set before commit, so a failed commit
-            // would still apply tombstones in the tail loop — hiding cold rows
-            // without the update version to replace them.
-            if should_record_wal {
-                tombstones_wal_recorded.insert(table_name.to_string());
-            }
-
-            any_committed = true;
-        }
-
-        // Always cleanup txn_version_stores to prevent memory leak,
-        // even if commit failed partway through
-        let mut cache = self.txn_version_stores().write().unwrap();
-        cache.remove(txn_id);
-        drop(cache);
-
-        drop(tables_to_commit);
-
-        // Commit or rollback pending tombstones on all segment managers.
-        // For tables with hot changes, tombstone WAL entries were already
-        // recorded in the per-table loop above. For cold-only changes
-        // (no hot), record tombstones here.
-        //
-        // On partial failure: tables whose hot changes were already committed
-        // (tracked in tombstones_wal_recorded) must have their tombstones
-        // committed too, not rolled back. Rolling back tombstones on an
-        // already-committed table would leave stale cold rows visible.
-        {
-            let should_record_wal = commit_error.is_none()
-                && !self.should_skip_wal()
-                && self
-                    .persistence()
-                    .as_ref()
-                    .is_some_and(|pm| pm.is_enabled());
-
-            // Reuse the commit_mgrs read lock acquired before the commit loop
-            for (table_name, mgr) in commit_mgrs.iter() {
-                if commit_error.is_none() {
-                    // Record cold-only tombstones to WAL (tables not already handled above)
-                    if should_record_wal && !tombstones_wal_recorded.contains(table_name.as_str()) {
-                        let pending = mgr.get_pending_tombstones(txn_id);
-                        if !pending.is_empty() {
-                            if let Some(ref pm) = *self.persistence() {
-                                for &row_id in &pending {
+        tables.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let result = (|| -> Result<()> {
+            // Complete all fallible WAL writes and cold validation before the
+            // first table changes global versions. No cache lock spans I/O.
+            for (name, local, parent, mgr) in &tables {
+                if !self.should_skip_wal() {
+                    if let Some(ref pm) = self.persistence() {
+                        if pm.is_enabled() {
+                            if let Some(mgr) = mgr {
+                                for row_id in mgr.get_pending_tombstones(txn_id) {
                                     let version = crate::storage::mvcc::version_store::RowVersion {
                                         txn_id,
                                         deleted_at_txn_id: txn_id,
                                         data: crate::core::Row::new(),
                                         create_time: 0,
                                     };
-                                    if let Err(e) = pm.record_dml_operation(
+                                    pm.record_dml_operation(
                                         txn_id,
-                                        table_name,
+                                        name,
                                         row_id,
                                         crate::storage::mvcc::wal_manager::WALOperationType::Delete,
                                         &version,
-                                    ) {
-                                        commit_error = Some(e);
-                                        break;
-                                    }
+                                    )?;
                                 }
                             }
                         }
                     }
-                    if commit_error.is_some() {
-                        mgr.rollback_pending_tombstones(txn_id);
-                    } else {
-                        mgr.commit_pending_tombstones(txn_id, commit_seq);
-                    }
-                } else if tombstones_wal_recorded.contains(table_name.as_str()) {
-                    mgr.commit_pending_tombstones(txn_id, commit_seq);
-                } else {
-                    mgr.rollback_pending_tombstones(txn_id);
+                    let table = MVCCTable::new_with_shared_store(
+                        txn_id,
+                        Arc::clone(parent),
+                        Arc::clone(local),
+                    );
+                    self.record_table_to_wal(txn_id, &table)?;
                 }
-                mgr.clear_txn_seal_generation(txn_id);
             }
-        }
-
-        (any_committed, commit_error)
+            // Retain baseline seal exclusion through validation and apply;
+            // COMMIT marker I/O happens after these guards are released.
+            let _fences: smallvec::SmallVec<[_; 4]> = tables
+                .iter()
+                .filter_map(|(_, _, _, mgr)| mgr.as_ref().map(|mgr| mgr.acquire_seal_read()))
+                .collect();
+            for (_, local, parent, mgr) in &tables {
+                if let Some(mgr) = mgr {
+                    let needs_recheck = mgr.get_txn_seal_generation(txn_id).map_or_else(
+                        || mgr.has_segments(),
+                        |generation| generation != mgr.seal_generation(),
+                    );
+                    if needs_recheck {
+                        self.validate_pending_against_cold(txn_id, local, parent, mgr)?;
+                    }
+                }
+                local
+                    .write()
+                    .map_err(|_| Error::internal("transaction store is poisoned"))?
+                    .prepare_publication()?;
+                if let Some(mgr) = mgr {
+                    // Retain only projected keys while processing one cold original at a time.
+                    let requires_keys = local
+                        .read()
+                        .map_err(|_| Error::internal("transaction store is poisoned"))?
+                        .requires_cold_unique_reservations();
+                    if requires_keys {
+                        let schema = parent.schema();
+                        for row_id in mgr.get_pending_tombstones(txn_id) {
+                            if let Some(row) = mgr.get_cold_row_normalized(row_id, &schema)? {
+                                local
+                                    .write()
+                                    .map_err(|_| Error::internal("transaction store is poisoned"))?
+                                    .reserve_cold_unique_keys(&row)?;
+                            }
+                        }
+                    }
+                    mgr.prepare_tombstone_publication(txn_id, commit_seq);
+                }
+            }
+            for (_, local, _, mgr) in &tables {
+                #[cfg(any(test, feature = "test-failpoints"))]
+                if crate::test_failpoints::should_fail_table_publish() {
+                    return Err(Error::internal("failpoint: table publication"));
+                }
+                local
+                    .write()
+                    .map_err(|_| Error::internal("transaction store is poisoned"))?
+                    .apply_prepared_publication()?;
+                if let Some(mgr) = mgr {
+                    mgr.commit_pending_tombstones(txn_id, commit_seq);
+                }
+            }
+            Ok(())
+        })();
+        (result.is_ok() && !tables.is_empty(), result.err())
     }
 
     fn begin_publish(&self, txn_id: i64) -> super::version_store::PublishHold {

@@ -65,6 +65,68 @@ pub(crate) const FLAG_SORTED: u8 = 0x01;
 // Helpers
 // =============================================================================
 
+#[cold]
+fn invalid(message: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+fn checked_end(data: &[u8], pos: usize, count: usize, width: usize) -> io::Result<usize> {
+    count
+        .checked_mul(width)
+        .and_then(|len| pos.checked_add(len))
+        .filter(|&end| end <= data.len())
+        .ok_or_else(|| invalid("truncated or overflowing volume range"))
+}
+
+fn read_usize(data: &[u8], pos: &mut usize) -> io::Result<usize> {
+    usize::try_from(read_u64(data, pos)?)
+        .map_err(|_| invalid("volume length exceeds address space"))
+}
+
+fn check_flags(bytes: &[u8]) -> io::Result<()> {
+    // OR reduction is vectorizable and rejects every representation except 0/1.
+    if bytes.iter().fold(0u8, |flags, &byte| flags | byte) > 1 {
+        return Err(invalid("invalid boolean/null flag"));
+    }
+    Ok(())
+}
+
+/// Validate untrusted flags before exposing them as Rust booleans. The copy
+/// uses the already-validated representation instead of pushing each flag.
+fn append_flags(bytes: &[u8], out: &mut Vec<bool>) -> io::Result<()> {
+    check_flags(bytes)?;
+    // SAFETY: bool has size/alignment one, and check_flags proved every byte
+    // is a valid bool representation. The source slice remains borrowed only
+    // for this copy; no reference to unvalidated disk bytes escapes.
+    let flags = unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<bool>(), bytes.len()) };
+    out.extend_from_slice(flags);
+    Ok(())
+}
+
+/// Validate layout lengths before allocations; row counts come from disk.
+fn check_block_layout(data: &[u8], tag: u8, rows: usize) -> io::Result<()> {
+    let end = match tag {
+        COL_INT64 | COL_FLOAT64 | COL_TIMESTAMP => checked_end(data, 0, rows, 9)?,
+        COL_BOOLEAN => checked_end(data, 0, rows, 2)?,
+        COL_DICTIONARY => checked_end(data, 0, rows, 5)?,
+        COL_BYTES => {
+            let mut pos = checked_end(data, 0, rows, 1)?;
+            let count = read_usize(data, &mut pos)?;
+            if count != rows {
+                return Err(invalid("bytes offset count differs from row count"));
+            }
+            pos = checked_end(data, pos, count, 16)?;
+            let len = read_usize(data, &mut pos)?;
+            checked_end(data, pos, len, 1)?
+        }
+        _ => return Err(invalid("unknown column type tag")),
+    };
+    if end != data.len() {
+        return Err(invalid("trailing column block bytes"));
+    }
+    Ok(())
+}
+
 fn write_nulls(buf: &mut Vec<u8>, nulls: &[bool]) -> io::Result<()> {
     for &n in nulls {
         buf.push(if n { 1 } else { 0 });
@@ -73,24 +135,22 @@ fn write_nulls(buf: &mut Vec<u8>, nulls: &[bool]) -> io::Result<()> {
 }
 
 fn read_nulls(data: &[u8], pos: &mut usize, count: usize) -> io::Result<Vec<bool>> {
-    let end = *pos + count;
+    let end = checked_end(data, *pos, count, 1)?;
     if end > data.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated volume: null bitmap extends past end of data",
         ));
     }
-    let mut nulls = Vec::with_capacity(count);
-    for i in 0..count {
-        nulls.push(data[*pos + i] != 0);
-    }
+    let mut nulls = Vec::new();
+    append_flags(&data[*pos..end], &mut nulls)?;
     *pos = end;
     Ok(nulls)
 }
 
 #[inline]
 fn read_u32(data: &[u8], pos: &mut usize) -> io::Result<u32> {
-    let end = *pos + 4;
+    let end = checked_end(data, *pos, 1, 4)?;
     let bytes: [u8; 4] = data
         .get(*pos..end)
         .and_then(|s| s.try_into().ok())
@@ -103,7 +163,7 @@ fn read_u32(data: &[u8], pos: &mut usize) -> io::Result<u32> {
 
 #[inline]
 fn read_u64(data: &[u8], pos: &mut usize) -> io::Result<u64> {
-    let end = *pos + 8;
+    let end = checked_end(data, *pos, 1, 8)?;
     let bytes: [u8; 8] = data
         .get(*pos..end)
         .and_then(|s| s.try_into().ok())
@@ -116,7 +176,7 @@ fn read_u64(data: &[u8], pos: &mut usize) -> io::Result<u64> {
 
 #[inline]
 fn read_i64(data: &[u8], pos: &mut usize) -> io::Result<i64> {
-    let end = *pos + 8;
+    let end = checked_end(data, *pos, 1, 8)?;
     let bytes: [u8; 8] = data
         .get(*pos..end)
         .and_then(|s| s.try_into().ok())
@@ -129,7 +189,7 @@ fn read_i64(data: &[u8], pos: &mut usize) -> io::Result<i64> {
 
 #[inline]
 fn read_f64(data: &[u8], pos: &mut usize) -> io::Result<f64> {
-    let end = *pos + 8;
+    let end = checked_end(data, *pos, 1, 8)?;
     let bytes: [u8; 8] = data
         .get(*pos..end)
         .and_then(|s| s.try_into().ok())
@@ -142,7 +202,7 @@ fn read_f64(data: &[u8], pos: &mut usize) -> io::Result<f64> {
 
 #[inline]
 fn read_i128(data: &[u8], pos: &mut usize) -> io::Result<i128> {
-    let end = *pos + 16;
+    let end = checked_end(data, *pos, 1, 16)?;
     let bytes: [u8; 16] = data
         .get(*pos..end)
         .and_then(|s| s.try_into().ok())
@@ -232,8 +292,10 @@ fn write_bool_bulk(buf: &mut Vec<u8>, values: &[bool]) {
 
 /// Read `count` i64 values from little-endian bytes in bulk.
 fn read_i64_bulk(data: &[u8], pos: &mut usize, count: usize) -> io::Result<Vec<i64>> {
-    let byte_len = count * 8;
-    let end = *pos + byte_len;
+    let byte_len = count
+        .checked_mul(8)
+        .ok_or_else(|| invalid("column size overflow"))?;
+    let end = checked_end(data, *pos, byte_len, 1)?;
     if end > data.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -271,8 +333,10 @@ fn read_i64_bulk(data: &[u8], pos: &mut usize, count: usize) -> io::Result<Vec<i
 
 /// Read `count` f64 values from little-endian bytes in bulk.
 fn read_f64_bulk(data: &[u8], pos: &mut usize, count: usize) -> io::Result<Vec<f64>> {
-    let byte_len = count * 8;
-    let end = *pos + byte_len;
+    let byte_len = count
+        .checked_mul(8)
+        .ok_or_else(|| invalid("column size overflow"))?;
+    let end = checked_end(data, *pos, byte_len, 1)?;
     if end > data.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -307,8 +371,10 @@ fn read_f64_bulk(data: &[u8], pos: &mut usize, count: usize) -> io::Result<Vec<f
 
 /// Read `count` u32 values from little-endian bytes in bulk.
 fn read_u32_bulk(data: &[u8], pos: &mut usize, count: usize) -> io::Result<Vec<u32>> {
-    let byte_len = count * 4;
-    let end = *pos + byte_len;
+    let byte_len = count
+        .checked_mul(4)
+        .ok_or_else(|| invalid("column size overflow"))?;
+    let end = checked_end(data, *pos, byte_len, 1)?;
     if end > data.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -343,17 +409,15 @@ fn read_u32_bulk(data: &[u8], pos: &mut usize, count: usize) -> io::Result<Vec<u
 
 /// Read `count` boolean values from bytes in bulk.
 fn read_bool_bulk(data: &[u8], pos: &mut usize, count: usize) -> io::Result<Vec<bool>> {
-    let end = *pos + count;
+    let end = checked_end(data, *pos, count, 1)?;
     if end > data.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated volume: boolean column data",
         ));
     }
-    let mut values = Vec::with_capacity(count);
-    for i in 0..count {
-        values.push(data[*pos + i] != 0);
-    }
+    let mut values = Vec::new();
+    append_flags(&data[*pos..end], &mut values)?;
     *pos = end;
     Ok(values)
 }
@@ -419,7 +483,8 @@ fn read_value(data: &[u8], pos: &mut usize) -> io::Result<Value> {
                     "truncated null type",
                 ));
             }
-            let dt = DataType::from_u8(data[*pos]).unwrap_or(DataType::Null);
+            let dt =
+                DataType::from_u8(data[*pos]).ok_or_else(|| invalid("unknown null data type"))?;
             *pos += 1;
             Ok(Value::Null(dt))
         }
@@ -427,7 +492,7 @@ fn read_value(data: &[u8], pos: &mut usize) -> io::Result<Value> {
         2 => Ok(Value::Float(read_f64(data, pos)?)),
         3 => {
             let slen = read_u32(data, pos)? as usize;
-            if *pos + slen > data.len() {
+            if checked_end(data, *pos, slen, 1).is_err() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated volume: text value data",
@@ -445,6 +510,7 @@ fn read_value(data: &[u8], pos: &mut usize) -> io::Result<Value> {
                     "truncated boolean",
                 ));
             }
+            check_flags(&data[*pos..*pos + 1])?;
             let b = data[*pos] != 0;
             *pos += 1;
             Ok(Value::Boolean(b))
@@ -460,7 +526,7 @@ fn read_value(data: &[u8], pos: &mut usize) -> io::Result<Value> {
         }
         6 => {
             let len = read_u32(data, pos)? as usize;
-            if *pos + len > data.len() {
+            if checked_end(data, *pos, len, 1).is_err() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated extension data",
@@ -566,17 +632,14 @@ pub(crate) fn read_nulls_into(
     count: usize,
     out: &mut Vec<bool>,
 ) -> io::Result<()> {
-    let end = *pos + count;
+    let end = checked_end(data, *pos, count, 1)?;
     if end > data.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated volume: null bitmap extends past end of data",
         ));
     }
-    out.reserve(count);
-    for i in 0..count {
-        out.push(data[*pos + i] != 0);
-    }
+    append_flags(&data[*pos..end], out)?;
     *pos = end;
     Ok(())
 }
@@ -589,8 +652,10 @@ pub(crate) fn read_i64_bulk_into(
     count: usize,
     out: &mut Vec<i64>,
 ) -> io::Result<()> {
-    let byte_len = count * 8;
-    let end = *pos + byte_len;
+    let byte_len = count
+        .checked_mul(8)
+        .ok_or_else(|| invalid("column size overflow"))?;
+    let end = checked_end(data, *pos, byte_len, 1)?;
     if end > data.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -631,8 +696,10 @@ pub(crate) fn read_f64_bulk_into(
     count: usize,
     out: &mut Vec<f64>,
 ) -> io::Result<()> {
-    let byte_len = count * 8;
-    let end = *pos + byte_len;
+    let byte_len = count
+        .checked_mul(8)
+        .ok_or_else(|| invalid("column size overflow"))?;
+    let end = checked_end(data, *pos, byte_len, 1)?;
     if end > data.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -672,8 +739,10 @@ pub(crate) fn read_u32_bulk_into(
     count: usize,
     out: &mut Vec<u32>,
 ) -> io::Result<()> {
-    let byte_len = count * 4;
-    let end = *pos + byte_len;
+    let byte_len = count
+        .checked_mul(4)
+        .ok_or_else(|| invalid("column size overflow"))?;
+    let end = checked_end(data, *pos, byte_len, 1)?;
     if end > data.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -713,17 +782,14 @@ pub(crate) fn read_bool_bulk_into(
     count: usize,
     out: &mut Vec<bool>,
 ) -> io::Result<()> {
-    let end = *pos + count;
+    let end = checked_end(data, *pos, count, 1)?;
     if end > data.len() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "truncated volume: boolean column data",
         ));
     }
-    out.reserve(count);
-    for i in 0..count {
-        out.push(data[*pos + i] != 0);
-    }
+    append_flags(&data[*pos..end], out)?;
     *pos = end;
     Ok(())
 }
@@ -754,6 +820,7 @@ pub(crate) fn deserialize_column_block_into(
     bytes_data_out: Option<&mut Vec<u8>>,
     bytes_offsets_out: Option<&mut Vec<(u64, u64)>>,
 ) -> io::Result<()> {
+    check_block_layout(data, col_type_tag, row_count)?;
     let mut pos = 0;
     match col_type_tag {
         COL_INT64 | COL_TIMESTAMP => {
@@ -802,7 +869,7 @@ pub(crate) fn deserialize_column_block_into(
         }
         COL_BYTES => {
             read_nulls_into(data, &mut pos, row_count, nulls_out)?;
-            let offset_count = read_u64(data, &mut pos)? as usize;
+            let offset_count = read_usize(data, &mut pos)?;
             let bytes_data = bytes_data_out.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing bytes_data_out buffer")
             })?;
@@ -831,14 +898,15 @@ pub(crate) fn deserialize_column_block_into(
                 })?;
                 bytes_offsets.push((adjusted, len));
             }
-            let data_len = read_u64(data, &mut pos)? as usize;
-            if pos + data_len > data.len() {
+            let data_len = read_usize(data, &mut pos)?;
+            if checked_end(data, pos, data_len, 1).is_err() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated column block: bytes data",
                 ));
             }
             bytes_data.extend_from_slice(&data[pos..pos + data_len]);
+            pos += data_len;
             // Validate offsets against the data blob
             for (i, &(off, len)) in bytes_offsets
                 .iter()
@@ -851,7 +919,7 @@ pub(crate) fn deserialize_column_block_into(
                         format!("bytes offset overflow at row {}", i),
                     )
                 })?;
-                if (end as usize) > bytes_data.len() {
+                if end > bytes_data.len() as u64 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -872,6 +940,9 @@ pub(crate) fn deserialize_column_block_into(
             ));
         }
     }
+    if pos != data.len() {
+        return Err(invalid("trailing column block bytes"));
+    }
     Ok(())
 }
 
@@ -884,8 +955,9 @@ pub(crate) fn deserialize_column_block(
     dictionary: Option<Arc<[SmartString]>>,
     ext_type: DataType,
 ) -> io::Result<ColumnData> {
+    check_block_layout(data, col_type_tag, row_count)?;
     let mut pos = 0;
-    match col_type_tag {
+    let column = match col_type_tag {
         COL_INT64 => {
             let nulls = read_nulls(data, &mut pos, row_count)?;
             let values = read_i64_bulk(data, &mut pos, row_count)?;
@@ -932,31 +1004,32 @@ pub(crate) fn deserialize_column_block(
         }
         COL_BYTES => {
             let nulls = read_nulls(data, &mut pos, row_count)?;
-            let offset_count = read_u64(data, &mut pos)? as usize;
+            let offset_count = read_usize(data, &mut pos)?;
             let mut offsets = Vec::with_capacity(offset_count);
             for _ in 0..offset_count {
                 let off = read_u64(data, &mut pos)?;
                 let len = read_u64(data, &mut pos)?;
                 offsets.push((off, len));
             }
-            let data_len = read_u64(data, &mut pos)? as usize;
-            if pos + data_len > data.len() {
+            let data_len = read_usize(data, &mut pos)?;
+            if checked_end(data, pos, data_len, 1).is_err() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated column block: bytes data",
                 ));
             }
             let blob = data[pos..pos + data_len].to_vec();
+            pos += data_len;
             // Validate offsets to prevent panics on corrupted volumes
             for (i, &(off, len)) in offsets.iter().enumerate() {
-                if !nulls[i] {
+                {
                     let end = off.checked_add(len).ok_or_else(|| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!("bytes offset overflow at row {}", i),
                         )
                     })?;
-                    if (end as usize) > blob.len() {
+                    if end > blob.len() as u64 {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
@@ -981,7 +1054,11 @@ pub(crate) fn deserialize_column_block(
             io::ErrorKind::InvalidData,
             format!("unknown column type tag {}", col_type_tag),
         )),
+    }?;
+    if pos != data.len() {
+        return Err(invalid("trailing column block bytes"));
     }
+    Ok(column)
 }
 
 /// Metadata parsed from a V4 volume file (everything except column data).
@@ -1019,7 +1096,7 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     let mut shared_dict: Vec<SmartString> = Vec::new();
     let mut dict_counts: Vec<u32> = Vec::new();
     for i in 0..col_count {
-        if let ColumnData::Dictionary { dictionary, .. } = &vol.columns[i] {
+        if let ColumnData::Dictionary { dictionary, .. } = vol.columns.get(i)? {
             dict_counts.push(dictionary.len() as u32);
             shared_dict.extend(dictionary.iter().cloned());
         }
@@ -1028,7 +1105,7 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     // Column directory: type(1) + flags(1) + extra(4) per column
     let mut dict_col_idx = 0usize;
     for i in 0..col_count {
-        let col = &vol.columns[i];
+        let col = vol.columns.get(i)?;
         let type_tag = match col {
             ColumnData::Int64 { .. } => COL_INT64,
             ColumnData::Float64 { .. } => COL_FLOAT64,
@@ -1131,9 +1208,10 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
 pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetadata> {
     let mut pos = 0;
 
-    let row_count = read_u64(data, &mut pos)? as usize;
+    let row_count = read_usize(data, &mut pos)?;
     let col_count = read_u32(data, &mut pos)? as usize;
 
+    checked_end(data, pos, col_count, 6)?;
     // Column directory
     let mut col_type_tags = Vec::with_capacity(col_count);
     let mut col_ext_types = Vec::with_capacity(col_count);
@@ -1151,6 +1229,14 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
         let flags = data[pos];
         pos += 1;
         let extra = read_u32(data, &mut pos)?;
+        if !(COL_INT64..=COL_BYTES).contains(&type_tag) || flags & !FLAG_SORTED != 0 {
+            return Err(invalid("unknown column type or flags"));
+        }
+        if type_tag == COL_BYTES
+            && (extra > u8::MAX as u32 || DataType::from_u8(extra as u8).is_none())
+        {
+            return Err(invalid("invalid extension type"));
+        }
         col_type_tags.push(type_tag);
         col_ext_types.push(if type_tag == COL_BYTES {
             extra as u8
@@ -1163,10 +1249,18 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
 
     // Shared dictionary
     let dict_len = read_u32(data, &mut pos)? as usize;
+    checked_end(data, pos, dict_len, 4)?;
+    if col_dict_counts
+        .iter()
+        .try_fold(0usize, |n, count| n.checked_add(*count as usize))
+        != Some(dict_len)
+    {
+        return Err(invalid("dictionary counts mismatch"));
+    }
     let mut shared_dict = Vec::with_capacity(dict_len);
     for _ in 0..dict_len {
         let slen = read_u32(data, &mut pos)? as usize;
-        if pos + slen > data.len() {
+        if checked_end(data, pos, slen, 1).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated V4 metadata: dictionary string",
@@ -1180,6 +1274,9 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
 
     // Row IDs (bulk read — single memcpy on LE platforms)
     let row_ids = read_i64_bulk(data, &mut pos, row_count)?;
+    if row_ids.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(invalid("V4 row IDs are not strictly ascending"));
+    }
 
     // Zone maps
     let mut zone_maps = Vec::with_capacity(col_count);
@@ -1188,6 +1285,9 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
         let max = read_value(data, &mut pos)?;
         let null_count = read_u32(data, &mut pos)?;
         let row_count_zm = read_u32(data, &mut pos)?;
+        if null_count > row_count_zm || row_count_zm as usize != row_count {
+            return Err(invalid("invalid volume zone-map counts"));
+        }
         zone_maps.push(ZoneMap {
             min,
             max,
@@ -1198,15 +1298,25 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
 
     // Bloom filters
     let num_blooms = read_u32(data, &mut pos)? as usize;
+    if num_blooms != 0 && num_blooms != col_count {
+        return Err(invalid("bloom count mismatch"));
+    }
+    checked_end(data, pos, num_blooms, 12)?;
     let mut bloom_filters = Vec::with_capacity(num_blooms);
     for _ in 0..num_blooms {
-        let num_bits = read_u64(data, &mut pos)? as usize;
+        let num_bits = read_usize(data, &mut pos)?;
         let data_len = read_u32(data, &mut pos)? as usize;
-        if pos + data_len > data.len() {
+        if checked_end(data, pos, data_len, 1).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated V4 metadata: bloom filter",
             ));
+        }
+        if num_bits == 0
+            || !data_len.is_multiple_of(8)
+            || num_bits.div_ceil(64).checked_mul(8) != Some(data_len)
+        {
+            return Err(invalid("invalid bloom filter size"));
         }
         let bits_bytes = &data[pos..pos + data_len];
         pos += data_len;
@@ -1219,6 +1329,10 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
     let total_rows = read_u64(data, &mut pos)?;
     let live_rows = read_u64(data, &mut pos)?;
     let stats_col_count = read_u32(data, &mut pos)? as usize;
+    if stats_col_count != col_count || total_rows != row_count as u64 || live_rows > total_rows {
+        return Err(invalid("aggregate counts mismatch"));
+    }
+    checked_end(data, pos, stats_col_count, 44)?;
     let mut stat_columns = Vec::with_capacity(stats_col_count);
     for _ in 0..stats_col_count {
         let sum_int = read_i128(data, &mut pos)?;
@@ -1227,6 +1341,9 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
         let non_null_count = read_u64(data, &mut pos)?;
         let min = read_value(data, &mut pos)?;
         let max = read_value(data, &mut pos)?;
+        if numeric_count > non_null_count || non_null_count > total_rows {
+            return Err(invalid("invalid column aggregate counts"));
+        }
         stat_columns.push(ColumnAggregateStats {
             sum_int,
             sum_float,
@@ -1241,7 +1358,7 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
     let mut column_names = Vec::with_capacity(col_count);
     for _ in 0..col_count {
         let slen = read_u32(data, &mut pos)? as usize;
-        if pos + slen > data.len() {
+        if checked_end(data, pos, slen, 1).is_err() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated V4 metadata: column name",
@@ -1262,22 +1379,51 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
                 "truncated V4 metadata: column type",
             ));
         }
-        column_types.push(DataType::from_u8(data[pos]).unwrap_or(DataType::Null));
+        column_types
+            .push(DataType::from_u8(data[pos]).ok_or_else(|| invalid("unknown column data type"))?);
         pos += 1;
+    }
+    for (ci, dt) in column_types.iter().enumerate() {
+        let expected = match dt {
+            DataType::Integer => COL_INT64,
+            DataType::Float => COL_FLOAT64,
+            DataType::Timestamp => COL_TIMESTAMP,
+            DataType::Boolean => COL_BOOLEAN,
+            DataType::Text => COL_DICTIONARY,
+            _ => COL_BYTES,
+        };
+        if col_type_tags[ci] != expected
+            || (expected == COL_BYTES && col_ext_types[ci] != *dt as u8)
+        {
+            return Err(invalid("column physical/logical type mismatch"));
+        }
     }
 
     // Row groups
     let num_groups = read_u32(data, &mut pos)? as usize;
+    if num_groups != 0 && num_groups != row_count.div_ceil(super::column::ROW_GROUP_SIZE) {
+        return Err(invalid("row group count mismatch"));
+    }
+    checked_end(data, pos, num_groups, 8)?;
     let mut row_groups = Vec::with_capacity(num_groups);
+    let mut next_start = 0;
     for _ in 0..num_groups {
         let start_idx = read_u32(data, &mut pos)?;
         let end_idx = read_u32(data, &mut pos)?;
+        let expected_end = (next_start + super::column::ROW_GROUP_SIZE).min(row_count);
+        if start_idx as usize != next_start || end_idx as usize != expected_end {
+            return Err(invalid("invalid row group range"));
+        }
+        next_start = expected_end;
         let mut group_zone_maps = Vec::with_capacity(col_count);
         for _ in 0..col_count {
             let min = read_value(data, &mut pos)?;
             let max = read_value(data, &mut pos)?;
             let nc = read_u32(data, &mut pos)?;
             let rc = read_u32(data, &mut pos)?;
+            if nc > rc || rc != end_idx - start_idx {
+                return Err(invalid("invalid group zone-map counts"));
+            }
             group_zone_maps.push(ZoneMap {
                 min,
                 max,
@@ -1292,6 +1438,9 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
         });
     }
 
+    if pos != data.len() {
+        return Err(invalid("trailing volume metadata bytes"));
+    }
     let column_name_map = column_names
         .iter()
         .enumerate()
@@ -1327,4 +1476,204 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
         row_groups,
         column_name_map,
     })
+}
+
+#[cfg(test)]
+mod corruption_tests {
+    use super::*;
+    use crate::core::{Row, SchemaBuilder};
+    use crate::storage::volume::writer::VolumeBuilder;
+
+    fn decode(data: &[u8], tag: u8, rows: usize) -> io::Result<ColumnData> {
+        deserialize_column_block(
+            data,
+            tag,
+            rows,
+            Some(Arc::from(vec![SmartString::from("a")])),
+            DataType::Json,
+        )
+    }
+
+    #[test]
+    fn truncated_and_trailing_column_blocks_fail_for_every_type() {
+        let columns = [
+            (
+                COL_INT64,
+                ColumnData::Int64 {
+                    values: vec![17],
+                    nulls: vec![false],
+                },
+            ),
+            (
+                COL_FLOAT64,
+                ColumnData::Float64 {
+                    values: vec![1.25],
+                    nulls: vec![false],
+                },
+            ),
+            (
+                COL_TIMESTAMP,
+                ColumnData::TimestampNanos {
+                    values: vec![17],
+                    nulls: vec![false],
+                },
+            ),
+            (
+                COL_BOOLEAN,
+                ColumnData::Boolean {
+                    values: vec![true],
+                    nulls: vec![false],
+                },
+            ),
+            (
+                COL_DICTIONARY,
+                ColumnData::Dictionary {
+                    ids: vec![0],
+                    nulls: vec![false],
+                    dictionary: Arc::from(vec![SmartString::from("a")]),
+                },
+            ),
+            (
+                COL_BYTES,
+                ColumnData::Bytes {
+                    data: vec![1, 2],
+                    offsets: vec![(0, 2)],
+                    nulls: vec![false],
+                    ext_type: DataType::Json,
+                },
+            ),
+        ];
+        for (tag, column) in columns {
+            let mut raw = serialize_column_block(&column, 0, 1);
+            assert!(decode(&raw, tag, 1).is_ok());
+            for end in 0..raw.len() {
+                assert!(decode(&raw[..end], tag, 1).is_err(), "tag={tag}, end={end}");
+            }
+            raw.push(0);
+            assert!(decode(&raw, tag, 1).is_err(), "tag={tag}: trailing bytes");
+        }
+    }
+
+    #[test]
+    fn bulk_flags_validate_every_byte_before_exposing_booleans() {
+        for len in [0, 1, 31, 32, 33, 64, 65, 257] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 2) as u8).collect();
+            let mut out = vec![true];
+            append_flags(&bytes, &mut out).unwrap();
+            assert_eq!(out.len(), len + 1);
+            assert!(out[0]);
+            assert!(out[1..]
+                .iter()
+                .zip(&bytes)
+                .all(|(&flag, &byte)| flag == (byte == 1)));
+            if len == 0 {
+                continue;
+            }
+            for offset in [0, len / 2, len - 1] {
+                for invalid in 2..=u8::MAX {
+                    let mut damaged = bytes.clone();
+                    damaged[offset] = invalid;
+                    let before = out.clone();
+                    let capacity = out.capacity();
+                    assert!(append_flags(&damaged, &mut out).is_err());
+                    assert_eq!(out, before);
+                    assert_eq!(out.capacity(), capacity);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_overflowing_counts_offsets_and_invalid_flags() {
+        assert!(decode(&[], COL_INT64, usize::MAX).is_err());
+        let mut raw = serialize_column_block(
+            &ColumnData::Bytes {
+                data: vec![7],
+                offsets: vec![(0, 1)],
+                nulls: vec![false],
+                ext_type: DataType::Json,
+            },
+            0,
+            1,
+        );
+        raw[1..9].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decode(&raw, COL_BYTES, 1).is_err());
+        raw[1..9].copy_from_slice(&1u64.to_le_bytes());
+        raw[9..17].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert!(decode(&raw, COL_BYTES, 1).is_err());
+        let mut null_flag = vec![0u8; 9];
+        null_flag[0] = 2;
+        assert!(decode(&null_flag, COL_INT64, 1).is_err());
+        assert!(decode(&[0, 2], COL_BOOLEAN, 1).is_err());
+        assert!(decode(&[0, 1, 0, 0, 0], COL_DICTIONARY, 1).is_err());
+        assert!(decode(&[], 255, 0).is_err());
+    }
+
+    #[test]
+    fn append_decoder_rejects_malformed_layout_without_new_group_allocation() {
+        let mut nulls = vec![];
+        let mut values = vec![];
+        assert!(deserialize_column_block_into(
+            &[0, 2],
+            COL_BOOLEAN,
+            1,
+            &mut nulls,
+            None,
+            None,
+            None,
+            Some(&mut values),
+            None,
+            None
+        )
+        .is_err());
+        let mut bytes = vec![];
+        let mut offsets = vec![];
+        let mut raw = vec![0u8; 33];
+        raw[1..9].copy_from_slice(&2u64.to_le_bytes());
+        assert!(deserialize_column_block_into(
+            &raw,
+            COL_BYTES,
+            1,
+            &mut nulls,
+            None,
+            None,
+            None,
+            None,
+            Some(&mut bytes),
+            Some(&mut offsets)
+        )
+        .is_err());
+        assert!(bytes.is_empty() && offsets.is_empty());
+    }
+
+    #[test]
+    fn metadata_rejects_unbounded_counts_bad_identity_and_trailing_bytes() {
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("s", DataType::Text, false, false)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Integer(1), Value::text("a")]),
+        );
+        builder.add_row(
+            2,
+            &Row::from_values(vec![Value::Integer(2), Value::text("b")]),
+        );
+        let mut volume = builder.finish();
+        let raw = serialize_volume_metadata(&volume).unwrap();
+        assert!(deserialize_volume_metadata(&raw).is_ok());
+        let mut bad = raw.clone();
+        bad[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(deserialize_volume_metadata(&bad).is_err());
+        let mut bad = raw.clone();
+        bad[24..28].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(deserialize_volume_metadata(&bad).is_err());
+        let mut bad = raw;
+        bad.push(0);
+        assert!(deserialize_volume_metadata(&bad).is_err());
+        Arc::make_mut(&mut volume.meta).row_ids.swap(0, 1);
+        assert!(deserialize_volume_metadata(&serialize_volume_metadata(&volume).unwrap()).is_err());
+    }
 }

@@ -55,6 +55,15 @@ pub trait Transaction: Send {
     /// Rolls back the transaction
     fn rollback(&mut self) -> Result<()>;
 
+    /// Starts an internal statement checkpoint. False means a surrounding
+    /// statement already owns one, or the engine needs none.
+    fn begin_statement(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Restore only this statement's changes when success is false.
+    fn finish_statement(&mut self, _success: bool) {}
+
     /// Creates a savepoint with the given name
     ///
     /// Records the current state so it can be rolled back to later.
