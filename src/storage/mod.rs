@@ -21,6 +21,7 @@
 //! - Configuration types
 //! - MVCC (Multi-Version Concurrency Control) engine
 
+pub mod catalog;
 pub mod config;
 pub mod expression;
 pub mod index;
