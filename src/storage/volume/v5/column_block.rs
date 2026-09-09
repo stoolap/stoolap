@@ -42,6 +42,8 @@
 //! entries are strictly sorted and unique within this block. Existing V4
 //! insertion-order dictionaries can use PlainTextFromDictionary without
 //! walking unused dictionary entries or allocating a remapping table.
+//! A spooled gather can retain a BorrowedTextDictionary over one group-local
+//! UTF-8 blob and offset buffer, avoiding one SmartString allocation per key.
 
 use std::fmt;
 
@@ -177,6 +179,70 @@ pub enum ColumnInput<'a> {
         ids: &'a [u32],
         dictionary: &'a [SmartString],
     },
+    /// Same sorted group-local dictionary encoding, borrowing a checked view
+    /// over the caller's blob/offset buffers. IDs are already remapped by the
+    /// caller; this codec neither sorts nor builds a per-cell remapping table.
+    BorrowedDictionaryText {
+        ids: &'a [u32],
+        dictionary: &'a BorrowedTextDictionary<'a>,
+    },
+}
+
+/// Immutable, sorted, unique text dictionary over caller-owned group buffers.
+/// Offsets are native u32 byte positions, include the initial zero and terminal
+/// blob length, and delimit UTF-8 characters. Validation allocates nothing and
+/// scans the blob once for UTF-8; adjacent ordering checks are linear in total
+/// dictionary bytes. Reusing the view never repeats UTF-8/order validation.
+/// The full encoded column must still fit the caller's lower ColumnLimits.
+#[derive(Clone, Copy, Debug)]
+pub struct BorrowedTextDictionary<'a> {
+    text: &'a str,
+    offsets: &'a [u32],
+}
+impl<'a> BorrowedTextDictionary<'a> {
+    pub fn new(blob: &'a [u8], offsets: &'a [u32]) -> Result<Self> {
+        let count = offsets.len().checked_sub(1).ok_or(ColumnError::Offsets)?;
+        if count > MAX_BLOCK_ROWS as usize {
+            return Err(ColumnError::DictionaryLimit);
+        }
+        if blob.len() > MAX_DECODED_BYTES {
+            return Err(ColumnError::ByteLimit);
+        }
+        if offsets[0] != 0
+            || offsets[count] as usize != blob.len()
+            || offsets.windows(2).any(|pair| pair[0] > pair[1])
+        {
+            return Err(ColumnError::Offsets);
+        }
+        let text = std::str::from_utf8(blob).map_err(|_| ColumnError::Utf8)?;
+        let mut previous = None;
+        for pair in offsets.windows(2) {
+            let value = text
+                .get(pair[0] as usize..pair[1] as usize)
+                .ok_or(ColumnError::Utf8)?;
+            if previous.is_some_and(|old| old >= value) {
+                return Err(ColumnError::DictionaryOrder);
+            }
+            previous = Some(value);
+        }
+        Ok(Self { text, offsets })
+    }
+    pub const fn len(self) -> usize {
+        self.offsets.len() - 1
+    }
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+    pub fn get(self, id: usize) -> Option<&'a str> {
+        let start = *self.offsets.get(id)? as usize;
+        let end = *self.offsets.get(id.checked_add(1)?)? as usize;
+        self.text.get(start..end)
+    }
+    pub fn iter(self) -> impl ExactSizeIterator<Item = &'a str> {
+        self.offsets
+            .windows(2)
+            .map(|pair| &self.text[pair[0] as usize..pair[1] as usize])
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,6 +470,23 @@ impl<'a> ColumnEncodePlan<'a> {
                 }
                 Encoding::DictionaryText
             }
+            ColumnInput::BorrowedDictionaryText { ids, dictionary } => {
+                validate_fixed(ids.len(), n, dt, DataType::Text)?;
+                dictionary_count = dictionary.len();
+                if dictionary_count > n || dictionary_count > limits.dictionary_entries as usize {
+                    return Err(ColumnError::DictionaryLimit);
+                }
+                for pair in dictionary.offsets.windows(2) {
+                    validate_cell_length((pair[1] - pair[0]) as usize, limits)?;
+                }
+                blob_bytes = add_blob(0, dictionary.text.len(), limits)?;
+                for (i, &id) in ids.iter().enumerate() {
+                    if !nulls[i] && id as usize >= dictionary_count {
+                        return Err(ColumnError::DictionaryId);
+                    }
+                }
+                Encoding::DictionaryText
+            }
         };
         let shape = Shape::new(expect, encoding, dictionary_count, blob_bytes, limits)?;
         Ok(Self {
@@ -511,6 +594,21 @@ impl<'a> ColumnEncodePlan<'a> {
                     position += text.len();
                     put32(offsets, (i + 1) * 4, position as u32);
                 }
+            }
+            ColumnInput::BorrowedDictionaryText { ids, dictionary } => {
+                let (id_bytes, rest) = body.split_at_mut(s.count * 4);
+                for (i, bytes) in id_bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    *bytes = if self.nulls[i] { 0 } else { ids[i] }.to_le_bytes();
+                }
+                let (offsets, blob) = rest.split_at_mut((s.dictionary_count + 1) * 4);
+                for (offset, bytes) in dictionary
+                    .offsets
+                    .iter()
+                    .zip(offsets.as_chunks_mut::<4>().0)
+                {
+                    *bytes = offset.to_le_bytes();
+                }
+                blob.copy_from_slice(dictionary.text.as_bytes());
             }
         }
         Ok(s.total)
@@ -973,6 +1071,9 @@ fn get32(b: &[u8], p: usize) -> u32 {
 fn get64(b: &[u8], p: usize) -> u64 {
     u64::from_le_bytes(b[p..p + 8].try_into().expect("checked column shape"))
 }
+
+#[cfg(test)]
+mod borrowed_dictionary_tests;
 
 #[cfg(test)]
 mod tests {

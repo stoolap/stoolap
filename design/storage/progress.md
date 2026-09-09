@@ -107,10 +107,10 @@ durability remain the caller's responsibility. No module opens or deletes files.
 
 Independent review and re-review passed after fixing UTF-8 rescans, exact deep
 directory validation, timestamp range/leap preservation and mixed legacy/new
-source conversion. Current V5 tests pass 86/86. Allocation integrations pass
+source conversion. Current V5 tests pass 90/90. Allocation integrations pass
 6/6 for shared envelope/directory/identity operations, 3/3 for columns and
 compression, 1/1 for external descriptor sorting and 1/1 for complete payload
-emission, all with zero allocation calls inside the
+emission, plus 1/1 for borrowed dictionaries, all with zero allocation calls inside the
 measured codec operations. Caller-owned scratch and test backing storage are
 outside those allocation meters; these results do not prove an engine budget.
 All-target clippy with test failpoints and Rust 1.88 all-feature compilation pass.
@@ -135,6 +135,14 @@ producer can encode a column larger than the stored-page cap when its compressed
 representation fits. Independent review and fresh tests cover both Raw and LZ4,
 empty volumes, zero-column groups, 65-group directory boundaries, fault and
 panic handling, and zero allocations during the complete emission loops.
+
+Group-local dictionaries can now borrow a single UTF-8 blob and offset array.
+A checked immutable view validates offsets, character boundaries and sorted
+uniqueness once; planning and encoding reuse that proof without constructing a
+SmartString for every key. Existing dictionary wire bytes and NULL-ID behavior
+are preserved. Four independent compatibility/limit tests and a zero-allocation
+test pass, including 4,096 rows and 4,096 distinct entries. The input enum remains
+40 bytes on 64-bit targets. The full V5 suite and Rust 1.88 compilation pass.
 
 The stage remains incomplete: bounded payload capture/spill, actual streaming
 seal integration, reservation ownership, durable identity activation and
