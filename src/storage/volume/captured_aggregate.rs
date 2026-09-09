@@ -571,26 +571,54 @@ impl<'a> GroupColumns<'a> {
         let _ = self.columns[physical].set(column);
         Ok(())
     }
-    fn dictionary_candidates(
+    fn dictionary_selection(
         &self,
         predicates: &[Option<DictionaryPredicate>],
-        start: usize,
-        count: usize,
-        out: &mut Vec<usize>,
-    ) -> Result<()> {
-        out.clear();
+    ) -> Result<DictionarySelection<'_>> {
         let mut filters: SmallVec<[DictFilter<'_>; DICTIONARY_PREFIX]> = SmallVec::new();
         for predicate in predicates {
             let predicate = predicate.as_ref().expect("dictionary equality prefix");
             // Missing targets prove the conjunction empty, including NULL rows.
             let Some(target) = predicate.target else {
-                return Ok(());
+                return Ok(DictionarySelection { filters: None });
             };
             let (column, offset) = self.columns[predicate.physical].get().unwrap().data();
-            filters.push((column, offset + start, target));
+            filters.push((column, offset, target));
         }
-        ColumnData::dict_matching_offsets(&filters, count, out)
-            .ok_or_else(|| Error::internal("invalid captured dictionary predicate window"))
+        // A small sample chooses a promising leading filter without assuming
+        // that dictionary cardinality predicts frequency. All filters here
+        // are infallible equalities in the original leading conjunction; no
+        // scalar predicate or its error ordering moves. Sample once per group,
+        // not once per window, and retain only borrowed column references.
+        if filters.len() > 1 && self.count >= 128 {
+            let mut leading = 0;
+            let mut fewest = usize::MAX;
+            for (index, &(column, offset, target)) in filters.iter().enumerate() {
+                let (ids, nulls) = column.dict_ids().expect("bound dictionary predicate");
+                let end = offset
+                    .checked_add(64)
+                    .ok_or_else(|| Error::internal("captured dictionary sample offset overflow"))?;
+                let ids = ids
+                    .get(offset..end)
+                    .ok_or_else(|| Error::internal("captured dictionary sample exceeds column"))?;
+                let nulls = nulls.get(offset..end).ok_or_else(|| {
+                    Error::internal("captured dictionary sample exceeds null flags")
+                })?;
+                let matches = ids
+                    .iter()
+                    .zip(nulls)
+                    .filter(|&(id, null)| *id == target && !null)
+                    .count();
+                if matches < fewest {
+                    leading = index;
+                    fewest = matches;
+                }
+            }
+            filters.swap(0, leading);
+        }
+        Ok(DictionarySelection {
+            filters: Some(filters),
+        })
     }
 
     fn get(&self, logical: usize, local: usize) -> Cell<'_> {
@@ -622,6 +650,25 @@ impl<'a> GroupColumns<'a> {
             }
         };
         BoundAggregate { operation, source }
+    }
+}
+
+struct DictionarySelection<'a> {
+    // None proves the conjunction empty; Some([]) is the unfiltered case.
+    filters: Option<SmallVec<[DictFilter<'a>; DICTIONARY_PREFIX]>>,
+}
+impl DictionarySelection<'_> {
+    fn candidates(&self, start: usize, count: usize, out: &mut Vec<usize>) -> Result<()> {
+        out.clear();
+        let Some(filters) = &self.filters else {
+            return Ok(());
+        };
+        let window: SmallVec<[DictFilter<'_>; DICTIONARY_PREFIX]> = filters
+            .iter()
+            .map(|&(column, offset, target)| (column, offset + start, target))
+            .collect();
+        ColumnData::dict_matching_offsets(&window, count, out)
+            .ok_or_else(|| Error::internal("invalid captured dictionary predicate window"))
     }
 }
 
@@ -895,6 +942,8 @@ fn run(
                 if dictionary_prefix != 0 && candidates.capacity() == 0 {
                     candidates.reserve_exact(DICTIONARY_WINDOW);
                 }
+                let dictionary_selection =
+                    columns.dictionary_selection(&dictionary_predicates[..dictionary_prefix])?;
                 candidates.clear();
                 let mut candidate_position = 0;
                 let mut window_start = 0;
@@ -913,8 +962,7 @@ fn run(
                             }
                             window_start = window_end;
                             window_end = (window_start + DICTIONARY_WINDOW).min(ids.len());
-                            columns.dictionary_candidates(
-                                &dictionary_predicates[..dictionary_prefix],
+                            dictionary_selection.candidates(
                                 window_start,
                                 window_end - window_start,
                                 &mut candidates,
@@ -1986,6 +2034,67 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn dictionary_sample_is_only_a_hint_and_keeps_later_window_matches() {
+        let schema = schema();
+        for warm in [false, true] {
+            let (registry, store) = store(&schema);
+            let manager = SegmentManager::new("aggregate", None);
+            let rows: Vec<_> = (1..=DICTIONARY_WINDOW + 65)
+                .map(|id| {
+                    // The second target has zero sample hits but matches in
+                    // later windows. NULL has the target's dictionary ID on
+                    // some rows and must still be excluded.
+                    let mut value = row(
+                        id as i64,
+                        if id <= 64 || id % 3 == 0 { "a" } else { "b" },
+                        if id <= 64 { "y" } else { "x" },
+                        id as i64,
+                    );
+                    if id % 17 == 0 {
+                        value.set(2, Value::Null(DataType::Text)).unwrap();
+                    }
+                    (id as i64, value)
+                })
+                .collect();
+            add_segment(&manager, &schema, 1, &rows, warm);
+            let (_, generation) = manager.capture_with_hot(|| ()).unwrap();
+            let view = CapturedHotView::new(
+                store.capture_hot_root(),
+                registry.capture_read_epoch(),
+                None,
+            );
+            let pending = FxHashSet::from_iter([69, 1026]);
+            let mut expression = AndExpr::new(vec![
+                Box::new(ComparisonExpr::eq("a", Value::text("a"))),
+                Box::new(ComparisonExpr::eq("b", Value::text("x"))),
+            ]);
+            expression.prepare_for_schema(&schema);
+            let expected: Vec<_> = rows
+                .iter()
+                .filter(|(id, row)| !pending.contains(id) && expression.evaluate(row).unwrap())
+                .collect();
+            assert!(!expected.is_empty());
+            assert!(expected
+                .iter()
+                .any(|(id, _)| *id > DICTIONARY_WINDOW as i64));
+            assert_eq!(
+                filtered(
+                    &schema,
+                    &view,
+                    Some((&generation, &pending)),
+                    &[(AggregateOp::CountStar, 0), (AggregateOp::Sum, 3)],
+                    &expression,
+                )
+                .unwrap(),
+                Some(vec![
+                    Value::Integer(expected.len() as i64),
+                    Value::Integer(expected.iter().map(|(id, _)| *id).sum()),
+                ]),
+            );
         }
     }
 

@@ -104,3 +104,51 @@ at 93,604 versus 93,620. The 16-byte excess is the conservative account-object
 allowance. The test-owned payload and receipt-handle vector are allocated before
 the measured interval so these probes isolate structural arena/receipt capacity.
 They do not time allocations or claim to measure RSS.
+
+
+## Phase 3
+
+[Phase 3 results](phase-03.json) compare the final Phase 2 source against fixed
+read epochs, coherent hot/cold execution and verified file leases. The fixture
+and release settings are unchanged; all three five-pair comparisons pass the
+same latency/noise gate. Raw records for every measured phase, including
+allocator counters and both concurrent workers, are preserved with source and
+binary hashes. Allocation-call percentages below refer specifically to `alloc`;
+`alloc_zeroed` and `realloc` have separate counters in the raw data.
+
+| Metric | Narrow | Wide | 10,000-operation case |
+|---|---:|---:|---:|
+| Warm aggregate p50 | -28.49% | -27.39% | -29.74% |
+| Warm aggregate alloc calls | -41.94% | -41.94% | -41.94% |
+| Warm aggregate requested bytes | -65.92% | -51.66% | -65.92% |
+| Hot PK p50 | -17.64% | -10.80% | -12.93% |
+| UPDATE p50 | -96.90% | -74.32% | -97.11% |
+| UPDATE alloc calls | -13.30% | -10.31% | -13.33% |
+| INSERT p50 | +11.11% | +5.49% | +3.80% |
+| INSERT p99 | +2.82% | +13.72% | +19.57% |
+| Sealed PK p50 | -95.22% | -82.60% | -95.77% |
+
+The UPDATE and sealed-PK improvements reflect avoiding broad row selection for
+single-PK statements in this fixture. They are not a general throughput claim.
+INSERT alloc calls are unchanged. Its short narrow median increases from
+2,250 to 2,500 ns; the 250 ns difference stays below its 418 ns twice-range
+threshold. Concurrent wide writer p50/p99 increase 10.26%/15.26%, within that
+run's noise gate, while reader p50/p99 change -1.66%/-0.57%. The report retains
+these costs; it does not claim every operation is faster.
+
+An earlier long warm-aggregate comparison failed: +5.51% p50 and +6.32% total
+time exceeded the stated noise thresholds. Profiling the actual release crate
+identified dictionary selection as the dominant CPU cost. The captured group
+now binds its infallible leading equality filters once and uses a bounded
+64-row sample to choose the leading filter. The sample changes only execution
+order; it never proves absence or changes scalar-predicate error ordering.
+A misleading-zero-hit-sample regression verifies later-window matches, NULLs
+and visibility against scalar evaluation. The failed comparison is retained.
+
+UPDATE retained deltas increase 12.94–22.08%, while extra requested heap peaks
+fall 7.07–61.54%. Post-checkpoint total requested live heap is 37,981,017 bytes
+narrow, 95,052,058 wide and 42,226,172 long, versus 38,639,896, 95,066,073 and
+42,426,299 in the matched baseline. A positive change of the negative checkpoint
+retained delta means less memory released during that phase, not a larger final
+engine total. Reopen/first-touch observations remain OS-cache uncontrolled.
+These measurements neither establish RSS nor activate the later hard budgets.
