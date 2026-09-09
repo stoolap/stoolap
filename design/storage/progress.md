@@ -107,12 +107,18 @@ durability remain the caller's responsibility. No module opens or deletes files.
 
 Independent review and re-review passed after fixing UTF-8 rescans, exact deep
 directory validation, timestamp range/leap preservation and mixed legacy/new
-source conversion. Current V5 tests pass 73/73. Allocation integrations pass
+source conversion. Current V5 tests pass 75/75. Allocation integrations pass
 6/6 for shared envelope/directory/identity operations, 2/2 for columns and 1/1
 for external descriptor sorting, all with zero allocation calls inside the
 measured codec operations. Caller-owned scratch and test backing storage are
 outside those allocation meters; these results do not prove an engine budget.
 All-target clippy with test failpoints passes.
+
+Logical volume shape is now checked before a directory exists. The staged
+writer's checkpoint assertion is separate from installed-file read evidence;
+encoding does not authorize legacy decoding or acknowledge durability. This
+separation passed independent review, wire regressions and unchanged allocation
+gates. Completed roots still require their actual directory and exact counts.
 
 The stage remains incomplete: bounded payload capture/spill, actual streaming
 seal integration, reservation ownership, durable identity activation and
