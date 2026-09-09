@@ -401,6 +401,10 @@ struct StopAfterIndexAdd {
 }
 
 impl Index for StopAfterIndexAdd {
+    fn memory_account(&self) -> Option<&stoolap::common::MemoryAccount> {
+        self.inner.memory_account()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
