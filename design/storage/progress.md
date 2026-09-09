@@ -12,7 +12,7 @@ independently reviewable without claiming unmerged work is shipped.
 | 3 | Coherent two-layer execution | Pending | Pending | — |
 | 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
 | 5 | Remover, durable WAL/catalog and pressure seal | Catalog foundations implemented; lifecycle integration pending | Foundations passed independent review | — |
-| 6 | Paged reads, four ledgers and DML preflight | Pending | Pending | — |
+| 6 | Paged reads, four ledgers and DML preflight | Bounded legacy decompression implemented; reader and admission integration pending | Decoder passed independent review | — |
 | 7 | Explicit clustering and compatibility fallback | Pending | Pending | — |
 | 8 | Identity-first compaction and bounded migration | Pending | Pending | — |
 | 9 | Index ownership, write batching and allocation reduction | Pending | Pending | — |
@@ -113,3 +113,25 @@ This stage remains incomplete: engine DDL/WAL identity wiring, complete legacy
 bootstrap, durable installation/receipts, witness/remover coordination and
 memory-pressure activation are still required. The codec descriptor cannot
 acknowledge durability, and production lifecycle behavior is not enabled.
+
+## Phase 6 legacy decoder foundation
+
+The inactive raw LZ4 decoder streams a block from a caller-owned reader into a
+caller-owned sink using a 64 KiB history ring and bounded input/output scratch.
+Literal copies and overlapping matches use bulk spans. Declared stored/decoded
+lengths bound every operation, and an error or unwinding callback leaves the
+decoder aborted. Short and interrupted I/O, invalid reported byte counts and
+following-block boundaries are covered. No whole-block allocation is required.
+
+Root and independent review passed after correcting byte-count validation.
+Seven unit tests and two allocation tests pass. A real file-to-file fixture
+larger than 32 MiB used 80 KiB caller scratch and observed zero allocation calls
+during decoding; every output byte was verified. This raw fixture does not yet
+exercise actual V4 column conversion. Rust 1.88 all-feature compilation and
+no-default/failpoint clippy pass.
+
+Actual V4 column subdivision and paged dictionaries, outer checksum validation,
+V5 reader activation, managed file ownership, the four retained-memory ledgers
+and bounded DML admission remain required. Scratch reservations and temporary
+file lifetime belong to that later coordinator; this decoder neither installs
+files nor establishes an engine-wide memory bound.
