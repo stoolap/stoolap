@@ -1,47 +1,44 @@
 # Storage implementation progress
 
-Baseline: `9cf15ea4`. Each phase is a separate dependent PR. The previous
-phase is the next PR's base until the stack is merged. This keeps each diff
-independently reviewable without claiming unmerged work is shipped.
+The [plan](plan.md) and [contracts](contracts.md) define the accepted design.
+Each implementation phase has a separate dependent pull request. A component
+with no engine caller does not count as an implemented phase.
 
-| Phase | Deliverable | Status | Review | PR |
-|---|---|---|---|---|
-| 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
-| 1 | Fallible access and complete statement rollback | Pending | Pending | — |
-| 2 | Chunked arena and retained-hot accounting | Pending | Pending | — |
-| 3 | Coherent two-layer execution | Pending | Pending | — |
-| 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
-| 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |
-| 6 | Paged reads, four ledgers and DML preflight | Pending | Pending | — |
-| 7 | Explicit clustering and compatibility fallback | Pending | Pending | — |
-| 8 | Identity-first compaction and bounded migration | Pending | Pending | — |
-| 9 | Index ownership, write batching and allocation reduction | Pending | Pending | — |
+| Phase | Deliverable | Status | PR |
+|---|---|---|---|
+| 0 | Lifecycle contracts and validation rules | Design accepted | [#115](https://github.com/stoolap/stoolap/pull/115) |
+| 1 | Fallible cold access and statement rollback | Engine implementation present; cleanup verification in progress | [#116](https://github.com/stoolap/stoolap/pull/116) |
+| 2 | Releasable chunks and retained hot accounting | Engine implementation present; dependency cleanup and verification in progress | [#117](https://github.com/stoolap/stoolap/pull/117) |
+| 3 | Coherent hot/cold reads | Draft; cleanup and final abort-publication correction remain | [#118](https://github.com/stoolap/stoolap/pull/118) |
+| 4 | Bounded streaming seal | Incomplete; unintegrated V5 prototype withdrawn | [#119](https://github.com/stoolap/stoolap/pull/119) |
+| 5 | Durable lifecycle and pressure seal | Incomplete; unintegrated catalog and WAL prototypes withdrawn | [#120](https://github.com/stoolap/stoolap/pull/120) |
+| 6 | Paged residency and engine memory budgets | Frozen until phases 2 and 3 are clean; existing adapters are component work only | [#121](https://github.com/stoolap/stoolap/pull/121) |
+| 7 | Explicit clustering | Not started | |
+| 8 | Compaction and migration | Not started | |
+| 9 | Index ownership and write batching | Not started | |
 
-Backup and restore are outside this sequence. The temporary lifecycle probe
-in examples is used for local measurements; it is not an engine feature.
+## Review requirements
 
-## Phase 0
+Each claimed engine behavior needs a SQL or public-API regression that fails
+on the phase's parent. Format, strict Clippy, touched test targets, the default
+nextest suite and storage tests with `test-filedb` are recorded in each PR.
+Helper allocation tests establish only their own scope. Hot accounting does
+not enforce a hard engine memory limit or measure process RSS.
 
-The normative protocols are in [contracts.md](contracts.md). They refine the
-accepted [plan](plan.md) with read epochs, stable source LSNs, bounded witness
-records, pressure reservations and a file-backed writer result. Claimed rows
-are deferred by the remover until commit/abort instead of guessing a tombstone
-sequence. All implementation phases remain pending until their tests,
-measurements and review are recorded here.
+Raw measurements, temporary probes and withdrawn prototypes are kept outside
+the repository. PR descriptions contain the relevant measurements, profiles,
+ranges and limitations. Historical alternating-run timings require reproduction
+under the current measurement protocol before supporting performance claims.
 
-Independent review covered MVCC/publication/recovery, format/compatibility,
-and memory/progress. Re-review found no remaining blockers after correcting:
+## Remaining Phase 3 aggregate migration
 
-- permanent in-flight exclusions in seal/GC horizons;
-- claim ownership through terminal transaction outcome;
-- all-table publication undo and indeterminate COMMIT-I/O handling;
-- monotonic durable manifest/catalog installation;
-- deletion witness retirement gated by the durable WAL replay floor;
-- a complete legacy upgrade generation and Phase 4 identity gating;
-- streaming/subdivision of large V4 data blocks, not only metadata.
+Before #118 leaves draft, the final read-epoch binding cleanup removes the
+legacy `SegmentedTable::compute_filtered_aggregates` and
+`SegmentedTable::compute_grouped_aggregates` bodies. Captured views remain the
+SQL path; unbound `SegmentedTable` handles decline these optional pushdowns
+with `Ok(None)`. The existing hot-only `MVCCTable` fallback is outside this step.
+The two direct error fixtures must use epoch-bound tables, including a fresh
+binding after registering another segment. Their obsolete comparison helpers
+are removed with the legacy bodies.
 
-The baseline lifecycle probe passed row/checksum and allocator-balance checks
-with 20,000 rows/64-byte payloads and a 4,096-row/4,096-byte variant including
-concurrent ingest and analytics. These are baseline observations, not achieved
-performance gains or proof of the future budget. CI also runs for dependent
-storage PR branches so each phase receives its own checks.
+Backup and restore remain outside this sequence.

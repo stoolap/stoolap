@@ -489,7 +489,11 @@ no-default-feature build. Broad suite runs follow integration milestones.
 The lifecycle probe records input size, value width, repetitions, build,
 allocator and cache state with p50/p95/p99 plus allocator live/peak bytes and
 allocation calls. Reopening a file is not claimed to flush the OS cache.
-Compare five alternating baseline/candidate runs; report medians and spread.
+Use a dedicated probe for the changed operation. Run each build several times
+in isolation and report its range, build profile and concurrent machine load.
+Do not alternate builds: process position has produced misleading differences
+on the measurement host. Earlier alternating-run timings require reproduction
+with this protocol before they can establish a performance result.
 The initial writer acceptance threshold is no regression exceeding both
 5% and twice the measured run-to-run noise at equal offered load. A larger
 regression blocks readiness pending diagnosis. Benchmark instrumentation is
