@@ -26,6 +26,7 @@
 use std::sync::Arc;
 
 use crate::core::{Error, Result, Row, Value};
+use crate::storage::mvcc::version_store::CapturedHotView;
 use crate::storage::traits::Scanner;
 
 use super::writer::FrozenVolume;
@@ -78,6 +79,18 @@ impl GroupColumnCache {
     }
 }
 
+/// Statement visibility is resolved once for the requested part of each row
+/// group, before any predicate column is loaded. Boxing keeps legacy scanners
+/// at one pointer of overhead; the bitmap never grows with table cardinality.
+struct CapturedVisibility {
+    view: Arc<CapturedHotView>,
+    pending: Arc<rustc_hash::FxHashSet<i64>>,
+    hidden: smallvec::SmallVec<[u64; 4]>,
+    group: Option<usize>,
+    start: usize,
+    all_hidden: bool,
+}
+
 /// Scanner over a frozen volume that implements the `Scanner` trait.
 ///
 /// Reconstructs rows lazily from column-major data, projecting only
@@ -89,6 +102,9 @@ pub struct VolumeScanner {
     volume: Arc<FrozenVolume>,
     /// Column indices to project (empty = all columns)
     project_cols: Vec<usize>,
+    /// An empty projection requests every logical schema column, including
+    /// columns added after this physical volume was written.
+    projects_all_columns: bool,
     /// Pre-computed flag: true when project_cols is an identity mapping over
     /// all volume columns. Avoids recomputing this check on every row.
     is_full_projection: bool,
@@ -166,9 +182,102 @@ pub struct VolumeScanner {
     group_candidates: Vec<usize>,
     /// The group `group_candidates` was computed for
     candidates_group: Option<usize>,
+    captured_visibility: Option<Box<CapturedVisibility>>,
 }
 
 impl VolumeScanner {
+    /// Bind a fixed statement before installing its filter or starting the
+    /// scan. The view supplies the same epoch for hot rows and tombstones.
+    /// Pending deletes are the transaction's frozen statement overlay.
+    pub fn set_captured_visibility(
+        &mut self,
+        view: Arc<CapturedHotView>,
+        pending: Arc<rustc_hash::FxHashSet<i64>>,
+    ) {
+        // Short ranges, especially a primary-key point read, need only their
+        // own bits. Larger scans reuse at most one physical group's bitmap.
+        let words = self
+            .end_idx
+            .saturating_sub(self.current_idx)
+            .min(super::column::ROW_GROUP_SIZE)
+            .div_ceil(64);
+        let mut hidden = smallvec::SmallVec::new();
+        hidden.resize(words, 0);
+        self.captured_visibility = Some(Box::new(CapturedVisibility {
+            view,
+            pending,
+            hidden,
+            group: None,
+            start: 0,
+            all_hidden: false,
+        }));
+        // Preserve a previously selected reverse direction. Captured scans
+        // cannot eagerly inspect dictionary columns in later hidden groups.
+        self.ordered_walk = true;
+        self.matching_indices = None;
+        self.match_idx = 0;
+        self.next_group_boundary = 0;
+        self.candidates_group = None;
+        self.group_candidates.clear();
+    }
+
+    /// Returns true when every requested row in this group is hidden. The
+    /// initial bounds remain valid as the forward/reverse cursor advances.
+    fn prepare_captured_group(&mut self, group: usize, lo: usize, hi: usize) -> bool {
+        let Some(policy) = &mut self.captured_visibility else {
+            return false;
+        };
+        if policy.group == Some(group) {
+            return policy.all_hidden;
+        }
+        let ids = &self.volume.meta.row_ids[lo..hi];
+        policy.view.mark_authoritative(ids, &mut policy.hidden);
+        policy.start = lo;
+        policy.group = Some(group);
+        if self.visibility_bitmap.is_none()
+            && policy.pending.is_empty()
+            && self
+                .committed_tombstones
+                .as_ref()
+                .is_none_or(|tombstones| tombstones.is_empty())
+        {
+            // The authority writer clears unused tail bits; counting bounded
+            // words avoids another row pass when cold exclusions are absent.
+            policy.all_hidden = policy.hidden[..ids.len().div_ceil(64)]
+                .iter()
+                .map(|bits| bits.count_ones() as usize)
+                .sum::<usize>()
+                == ids.len();
+            return policy.all_hidden;
+        }
+        policy.all_hidden = true;
+        for (local, &id) in ids.iter().enumerate() {
+            let global = lo + local;
+            let hidden = self.visibility_bitmap.as_ref().is_some_and(|bitmap| {
+                bitmap
+                    .get(global / 64)
+                    .is_some_and(|word| word & (1u64 << (global % 64)) == 0)
+            }) || policy.pending.contains(&id)
+                || self
+                    .committed_tombstones
+                    .as_ref()
+                    .is_some_and(|tombstones| {
+                        tombstones.get(&id).is_some_and(|&sequence| {
+                            i64::try_from(sequence).is_ok_and(|sequence| {
+                                policy.view.epoch().admits_commit_sequence(sequence)
+                            })
+                        })
+                    });
+            let bit = 1u64 << (local % 64);
+            let word = &mut policy.hidden[local / 64];
+            if hidden {
+                *word |= bit;
+            }
+            policy.all_hidden &= *word & bit != 0;
+        }
+        policy.all_hidden
+    }
+
     /// Rows in the volume's order, from the start (ascending) or from the end
     /// (descending), without the eager dictionary pre-scan over the range
     pub fn set_ordered_walk(&mut self, ascending: bool) {
@@ -242,6 +351,14 @@ impl VolumeScanner {
             let idx = self.end_idx - 1;
             let group_idx = idx / super::column::ROW_GROUP_SIZE;
             let group_start = group_idx * super::column::ROW_GROUP_SIZE;
+            if self.prepare_captured_group(
+                group_idx,
+                group_start.max(self.current_idx),
+                self.end_idx,
+            ) {
+                self.end_idx = group_start.max(self.current_idx);
+                continue;
+            }
             let cached = self.group_cache.as_ref().map(|c| c.group_idx);
             if cached != Some(group_idx) {
                 if let Some(ref skips) = self.row_group_skips {
@@ -258,7 +375,12 @@ impl VolumeScanner {
                     }
                 }
             }
-            if !self.dict_filters.is_empty() && self.candidates_group != Some(group_idx) {
+            // Captured scans test visibility before even dictionary predicates.
+            // Legacy reverse scans can batch candidates for the whole group.
+            if self.captured_visibility.is_none()
+                && !self.dict_filters.is_empty()
+                && self.candidates_group != Some(group_idx)
+            {
                 let lo = group_start.max(self.current_idx);
                 match self.dictionary_candidates(lo, self.end_idx)? {
                     Some(candidates) => {
@@ -283,14 +405,14 @@ impl VolumeScanner {
             } else {
                 idx
             };
+            self.end_idx = idx;
+            if self.should_skip_row(idx) {
+                continue;
+            }
             if self.past_stop_key(idx)? {
                 self.end_idx = self.current_idx;
                 self.has_current = false;
                 return Ok(false);
-            }
-            self.end_idx = idx;
-            if self.should_skip_row(idx) {
-                continue;
             }
             if self.candidates_group != Some(group_idx)
                 && !self.dict_filters.is_empty()
@@ -324,6 +446,7 @@ impl VolumeScanner {
         project_cols: Vec<usize>,
         _delete_vector: Option<()>,
     ) -> Self {
+        let projects_all_columns = project_cols.is_empty();
         let project = if project_cols.is_empty() {
             (0..volume.columns.len()).collect()
         } else {
@@ -336,6 +459,7 @@ impl VolumeScanner {
             end_idx: volume.meta.row_count,
             volume,
             project_cols: project,
+            projects_all_columns,
             is_full_projection,
             current_idx: 0,
             current_row: Row::new(),
@@ -361,6 +485,7 @@ impl VolumeScanner {
             stop_key: None,
             group_candidates: Vec::new(),
             candidates_group: None,
+            captured_visibility: None,
         };
         if !s.is_full_projection && s.volume.columns.should_use_group_cache() {
             let mut mask = vec![false; s.volume.columns.len()];
@@ -382,6 +507,7 @@ impl VolumeScanner {
         end_idx: usize,
         _delete_vector: Option<()>,
     ) -> Self {
+        let projects_all_columns = project_cols.is_empty();
         let project = if project_cols.is_empty() {
             (0..volume.columns.len()).collect()
         } else {
@@ -392,6 +518,7 @@ impl VolumeScanner {
         let mut s = Self {
             volume,
             project_cols: project,
+            projects_all_columns,
             is_full_projection,
             current_idx: start_idx,
             end_idx,
@@ -418,6 +545,7 @@ impl VolumeScanner {
             stop_key: None,
             group_candidates: Vec::new(),
             candidates_group: None,
+            captured_visibility: None,
         };
         if !s.is_full_projection && s.volume.columns.should_use_group_cache() {
             let mut mask = vec![false; s.volume.columns.len()];
@@ -462,6 +590,7 @@ impl VolumeScanner {
     pub fn empty() -> Self {
         Self {
             volume: Arc::new(FrozenVolume {
+                backing: std::sync::OnceLock::new(),
                 columns: super::writer::LazyColumns::empty(),
                 meta: Arc::new(super::writer::VolumeMeta {
                     zone_maps: Vec::new(),
@@ -481,6 +610,7 @@ impl VolumeScanner {
                 last_access_epoch: std::sync::atomic::AtomicU64::new(0),
             }),
             project_cols: Vec::new(),
+            projects_all_columns: true,
             is_full_projection: true,
             current_idx: 0,
             end_idx: 0,
@@ -507,6 +637,7 @@ impl VolumeScanner {
             stop_key: None,
             group_candidates: Vec::new(),
             candidates_group: None,
+            captured_visibility: None,
         }
     }
 
@@ -525,7 +656,12 @@ impl VolumeScanner {
     ) -> Result<()> {
         // Extract dictionary filters for fast pre-filtering.
         // Uses CompressedBlockStore's shared dict when available (no column decompression).
-        let comparisons = filter.collect_comparisons();
+        // Apply logical schema mapping before physical dictionary pruning.
+        let comparisons = if self.column_mapping.is_some() {
+            Vec::new()
+        } else {
+            filter.collect_comparisons()
+        };
         // Only use CompressedBlockStore for dict lookup / group scan when
         // columns are NOT already loaded (deferred volumes from disk).
         // After seal/compaction, eager() pre-loads all OnceLock
@@ -541,7 +677,18 @@ impl VolumeScanner {
             }
             if let Value::Text(s) = value {
                 if let Some(col_idx) = self.volume.column_index(col_name) {
-                    let dict_id = if let Some(st) = store {
+                    let dict_id = if self.captured_visibility.is_some() {
+                        // Optional dictionary narrowing must not force a
+                        // column read before this group's authority mask.
+                        let Some(dictionary) = self.volume.columns.get_column_dictionary(col_idx)
+                        else {
+                            continue;
+                        };
+                        dictionary
+                            .iter()
+                            .position(|value| value.as_str() == s.as_str())
+                            .map(|index| index as u32)
+                    } else if let Some(st) = store {
                         st.dict_lookup(col_idx, s.as_str())
                     } else {
                         self.volume.columns.get(col_idx)?.dict_lookup(s.as_str())
@@ -725,10 +872,9 @@ impl VolumeScanner {
         let mut filter_cols = Vec::new();
         if filter.collect_column_indices(&mut filter_cols) {
             let num_cols = self.volume.columns.len();
-            // Use the larger of volume columns and mapping sources length
-            // to handle schema-evolved volumes.
+            // Filter and projection positions address the logical schema.
             let mask_len = if let Some(ref m) = self.column_mapping {
-                m.sources.len().max(num_cols)
+                m.sources.len()
             } else {
                 num_cols
             };
@@ -847,11 +993,56 @@ impl VolumeScanner {
     }
 
     /// Set a precomputed column mapping for schema-evolved volumes.
-    /// Only stores it if the mapping is non-identity (avoids overhead
-    /// when the volume matches the current schema).
+    /// Install before the filter or iteration. Projection and filter masks use
+    /// logical positions; decompression maps
+    /// those positions back to physical columns when loading a group.
     pub fn set_column_mapping(&mut self, mapping: super::writer::ColumnMapping) {
-        if !mapping.is_identity {
-            self.column_mapping = Some(mapping);
+        if mapping.sources.iter().any(|source| {
+            matches!(source,
+            super::writer::ColSource::Volume(index) if *index >= self.volume.columns.len())
+        }) {
+            self.error = Some(Error::internal("volume column mapping index out of bounds"));
+            self.has_current = false;
+            return;
+        }
+        let logical_columns = mapping.sources.len();
+        if mapping.is_identity
+            && self.column_mapping.is_none()
+            && logical_columns == self.volume.columns.len()
+        {
+            return;
+        }
+        if self.projects_all_columns && self.project_cols.len() != logical_columns {
+            self.project_cols = (0..logical_columns).collect();
+        }
+        self.is_full_projection =
+            Self::compute_is_full_projection(&self.project_cols, logical_columns);
+        self.column_mapping = (!mapping.is_identity).then_some(mapping);
+        self.group_cache = None;
+        self.next_group_boundary = 0;
+        self.dict_filters.clear();
+        self.typed_predicates.clear();
+        self.matching_indices = None;
+        self.match_idx = 0;
+        self.row_group_skips = None;
+        self.group_candidates.clear();
+        self.candidates_group = None;
+        let mut references = Vec::new();
+        if self
+            .filter
+            .as_ref()
+            .is_some_and(|filter| !filter.collect_column_indices(&mut references))
+            || (self.filter.is_none() && self.is_full_projection)
+        {
+            self.needed_cols = None;
+        } else {
+            let mut mask = vec![false; logical_columns];
+            for &index in self.project_cols.iter().chain(&references) {
+                if let Some(needed) = mask.get_mut(index) {
+                    *needed = true;
+                }
+            }
+            self.needed_cols = Some(mask);
         }
     }
 
@@ -888,7 +1079,30 @@ impl VolumeScanner {
         let group_start = group_idx * super::column::ROW_GROUP_SIZE;
 
         let mut columns: Vec<Option<Arc<super::column::ColumnData>>> = vec![None; col_count];
-        if let Some(ref needed) = self.needed_cols {
+        if let Some(mapping) = &self.column_mapping {
+            for (logical, source) in mapping.sources.iter().enumerate() {
+                if self
+                    .needed_cols
+                    .as_ref()
+                    .is_some_and(|needed| !needed.get(logical).copied().unwrap_or(false))
+                {
+                    continue;
+                }
+                let super::writer::ColSource::Volume(ci) = *source else {
+                    continue;
+                };
+                if columns[ci].is_some() {
+                    continue;
+                }
+                match store.group_column(ci, group_idx) {
+                    Ok(column) => columns[ci] = Some(column),
+                    Err(error) => {
+                        self.error = Some(error.into());
+                        return;
+                    }
+                }
+            }
+        } else if let Some(ref needed) = self.needed_cols {
             for (ci, &need) in needed.iter().enumerate() {
                 if need && ci < col_count && group_idx < store.num_groups(ci) {
                     match store.group_column(ci, group_idx) {
@@ -931,6 +1145,11 @@ impl VolumeScanner {
     /// the row should be skipped.
     #[inline(always)]
     fn should_skip_row(&self, idx: usize) -> bool {
+        if let Some(policy) = &self.captured_visibility {
+            debug_assert_eq!(policy.group, Some(idx / super::column::ROW_GROUP_SIZE));
+            let local = idx - policy.start;
+            return policy.hidden[local / 64] & (1u64 << (local % 64)) != 0;
+        }
         // Check pre-computed inter-volume visibility bitmap first (O(1) bit check).
         // A clear bit means a newer volume owns this row_id — skip without materialization.
         if let Some(ref bm) = self.visibility_bitmap {
@@ -974,9 +1193,12 @@ impl VolumeScanner {
     /// rejects the row.
     #[inline(always)]
     fn materialize_row(&mut self, idx: usize) -> Result<bool> {
-        // Per-group cache path: only when no schema mapping is needed.
-        // Schema-evolved volumes require column_mapping which remaps positions.
-        if self.group_cache.is_some() && self.column_mapping.is_none() {
+        // Both paths use already-loaded group columns. Schema mappings resolve
+        // logical positions without reloading entire physical columns.
+        if self.group_cache.is_some() && self.column_mapping.is_some() {
+            return self.materialize_mapped_row_from_cache(idx);
+        }
+        if self.group_cache.is_some() {
             return self.materialize_row_from_cache(idx);
         }
 
@@ -989,7 +1211,7 @@ impl VolumeScanner {
                 (None, Some(mapping)) => self.volume.get_row_mapped(idx, mapping)?,
                 (None, None) => self.volume.get_row(idx)?,
             };
-            if !filter.evaluate_fast(&full_row) {
+            if !filter.evaluate(&full_row)? {
                 return Ok(false);
             }
             if self.is_full_projection {
@@ -1024,6 +1246,39 @@ impl VolumeScanner {
     }
 
     /// Build a row from the per-group column cache (avoids full-column decompression).
+    fn materialize_mapped_row_from_cache(&mut self, idx: usize) -> Result<bool> {
+        let mapping = self
+            .column_mapping
+            .as_ref()
+            .ok_or_else(|| crate::core::Error::internal("mapped cache path has no mapping"))?;
+        let mut values = Vec::with_capacity(mapping.sources.len());
+        for (logical, source) in mapping.sources.iter().enumerate() {
+            let needed = self
+                .needed_cols
+                .as_ref()
+                .is_none_or(|mask| mask.get(logical).copied().unwrap_or(false));
+            let value = match source {
+                super::writer::ColSource::Volume(physical) => {
+                    if needed {
+                        let (column, local) = self.col_and_idx(*physical, idx)?;
+                        column.get_value(local)
+                    } else {
+                        Value::Null(self.volume.columns.data_type(*physical))
+                    }
+                }
+                super::writer::ColSource::Default(value) => {
+                    if needed {
+                        value.clone()
+                    } else {
+                        Value::Null(value.data_type())
+                    }
+                }
+            };
+            values.push(value);
+        }
+        self.finish_cached_row(Row::from_values(values))
+    }
+
     fn materialize_row_from_cache(&mut self, idx: usize) -> Result<bool> {
         let col_count = self.volume.columns.len();
         let mut values = Vec::with_capacity(col_count);
@@ -1039,11 +1294,16 @@ impl VolumeScanner {
                 values.push(Value::Null(self.volume.columns.data_type(ci)));
             }
         }
-        let full_row = Row::from_values(values);
+        self.finish_cached_row(Row::from_values(values))
+    }
+
+    fn finish_cached_row(&mut self, full_row: Row) -> Result<bool> {
         if self
             .filter
             .as_ref()
-            .is_some_and(|filter| !filter.evaluate_fast(&full_row))
+            .map(|filter| filter.evaluate(&full_row))
+            .transpose()?
+            .is_some_and(|matched| !matched)
         {
             return Ok(false);
         }
@@ -1092,6 +1352,12 @@ impl VolumeScanner {
                     }
                 };
 
+                let gi = idx / super::column::ROW_GROUP_SIZE;
+                self.prepare_captured_group(
+                    gi,
+                    gi * super::column::ROW_GROUP_SIZE,
+                    ((gi + 1) * super::column::ROW_GROUP_SIZE).min(self.end_idx),
+                );
                 if self.should_skip_row(idx) {
                     continue;
                 }
@@ -1131,6 +1397,15 @@ impl VolumeScanner {
                 self.next_group_boundary =
                     ((group_idx + 1) * super::column::ROW_GROUP_SIZE).min(self.end_idx);
 
+                if self.prepare_captured_group(
+                    group_idx,
+                    self.current_idx,
+                    self.next_group_boundary,
+                ) {
+                    self.current_idx = self.next_group_boundary;
+                    continue;
+                }
+
                 // Zone map skip
                 if let Some(ref skips) = self.row_group_skips {
                     if group_idx < skips.len() && skips[group_idx] {
@@ -1149,15 +1424,15 @@ impl VolumeScanner {
                 }
             }
 
+            if self.should_skip_row(self.current_idx) {
+                self.current_idx += 1;
+                continue;
+            }
+
             if self.stop_key.is_some() && self.past_stop_key(self.current_idx)? {
                 self.current_idx = self.end_idx;
                 self.has_current = false;
                 return Ok(false);
-            }
-
-            if self.should_skip_row(self.current_idx) {
-                self.current_idx += 1;
-                continue;
             }
 
             let idx = self.current_idx;
@@ -1208,6 +1483,22 @@ impl Scanner for VolumeScanner {
 
     fn close(&mut self) -> Result<()> {
         self.has_current = false;
+        if let Some(policy) = self.captured_visibility.take() {
+            // A closed scanner can remain allocated. Release its captured
+            // owners and buffers, then the epoch, and never resume the cursor.
+            self.current_idx = self.end_idx;
+            self.matching_indices = None;
+            self.match_idx = 0;
+            self.group_cache = None;
+            self.group_candidates = Vec::new();
+            self.candidates_group = None;
+            self.visibility_bitmap = None;
+            self.pending_cold_deletes = None;
+            self.committed_tombstones = None;
+            self.filter = None;
+            self.current_row = Row::new();
+            drop(policy);
+        }
         Ok(())
     }
 
@@ -1407,6 +1698,420 @@ mod tests {
     use super::super::writer::VolumeBuilder;
     use super::*;
     use crate::core::{DataType, SchemaBuilder};
+    use crate::storage::expression::{ComparisonExpr, Expression};
+    use crate::storage::mvcc::registry::TransactionRegistry;
+    use crate::storage::mvcc::version_store::{RowVersion, VersionStore};
+
+    fn captured_store() -> (Arc<TransactionRegistry>, VersionStore) {
+        let registry = Arc::new(TransactionRegistry::new());
+        let schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .column("name", DataType::Text, false, false)
+            .column("price", DataType::Float, false, false)
+            .build();
+        let store = VersionStore::with_visibility_checker("test", schema, registry.clone());
+        (registry, store)
+    }
+
+    fn scan_ids(scanner: &mut VolumeScanner) -> Vec<i64> {
+        let mut ids = Vec::new();
+        while scanner.next() {
+            ids.push(scanner.current_rid);
+        }
+        assert!(scanner.err().is_none(), "{:?}", scanner.err());
+        ids
+    }
+
+    #[test]
+    fn mapped_projection_keeps_added_defaults_and_explicit_physical_width_prefix() {
+        use super::super::writer::{ColSource, ColumnMapping};
+        let (registry, store) = captured_store();
+        let view = Arc::new(CapturedHotView::new(
+            store.capture_hot_root(),
+            registry.capture_read_epoch(),
+            None,
+        ));
+        let old_schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .column("g", DataType::Integer, false, false)
+            .build();
+        let schema = SchemaBuilder::new("test")
+            .column("id", DataType::Integer, false, true)
+            .column("g", DataType::Integer, false, false)
+            .column("added", DataType::Integer, false, false)
+            .build();
+        let mut builder = VolumeBuilder::new(&old_schema);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Integer(1), Value::Integer(20)]),
+        );
+        let mut volume = builder.finish();
+        let (_, compressed) = super::super::io::serialize_v4_public(&volume).unwrap();
+        volume.columns.attach_compressed_store(compressed);
+        let warm = Arc::new(volume.to_warm().unwrap());
+        let eager = Arc::new(volume);
+        let mapping = ColumnMapping {
+            sources: vec![
+                ColSource::Volume(0),
+                ColSource::Volume(1),
+                ColSource::Default(Value::Integer(7)),
+            ],
+            is_identity: false,
+        };
+        for volume in [eager, warm] {
+            for columns in [vec![], vec![0, 1], vec![0, 1, 2], vec![2], vec![2, 0]] {
+                for filtered in [false, true] {
+                    let mut scanner = VolumeScanner::new(volume.clone(), columns.clone(), None);
+                    scanner.set_column_mapping(mapping.clone());
+                    scanner.set_captured_visibility(view.clone(), Arc::default());
+                    if filtered {
+                        let mut filter = ComparisonExpr::eq("id", Value::Integer(1));
+                        filter.prepare_for_schema(&schema);
+                        scanner.set_filter(Box::new(filter));
+                    }
+                    assert!(scanner.next(), "{:?}", scanner.err());
+                    let values = [Value::Integer(1), Value::Integer(20), Value::Integer(7)];
+                    let expected = if columns.is_empty() {
+                        values.to_vec()
+                    } else {
+                        columns.iter().map(|&index| values[index].clone()).collect()
+                    };
+                    assert_eq!(scanner.row(), &Row::from_values(expected));
+                    assert!(!scanner.next());
+                    assert!(scanner.err().is_none());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn mapped_default_filter_does_not_read_dropped_or_omitted_physical_columns() {
+        use super::super::writer::{ColSource, ColumnMapping};
+        let _guard = crate::test_failpoints::FailpointGuard::new();
+        let (registry, store) = captured_store();
+        let view = Arc::new(CapturedHotView::new(
+            store.capture_hot_root(),
+            registry.capture_read_epoch(),
+            None,
+        ));
+        let mut volume = Arc::try_unwrap(make_test_volume()).ok().unwrap();
+        let (_, compressed) = super::super::io::serialize_v4_public(&volume).unwrap();
+        volume.columns.attach_compressed_store(compressed);
+        let warm = Arc::new(volume.to_warm().unwrap());
+        let schema = SchemaBuilder::new("test")
+            .column("name", DataType::Text, false, false)
+            .column("price", DataType::Float, false, false)
+            .build();
+        let mapping = ColumnMapping {
+            sources: vec![
+                ColSource::Default(Value::text("replacement")),
+                ColSource::Volume(2),
+            ],
+            is_identity: false,
+        };
+        for ascending in [true, false] {
+            let mut scanner = VolumeScanner::new(warm.clone(), vec![0], None);
+            scanner.set_column_mapping(mapping.clone());
+            scanner.set_captured_visibility(view.clone(), Arc::default());
+            scanner.set_ordered_walk(ascending);
+            let mut filter = ComparisonExpr::eq("name", Value::text("replacement"));
+            filter.prepare_for_schema(&schema);
+            crate::test_failpoints::fail_cold_read_on(1);
+            scanner.set_filter(Box::new(filter));
+            let mut count = 0;
+            while scanner.next() {
+                assert_eq!(
+                    scanner.row(),
+                    &Row::from_values(vec![Value::text("replacement")])
+                );
+                count += 1;
+            }
+            assert_eq!(count, 5);
+            assert!(scanner.err().is_none(), "{:?}", scanner.err());
+            let mut required = VolumeScanner::new(warm.clone(), vec![2], None);
+            assert!(
+                !required.next(),
+                "the first physical access must retain the fault"
+            );
+            assert!(required.err().is_some());
+        }
+    }
+
+    #[test]
+    fn captured_authority_precedes_filters_and_keeps_invisible_hot_fallback() {
+        let (registry, store) = captured_store();
+        let (committed, _) = registry.begin_transaction();
+        registry.start_commit(committed);
+        store
+            .add_version(1, RowVersion::new(committed, Row::new()))
+            .unwrap();
+        let mut deleted = RowVersion::new(committed, Row::new());
+        deleted.deleted_at_txn_id = committed;
+        store.add_version(2, deleted).unwrap();
+        registry.complete_commit(committed);
+        let (inflight, _) = registry.begin_transaction();
+        registry.start_commit(inflight);
+        store
+            .add_version(3, RowVersion::new(inflight, Row::new()))
+            .unwrap();
+        let epoch = registry.capture_read_epoch();
+        let view = Arc::new(CapturedHotView::new(store.capture_hot_root(), epoch, None));
+        registry.complete_commit(inflight);
+        let pending: Arc<rustc_hash::FxHashSet<i64>> = Arc::new([4].into_iter().collect());
+        let volume = make_test_volume();
+
+        for start in 0..=5 {
+            for end in start..=5 {
+                for ascending in [true, false] {
+                    let mut scanner =
+                        VolumeScanner::with_range(volume.clone(), vec![], start, end, None);
+                    scanner.set_ordered_walk(ascending);
+                    scanner.set_captured_visibility(view.clone(), pending.clone());
+                    let mut expected: Vec<i64> = [3, 5]
+                        .into_iter()
+                        .filter(|id| start < *id as usize && (*id as usize - 1) < end)
+                        .collect();
+                    if !ascending {
+                        expected.reverse();
+                    }
+                    assert_eq!(scan_ids(&mut scanner), expected);
+                }
+            }
+        }
+
+        // The old cold value matches "apple", but visible hot authority must
+        // suppress it even though the replacement hot row does not match.
+        for ascending in [true, false] {
+            let mut scanner = VolumeScanner::new(volume.clone(), vec![], None);
+            scanner.set_captured_visibility(view.clone(), pending.clone());
+            scanner.set_ordered_walk(ascending);
+            let mut filter = ComparisonExpr::eq("name", Value::text("apple"));
+            filter.prepare_for_schema(&store.schema());
+            scanner.set_filter(Box::new(filter));
+            assert!(scan_ids(&mut scanner).is_empty());
+            assert!(scanner.matching_indices.is_none());
+        }
+
+        // An excluded tombstone remains invisible after its publisher commits.
+        let tombstones: Arc<rustc_hash::FxHashMap<i64, u64>> = Arc::new(
+            [
+                (3, registry.get_commit_sequence(inflight).unwrap() as u64),
+                (5, registry.get_commit_sequence(committed).unwrap() as u64),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let mut scanner = VolumeScanner::new(volume.clone(), vec![], None);
+        scanner.set_captured_visibility(view.clone(), pending.clone());
+        scanner.set_skip_sets(tombstones.clone(), pending.clone());
+        assert_eq!(scan_ids(&mut scanner), vec![3]);
+
+        let mut scanner = VolumeScanner::new(volume, vec![], None);
+        scanner.set_captured_visibility(view, pending.clone());
+        scanner.set_skip_sets(tombstones, pending);
+        scanner.set_visibility_bitmap(Some(Arc::new(vec![!(1u64 << 2)])));
+        assert!(scan_ids(&mut scanner).is_empty());
+    }
+
+    #[test]
+    fn captured_hidden_range_never_loads_columns_or_stop_keys() {
+        let (registry, store) = captured_store();
+        let (txn, _) = registry.begin_transaction();
+        registry.start_commit(txn);
+        for id in [2, 3] {
+            store
+                .add_version(id, RowVersion::new(txn, Row::new()))
+                .unwrap();
+        }
+        registry.complete_commit(txn);
+        let view = Arc::new(CapturedHotView::new(
+            store.capture_hot_root(),
+            registry.capture_read_epoch(),
+            None,
+        ));
+        // A metadata-only volume has no column source. Any attempted column
+        // access fails, including optional dictionary resolution in set_filter.
+        let volume = Arc::new(make_test_volume().to_cold());
+        for ascending in [true, false] {
+            let mut scanner = VolumeScanner::with_range(volume.clone(), vec![], 1, 3, None);
+            scanner.set_ordered_walk(ascending);
+            scanner.set_captured_visibility(view.clone(), Arc::default());
+            scanner.set_stop_key(0, &Value::Integer(2), ascending);
+            let mut filter = ComparisonExpr::eq("name", Value::text("banana"));
+            filter.prepare_for_schema(&store.schema());
+            scanner.set_filter(Box::new(filter));
+            assert!(scan_ids(&mut scanner).is_empty());
+        }
+        let mut visible = VolumeScanner::new(volume, vec![], None);
+        visible.set_captured_visibility(view, Arc::default());
+        assert!(!visible.next());
+        assert!(
+            visible.err().is_some(),
+            "visible cold access must still fail"
+        );
+    }
+
+    #[test]
+    fn captured_close_releases_epoch_and_stops_without_discarding_error() {
+        let (registry, store) = captured_store();
+        for reverse in [false, true] {
+            for unreadable in [false, true] {
+                assert_eq!(registry.oldest_retention_horizon(), None);
+                let epoch = registry.capture_read_epoch();
+                let horizon = epoch.retention_horizon();
+                let view = Arc::new(CapturedHotView::new(store.capture_hot_root(), epoch, None));
+                let volume = make_test_volume();
+                let volume = if unreadable {
+                    Arc::new(volume.to_cold())
+                } else {
+                    volume
+                };
+                let mut scanner = VolumeScanner::new(volume, vec![], None);
+                scanner.set_captured_visibility(view, Arc::default());
+                scanner.set_ordered_walk(!reverse);
+                assert_eq!(registry.oldest_retention_horizon(), Some(horizon));
+                assert_eq!(scanner.next(), !unreadable);
+                let error = scanner.err().map(ToString::to_string);
+                scanner.close().unwrap();
+                assert_eq!(registry.oldest_retention_horizon(), None);
+                assert!(scanner.captured_visibility.is_none());
+                assert!(!scanner.next(), "closed object must not resume scanning");
+                assert_eq!(scanner.err().map(ToString::to_string), error);
+                scanner.close().unwrap();
+                assert!(!scanner.next());
+            }
+        }
+    }
+
+    #[cfg(feature = "test-failpoints")]
+    #[test]
+    fn captured_hidden_warm_group_skips_dictionary_prescan_and_decompression() {
+        let _guard = crate::test_failpoints::FailpointGuard::new();
+        let (registry, store) = captured_store();
+        let view = Arc::new(CapturedHotView::new(
+            store.capture_hot_root(),
+            registry.capture_read_epoch(),
+            None,
+        ));
+        let mut volume = Arc::try_unwrap(make_test_volume()).ok().unwrap();
+        let (_, compressed) = super::super::io::serialize_v4_public(&volume).unwrap();
+        volume.columns.attach_compressed_store(compressed);
+        let warm = Arc::new(volume.to_warm().unwrap());
+        assert!(warm.columns.should_use_group_cache());
+        for ascending in [true, false] {
+            let mut scanner = VolumeScanner::new(warm.clone(), vec![], None);
+            scanner.set_captured_visibility(view.clone(), Arc::new((1..=5).collect()));
+            scanner.set_ordered_walk(ascending);
+            let mut filter = ComparisonExpr::eq("name", Value::text("apple"));
+            filter.prepare_for_schema(&store.schema());
+            crate::test_failpoints::fail_cold_read_on(1);
+            scanner.set_filter(Box::new(filter));
+            assert!(scan_ids(&mut scanner).is_empty());
+            // No masked access consumed the fault, and a required access
+            // remains fallible rather than treating unreadable data as empty.
+            let mut visible = VolumeScanner::new(warm.clone(), vec![], None);
+            visible.set_captured_visibility(view.clone(), Arc::default());
+            assert!(!visible.next());
+            assert!(visible.err().is_some());
+        }
+    }
+
+    #[test]
+    fn captured_point_range_bounds_authority_work_with_many_hot_rows() {
+        let (registry, store) = captured_store();
+        let schema = SchemaBuilder::new("point")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let target = 2048usize;
+        let mut builder = VolumeBuilder::with_capacity(&schema, 4096);
+        let (writer, _) = registry.begin_transaction();
+        registry.start_commit(writer);
+        for id in 0..4096 {
+            let row = Row::from_values(vec![Value::Integer(id as i64)]);
+            builder.add_row(id as i64, &row);
+            if id != target {
+                store
+                    .add_version(id as i64, RowVersion::new(writer, row))
+                    .unwrap();
+            }
+        }
+        registry.complete_commit(writer);
+        let view = Arc::new(CapturedHotView::new(
+            store.capture_hot_root(),
+            registry.capture_read_epoch(),
+            None,
+        ));
+        assert!(!view.is_empty());
+        let volume = Arc::new(builder.finish());
+        for ascending in [true, false] {
+            let mut scanner =
+                VolumeScanner::with_range(volume.clone(), vec![0], target, target + 1, None);
+            scanner.set_captured_visibility(view.clone(), Arc::default());
+            scanner.set_ordered_walk(ascending);
+            let mut filter = ComparisonExpr::eq("id", Value::Integer(target as i64));
+            filter.prepare_for_schema(&schema);
+            scanner.set_filter(Box::new(filter));
+            assert_eq!(
+                scanner.captured_visibility.as_ref().unwrap().hidden.len(),
+                1
+            );
+            assert!(scanner.next(), "{:?}", scanner.err());
+            assert_eq!(scanner.current_row_id(), target as i64);
+            let policy = scanner.captured_visibility.as_ref().unwrap();
+            assert_eq!(
+                policy.start, target,
+                "authority begins at the requested point, not the physical group"
+            );
+            assert_eq!(policy.hidden[0], 0);
+            assert_eq!(
+                policy.hidden.len(),
+                1,
+                "a point needs only its own mask word"
+            );
+            assert!(!scanner.next());
+            assert!(scanner.err().is_none());
+        }
+    }
+
+    #[test]
+    fn captured_visibility_reuses_bounded_mask_across_group_and_word_boundaries() {
+        let (registry, store) = captured_store();
+        let view = Arc::new(CapturedHotView::new(
+            store.capture_hot_root(),
+            registry.capture_read_epoch(),
+            None,
+        ));
+        let schema = SchemaBuilder::new("large")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let count = super::super::column::ROW_GROUP_SIZE + 65;
+        let mut builder = VolumeBuilder::with_capacity(&schema, count);
+        for id in 0..count {
+            builder.add_row(
+                id as i64,
+                &Row::from_values(vec![Value::Integer(id as i64)]),
+            );
+        }
+        let volume = Arc::new(builder.finish());
+        let survivors = [0, 63, 64, count - 66, count - 65, count - 1];
+        let pending: Arc<rustc_hash::FxHashSet<i64>> = Arc::new(
+            (0..count)
+                .filter(|id| !survivors.contains(id))
+                .map(|id| id as i64)
+                .collect(),
+        );
+        for ascending in [true, false] {
+            let mut scanner = VolumeScanner::with_range(volume.clone(), vec![], 1, count, None);
+            scanner.set_captured_visibility(view.clone(), pending.clone());
+            scanner.set_ordered_walk(ascending);
+            let mut expected: Vec<i64> = survivors[1..].iter().map(|id| *id as i64).collect();
+            if !ascending {
+                expected.reverse();
+            }
+            assert_eq!(scan_ids(&mut scanner), expected);
+        }
+    }
 
     fn make_test_volume() -> Arc<FrozenVolume> {
         let schema = SchemaBuilder::new("test")

@@ -128,6 +128,7 @@ pub use parallel::{
 pub use planner::{
     ColumnStatsCache, QueryPlanner, RuntimeJoinAlgorithm, RuntimeJoinDecision, StatsHealth,
 };
+use query_cache::CompiledExecution;
 pub use query_cache::{CacheStats, CachedPlanRef, CachedQueryPlan, QueryCache, DEFAULT_CACHE_SIZE};
 pub use query_classification::clear_classification_cache;
 pub use result::{ColumnarResult, ExecResult, ExecutorResult};
@@ -357,19 +358,61 @@ impl Executor {
             return None; // Let normal path handle error
         }
 
-        // Try compiled fast paths based on statement type
-        match cached.statement.as_ref() {
+        // Unsupported statement kinds use normal dispatch. Do not register
+        // and immediately discard a read epoch on every prepared INSERT.
+        if !matches!(
+            cached.statement.as_ref(),
+            Statement::Select(_) | Statement::Update(_) | Statement::Delete(_)
+        ) {
+            return None;
+        }
+
+        // These borrowed-parameter helpers only consume an already compiled
+        // matching plan. Unknown/stale plans must return to normal dispatch,
+        // where compilation happens, without creating an unused epoch first.
+        {
+            let compiled = cached.compiled.read().ok()?;
+            let cached_epoch = match (cached.statement.as_ref(), &*compiled) {
+                (Statement::Select(_), CompiledExecution::PkLookup(plan)) => plan.cached_epoch,
+                (Statement::Update(_), CompiledExecution::PkUpdate(plan)) => plan.cached_epoch,
+                (Statement::Delete(_), CompiledExecution::PkDelete(plan)) => plan.cached_epoch,
+                _ => return None,
+            };
+            if self.engine.schema_epoch() != cached_epoch {
+                return None;
+            }
+        }
+
+        // The borrowed-parameter entry point bypasses normal dispatch, but
+        // still registers the same statement visibility boundary.
+        let mut ctx = ExecutionContext::new();
+        let epoch = match self.engine.capture_read_epoch() {
+            Ok(epoch) => epoch,
+            Err(error) => return Some(Err(error)),
+        };
+        if let Some(epoch) = &epoch {
+            ctx = ctx.with_read_epoch(epoch.clone());
+        }
+        let result = match cached.statement.as_ref() {
             Statement::Select(stmt) => {
-                self.try_fast_pk_lookup_with_params(stmt, params, &cached.compiled)
+                self.try_fast_pk_lookup_with_params(stmt, params, &ctx, &cached.compiled)
             }
             Statement::Update(stmt) => {
-                self.try_fast_pk_update_with_params(stmt, params, &cached.compiled)
+                self.try_fast_pk_update_with_params(stmt, params, &ctx, &cached.compiled)
             }
             Statement::Delete(stmt) => {
-                self.try_fast_pk_delete_with_params(stmt, params, &cached.compiled)
+                self.try_fast_pk_delete_with_params(stmt, params, &ctx, &cached.compiled)
             }
             _ => None,
-        }
+        };
+        result.map(|result| {
+            result.map(|result| match epoch {
+                Some(epoch) if !result.columns().is_empty() => {
+                    Box::new(result::EpochResult::new(result, epoch)) as Box<dyn QueryResult>
+                }
+                _ => result,
+            })
+        })
     }
 
     /// Execute a SQL query with named parameters
@@ -404,46 +447,7 @@ impl Executor {
         self.engine.check_health()?;
         // Try to get from cache
         if let Some(cached) = self.query_cache.get(sql) {
-            // Validate parameter count if query has parameters
-            if cached.has_params {
-                let provided = ctx.params().len();
-                if provided < cached.param_count {
-                    return Err(Error::internal(format!(
-                        "Query requires {} parameters but only {} provided",
-                        cached.param_count, provided
-                    )));
-                }
-            }
-
-            // INSERT handles the active transaction itself; dispatch before
-            // the txn-state capture so the hot prepared-INSERT path takes
-            // the transaction mutex only once.
-            if let Statement::Insert(stmt) = cached.statement.as_ref() {
-                return self.execute_insert_with_compiled_cache(stmt, ctx, &cached.compiled);
-            }
-
-            // Capture transaction state once for the rest of the statement:
-            // the probe battery and the ctx txn-id injection both need it,
-            // and repeated mutex acquisitions dominate the fixed cost of
-            // cached statements.
-            let active_txn_id = self.active_txn_id();
-
-            if let Some(result) = self.try_compiled_fast_paths(
-                cached.statement.as_ref(),
-                ctx,
-                &cached.compiled,
-                active_txn_id.is_some(),
-            ) {
-                return result;
-            }
-
-            // Execute the cached statement (standard path)
-            return self.execute_statement_inner(
-                &cached.statement,
-                ctx,
-                active_txn_id,
-                Some(&cached.classification),
-            );
+            return self.execute_with_cached_plan(&cached, ctx);
         }
 
         // Parse the query
@@ -462,28 +466,7 @@ impl Executor {
                 .query_cache
                 .put(sql, stmt_arc.clone(), has_params, param_count);
 
-            if let Statement::Insert(stmt) = stmt_arc.as_ref() {
-                return self.execute_insert_with_compiled_cache(stmt, ctx, &cached_plan.compiled);
-            }
-
-            let active_txn_id = self.active_txn_id();
-
-            if let Some(result) = self.try_compiled_fast_paths(
-                stmt_arc.as_ref(),
-                ctx,
-                &cached_plan.compiled,
-                active_txn_id.is_some(),
-            ) {
-                return result;
-            }
-
-            // Execute directly from the Arc (no clone needed)
-            return self.execute_statement_inner(
-                &stmt_arc,
-                ctx,
-                active_txn_id,
-                Some(&cached_plan.classification),
-            );
+            return self.execute_with_cached_plan(&cached_plan, ctx);
         }
 
         self.execute_program_with_context(&program, ctx)
@@ -518,10 +501,10 @@ impl Executor {
                 if let Some(result) = self.try_fast_pk_lookup_compiled(stmt, ctx, compiled) {
                     return Some(result);
                 }
-                if let Some(result) = self.try_fast_count_distinct_compiled(stmt, compiled) {
+                if let Some(result) = self.try_fast_count_distinct_compiled(stmt, ctx, compiled) {
                     return Some(result);
                 }
-                self.try_fast_count_star_compiled(stmt, compiled)
+                self.try_fast_count_star_compiled(stmt, ctx, compiled)
             }
             Statement::Update(stmt) if !in_txn => {
                 self.try_fast_pk_update_compiled(stmt, ctx, compiled)
@@ -531,6 +514,39 @@ impl Executor {
             }
             _ => None,
         }
+    }
+
+    pub(crate) fn fetch_rows_in_context(
+        &self,
+        table_name: &str,
+        row_ids: &[i64],
+        ctx: &ExecutionContext,
+    ) -> Result<crate::core::RowVec> {
+        let table = self.table_in_context(table_name, ctx)?;
+        table.fetch_rows_by_ids(
+            row_ids,
+            &crate::storage::expression::logical::ConstBoolExpr::true_expr(),
+        )
+    }
+
+    pub(crate) fn table_in_context(
+        &self,
+        name: &str,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn Table>> {
+        let active = self
+            .active_transaction
+            .lock()
+            .map_err(|_| Error::internal("active transaction lock is poisoned"))?;
+        if let Some(tx) = active.as_ref() {
+            return ctx.get_table(tx.transaction.as_ref(), name);
+        }
+        drop(active);
+        if let Some(snapshot) = ctx.statement_snapshot() {
+            return snapshot.get_table(name);
+        }
+        let tx = self.engine.begin_transaction()?;
+        ctx.get_table(tx.as_ref(), name)
     }
 
     /// Get the query cache
@@ -601,7 +617,68 @@ impl Executor {
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        self.execute_statement_inner(statement, ctx, self.active_txn_id(), None)
+        self.with_statement_epoch(statement, ctx, |ctx| {
+            self.execute_statement_inner(statement, ctx, self.active_txn_id(), None)
+        })
+    }
+
+    /// Capture exactly once before any compiled or regular read. Context
+    /// clones used for nested queries share this lease; each top-level call
+    /// starts with its caller's unmodified context.
+    fn with_statement_epoch<F>(
+        &self,
+        statement: &Statement,
+        ctx: &ExecutionContext,
+        action: F,
+    ) -> Result<Box<dyn QueryResult>>
+    where
+        F: FnOnce(&ExecutionContext) -> Result<Box<dyn QueryResult>>,
+    {
+        if matches!(
+            statement,
+            Statement::Begin(_)
+                | Statement::Commit(_)
+                | Statement::Rollback(_)
+                | Statement::Savepoint(_)
+                | Statement::ReleaseSavepoint(_)
+                | Statement::Truncate(_)
+        ) {
+            return action(ctx);
+        }
+        if let Some(epoch) = ctx.read_epoch() {
+            let result = action(ctx)?;
+            return if ctx.query_depth == 0 && !result.columns().is_empty() {
+                Ok(Box::new(result::EpochResult::new(result, epoch.clone())))
+            } else {
+                Ok(result)
+            };
+        }
+        let (epoch, txn_id) = {
+            let active = self
+                .active_transaction
+                .lock()
+                .map_err(|_| Error::internal("active transaction lock is poisoned"))?;
+            match active.as_ref() {
+                Some(tx) => (
+                    tx.transaction.capture_read_epoch()?,
+                    Some(tx.transaction.id()),
+                ),
+                None => (self.engine.capture_read_epoch()?, None),
+            }
+        };
+        let Some(epoch) = epoch else {
+            return action(ctx);
+        };
+        let mut statement_ctx = ctx.with_read_epoch(epoch.clone());
+        if let Some(txn_id) = txn_id {
+            statement_ctx.set_transaction_id(txn_id as u64);
+        }
+        let result = action(&statement_ctx)?;
+        if result.columns().is_empty() {
+            Ok(result)
+        } else {
+            Ok(Box::new(result::EpochResult::new(result, epoch)))
+        }
     }
 
     /// Execute a single statement with pre-captured transaction state.
@@ -745,9 +822,7 @@ impl Executor {
         &self,
         isolation: crate::core::IsolationLevel,
     ) -> Result<Box<dyn Transaction>> {
-        let mut tx = self.engine.begin_transaction()?;
-        let _ = tx.set_isolation_level(isolation);
-        Ok(tx)
+        self.engine.begin_transaction_with_level(isolation)
     }
 
     /// Get or create a cached plan for a SQL statement.
@@ -782,6 +857,16 @@ impl Executor {
     /// here on every execution, avoiding normalize + hash + RwLock read
     /// per call.
     pub fn execute_with_cached_plan(
+        &self,
+        plan: &CachedPlanRef,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        self.with_statement_epoch(&plan.statement, ctx, |ctx| {
+            self.execute_cached_plan_inner(plan, ctx)
+        })
+    }
+
+    fn execute_cached_plan_inner(
         &self,
         plan: &CachedPlanRef,
         ctx: &ExecutionContext,
@@ -988,6 +1073,257 @@ mod tests {
         let engine = MVCCEngine::in_memory();
         engine.open_engine().unwrap();
         Executor::new(Arc::new(engine))
+    }
+
+    fn epoch_statement() -> Statement {
+        Parser::new("SELECT 1")
+            .parse_program()
+            .unwrap()
+            .statements
+            .remove(0)
+    }
+
+    #[test]
+    fn statement_epoch_is_shared_by_nested_and_derived_contexts() {
+        let executor = create_test_executor();
+        let registry = executor.engine.registry();
+        let statement = epoch_statement();
+        executor
+            .with_statement_epoch(&statement, &ExecutionContext::new(), |ctx| {
+                let epoch = ctx.read_epoch().unwrap();
+                let (writer, _) = registry.begin_transaction();
+                registry.complete_commit(writer);
+                assert!(!epoch.is_visible(writer));
+                for nested in [
+                    ctx.with_incremented_query_depth(),
+                    ctx.with_incremented_view_depth(),
+                    ctx.with_transaction_id(99),
+                ] {
+                    executor.with_statement_epoch(&statement, &nested, |nested| {
+                        assert!(epoch.same_epoch(nested.read_epoch().unwrap()));
+                        assert!(!nested.read_epoch().unwrap().is_visible(writer));
+                        Ok(Box::new(ExecResult::empty()))
+                    })?;
+                }
+                Ok(Box::new(ExecResult::empty()))
+            })
+            .unwrap();
+        assert_eq!(registry.oldest_retention_horizon(), None);
+    }
+
+    #[test]
+    fn statement_epoch_refreshes_rc_and_preserves_si_begin() {
+        for isolation in [
+            crate::IsolationLevel::ReadCommitted,
+            crate::IsolationLevel::SnapshotIsolation,
+        ] {
+            let executor = create_test_executor();
+            let registry = executor.engine.registry();
+            let transaction = executor
+                .begin_transaction_with_isolation(isolation)
+                .unwrap();
+            let txn_id = transaction.id();
+            executor.install_transaction(transaction);
+            let statement = epoch_statement();
+            let mut first_cutoff = 0;
+            executor
+                .with_statement_epoch(&statement, &ExecutionContext::new(), |ctx| {
+                    first_cutoff = ctx.read_epoch().unwrap().cutoff();
+                    assert_eq!(ctx.transaction_id(), Some(txn_id as u64));
+                    Ok(Box::new(ExecResult::empty()))
+                })
+                .unwrap();
+            let (writer, _) = registry.begin_transaction();
+            registry.complete_commit(writer);
+            executor
+                .with_statement_epoch(&statement, &ExecutionContext::new(), |ctx| {
+                    let epoch = ctx.read_epoch().unwrap();
+                    if isolation == crate::IsolationLevel::ReadCommitted {
+                        assert!(epoch.cutoff() > first_cutoff);
+                        assert!(epoch.is_visible(writer));
+                    } else {
+                        assert_eq!(epoch.cutoff(), first_cutoff);
+                        assert!(!epoch.is_visible(writer));
+                    }
+                    Ok(Box::new(ExecResult::empty()))
+                })
+                .unwrap();
+            executor.execute("ROLLBACK").unwrap();
+            assert_eq!(registry.oldest_retention_horizon(), None);
+        }
+    }
+
+    #[test]
+    fn borrowed_fast_path_rejects_insert_before_epoch_registration() {
+        let executor = create_test_executor();
+        executor
+            .execute("CREATE TABLE epoch_insert (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let sql = "INSERT INTO epoch_insert VALUES ($1)";
+        executor
+            .execute_with_params(sql, smallvec::smallvec![Value::Integer(1)])
+            .unwrap();
+        let registry = executor.engine.registry();
+        let before = registry.capture_read_epoch().cache_identity().1;
+        assert!(executor
+            .try_fast_path_with_params(sql, &[Value::Integer(2)])
+            .is_none());
+        let after = registry.capture_read_epoch().cache_identity().1;
+        assert_eq!(
+            after,
+            before + 1,
+            "a rejected dispatch must not register an epoch"
+        );
+        assert_eq!(registry.oldest_retention_horizon(), None);
+
+        // The supported compiled SELECT still captures exactly one statement
+        // epoch. Its independent read transaction also registers a begin slot.
+        let select = "SELECT * FROM epoch_insert WHERE id = $1";
+        executor
+            .execute_with_params(select, smallvec::smallvec![Value::Integer(1)])
+            .unwrap();
+        let before_select = registry.capture_read_epoch().cache_identity().1;
+        let mut result = executor
+            .try_fast_path_with_params(select, &[Value::Integer(1)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            registry.capture_read_epoch().cache_identity().1,
+            before_select + 3,
+            "compiled lookup must share one statement lease plus its transaction begin slot"
+        );
+        assert!(registry.has_retention_obligations());
+        assert!(result.next());
+        assert_eq!(result.row().get(0), Some(&Value::Integer(1)));
+        result.close().unwrap();
+        assert!(!registry.has_retention_obligations());
+    }
+
+    #[test]
+    fn borrowed_compiled_preflight_preserves_normal_compilation_and_schema_refresh() {
+        let executor = create_test_executor();
+        executor
+            .execute("CREATE TABLE epoch_lookup (id INTEGER PRIMARY KEY, n INTEGER)")
+            .unwrap();
+        executor
+            .execute("INSERT INTO epoch_lookup VALUES (1, 10)")
+            .unwrap();
+        let registry = executor.engine.registry();
+        let query = "SELECT * FROM epoch_lookup WHERE id = $1";
+        executor
+            .execute_with_params(query, smallvec::smallvec![Value::Integer(1)])
+            .unwrap();
+        let cached = executor.query_cache.get(query).unwrap();
+        for state in [
+            CompiledExecution::Unknown,
+            CompiledExecution::NotOptimizable(executor.engine.schema_epoch()),
+        ] {
+            *cached.compiled.write().unwrap() = state;
+            let before = registry.capture_read_epoch().cache_identity().1;
+            assert!(executor
+                .try_fast_path_with_params(query, &[Value::Integer(1)])
+                .is_none());
+            assert_eq!(registry.capture_read_epoch().cache_identity().1, before + 1);
+            let mut result = executor
+                .execute_with_params(query, smallvec::smallvec![Value::Integer(1)])
+                .unwrap();
+            assert!(result.next());
+            assert_eq!(result.row().get(1), Some(&Value::Integer(10)));
+            result.close().unwrap();
+        }
+        // Unknown compilation still populates the shared slot; a later schema
+        // change routes through normal recompilation instead of getting stuck.
+        *cached.compiled.write().unwrap() = CompiledExecution::Unknown;
+        executor
+            .execute_with_params(query, smallvec::smallvec![Value::Integer(1)])
+            .unwrap();
+        assert!(matches!(
+            &*cached.compiled.read().unwrap(),
+            CompiledExecution::PkLookup(_)
+        ));
+        executor
+            .execute("ALTER TABLE epoch_lookup ADD COLUMN extra INTEGER DEFAULT 7")
+            .unwrap();
+        let before = registry.capture_read_epoch().cache_identity().1;
+        assert!(executor
+            .try_fast_path_with_params(query, &[Value::Integer(1)])
+            .is_none());
+        assert_eq!(registry.capture_read_epoch().cache_identity().1, before + 1);
+        let mut result = executor
+            .execute_with_params(query, smallvec::smallvec![Value::Integer(1)])
+            .unwrap();
+        assert!(result.next());
+        assert_eq!(result.row().get(2), Some(&Value::Integer(7)));
+        result.close().unwrap();
+        assert!(executor
+            .try_fast_path_with_params(query, &[Value::Integer(1)])
+            .is_some());
+        assert!(!registry.has_retention_obligations());
+    }
+
+    #[test]
+    fn statement_result_retains_epoch_until_drop_or_close() {
+        let executor = create_test_executor();
+        let registry = executor.engine.registry();
+        let mut result = executor.execute("SELECT 1").unwrap();
+        assert!(registry.oldest_retention_horizon().is_some());
+        assert!(result.next());
+        assert_eq!(result.row().get(0), Some(&Value::Integer(1)));
+        result.close().unwrap();
+        assert_eq!(registry.oldest_retention_horizon(), None);
+        assert!(!result.next());
+        let result = executor.execute("SELECT 2").unwrap();
+        assert!(registry.oldest_retention_horizon().is_some());
+        drop(result);
+        assert_eq!(registry.oldest_retention_horizon(), None);
+    }
+
+    #[test]
+    fn statement_epoch_error_releases_lease() {
+        let executor = create_test_executor();
+        let registry = executor.engine.registry();
+        let error =
+            executor.with_statement_epoch(&epoch_statement(), &ExecutionContext::new(), |_ctx| {
+                Err(Error::internal("statement failed"))
+            });
+        assert!(error.is_err());
+        assert_eq!(registry.oldest_retention_horizon(), None);
+    }
+
+    #[test]
+    fn statement_cache_epoch_separates_engines_without_pinning_horizons() {
+        use super::context::{
+            cache_scalar_subquery, ensure_statement_cache_epoch, get_cached_scalar_subquery,
+        };
+        let first = crate::storage::mvcc::TransactionRegistry::new();
+        let second = crate::storage::mvcc::TransactionRegistry::new();
+        let first_ctx = ExecutionContext::new().with_read_epoch(first.capture_read_epoch());
+        let second_ctx = ExecutionContext::new().with_read_epoch(second.capture_read_epoch());
+        ensure_statement_cache_epoch(&first_ctx);
+        cache_scalar_subquery(
+            "same key".into(),
+            smallvec::SmallVec::new(),
+            Value::Integer(1),
+        );
+        ensure_statement_cache_epoch(&first_ctx.with_incremented_query_depth());
+        assert_eq!(
+            get_cached_scalar_subquery("same key"),
+            Some(Value::Integer(1))
+        );
+        ensure_statement_cache_epoch(&second_ctx);
+        assert_eq!(get_cached_scalar_subquery("same key"), None);
+        cache_scalar_subquery(
+            "same key".into(),
+            smallvec::SmallVec::new(),
+            Value::Integer(2),
+        );
+        // Resuming an older lazy query must not consume the newer query's memo.
+        ensure_statement_cache_epoch(&first_ctx);
+        assert_eq!(get_cached_scalar_subquery("same key"), None);
+        drop(first_ctx);
+        drop(second_ctx);
+        assert_eq!(first.oldest_retention_horizon(), None);
+        assert_eq!(second.oldest_retention_horizon(), None);
     }
 
     #[test]

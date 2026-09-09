@@ -367,6 +367,11 @@ impl Chunk {
     }
 }
 
+/// Detached chunk ownership, released only after a truncate transfer unlocks.
+pub(crate) struct RetiredArena {
+    _inner: ArenaInner,
+}
+
 struct ArenaInner {
     chunks: Vec<Chunk>,
     active: Option<ChunkId>,
@@ -1121,6 +1126,29 @@ impl RowArena {
         self.bytes.store(0, Ordering::Relaxed);
     }
 
+    /// Detach ownership without dropping row payloads inside a transfer fence.
+    /// The caller drops the returned owner after publication unlocks. Chunk
+    /// identities and independent WAL receipts are never reset by TRUNCATE.
+    pub(crate) fn take_all_for_truncate(&self) -> RetiredArena {
+        let mut inner = self.inner.write();
+        let replacement = ArenaInner {
+            chunks: Vec::new(),
+            active: None,
+            next_chunk_id: inner.next_chunk_id,
+            free_head: None,
+            occupied: 0,
+            slot_count: 0,
+            initial_capacity: inner.initial_capacity,
+            directory_charge: inner
+                .directory_charge
+                .as_ref()
+                .map(|charge| MemoryCharge::new(charge.account(), 0)),
+        };
+        let retired = std::mem::replace(&mut *inner, replacement);
+        self.bytes.store(0, Ordering::Relaxed);
+        RetiredArena { _inner: retired }
+    }
+
     pub fn len(&self) -> usize {
         self.inner.read().occupied
     }
@@ -1790,6 +1818,34 @@ mod tests {
             arena.capacity().lsn_tree_bytes,
             4 * std::mem::size_of::<Option<NonZeroU64>>()
         );
+    }
+
+    #[test]
+    fn truncate_detaches_charges_without_reusing_chunk_ids_or_dropping_receipts() {
+        let account = MemoryAccount::new();
+        let baseline = account.snapshot().accounted_bytes;
+        let arena = RowArena::with_account(0, &account);
+        let first = arena.insert_arc(1, 1, payload(1), lsn(10)).unwrap();
+        let pin = arena.pin_chunk_lsn(first.chunk_id()).unwrap().unwrap();
+        let retained = account.snapshot().retained_bytes;
+        let retired = arena.take_all_for_truncate();
+        assert!(arena.is_empty());
+        assert!(arena.read_guard().get(first).is_none());
+        assert_eq!(arena.capacity().metadata_bytes, 0);
+        assert_eq!(account.snapshot().retained_bytes, retained);
+        assert_eq!(arena.first_lsn(), lsn(10));
+
+        let second = arena.insert_arc(1, 2, payload(2), lsn(20)).unwrap();
+        assert!(second.chunk_id() > first.chunk_id());
+        assert!(arena.read_guard().get(first).is_none());
+        let both = account.snapshot().retained_bytes;
+        drop(retired);
+        assert!(account.snapshot().retained_bytes < both);
+        assert_eq!(arena.first_lsn(), lsn(10));
+        drop(pin);
+        assert_eq!(arena.first_lsn(), lsn(20));
+        drop(arena);
+        assert_eq!(account.snapshot().accounted_bytes, baseline);
     }
 
     #[test]

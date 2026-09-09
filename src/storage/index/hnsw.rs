@@ -2898,6 +2898,11 @@ impl HnswIndex {
         self.metric
     }
 
+    /// Immutable vector shape for preparing an equivalent empty index.
+    pub(crate) fn dimensions(&self) -> usize {
+        self.dims
+    }
+
     /// Get the HNSW tuning parameters (m, ef_construction, ef_search, metric).
     pub fn params(&self) -> (usize, usize, usize, HnswDistanceMetric) {
         (self.m, self.ef_construction, self.ef_search, self.metric)

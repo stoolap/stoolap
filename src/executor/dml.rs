@@ -477,13 +477,13 @@ impl Executor {
             if let Some(ref mut tx_state) = *active_tx {
                 // Use the active transaction
                 // NOTE: table_name is already lowercase (value_lower from AST)
-                let table = tx_state.transaction.get_table(table_name)?;
+                let table = ctx.get_table(tx_state.transaction.as_ref(), table_name)?;
 
                 // Store a reference to this table for commit/rollback
                 if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
-                        tx_state.transaction.get_table(table_name)?,
+                        ctx.get_table(tx_state.transaction.as_ref(), table_name)?,
                     );
                 }
 
@@ -491,7 +491,7 @@ impl Executor {
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
                 let tx = self.engine.begin_transaction()?;
-                let table = tx.get_table(table_name)?;
+                let table = ctx.get_table(tx.as_ref(), table_name)?;
                 (table, true, Some(tx))
             };
 
@@ -883,6 +883,17 @@ impl Executor {
                 invalidate_in_subquery_cache_for_table(table_name);
             }
 
+            // Evaluate RETURNING while statement rollback can still restore mutations.
+            let mut returning_result = if let Some(column_names) = &schema_column_names_arc {
+                Some(self.build_returning_result(
+                    &stmt.returning,
+                    returning_rows,
+                    column_names,
+                    ctx,
+                )?)
+            } else {
+                None
+            };
             // Commit if this is a standalone (auto-commit) transaction
             if should_auto_commit {
                 if let Some(mut tx) = standalone_tx {
@@ -902,7 +913,14 @@ impl Executor {
                             if stmt.do_nothing {
                                 // DO NOTHING: returning 0 rows is the correct semantic
                                 rows_affected = 0;
-                                returning_rows.clear();
+                                if let Some(column_names) = &schema_column_names_arc {
+                                    returning_result = Some(self.build_returning_result(
+                                        &stmt.returning,
+                                        Vec::new(),
+                                        column_names,
+                                        ctx,
+                                    )?);
+                                }
                             } else {
                                 return Err(e);
                             }
@@ -913,13 +931,8 @@ impl Executor {
             }
 
             // Handle RETURNING clause for INSERT...SELECT
-            if has_returning {
-                return self.build_returning_result(
-                    &stmt.returning,
-                    returning_rows,
-                    schema_column_names_arc.as_ref().unwrap(),
-                    ctx,
-                );
+            if let Some(result) = returning_result {
+                return Ok(result);
             }
 
             return Ok(Box::new(ExecResult::with_rows_affected(rows_affected)));
@@ -1239,6 +1252,12 @@ impl Executor {
             invalidate_in_subquery_cache_for_table(table_name);
         }
 
+        // Evaluate RETURNING before durable commit while statement rollback remains available.
+        let mut returning_result = if let Some(column_names) = &schema_column_names_arc {
+            Some(self.build_returning_result(&stmt.returning, returning_rows, column_names, ctx)?)
+        } else {
+            None
+        };
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             if let Some(mut tx) = standalone_tx {
@@ -1256,7 +1275,14 @@ impl Executor {
                         if stmt.do_nothing {
                             // DO NOTHING: returning 0 rows is the correct semantic
                             rows_affected = 0;
-                            returning_rows.clear();
+                            if let Some(column_names) = &schema_column_names_arc {
+                                returning_result = Some(self.build_returning_result(
+                                    &stmt.returning,
+                                    Vec::new(),
+                                    column_names,
+                                    ctx,
+                                )?);
+                            }
                         } else {
                             return Err(e);
                         }
@@ -1267,13 +1293,8 @@ impl Executor {
         }
 
         // Handle RETURNING clause
-        if has_returning {
-            return self.build_returning_result(
-                &stmt.returning,
-                returning_rows,
-                schema_column_names_arc.as_ref().unwrap(),
-                ctx,
-            );
+        if let Some(result) = returning_result {
+            return Ok(result);
         }
 
         Ok(Box::new(ExecResult::with_rows_affected(rows_affected)))
@@ -1324,13 +1345,13 @@ impl Executor {
         let (mut table, should_auto_commit, standalone_tx) =
             if let Some(ref mut tx_state) = *active_tx {
                 // Use the active transaction
-                let table = tx_state.transaction.get_table(table_name)?;
+                let table = ctx.get_table(tx_state.transaction.as_ref(), table_name)?;
 
                 // Store a reference to this table for commit/rollback
                 if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
-                        tx_state.transaction.get_table(table_name)?,
+                        ctx.get_table(tx_state.transaction.as_ref(), table_name)?,
                     );
                 }
 
@@ -1338,7 +1359,7 @@ impl Executor {
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
                 let tx = self.engine.begin_transaction()?;
-                let table = tx.get_table(table_name)?;
+                let table = ctx.get_table(tx.as_ref(), table_name)?;
                 (table, true, Some(tx))
             };
 
@@ -1700,6 +1721,21 @@ impl Executor {
             invalidate_in_subquery_cache_for_table(table_name);
         }
 
+        // All target reads are complete. Release its captured root before
+        // publication so this handle does not force hot-tree copy-on-write.
+        // The transaction owns staged changes; RETURNING owns its rows.
+        drop(table);
+
+        let returning_result = if has_returning {
+            Some(self.build_returning_result(
+                &stmt.returning,
+                returning_rows,
+                schema_column_names_arc.as_ref().unwrap(),
+                ctx,
+            )?)
+        } else {
+            None
+        };
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             if let Some(mut tx) = standalone_tx {
@@ -1708,13 +1744,8 @@ impl Executor {
         }
 
         // Handle RETURNING clause
-        if has_returning {
-            return self.build_returning_result(
-                &stmt.returning,
-                returning_rows,
-                schema_column_names_arc.as_ref().unwrap(),
-                ctx,
-            );
+        if let Some(result) = returning_result {
+            return Ok(result);
         }
 
         Ok(Box::new(ExecResult::with_rows_affected(rows_affected)))
@@ -1785,13 +1816,13 @@ impl Executor {
             if let Some(ref mut tx_state) = *active_tx {
                 // Use the active transaction
                 // NOTE: table_name is already lowercase (value_lower from AST)
-                let table = tx_state.transaction.get_table(table_name)?;
+                let table = ctx.get_table(tx_state.transaction.as_ref(), table_name)?;
 
                 // Store a reference to this table for commit/rollback
                 if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
-                        tx_state.transaction.get_table(table_name)?,
+                        ctx.get_table(tx_state.transaction.as_ref(), table_name)?,
                     );
                 }
 
@@ -1799,7 +1830,7 @@ impl Executor {
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
                 let tx = self.engine.begin_transaction()?;
-                let table = tx.get_table(table_name)?;
+                let table = ctx.get_table(tx.as_ref(), table_name)?;
                 (table, true, Some(tx))
             };
 
@@ -2688,18 +2719,20 @@ impl Executor {
             invalidate_in_subquery_cache_for_table(table_name);
         }
 
-        // Commit if this is a standalone (auto-commit) transaction
+        let returning_result = if has_returning {
+            let rows = returning_rows.into_inner();
+            Some(self.build_returning_result(&stmt.returning, rows, &column_names, ctx)?)
+        } else {
+            None
+        };
+        // Commit only after fallible RETURNING projection has completed.
         if should_auto_commit {
-            // Commit the transaction - it will commit all tables via commit_all_tables()
             if let Some(mut tx) = standalone_tx {
                 tx.commit()?;
             }
         }
-
-        // Handle RETURNING clause
-        if has_returning {
-            let rows = returning_rows.into_inner();
-            return self.build_returning_result(&stmt.returning, rows, &column_names, ctx);
+        if let Some(result) = returning_result {
+            return Ok(result);
         }
 
         Ok(Box::new(ExecResult::with_rows_affected(
@@ -2775,13 +2808,13 @@ impl Executor {
             if let Some(ref mut tx_state) = *active_tx {
                 // Use the active transaction
                 // NOTE: table_name is already lowercase (value_lower from AST)
-                let table = tx_state.transaction.get_table(table_name)?;
+                let table = ctx.get_table(tx_state.transaction.as_ref(), table_name)?;
 
                 // Store a reference to this table for commit/rollback
                 if !tx_state.tables.contains_key(table_name.as_str()) {
                     tx_state.tables.insert(
                         table_name.to_string(),
-                        tx_state.transaction.get_table(table_name)?,
+                        ctx.get_table(tx_state.transaction.as_ref(), table_name)?,
                     );
                 }
 
@@ -2789,7 +2822,7 @@ impl Executor {
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
                 let tx = self.engine.begin_transaction()?;
-                let table = tx.get_table(table_name)?;
+                let table = ctx.get_table(tx.as_ref(), table_name)?;
                 (table, true, Some(tx))
             };
 
@@ -3190,22 +3223,24 @@ impl Executor {
             invalidate_in_subquery_cache_for_table(table_name);
         }
 
-        // Commit if this is a standalone (auto-commit) transaction
-        if should_auto_commit {
-            // Commit the transaction - it will commit all tables via commit_all_tables()
-            if let Some(mut tx) = standalone_tx {
-                tx.commit()?;
-            }
-        }
-
-        // Handle RETURNING clause
-        if has_returning {
-            return self.build_returning_result(
+        let returning_result = if has_returning {
+            Some(self.build_returning_result(
                 &stmt.returning,
                 returning_rows,
                 &column_names_owned,
                 ctx,
-            );
+            )?)
+        } else {
+            None
+        };
+        // Commit only after fallible RETURNING projection has completed.
+        if should_auto_commit {
+            if let Some(mut tx) = standalone_tx {
+                tx.commit()?;
+            }
+        }
+        if let Some(result) = returning_result {
+            return Ok(result);
         }
 
         Ok(Box::new(ExecResult::with_rows_affected(
@@ -3227,7 +3262,7 @@ impl Executor {
     pub(crate) fn execute_truncate(
         &self,
         stmt: &TruncateStatement,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         // OPTIMIZATION: Use pre-computed lowercase name to avoid allocation per query
         let table_name = &stmt.table_name.value_lower;
@@ -3245,41 +3280,25 @@ impl Executor {
                 }
 
                 // Use the active transaction
-                let table = tx_state.transaction.get_table(table_name)?;
+                let table = ctx.get_table(tx_state.transaction.as_ref(), table_name)?;
 
-                // Register this table for commit/rollback
-                tx_state.tables.insert(
-                    table_name.to_string(),
-                    tx_state.transaction.get_table(table_name)?,
-                );
+                // Physical TRUNCATE is already committed by its coordinator;
+                // a redundant table handle would retain a second read lease.
 
                 (table, false, None)
             } else {
                 // No active transaction - create a standalone transaction with auto-commit
                 let tx = self.engine.begin_transaction()?;
-                let table = tx.get_table(table_name)?;
+                let table = ctx.get_table(tx.as_ref(), table_name)?;
                 (table, true, Some(tx))
             };
 
         // Drop the lock before doing work
         drop(active_tx);
 
-        // FK enforcement: block truncate if child tables reference this table
-        // Uses the table's transaction for visibility (sees uncommitted child deletes)
-        super::foreign_key::check_no_referencing_rows(
-            &self.engine,
-            table_name,
-            Some(table.txn_id()),
-        )?;
-
-        // Truncate all rows (fast path: drops storage directly)
-        // WAL is recorded AFTER success to prevent phantom records on failure.
-        // If a crash occurs between truncate and WAL write, recovery restores
-        // the pre-truncate state from the snapshot — the user simply retries.
+        // One operation validates all claims/read leases and allocates its
+        // replacement state before WAL. A WAL error leaves both layers intact.
         let rows_affected = table.truncate()?;
-
-        // Record TRUNCATE to WAL for persistence (only after successful truncate)
-        self.engine.record_truncate_table(table_name)?;
 
         // Invalidate semantic cache for this table BEFORE commit
         // CRITICAL: Must invalidate before commit to prevent stale data window
@@ -3898,7 +3917,10 @@ impl Executor {
             result_rows.push((row_id as i64, Row::from_values(row_values)));
         }
 
-        Ok(Box::new(ExecutorResult::new(result_columns, result_rows)))
+        let affected = result_rows.len() as i64;
+        let mut result = ExecutorResult::new(result_columns, result_rows);
+        result.set_rows_affected(affected);
+        Ok(Box::new(result))
     }
 
     /// Get a column name for a RETURNING expression
@@ -3926,6 +3948,108 @@ mod tests {
     use super::*;
     use crate::storage::mvcc::engine::MVCCEngine;
     use std::sync::Arc;
+
+    #[test]
+    fn prepared_insert_released_target_preserves_values_and_returning() {
+        let db = crate::api::Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", ())
+            .unwrap();
+        let insert = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
+        // Populate multiple tree nodes, then reuse the compiled plan.
+        for id in 1..=128i64 {
+            assert_eq!(insert.execute((id, id * 10)).unwrap(), 1);
+        }
+        let returning = db
+            .prepare("INSERT INTO t VALUES ($1, $2) RETURNING id, n + $3")
+            .unwrap();
+        for id in 129..=130i64 {
+            let mut rows = returning.query((id, id * 10, 7i64)).unwrap();
+            let row = rows.next().unwrap().unwrap();
+            assert_eq!(row.get::<i64>(0).unwrap(), id);
+            assert_eq!(row.get::<i64>(1).unwrap(), id * 10 + 7);
+            assert!(rows.next().is_none());
+        }
+        assert!(insert.execute((1i64, 999i64)).is_err());
+        assert_eq!(
+            db.query_one::<i64, _>("SELECT COUNT(*) FROM t", ())
+                .unwrap(),
+            130
+        );
+        assert_eq!(
+            db.query_one::<i64, _>("SELECT n FROM t WHERE id=1", ())
+                .unwrap(),
+            10
+        );
+    }
+
+    #[test]
+    fn prepared_insert_released_target_preserves_constraints_and_defaults() {
+        let db = crate::api::Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE parents (id INTEGER PRIMARY KEY)", ())
+            .unwrap();
+        db.execute("INSERT INTO parents VALUES (1)", ()).unwrap();
+        db.execute(
+            "CREATE TABLE children (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parents(id), n INTEGER CHECK (n >= 0), label TEXT DEFAULT 'new')",
+            (),
+        ).unwrap();
+        let insert = db
+            .prepare("INSERT INTO children (id, parent_id, n) VALUES ($1, $2, $3) RETURNING label")
+            .unwrap();
+        assert_eq!(
+            insert.query_one::<String, _>((1i64, 1i64, 4i64)).unwrap(),
+            "new"
+        );
+        assert!(insert.query((2i64, 99i64, 4i64)).is_err());
+        assert!(insert.query((3i64, 1i64, -1i64)).is_err());
+        assert_eq!(
+            insert.query_one::<String, _>((4i64, 1i64, 5i64)).unwrap(),
+            "new"
+        );
+        assert_eq!(
+            db.query_one::<i64, _>("SELECT COUNT(*) FROM children", ())
+                .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn prepared_insert_released_target_preserves_select_and_explicit_rollback() {
+        let db = crate::api::Database::open_in_memory().unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)", ())
+            .unwrap();
+        db.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, n INTEGER)", ())
+            .unwrap();
+        db.execute("INSERT INTO src VALUES (1, 10), (2, 20)", ())
+            .unwrap();
+        let insert = db
+            .prepare("INSERT INTO t SELECT id, n FROM src RETURNING id, n")
+            .unwrap();
+        let collect = || {
+            let mut rows = insert
+                .query(())
+                .unwrap()
+                .map(|row| {
+                    let row = row.unwrap();
+                    (row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap())
+                })
+                .collect::<Vec<_>>();
+            rows.sort_unstable();
+            rows
+        };
+        assert_eq!(collect(), vec![(1, 10), (2, 20)]);
+        db.execute("DELETE FROM src", ()).unwrap();
+        db.execute("INSERT INTO src VALUES (3, 30), (4, 40)", ())
+            .unwrap();
+        db.execute("BEGIN", ()).unwrap();
+        assert_eq!(collect(), vec![(3, 30), (4, 40)]);
+        db.execute("ROLLBACK", ()).unwrap();
+        assert_eq!(
+            db.query_one::<i64, _>("SELECT COUNT(*) FROM t", ())
+                .unwrap(),
+            2
+        );
+        assert_eq!(collect(), vec![(3, 30), (4, 40)]);
+    }
 
     fn create_test_executor() -> Executor {
         let engine = MVCCEngine::in_memory();

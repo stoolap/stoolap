@@ -16,6 +16,47 @@
 
 use stoolap::Database;
 
+#[test]
+fn committed_changes_from_another_executor_cannot_reuse_old_rows() {
+    use std::sync::Arc;
+    use stoolap::executor::Executor;
+
+    let db =
+        Database::open("memory://committed_changes_from_another_executor_cannot_reuse_old_rows")
+            .unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
+        .unwrap();
+    let reader = Executor::new(Arc::clone(db.engine()));
+    let writer = Executor::new(Arc::clone(db.engine()));
+    let values = || {
+        let mut result = reader.execute("SELECT * FROM t WHERE id > 0").unwrap();
+        let mut rows = Vec::new();
+        while result.next() {
+            let row = result.row();
+            rows.push((
+                row.get(0).unwrap().as_int64().unwrap(),
+                row.get(1).unwrap().as_int64().unwrap(),
+            ));
+        }
+        assert!(result.last_error().is_none());
+        result.close().unwrap();
+        rows.sort_unstable();
+        rows
+    };
+    assert_eq!(values(), vec![(1, 10), (2, 20)]);
+    assert_eq!(values(), vec![(1, 10), (2, 20)]);
+    assert_eq!(reader.semantic_cache_stats().exact_hits, 1);
+    writer.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+    assert_eq!(values(), vec![(1, 10), (2, 20), (3, 30)]);
+    writer.execute("UPDATE t SET v=99 WHERE id=1").unwrap();
+    assert_eq!(values(), vec![(1, 99), (2, 20), (3, 30)]);
+    writer.execute("DELETE FROM t WHERE id=2").unwrap();
+    assert_eq!(values(), vec![(1, 99), (3, 30)]);
+    assert_eq!(reader.semantic_cache_stats().exact_hits, 1);
+}
+
 /// Tests basic query cache functionality
 #[test]
 fn test_query_cache_basic() {

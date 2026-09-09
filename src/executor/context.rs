@@ -667,6 +667,43 @@ pub fn cache_exists_correlation(
     result
 }
 
+thread_local! {
+    static DATA_CACHE_EPOCH: RefCell<Option<(usize, i64)>> = const { RefCell::new(None) };
+}
+
+/// Cached row/value data belongs to one immutable statement view. The copied
+/// identity retains no registry horizon or allocation while a thread is idle.
+/// Checking again during lazy/nested evaluation also handles two results
+/// consumed in alternating order on the same thread.
+pub(crate) fn ensure_statement_cache_epoch(ctx: &ExecutionContext) {
+    let Some(epoch) = ctx.read_epoch() else {
+        return;
+    };
+    let changed = DATA_CACHE_EPOCH.with(|current| {
+        let mut current = current.borrow_mut();
+        if *current == Some(epoch.cache_identity()) {
+            false
+        } else {
+            *current = Some(epoch.cache_identity());
+            true
+        }
+    });
+    if changed {
+        clear_scalar_subquery_cache();
+        clear_in_subquery_cache();
+        clear_semi_join_cache();
+        clear_batch_aggregate_cache();
+        clear_batch_aggregate_info_cache();
+        clear_exists_correlation_cache();
+        clear_exists_predicate_cache();
+        clear_exists_index_cache();
+        clear_exists_fetcher_cache();
+        clear_count_counter_cache();
+        clear_exists_schema_cache();
+        clear_exists_pred_key_cache();
+    }
+}
+
 /// Execution context for SQL queries
 ///
 /// The execution context carries state and configuration for query execution,
@@ -676,21 +713,44 @@ pub fn cache_exists_correlation(
 /// during correlated subquery processing where context is cloned per row.
 /// A transaction shared by every read of one statement
 #[derive(Clone)]
-pub struct StatementSnapshot(Arc<Mutex<Box<dyn crate::storage::traits::Transaction>>>);
+pub struct StatementSnapshot {
+    transaction: Arc<Mutex<Box<dyn crate::storage::traits::Transaction>>>,
+    epoch: Option<crate::storage::mvcc::registry::ReadEpoch>,
+}
 
 impl StatementSnapshot {
     pub fn new(transaction: Box<dyn crate::storage::traits::Transaction>) -> Self {
-        Self(Arc::new(Mutex::new(transaction)))
+        Self {
+            transaction: Arc::new(Mutex::new(transaction)),
+            epoch: None,
+        }
+    }
+
+    pub fn with_epoch(mut self, epoch: Option<crate::storage::mvcc::registry::ReadEpoch>) -> Self {
+        self.epoch = epoch;
+        self
     }
 
     pub fn get_table(
         &self,
         name: &str,
     ) -> crate::core::Result<Box<dyn crate::storage::traits::Table>> {
-        self.0
+        let transaction = self
+            .transaction
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get_table(name)
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.get_table_for_transaction(transaction.as_ref(), name)
+    }
+
+    pub(crate) fn get_table_for_transaction(
+        &self,
+        transaction: &dyn crate::storage::traits::Transaction,
+        name: &str,
+    ) -> crate::core::Result<Box<dyn crate::storage::traits::Table>> {
+        match &self.epoch {
+            Some(epoch) => transaction.get_table_in_epoch(name, epoch),
+            None => transaction.get_table(name),
+        }
     }
 }
 
@@ -736,6 +796,8 @@ pub struct ExecutionContext {
     /// One transaction for every fetch of a statement that has no explicit
     /// transaction, so its reads share a snapshot
     statement_snapshot: Option<StatementSnapshot>,
+    /// One registered lease shared by every read of this statement.
+    read_epoch: Option<crate::storage::mvcc::registry::ReadEpoch>,
 }
 
 /// Type alias for CTE data: (columns, rows) with Arc for zero-copy sharing
@@ -772,6 +834,7 @@ impl ExecutionContext {
             cte_data: None,
             transaction_id: None,
             statement_snapshot: None,
+            read_epoch: None,
         }
     }
 
@@ -933,6 +996,7 @@ impl ExecutionContext {
             cte_data: self.cte_data.clone(),
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
+            read_epoch: self.read_epoch.clone(),
         }
     }
 
@@ -954,6 +1018,7 @@ impl ExecutionContext {
             cte_data: self.cte_data.clone(),
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
+            read_epoch: self.read_epoch.clone(),
         }
     }
 
@@ -1000,6 +1065,7 @@ impl ExecutionContext {
             cte_data: self.cte_data.clone(),    // Arc clone = cheap
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
+            read_epoch: self.read_epoch.clone(),
         }
     }
 
@@ -1053,6 +1119,7 @@ impl ExecutionContext {
             cte_data: Some(cte_data),
             transaction_id: self.transaction_id,
             statement_snapshot: self.statement_snapshot.clone(),
+            read_epoch: self.read_epoch.clone(),
         }
     }
 
@@ -1068,6 +1135,29 @@ impl ExecutionContext {
 
     /// Create a new context with a transaction ID
     /// The statement-scoped snapshot, if the statement carries one
+    pub fn read_epoch(&self) -> Option<&crate::storage::mvcc::registry::ReadEpoch> {
+        self.read_epoch.as_ref()
+    }
+
+    pub fn with_read_epoch(&self, epoch: crate::storage::mvcc::registry::ReadEpoch) -> Self {
+        let mut ctx = self.clone();
+        ctx.read_epoch = Some(epoch);
+        ctx
+    }
+
+    /// Use this statement's visibility even when a helper opens a new table
+    /// handle or an autocommit storage transaction after the statement began.
+    pub(crate) fn get_table(
+        &self,
+        transaction: &dyn crate::storage::traits::Transaction,
+        name: &str,
+    ) -> crate::core::Result<Box<dyn crate::storage::traits::Table>> {
+        match &self.read_epoch {
+            Some(epoch) => transaction.get_table_in_epoch(name, epoch),
+            None => transaction.get_table(name),
+        }
+    }
+
     pub fn statement_snapshot(&self) -> Option<&StatementSnapshot> {
         self.statement_snapshot.as_ref()
     }
@@ -1095,6 +1185,7 @@ impl ExecutionContext {
             cte_data: self.cte_data.clone(),
             transaction_id: Some(txn_id),
             statement_snapshot: self.statement_snapshot.clone(),
+            read_epoch: self.read_epoch.clone(),
         }
     }
 

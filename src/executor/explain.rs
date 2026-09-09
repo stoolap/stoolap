@@ -939,6 +939,7 @@ impl Executor {
                 &join_type_upper,
                 left_alias.as_deref(),
                 right_alias.as_deref(),
+                None,
             );
 
             if let Some((_, strategy, _, _)) = inlj_info {
@@ -956,6 +957,7 @@ impl Executor {
                 &join_type_upper,
                 right_alias.as_deref(),
                 left_alias.as_deref(),
+                None,
             );
 
             if let Some((_, strategy, _, _)) = swapped_info {

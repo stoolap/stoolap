@@ -157,11 +157,20 @@ fn cold_error_after_scan_progress_discards_rows_and_aggregate() {
     let _guard = test_failpoints::FailpointGuard::new();
     let (_dir, dsn) = fixture();
     let db = Database::open(&dsn).unwrap();
+    db.execute(
+        "INSERT INTO items VALUES (7, 'c', 70, 'seven'), (8, 'c', 80, 'eight')",
+        (),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(db.engine().volume_stats().len(), 2);
     for (sql, nth) in [
-        ("SELECT id, amount, code FROM items ORDER BY id", 7),
-        // The SUM column is bound once; later predicate reads still follow
-        // rows already accumulated and must discard that partial aggregate.
-        ("SELECT SUM(amount) FROM items WHERE amount >= 10", 5),
+        // Each volume binds four projected columns; the fifth read belongs
+        // to the second volume after the first has contributed visible rows.
+        ("SELECT id, amount, code FROM items ORDER BY id", 5),
+        // Predicate and SUM share the amount column. The second binding is
+        // in the next volume, after the first partial aggregate was accumulated.
+        ("SELECT SUM(amount) FROM items WHERE amount >= 10", 2),
     ] {
         let expected = rows(&db, sql).unwrap();
         test_failpoints::fail_cold_read_on(nth);

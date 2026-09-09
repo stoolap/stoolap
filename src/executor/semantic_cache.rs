@@ -56,23 +56,9 @@
 //!
 //! # Transaction Isolation Considerations
 //!
-//! **Important:** The semantic cache is currently global and does not account for
-//! MVCC transaction isolation. This means:
-//!
-//! - Cache entries are shared across all transactions
-//! - A transaction might see cached results from another transaction's read
-//! - Cache invalidation on DML ensures committed changes are reflected
-//!
-//! This is safe for:
-//! - Single-connection usage
-//! - Read-only workloads
-//! - Scenarios where eventual consistency is acceptable
-//!
-//! For strict serializable isolation with concurrent writes, consider:
-//! - Disabling the cache during critical transactions
-//! - Using explicit cache invalidation between operations
-//!
-//! Future enhancement: Per-transaction cache scoping with timestamp-based invalidation
+//! Executor entries carry an engine-issued scalar committed-view proof. Exact
+//! and subsumption hits require the same proof; invalidation is only eviction.
+//! Legacy standalone APIs remain untagged and never match tagged executor rows.
 
 use crate::common::time_compat::Instant;
 use rustc_hash::FxHasher;
@@ -84,6 +70,7 @@ use std::time::Duration;
 
 use crate::common::{CompactArc, StringMap};
 use crate::core::{Result, Row};
+use crate::storage::mvcc::registry::CacheProvenance;
 
 /// Convert to lowercase without allocation if already lowercase.
 /// Returns Cow::Borrowed for already-lowercase strings (zero allocation).
@@ -171,6 +158,7 @@ impl QueryFingerprint {
 /// Cached query result with metadata
 #[derive(Debug, Clone)]
 pub struct CachedResult {
+    provenance: Option<CacheProvenance>,
     /// The fingerprint identifying this query pattern
     pub fingerprint: QueryFingerprint,
     /// Column names in order
@@ -198,6 +186,7 @@ impl CachedResult {
         let now = Instant::now();
         Self {
             fingerprint,
+            provenance: None,
             column_names,
             rows: CompactArc::new(rows), // Wrap in CompactArc for zero-copy sharing
             predicate,
@@ -220,6 +209,7 @@ impl CachedResult {
         let now = Instant::now();
         Self {
             fingerprint,
+            provenance: None,
             column_names,
             rows, // Use Arc directly - no additional wrapping
             predicate,
@@ -382,6 +372,26 @@ impl SemanticCache {
         columns: &[String],
         predicate: Option<&Expression>,
     ) -> CacheLookupResult {
+        self.lookup_tagged(table_name, columns, predicate, None)
+    }
+
+    pub fn lookup_with_provenance(
+        &self,
+        table_name: &str,
+        columns: &[String],
+        predicate: Option<&Expression>,
+        provenance: CacheProvenance,
+    ) -> CacheLookupResult {
+        self.lookup_tagged(table_name, columns, predicate, Some(provenance))
+    }
+
+    fn lookup_tagged(
+        &self,
+        table_name: &str,
+        columns: &[String],
+        predicate: Option<&Expression>,
+        provenance: Option<CacheProvenance>,
+    ) -> CacheLookupResult {
         let (table_key, column_key) = Self::cache_keys(table_name, columns);
 
         // First pass: read-only search
@@ -418,6 +428,9 @@ impl SemanticCache {
             let mut found = None;
             let now = Instant::now();
             for (idx, entry) in entries.iter().enumerate() {
+                if entry.provenance != provenance {
+                    continue;
+                }
                 // Skip expired entries
                 if entry.is_expired_at(self.ttl, now) {
                     continue;
@@ -500,6 +513,28 @@ impl SemanticCache {
         rows: Vec<Row>,
         predicate: Option<Expression>,
     ) {
+        self.insert_tagged(table_name, columns, rows, predicate, None);
+    }
+
+    pub fn insert_with_provenance(
+        &self,
+        table_name: &str,
+        columns: Vec<String>,
+        rows: Vec<Row>,
+        predicate: Option<Expression>,
+        provenance: CacheProvenance,
+    ) {
+        self.insert_tagged(table_name, columns, rows, predicate, Some(provenance));
+    }
+
+    fn insert_tagged(
+        &self,
+        table_name: &str,
+        columns: Vec<String>,
+        rows: Vec<Row>,
+        predicate: Option<Expression>,
+        provenance: Option<CacheProvenance>,
+    ) {
         let new_row_count = rows.len();
 
         // Don't cache if too many rows in this single result
@@ -513,7 +548,8 @@ impl SemanticCache {
             None => QueryFingerprint::new(table_name, columns.clone()),
         };
 
-        let entry = CachedResult::new(fingerprint, columns, rows, predicate);
+        let mut entry = CachedResult::new(fingerprint, columns, rows, predicate);
+        entry.provenance = provenance;
         self.insert_entry(entry, new_row_count, table_key, column_key);
     }
 

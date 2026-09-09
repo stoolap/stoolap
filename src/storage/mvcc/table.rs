@@ -27,10 +27,20 @@ use crate::core::{
 use crate::storage::expression::logical::OrExpr;
 use crate::storage::expression::Expression;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
+use crate::storage::mvcc::registry::ReadEpoch;
 use crate::storage::mvcc::scanner::MVCCScanner;
+use crate::storage::mvcc::version_store::{CapturedHotRoot, CapturedHotRow, CapturedHotView};
 use crate::storage::mvcc::{TransactionVersionStore, VersionStore};
 use crate::storage::traits::{Index, QueryResult, ScanPlan, Scanner, Table};
 use crate::storage::MemoryResult;
+
+/// Write-only statements bind an epoch/root without copying previous local
+/// writes. A real read freezes its own overlay before returning a lazy result.
+struct CapturedReadBinding {
+    root: CapturedHotRoot,
+    epoch: ReadEpoch,
+    view: std::sync::OnceLock<Arc<CapturedHotView>>,
+}
 
 /// MVCC Table wrapper that provides MVCC isolation for tables
 pub struct MVCCTable {
@@ -42,6 +52,7 @@ pub struct MVCCTable {
     txn_versions: CompactArc<RwLock<TransactionVersionStore>>,
     /// Cached schema for returning references (Arc clone from version_store - O(1) instead of cloning)
     cached_schema: CompactArc<Schema>,
+    read_view: Option<CapturedReadBinding>,
 }
 
 /// Where a WHERE conjunction sits on a multi-column index: equalities on the
@@ -52,6 +63,10 @@ struct PrefixPlan {
     lower: Option<(Value, bool)>,
     upper: Option<(Value, bool)>,
 }
+
+/// Selected global rows retain exact conflict metadata; own writes already
+/// have their original version in the transaction's write set.
+type DmlTargets = (Vec<(i64, Row, crate::storage::mvcc::RowVersion)>, RowVec);
 
 /// The comparisons of an AND tree; false when a leaf is not a comparison
 fn collect_conjuncts<'a>(
@@ -73,6 +88,34 @@ fn collect_conjuncts<'a>(
 }
 
 impl MVCCTable {
+    fn prepare_filter_if_needed(
+        &self,
+        filter: Option<&dyn Expression>,
+    ) -> Option<Box<dyn Expression>> {
+        filter.filter(|filter| !filter.is_prepared()).map(|filter| {
+            let mut filter = filter.clone_box();
+            filter.prepare_for_schema(&self.cached_schema);
+            filter
+        })
+    }
+
+    fn captured_view(&self) -> Option<&Arc<CapturedHotView>> {
+        self.read_view.as_ref().map(|binding| {
+            binding.view.get_or_init(|| {
+                let own = {
+                    let Ok(versions) = self.txn_versions.read() else {
+                        panic!("transaction store is poisoned during view capture");
+                    };
+                    versions.capture_hot_overlay()
+                };
+                Arc::new(CapturedHotView::new(
+                    binding.root.clone(),
+                    binding.epoch.clone(),
+                    own,
+                ))
+            })
+        })
+    }
     /// Creates a new MVCC table with an owned transaction version store
     /// (wraps it in Arc<RwLock> internally)
     pub fn new(
@@ -89,6 +132,7 @@ impl MVCCTable {
             version_store,
             txn_versions,
             cached_schema,
+            read_view: None,
         }
     }
 
@@ -106,6 +150,7 @@ impl MVCCTable {
             version_store,
             txn_versions,
             cached_schema,
+            read_view: None,
         }
     }
 
@@ -122,6 +167,122 @@ impl MVCCTable {
     /// Returns a reference to the shared transaction version store
     pub fn txn_versions(&self) -> &CompactArc<RwLock<TransactionVersionStore>> {
         &self.txn_versions
+    }
+
+    /// Write-set metadata describes the value visible at the read epoch, not
+    /// an excluded physical deletion layered on that value. Keep its creator,
+    /// timestamp, and payload; old-index projection must still see a live row.
+    fn dml_observed_original(
+        version: &crate::storage::mvcc::RowVersion,
+    ) -> crate::storage::mvcc::RowVersion {
+        let mut observed = version.clone();
+        observed.deleted_at_txn_id = 0;
+        observed
+    }
+
+    /// DML reads its latest own state separately. Only the committed fallback
+    /// uses the fixed statement epoch, preserving the original conflict token.
+    fn dml_global_version(&self, row_id: i64) -> Option<crate::storage::mvcc::RowVersion> {
+        if let Some(binding) = &self.read_view {
+            // A captured Value may carry an invisible deletion marker. Its
+            // tri-state decision is authoritative; do not call is_deleted again.
+            binding
+                .root
+                .visible_version(row_id, &binding.epoch)
+                .map(Self::dml_observed_original)
+        } else {
+            self.version_store
+                .get_visible_version(row_id, self.txn_id)
+                .filter(|version| !version.is_deleted())
+        }
+    }
+
+    fn dml_global_rows_by_ids(
+        &self,
+        row_ids: &[i64],
+    ) -> Vec<(i64, Row, crate::storage::mvcc::RowVersion)> {
+        if let Some(binding) = &self.read_view {
+            row_ids
+                .iter()
+                .filter_map(|&id| {
+                    binding
+                        .root
+                        .visible_version(id, &binding.epoch)
+                        .map(|version| {
+                            (
+                                id,
+                                version.data.clone(),
+                                Self::dml_observed_original(version),
+                            )
+                        })
+                })
+                .collect()
+        } else {
+            self.version_store
+                .get_visible_versions_for_update(row_ids, self.txn_id)
+        }
+    }
+
+    /// Normalize only when schema evolution requires it, and copy a matching
+    /// payload after the predicate. Predicate errors abort selection.
+    fn dml_matching_row(&self, row: &Row, filter: Option<&dyn Expression>) -> Result<Option<Row>> {
+        if row.len() == self.cached_schema.columns.len() {
+            if filter.map_or(Ok(true), |filter| filter.evaluate(row))? {
+                Ok(Some(row.clone()))
+            } else {
+                Ok(None)
+            }
+        } else {
+            let row = self.normalize_row_to_schema(row.clone(), &self.cached_schema);
+            if filter.map_or(Ok(true), |filter| filter.evaluate(&row))? {
+                Ok(Some(row))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    /// A full DML scan visits own writes once, without constructing a frozen
+    /// read overlay. Own identities mask global data before filtering, including
+    /// local deletes and writes that no longer match the predicate.
+    fn captured_dml_targets(&self, filter: Option<&dyn Expression>) -> Result<Option<DmlTargets>> {
+        let Some(binding) = &self.read_view else {
+            return Ok(None);
+        };
+        let txn_versions = self
+            .txn_versions
+            .read()
+            .map_err(|_| Error::internal("transaction store is poisoned"))?;
+        let mut globals = Vec::new();
+        let mut selection_error = None;
+        binding
+            .root
+            .for_each_visible_version_until(&binding.epoch, |id, version| {
+                if txn_versions.get_local_version(id).is_some() {
+                    return true;
+                }
+                match self.dml_matching_row(&version.data, filter) {
+                    Ok(Some(row)) => globals.push((id, row, Self::dml_observed_original(version))),
+                    Ok(None) => {}
+                    Err(error) => {
+                        selection_error = Some(error);
+                        return false;
+                    }
+                }
+                true
+            });
+        if let Some(error) = selection_error {
+            return Err(error);
+        }
+        let mut locals = RowVec::new();
+        for (id, version) in txn_versions.iter_local() {
+            if !version.is_deleted() {
+                if let Some(row) = self.dml_matching_row(&version.data, filter)? {
+                    locals.push((id, row));
+                }
+            }
+        }
+        Ok(Some((globals, locals)))
     }
 
     /// Auto-selects the optimal index type based on column data types
@@ -384,6 +545,9 @@ impl MVCCTable {
     }
 
     fn try_index_lookup(&self, expr: &dyn Expression) -> Option<RowIdVec> {
+        if self.read_view.is_some() {
+            return None;
+        }
         use crate::core::Operator;
         use crate::storage::index::intersect_sorted_ids;
 
@@ -1553,6 +1717,11 @@ impl MVCCTable {
     /// OPTIMIZATION: Uses single-pass counting instead of per-row visibility checks.
     /// Reduces lock acquisitions from O(N) to O(1) for the global store.
     pub fn row_count(&self) -> usize {
+        if let Some(view) = self.captured_view() {
+            let mut count = 0;
+            view.for_each_visible(|_, _| count += 1);
+            return count;
+        }
         // Count global visible versions in single pass (O(1) lock instead of O(N))
         let mut count = self.version_store.count_visible_rows(self.txn_id);
 
@@ -1587,6 +1756,9 @@ impl MVCCTable {
     /// instead of iterating all rows with visibility checks.
     #[inline]
     pub fn fast_row_count(&self) -> Option<usize> {
+        if self.read_view.is_some() {
+            return Some(self.row_count());
+        }
         // Check if there are any local changes
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
@@ -1601,6 +1773,44 @@ impl MVCCTable {
         Some(self.version_store.committed_row_count())
     }
 
+    fn collect_captured_filtered(
+        &self,
+        view: &CapturedHotView,
+        filter: Option<&dyn Expression>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<RowVec> {
+        let mut rows = RowVec::new();
+        if limit == 0 {
+            return Ok(rows);
+        }
+        let prepared = self.prepare_filter_if_needed(filter);
+        let filter = prepared.as_deref().or(filter);
+        let mut skipped = 0;
+        let mut error = None;
+        view.for_each_visible_until(|id, row| {
+            let row = self.normalize_row_to_schema(row.clone(), &self.cached_schema);
+            match filter.map(|filter| filter.evaluate(&row)).transpose() {
+                Err(failure) => {
+                    error = Some(failure);
+                    return false;
+                }
+                Ok(Some(false)) => return true,
+                _ => (),
+            }
+            if skipped < offset {
+                skipped += 1;
+                return true;
+            }
+            rows.push((id, row));
+            rows.len() < limit
+        });
+        match error {
+            Some(error) => Err(error),
+            None => Ok(rows),
+        }
+    }
+
     /// Collect all visible rows, optionally filtered
     ///
     /// Optimized to use batch fetch even when there are local changes,
@@ -1608,6 +1818,18 @@ impl MVCCTable {
     /// Returns RowVec for zero-allocation reuse across queries.
     #[inline]
     fn collect_visible_rows(&self, filter: Option<&dyn Expression>) -> RowVec {
+        if let Some(view) = self.captured_view() {
+            let prepared = self.prepare_filter_if_needed(filter);
+            let filter = prepared.as_deref().or(filter);
+            let mut rows = RowVec::new();
+            view.for_each_visible(|id, row| {
+                let row = self.normalize_row_to_schema(row.clone(), &self.cached_schema);
+                if filter.is_none_or(|filter| filter.evaluate_fast(&row)) {
+                    rows.push((id, row));
+                }
+            });
+            return rows;
+        }
         let txn_versions = self.txn_versions.read().unwrap();
         let schema = &self.cached_schema;
 
@@ -1704,6 +1926,9 @@ impl MVCCTable {
     /// Returns rows in version store iteration order.
     #[inline]
     fn collect_visible_rows_unsorted(&self) -> RowVec {
+        if self.read_view.is_some() {
+            return self.collect_visible_rows(None);
+        }
         // For GROUP BY, order doesn't matter - use same cached path
         self.collect_visible_rows(None)
     }
@@ -1716,6 +1941,26 @@ impl MVCCTable {
         limit: usize,
         offset: usize,
     ) -> RowVec {
+        if let Some(view) = self.captured_view() {
+            let prepared = self.prepare_filter_if_needed(filter);
+            let filter = prepared.as_deref().or(filter);
+            let mut rows = RowVec::with_capacity(limit.min(256));
+            let mut skipped = 0;
+            if limit != 0 {
+                view.for_each_visible_until(|id, row| {
+                    let row = self.normalize_row_to_schema(row.clone(), &self.cached_schema);
+                    if filter.is_none_or(|expr| expr.evaluate_fast(&row)) {
+                        if skipped < offset {
+                            skipped += 1;
+                        } else {
+                            rows.push((id, row));
+                        }
+                    }
+                    rows.len() < limit
+                });
+            }
+            return rows;
+        }
         let schema = &self.cached_schema;
 
         // FAST PATH: Check if this is a primary key equality lookup (WHERE id = X)
@@ -1876,6 +2121,9 @@ impl MVCCTable {
         limit: usize,
         offset: usize,
     ) -> RowVec {
+        if self.read_view.is_some() {
+            return self.collect_visible_rows_with_limit(filter, limit, offset);
+        }
         let schema = &self.cached_schema;
 
         // FAST PATH: Check if this is a primary key equality lookup (WHERE id = X)
@@ -1969,6 +2217,43 @@ impl MVCCTable {
 }
 
 impl Table for MVCCTable {
+    fn begin_logical_mutation(&self) -> Option<super::registry::LogicalMutationGuard> {
+        self.version_store.begin_logical_mutation()
+    }
+
+    fn set_read_epoch(&mut self, epoch: ReadEpoch) -> Result<()> {
+        if self
+            .read_view
+            .as_ref()
+            .is_some_and(|binding| binding.epoch.same_epoch(&epoch))
+        {
+            return Ok(());
+        }
+        self.read_view = Some(CapturedReadBinding {
+            root: self.version_store.capture_hot_root(),
+            epoch,
+            view: std::sync::OnceLock::new(),
+        });
+        Ok(())
+    }
+
+    fn capture_hot_root(&self) -> Option<CapturedHotRoot> {
+        Some(self.version_store.capture_hot_root())
+    }
+
+    fn replace_hot_root(&mut self, root: CapturedHotRoot) -> Result<()> {
+        let binding = self
+            .read_view
+            .as_mut()
+            .ok_or_else(|| Error::internal("hot root capture has no read epoch"))?;
+        binding.root = root;
+        binding.view.take();
+        Ok(())
+    }
+
+    fn captured_hot_view(&self) -> Option<Arc<CapturedHotView>> {
+        self.captured_view().cloned()
+    }
     fn name(&self) -> &str {
         self.version_store.table_name()
     }
@@ -1992,6 +2277,19 @@ impl Table for MVCCTable {
         filter: &dyn Expression,
         rows: &mut RowVec,
     ) -> Result<()> {
+        if let Some(view) = self.captured_view() {
+            let prepared = self.prepare_filter_if_needed(Some(filter));
+            let filter = prepared.as_deref().unwrap_or(filter);
+            for &id in row_ids {
+                if let CapturedHotRow::Value(row) = view.row_state(id) {
+                    let row = self.normalize_row_to_schema(row.clone(), &self.cached_schema);
+                    if filter.evaluate(&row)? {
+                        rows.push((id, row));
+                    }
+                }
+            }
+            return Ok(());
+        }
         let txn_versions = self.txn_versions.read().unwrap();
         let schema = &self.cached_schema;
 
@@ -2058,6 +2356,7 @@ impl Table for MVCCTable {
         default_expr: Option<String>,
         default_value: Option<Value>,
     ) -> Result<()> {
+        let _logical_change = self.version_store.begin_logical_mutation();
         // Create a SchemaColumn and add to both version store and cached schema
         // Get the next column ID
         let next_id = self.cached_schema.columns.len();
@@ -2081,6 +2380,7 @@ impl Table for MVCCTable {
     }
 
     fn drop_column(&mut self, name: &str) -> Result<()> {
+        let _logical_change = self.version_store.begin_logical_mutation();
         // Remove column from both version store and cached schema
         {
             let mut schema_guard = self.version_store.schema_mut();
@@ -2135,15 +2435,9 @@ impl Table for MVCCTable {
                             // Local version - no need to track original (already in write-set)
                             Some((local.data.clone(), None))
                         }
-                    } else if let Some(version) =
-                        self.version_store.get_visible_version(pk_id, self.txn_id)
-                    {
-                        if !version.is_deleted() {
-                            let data = version.data.clone();
-                            Some((data, Some(version)))
-                        } else {
-                            None
-                        }
+                    } else if let Some(version) = self.dml_global_version(pk_id) {
+                        let data = version.data.clone();
+                        Some((data, Some(version)))
                     } else {
                         None
                     }
@@ -2206,9 +2500,7 @@ impl Table for MVCCTable {
 
                 // Step 2: Batch fetch remaining from version store (1 lock for N rows)
                 if !remaining_row_ids.is_empty() {
-                    let batch_rows = self
-                        .version_store
-                        .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+                    let batch_rows = self.dml_global_rows_by_ids(&remaining_row_ids);
                     for (row_id, row, version) in batch_rows {
                         let row = self.normalize_row_to_schema(row, schema);
                         let (updated_row, changed) = setter(row)?;
@@ -2263,9 +2555,7 @@ impl Table for MVCCTable {
                 let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
                     Vec::with_capacity(remaining_row_ids.len());
                 if !remaining_row_ids.is_empty() {
-                    let batch_rows = self
-                        .version_store
-                        .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+                    let batch_rows = self.dml_global_rows_by_ids(&remaining_row_ids);
                     for (row_id, row, original) in batch_rows {
                         // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
                         let row = self.normalize_row_to_schema(row, schema);
@@ -2333,79 +2623,87 @@ impl Table for MVCCTable {
             }
         }
 
-        // Fall back to full scan - use batch fetch WITH original versions for O(1) lock
-        // OPTIMIZATION: When WHERE clause exists, push filter to storage layer
-        // This avoids allocating Row objects for non-matching rows
-        let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
-            if let Some(expr) = where_expr {
-                // Use filtered scan - filter is applied BEFORE cloning rows
-                self.version_store
-                    .get_all_visible_rows_for_update_filtered(self.txn_id, expr)
-                    .into_iter()
-                    .map(|(row_id, row, orig)| {
-                        // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                        (row_id, self.normalize_row_to_schema(row, schema), orig)
-                    })
-                    .collect()
-            } else {
-                // No filter - get all rows
-                self.version_store
-                    .get_all_visible_rows_for_update(self.txn_id)
-                    .into_iter()
-                    .map(|(row_id, row, orig)| {
-                        // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                        (row_id, self.normalize_row_to_schema(row, schema), orig)
+        let (mut rows_with_originals, local_rows_to_update) = if let Some(targets) =
+            self.captured_dml_targets(where_expr)?
+        {
+            targets
+        } else {
+            // Fall back to full scan - use batch fetch WITH original versions for O(1) lock
+            // OPTIMIZATION: When WHERE clause exists, push filter to storage layer
+            // This avoids allocating Row objects for non-matching rows
+            let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
+                if let Some(expr) = where_expr {
+                    // Use filtered scan - filter is applied BEFORE cloning rows
+                    self.version_store
+                        .get_all_visible_rows_for_update_filtered(self.txn_id, expr)
+                        .into_iter()
+                        .map(|(row_id, row, orig)| {
+                            // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
+                            (row_id, self.normalize_row_to_schema(row, schema), orig)
+                        })
+                        .collect()
+                } else {
+                    // No filter - get all rows
+                    self.version_store
+                        .get_all_visible_rows_for_update(self.txn_id)
+                        .into_iter()
+                        .map(|(row_id, row, orig)| {
+                            // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
+                            (row_id, self.normalize_row_to_schema(row, schema), orig)
+                        })
+                        .collect()
+                };
+
+            // Overlay local transaction changes onto the global rows:
+            // - Rows locally updated: use local data instead of stale global data
+            // - Rows locally deleted: remove from update set
+            // - Rows locally inserted (not in global store): add to update set
+            let local_rows_to_update: RowVec = {
+                let txn_versions = self.txn_versions.read().unwrap();
+                if txn_versions.has_local_changes() {
+                    // Fix up global rows that have local modifications
+                    rows_with_originals.retain_mut(|(row_id, row, _orig)| {
+                        if let Some(local_version) = txn_versions.get_latest_local(*row_id) {
+                            if local_version.is_deleted() {
+                                // Locally deleted — exclude from update
+                                return false;
+                            }
+                            // Locally modified — use local data instead of stale global data
+                            *row = self.normalize_row_to_schema(local_version.data.clone(), schema);
+                            // Re-check filter against local data
+                            if let Some(expr) = where_expr {
+                                if !expr.evaluate(row).unwrap_or(false) {
+                                    return false;
+                                }
+                            }
+                        }
+                        true
+                    });
+                }
+
+                // Collect local-only inserts (not in global store)
+                txn_versions
+                    .iter_local()
+                    .filter_map(|(row_id, version)| {
+                        // Skip if already in global store (processed above)
+                        if self.version_store.quick_check_row_existence(row_id) {
+                            return None;
+                        }
+                        if version.is_deleted() {
+                            return None;
+                        }
+                        let row = self.normalize_row_to_schema(version.data.clone(), schema);
+                        if let Some(expr) = where_expr {
+                            if !expr.evaluate(&row).unwrap_or(false) {
+                                return None;
+                            }
+                        }
+                        Some((row_id, row))
                     })
                     .collect()
             };
 
-        // Overlay local transaction changes onto the global rows:
-        // - Rows locally updated: use local data instead of stale global data
-        // - Rows locally deleted: remove from update set
-        // - Rows locally inserted (not in global store): add to update set
-        let local_rows_to_update: RowVec = {
-            let txn_versions = self.txn_versions.read().unwrap();
-            if txn_versions.has_local_changes() {
-                // Fix up global rows that have local modifications
-                rows_with_originals.retain_mut(|(row_id, row, _orig)| {
-                    if let Some(local_version) = txn_versions.get_latest_local(*row_id) {
-                        if local_version.is_deleted() {
-                            // Locally deleted — exclude from update
-                            return false;
-                        }
-                        // Locally modified — use local data instead of stale global data
-                        *row = self.normalize_row_to_schema(local_version.data.clone(), schema);
-                        // Re-check filter against local data
-                        if let Some(expr) = where_expr {
-                            if !expr.evaluate(row).unwrap_or(false) {
-                                return false;
-                            }
-                        }
-                    }
-                    true
-                });
-            }
-
-            // Collect local-only inserts (not in global store)
-            txn_versions
-                .iter_local()
-                .filter_map(|(row_id, version)| {
-                    // Skip if already in global store (processed above)
-                    if self.version_store.quick_check_row_existence(row_id) {
-                        return None;
-                    }
-                    if version.is_deleted() {
-                        return None;
-                    }
-                    let row = self.normalize_row_to_schema(version.data.clone(), schema);
-                    if let Some(expr) = where_expr {
-                        if !expr.evaluate(&row).unwrap_or(false) {
-                            return None;
-                        }
-                    }
-                    Some((row_id, row))
-                })
-                .collect()
+            (rows_with_originals, local_rows_to_update)
         };
 
         // Apply setter to rows with originals (from version store), filtering out unchanged
@@ -2497,9 +2795,7 @@ impl Table for MVCCTable {
         let mut rows_with_originals: Vec<(i64, Row, crate::storage::mvcc::RowVersion)> =
             Vec::with_capacity(remaining_row_ids.len());
         if !remaining_row_ids.is_empty() {
-            let batch_rows = self
-                .version_store
-                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+            let batch_rows = self.dml_global_rows_by_ids(&remaining_row_ids);
             for (row_id, row, version) in batch_rows {
                 let row = self.normalize_row_to_schema(row, schema);
                 let (updated_row, changed) = setter(row)?;
@@ -2553,9 +2849,7 @@ impl Table for MVCCTable {
         // Track which remaining row_ids have hot versions (cold-only rows won't)
         let mut found_ids = rustc_hash::FxHashSet::default();
         if !remaining_row_ids.is_empty() {
-            let batch_rows = self
-                .version_store
-                .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+            let batch_rows = self.dml_global_rows_by_ids(&remaining_row_ids);
             for (row_id, row, version) in batch_rows {
                 found_ids.insert(row_id);
                 let row = self.normalize_row_to_schema(row, schema);
@@ -2568,7 +2862,15 @@ impl Table for MVCCTable {
         // tombstone recovery on restart.
         let cold_only_ids: Vec<i64> = remaining_row_ids
             .iter()
-            .filter(|id| !found_ids.contains(id))
+            .filter(|id| {
+                !found_ids.contains(id)
+                    && self.read_view.as_ref().is_none_or(|binding| {
+                        !matches!(
+                            binding.root.version_state(**id, &binding.epoch),
+                            crate::storage::mvcc::version_store::CapturedHotVersion::Deleted
+                        )
+                    })
+            })
             .copied()
             .collect();
 
@@ -2600,6 +2902,11 @@ impl Table for MVCCTable {
     }
 
     fn get_active_row_ids(&self) -> Result<Vec<i64>> {
+        if let Some(view) = self.captured_view() {
+            let mut ids = Vec::new();
+            view.for_each_visible(|id, _| ids.push(id));
+            return Ok(ids);
+        }
         // Only the keys this transaction sees: a committed delete stays in
         // the version tree until it is collected, but it is not a row
         let mut ids = self.version_store.visible_row_ids_excluding(
@@ -2632,6 +2939,18 @@ impl Table for MVCCTable {
         exclude: &crate::common::I64Set,
         limit: usize,
     ) -> Result<Vec<i64>> {
+        if let Some(view) = self.captured_view() {
+            let mut ids = Vec::with_capacity(limit.min(256));
+            if limit != 0 {
+                view.for_each_visible_until(|id, _| {
+                    if !exclude.contains(id) {
+                        ids.push(id);
+                    }
+                    ids.len() < limit
+                });
+            }
+            return Ok(ids);
+        }
         // A transaction with writes of its own reads the whole key list
         if self.txn_versions.read().unwrap().has_local_changes() {
             let mut ids = self.get_active_row_ids()?;
@@ -2652,6 +2971,9 @@ impl Table for MVCCTable {
     }
 
     fn has_row_id(&self, row_id: i64) -> Result<bool> {
+        if let Some(view) = self.captured_view() {
+            return Ok(matches!(view.row_state(row_id), CapturedHotRow::Value(_)));
+        }
         Ok(self.version_store.has_committed_row(row_id))
     }
 
@@ -2667,6 +2989,31 @@ impl Table for MVCCTable {
             .write()
             .unwrap()
             .track_external_claim(row_id);
+        Ok(())
+    }
+
+    fn captured_mutation_has_hot_authority(&self, row_id: i64) -> Option<bool> {
+        let binding = self.read_view.as_ref()?;
+        let has_local = {
+            let Ok(versions) = self.txn_versions.read() else {
+                panic!("transaction store is poisoned during authority lookup");
+            };
+            versions.get_local_version(row_id).is_some()
+        };
+        if has_local {
+            return Some(true);
+        }
+        Some(!matches!(
+            binding.root.version_state(row_id, &binding.epoch),
+            super::version_store::CapturedHotVersion::NoVisibleVersion
+        ))
+    }
+
+    fn validate_cold_mutation(&self, row_id: i64) -> Result<()> {
+        if let Some(binding) = &self.read_view {
+            self.version_store
+                .validate_mutation_epoch(row_id, &binding.epoch)?;
+        }
         Ok(())
     }
 
@@ -2690,15 +3037,9 @@ impl Table for MVCCTable {
                             // Local version - no need to track original (already in write-set)
                             Some((local.data.clone(), None))
                         }
-                    } else if let Some(version) =
-                        self.version_store.get_visible_version(pk_id, self.txn_id)
-                    {
-                        if !version.is_deleted() {
-                            let data = version.data.clone();
-                            Some((data, Some(version)))
-                        } else {
-                            None
-                        }
+                    } else if let Some(version) = self.dml_global_version(pk_id) {
+                        let data = version.data.clone();
+                        Some((data, Some(version)))
                     } else {
                         None
                     }
@@ -2747,9 +3088,7 @@ impl Table for MVCCTable {
 
                 // Step 2: Batch fetch remaining from version store (1 lock for N rows)
                 if !remaining_row_ids.is_empty() {
-                    let batch_rows = self
-                        .version_store
-                        .get_visible_versions_for_update(&remaining_row_ids, self.txn_id);
+                    let batch_rows = self.dml_global_rows_by_ids(&remaining_row_ids);
                     for (row_id, row, version) in batch_rows {
                         rows_with_originals.push((row_id, row, version));
                     }
@@ -2819,6 +3158,19 @@ impl Table for MVCCTable {
                 }
                 return Ok(delete_count);
             }
+        }
+
+        if let Some((globals, locals)) = self.captured_dml_targets(where_expr)? {
+            let count = (globals.len() + locals.len()) as i32;
+            if count != 0 {
+                let mut txn_versions = self
+                    .txn_versions
+                    .write()
+                    .map_err(|_| Error::internal("transaction store is poisoned"))?;
+                txn_versions.put_batch_deleted_with_originals(globals)?;
+                txn_versions.put_batch_deleted(locals)?;
+            }
+            return Ok(count);
         }
 
         // Fall back to full scan
@@ -2915,10 +3267,50 @@ impl Table for MVCCTable {
     }
 
     fn truncate(&mut self) -> Result<i32> {
-        // Fast path: drop all storage directly, bypassing per-row MVCC versioning.
-        // This is O(1) instead of O(N) for delete-all.
-        // Fails if other transactions have uncommitted writes on this table.
-        self.version_store.truncate_all()
+        self.truncate_with_outer_epoch(&mut None)
+    }
+
+    fn truncate_with_outer_epoch(&mut self, outer_epoch: &mut Option<ReadEpoch>) -> Result<i32> {
+        // Hold the transaction guard before namespace/registry/transfer reservations through WAL.
+        let local = self
+            .txn_versions
+            .write()
+            .map_err(|_| Error::internal("transaction store is poisoned"))?;
+        if local.has_local_changes() {
+            return Err(Error::TableHasActiveTransactions);
+        }
+        let mut owners = 0;
+        let epoch = match self.read_view.as_mut() {
+            Some(binding) => {
+                owners += 1;
+                if let Some(view) = binding.view.get_mut() {
+                    // An external result can share this Arc without cloning
+                    // its nested ReadEpoch, including via a later Weak upgrade.
+                    // get_mut atomically proves no other strong OR weak owner.
+                    if Arc::get_mut(view).is_none() {
+                        return Err(Error::TableHasActiveTransactions);
+                    }
+                    owners += 1;
+                }
+                if let Some(outer) = outer_epoch.as_mut() {
+                    if !outer.same_epoch(&binding.epoch) {
+                        return Err(Error::TableHasActiveTransactions);
+                    }
+                    owners += 1;
+                }
+                Some((&binding.epoch, owners))
+            }
+            None => outer_epoch.as_mut().map(|epoch| (&*epoch, 1)),
+        };
+        let rows = self
+            .version_store
+            .coordinated_truncate(self.txn_id, epoch)?;
+        // The immutable pre-truncate view remains intact on every error. Only
+        // successful physical mutation makes this handle read the empty table.
+        self.read_view = None;
+        outer_epoch.take();
+        drop(local);
+        Ok(rows)
     }
 
     fn scan(
@@ -2926,6 +3318,54 @@ impl Table for MVCCTable {
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
+        if let Some(view) = self.captured_view() {
+            let prepared = self.prepare_filter_if_needed(where_expr);
+            let where_expr = prepared.as_deref().or(where_expr);
+            if let Some(id) =
+                where_expr.and_then(|expr| self.try_pk_lookup(expr, &self.cached_schema))
+            {
+                let mut rows = RowVec::new();
+                if let CapturedHotRow::Value(row) = view.row_state(id) {
+                    let row = self.normalize_row_to_schema(row.clone(), &self.cached_schema);
+                    if where_expr
+                        .map(|expr| expr.evaluate(&row))
+                        .transpose()?
+                        .unwrap_or(true)
+                    {
+                        let row = if !column_indices.is_empty()
+                            && (column_indices.len() != row.len()
+                                || !column_indices
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(i, &column)| i == column))
+                        {
+                            Row::from_values(
+                                column_indices
+                                    .iter()
+                                    .map(|&column| {
+                                        row.get(column).cloned().unwrap_or_else(Value::null_unknown)
+                                    })
+                                    .collect(),
+                            )
+                        } else {
+                            row
+                        };
+                        rows.push((id, row));
+                    }
+                }
+                return Ok(Box::new(MVCCScanner::from_rows(
+                    rows,
+                    self.cached_schema.clone(),
+                    Vec::new(),
+                )));
+            }
+            return Ok(Box::new(super::captured_scanner::CapturedHotScanner::new(
+                view.clone(),
+                self.cached_schema.clone(),
+                column_indices,
+                where_expr,
+            )));
+        }
         // CompactArc clone - O(1) reference count increment instead of full Schema clone
         let schema = self.cached_schema.clone();
 
@@ -2999,6 +3439,24 @@ impl Table for MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
+        if let Some(view) = self.captured_view() {
+            let Some((column, definition)) = self.cached_schema.find_column(column_name) else {
+                return Ok(None);
+            };
+            if definition.nullable || definition.data_type == DataType::Float {
+                return Ok(None);
+            }
+            let prepared = self.prepare_filter_if_needed(where_expr);
+            return Ok(Some(super::captured_scanner::sorted_hot_rows(
+                view,
+                &self.cached_schema,
+                column,
+                ascending,
+                limit,
+                offset,
+                prepared.as_deref().or(where_expr),
+            )?));
+        }
         let needed = limit.saturating_add(offset);
         if needed == 0 {
             return Ok(Some(RowVec::new()));
@@ -3080,6 +3538,9 @@ impl Table for MVCCTable {
     }
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {
+        if let Some(view) = self.captured_view() {
+            return self.collect_captured_filtered(view, where_expr, usize::MAX, 0);
+        }
         // Return cached row vector directly - caller iterates (i64, Row) tuples
         Ok(self.collect_visible_rows(where_expr))
     }
@@ -3089,6 +3550,18 @@ impl Table for MVCCTable {
     }
 
     fn collect_rows_by_ids(&self, row_ids: &[i64]) -> Result<RowVec> {
+        if let Some(view) = self.captured_view() {
+            let mut rows = RowVec::with_capacity(row_ids.len().min(256));
+            for &id in row_ids {
+                if let CapturedHotRow::Value(row) = view.row_state(id) {
+                    rows.push((
+                        id,
+                        self.normalize_row_to_schema(row.clone(), &self.cached_schema),
+                    ));
+                }
+            }
+            return Ok(rows);
+        }
         let mut rows = RowVec::with_capacity(row_ids.len());
         for &row_id in row_ids {
             if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
@@ -3106,6 +3579,9 @@ impl Table for MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
+        if let Some(view) = self.captured_view() {
+            return self.collect_captured_filtered(view, where_expr, limit, offset);
+        }
         // Use the optimized version with limit/offset
         Ok(self.collect_visible_rows_with_limit(where_expr, limit, offset))
     }
@@ -3116,6 +3592,9 @@ impl Table for MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<RowVec> {
+        if let Some(view) = self.captured_view() {
+            return self.collect_captured_filtered(view, where_expr, limit, offset);
+        }
         // Use the optimized unordered version with true early termination
         Ok(self.collect_visible_rows_with_limit_unordered(where_expr, limit, offset))
     }
@@ -3127,6 +3606,20 @@ impl Table for MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<Row>> {
+        if let Some(view) = self.captured_view() {
+            return Ok(super::captured_scanner::sorted_hot_rows(
+                view,
+                &self.cached_schema,
+                sort_col_idx,
+                ascending,
+                limit,
+                offset,
+                None,
+            )?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect());
+        }
         // DEFERRED MATERIALIZATION OPTIMIZATION
         // Instead of cloning all rows, sorting, and taking limit:
         // 1. Get row indices (no cloning)
@@ -3187,6 +3680,7 @@ impl Table for MVCCTable {
     fn close(&mut self) -> Result<()> {
         // Rollback any uncommitted changes
         self.txn_versions.write().unwrap().rollback();
+        self.read_view = None;
         Ok(())
     }
 
@@ -3462,49 +3956,11 @@ impl Table for MVCCTable {
 
         self.version_store.attach_index_memory(&mut index)?;
 
-        // Populate the index with existing data using batch_slice for better performance
-        // Collect all entries first, then add in a single batch operation
-        let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
-
-        for row_id in self.version_store.get_all_visible_row_ids(self.txn_id) {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
-                if !version.is_deleted() {
-                    let values: Vec<Value> = col_indices
-                        .iter()
-                        .map(|&idx| {
-                            version
-                                .data
-                                .get(idx)
-                                .cloned()
-                                .unwrap_or(Value::Null(DataType::Null))
-                        })
-                        .collect();
-                    entries.push((row_id, values));
-                }
-            }
-        }
-
-        // Also collect any local uncommitted data
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            for (row_id, version) in txn_versions.iter_local() {
-                if !version.is_deleted() && !self.version_store.quick_check_row_existence(row_id) {
-                    let values: Vec<Value> = col_indices
-                        .iter()
-                        .map(|&idx| {
-                            version
-                                .data
-                                .get(idx)
-                                .cloned()
-                                .unwrap_or(Value::Null(DataType::Null))
-                        })
-                        .collect();
-                    entries.push((row_id, values));
-                }
-            }
-        }
-
-        // Add all entries in a single batch operation
+        // Build the shared index from current committed canonical keys. The
+        // requesting transaction's older snapshot and local writes stay private.
+        let entries = self
+            .version_store
+            .current_index_entries(&schema, &col_indices)?;
         if !entries.is_empty() {
             let entry_refs: Vec<(i64, &[Value])> = entries
                 .iter()
@@ -3612,33 +4068,11 @@ impl Table for MVCCTable {
         let mut index: Arc<dyn Index> = Arc::new(hnsw);
         self.version_store.attach_index_memory(&mut index)?;
 
-        // Populate with existing data
-        let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
-        for row_id in self.version_store.get_all_visible_row_ids(self.txn_id) {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
-                if !version.is_deleted() {
-                    let val = version
-                        .data
-                        .get(col_idx)
-                        .cloned()
-                        .unwrap_or(Value::Null(DataType::Null));
-                    entries.push((row_id, vec![val]));
-                }
-            }
-        }
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            for (row_id, version) in txn_versions.iter_local() {
-                if !version.is_deleted() && !self.version_store.quick_check_row_existence(row_id) {
-                    let val = version
-                        .data
-                        .get(col_idx)
-                        .cloned()
-                        .unwrap_or(Value::Null(DataType::Null));
-                    entries.push((row_id, vec![val]));
-                }
-            }
-        }
+        // Build the shared index from current committed canonical keys. The
+        // requesting transaction's older snapshot and local writes stay private.
+        let entries = self
+            .version_store
+            .current_index_entries(&schema, &[col_idx])?;
         if !entries.is_empty() {
             let entry_refs: Vec<(i64, &[Value])> = entries
                 .iter()
@@ -3681,6 +4115,15 @@ impl Table for MVCCTable {
     }
 
     fn get_index_on_column(&self, column_name: &str) -> Option<std::sync::Arc<dyn Index>> {
+        self.version_store.get_index_by_column(column_name)
+    }
+
+    fn lookup_index_on_column(&self, column_name: &str) -> Option<std::sync::Arc<dyn Index>> {
+        // Current index membership cannot prove completeness at an older epoch.
+        // Catalog and constraint callers still use get_index_on_column.
+        if self.read_view.is_some() {
+            return None;
+        }
         self.version_store.get_index_by_column(column_name)
     }
 
@@ -3831,36 +4274,11 @@ impl Table for MVCCTable {
 
         index.attach_memory_account(self.version_store.memory_account())?;
 
-        // Populate the index with existing data using batch_slice
-        let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
-
-        // Scan all visible rows
-        for row_id in self.version_store.get_all_visible_row_ids(self.txn_id) {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
-                if !version.is_deleted() {
-                    if let Some(value) = version.data.get(col_idx) {
-                        entries.push((row_id, vec![value.clone()]));
-                    }
-                }
-            }
-        }
-
-        // Also collect any local uncommitted data
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            for (row_id, version) in txn_versions.iter_local() {
-                if !version.is_deleted() {
-                    if let Some(value) = version.data.get(col_idx) {
-                        // Skip if already added from global store
-                        if !self.version_store.quick_check_row_existence(row_id) {
-                            entries.push((row_id, vec![value.clone()]));
-                        }
-                    }
-                }
-            }
-        }
-
-        // Add all entries in a single batch operation
+        // Build the shared index from current committed canonical keys. The
+        // requesting transaction's older snapshot and local writes stay private.
+        let entries = self
+            .version_store
+            .current_index_entries(&schema, &[col_idx])?;
         if !entries.is_empty() {
             let entry_refs: Vec<(i64, &[Value])> = entries
                 .iter()
@@ -3948,52 +4366,11 @@ impl Table for MVCCTable {
 
         index.attach_memory_account(self.version_store.memory_account())?;
 
-        // Populate the index with existing data using batch_slice
-        let mut entries: Vec<(i64, Vec<Value>)> = Vec::new();
-
-        for row_id in self.version_store.get_all_visible_row_ids(self.txn_id) {
-            if let Some(version) = self.version_store.get_visible_version(row_id, self.txn_id) {
-                if !version.is_deleted() {
-                    // Collect values for all columns in the index
-                    let values: Vec<Value> = col_indices
-                        .iter()
-                        .map(|&idx| {
-                            version
-                                .data
-                                .get(idx)
-                                .cloned()
-                                .unwrap_or(Value::Null(DataType::Null))
-                        })
-                        .collect();
-                    entries.push((row_id, values));
-                }
-            }
-        }
-
-        // Also collect any local uncommitted data
-        {
-            let txn_versions = self.txn_versions.read().unwrap();
-            for (row_id, version) in txn_versions.iter_local() {
-                if !version.is_deleted() {
-                    // Skip if already added from global store
-                    if !self.version_store.quick_check_row_existence(row_id) {
-                        let values: Vec<Value> = col_indices
-                            .iter()
-                            .map(|&idx| {
-                                version
-                                    .data
-                                    .get(idx)
-                                    .cloned()
-                                    .unwrap_or(Value::Null(DataType::Null))
-                            })
-                            .collect();
-                        entries.push((row_id, values));
-                    }
-                }
-            }
-        }
-
-        // Add all entries in a single batch operation
+        // Build the shared index from current committed canonical keys. The
+        // requesting transaction's older snapshot and local writes stay private.
+        let entries = self
+            .version_store
+            .current_index_entries(&schema, &col_indices)?;
         if !entries.is_empty() {
             let entry_refs: Vec<(i64, &[Value])> = entries
                 .iter()
@@ -4039,6 +4416,9 @@ impl Table for MVCCTable {
     }
 
     fn get_index_min_value(&self, column_name: &str) -> Option<Value> {
+        if self.read_view.is_some() {
+            return None;
+        }
         // Try to find an index on this column and get its minimum value
         if let Some(index) = self.version_store.get_index_by_column(column_name) {
             return index.get_min_value();
@@ -4047,6 +4427,9 @@ impl Table for MVCCTable {
     }
 
     fn get_index_max_value(&self, column_name: &str) -> Option<Value> {
+        if self.read_view.is_some() {
+            return None;
+        }
         // Try to find an index on this column and get its maximum value
         if let Some(index) = self.version_store.get_index_by_column(column_name) {
             return index.get_max_value();
@@ -4079,6 +4462,37 @@ impl Table for MVCCTable {
         limit: usize,
         offset: usize,
     ) -> Result<Option<RowVec>> {
+        if let Some(view) = self.captured_view() {
+            if self.cached_schema.pk_column_index().is_some_and(|index| {
+                self.cached_schema.columns[index]
+                    .name
+                    .eq_ignore_ascii_case(column_name)
+            }) {
+                let mut rows = RowVec::with_capacity(limit.min(128));
+                if limit == 0 {
+                    return Ok(Some(rows));
+                }
+                let mut skipped = 0;
+                let mut visit = |id, row: &Row| {
+                    if skipped < offset {
+                        skipped += 1;
+                        return true;
+                    }
+                    rows.push((
+                        id,
+                        self.normalize_row_to_schema(row.clone(), &self.cached_schema),
+                    ));
+                    rows.len() < limit
+                };
+                if ascending {
+                    view.for_each_visible_until(&mut visit);
+                } else {
+                    view.for_each_visible_range_rev_until(.., &mut visit);
+                }
+                return Ok(Some(rows));
+            }
+            return self.scan_top_k(None, column_name, ascending, limit, offset);
+        }
         // If transaction has local changes (inserts/updates/deletes), fall back to
         // the regular path which correctly merges local changes via collect_visible_rows.
         // This optimization only reads from the global version store and indexes.
@@ -4216,6 +4630,33 @@ impl Table for MVCCTable {
         ascending: bool,
         limit: usize,
     ) -> Option<RowVec> {
+        if let Some(view) = self.captured_view() {
+            self.cached_schema.pk_column_index()?;
+            let mut rows = RowVec::with_capacity(limit.min(128));
+            if limit == 0 {
+                return Some(rows);
+            }
+            let start = start_after
+                .map(std::ops::Bound::Excluded)
+                .or_else(|| start_from.map(std::ops::Bound::Included))
+                .unwrap_or(std::ops::Bound::Unbounded);
+            let mut visit = |id, row: &Row| {
+                rows.push((
+                    id,
+                    self.normalize_row_to_schema(row.clone(), &self.cached_schema),
+                ));
+                rows.len() < limit
+            };
+            if ascending {
+                view.for_each_visible_range_until((start, std::ops::Bound::Unbounded), &mut visit);
+            } else {
+                view.for_each_visible_range_rev_until(
+                    (start, std::ops::Bound::Unbounded),
+                    &mut visit,
+                );
+            }
+            return Some(rows);
+        }
         // Only works if table has a single-column INTEGER PRIMARY KEY
         self.cached_schema.pk_column_index()?;
 
@@ -4242,6 +4683,9 @@ impl Table for MVCCTable {
         &self,
         column_name: &str,
     ) -> Result<Option<Vec<(Value, RowVec)>>> {
+        if self.read_view.is_some() {
+            return Ok(None);
+        }
         // If transaction has local changes, fall back to regular path
         {
             let txn_versions = self.txn_versions.read().unwrap();
@@ -4289,6 +4733,31 @@ impl Table for MVCCTable {
     }
 
     fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
+        if let Some(view) = self.captured_view() {
+            let Some((column, _)) = self.cached_schema.find_column(column_name) else {
+                return Ok(None);
+            };
+            return crate::storage::volume::captured_aggregate::grouped(
+                &self.cached_schema,
+                view,
+                None,
+                &[column],
+                &[],
+            )?
+            .map(|groups| {
+                groups
+                    .into_iter()
+                    .map(|group| {
+                        group
+                            .group_values
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| Error::internal("distinct group has no key"))
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose();
+        }
         // Only use index-based distinct values if no uncommitted local changes
         // (local changes are in txn_versions, not reflected in the index)
         let txn_versions = self.txn_versions.read().unwrap();
@@ -4306,6 +4775,11 @@ impl Table for MVCCTable {
     }
 
     fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
+        if self.read_view.is_some() {
+            return Ok(self
+                .get_partition_values(column_name)?
+                .map(|values| values.into_iter().filter(|value| !value.is_null()).count()));
+        }
         // Only use index-based count if no uncommitted local changes
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
@@ -4326,6 +4800,9 @@ impl Table for MVCCTable {
         column_name: &str,
         partition_value: &Value,
     ) -> Result<Option<RowVec>> {
+        if self.read_view.is_some() {
+            return Ok(None);
+        }
         // If transaction has local changes, fall back to regular path
         {
             let txn_versions = self.txn_versions.read().unwrap();
@@ -4357,6 +4834,7 @@ impl Table for MVCCTable {
     }
 
     fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()> {
+        let _logical_change = self.version_store.begin_logical_mutation();
         // Rename column in both version store and cached schema
         {
             let mut schema_guard = self.version_store.schema_mut();
@@ -4367,6 +4845,7 @@ impl Table for MVCCTable {
     }
 
     fn modify_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
+        let _logical_change = self.version_store.begin_logical_mutation();
         // Modify column in both version store and cached schema
         {
             let mut schema_guard = self.version_store.schema_mut();
@@ -4822,6 +5301,28 @@ impl Table for MVCCTable {
     }
 
     fn sum_column(&self, col_idx: usize) -> Result<Option<(f64, usize)>> {
+        if let Some(view) = self.captured_view() {
+            let Some(column) = self.cached_schema.columns.get(col_idx) else {
+                return Ok(None);
+            };
+            let default = column
+                .default_value
+                .clone()
+                .unwrap_or_else(|| Value::null(column.data_type));
+            let mut int_sum = 0i128;
+            let mut float_sum = 0.0;
+            let mut count = 0;
+            view.for_each_visible(|_, row| {
+                match row.get(col_idx).unwrap_or(&default) {
+                    Value::Integer(value) => int_sum += *value as i128,
+                    Value::Float(value) => float_sum += *value,
+                    Value::Boolean(value) => int_sum += i128::from(*value),
+                    _ => return,
+                }
+                count += 1;
+            });
+            return Ok(Some((int_sum as f64 + float_sum, count)));
+        }
         // Only use deferred aggregation if no uncommitted local changes
         // (local changes are in txn_versions, not the main version_store)
         let txn_versions = self.txn_versions.read().unwrap();
@@ -4834,6 +5335,27 @@ impl Table for MVCCTable {
     }
 
     fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+        if let Some(view) = self.captured_view() {
+            let Some(column) = self.cached_schema.columns.get(col_idx) else {
+                return Ok(None);
+            };
+            let default = column
+                .default_value
+                .clone()
+                .unwrap_or_else(|| Value::null(column.data_type));
+            let mut best: Option<Value> = None;
+            view.for_each_visible(|_, row| {
+                let value = row.get(col_idx).unwrap_or(&default);
+                if !value.is_null()
+                    && best
+                        .as_ref()
+                        .is_none_or(|best| value.compare(best).is_ok_and(|order| order.is_lt()))
+                {
+                    best = Some(value.clone());
+                }
+            });
+            return Ok(Some(best));
+        }
         // Only use deferred aggregation if no uncommitted local changes
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
@@ -4845,6 +5367,27 @@ impl Table for MVCCTable {
     }
 
     fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
+        if let Some(view) = self.captured_view() {
+            let Some(column) = self.cached_schema.columns.get(col_idx) else {
+                return Ok(None);
+            };
+            let default = column
+                .default_value
+                .clone()
+                .unwrap_or_else(|| Value::null(column.data_type));
+            let mut best: Option<Value> = None;
+            view.for_each_visible(|_, row| {
+                let value = row.get(col_idx).unwrap_or(&default);
+                if !value.is_null()
+                    && best
+                        .as_ref()
+                        .is_none_or(|best| value.compare(best).is_ok_and(|order| order.is_gt()))
+                {
+                    best = Some(value.clone());
+                }
+            });
+            return Ok(Some(best));
+        }
         // Only use deferred aggregation if no uncommitted local changes
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
@@ -4855,11 +5398,37 @@ impl Table for MVCCTable {
         Ok(Some(self.version_store.max_column(self.txn_id, col_idx)))
     }
 
+    fn compute_filtered_aggregates(
+        &self,
+        aggregates: &[(crate::storage::mvcc::version_store::AggregateOp, usize)],
+        where_expr: &dyn Expression,
+    ) -> Result<Option<Vec<Value>>> {
+        let Some(view) = self.captured_view() else {
+            return Ok(None);
+        };
+        crate::storage::volume::captured_aggregate::filtered(
+            &self.cached_schema,
+            view,
+            None,
+            aggregates,
+            where_expr,
+        )
+    }
+
     fn compute_grouped_aggregates(
         &self,
         group_by_indices: &[usize],
         aggregates: &[(crate::storage::mvcc::version_store::AggregateOp, usize)],
     ) -> Result<Option<Vec<crate::storage::mvcc::version_store::GroupedAggregateResult>>> {
+        if let Some(view) = self.captured_view() {
+            return crate::storage::volume::captured_aggregate::grouped(
+                &self.cached_schema,
+                view,
+                None,
+                group_by_indices,
+                aggregates,
+            );
+        }
         // Only use storage-level aggregation if no uncommitted local changes
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {

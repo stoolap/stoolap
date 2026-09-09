@@ -114,7 +114,7 @@ impl Executor {
         let lookup_info = self.extract_pk_lookup_info(table_name, where_clause, ctx)?;
 
         // Execute the fast-path lookup
-        Some(self.execute_pk_lookup(lookup_info))
+        Some(self.execute_pk_lookup(lookup_info, ctx))
     }
 
     /// Extract PK lookup information from a WHERE clause
@@ -269,16 +269,18 @@ impl Executor {
     }
 
     /// Execute the fast-path PK lookup using Engine::fetch_rows_by_ids
-    fn execute_pk_lookup(&self, info: PkLookupInfo) -> Result<Box<dyn QueryResult>> {
+    fn execute_pk_lookup(
+        &self,
+        info: PkLookupInfo,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
         // Use cached schema for column names - Arc clone is O(1)
         let columns = info.schema.column_names_arc();
 
         // Use engine's fetch_rows_by_ids for direct MVCC lookup
         // This bypasses the full query planner and goes straight to version store
         // Note: table_name is already lowercased, so storage layer won't call to_lowercase again
-        let rows = self
-            .engine
-            .fetch_rows_by_ids(&info.table_name, &[info.pk_value])?;
+        let rows = self.fetch_rows_in_context(&info.table_name, &[info.pk_value], ctx)?;
 
         // Extract Row values and normalize to current schema (handles ADD/DROP COLUMN)
         let result_rows: RowVec = rows
@@ -328,7 +330,7 @@ impl Executor {
                     if self.engine.schema_epoch() == lookup.cached_epoch {
                         // Fast path: extract value and execute
                         let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
-                        return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
+                        return Some(self.execute_compiled_pk_lookup(lookup, pk_value, ctx));
                     }
                     // Epoch changed - some DDL occurred, need to recompile
                     // Fall through to recompile path
@@ -401,6 +403,7 @@ impl Executor {
         &self,
         _stmt: &SelectStatement,
         params: &[Value],
+        ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Try read lock first - check if already compiled
@@ -413,7 +416,7 @@ impl Executor {
                     // Fast path: extract value from slice directly
                     let pk_value =
                         Self::extract_pk_value_from_slice(&lookup.pk_value_source, params)?;
-                    Some(self.execute_compiled_pk_lookup(lookup, pk_value))
+                    Some(self.execute_compiled_pk_lookup(lookup, pk_value, ctx))
                 } else {
                     // Epoch changed - need recompile, use normal path
                     None
@@ -429,10 +432,9 @@ impl Executor {
         &self,
         lookup: &CompiledPkLookup,
         pk_value: i64,
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        let rows = self
-            .engine
-            .fetch_rows_by_ids(&lookup.table_name, &[pk_value])?;
+        let rows = self.fetch_rows_in_context(&lookup.table_name, &[pk_value], ctx)?;
         // Normalize rows to current schema (handles ADD/DROP COLUMN)
         // Pre-allocate with capacity 1 for single PK lookup (avoids realloc)
         let mut result_rows = RowVec::with_capacity(1);
@@ -472,7 +474,7 @@ impl Executor {
                 // Re-validate epoch: another thread may have compiled before DDL
                 if self.engine.schema_epoch() == lookup.cached_epoch {
                     let pk_value = self.extract_pk_value_fast(&lookup.pk_value_source, ctx)?;
-                    return Some(self.execute_compiled_pk_lookup(lookup, pk_value));
+                    return Some(self.execute_compiled_pk_lookup(lookup, pk_value, ctx));
                 }
                 // Epoch changed since last compilation - fall through to recompile
             }
@@ -551,11 +553,14 @@ impl Executor {
                 // Resolve this execution's value; on failure fall back to
                 // the standard path (the stored PkLookup stays valid).
                 let pk_value = self.extract_pk_value_fast(&pk_value_source, ctx)?;
-                Some(self.execute_pk_lookup(PkLookupInfo {
-                    table_name: table_name.to_string(),
-                    pk_value,
-                    schema,
-                }))
+                Some(self.execute_pk_lookup(
+                    PkLookupInfo {
+                        table_name: table_name.to_string(),
+                        pk_value,
+                        schema,
+                    },
+                    ctx,
+                ))
             }
             None => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());

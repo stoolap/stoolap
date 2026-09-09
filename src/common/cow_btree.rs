@@ -33,6 +33,7 @@
 //! - Memory: Shared nodes between snapshots
 
 use super::{CompactArc, MemoryAccount};
+use smallvec::SmallVec;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::Bound;
@@ -1817,8 +1818,9 @@ enum InsertResult<V: Clone> {
 /// Iterator over chunks of a CowBTree (leaf slices)
 struct CowBTreeChunkIter<'a, V: Clone> {
     /// Stack of (node, next_child_index) for traversal
-    /// Only holds internal nodes.
-    stack: Vec<(&'a NodePtr<V>, usize)>,
+    /// Only holds internal nodes. Supported NodePath depths remain inline;
+    /// retain SmallVec fallback for compatibility with any deeper future tree.
+    stack: SmallVec<[(&'a NodePtr<V>, usize); MAX_TREE_DEPTH]>,
     /// Current leaf node being yielded (if any)
     current_leaf: Option<&'a NodePtr<V>>,
 }
@@ -1826,7 +1828,7 @@ struct CowBTreeChunkIter<'a, V: Clone> {
 impl<'a, V: Clone> CowBTreeChunkIter<'a, V> {
     fn new(root: Option<&'a NodePtr<V>>) -> Self {
         let mut iter = Self {
-            stack: Vec::new(),
+            stack: SmallVec::new(),
             current_leaf: None,
         };
         if let Some(root) = root {
@@ -1875,7 +1877,7 @@ impl<'a, V: Clone> Iterator for CowBTreeChunkIter<'a, V> {
 /// Range iterator over a CowBTree yielding chunks
 /// Optimized: Seeks directly to start bound and yields slices
 struct CowBTreeRangeChunkIter<'a, V: Clone, R> {
-    stack: Vec<(&'a NodePtr<V>, usize)>,
+    stack: SmallVec<[(&'a NodePtr<V>, usize); MAX_TREE_DEPTH]>,
     range: R,
     current_leaf: Option<&'a NodePtr<V>>,
     current_idx: usize,
@@ -1885,7 +1887,7 @@ struct CowBTreeRangeChunkIter<'a, V: Clone, R> {
 impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> CowBTreeRangeChunkIter<'a, V, R> {
     fn new(root: Option<&'a NodePtr<V>>, range: R) -> Self {
         let mut iter = Self {
-            stack: Vec::new(),
+            stack: SmallVec::new(),
             range,
             current_leaf: None,
             current_idx: 0,
@@ -2047,7 +2049,7 @@ impl<V: Clone + std::fmt::Debug> std::fmt::Debug for CowBTree<V> {
 struct CowBTreeRevChunkIter<'a, V: Clone> {
     /// Stack of (node, next_child_plus_one) for reverse traversal.
     /// next_child_plus_one == 0 means no more children to visit at this level.
-    stack: Vec<(&'a NodePtr<V>, usize)>,
+    stack: smallvec::SmallVec<[(&'a NodePtr<V>, usize); MAX_TREE_DEPTH]>,
     /// Current leaf node being yielded
     current_leaf: Option<&'a NodePtr<V>>,
 }
@@ -2055,7 +2057,7 @@ struct CowBTreeRevChunkIter<'a, V: Clone> {
 impl<'a, V: Clone> CowBTreeRevChunkIter<'a, V> {
     fn new(root: Option<&'a NodePtr<V>>) -> Self {
         let mut iter = Self {
-            stack: Vec::new(),
+            stack: smallvec::SmallVec::new(),
             current_leaf: None,
         };
         if let Some(root) = root {
@@ -2107,7 +2109,7 @@ impl<'a, V: Clone> Iterator for CowBTreeRevChunkIter<'a, V> {
 /// Reverse range iterator over a CowBTree yielding chunks from end bound to start bound.
 /// Each chunk contains keys in ascending order; the consumer should reverse within each chunk.
 struct CowBTreeRevRangeChunkIter<'a, V: Clone, R> {
-    stack: Vec<(&'a NodePtr<V>, usize)>,
+    stack: smallvec::SmallVec<[(&'a NodePtr<V>, usize); MAX_TREE_DEPTH]>,
     range: R,
     current_leaf: Option<&'a NodePtr<V>>,
     /// End index (exclusive) within current leaf
@@ -2118,7 +2120,7 @@ struct CowBTreeRevRangeChunkIter<'a, V: Clone, R> {
 impl<'a, V: Clone, R: std::ops::RangeBounds<i64>> CowBTreeRevRangeChunkIter<'a, V, R> {
     fn new(root: Option<&'a NodePtr<V>>, range: R) -> Self {
         let mut iter = Self {
-            stack: Vec::new(),
+            stack: smallvec::SmallVec::new(),
             range,
             current_leaf: None,
             current_end_idx: 0,
