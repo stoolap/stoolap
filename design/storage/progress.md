@@ -8,7 +8,7 @@ independently reviewable without claiming unmerged work is shipped.
 |---|---|---|---|---|
 | 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
 | 1 | Fallible access and complete statement rollback | Implemented; local gates and CI passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
-| 2 | Chunked arena and retained-hot accounting | Implemented; final validation running | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) (draft) |
+| 2 | Chunked arena and retained-hot accounting | Implemented; local gates passed; final CI running | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) (draft) |
 | 3 | Coherent two-layer execution | Pending | Pending | — |
 | 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
 | 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |
@@ -89,7 +89,7 @@ The exact fixture, source digest, medians, ranges and limitations are recorded
 in [measurements](measurements/README.md). Clippy with FFI and failpoints,
 no-default compilation and final targeted tests passed.
 
-## Phase 2 (in progress)
+## Phase 2
 
 The current accounting scope covers owned hot row payloads, arena and COW
 capacity, retained previous versions, hot index storage, transaction histories,
@@ -124,10 +124,31 @@ undo and UNIQUE-key claims keep their charge until their actual backing is freed
 
 Independent review required explicit replacement buffers for arena and receipt
 growth: a moving allocator can keep both old and new buffers live during growth.
-Unchanged allocator probes now report 459,600 actual peak bytes versus 459,616
-accounted bytes for the arena, and 93,612 versus 93,628 for 1,024 same-chunk pins.
+Unchanged allocator probes now report 459,592 actual peak bytes versus 459,608
+accounted bytes for the arena, and 93,604 versus 93,620 for 1,024 same-chunk pins.
 The 16-byte difference is the account object's existing conservative allowance.
 Retained totals are unchanged; the fix accounts the temporary overlap. Single-pin
 receipts remain inline, and partial promotion failure preserves the original pin.
 
-Final integrated test, performance and review gates are still in progress.
+The integrated full-suite run passed 5,444 tests and exposed two transparent
+index-wrapper fixture failures; forwarding the underlying allocation account
+fixed both, and all 11 tests in that target passed. The resulting revision also
+passes the complete Linux, macOS and Windows CI test jobs. Final counter/inline
+owner changes pass all 2,136 serial failpoint-enabled library tests, all-target/
+all-feature Clippy, Rust 1.88 all-feature and no-default compilation. Their
+remote CI rerun remains the final readiness gate.
+
+Five alternating pairs for each lifecycle case pass the predeclared latency
+and noise rule. INSERT allocation calls fall 2.69–2.70%, while warm aggregate
+p50 changes by +0.29% narrow and -0.71% wide. The longer INSERT median retains
+a +6.05% cost (126 ns, below its 166 ns twice-range threshold), reduced from
+the prior +12.19% failing attempt by eliminating account-reference churn for
+inline transaction buffers. The report preserves that failed attempt and the
+residual cost. Hot point lookup and short INSERT percentiles also rise within
+the measured noise gate; this phase does not claim every hot operation is faster.
+
+Concurrent wide writer p50/p99 improve 25.41%/20.73%. Short INSERT peak heap
+increases 14.51–15.94%; checkpoint releases more capacity, leaving total requested
+heap 3.07% lower on narrow rows and 0.32% lower on wide rows. Exact ranges,
+allocation counts, source/binary/fixture identities and portable moving-allocator
+proofs are in [measurements](measurements/README.md).

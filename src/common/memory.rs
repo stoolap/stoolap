@@ -41,7 +41,6 @@ enum Kind {
 
 #[derive(Default)]
 struct Counters {
-    retained: AtomicUsize,
     conservative: AtomicUsize,
     pending: AtomicUsize,
     total: AtomicUsize,
@@ -49,11 +48,11 @@ struct Counters {
 }
 
 impl Counters {
-    fn counter(&self, kind: Kind) -> &AtomicUsize {
+    fn separate_counter(&self, kind: Kind) -> Option<&AtomicUsize> {
         match kind {
-            Kind::Retained => &self.retained,
-            Kind::Conservative => &self.conservative,
-            Kind::Pending => &self.pending,
+            Kind::Retained => None,
+            Kind::Conservative => Some(&self.conservative),
+            Kind::Pending => Some(&self.pending),
         }
     }
 
@@ -69,7 +68,9 @@ impl Counters {
                 n.checked_add(bytes)
             })
             .expect("memory accounting overflow");
-        self.counter(kind).fetch_add(bytes, Ordering::Relaxed);
+        if let Some(counter) = self.separate_counter(kind) {
+            counter.fetch_add(bytes, Ordering::Relaxed);
+        }
         let total = previous + bytes;
         if total > self.peak.load(Ordering::Relaxed) {
             self.peak.fetch_max(total, Ordering::Relaxed);
@@ -80,8 +81,10 @@ impl Counters {
         if bytes == 0 {
             return;
         }
-        let previous = self.counter(kind).fetch_sub(bytes, Ordering::Relaxed);
-        assert!(previous >= bytes, "memory accounting underflow");
+        if let Some(counter) = self.separate_counter(kind) {
+            let previous = counter.fetch_sub(bytes, Ordering::Relaxed);
+            assert!(previous >= bytes, "memory accounting underflow");
+        }
         let previous = self.total.fetch_sub(bytes, Ordering::Relaxed);
         assert!(previous >= bytes, "memory accounting total underflow");
     }
@@ -90,18 +93,26 @@ impl Counters {
         if bytes == 0 {
             return;
         }
-        self.retained.fetch_add(bytes, Ordering::Relaxed);
         let previous = self.pending.fetch_sub(bytes, Ordering::Relaxed);
         assert!(previous >= bytes, "memory accounting pending underflow");
         // Total and peak do not change: pending ownership was already charged.
     }
 
     fn snapshot(&self) -> MemorySnapshot {
+        let accounted_bytes = self.total.load(Ordering::Relaxed);
+        let conservative_bytes = self.conservative.load(Ordering::Relaxed);
+        let pending_bytes = self.pending.load(Ordering::Relaxed);
+        // Retained ownership is the residual of the single total. Avoid a
+        // redundant atomic update for every hot allocation and final release.
+        // These loads are observational, as before: a concurrent conversion
+        // may straddle them, so use saturating arithmetic for the derived field.
+        let retained_bytes =
+            accounted_bytes.saturating_sub(conservative_bytes.saturating_add(pending_bytes));
         MemorySnapshot {
-            retained_bytes: self.retained.load(Ordering::Relaxed),
-            conservative_bytes: self.conservative.load(Ordering::Relaxed),
-            pending_bytes: self.pending.load(Ordering::Relaxed),
-            accounted_bytes: self.total.load(Ordering::Relaxed),
+            retained_bytes,
+            conservative_bytes,
+            pending_bytes,
+            accounted_bytes,
             peak_accounted_bytes: self.peak.load(Ordering::Relaxed),
         }
     }
@@ -427,6 +438,65 @@ impl AccountSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retained_residual_tracks_mixed_classes_and_pending_conversion() {
+        let counters = Counters::default();
+        counters.add(80, Kind::Retained);
+        counters.add(120, Kind::Conservative);
+        counters.add(64, Kind::Pending);
+        assert_eq!(
+            counters.snapshot(),
+            MemorySnapshot {
+                retained_bytes: 80,
+                conservative_bytes: 120,
+                pending_bytes: 64,
+                accounted_bytes: 264,
+                peak_accounted_bytes: 264,
+            }
+        );
+        counters.retain_pending(64);
+        assert_eq!(counters.snapshot().retained_bytes, 144);
+        assert_eq!(counters.snapshot().pending_bytes, 0);
+        assert_eq!(counters.snapshot().accounted_bytes, 264);
+        counters.remove(144, Kind::Retained);
+        counters.remove(120, Kind::Conservative);
+        assert_eq!(
+            counters.snapshot(),
+            MemorySnapshot {
+                peak_accounted_bytes: 264,
+                ..MemorySnapshot::default()
+            }
+        );
+    }
+
+    #[test]
+    fn concurrent_mixed_classes_leave_exact_quiescent_totals() {
+        let counters = Counters::default();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..1000 {
+                        counters.add(80, Kind::Retained);
+                        counters.add(120, Kind::Conservative);
+                        counters.add(64, Kind::Pending);
+                        counters.retain_pending(64);
+                        let sample = counters.snapshot();
+                        assert!(sample.retained_bytes <= sample.accounted_bytes);
+                        counters.remove(144, Kind::Retained);
+                        counters.remove(120, Kind::Conservative);
+                    }
+                });
+            }
+        });
+        let snapshot = counters.snapshot();
+        assert_eq!(snapshot.retained_bytes, 0);
+        assert_eq!(snapshot.conservative_bytes, 0);
+        assert_eq!(snapshot.pending_bytes, 0);
+        assert_eq!(snapshot.accounted_bytes, 0);
+        assert!(snapshot.peak_accounted_bytes >= 264);
+        assert!(snapshot.peak_accounted_bytes <= 8 * 264);
+    }
 
     #[test]
     fn replacement_transfers_ownership_without_counter_gap_or_duplicate_peak() {
