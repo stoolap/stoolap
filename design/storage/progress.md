@@ -9,7 +9,7 @@ independently reviewable without claiming unmerged work is shipped.
 | 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
 | 1 | Fallible access and complete statement rollback | Implemented; local gates and CI passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
 | 2 | Chunked arena and retained-hot accounting | Implemented; local gates passed; final CI running | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) (draft) |
-| 3 | Coherent two-layer execution | Implemented; final parent validation running | Passed after corrections | [#118](https://github.com/stoolap/stoolap/pull/118) (draft) |
+| 3 | Coherent two-layer execution | Implemented; local gates passed; final CI running | Passed after corrections | [#118](https://github.com/stoolap/stoolap/pull/118) (draft) |
 | 4 | V5 envelope and bounded streaming seal | Format, row spool and sort implemented; seal integration pending | Foundations passed independent review | — |
 | 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |
 | 6 | Paged reads, four ledgers and DML preflight | Pending | Pending | — |
@@ -183,11 +183,20 @@ handle retains the cache allocation's charge through the final weak owner.
 
 Independent source review and re-review passed after visibility, cache-proof,
 file-identity and allocation-lifetime corrections. Integrated library tests pass
-2,242/2,242, and 21 SQL/file/atomicity targets pass 166/166. The complete integration run passes 5,619 tests across 284 harnesses, with
+2,247/2,247 after the final parent merge, and 21 SQL/file/atomicity targets pass 166/166. The complete integration run passes 5,619 tests across 284 harnesses, with
 63 existing ignored doctests and no failures. All-target/all-feature Clippy
-passes after three test-only slice-reference simplifications. Fresh lifecycle
-comparisons against the final Phase 2 source and remote CI remain pending;
-this stage is not yet marked ready.
+passes after three test-only slice-reference simplifications. Final-parent Rust 1.88 all-feature/no-default and Windows compilation pass.
+A subsequent bounded dictionary-selection optimization passes 12 focused
+aggregation regressions and all-target/all-feature Clippy after independent
+review. Independent volume failpoint tests pass 115/115, final Rust 1.88
+all-feature compilation passes, and the raw measurement summaries match an
+independent recalculation. All three fresh five-pair lifecycle comparisons pass. Warm aggregate
+p50 improves 27.39–29.74%; UPDATE and point lookup also improve. INSERT has
+residual costs (+11.11% short narrow, +3.80% long p50), retained with the measured
+noise ranges rather than hidden by the aggregate improvements. The failed
+pre-optimization warm-query comparison remains in the report. Exact source,
+raw measurements and memory tradeoffs are in [measurements](measurements/README.md).
+Final remote CI remains the readiness gate.
 
 ## Phase 4 foundations
 
