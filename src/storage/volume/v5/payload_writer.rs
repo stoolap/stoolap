@@ -39,16 +39,16 @@ use super::column_block::{
 };
 use super::compression::{CompressionError, CompressionPlan};
 use super::directory::{
-    DirectoryError, DirectoryKey, GLOBAL_COLUMN, KEY_REQUIRED, Layout, LeafEntry, Section,
-    VolumeShape,
+    DirectoryError, DirectoryKey, Layout, LeafEntry, Section, VolumeShape, GLOBAL_COLUMN,
+    KEY_REQUIRED,
 };
 use super::directory_writer::{
     DirectoryScratch, DirectoryWriteError, DirectoryWriter, ENCODING_BYTES, MAX_ENTRIES,
 };
 use super::envelope::{Codec, Header, LegacyBase, ReadLimits};
 use super::group_metadata::{
-    GROUP_HEADER_BYTES, GROUP_RECORD_BYTES, GroupError, GroupExpectation, GroupPageExpectation,
-    GroupRangeValidator, GroupRecord,
+    GroupError, GroupExpectation, GroupPageExpectation, GroupRangeValidator, GroupRecord,
+    GROUP_HEADER_BYTES, GROUP_RECORD_BYTES,
 };
 use super::metadata_runs::{RunError, RunWriter};
 use super::page_io::{FinishedVolume, PageIoError, PageWriter};

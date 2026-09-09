@@ -20,8 +20,8 @@ use std::num::NonZeroU64;
 use stoolap::core::DataType;
 use stoolap::storage::volume::v5::column_block::{ColumnInput, ColumnLimits};
 use stoolap::storage::volume::v5::directory::{
-    DirectoryKey, GLOBAL_COLUMN, KEY_REQUIRED, Layout as VolumeLayout, LeafEntry, RowBounds,
-    Section, VolumeShape,
+    DirectoryKey, Layout as VolumeLayout, LeafEntry, RowBounds, Section, VolumeShape,
+    GLOBAL_COLUMN, KEY_REQUIRED,
 };
 use stoolap::storage::volume::v5::directory_writer::{DirectoryScratch, ENCODING_BYTES};
 use stoolap::storage::volume::v5::envelope::{
@@ -29,7 +29,7 @@ use stoolap::storage::volume::v5::envelope::{
 };
 use stoolap::storage::volume::v5::group_metadata::GroupRecord;
 use stoolap::storage::volume::v5::metadata_runs::{
-    IO_BYTES, RECORD_BYTES, RunWriter, SortedReader,
+    RunWriter, SortedReader, IO_BYTES, RECORD_BYTES,
 };
 use stoolap::storage::volume::v5::page_io::ReadAt;
 use stoolap::storage::volume::v5::payload_writer::{ColumnSpec, PayloadWriter};
@@ -179,11 +179,9 @@ fn payload_groups_columns_spool_directory_and_finish_allocate_nothing() {
                     &mut encoding,
                 )
                 .unwrap();
-            assert!(
-                writer
-                    .write_column(&[false], ColumnInput::F64(&[1.0]), &mut encoding)
-                    .is_err()
-            );
+            assert!(writer
+                .write_column(&[false], ColumnInput::F64(&[1.0]), &mut encoding)
+                .is_err());
             if compress {
                 writer
                     .write_column_compressed(
