@@ -7641,36 +7641,41 @@ impl TransactionVersionStore {
         self.release_all_claims();
     }
 
-    /// Rollback to a specific timestamp (for savepoint support)
-    ///
-    /// Discards all local changes that were made after the given timestamp.
-    /// For rows with version history, keeps versions at or before the timestamp.
-    /// Row claims are released only if all versions for that row are discarded.
+    /// Discard later local versions and release claims with no surviving write.
     pub fn rollback_to_timestamp(&mut self, timestamp: i64) {
-        let Some(local_versions) = self.local_versions.as_mut() else {
+        self.rollback_to_timestamp_with_pending(timestamp, &[]);
+    }
+
+    /// Retain claims for surviving cold tombstones as well as local versions.
+    /// `pending` contains sorted row IDs after the cold rollback.
+    pub(crate) fn rollback_to_timestamp_with_pending(&mut self, timestamp: i64, pending: &[i64]) {
+        debug_assert!(pending.windows(2).all(|pair| pair[0] < pair[1]));
+        if let Some(local_versions) = self.local_versions.as_mut() {
+            local_versions.retain(|_, versions| {
+                versions.retain(|v| v.create_time <= timestamp);
+                !versions.is_empty()
+            });
+        }
+        let Some(write_set) = self.write_set.as_mut() else {
             return;
         };
-
-        let mut rows_to_remove_completely: Vec<i64> = Vec::new();
-
-        // For each row, remove versions with create_time > timestamp
-        for (row_id, versions) in local_versions.iter_mut() {
-            // Keep only versions at or before the timestamp
-            versions.retain(|v| v.create_time <= timestamp);
-
-            // If all versions are removed, mark for complete removal
-            if versions.is_empty() {
-                rows_to_remove_completely.push(row_id);
-            }
+        let mut released: Vec<i64> = write_set
+            .keys()
+            .filter(|&row_id| {
+                !self
+                    .local_versions
+                    .as_ref()
+                    .is_some_and(|versions| versions.contains_key(row_id))
+                    && pending.binary_search(&row_id).is_err()
+            })
+            .collect();
+        for &row_id in &released {
+            write_set.remove(row_id);
         }
-
-        // Remove rows with no remaining versions and release their claims
-        for row_id in &rows_to_remove_completely {
-            local_versions.remove(*row_id);
-            self.parent_store.release_row_claim(*row_id, self.txn_id);
-            if let Some(write_set) = self.write_set.as_mut() {
-                write_set.remove(*row_id);
-            }
+        if !released.is_empty() {
+            released.sort_unstable();
+            self.parent_store
+                .release_row_claims_batch(&released, self.txn_id);
         }
     }
 
@@ -7689,30 +7694,6 @@ impl TransactionVersionStore {
                 read_version: None,
                 read_version_seq: 0,
             });
-        }
-    }
-
-    /// Release the claims on rows this transaction no longer changes (savepoint
-    /// rollback of cold-row tombstones). A row that still has a local version
-    /// keeps its claim.
-    pub fn release_claims(&mut self, row_ids: &[i64]) {
-        let Some(write_set) = self.write_set.as_mut() else {
-            return;
-        };
-        let mut released: Vec<i64> = Vec::with_capacity(row_ids.len());
-        for &row_id in row_ids {
-            let has_local_version = self
-                .local_versions
-                .as_ref()
-                .is_some_and(|versions| versions.contains_key(row_id));
-            if !has_local_version && write_set.remove(row_id).is_some() {
-                released.push(row_id);
-            }
-        }
-        if !released.is_empty() {
-            released.sort_unstable();
-            self.parent_store
-                .release_row_claims_batch(&released, self.txn_id);
         }
     }
 

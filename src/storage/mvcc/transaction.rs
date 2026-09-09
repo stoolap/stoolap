@@ -115,9 +115,6 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// Record rollback in WAL
     fn record_rollback(&self, txn_id: i64) -> Result<()>;
 
-    /// Get all tables with pending changes for a transaction
-    fn get_tables_with_pending_changes(&self, txn_id: i64) -> Result<Vec<Box<dyn Table>>>;
-
     /// Check if transaction has any pending DML changes (without allocating)
     fn has_pending_dml_changes(&self, txn_id: i64) -> bool;
 
@@ -156,9 +153,8 @@ pub trait TransactionEngineOperations: Send + Sync {
         let _ = hold;
     }
 
-    /// Discard the cold-row tombstones the transaction made after a timestamp
-    /// (savepoint rollback). Engines without cold storage have none.
-    fn rollback_tombstones_after(&self, _txn_id: i64, _timestamp: i64) {}
+    /// Discard later DML across all touched tables, including cold claims.
+    fn rollback_dml_after(&self, txn_id: i64, timestamp: i64);
 
     /// Defer table cleanup to background thread (avoids synchronous deallocation)
     /// Default implementation drops synchronously
@@ -375,14 +371,8 @@ impl MvccTransaction {
         let position = self.savepoint_position(name)?;
         let sp_state = self.savepoints[position].1;
 
-        // Rollback DML changes via engine operations (not self.tables which is empty)
         if let Some(ops) = &self.engine_operations {
-            if let Ok(tables) = ops.get_tables_with_pending_changes(self.id) {
-                for table in &tables {
-                    table.rollback_to_timestamp(sp_state.timestamp);
-                }
-            }
-            ops.rollback_tombstones_after(self.id, sp_state.timestamp);
+            ops.rollback_dml_after(self.id, sp_state.timestamp);
         }
 
         // Rollback DDL: undo CREATE TABLEs after savepoint

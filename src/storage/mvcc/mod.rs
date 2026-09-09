@@ -70,6 +70,7 @@ pub use snapshot::{DiskVersionStore, SnapshotReader, SnapshotWriter};
 pub use streaming_result::{AggregationScanner, StreamingResult, VisibleRowInfo};
 pub use table::MVCCTable;
 pub use timestamp::get_fast_timestamp;
+pub(crate) use timestamp::last_timestamp;
 pub use transaction::{
     MvccTransaction, SealFenceGuard, TransactionEngineOperations, TransactionState,
 };

@@ -1799,7 +1799,8 @@ impl SegmentManager {
             .write()
             .entry(txn_id)
             .or_default()
-            .insert(row_id, get_fast_timestamp());
+            .entry(row_id)
+            .or_insert_with(get_fast_timestamp);
     }
 
     /// Get pending tombstone row_ids for a transaction (for WAL recording).

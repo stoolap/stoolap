@@ -3925,8 +3925,16 @@ impl Table for SegmentedTable {
         self.segment_mgr.clear_txn_seal_generation(txn_id);
     }
 
-    fn rollback_to_timestamp(&self, timestamp: i64) {
-        self.hot.rollback_to_timestamp(timestamp);
+    fn rollback_to_timestamp_with_pending(&self, timestamp: i64, retained: &[i64]) {
+        let txn_id = self.txn_id();
+        self.segment_mgr
+            .rollback_pending_tombstones_after(txn_id, timestamp);
+        let mut pending = self.segment_mgr.get_pending_tombstones(txn_id);
+        pending.extend_from_slice(retained);
+        pending.sort_unstable();
+        pending.dedup();
+        self.hot
+            .rollback_to_timestamp_with_pending(timestamp, &pending);
     }
 
     fn has_local_changes(&self) -> bool {
@@ -6350,7 +6358,7 @@ mod tests {
             Ok(())
         }
         fn rollback(&mut self) {}
-        fn rollback_to_timestamp(&self, _: i64) {}
+        fn rollback_to_timestamp_with_pending(&self, _: i64, _: &[i64]) {}
         fn has_local_changes(&self) -> bool {
             false
         }
