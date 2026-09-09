@@ -108,6 +108,10 @@ They do not time allocations or claim to measure RSS.
 
 ## Phase 3
 
+The first table below records the dictionary optimization before the CI-driven
+admission correction. The final-source rerun is recorded afterward; both full
+comparisons and the preceding failed optimization are preserved in the JSON.
+
 [Phase 3 results](phase-03.json) compare the final Phase 2 source against fixed
 read epochs, coherent hot/cold execution and verified file leases. The fixture
 and release settings are unchanged; all three five-pair comparisons pass the
@@ -152,3 +156,47 @@ narrow, 95,052,058 wide and 42,226,172 long, versus 38,639,896, 95,066,073 and
 retained delta means less memory released during that phase, not a larger final
 engine total. Reopen/first-touch observations remain OS-cache uncontrolled.
 These measurements neither establish RSS nor activate the later hard budgets.
+
+### Final source after pressure-admission correction
+
+A no-progress checkpoint could consume a waiting writer's seal request while a
+reader retained the needed history. Reader release did not rearm it, so the
+writer waited until the existing ten-second soft fallback. Admission now
+retries at most every 100 ms while over the limit. The deterministic real-engine
+regression failed before the fix and passes afterward; all 70 unchanged
+hot-limit test executions pass at two parallelism settings. Fixed read/build
+cutoffs and the existing admission deadline are preserved.
+
+The complete release source was rebuilt and measured in another five alternating
+pairs per case, with the identical Phase 2 baseline and fixture. Canonical source
+SHA-256 is `695550b33d056ae55bc38f229277cbb291808ac9dda0223b494aa9e783175e29`;
+binary SHA-256 is `2f21c2cb9c5c85c40e56d822d5821869902bcb69e8074138f9c3f3abeebd6662`.
+Every predeclared latency/noise gate passes. The fixture disables the byte limit,
+so it measures the final executable's unaffected hot/query paths, not the
+pressure retry's timing. The correctness regression separately exercises retry.
+
+| Metric | Narrow | Wide | 10,000-operation case |
+|---|---:|---:|---:|
+| Warm aggregate p50 | -29.07% | -24.65% | -29.74% |
+| Warm aggregate alloc calls | -41.94% | -41.94% | -41.94% |
+| Hot PK p50 | -20.61% | -17.29% | -10.00% |
+| UPDATE p50 | -97.01% | -75.68% | -97.20% |
+| INSERT p50 | +7.24% | -3.92% | +1.90% |
+| INSERT p99 | +7.43% | -11.66% | +0.02% |
+| Sealed PK p50 | -95.18% | -82.37% | -95.80% |
+| Reopen p50 | +6.34% | +2.49% | +18.05% |
+| First aggregate after reopen p50 | +19.96% | -13.77% | +35.39% |
+
+Narrow INSERT increases 166 ns (2,292 to 2,458), below its 416 ns twice-range
+threshold. Concurrent wide writer p50/p99 increase 9.02%/6.09%; reader p50/p99
+fall 3.29%/1.76%, all within the gate. INSERT allocation calls remain unchanged.
+The long reopen increase is 1,256,083 ns, below the 1,842,166 ns noise allowance;
+first-touch aggregation increases 94,542 ns, below its 124,500 ns allowance.
+These cold-start costs are retained explicitly and OS-cache state is uncontrolled.
+Five repetitions do not establish a noise distribution or guarantee cold latency.
+
+Warm aggregate requested bytes remain 65.92% lower on narrow/long and 51.66%
+lower on wide rows. UPDATE retained deltas still rise 12.94–22.08%, with lower
+peak extra bytes. Short narrow INSERT peak extra bytes rise 7.37%; concurrent
+wide peak extra bytes rise 0.27%. The raw records retain all memory and allocator
+counters. No RSS, global hard-budget or competitor performance claim is made.
