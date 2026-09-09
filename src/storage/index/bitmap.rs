@@ -354,13 +354,13 @@ impl BitmapIndex {
 
         // Check if row already exists with a different value
         if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
-            if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
-                if bitmaps.mutate_remove_if(&old_arc_key, |old_bitmap| {
+            if !CompactArc::ptr_eq(&old_arc_key, &arc_key)
+                && bitmaps.mutate_remove_if(&old_arc_key, |old_bitmap| {
                     old_bitmap.remove(row_id_u64, self.memory.account());
                     old_bitmap.is_empty()
-                }) {
-                    self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                }
+                })
+            {
+                self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
             }
         }
 
@@ -660,13 +660,13 @@ impl Index for BitmapIndex {
 
             // Handle update case - remove from old bitmap
             if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
-                if !CompactArc::ptr_eq(&old_arc_key, &final_arc_key) {
-                    if bitmaps.mutate_remove_if(&old_arc_key, |old_bitmap| {
+                if !CompactArc::ptr_eq(&old_arc_key, &final_arc_key)
+                    && bitmaps.mutate_remove_if(&old_arc_key, |old_bitmap| {
                         old_bitmap.remove(row_id_u64, self.memory.account());
                         old_bitmap.is_empty()
-                    }) {
-                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                    }
+                    })
+                {
+                    self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
                 }
             }
 

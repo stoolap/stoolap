@@ -352,8 +352,7 @@ impl Chunk {
             let desired = (slot + 1)
                 .max(capacity.saturating_mul(2))
                 .max(hint)
-                .max(4)
-                .min(ARENA_CHUNK_ROWS);
+                .clamp(4, ARENA_CHUNK_ROWS);
             reserve_charged_vec(&mut self.data, desired, &mut self.charge)?;
             reserve_charged_vec(&mut self.meta, desired, &mut self.charge)?;
         }

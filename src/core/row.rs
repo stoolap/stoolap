@@ -918,10 +918,10 @@ mod hot_accounting_tests {
                             total += text_bytes(text);
                         }
                     }
-                    Value::Extension(bytes) => {
-                        if bytes.belongs_to(account) && seen.insert(bytes.as_ptr() as usize) {
-                            total += bytes.allocation_size();
-                        }
+                    Value::Extension(bytes)
+                        if bytes.belongs_to(account) && seen.insert(bytes.as_ptr() as usize) =>
+                    {
+                        total += bytes.allocation_size();
                     }
                     _ => {}
                 }

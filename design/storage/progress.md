@@ -8,7 +8,7 @@ independently reviewable without claiming unmerged work is shipped.
 |---|---|---|---|---|
 | 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
 | 1 | Fallible access and complete statement rollback | Implemented; local gates and CI passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
-| 2 | Chunked arena and retained-hot accounting | Implementing in isolated worktree | Pending | — |
+| 2 | Chunked arena and retained-hot accounting | Implemented; final validation running | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) (draft) |
 | 3 | Coherent two-layer execution | Pending | Pending | — |
 | 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
 | 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |

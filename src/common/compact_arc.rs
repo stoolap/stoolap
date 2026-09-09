@@ -1376,9 +1376,8 @@ mod tests {
     fn exact_iterator_accounts_callbacks_and_destructor_unwind() {
         use std::sync::Arc;
         let account = MemoryAccount::new();
-        let values = [1usize, 2, 3].into_iter().map(|value| {
+        let values = [1usize, 2, 3].into_iter().inspect(|_| {
             assert!(account.snapshot().retained_bytes > 0);
-            value
         });
         let array = CompactArc::from_exact_iter_in(values, &account);
         assert_eq!(account.snapshot().retained_bytes, array.allocation_size());

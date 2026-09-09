@@ -6281,16 +6281,16 @@ impl Drop for IndexCatalogLease {
     }
 }
 
+type PublicationRowUndo = (
+    i64,
+    Option<VersionChainEntry>,
+    Option<super::arena::ArenaRowMeta>,
+);
+
 struct TransactionMutation {
     index_undo: Mutex<RetainedSmallVec<[IndexUndo; 0]>>,
     statement_undo: RetainedSmallVec<[LocalMutationUndo; 1]>,
-    publication_undo: RetainedSmallVec<
-        [(
-            i64,
-            Option<VersionChainEntry>,
-            Option<super::arena::ArenaRowMeta>,
-        ); 1],
-    >,
+    publication_undo: RetainedSmallVec<[PublicationRowUndo; 1]>,
     undo_lsn_pins: RetainedSmallVec<[super::arena::ArenaLsnPin; 1]>,
     source_lsns: RetainedSmallVec<[(i64, NonZeroU64); 1]>,
     publication_applied: bool,
@@ -7260,79 +7260,76 @@ impl TransactionVersionStore {
         let Some(mut mutation) = self.mutation.take() else {
             return Ok(());
         };
-        if !committed {
-            if mutation.publication_applied {
-                let mut versions = self.parent_store.versions.write();
-                let restore_result = (|| -> Result<(), Error> {
-                    while let Some((row_id, previous, saved_meta)) =
-                        mutation.publication_undo.last().cloned()
-                    {
-                        let current = versions.get(row_id);
-                        if current.is_none_or(|entry| entry.version.txn_id != self.txn_id) {
-                            mutation.publication_undo.pop();
-                            continue;
-                        }
-                        let current = current.unwrap();
-                        let current_live = !current.version.is_deleted();
-                        let current_slot = current.arena_idx;
-                        let previous_live = previous
-                            .as_ref()
-                            .is_some_and(|entry| !entry.version.is_deleted());
-                        let previous_slot = previous.as_ref().and_then(|entry| entry.arena_idx);
-                        if let Some(entry) = previous {
-                            if let Some(slot) = previous_slot {
-                                if !self.parent_store.arena.update_at(
+        if !committed && mutation.publication_applied {
+            let mut versions = self.parent_store.versions.write();
+            let restore_result = (|| -> Result<(), Error> {
+                while let Some((row_id, previous, saved_meta)) =
+                    mutation.publication_undo.last().cloned()
+                {
+                    let current = versions.get(row_id);
+                    if current.is_none_or(|entry| entry.version.txn_id != self.txn_id) {
+                        mutation.publication_undo.pop();
+                        continue;
+                    }
+                    let current = current.unwrap();
+                    let current_live = !current.version.is_deleted();
+                    let current_slot = current.arena_idx;
+                    let previous_live = previous
+                        .as_ref()
+                        .is_some_and(|entry| !entry.version.is_deleted());
+                    let previous_slot = previous.as_ref().and_then(|entry| entry.arena_idx);
+                    if let Some(entry) = previous {
+                        if let Some(slot) = previous_slot {
+                            if !self.parent_store.arena.update_at(
+                                slot,
+                                row_id,
+                                saved_meta.map_or(entry.version.txn_id, |meta| meta.txn_id),
+                                entry.version.data.clone().into_arc(),
+                                saved_meta.and_then(|meta| meta.source_lsn),
+                            )? {
+                                return Err(Error::internal(
+                                    "publication undo lost its arena slot",
+                                ));
+                            }
+                            if entry.version.is_deleted()
+                                && !self.parent_store.arena.mark_deleted(
                                     slot,
                                     row_id,
-                                    saved_meta.map_or(entry.version.txn_id, |meta| meta.txn_id),
-                                    entry.version.data.clone().into_arc(),
+                                    entry.version.deleted_at_txn_id,
                                     saved_meta.and_then(|meta| meta.source_lsn),
-                                )? {
-                                    return Err(Error::internal(
-                                        "publication undo lost its arena slot",
-                                    ));
-                                }
-                                if entry.version.is_deleted() {
-                                    if !self.parent_store.arena.mark_deleted(
-                                        slot,
-                                        row_id,
-                                        entry.version.deleted_at_txn_id,
-                                        saved_meta.and_then(|meta| meta.source_lsn),
-                                    )? {
-                                        return Err(Error::internal(
-                                            "publication undo lost its deleted arena slot",
-                                        ));
-                                    }
-                                }
+                                )?
+                            {
+                                return Err(Error::internal(
+                                    "publication undo lost its deleted arena slot",
+                                ));
                             }
-                            versions.insert(row_id, entry);
-                        } else {
-                            versions.remove(row_id);
                         }
-                        if let Some(slot) = current_slot.filter(|slot| Some(*slot) != previous_slot)
-                        {
-                            self.parent_store.arena.clear_at(slot, row_id, self.txn_id);
-                        }
-                        if current_live && !previous_live {
-                            self.parent_store
-                                .committed_row_count
-                                .fetch_sub(1, Ordering::Relaxed);
-                        } else if previous_live && !current_live {
-                            self.parent_store
-                                .committed_row_count
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        mutation.publication_undo.pop();
+                        versions.insert(row_id, entry);
+                    } else {
+                        versions.remove(row_id);
                     }
-                    Ok(())
-                })();
-                drop(versions);
-                if let Err(error) = restore_result {
-                    // Keep ownership claims and receipt pins while recovery is
-                    // still required; an incomplete undo is not terminal.
-                    self.mutation = Some(mutation);
-                    return Err(error);
+                    if let Some(slot) = current_slot.filter(|slot| Some(*slot) != previous_slot) {
+                        self.parent_store.arena.clear_at(slot, row_id, self.txn_id);
+                    }
+                    if current_live && !previous_live {
+                        self.parent_store
+                            .committed_row_count
+                            .fetch_sub(1, Ordering::Relaxed);
+                    } else if previous_live && !current_live {
+                        self.parent_store
+                            .committed_row_count
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    mutation.publication_undo.pop();
                 }
+                Ok(())
+            })();
+            drop(versions);
+            if let Err(error) = restore_result {
+                // Keep ownership claims and receipt pins while recovery is
+                // still required; an incomplete undo is not terminal.
+                self.mutation = Some(mutation);
+                return Err(error);
             }
         }
         mutation.publication_undo.clear();
