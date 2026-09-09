@@ -19,8 +19,8 @@ use std::io::Write;
 use std::num::NonZeroU64;
 
 use stoolap::storage::volume::v5::directory::{
-    DirectoryKey, DirectoryRoot, KEY_REQUIRED, Layout as VolumeLayout, LeafEntry, RowBounds,
-    Section, VolumeShape,
+    DirectoryKey, DirectoryRoot, Layout as VolumeLayout, LeafEntry, RowBounds, Section,
+    VolumeShape, KEY_REQUIRED,
 };
 use stoolap::storage::volume::v5::envelope::{Codec, FileIdentity, Header, ReadLimits};
 use stoolap::storage::volume::v5::file_backed::FileBackedVolume;
@@ -165,11 +165,9 @@ fn large_file_open_retains_only_metadata_and_page_reads_do_not_allocate() {
                 let plan = lease.page(found.page).unwrap();
                 let bytes = plan.read_into(&mut page_scratch, &mut []).unwrap();
                 assert_eq!(bytes.len(), PAGE);
-                assert!(
-                    bytes
-                        .iter()
-                        .all(|byte| *byte == entry.key.ordinal as u8 + 31)
-                );
+                assert!(bytes
+                    .iter()
+                    .all(|byte| *byte == entry.key.ordinal as u8 + 31));
             }
         });
         assert_eq!(read_counts, (0, 0));

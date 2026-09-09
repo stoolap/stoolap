@@ -17,6 +17,7 @@
 
 pub mod column_block;
 pub mod compression;
+pub mod coordinator;
 pub mod directory;
 pub mod directory_reader;
 pub mod directory_writer;

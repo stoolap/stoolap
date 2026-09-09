@@ -463,7 +463,7 @@ fn value_bytes(value: &Value, column: ColumnSpec) -> Result<ValueBytes<'_>> {
             12
         }
         Value::Text(value) if column.data_type == DataType::Text => {
-            return Ok(ValueBytes::Borrowed(value.as_bytes()))
+            return Ok(ValueBytes::Borrowed(value.as_bytes()));
         }
         Value::Extension(value) if value.first() == Some(&(column.data_type as u8)) => {
             let bytes = &value[1..];
@@ -518,6 +518,10 @@ pub struct CellSpan {
     null: bool,
 }
 impl CellSpan {
+    /// Raw payload length; NULL descriptors have length zero.
+    pub const fn byte_len(self) -> u64 {
+        self.len
+    }
     pub const EMPTY: Self = Self {
         offset: 0,
         len: 0,
@@ -551,7 +555,45 @@ pub struct PreparedGroup<'group, 'io, 'schema, R: ReadAt + ?Sized> {
     reader: &'group mut SpoolReader<'io, 'schema, R>,
     rows: &'group [RowPosition],
 }
-impl<R: ReadAt + ?Sized> PreparedGroup<'_, '_, '_, R> {
+impl<'group, 'io, 'schema, R: ReadAt + ?Sized> PreparedGroup<'group, 'io, 'schema, R> {
+    /// Reborrow any nonempty range of the same descriptor-validated receipts.
+    pub fn range(
+        &mut self,
+        start: usize,
+        rows: usize,
+    ) -> Result<PreparedGroup<'_, 'io, 'schema, R>> {
+        self.reader.state.check()?;
+        let end = start.checked_add(rows).ok_or(SpoolError::Overflow)?;
+        if rows == 0 || end > self.rows.len() {
+            return Err(SpoolError::Limits);
+        }
+        Ok(PreparedGroup {
+            reader: self.reader,
+            rows: &self.rows[start..end],
+        })
+    }
+    /// Read only the selected checked descriptors into caller scratch. Payload
+    /// bytes are not touched; the immutable reader/receipt binding is retained.
+    /// Scratch may change on an I/O failure; this reader is then poisoned.
+    pub fn column_spans<'out>(
+        &mut self,
+        column: u32,
+        spans: &'out mut [CellSpan],
+    ) -> Result<&'out [CellSpan]> {
+        self.reader.state.check()?;
+        if column as usize >= self.reader.summary.binding.columns.len() {
+            return Err(SpoolError::Schema);
+        }
+        if spans.len() < self.rows.len() {
+            return Err(SpoolError::BufferTooSmall);
+        }
+        self.reader.state = State::Poisoned;
+        for (&row, slot) in self.rows.iter().zip(spans.iter_mut()) {
+            *slot = self.reader.inspect_selected(row, column)?;
+        }
+        self.reader.state = State::Open;
+        Ok(&spans[..self.rows.len()])
+    }
     pub fn gather_column<'out>(
         &mut self,
         column: u32,
@@ -918,7 +960,11 @@ fn check_io(bytes: &[u8]) -> Result<()> {
     }
     Ok(())
 }
-fn read_exact<R: ReadAt + ?Sized>(source: &R, mut offset: u64, mut bytes: &mut [u8]) -> Result<()> {
+pub(super) fn read_exact<R: ReadAt + ?Sized>(
+    source: &R,
+    mut offset: u64,
+    mut bytes: &mut [u8],
+) -> Result<()> {
     while !bytes.is_empty() {
         match source.read_at(offset, bytes) {
             Ok(0) => return Err(SpoolError::UnexpectedEof),
@@ -933,7 +979,7 @@ fn read_exact<R: ReadAt + ?Sized>(source: &R, mut offset: u64, mut bytes: &mut [
     }
     Ok(())
 }
-fn write_all<W: Write + ?Sized>(sink: &mut W, mut bytes: &[u8]) -> Result<()> {
+pub(super) fn write_all<W: Write + ?Sized>(sink: &mut W, mut bytes: &[u8]) -> Result<()> {
     while !bytes.is_empty() {
         match sink.write(bytes) {
             Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero).into()),

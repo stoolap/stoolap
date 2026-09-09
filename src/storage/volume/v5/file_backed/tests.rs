@@ -7,7 +7,7 @@ use std::num::NonZeroU64;
 use super::*;
 use crate::storage::volume::io::VolumeRetirementQueue;
 use crate::storage::volume::v5::directory::{
-    DirectoryKey, DirectoryRoot, KEY_REQUIRED, Layout, LeafEntry, RowBounds, Section, VolumeShape,
+    DirectoryKey, DirectoryRoot, Layout, LeafEntry, RowBounds, Section, VolumeShape, KEY_REQUIRED,
 };
 use crate::storage::volume::v5::envelope::Codec;
 use crate::storage::volume::v5::page_io::PageWriter;
@@ -218,7 +218,24 @@ fn managed_rename_and_retirement_share_the_existing_file_owner() {
     queue.track(volume.backing());
     queue.retire(volume.backing());
     let lease = volume.lease().unwrap();
-    queue.rename_directory(&old, &new, &[]).unwrap();
+    let lease = match queue.rename_directory(&old, &new, &[]) {
+        Ok(()) => lease,
+        #[cfg(windows)]
+        Err(error) => {
+            // Windows can reject a directory rename while a child has an
+            // active file handle. The failed rename must retain the old alias;
+            // releasing that short lease permits the same operation to retry.
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(old.join("data.vol").exists());
+            assert!(!new.exists());
+            assert!(alias.lease().is_ok());
+            drop(lease);
+            queue.rename_directory(&old, &new, &[]).unwrap();
+            alias.lease().unwrap()
+        }
+        #[cfg(not(windows))]
+        Err(error) => panic!("managed directory rename failed: {error}"),
+    };
     assert_eq!(
         lease
             .page(entry.page)

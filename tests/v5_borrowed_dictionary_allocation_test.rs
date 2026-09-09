@@ -114,18 +114,16 @@ fn borrowed_dictionary_proof_plan_encode_and_parse_allocate_nothing() {
                 view.dictionary_lookup(&texts[unique - 1]).unwrap(),
                 Some(unique as u32 - 1)
             );
-            assert!(
-                ColumnEncodePlan::new(
-                    expect,
-                    &nulls,
-                    input,
-                    ColumnLimits {
-                        dictionary_entries: 0,
-                        ..ColumnLimits::default()
-                    }
-                )
-                .is_err()
-            );
+            assert!(ColumnEncodePlan::new(
+                expect,
+                &nulls,
+                input,
+                ColumnLimits {
+                    dictionary_entries: 0,
+                    ..ColumnLimits::default()
+                }
+            )
+            .is_err());
         }
         assert!(BorrowedTextDictionary::new(b"\xff", &[0, 1]).is_err());
         assert!(BorrowedTextDictionary::new("é".as_bytes(), &[0, 1, 2]).is_err());

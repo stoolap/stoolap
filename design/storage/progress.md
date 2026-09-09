@@ -10,7 +10,7 @@ independently reviewable without claiming unmerged work is shipped.
 | 1 | Fallible access and complete statement rollback | Implemented; local gates and CI passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
 | 2 | Chunked arena and retained-hot accounting | Implemented; local gates and CI passed | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) |
 | 3 | Coherent two-layer execution | Implemented; local gates passed; final CI running | Passed after corrections | [#118](https://github.com/stoolap/stoolap/pull/118) (draft) |
-| 4 | V5 envelope and bounded streaming seal | Format, row spool and sort implemented; seal integration pending | Foundations passed independent review | — |
+| 4 | V5 envelope and bounded streaming seal | Format, row spool and sort implemented; seal integration pending | Foundations passed independent review | [#119](https://github.com/stoolap/stoolap/pull/119) (draft) |
 | 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |
 | 6 | Paged reads, four ledgers and DML preflight | Pending | Pending | — |
 | 7 | Explicit clustering and compatibility fallback | Pending | Pending | — |
@@ -292,7 +292,29 @@ All-target/all-feature Clippy, Windows no-default compilation and Rust 1.88
 no-default compilation pass. This is file-layer evidence; typed coverage,
 reservations and engine-wide accounting remain activation requirements.
 
-The stage remains incomplete: actual hot capture, byte-capped group planning,
-reservation ownership, durable identity
-activation and replacement of the eager V4 readback path are still required. The actual cold
-reader and engine-wide admission guarantee remain later integration gates.
+The sorted-spool coordinator now plans the complete checksummed group-boundary
+stream before emitting V5 bytes. A group's cap includes every decoded column
+page, group metadata, row IDs and source LSNs. A prepared batch validates metadata
+once, and per-row descriptor-derived size bounds avoid repeated suffix scans.
+Rounded NULL maps and fixed overhead stay exact; timestamps and a lower column
+cap may conservatively underpack. Exact one-row sizing preserves fitting narrow
+timestamps. Oversized existing rows fail before V5 emission and remain retained.
+
+All 117 V5 units pass; two actual-file allocation/reopen tests process an
+8,193-row, 64,282,760-byte spool using 2,795,416 or 3,229,080 bytes of reserved
+caller scratch, within their 16/64 MiB caps. The measured pipeline performs zero
+allocation calls after preparation. Reverse physical order still amplifies reads:
+planning reads about 593–595 MB and emission about 464–465 MB. This cost is
+explicit in [the component measurements](measurements/phase-04-streaming.json).
+A late-wide-column case proves linear read-count scaling as rows increase.
+Independent source reviews and final all-target/all-feature Clippy pass, as does
+Rust 1.88 all-target/all-feature compilation. CI formatting discrepancies were
+corrected using the repository edition. The Windows rename fixture now verifies
+old aliases after an open-handle PermissionDenied and retries after lease release;
+its Windows runtime gate remains CI because local C cross dependencies lack GCC.
+
+The stage remains incomplete: actual hot capture, job reservation ownership,
+durable identity activation and replacement of the eager V4 seal call path are
+still required. Plain/raw coordinator emission is explicit; compression and
+large-value integration remain activation work. Actual cold readers and the
+engine-wide admission guarantee remain later integration gates.

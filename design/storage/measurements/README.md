@@ -200,3 +200,16 @@ lower on wide rows. UPDATE retained deltas still rise 12.94–22.08%, with lower
 peak extra bytes. Short narrow INSERT peak extra bytes rise 7.37%; concurrent
 wide peak extra bytes rise 0.27%. The raw records retain all memory and allocator
 counters. No RSS, global hard-budget or competitor performance claim is made.
+
+## Phase 4 streaming components
+
+[The component record](phase-04-streaming.json) preserves exact scratch capacities,
+file I/O counters, fixture shape and source hashes. The committed coordinator
+allocation fixture covers a 64,282,760-byte reverse-order row spool, bounded
+sorting/planning/emission and complete page verification after reopen. It makes
+zero measured allocation calls with caller scratch of 2.80 MB or 3.23 MB, below
+its 16 MiB/64 MiB test caps. These caps cover that caller scratch, not engine
+memory or RSS. Planning and emission still read roughly 1.06 GB combined because
+of reverse-order gather amplification; bounded memory is not sequential I/O.
+The late-large-column fixture checks linear work rather than repeated suffix
+validation. The coordinator is inactive and emits plain/raw pages explicitly.
