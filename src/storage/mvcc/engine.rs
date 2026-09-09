@@ -7779,7 +7779,7 @@ impl TransactionEngineOperations for EngineOperations {
                 let mut cache = self.txn_version_stores().write().unwrap();
                 let txn_tables = cache
                     .entry(txn_id)
-                    .or_insert_with(|| super::accounting::RetainedSmallVec::new(&self.memory));
+                    .or_insert_with(super::accounting::RetainedSmallVec::new);
                 if let Some((_, cached)) = txn_tables
                     .iter()
                     .find(|(name, _)| name == &*table_name_lower)
@@ -7793,11 +7793,14 @@ impl TransactionEngineOperations for EngineOperations {
                         )),
                         version_store.memory_account(),
                     );
-                    txn_tables.push((
-                        SmartString::from(table_name_lower.clone().into_owned())
-                            .into_hot(&self.memory),
-                        CompactArc::clone(&new_store),
-                    ));
+                    txn_tables.push(
+                        (
+                            SmartString::from(table_name_lower.clone().into_owned())
+                                .into_hot(&self.memory),
+                            CompactArc::clone(&new_store),
+                        ),
+                        &self.memory,
+                    );
                     new_store
                 }
             }

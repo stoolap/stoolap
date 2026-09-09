@@ -7123,14 +7123,14 @@ struct TransactionMutation {
 impl TransactionMutation {
     fn new(account: &crate::common::memory::MemoryAccount) -> Self {
         Self {
-            index_undo: Mutex::new(RetainedSmallVec::new(account)),
-            statement_undo: RetainedSmallVec::new(account),
-            publication_undo: RetainedSmallVec::new(account),
-            undo_lsn_pins: RetainedSmallVec::new(account),
-            source_lsns: RetainedSmallVec::new(account),
+            index_undo: Mutex::new(RetainedSmallVec::new()),
+            statement_undo: RetainedSmallVec::new(),
+            publication_undo: RetainedSmallVec::new(),
+            undo_lsn_pins: RetainedSmallVec::new(),
+            source_lsns: RetainedSmallVec::new(),
             publication_applied: false,
-            reserved_keys: RetainedSmallVec::new(account),
-            reserved_indexes: RetainedSmallVec::new(account),
+            reserved_keys: RetainedSmallVec::new(),
+            reserved_indexes: RetainedSmallVec::new(),
             index_catalog_lease: None,
             history_charge: crate::common::memory::MemoryCharge::new(account, 0),
         }
@@ -7222,7 +7222,7 @@ impl TransactionVersionStore {
         self.mutation
             .get_or_insert_with(|| TransactionMutationOwner::new(&self.parent_store.memory))
             .statement_undo
-            .push(undo);
+            .push(undo, &self.parent_store.memory);
     }
 
     pub fn finish_statement(&mut self, checkpoint: usize, success: bool) {
@@ -7876,7 +7876,7 @@ impl TransactionVersionStore {
             self.mutation
                 .get_or_insert_with(|| TransactionMutationOwner::new(&self.parent_store.memory))
                 .source_lsns
-                .push((row_id, lsn));
+                .push((row_id, lsn), &self.parent_store.memory);
         }
     }
 
@@ -7892,7 +7892,7 @@ impl TransactionVersionStore {
             }
         }
         self.detect_conflicts_safe()?;
-        let mut keys = RetainedSmallVec::<[PublicationKey; 2]>::new(&self.parent_store.memory);
+        let mut keys = RetainedSmallVec::<[PublicationKey; 2]>::new();
         let indexes = self.parent_store.get_all_indexes();
         for index in &indexes {
             if !index.is_unique() || index.index_type() == crate::core::IndexType::PrimaryKey {
@@ -7926,7 +7926,7 @@ impl TransactionVersionStore {
                     if values.iter().any(Value::is_null) {
                         continue;
                     }
-                    keys.push((identity, values));
+                    keys.push((identity, values), &self.parent_store.memory);
                 }
             }
         }
@@ -7944,10 +7944,11 @@ impl TransactionVersionStore {
         mutation.reserved_indexes =
             RetainedSmallVec::from_inner(indexes, &self.parent_store.memory);
         let versions = self.parent_store.versions.read();
-        let mut undo = RetainedSmallVec::<[_; 1]>::new(&self.parent_store.memory);
+        let mut undo = RetainedSmallVec::<[_; 1]>::new();
         undo.extend(
             self.iter_local()
                 .map(|(row_id, _)| (row_id, versions.get(row_id).cloned(), None)),
+            &self.parent_store.memory,
         );
         let mut chunks: SmallVec<[_; 1]> = SmallVec::new();
         if undo
@@ -7980,10 +7981,10 @@ impl TransactionVersionStore {
         }
         chunks.sort_unstable();
         chunks.dedup();
-        let mut pins = RetainedSmallVec::<[_; 1]>::new(&self.parent_store.memory);
+        let mut pins = RetainedSmallVec::<[_; 1]>::new();
         for chunk in chunks {
             if let Some(pin) = self.parent_store.arena.pin_chunk_lsn(chunk)? {
-                pins.push(pin);
+                pins.push(pin, &self.parent_store.memory);
             }
         }
         let mutation = self.mutation.as_mut().unwrap();
@@ -8015,7 +8016,7 @@ impl TransactionVersionStore {
             .mutation
             .as_mut()
             .ok_or_else(|| Error::internal("cold reservation before prepare"))?;
-        let mut keys = RetainedSmallVec::<[PublicationKey; 2]>::new(&self.parent_store.memory);
+        let mut keys = RetainedSmallVec::<[PublicationKey; 2]>::new();
         for index in &mutation.reserved_indexes {
             if !index.is_unique() || index.index_type() == crate::core::IndexType::PrimaryKey {
                 continue;
@@ -8032,7 +8033,10 @@ impl TransactionVersionStore {
             if values.iter().any(Value::is_null) {
                 continue;
             }
-            keys.push((Arc::as_ptr(index) as *const () as usize, values));
+            keys.push(
+                (Arc::as_ptr(index) as *const () as usize, values),
+                &self.parent_store.memory,
+            );
         }
         if keys.is_empty() {
             return Ok(());
@@ -8043,7 +8047,9 @@ impl TransactionVersionStore {
                 "write conflict: cold unique key is being published",
             ));
         }
-        mutation.reserved_keys.extend(keys);
+        mutation
+            .reserved_keys
+            .extend(keys, &self.parent_store.memory);
         Ok(())
     }
 
@@ -8450,12 +8456,15 @@ impl TransactionVersionStore {
             if add_batches[idx].is_empty() && remove_batches[idx].is_empty() {
                 continue;
             }
-            undo.push(IndexUndo::new(
-                Arc::clone(index),
-                std::mem::take(&mut add_batches[idx]),
-                std::mem::take(&mut remove_batches[idx]),
+            undo.push(
+                IndexUndo::new(
+                    Arc::clone(index),
+                    std::mem::take(&mut add_batches[idx]),
+                    std::mem::take(&mut remove_batches[idx]),
+                    &self.parent_store.memory,
+                ),
                 &self.parent_store.memory,
-            ));
+            );
         }
         for entry in &mut undo[start..] {
             entry.apply()?;
@@ -8516,12 +8525,10 @@ impl TransactionVersionStore {
             } else {
                 Vec::new()
             };
-            undo.push(IndexUndo::new(
-                Arc::clone(index),
-                added,
-                removed,
+            undo.push(
+                IndexUndo::new(Arc::clone(index), added, removed, &self.parent_store.memory),
                 &self.parent_store.memory,
-            ));
+            );
         }
         for entry in &mut undo[start..] {
             entry.apply()?;
@@ -10789,13 +10796,16 @@ mod tests {
     #[test]
     fn idle_publication_table_releases_bulk_capacity_after_last_owner() {
         let store = VersionStore::new("publication_capacity", test_schema());
-        let mut keys = RetainedSmallVec::<[PublicationKey; 2]>::new(&store.memory);
-        keys.extend((0..4096).map(|value| {
-            (
-                0,
-                CompactArc::from_slice_in(&[Value::Integer(value)], &store.memory),
-            )
-        }));
+        let mut keys = RetainedSmallVec::<[PublicationKey; 2]>::new();
+        keys.extend(
+            (0..4096).map(|value| {
+                (
+                    0,
+                    CompactArc::from_slice_in(&[Value::Integer(value)], &store.memory),
+                )
+            }),
+            &store.memory,
+        );
         {
             let mut owners = store.publication_keys.lock();
             assert!(try_reserve_publication_keys(&mut owners, &keys, 1));
