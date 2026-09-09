@@ -112,7 +112,7 @@ impl Executor {
     pub(crate) fn execute_copy(
         &self,
         stmt: &CopyStatement,
-        _ctx: &ExecutionContext,
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         let table_name = &stmt.table_name.value_lower;
 
@@ -128,7 +128,7 @@ impl Executor {
 
         // Create a standalone auto-commit transaction
         let mut tx = self.engine.begin_transaction()?;
-        let mut table = tx.get_table(table_name)?;
+        let mut table = ctx.get_table(tx.as_ref(), table_name)?;
 
         // Pre-compute schema information
         let schema = table.schema();

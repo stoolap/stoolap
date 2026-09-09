@@ -290,6 +290,7 @@ impl Executor {
         ctx: &ExecutionContext,
         plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
     ) -> Result<Box<dyn QueryResult>> {
+        super::context::ensure_statement_cache_epoch(ctx);
         // Start timeout guard ONLY at the top level (query_depth == 0).
         // For nested queries (subqueries, views), the parent's TimeoutGuard handles timeout.
         // This ensures the timeout applies to the entire query, not each nested call.
@@ -2228,13 +2229,15 @@ impl Executor {
         // Get table from active transaction or create a new one
         let (table, _standalone_tx) = if let Some(ref tx_state) = *active_tx {
             // Use the active transaction - this allows seeing uncommitted changes
-            let table = tx_state.transaction.get_table(table_name).map_err(|e| {
-                if matches!(e, Error::TableNotFound(_)) {
-                    Error::TableOrViewNotFound(table_name.to_string())
-                } else {
-                    e
-                }
-            })?;
+            let table = ctx
+                .get_table(tx_state.transaction.as_ref(), table_name)
+                .map_err(|e| {
+                    if matches!(e, Error::TableNotFound(_)) {
+                        Error::TableOrViewNotFound(table_name.to_string())
+                    } else {
+                        e
+                    }
+                })?;
             drop(active_tx); // Release lock before doing work
             (table, None)
         } else {
@@ -2277,7 +2280,7 @@ impl Executor {
                     );
                 }
 
-                let table = tx.get_table(table_name).map_err(|e| {
+                let table = ctx.get_table(tx.as_ref(), table_name).map_err(|e| {
                     if matches!(e, Error::TableNotFound(_)) {
                         Error::TableOrViewNotFound(table_name.to_string())
                     } else {
@@ -2474,7 +2477,7 @@ impl Executor {
         // CRITICAL: Disable caching during explicit transactions (BEGIN/COMMIT)
         // to preserve MVCC isolation guarantees. A transaction must see its own
         // consistent snapshot, not cached results from other transactions.
-        let cache_eligible = is_select_star
+        let cache_shape_eligible = is_select_star
             && where_to_use.is_some()
             && !has_aggregation_window_grouping
             && !has_outer_context
@@ -2484,17 +2487,33 @@ impl Executor {
             && !classification.has_order_by
             && !classification.has_distinct
             && !classification.has_limit
-            && !in_explicit_transaction; // MVCC safety: no caching in transactions
+            && !in_explicit_transaction
+            && ctx.transaction_id().is_none()
+            && ctx.statement_snapshot().is_none();
+
+        // Table and schema are already bound. Keep this exact original proof
+        // for insertion even if another commit finishes while the scan runs.
+        // A historical/foreign epoch or an intervening logical mutation cannot
+        // be relabeled with the current generation.
+        let cache_provenance = if cache_shape_eligible {
+            ctx.read_epoch()
+                .and_then(|epoch| self.engine.cache_provenance(epoch))
+        } else {
+            None
+        };
+        let cache_eligible = cache_provenance.is_some();
 
         // Try cache lookup for eligible queries
         if cache_eligible {
             if let Some(where_expr) = where_to_use {
                 use super::semantic_cache::CacheLookupResult;
 
-                match self
-                    .semantic_cache
-                    .lookup(table_name, &all_columns, Some(where_expr))
-                {
+                match self.semantic_cache.lookup_with_provenance(
+                    table_name,
+                    &all_columns,
+                    Some(where_expr),
+                    cache_provenance.unwrap(),
+                ) {
                     CacheLookupResult::ExactHit(rows_arc) => {
                         // Exact cache hit - return cached rows with zero-copy sharing
                         let output_columns = CompactArc::new(self.get_output_column_names(
@@ -3847,6 +3866,26 @@ impl Executor {
                                 }),
                                 None,
                             )
+                        } else if ctx.read_epoch().is_some() {
+                            // Captured reads cannot use current secondary keys.
+                            // Their storage shortcut also declines FLOAT keys;
+                            // retain the indexed window's input order by sorting
+                            // the captured rows with the window's own comparator.
+                            let mut rows = table.collect_all_rows(None)?;
+                            let column = schema
+                                .find_column(&col_name)
+                                .ok_or_else(|| Error::ColumnNotFound(col_name.clone()))?
+                                .0;
+                            Self::sort_captured_window_rows(&mut rows, column, ascending);
+                            rows.truncate(fetch_limit);
+                            (
+                                rows,
+                                Some(WindowPreSortedState {
+                                    column: col_lower,
+                                    ascending,
+                                }),
+                                None,
+                            )
                         } else {
                             (table.collect_all_rows(None)?, None, None)
                         }
@@ -4002,11 +4041,12 @@ impl Executor {
             if let Some(where_expr) = where_to_use {
                 // Clone rows for cache (cache needs Vec<Row>)
                 let rows_for_cache: Vec<Row> = projected_rows.rows().cloned().collect();
-                self.semantic_cache.insert(
+                self.semantic_cache.insert_with_provenance(
                     table_name,
                     all_columns.to_vec(),
                     rows_for_cache,
                     Some(where_expr.clone()),
+                    cache_provenance.unwrap(),
                 );
             }
         }
@@ -4342,6 +4382,7 @@ impl Executor {
                     &join_type,
                     left_alias.as_deref(),
                     right_alias.as_deref(),
+                    Some(ctx),
                 )
             };
 
@@ -4368,6 +4409,7 @@ impl Executor {
                     &join_type,
                     right_alias.as_deref(), // Swap aliases for the check
                     left_alias.as_deref(),
+                    Some(ctx),
                 );
                 if left_as_inner.is_some() {
                     (left_as_inner, true) // Force swap
@@ -4406,6 +4448,7 @@ impl Executor {
                     &join_type,
                     right_alias.as_deref(), // Swap aliases
                     left_alias.as_deref(),
+                    Some(ctx),
                 );
 
                 // Prefer swapped if it gives PK lookup (most efficient)
@@ -4533,9 +4576,8 @@ impl Executor {
                 // continuation finds that a commit moved rows under it
                 let mut snapshot = match ctx.statement_snapshot() {
                     Some(snapshot) => snapshot.clone(),
-                    None => {
-                        self.new_statement_snapshot(crate::core::IsolationLevel::ReadCommitted)?
-                    }
+                    None => self
+                        .new_statement_snapshot(crate::core::IsolationLevel::ReadCommitted, ctx)?,
                 };
                 let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
                 // An explicit transaction reads through its own transaction, whose
@@ -4703,7 +4745,7 @@ impl Executor {
                         let mut outer_result = outer_result;
                         let mut inner_table = Some(inner_table);
                         let mut fetched = 0usize;
-                        let mut consistent = false;
+                        let mut consistent = ctx.read_epoch().is_some();
                         loop {
                             let outer_op: Box<dyn Operator> = Box::new(QueryResultOperator::new(
                                 outer_result,
@@ -4789,6 +4831,7 @@ impl Executor {
                             }
                             snapshot = self.new_statement_snapshot(
                                 crate::core::IsolationLevel::SnapshotIsolation,
+                                ctx,
                             )?;
                             ctx_join = ctx.with_statement_snapshot(snapshot.clone());
                             consistent = true;
@@ -7020,7 +7063,7 @@ impl Executor {
         name: &str,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
         if let Some(active) = self.active_transaction.lock().unwrap().as_ref() {
-            return active.transaction.get_table(name);
+            return snapshot.get_table_for_transaction(active.transaction.as_ref(), name);
         }
         snapshot.get_table(name)
     }
@@ -7029,12 +7072,10 @@ impl Executor {
     fn new_statement_snapshot(
         &self,
         isolation: crate::core::IsolationLevel,
+        ctx: &ExecutionContext,
     ) -> Result<StatementSnapshot> {
-        let mut transaction = self.engine.begin_transaction()?;
-        if isolation != crate::core::IsolationLevel::ReadCommitted {
-            transaction.set_isolation_level(isolation)?;
-        }
-        Ok(StatementSnapshot::new(transaction))
+        let transaction = self.engine.begin_transaction_with_level(isolation)?;
+        Ok(StatementSnapshot::new(transaction).with_epoch(ctx.read_epoch().cloned()))
     }
 
     /// True when a filter carries a subquery anywhere inside it. The grouped
@@ -7145,6 +7186,7 @@ impl Executor {
                 join_type,
                 left_alias,
                 right_alias,
+                Some(ctx),
             )
         else {
             return Ok(None);
@@ -7184,7 +7226,7 @@ impl Executor {
         // explicit transaction the outer side is read whole
         let mut snapshot = match ctx.statement_snapshot() {
             Some(snapshot) => snapshot.clone(),
-            None => self.new_statement_snapshot(crate::core::IsolationLevel::ReadCommitted)?,
+            None => self.new_statement_snapshot(crate::core::IsolationLevel::ReadCommitted, ctx)?,
         };
         let mut ctx_join = ctx.with_statement_snapshot(snapshot.clone());
         let in_explicit_transaction = self.active_transaction.lock().unwrap().is_some();
@@ -7389,7 +7431,7 @@ impl Executor {
         let mut outer_result = outer_result;
         let mut inner_table = Some(inner_table);
         let mut fetched = 0usize;
-        let mut consistent = false;
+        let mut consistent = ctx.read_epoch().is_some();
         loop {
             let outer_op: Box<dyn Operator> =
                 Box::new(QueryResultOperator::new(outer_result, outer_cols.clone()));
@@ -7505,7 +7547,7 @@ impl Executor {
                 continue;
             }
             snapshot =
-                self.new_statement_snapshot(crate::core::IsolationLevel::SnapshotIsolation)?;
+                self.new_statement_snapshot(crate::core::IsolationLevel::SnapshotIsolation, ctx)?;
             ctx_join = ctx.with_statement_snapshot(snapshot.clone());
             inner_table = Some(self.join_table(&snapshot, &table_name)?);
             consistent = true;
@@ -7568,6 +7610,12 @@ impl Executor {
         // Try to extract Arc directly (zero-copy path for CTEs)
         if let Some(arc_rows) = result.try_into_arc_rows() {
             return Ok(arc_rows);
+        }
+
+        // A consuming extraction may fail while closing its captured source.
+        // Surface that error before trusting an estimate for a fallback buffer.
+        if let Some(error) = result.last_error() {
+            return Err(error);
         }
 
         // Pre-allocate based on estimate to avoid reallocations
@@ -9333,7 +9381,19 @@ impl Executor {
             return Some(((0..all_columns.len()).collect(), all_columns.to_vec()));
         }
 
-        let col_index_map = build_column_index_map(all_columns);
+        // A narrow projection should not allocate and lowercase maps for
+        // every input column. Keep the existing Unicode/map path for larger
+        // projections and non-ASCII schemas.
+        let col_index_map =
+            if select_exprs.len() <= 4 && all_columns.iter().all(|name| name.is_ascii()) {
+                None
+            } else {
+                Some(build_column_index_map(all_columns))
+            };
+        let column_index = |name: &str| match &col_index_map {
+            Some(map) => map.get(name).copied(),
+            None => Self::find_ascii_projection_column(all_columns, name),
+        };
 
         let mut indices = Vec::with_capacity(select_exprs.len());
         let mut names = Vec::with_capacity(select_exprs.len());
@@ -9341,39 +9401,23 @@ impl Executor {
         for expr in select_exprs {
             match expr {
                 Expression::Identifier(id) => {
-                    if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
-                        indices.push(idx);
-                        names.push(id.value.to_string());
-                    } else {
-                        return None;
-                    }
+                    indices.push(column_index(id.value_lower.as_str())?);
+                    names.push(id.value.to_string());
                 }
                 Expression::QualifiedIdentifier(qid) => {
-                    if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
-                        indices.push(idx);
-                        names.push(qid.name.value.to_string());
-                    } else {
-                        return None;
-                    }
+                    indices.push(column_index(qid.name.value_lower.as_str())?);
+                    names.push(qid.name.value.to_string());
                 }
                 Expression::Aliased(aliased) => {
                     // Check if inner expression is simple
                     match &*aliased.expression {
                         Expression::Identifier(id) => {
-                            if let Some(&idx) = col_index_map.get(id.value_lower.as_str()) {
-                                indices.push(idx);
-                                names.push(aliased.alias.value.to_string());
-                            } else {
-                                return None;
-                            }
+                            indices.push(column_index(id.value_lower.as_str())?);
+                            names.push(aliased.alias.value.to_string());
                         }
                         Expression::QualifiedIdentifier(qid) => {
-                            if let Some(&idx) = col_index_map.get(qid.name.value_lower.as_str()) {
-                                indices.push(idx);
-                                names.push(aliased.alias.value.to_string());
-                            } else {
-                                return None;
-                            }
+                            indices.push(column_index(qid.name.value_lower.as_str())?);
+                            names.push(aliased.alias.value.to_string());
                         }
                         _ => return None, // Complex expression in alias
                     }
@@ -9383,6 +9427,30 @@ impl Executor {
         }
 
         Some((indices, names))
+    }
+
+    /// Match build_column_index_map's precedence without allocating: the last
+    /// complete name wins; an absent complete name may use one qualified base.
+    fn find_ascii_projection_column(columns: &[String], name: &str) -> Option<usize> {
+        if let Some(index) = columns
+            .iter()
+            .rposition(|column| column.eq_ignore_ascii_case(name))
+        {
+            return Some(index);
+        }
+        let mut found = None;
+        for (index, column) in columns.iter().enumerate() {
+            if column
+                .rsplit_once('.')
+                .is_some_and(|(_, base)| base.eq_ignore_ascii_case(name))
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(index);
+            }
+        }
+        found
     }
 
     /// Compare two rows for ORDER BY using pre-computed column indices
@@ -10763,7 +10831,7 @@ impl Executor {
     /// - Join type is INNER or LEFT (not RIGHT or FULL)
     ///
     /// The outer_key_idx will be determined after materializing the outer side.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     pub(crate) fn check_index_nested_loop_opportunity(
         &self,
         right_expr: &Expression,
@@ -10771,6 +10839,7 @@ impl Executor {
         join_type: &str,
         left_alias: Option<&str>,
         right_alias: Option<&str>,
+        ctx: Option<&ExecutionContext>,
     ) -> Option<(
         String,              // table_name
         IndexLookupStrategy, // lookup strategy (index or PK)
@@ -10882,8 +10951,15 @@ impl Executor {
         };
 
         // Try to get the table and check for index or PK
-        let txn = self.engine.begin_transaction().ok()?;
-        let table = txn.get_table(table_name_ref).ok()?;
+        let table = match ctx {
+            Some(ctx) => self.table_in_context(table_name_ref, ctx).ok()?,
+            None => self
+                .engine
+                .begin_transaction()
+                .ok()?
+                .get_table(table_name_ref)
+                .ok()?,
+        };
         let schema = table.schema();
 
         // First check if inner column is the PRIMARY KEY (direct row_id lookup)
@@ -10898,6 +10974,13 @@ impl Executor {
                     outer_col,
                 ));
             }
+        }
+
+        // Secondary index contents are live; they may omit a key removed
+        // after the epoch. PK probes derive IDs from the outer rows and are
+        // resolved through the captured table, so that strategy remains safe.
+        if ctx.is_some_and(|ctx| ctx.read_epoch().is_some()) {
+            return None;
         }
 
         // Check if there's a secondary index on the inner column
@@ -11544,6 +11627,75 @@ mod tests {
         let engine = MVCCEngine::in_memory();
         engine.open_engine().unwrap();
         Executor::new(Arc::new(engine))
+    }
+
+    #[test]
+    fn narrow_projection_lookup_matches_map_precedence() {
+        let choices = ["a", "A", "left.a", "right.A", "x.b", "b", "x.y.b", "empty."];
+        for encoded in 0..choices.len().pow(4) {
+            let mut number = encoded;
+            let columns: Vec<String> = (0..4)
+                .map(|_| {
+                    let value = choices[number % choices.len()].to_owned();
+                    number /= choices.len();
+                    value
+                })
+                .collect();
+            let map = build_column_index_map(&columns);
+            for name in [
+                "a", "b", "left.a", "right.a", "x.y.b", "empty.", "", "missing", "é",
+            ] {
+                assert_eq!(
+                    Executor::find_ascii_projection_column(&columns, name),
+                    map.get(name).copied(),
+                    "columns={columns:?}, name={name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_projection_preserves_aliases_duplicates_and_unicode_fallback() {
+        let executor = create_test_executor();
+        executor
+            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, price INTEGER, extra INTEGER)")
+            .unwrap();
+        executor
+            .execute("INSERT INTO t VALUES (1, 17, 23)")
+            .unwrap();
+        executor
+            .execute("CREATE TABLE u (id INTEGER PRIMARY KEY, price INTEGER, É INTEGER)")
+            .unwrap();
+        executor
+            .execute("INSERT INTO u VALUES (1, 17, 23)")
+            .unwrap();
+        for (sql, expected, names) in [
+            (
+                "SELECT price AS p, PRICE, t.id FROM t WHERE id = 1",
+                vec![17, 17, 1],
+                vec!["p", "PRICE", "id"],
+            ),
+            (
+                "SELECT é, price FROM u WHERE id = 1",
+                vec![23, 17],
+                vec!["é", "price"],
+            ),
+            (
+                "SELECT price, price, price, price, id FROM t WHERE id = 1",
+                vec![17, 17, 17, 17, 1],
+                vec!["price", "price", "price", "price", "id"],
+            ),
+        ] {
+            let mut result = executor.execute(sql).unwrap();
+            assert_eq!(result.columns(), names);
+            assert!(result.next());
+            assert_eq!(
+                result.row().as_slice(),
+                expected.into_iter().map(Value::Integer).collect::<Vec<_>>()
+            );
+            assert!(!result.next());
+            assert!(result.last_error().is_none());
+        }
     }
 
     #[test]

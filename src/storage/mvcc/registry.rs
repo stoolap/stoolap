@@ -22,7 +22,7 @@
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
 
 use crate::common::I64Map;
@@ -35,6 +35,9 @@ const ABORTED_SENTINEL: i64 = -1;
 const STATUS_SHIFT: u32 = 62;
 const SEQ_MASK: i64 = (1i64 << STATUS_SHIFT) - 1;
 const SNAPSHOT_FLAG: i64 = 1i64 << STATUS_SHIFT;
+// Namespaces are never reused, including after an engine is dropped. Assigned
+// once per registry; no global atomic access occurs during statement reads.
+static NEXT_REGISTRY_NAMESPACE: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -47,11 +50,14 @@ pub enum TxnStatus {
 /// Transaction state and its begin-view registration. The begin word records the
 /// transaction's effective isolation level; changing the global default does
 /// not change transactions which have already begun.
+/// Active state_seq stores the begin registration; Committing stores its commit
+/// sequence and moves the registration into the small in-flight commit list.
+/// Aborted state_seq stores the rollback acknowledgment. Keep this state 16 bytes
+/// because the main registry also retains completed abort markers until GC.
 #[derive(Clone, Copy, Debug)]
 pub struct TxnState {
     begin_seq: i64,
     state_seq: i64,
-    begin_registration: i64,
 }
 
 impl TxnState {
@@ -59,8 +65,7 @@ impl TxnState {
     const fn new_active(begin_seq: i64, snapshot: bool, begin_registration: i64) -> Self {
         Self {
             begin_seq: begin_seq | if snapshot { SNAPSHOT_FLAG } else { 0 },
-            state_seq: 0,
-            begin_registration,
+            state_seq: begin_registration,
         }
     }
 
@@ -68,7 +73,6 @@ impl TxnState {
         Self {
             begin_seq: ABORTED_SENTINEL,
             state_seq: (TxnStatus::Aborted as i64) << STATUS_SHIFT,
-            begin_registration: 0,
         }
     }
 
@@ -90,7 +94,7 @@ impl TxnState {
     pub const fn status(&self) -> TxnStatus {
         if self.is_aborted() {
             TxnStatus::Aborted
-        } else if self.state_seq == 0 {
+        } else if self.state_seq >> STATUS_SHIFT == 0 {
             TxnStatus::Active
         } else {
             TxnStatus::Committing
@@ -112,6 +116,15 @@ impl TxnState {
     }
 
     #[inline]
+    const fn active_begin_registration(&self) -> Option<i64> {
+        if !self.is_aborted() && self.state_seq >> STATUS_SHIFT == 0 {
+            Some(self.state_seq & SEQ_MASK)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
     fn set_committing(&mut self, commit_seq: i64) {
         self.state_seq = commit_seq | (1i64 << STATUS_SHIFT);
     }
@@ -129,10 +142,10 @@ impl TxnState {
 
     #[inline(always)]
     pub const fn commit_seq(&self) -> i64 {
-        if self.is_aborted() {
-            0
-        } else {
+        if !self.is_aborted() && self.state_seq >> STATUS_SHIFT == 1 {
             self.state_seq & SEQ_MASK
+        } else {
+            0
         }
     }
 }
@@ -174,6 +187,9 @@ impl CommittedCache {
 #[derive(Clone, Debug)]
 struct EpochData {
     cutoff: i64,
+    // Zero means this view cannot authorize shared result reuse. Historical
+    // views must never inherit the generation current when they are reopened.
+    cache_generation: u64,
     // None avoids an empty-slice allocation in the common case.
     excluded: Option<Arc<[i64]>>,
 }
@@ -205,6 +221,14 @@ pub struct ReadEpoch {
     lease: Arc<EpochLease>,
 }
 
+/// Scalar proof of one engine's committed logical view. It retains no epoch,
+/// row tree, file, or registry owner. Only a matching engine can issue it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CacheProvenance {
+    namespace: usize,
+    generation: std::num::NonZeroU64,
+}
+
 struct EpochLease {
     registry: Arc<RegistryShared>,
     id: i64,
@@ -213,11 +237,39 @@ struct EpochLease {
 
 impl Drop for EpochLease {
     fn drop(&mut self) {
-        self.registry.state.lock().leases.remove(self.id);
+        let mut state = self.registry.state.lock();
+        state.leases.remove(self.id);
+        state.reset_retention_if_idle(self.registry.active_txn_count.load(Ordering::Relaxed));
+    }
+}
+
+impl std::fmt::Debug for ReadEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadEpoch")
+            .field("cutoff", &self.cutoff())
+            .field("exclusions", &self.excluded_sequences())
+            .finish_non_exhaustive()
     }
 }
 
 impl ReadEpoch {
+    /// Used only while all claimed owners are exclusively borrowed by a
+    /// destructive DDL operation. The caller must count actual private epoch
+    /// values, and reject cached views with any externally shared Arc owner.
+    pub(crate) fn has_exact_owners(&self, owners: usize) -> bool {
+        owners != 0 && Arc::strong_count(&self.lease) == owners
+    }
+
+    pub(crate) fn cache_identity(&self) -> (usize, i64) {
+        (self.lease.registry.namespace, self.lease.id)
+    }
+
+    /// True for handles sharing the same registered statement lease.
+    #[inline]
+    pub fn same_epoch(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.lease, &other.lease)
+    }
+
     pub fn cutoff(&self) -> i64 {
         self.lease.data.cutoff
     }
@@ -318,7 +370,19 @@ impl BuildLease {
     }
 }
 
+#[derive(Clone, Copy)]
+struct CommittingTxn {
+    id: i64,
+    commit_seq: i64,
+    begin_registration: i64,
+}
+
 struct RegistryState {
+    /// Prevent new read/build/transaction registrations while a prevalidated
+    /// destructive DDL writes WAL. No lifecycle mutex is held during that IO.
+    destructive_ddl: bool,
+    logical_generation: u64,
+    immediate_mutations: usize,
     transactions: I64Map<TxnState>,
     snapshot_seqs: I64Map<i64>,
     // Preserve begin-time exclusions for legacy callers that set isolation
@@ -326,8 +390,11 @@ struct RegistryState {
     begin_exclusions: I64Map<Arc<[i64]>>,
     // Only committing transactions, normally inline. Avoid scanning all active
     // transactions whenever a statement or transaction captures an epoch.
-    committing: SmallVec<[(i64, i64); 4]>,
+    committing: SmallVec<[CommittingTxn; 4]>,
     leases: I64Map<i64>,
+    // Lowered atomically with each registration; stale low floors only retain
+    // extra history. Exact GC/pressure refresh raises it without per-row scans.
+    cached_retention_horizon: Option<i64>,
     next_registration: i64,
     next_txn_id: i64,
     next_sequence: i64,
@@ -337,6 +404,14 @@ struct RegistryState {
 }
 
 impl RegistryState {
+    fn advance_logical_generation(&mut self) {
+        // Exhaustion disables reuse permanently. In particular, completion of
+        // a durable COMMIT must neither fail nor reuse an earlier identity.
+        if self.logical_generation != 0 {
+            self.logical_generation = self.logical_generation.checked_add(1).unwrap_or(0);
+        }
+    }
+
     fn allocate_sequence(&mut self) -> i64 {
         let next = self
             .next_sequence
@@ -349,10 +424,15 @@ impl RegistryState {
 
     fn capture_data(&self) -> EpochData {
         let mut excluded: SmallVec<[i64; 4]> =
-            self.committing.iter().map(|&(_, seq)| seq).collect();
+            self.committing.iter().map(|txn| txn.commit_seq).collect();
         excluded.sort_unstable();
         EpochData {
             cutoff: self.next_sequence,
+            cache_generation: if self.immediate_mutations == 0 && !self.destructive_ddl {
+                self.logical_generation
+            } else {
+                0
+            },
             excluded: (!excluded.is_empty()).then(|| Arc::from(excluded.as_slice())),
         }
     }
@@ -361,6 +441,7 @@ impl RegistryState {
         let txn = self.transactions.get(txn_id)?;
         txn.is_active_or_committing().then(|| EpochData {
             cutoff: txn.begin_seq(),
+            cache_generation: 0,
             excluded: self.begin_exclusions.get(txn_id).cloned(),
         })
     }
@@ -376,15 +457,36 @@ impl RegistryState {
 
     fn register_lease(&mut self, data: &EpochData) -> i64 {
         let id = self.allocate_registration();
-        self.leases.insert(id, data.horizon());
+        let horizon = data.horizon();
+        self.lower_retention_horizon(horizon);
+        self.leases.insert(id, horizon);
         id
+    }
+
+    fn lower_retention_horizon(&mut self, horizon: i64) {
+        self.cached_retention_horizon = Some(
+            self.cached_retention_horizon
+                .map_or(horizon, |old| old.min(horizon)),
+        );
+    }
+
+    fn reset_retention_if_idle(&mut self, active: usize) {
+        if active == 0 && self.leases.is_empty() {
+            self.cached_retention_horizon = None;
+        }
+    }
+
+    fn refresh_retention_horizon(&mut self) -> Option<i64> {
+        let horizon = self.retention_horizon();
+        self.cached_retention_horizon = horizon;
+        horizon
     }
 
     fn oldest_registration(&self) -> Option<i64> {
         self.transactions
             .values()
-            .filter(|txn| txn.is_active_or_committing())
-            .map(|txn| txn.begin_registration)
+            .filter_map(TxnState::active_begin_registration)
+            .chain(self.committing.iter().map(|txn| txn.begin_registration))
             .chain(self.leases.keys())
             .min()
     }
@@ -392,7 +494,7 @@ impl RegistryState {
     fn safe_completed_cutoff(&self) -> i64 {
         self.committing
             .iter()
-            .map(|&(_, seq)| seq - 1)
+            .map(|txn| txn.commit_seq - 1)
             .min()
             .unwrap_or(self.next_sequence)
     }
@@ -436,14 +538,16 @@ impl RegistryState {
     }
 
     fn remove_committing(&mut self, txn_id: i64) {
-        if let Some(index) = self.committing.iter().position(|&(id, _)| id == txn_id) {
+        if let Some(index) = self.committing.iter().position(|txn| txn.id == txn_id) {
             self.committing.swap_remove(index);
         }
     }
 }
 
 struct RegistryShared {
+    namespace: usize,
     state: Mutex<RegistryState>,
+    ddl_finished: Condvar,
     global_isolation_level: AtomicU8,
     active_txn_count: AtomicUsize,
     snapshot_txn_count: AtomicUsize,
@@ -458,7 +562,136 @@ pub struct TransactionRegistry {
     shared: Arc<RegistryShared>,
 }
 
+/// Marks a logical mutation which does not wait for transaction visibility.
+/// Owned guards may nest; they hold no mutex during the operation or its I/O.
+#[must_use = "keep the guard alive through the complete logical mutation"]
+pub struct LogicalMutationGuard {
+    shared: Arc<RegistryShared>,
+}
+
+impl Drop for LogicalMutationGuard {
+    fn drop(&mut self) {
+        let mut state = self.shared.state.lock();
+        state.advance_logical_generation();
+        state.immediate_mutations -= 1;
+    }
+}
+
+/// Admission reservation, not a held mutex: registered epochs cannot be
+/// created between destructive DDL prevalidation and its completed mutation.
+pub(crate) struct DestructiveDdlGuard<'a> {
+    shared: &'a Arc<RegistryShared>,
+}
+
+impl DestructiveDdlGuard<'_> {
+    /// Internal current-state validation is part of the reserved operation.
+    /// It must not wait on its own admission flag or reuse an older SI epoch.
+    pub(crate) fn capture_current_epoch(&self) -> ReadEpoch {
+        let (data, id) = {
+            let mut state = self.shared.state.lock();
+            debug_assert!(state.destructive_ddl);
+            let data = state.capture_data();
+            let id = state.register_lease(&data);
+            (data, id)
+        };
+        ReadEpoch {
+            lease: Arc::new(EpochLease {
+                registry: Arc::clone(self.shared),
+                id,
+                data,
+            }),
+        }
+    }
+}
+
+impl Drop for DestructiveDdlGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.shared.state.lock();
+        state.advance_logical_generation();
+        state.destructive_ddl = false;
+        self.shared.ddl_finished.notify_all();
+    }
+}
+
 impl TransactionRegistry {
+    pub fn begin_logical_mutation(&self) -> LogicalMutationGuard {
+        let mut state = self.shared.state.lock();
+        state.immediate_mutations = state
+            .immediate_mutations
+            .checked_add(1)
+            .expect("logical mutation count exhausted");
+        state.advance_logical_generation();
+        LogicalMutationGuard {
+            shared: Arc::clone(&self.shared),
+        }
+    }
+
+    /// Call after binding the table and schema. Never stamp a completed old
+    /// result with a newly sampled generation; retain this original proof.
+    pub fn cache_provenance(&self, epoch: &ReadEpoch) -> Option<CacheProvenance> {
+        if !Arc::ptr_eq(&self.shared, &epoch.lease.registry) {
+            return None;
+        }
+        let generation = std::num::NonZeroU64::new(epoch.lease.data.cache_generation)?;
+        let state = self.shared.state.lock();
+        (state.logical_generation == generation.get()
+            && state.immediate_mutations == 0
+            && !state.destructive_ddl)
+            .then_some(CacheProvenance {
+                namespace: self.shared.namespace,
+                generation,
+            })
+    }
+
+    fn wait_for_ddl(&self, state: &mut parking_lot::MutexGuard<'_, RegistryState>) {
+        while state.destructive_ddl {
+            self.shared.ddl_finished.wait(state);
+        }
+    }
+
+    /// The caller exclusively borrows every counted epoch value until this
+    /// guard drops. No additional lease is exempted, including another lease
+    /// issued for the same transaction. This permits private table bindings,
+    /// but rejects a delayed table capture/result sharing the caller's epoch.
+    pub(crate) fn prepare_destructive_ddl(
+        &self,
+        txn_id: i64,
+        private_epoch: Option<(&ReadEpoch, usize)>,
+    ) -> crate::core::Result<DestructiveDdlGuard<'_>> {
+        let mut state = self.shared.state.lock();
+        if state.destructive_ddl
+            || !self.shared.accepting.load(Ordering::Acquire)
+            || state
+                .transactions
+                .get(txn_id)
+                .is_none_or(|txn| txn.status() != TxnStatus::Active)
+            || state
+                .transactions
+                .iter()
+                .any(|(id, txn)| id != txn_id && txn.is_active_or_committing())
+        {
+            return Err(crate::core::Error::TableHasActiveTransactions);
+        }
+        let exempt = match private_epoch {
+            Some((epoch, owners))
+                if Arc::ptr_eq(&self.shared, &epoch.lease.registry)
+                    && epoch.has_exact_owners(owners) =>
+            {
+                Some(epoch.lease.id)
+            }
+            Some(_) => return Err(crate::core::Error::TableHasActiveTransactions),
+            None => None,
+        };
+        if state.leases.keys().any(|id| Some(id) != exempt) {
+            return Err(crate::core::Error::TableHasActiveTransactions);
+        }
+        state.advance_logical_generation();
+        state.destructive_ddl = true;
+        Ok(DestructiveDdlGuard {
+            shared: &self.shared,
+        })
+    }
+
     pub fn new() -> Self {
         Self::with_capacity(1024)
     }
@@ -466,17 +699,27 @@ impl TransactionRegistry {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             shared: Arc::new(RegistryShared {
+                namespace: NEXT_REGISTRY_NAMESPACE
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                        next.checked_add(1)
+                    })
+                    .expect("registry namespace exhausted"),
                 state: Mutex::new(RegistryState {
+                    destructive_ddl: false,
+                    logical_generation: 1,
+                    immediate_mutations: 0,
                     transactions: I64Map::with_capacity(capacity),
                     snapshot_seqs: I64Map::new(),
                     begin_exclusions: I64Map::new(),
                     committing: SmallVec::new(),
                     leases: I64Map::new(),
+                    cached_retention_horizon: None,
                     next_registration: 0,
                     next_txn_id: 0,
                     next_sequence: 0,
                     discarded_through: 0,
                 }),
+                ddl_finished: Condvar::new(),
                 global_isolation_level: AtomicU8::new(0),
                 active_txn_count: AtomicUsize::new(0),
                 snapshot_txn_count: AtomicUsize::new(0),
@@ -517,6 +760,7 @@ impl TransactionRegistry {
 
     pub fn set_transaction_isolation_level(&self, txn_id: i64, level: IsolationLevel) {
         let mut state = self.shared.state.lock();
+        self.wait_for_ddl(&mut state);
         if let Some(txn) = state.transactions.get_mut(txn_id) {
             if !txn.is_active_or_committing() {
                 return;
@@ -599,6 +843,7 @@ impl TransactionRegistry {
     pub fn capture_read_epoch(&self) -> ReadEpoch {
         let (data, id) = {
             let mut state = self.shared.state.lock();
+            self.wait_for_ddl(&mut state);
             let data = state.capture_data();
             let id = state.register_lease(&data);
             (data, id)
@@ -617,6 +862,7 @@ impl TransactionRegistry {
     pub fn read_epoch_for_transaction(&self, txn_id: i64) -> Option<ReadEpoch> {
         let (data, id) = {
             let mut state = self.shared.state.lock();
+            self.wait_for_ddl(&mut state);
             let txn = state.transactions.get(txn_id)?;
             if !txn.is_active_or_committing() {
                 return None;
@@ -643,12 +889,14 @@ impl TransactionRegistry {
     pub fn register_build_lease(&self) -> BuildLease {
         let (data, id) = {
             let mut state = self.shared.state.lock();
+            self.wait_for_ddl(&mut state);
             let safe = state.safe_completed_cutoff();
             let cutoff = state
-                .retention_horizon()
+                .refresh_retention_horizon()
                 .map_or(safe, |horizon| safe.min(horizon));
             let data = EpochData {
                 cutoff,
+                cache_generation: 0,
                 excluded: None,
             };
             let id = state.register_lease(&data);
@@ -664,7 +912,49 @@ impl TransactionRegistry {
     }
 
     pub fn oldest_retention_horizon(&self) -> Option<i64> {
-        self.shared.state.lock().retention_horizon()
+        self.refresh_retention_horizon()
+    }
+
+    /// Conservative O(1) floor for publication. Registration lowers the floor
+    /// before becoming observable. Last-obligation release resets it in O(1).
+    /// Continuous overlap may leave a stale low floor until explicit refresh.
+    pub fn cached_retention_horizon(&self) -> Option<i64> {
+        self.shared.state.lock().cached_retention_horizon
+    }
+
+    /// Refresh before pressure-driven history cleanup declares a live reader
+    /// pin. This and normal GC perform the full scan outside row mutation paths.
+    pub fn refresh_retention_horizon(&self) -> Option<i64> {
+        self.shared.state.lock().refresh_retention_horizon()
+    }
+
+    /// Check a bounded candidate prefix under one registry lock. The supplied
+    /// identities belong to one row's newest-to-oldest version chain.
+    pub fn history_retention(
+        &self,
+        creators: &[i64],
+    ) -> crate::storage::mvcc::version_store::HistoryRetention {
+        use crate::storage::mvcc::version_store::HistoryRetention;
+        let state = self.shared.state.lock();
+        let Some(cutoff) = state.cached_retention_horizon else {
+            return HistoryRetention::Unprotected;
+        };
+        let epoch = EpochData {
+            cutoff,
+            cache_generation: 0,
+            excluded: None,
+        };
+        creators
+            .iter()
+            .position(|&id| id == RECOVERY_TRANSACTION_ID || state.visible_at(id, &epoch))
+            .map_or(HistoryRetention::Protected, HistoryRetention::KeepThrough)
+    }
+
+    /// Presence-only check for history-cap decisions. Avoid computing the
+    /// minimum across every registration for each row in a publishing batch.
+    pub fn has_retention_obligations(&self) -> bool {
+        let state = self.shared.state.lock();
+        self.shared.active_txn_count.load(Ordering::Relaxed) != 0 || !state.leases.is_empty()
     }
 
     pub fn is_visible_in_epoch(&self, txn_id: i64, epoch: &ReadEpoch) -> bool {
@@ -683,6 +973,7 @@ impl TransactionRegistry {
 
     fn begin_transaction_inner(&self, isolation: Option<IsolationLevel>) -> (i64, i64) {
         let mut state = self.shared.state.lock();
+        self.wait_for_ddl(&mut state);
         if !self.shared.accepting.load(Ordering::Acquire) {
             return (INVALID_TRANSACTION_ID, 0);
         }
@@ -696,6 +987,11 @@ impl TransactionRegistry {
         let snapshot = isolation.unwrap_or_else(|| self.get_global_isolation_level())
             == IsolationLevel::SnapshotIsolation;
         state.next_txn_id = txn_id;
+        let horizon = data
+            .exclusions()
+            .first()
+            .map_or(begin_seq, |seq| begin_seq.min(seq - 1));
+        state.lower_retention_horizon(horizon);
         state.transactions.insert(
             txn_id,
             TxnState::new_active(begin_seq, snapshot, begin_registration),
@@ -722,6 +1018,7 @@ impl TransactionRegistry {
 
     fn start_commit_after_sequence(&self, txn_id: i64, after_sequence: impl FnOnce()) -> i64 {
         let mut state = self.shared.state.lock();
+        self.wait_for_ddl(&mut state);
         match state.transactions.get(txn_id).map(TxnState::status) {
             Some(TxnStatus::Active) => {}
             Some(TxnStatus::Committing) => {
@@ -731,12 +1028,26 @@ impl TransactionRegistry {
         }
         let commit_seq = state.allocate_sequence();
         after_sequence();
+        let begin_registration = state
+            .transactions
+            .get(txn_id)
+            .unwrap()
+            .active_begin_registration()
+            .expect("validated active transaction");
+        // Grow the bounded in-flight list before overwriting the Active word,
+        // which is still the sole owner of this begin registration. If a spill
+        // allocation unwinds, the transaction remains Active and fully tracked.
+        state.committing.push(CommittingTxn {
+            id: txn_id,
+            commit_seq,
+            begin_registration,
+        });
         state
             .transactions
             .get_mut(txn_id)
             .unwrap()
             .set_committing(commit_seq);
-        state.committing.push((txn_id, commit_seq));
+
         self.shared
             .current_sequence
             .store(commit_seq, Ordering::Release);
@@ -744,6 +1055,7 @@ impl TransactionRegistry {
     }
 
     fn finish_commit_locked(&self, state: &mut RegistryState, txn_id: i64, commit_seq: i64) {
+        state.advance_logical_generation();
         let txn = state.transactions.remove(txn_id).unwrap();
         state.remove_committing(txn_id);
         state.begin_exclusions.remove(txn_id);
@@ -764,11 +1076,13 @@ impl TransactionRegistry {
         // Publish only while holding the state lock; recovery invalidation uses
         // the same lock and cannot race a stale cache insertion.
         self.shared.committed_cache.insert(txn_id);
+        state.reset_retention_if_idle(self.shared.active_txn_count.load(Ordering::Relaxed));
     }
 
     #[inline]
     pub fn complete_commit(&self, txn_id: i64) {
         let mut state = self.shared.state.lock();
+        self.wait_for_ddl(&mut state);
         // Read-only transactions use this API without start_commit.
         let commit_seq = match state.transactions.get(txn_id).map(TxnState::status) {
             Some(TxnStatus::Active) => state.allocate_sequence(),
@@ -783,6 +1097,7 @@ impl TransactionRegistry {
 
     pub fn commit_transaction(&self, txn_id: i64) -> i64 {
         let mut state = self.shared.state.lock();
+        self.wait_for_ddl(&mut state);
         let commit_seq = match state.transactions.get(txn_id).map(TxnState::status) {
             Some(TxnStatus::Active) => state.allocate_sequence(),
             Some(TxnStatus::Committing) => state.transactions.get(txn_id).unwrap().commit_seq(),
@@ -798,6 +1113,7 @@ impl TransactionRegistry {
     #[inline]
     pub fn abort_transaction(&self, txn_id: i64) {
         let mut state = self.shared.state.lock();
+        self.wait_for_ddl(&mut state);
         let registration = state.next_registration;
         if let Some(txn) = state.transactions.get_mut(txn_id) {
             if !txn.is_active_or_committing() {
@@ -818,6 +1134,7 @@ impl TransactionRegistry {
             state.begin_exclusions.remove(txn_id);
             state.remove_committing(txn_id);
             self.shared.active_txn_count.fetch_sub(1, Ordering::Relaxed);
+            state.reset_retention_if_idle(self.shared.active_txn_count.load(Ordering::Relaxed));
         }
     }
 
@@ -846,6 +1163,7 @@ impl TransactionRegistry {
             "invalid recovered transaction: id={txn_id}, sequence={commit_seq}"
         );
         let mut state = self.shared.state.lock();
+        state.advance_logical_generation();
         if let Some(txn) = state.transactions.remove(txn_id) {
             if txn.is_active_or_committing() {
                 self.shared.active_txn_count.fetch_sub(1, Ordering::Relaxed);
@@ -865,6 +1183,7 @@ impl TransactionRegistry {
             .current_sequence
             .store(state.next_sequence, Ordering::Release);
         self.shared.committed_cache.invalidate(txn_id);
+        state.reset_retention_if_idle(self.shared.active_txn_count.load(Ordering::Relaxed));
     }
 
     /// Startup-only recovery. Acknowledgment remains separate until recovery
@@ -872,6 +1191,7 @@ impl TransactionRegistry {
     pub fn recover_aborted_transaction(&self, txn_id: i64) {
         assert!(txn_id > 0, "invalid recovered transaction");
         let mut state = self.shared.state.lock();
+        state.advance_logical_generation();
         if let Some(txn) = state.transactions.insert(txn_id, TxnState::new_aborted()) {
             if txn.is_active_or_committing() {
                 self.shared.active_txn_count.fetch_sub(1, Ordering::Relaxed);
@@ -887,6 +1207,7 @@ impl TransactionRegistry {
         state.snapshot_seqs.remove(txn_id);
         state.next_txn_id = state.next_txn_id.max(txn_id);
         self.shared.committed_cache.invalidate(txn_id);
+        state.reset_retention_if_idle(self.shared.active_txn_count.load(Ordering::Relaxed));
     }
 
     #[inline(always)]
@@ -980,7 +1301,9 @@ impl TransactionRegistry {
 
     fn run_gc_after_horizon(&self, after_horizon: impl FnOnce()) -> usize {
         let mut state = self.shared.state.lock();
-        let horizon = state.retention_horizon().unwrap_or(state.next_sequence);
+        let horizon = state
+            .refresh_retention_horizon()
+            .unwrap_or(state.next_sequence);
         let oldest_registration = state.oldest_registration();
         after_horizon();
         let old_transactions = state.transactions.len();
@@ -1081,6 +1404,7 @@ impl TransactionRegistry {
             txn_id,
             &EpochData {
                 cutoff: cutoff_commit_seq,
+                cache_generation: 0,
                 excluded: None,
             },
         )
@@ -1094,6 +1418,31 @@ impl Default for TransactionRegistry {
 }
 
 impl VisibilityChecker for TransactionRegistry {
+    fn begin_logical_mutation(&self) -> Option<LogicalMutationGuard> {
+        Some(TransactionRegistry::begin_logical_mutation(self))
+    }
+
+    fn capture_current_read_epoch(&self) -> Option<ReadEpoch> {
+        Some(self.capture_read_epoch())
+    }
+
+    fn has_retention_obligations(&self) -> bool {
+        TransactionRegistry::has_retention_obligations(self)
+    }
+
+    fn oldest_retention_horizon(&self) -> Option<i64> {
+        TransactionRegistry::oldest_retention_horizon(self)
+    }
+    fn cached_retention_horizon(&self) -> Option<i64> {
+        TransactionRegistry::cached_retention_horizon(self)
+    }
+    fn history_retention(
+        &self,
+        creators: &[i64],
+    ) -> crate::storage::mvcc::version_store::HistoryRetention {
+        TransactionRegistry::history_retention(self, creators)
+    }
+
     fn is_visible(&self, version_txn_id: i64, viewing_txn_id: i64) -> bool {
         TransactionRegistry::is_visible(self, version_txn_id, viewing_txn_id)
     }
@@ -1114,6 +1463,75 @@ impl VisibilityChecker for TransactionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_retention_floor_lowers_on_registration_and_refreshes_after_overlap() {
+        let registry = TransactionRegistry::new();
+        assert_eq!(registry.cached_retention_horizon(), None);
+        let (older, old_begin) = registry.begin_transaction();
+        let (newer, new_begin) = registry.begin_transaction();
+        assert_eq!(registry.cached_retention_horizon(), Some(old_begin));
+        registry.abort_transaction(older);
+        assert_eq!(registry.cached_retention_horizon(), Some(old_begin));
+        assert_eq!(registry.refresh_retention_horizon(), Some(new_begin));
+        assert_eq!(registry.cached_retention_horizon(), Some(new_begin));
+        registry.start_commit(newer);
+        let epoch = registry.capture_read_epoch();
+        registry.complete_commit(newer);
+        assert!(registry.cached_retention_horizon().unwrap() <= epoch.retention_horizon());
+        assert!(!epoch.is_visible(newer));
+        registry.run_gc();
+        assert_eq!(
+            registry.cached_retention_horizon(),
+            Some(epoch.retention_horizon())
+        );
+        let held = epoch.clone();
+        drop(epoch);
+        assert!(registry.cached_retention_horizon().is_some());
+        drop(held);
+        assert_eq!(registry.cached_retention_horizon(), None);
+        let build = registry.register_build_lease();
+        assert!(registry.cached_retention_horizon().is_some());
+        drop(build);
+        assert_eq!(registry.cached_retention_horizon(), None);
+    }
+
+    #[test]
+    fn cached_retention_floor_resets_for_serial_writers_and_recovery() {
+        let registry = TransactionRegistry::new();
+        for _ in 0..128 {
+            let (txn, begin) = registry.begin_transaction();
+            assert_eq!(registry.cached_retention_horizon(), Some(begin));
+            registry.commit_transaction(txn);
+            assert_eq!(registry.cached_retention_horizon(), None);
+        }
+        let (committed, _) = registry.begin_transaction();
+        let commit_seq = registry.start_commit(committed);
+        registry.recover_committed_transaction(committed, commit_seq);
+        assert_eq!(registry.cached_retention_horizon(), None);
+        let (aborted, _) = registry.begin_transaction();
+        registry.recover_aborted_transaction(aborted);
+        assert_eq!(registry.cached_retention_horizon(), None);
+    }
+
+    #[test]
+    fn retention_presence_tracks_transactions_and_external_leases() {
+        let registry = TransactionRegistry::new();
+        assert!(!registry.has_retention_obligations());
+        let (txn, _) = registry.begin_transaction();
+        assert!(registry.has_retention_obligations());
+        registry.start_commit(txn);
+        assert!(registry.has_retention_obligations());
+        let epoch = registry.capture_read_epoch();
+        registry.abort_transaction(txn);
+        assert!(registry.has_retention_obligations());
+        drop(epoch);
+        assert!(!registry.has_retention_obligations());
+        let build = registry.register_build_lease();
+        assert!(registry.has_retention_obligations());
+        drop(build);
+        assert!(!registry.has_retention_obligations());
+    }
 
     #[test]
     fn test_begin_transaction() {
@@ -2067,5 +2485,369 @@ mod epoch_tests {
         let (txn, sequence) = registry.begin_transaction();
         assert_eq!(txn, 1);
         assert!(sequence > 400);
+    }
+}
+
+#[cfg(test)]
+mod packing_tests {
+    use super::*;
+
+    #[test]
+    fn packing_keeps_active_commit_and_abort_words_disjoint() {
+        assert_eq!(std::mem::size_of::<TxnState>(), 16);
+        #[repr(C)]
+        struct Slot {
+            key: i64,
+            value: std::mem::MaybeUninit<TxnState>,
+        }
+        assert_eq!(std::mem::size_of::<Slot>(), 24);
+        let mut active = TxnState::new_active(SEQ_MASK, true, SEQ_MASK - 1);
+        assert_eq!(active.status(), TxnStatus::Active);
+        assert_eq!(active.begin_seq(), SEQ_MASK);
+        assert_eq!(active.commit_seq(), 0);
+        assert_eq!(active.active_begin_registration(), Some(SEQ_MASK - 1));
+        assert!(active.is_snapshot());
+        active.set_snapshot(false);
+        assert_eq!(active.active_begin_registration(), Some(SEQ_MASK - 1));
+        active.set_snapshot(true);
+        active.set_committing(SEQ_MASK);
+        assert_eq!(active.status(), TxnStatus::Committing);
+        assert_eq!(active.commit_seq(), SEQ_MASK);
+        assert_eq!(active.active_begin_registration(), None);
+        assert!(active.is_snapshot());
+        let mut aborted = TxnState::new_aborted();
+        assert_eq!(aborted.status(), TxnStatus::Aborted);
+        assert_eq!(aborted.commit_seq(), 0);
+        assert_eq!(aborted.active_begin_registration(), None);
+        assert_eq!(aborted.rollback_acknowledgment(), None);
+        aborted.acknowledge_rollback(SEQ_MASK - 1);
+        aborted.acknowledge_rollback(2);
+        assert_eq!(aborted.rollback_acknowledgment(), Some(SEQ_MASK - 1));
+    }
+
+    #[test]
+    fn packing_preserves_begin_registration_through_inflight_spill_and_recovery() {
+        let registry = TransactionRegistry::with_capacity(8);
+        let txns: [(i64, i64); 6] = std::array::from_fn(|_| registry.begin_transaction());
+        let oldest = registry.shared.state.lock().oldest_registration();
+        let mut sequences = [0; 6];
+        for i in 0..4 {
+            sequences[i] = registry.start_commit(txns[i].0);
+        }
+        assert!(!registry.shared.state.lock().committing.spilled());
+        assert_eq!(registry.shared.state.lock().oldest_registration(), oldest);
+        sequences[4] = registry.start_commit(txns[4].0);
+        assert!(registry.shared.state.lock().committing.spilled());
+        sequences[5] = registry.start_commit(txns[5].0);
+        assert_eq!(registry.start_commit(txns[4].0), sequences[4]);
+        assert_eq!(registry.shared.state.lock().committing.len(), 6);
+        assert_eq!(registry.shared.state.lock().oldest_registration(), oldest);
+        let epoch = registry.capture_read_epoch();
+        assert_eq!(epoch.excluded_sequences(), sequences);
+        assert_eq!(registry.safe_snapshot_cutoff(), sequences[0] - 1);
+        registry.recover_aborted_transaction(txns[0].0);
+        assert_eq!(registry.shared.state.lock().committing.len(), 5);
+        registry.acknowledge_rollback(txns[0].0);
+        registry.recover_committed_transaction(txns[1].0, sequences[1]);
+        assert_eq!(registry.shared.state.lock().committing.len(), 4);
+        for (id, _) in &txns[2..] {
+            registry.complete_commit(*id);
+        }
+        assert!(registry.shared.state.lock().committing.is_empty());
+        assert_eq!(registry.active_count(), 0);
+        for (id, _) in txns {
+            assert!(!epoch.is_visible(id));
+        }
+    }
+
+    #[test]
+    fn packing_committing_old_begin_still_pins_acknowledged_abort() {
+        let registry = TransactionRegistry::new();
+        let (old_reader, _) = registry.begin_transaction();
+        let oldest = registry.shared.state.lock().oldest_registration();
+        let (victim, _) = registry.begin_transaction();
+        registry.start_commit(victim);
+        registry.abort_transaction(victim);
+        registry.acknowledge_rollback(victim);
+        // Its later commit sequence cannot replace its earlier registration.
+        registry.start_commit(old_reader);
+        assert_eq!(registry.shared.state.lock().oldest_registration(), oldest);
+        registry.run_gc();
+        assert!(!registry.is_committed(victim));
+        registry.complete_commit(old_reader);
+        registry.run_gc();
+        assert!(!registry
+            .shared
+            .state
+            .lock()
+            .transactions
+            .contains_key(victim));
+    }
+
+    #[test]
+    fn packing_prepublication_unwind_keeps_active_registration() {
+        let registry = TransactionRegistry::new();
+        let (txn, _) = registry.begin_transaction();
+        let oldest = registry.shared.state.lock().oldest_registration();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.start_commit_after_sequence(txn, || panic!("before publication"));
+        }));
+        assert!(result.is_err());
+        let state = registry.shared.state.lock();
+        assert_eq!(
+            state.transactions.get(txn).unwrap().status(),
+            TxnStatus::Active
+        );
+        assert_eq!(state.transactions.get(txn).unwrap().commit_seq(), 0);
+        assert_eq!(state.oldest_registration(), oldest);
+        assert!(state.committing.is_empty());
+        drop(state);
+        assert!(registry.start_commit(txn) > 0);
+        registry.complete_commit(txn);
+    }
+}
+
+#[cfg(test)]
+mod destructive_ddl_tests {
+    use super::*;
+    use std::sync::{mpsc, Barrier};
+    use std::time::Duration;
+
+    #[test]
+    fn ddl_rejects_other_transaction_and_delayed_read_or_build_capture() {
+        let registry = TransactionRegistry::new();
+        let (older, _) =
+            registry.begin_transaction_with_isolation(IsolationLevel::SnapshotIsolation);
+        let (owner, _) = registry.begin_transaction();
+        assert!(registry.prepare_destructive_ddl(owner, None).is_err());
+        registry.abort_transaction(older);
+        let read = registry.capture_read_epoch();
+        assert!(registry.prepare_destructive_ddl(owner, None).is_err());
+        drop(read);
+        let build = registry.register_build_lease();
+        assert!(registry.prepare_destructive_ddl(owner, None).is_err());
+        drop(build);
+        assert!(registry.prepare_destructive_ddl(owner, None).is_ok());
+    }
+
+    #[test]
+    fn ddl_private_epoch_exemption_rejects_external_alias_and_foreign_registry() {
+        let registry = TransactionRegistry::new();
+        let (owner, _) = registry.begin_transaction();
+        let epoch = registry.read_epoch_for_transaction(owner).unwrap();
+        let external = epoch.clone();
+        assert!(registry
+            .prepare_destructive_ddl(owner, Some((&epoch, 1)))
+            .is_err());
+        drop(external);
+        let guard = registry
+            .prepare_destructive_ddl(owner, Some((&epoch, 1)))
+            .unwrap();
+        assert!(
+            registry.shared.state.try_lock().is_some(),
+            "WAL runs without the lifecycle mutex"
+        );
+        drop(guard);
+        let foreign = TransactionRegistry::new().capture_read_epoch();
+        assert!(registry
+            .prepare_destructive_ddl(owner, Some((&foreign, 1)))
+            .is_err());
+    }
+
+    #[test]
+    fn ddl_blocks_all_new_registration_and_isolation_paths_until_apply_finishes() {
+        let registry = Arc::new(TransactionRegistry::new());
+        let (owner, _) = registry.begin_transaction();
+        let guard = registry.prepare_destructive_ddl(owner, None).unwrap();
+        let (done, rx) = mpsc::channel();
+        let start = Arc::new(Barrier::new(5));
+        let mut threads = Vec::new();
+        for mode in 0..4 {
+            let registry = registry.clone();
+            let done = done.clone();
+            let start = start.clone();
+            threads.push(std::thread::spawn(move || {
+                start.wait();
+                match mode {
+                    0 => {
+                        let _ = registry.begin_transaction();
+                    }
+                    1 => {
+                        let _ = registry.capture_read_epoch();
+                    }
+                    2 => {
+                        let _ = registry.register_build_lease();
+                    }
+                    _ => registry
+                        .set_transaction_isolation_level(owner, IsolationLevel::SnapshotIsolation),
+                }
+                done.send(mode).unwrap();
+            }));
+        }
+        start.wait();
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        assert!(registry.shared.state.try_lock().is_some());
+        drop(guard);
+        for _ in 0..4 {
+            rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn ddl_error_or_unwind_reopens_registration() {
+        let registry = TransactionRegistry::new();
+        let (owner, _) = registry.begin_transaction();
+        let result: crate::core::Result<()> = (|| {
+            let _guard = registry.prepare_destructive_ddl(owner, None)?;
+            Err(crate::core::Error::internal("injected WAL failure"))
+        })();
+        assert!(result.is_err());
+        assert!(!registry.shared.state.lock().destructive_ddl);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.prepare_destructive_ddl(owner, None).unwrap();
+            panic!("injected preparation panic");
+        }));
+        assert!(panic.is_err());
+        assert!(!registry.shared.state.lock().destructive_ddl);
+        let lease = registry.read_epoch_for_transaction(owner).unwrap();
+        assert!(lease.cutoff() > 0);
+    }
+}
+
+#[cfg(test)]
+mod cache_provenance_tests {
+    use super::*;
+
+    #[test]
+    fn ordinary_reads_reuse_proof_but_every_visible_outcome_changes_it() {
+        let registry = TransactionRegistry::new();
+        let first = registry.capture_read_epoch();
+        let proof = registry.cache_provenance(&first).unwrap();
+        for _ in 0..3 {
+            let (reader, _) = registry.begin_transaction();
+            registry.abort_transaction(reader);
+            registry.acknowledge_rollback(reader);
+            let next = registry.capture_read_epoch();
+            assert_eq!(registry.cache_provenance(&next), Some(proof));
+        }
+        let (early, _) = registry.begin_transaction();
+        let (late, _) = registry.begin_transaction();
+        let early_seq = registry.start_commit(early);
+        let late_seq = registry.start_commit(late);
+        let excluded = registry.capture_read_epoch();
+        assert_eq!(excluded.excluded_sequences(), [early_seq, late_seq]);
+        assert_eq!(registry.cache_provenance(&excluded), Some(proof));
+        registry.complete_commit(late);
+        let after_late = registry.capture_read_epoch();
+        let late_proof = registry.cache_provenance(&after_late).unwrap();
+        assert_ne!(late_proof, proof);
+        assert!(registry.cache_provenance(&excluded).is_none());
+        registry.complete_commit(early);
+        let after_both = registry.capture_read_epoch();
+        assert_ne!(registry.cache_provenance(&after_both), Some(late_proof));
+        assert!(!after_late.is_visible(early));
+        assert!(after_both.is_visible(early));
+        assert!(registry.cache_provenance(&first).is_none());
+        let (direct, _) = registry.begin_transaction();
+        registry.complete_commit(direct); // Public direct Active -> committed path.
+        assert!(registry.cache_provenance(&after_both).is_none());
+    }
+
+    #[test]
+    fn historical_foreign_and_in_mutation_views_never_gain_fresh_proof() {
+        let registry = TransactionRegistry::new();
+        let other = TransactionRegistry::new();
+        let foreign = other.capture_read_epoch();
+        assert!(registry.cache_provenance(&foreign).is_none());
+        let (snapshot, _) =
+            registry.begin_transaction_with_isolation(IsolationLevel::SnapshotIsolation);
+        let historical = registry.read_epoch_for_transaction(snapshot).unwrap();
+        assert!(registry.cache_provenance(&historical).is_none());
+        let before = registry.capture_read_epoch();
+        let outer = registry.begin_logical_mutation();
+        let during = registry.capture_read_epoch();
+        assert!(registry.cache_provenance(&before).is_none());
+        assert!(registry.cache_provenance(&during).is_none());
+        {
+            let _inner = registry.begin_logical_mutation();
+        }
+        assert!(registry
+            .cache_provenance(&registry.capture_read_epoch())
+            .is_none());
+        drop(outer);
+        assert!(registry.cache_provenance(&during).is_none());
+        assert!(registry.cache_provenance(&historical).is_none());
+        assert!(registry
+            .cache_provenance(&registry.capture_read_epoch())
+            .is_some());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.begin_logical_mutation();
+            panic!("failed immediate operation");
+        }));
+        assert!(result.is_err());
+        assert_eq!(registry.shared.state.lock().immediate_mutations, 0);
+        registry.abort_transaction(snapshot);
+    }
+
+    #[test]
+    fn failed_publication_guard_covers_abort_through_undo_acknowledgment() {
+        let registry = TransactionRegistry::new();
+        let (writer, _) = registry.begin_transaction();
+        registry.start_commit(writer);
+        let before_abort = registry.capture_read_epoch();
+        assert!(registry.cache_provenance(&before_abort).is_some());
+        let undo = registry.begin_logical_mutation();
+        registry.abort_transaction(writer);
+        let after_abort_before_undo = registry.capture_read_epoch();
+        assert!(after_abort_before_undo.excluded_sequences().is_empty());
+        assert!(registry
+            .cache_provenance(&after_abort_before_undo)
+            .is_none());
+        registry.acknowledge_rollback(writer);
+        drop(undo);
+        assert!(registry
+            .cache_provenance(&after_abort_before_undo)
+            .is_none());
+        assert!(registry.cache_provenance(&before_abort).is_none());
+        assert!(registry
+            .cache_provenance(&registry.capture_read_epoch())
+            .is_some());
+    }
+
+    #[test]
+    fn cached_scalar_does_not_keep_a_read_registration_alive() {
+        let registry = TransactionRegistry::new();
+        let epoch = registry.capture_read_epoch();
+        let proof = registry.cache_provenance(&epoch).unwrap();
+        let cache = crate::executor::semantic_cache::SemanticCache::new();
+        cache.insert_with_provenance("t", vec!["id".into()], Vec::new(), None, proof);
+        drop(epoch);
+        let (owner, _) = registry.begin_transaction();
+        assert!(registry.prepare_destructive_ddl(owner, None).is_ok());
+        drop(cache);
+        registry.abort_transaction(owner);
+    }
+
+    #[test]
+    fn proof_exhaustion_disables_reuse_without_failing_commit_or_wrapping() {
+        let registry = TransactionRegistry::new();
+        registry.shared.state.lock().logical_generation = u64::MAX;
+        let before = registry.capture_read_epoch();
+        assert!(registry.cache_provenance(&before).is_some());
+        let (writer, _) = registry.begin_transaction();
+        registry.start_commit(writer);
+        registry.complete_commit(writer);
+        assert!(registry.is_committed(writer));
+        assert_eq!(registry.shared.state.lock().logical_generation, 0);
+        assert!(registry.cache_provenance(&before).is_none());
+        for _ in 0..3 {
+            drop(registry.begin_logical_mutation());
+            assert!(registry
+                .cache_provenance(&registry.capture_read_epoch())
+                .is_none());
+        }
     }
 }

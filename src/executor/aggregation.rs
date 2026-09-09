@@ -6855,6 +6855,7 @@ impl Executor {
     pub(crate) fn try_fast_count_distinct_compiled(
         &self,
         stmt: &SelectStatement,
+        ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Caller (try_compiled_fast_paths) guarantees no explicit transaction
@@ -6875,7 +6876,7 @@ impl Executor {
                 CompiledExecution::CountDistinct(cd) => {
                     // Fast path: validate epoch and execute directly
                     if self.engine.schema_epoch() == cd.cached_epoch {
-                        return Some(self.execute_compiled_count_distinct(cd));
+                        return Some(self.execute_compiled_count_distinct(cd, ctx));
                     }
                     // Schema changed - fall through to recompile
                 }
@@ -6886,17 +6887,18 @@ impl Executor {
         }
 
         // First execution or schema changed - compile and cache (write lock)
-        self.compile_and_execute_count_distinct(stmt, compiled)
+        self.compile_and_execute_count_distinct(stmt, ctx, compiled)
     }
 
     /// Execute using pre-compiled COUNT(DISTINCT col) info
     fn execute_compiled_count_distinct(
         &self,
         cd: &CompiledCountDistinct,
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         // Get table and count distinct values directly
         let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(&cd.table_name)?;
+        let table = ctx.get_table(tx.as_ref(), &cd.table_name)?;
 
         let count = table
             .get_partition_count(&cd.column_name)?
@@ -6919,6 +6921,7 @@ impl Executor {
     fn compile_and_execute_count_distinct(
         &self,
         stmt: &SelectStatement,
+        ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         use crate::common::SmartString;
@@ -6936,7 +6939,7 @@ impl Executor {
             }
             CompiledExecution::CountDistinct(cd) => {
                 if self.engine.schema_epoch() == cd.cached_epoch {
-                    return Some(self.execute_compiled_count_distinct(cd));
+                    return Some(self.execute_compiled_count_distinct(cd, ctx));
                 }
                 // Schema changed, continue to recompile
             }
@@ -7066,7 +7069,7 @@ impl Executor {
             }
         };
 
-        let table = match tx.get_table(&table_name) {
+        let table = match ctx.get_table(tx.as_ref(), &table_name) {
             Ok(t) => t,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
@@ -7126,6 +7129,7 @@ impl Executor {
     pub(crate) fn try_fast_count_star_compiled(
         &self,
         stmt: &SelectStatement,
+        ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         // Caller (try_compiled_fast_paths) guarantees no explicit transaction
@@ -7146,7 +7150,7 @@ impl Executor {
                 CompiledExecution::CountStar(cs) => {
                     // Fast path: validate epoch and execute directly
                     if self.engine.schema_epoch() == cs.cached_epoch {
-                        return Some(self.execute_compiled_count_star(cs));
+                        return Some(self.execute_compiled_count_star(cs, ctx));
                     }
                     // Schema changed - fall through to recompile
                 }
@@ -7157,17 +7161,18 @@ impl Executor {
         }
 
         // First execution or schema changed - compile and cache (write lock)
-        self.compile_and_execute_count_star(stmt, compiled)
+        self.compile_and_execute_count_star(stmt, ctx, compiled)
     }
 
     /// Execute using pre-compiled COUNT(*) info
     fn execute_compiled_count_star(
         &self,
         cs: &crate::executor::query_cache::CompiledCountStar,
+        ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
         // Get table and count rows directly
         let tx = self.engine.begin_transaction()?;
-        let table = tx.get_table(&cs.table_name)?;
+        let table = ctx.get_table(tx.as_ref(), &cs.table_name)?;
 
         let count = table.row_count()?;
 
@@ -7188,6 +7193,7 @@ impl Executor {
     fn compile_and_execute_count_star(
         &self,
         stmt: &SelectStatement,
+        ctx: &ExecutionContext,
         compiled: &RwLock<CompiledExecution>,
     ) -> Option<Result<Box<dyn QueryResult>>> {
         use crate::common::SmartString;
@@ -7206,7 +7212,7 @@ impl Executor {
             }
             CompiledExecution::CountStar(cs) => {
                 if self.engine.schema_epoch() == cs.cached_epoch {
-                    return Some(self.execute_compiled_count_star(cs));
+                    return Some(self.execute_compiled_count_star(cs, ctx));
                 }
                 // Schema changed, continue to recompile
             }
@@ -7378,7 +7384,7 @@ impl Executor {
             }
         };
 
-        let table = match tx.get_table(&table_name) {
+        let table = match ctx.get_table(tx.as_ref(), &table_name) {
             Ok(t) => t,
             Err(_) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());

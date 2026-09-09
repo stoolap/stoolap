@@ -242,6 +242,38 @@ impl fmt::Display for ScanPlan {
 /// }
 /// ```
 pub trait Table: Send + Sync {
+    fn begin_logical_mutation(
+        &self,
+    ) -> Option<crate::storage::mvcc::registry::LogicalMutationGuard> {
+        None
+    }
+
+    /// Bind reads to one statement epoch. MVCC implementations retain the
+    /// lease and capture their immutable view before performing any reads.
+    /// Rebinding the same lease preserves the already captured view.
+    fn set_read_epoch(&mut self, _epoch: crate::storage::mvcc::registry::ReadEpoch) -> Result<()> {
+        Ok(())
+    }
+
+    /// Clone only the owned hot root while a two-layer capture fence is held.
+    fn capture_hot_root(&self) -> Option<crate::storage::mvcc::version_store::CapturedHotRoot> {
+        None
+    }
+
+    /// Install the jointly captured hot root after releasing that fence.
+    fn replace_hot_root(
+        &mut self,
+        _root: crate::storage::mvcc::version_store::CapturedHotRoot,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn captured_hot_view(
+        &self,
+    ) -> Option<std::sync::Arc<crate::storage::mvcc::version_store::CapturedHotView>> {
+        None
+    }
+
     /// Returns the name of the table
     fn name(&self) -> &str;
 
@@ -418,6 +450,18 @@ pub trait Table: Send + Sync {
         Ok(())
     }
 
+    /// Resolve hot authority for a write target without freezing/copying the
+    /// entire own-write overlay. Deleted rows also suppress cold fallback.
+    fn captured_mutation_has_hot_authority(&self, _row_id: i64) -> Option<bool> {
+        None
+    }
+
+    /// Validate a cold baseline after acquiring its row claim. A later hot
+    /// publication must not turn an old cold snapshot into a lost update.
+    fn validate_cold_mutation(&self, _row_id: i64) -> Result<()> {
+        Ok(())
+    }
+
     /// Deletes rows matching the given expression
     ///
     /// # Arguments
@@ -432,6 +476,19 @@ pub trait Table: Send + Sync {
     /// Default implementation falls back to delete(None).
     fn truncate(&mut self) -> Result<i32> {
         self.delete(None)
+    }
+
+    /// Internal layering hook for physical TRUNCATE. The outer segmented
+    /// wrapper lends its private epoch value exclusively for the admission
+    /// proof; implementations that cannot coordinate both layers fail closed.
+    #[doc(hidden)]
+    fn truncate_with_outer_epoch(
+        &mut self,
+        _outer_epoch: &mut Option<crate::storage::mvcc::registry::ReadEpoch>,
+    ) -> Result<i32> {
+        Err(crate::core::Error::internal(
+            "table cannot coordinate physical TRUNCATE",
+        ))
     }
 
     /// Scans the table and returns a scanner over matching rows

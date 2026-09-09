@@ -38,6 +38,94 @@ use crate::core::{Result, Value};
 
 use super::writer::FrozenVolume;
 
+type GenerationCache = Arc<parking_lot::Mutex<Option<Arc<ColdGeneration>>>>;
+
+/// Every mutation invalidates the cached generation while still owning the
+/// source write lock. Readers validate revisions with all source locks held.
+struct GenerationSource<T> {
+    value: RwLock<T>,
+    revision: std::sync::atomic::AtomicU64,
+    cache: GenerationCache,
+}
+
+impl<T> GenerationSource<T> {
+    fn new(value: T, cache: &GenerationCache) -> Self {
+        Self {
+            value: RwLock::new(value),
+            revision: std::sync::atomic::AtomicU64::new(0),
+            cache: cache.clone(),
+        }
+    }
+    fn read(&self) -> parking_lot::RwLockReadGuard<'_, T> {
+        self.value.read()
+    }
+    fn write(&self) -> GenerationWriteGuard<'_, T> {
+        let guard = self.value.write();
+        // The cache is not a reader. Drop its aliases before exposing mutable
+        // access so Arc::make_mut only copies for actual captured readers.
+        let retired = self.cache.lock().take();
+        drop(retired);
+        GenerationWriteGuard {
+            guard: Some(guard),
+            source: self,
+        }
+    }
+    fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// A write guard that retires cached read metadata before publishing its change.
+pub struct GenerationWriteGuard<'a, T> {
+    guard: Option<parking_lot::RwLockWriteGuard<'a, T>>,
+    source: &'a GenerationSource<T>,
+}
+
+impl<T> std::ops::Deref for GenerationWriteGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        self.guard.as_ref().unwrap()
+    }
+}
+impl<T> std::ops::DerefMut for GenerationWriteGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.guard.as_mut().unwrap()
+    }
+}
+impl<T> Drop for GenerationWriteGuard<'_, T> {
+    fn drop(&mut self) {
+        self.source
+            .revision
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        drop(self.guard.take());
+    }
+}
+
+/// Immutable cold authority and file handles for one captured table view.
+/// Preparing this descriptor never reloads columns. An absent manifest member
+/// is an error; a reader never switches to a newer manager generation.
+pub struct ColdGeneration {
+    pub(crate) segment_ids_newest_first: Vec<u64>,
+    pub(crate) segments: Arc<FxHashMap<u64, ColdSegment>>,
+    pub(crate) tombstones: Arc<FxHashMap<i64, u64>>,
+    revisions: [u64; 3],
+}
+
+impl ColdGeneration {
+    /// Load only the selected captured file, outside the transfer fence.
+    pub(crate) fn load_segment(&self, id: u64) -> Result<ColdSegment> {
+        let segment = self.segments.get(&id).ok_or_else(|| {
+            crate::core::Error::internal(format!("captured generation has no segment {id}"))
+        })?;
+        if !segment.volume.is_cold() {
+            return Ok(segment.clone());
+        }
+        let mut loaded = segment.clone();
+        loaded.volume = Arc::new(segment.volume.reload_from_backing()?);
+        Ok(loaded)
+    }
+}
+
 /// A cold segment: immutable volume + pre-computed column mapping.
 /// The mapping is computed once at registration (seal/compaction/load) and
 /// recomputed on ALTER TABLE. No per-scan computation, no lock contention.
@@ -611,15 +699,18 @@ pub struct SegmentManager {
     /// Table name.
     table_name: SmartString,
     /// The manifest (source of truth for segment state).
-    manifest: RwLock<TableManifest>,
+    manifest: GenerationSource<TableManifest>,
     /// Loaded segments with pre-computed column mappings, keyed by segment_id.
     /// CoW via Arc: readers clone the Arc (O(1) atomic increment, ~5ns),
     /// writers clone the inner map, modify, and swap the Arc.
     /// The ColumnMapping is computed once at registration and recomputed on ALTER TABLE.
     /// This eliminates per-scan compute_column_mapping overhead and lock contention.
-    segments: RwLock<Arc<FxHashMap<u64, ColdSegment>>>,
+    segments: GenerationSource<Arc<FxHashMap<u64, ColdSegment>>>,
     /// Base directory for volume files (None for memory-only databases).
     volume_dir: Option<PathBuf>,
+    /// Engine-owned identity authority, independent of current manifest membership.
+    file_catalog: Arc<super::io::VolumeRetirementQueue>,
+    truncate_retirements: parking_lot::Mutex<Option<Box<super::io::PreparedRetirement>>>,
     /// Fast atomic flag: true if any segments are loaded.
     has_segments_flag: std::sync::atomic::AtomicBool,
     /// Current eviction epoch. Updated by evict_idle_volumes.
@@ -635,7 +726,8 @@ pub struct SegmentManager {
     /// membership, not mutate. Writers swap the Arc on mutation.
     /// The commit_seq enables snapshot isolation: a snapshot at begin_seq=N
     /// only sees tombstones with commit_seq <= N.
-    tombstones: RwLock<Arc<FxHashMap<i64, u64>>>,
+    tombstones: GenerationSource<Arc<FxHashMap<i64, u64>>>,
+    generation_cache: GenerationCache,
     /// Per-transaction pending tombstones: txn_id → list of cold row_ids to tombstone.
     /// Applied to the shared tombstone set on commit, discarded on rollback.
     /// This lives on the SegmentManager (not SegmentedTable) because the commit
@@ -675,19 +767,120 @@ pub struct SegmentManager {
     seal_overlap_count: std::sync::atomic::AtomicUsize,
 }
 
+/// Prepared allocations and exact old ownership for one physical truncate.
+/// The namespace and registry admission reservations keep these sources stable.
+pub(crate) struct PreparedColdTruncate {
+    pub(crate) old_segments: Arc<FxHashMap<u64, ColdSegment>>,
+    empty_segments: Arc<FxHashMap<u64, ColdSegment>>,
+    empty_tombstones: Arc<FxHashMap<i64, u64>>,
+    retired_cache: Option<Arc<ColdGeneration>>,
+}
+
+pub(crate) struct RetiredColdTruncate {
+    _segments: Arc<FxHashMap<u64, ColdSegment>>,
+    _tombstones: Arc<FxHashMap<i64, u64>>,
+    _manifest_segments: Vec<SegmentMeta>,
+    _manifest_tombstones: Vec<(i64, u64)>,
+    _cache: Option<Arc<ColdGeneration>>,
+    _transaction_generations: FxHashMap<i64, u64>,
+}
+
 impl SegmentManager {
+    fn prepare_cold_generation(&self) -> Result<Arc<ColdGeneration>> {
+        if let Some(generation) = self.generation_cache.lock().clone() {
+            return Ok(generation);
+        }
+        // This metadata preparation happens before the transfer fence. No
+        // column access, path reopen or decompression is allowed here.
+        let manifest = self.manifest.read();
+        let segments = self.segments.read();
+        let tombstones = self.tombstones.read();
+        let mut cache = self.generation_cache.lock();
+        if let Some(generation) = cache.as_ref() {
+            return Ok(generation.clone());
+        }
+        let mut ids = Vec::with_capacity(manifest.segments.len());
+        for meta in manifest.segments.iter().rev() {
+            if !segments.contains_key(&meta.segment_id) {
+                return Err(crate::core::Error::internal(format!(
+                    "table '{}': manifest segment {} has no captured backing",
+                    self.table_name, meta.segment_id,
+                )));
+            }
+            ids.push(meta.segment_id);
+        }
+        let generation = Arc::new(ColdGeneration {
+            segment_ids_newest_first: ids,
+            segments: segments.clone(),
+            tombstones: tombstones.clone(),
+            revisions: [
+                self.manifest.revision(),
+                self.segments.revision(),
+                self.tombstones.revision(),
+            ],
+        });
+        *cache = Some(generation.clone());
+        Ok(generation)
+    }
+
+    /// Capture hot authority and cold identity in one brief transfer-fence hold.
+    /// The callback must only clone an already-owned hot root: no I/O, filtering,
+    /// allocation or budget wait may happen inside this callback.
+    pub(crate) fn capture_with_hot<T>(
+        &self,
+        mut capture_hot: impl FnMut() -> T,
+    ) -> Result<(T, Arc<ColdGeneration>)> {
+        for _attempt in 0..3 {
+            let generation = self.prepare_cold_generation()?;
+            let _fence = self.acquire_seal_write();
+            let manifest = self.manifest.read();
+            let segments = self.segments.read();
+            let tombstones = self.tombstones.read();
+            if generation.revisions
+                != [
+                    self.manifest.revision(),
+                    self.segments.revision(),
+                    self.tombstones.revision(),
+                ]
+            {
+                continue;
+            }
+            drop((manifest, segments, tombstones));
+            return Ok((capture_hot(), generation));
+        }
+        Err(crate::core::Error::internal(
+            "retryable read conflict: cold generation changed during three capture attempts",
+        ))
+    }
+
     /// Create a new segment manager for a table.
     pub fn new(table_name: &str, volume_dir: Option<PathBuf>) -> Self {
+        Self::new_with_file_catalog(
+            table_name,
+            volume_dir,
+            Arc::new(super::io::VolumeRetirementQueue::default()),
+        )
+    }
+
+    pub(crate) fn new_with_file_catalog(
+        table_name: &str,
+        volume_dir: Option<PathBuf>,
+        file_catalog: Arc<super::io::VolumeRetirementQueue>,
+    ) -> Self {
+        let generation_cache = Arc::new(parking_lot::Mutex::new(None));
         Self {
             table_name: SmartString::from(table_name),
-            manifest: RwLock::new(TableManifest::new(table_name)),
-            segments: RwLock::new(Arc::new(FxHashMap::default())),
+            manifest: GenerationSource::new(TableManifest::new(table_name), &generation_cache),
+            segments: GenerationSource::new(Arc::new(FxHashMap::default()), &generation_cache),
             volume_dir,
+            file_catalog,
+            truncate_retirements: parking_lot::Mutex::new(None),
             has_segments_flag: std::sync::atomic::AtomicBool::new(false),
             has_cold: std::sync::atomic::AtomicBool::new(false),
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
-            tombstones: RwLock::new(Arc::new(FxHashMap::default())),
+            tombstones: GenerationSource::new(Arc::new(FxHashMap::default()), &generation_cache),
+            generation_cache,
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             pending_tombstone_undo: RwLock::new(FxHashMap::default()),
             published_tombstone_undo: RwLock::new(FxHashMap::default()),
@@ -702,18 +895,34 @@ impl SegmentManager {
 
     /// Create from an existing manifest loaded from disk.
     pub fn from_manifest(manifest: TableManifest, volume_dir: Option<PathBuf>) -> Self {
+        Self::from_manifest_with_file_catalog(
+            manifest,
+            volume_dir,
+            Arc::new(super::io::VolumeRetirementQueue::default()),
+        )
+    }
+
+    fn from_manifest_with_file_catalog(
+        manifest: TableManifest,
+        volume_dir: Option<PathBuf>,
+        file_catalog: Arc<super::io::VolumeRetirementQueue>,
+    ) -> Self {
+        let generation_cache = Arc::new(parking_lot::Mutex::new(None));
         let table_name = manifest.table_name.clone();
         let tombstone_map: FxHashMap<i64, u64> = manifest.tombstones.iter().copied().collect();
         Self {
             table_name,
-            manifest: RwLock::new(manifest),
-            segments: RwLock::new(Arc::new(FxHashMap::default())),
+            manifest: GenerationSource::new(manifest, &generation_cache),
+            segments: GenerationSource::new(Arc::new(FxHashMap::default()), &generation_cache),
             volume_dir,
+            file_catalog,
+            truncate_retirements: parking_lot::Mutex::new(None),
             has_segments_flag: std::sync::atomic::AtomicBool::new(false),
             has_cold: std::sync::atomic::AtomicBool::new(false),
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
-            tombstones: RwLock::new(Arc::new(tombstone_map)),
+            tombstones: GenerationSource::new(Arc::new(tombstone_map), &generation_cache),
+            generation_cache,
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             pending_tombstone_undo: RwLock::new(FxHashMap::default()),
             published_tombstone_undo: RwLock::new(FxHashMap::default()),
@@ -1478,16 +1687,17 @@ impl SegmentManager {
     /// Reload cold volumes (metadata-only, in segments map) from disk.
     /// Replaces them in-place with full deferred volumes.
     fn reload_cold_volumes(&self, ids: Vec<u64>) {
-        let vol_dir = match &self.volume_dir {
-            Some(d) => d,
-            None => return,
-        };
         let mut reloaded = Vec::new();
         let mut failed = Vec::new();
         for &id in &ids {
-            let filename = format!("vol_{:016x}.vol", id);
-            let full_path = vol_dir.join(self.table_name.as_str()).join(filename);
-            match crate::storage::volume::io::read_volume_from_disk(&full_path) {
+            let source = {
+                let segments = self.segments.read();
+                segments.get(&id).map(|segment| segment.volume.clone())
+            };
+            let Some(source) = source else {
+                continue;
+            };
+            match source.reload_from_backing() {
                 Ok(volume) => {
                     reloaded.push((id, Arc::new(volume)));
                 }
@@ -1510,10 +1720,6 @@ impl SegmentManager {
         let mut new_map = (**segments).clone();
         for (id, volume) in reloaded {
             if let Some(cs) = new_map.get_mut(&id) {
-                if !cs.volume.unique_indices.read().is_empty() {
-                    *volume.unique_indices.write() =
-                        std::mem::take(&mut *cs.volume.unique_indices.write());
-                }
                 volume.mark_accessed();
                 cs.volume = volume;
             }
@@ -1572,6 +1778,9 @@ impl SegmentManager {
         meta: SegmentMeta,
         schema: Option<&crate::core::Schema>,
     ) {
+        if let Some(backing) = volume.backing.get() {
+            self.file_catalog.track(backing);
+        }
         // Both manifest and segments must be updated atomically under write locks.
         // The bitmap computation runs inside the critical section — this is safe
         // because the segments write lock only blocks other writers (readers clone
@@ -1643,6 +1852,9 @@ impl SegmentManager {
         drop(manifest);
 
         if let Some(schema_version) = seg_schema_version {
+            if let Some(backing) = volume.backing.get() {
+                self.file_catalog.track(backing);
+            }
             let cold = ColdSegment {
                 mapping: super::writer::ColumnMapping {
                     sources: (0..volume.columns.len())
@@ -1799,7 +2011,7 @@ impl SegmentManager {
     }
 
     /// Get write access to the tombstone map (for seal cleanup).
-    pub fn tombstones_write(&self) -> parking_lot::RwLockWriteGuard<'_, Arc<FxHashMap<i64, u64>>> {
+    pub fn tombstones_write(&self) -> GenerationWriteGuard<'_, Arc<FxHashMap<i64, u64>>> {
         self.tombstones.write()
     }
 
@@ -2270,15 +2482,17 @@ impl SegmentManager {
     /// a later INSERT within the same txn cannot hide an earlier seal.
     #[inline]
     pub fn record_txn_seal_generation(&self, txn_id: i64) {
-        let gen = self.seal_generation();
+        self.record_txn_seal_generation_at(txn_id, self.seal_generation());
+    }
+
+    /// Remember the generation captured before statement staging. Recording a
+    /// later current generation could hide a seal that raced with that staging.
+    #[inline]
+    pub fn record_txn_seal_generation_at(&self, txn_id: i64, generation: u64) {
         let mut map = self.txn_seal_gens.lock();
         map.entry(txn_id)
-            .and_modify(|existing| {
-                if gen < *existing {
-                    *existing = gen;
-                }
-            })
-            .or_insert(gen);
+            .and_modify(|existing| *existing = (*existing).min(generation))
+            .or_insert(generation);
     }
 
     /// Get the seal generation recorded for a transaction.
@@ -2421,6 +2635,61 @@ impl SegmentManager {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// All node/list storage was prepared before WAL. Eligibility remains
+    /// blocked until this manager persists an image omitting the exact old IDs.
+    pub(crate) fn park_truncate_retirement(&self, mut batch: Box<super::io::PreparedRetirement>) {
+        let mut pending = self.truncate_retirements.lock();
+        batch.next = pending.take();
+        *pending = Some(batch);
+    }
+
+    /// Relocate even batches whose old files are not yet eligible for deletion.
+    /// Lock order matches durable promotion: parked batches, then file catalog.
+    /// No manifest or transfer-fence guard is held during filesystem operations.
+    pub(crate) fn rename_volume_directory(
+        &self,
+        old: &Path,
+        new: &Path,
+        current: &[Arc<FrozenVolume>],
+    ) -> std::io::Result<()> {
+        let mut pending = self.truncate_retirements.lock();
+        let mut batch = pending.as_ref();
+        let mut replacements = Vec::new();
+        while let Some(current) = batch {
+            replacements.push(current.prepare_relocation(old, new));
+            batch = current.next.as_ref();
+        }
+        self.file_catalog.rename_directory(old, new, current)?;
+        let mut batch = pending.as_mut();
+        for replacement in replacements {
+            let current = batch.expect("parked retirement list remains locked");
+            current.apply_relocation(replacement);
+            batch = current.next.as_mut();
+        }
+        Ok(())
+    }
+
+    fn release_truncate_retirements(&self, durable: &TableManifest) {
+        let mut pending = self.truncate_retirements.lock();
+        let mut next = pending.take();
+        let mut blocked = None;
+        while let Some(mut batch) = next {
+            next = batch.next.take();
+            if batch.omitted_segment_ids.iter().all(|id| {
+                !durable
+                    .segments
+                    .iter()
+                    .any(|segment| segment.segment_id == *id)
+            }) {
+                self.file_catalog.commit_retirement(batch);
+            } else {
+                batch.next = blocked;
+                blocked = Some(batch);
+            }
+        }
+        *pending = blocked;
+    }
+
     /// Persist the manifest to disk (includes tombstones).
     pub fn persist(&self) -> Result<()> {
         self.persist_manifest_only()
@@ -2429,6 +2698,7 @@ impl SegmentManager {
     /// Persist only the manifest.
     pub fn persist_manifest_only(&self) -> Result<()> {
         let Some(ref vol_dir) = self.volume_dir else {
+            self.release_truncate_retirements(&self.manifest.read());
             return Ok(());
         };
 
@@ -2439,7 +2709,9 @@ impl SegmentManager {
         })?;
 
         let manifest_path = table_dir.join("manifest.bin");
-        self.manifest.read().write_to_disk(&manifest_path)?;
+        let image = self.manifest.read();
+        image.write_to_disk(&manifest_path)?;
+        self.release_truncate_retirements(&image);
 
         Ok(())
     }
@@ -2456,6 +2728,18 @@ impl SegmentManager {
 
     /// Load manifest from disk.
     pub fn load_from_disk(table_name: &str, volume_dir: &Path) -> Result<Option<Self>> {
+        Self::load_from_disk_with_file_catalog(
+            table_name,
+            volume_dir,
+            Arc::new(super::io::VolumeRetirementQueue::default()),
+        )
+    }
+
+    pub(crate) fn load_from_disk_with_file_catalog(
+        table_name: &str,
+        volume_dir: &Path,
+        file_catalog: Arc<super::io::VolumeRetirementQueue>,
+    ) -> Result<Option<Self>> {
         let table_dir = volume_dir.join(table_name);
         let manifest_path = table_dir.join("manifest.bin");
 
@@ -2464,9 +2748,76 @@ impl SegmentManager {
         }
 
         let manifest = TableManifest::read_from_disk(&manifest_path)?;
-        let manager = Self::from_manifest(manifest, Some(volume_dir.to_path_buf()));
+        let manager = Self::from_manifest_with_file_catalog(
+            manifest,
+            Some(volume_dir.to_path_buf()),
+            file_catalog,
+        );
 
         Ok(Some(manager))
+    }
+
+    /// No column decoding or filesystem IO. All missing-manifest and pending
+    /// mutation errors are reported before the truncate WAL is written.
+    pub(crate) fn prepare_truncate(&self) -> Result<PreparedColdTruncate> {
+        if self
+            .pending_txn_tombstones
+            .read()
+            .values()
+            .any(|rows| !rows.is_empty())
+            || !self.pending_tombstone_undo.read().is_empty()
+            || !self.published_tombstone_undo.read().is_empty()
+        {
+            return Err(crate::core::Error::TableHasActiveTransactions);
+        }
+        let old_segments = Arc::clone(&*self.segments.read());
+        for segment in &self.manifest.read().segments {
+            if !old_segments.contains_key(&segment.segment_id) {
+                return Err(crate::core::Error::internal(
+                    "TRUNCATE manifest segment is not loaded",
+                ));
+            }
+        }
+        Ok(PreparedColdTruncate {
+            old_segments,
+            empty_segments: Arc::new(FxHashMap::default()),
+            empty_tombstones: Arc::new(FxHashMap::default()),
+            retired_cache: self.generation_cache.lock().take(),
+        })
+    }
+
+    /// Call only after WAL success while the transfer fence is held. No
+    /// allocation, budget admission, storage reads, or ownership destruction.
+    pub(crate) fn apply_truncate(&self, prepared: PreparedColdTruncate) -> RetiredColdTruncate {
+        let (manifest_segments, manifest_tombstones) = {
+            let mut manifest = self.manifest.write();
+            (
+                std::mem::take(&mut manifest.segments),
+                std::mem::take(&mut manifest.tombstones),
+            )
+        };
+        let segments = std::mem::replace(&mut *self.segments.write(), prepared.empty_segments);
+        let tombstones =
+            std::mem::replace(&mut *self.tombstones.write(), prepared.empty_tombstones);
+        let transaction_generations = std::mem::take(&mut *self.txn_seal_gens.lock());
+        self.cached_deduped_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.has_segments_flag
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.has_cold
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.seal_overlap_count
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.seal_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        RetiredColdTruncate {
+            _segments: segments,
+            _tombstones: tombstones,
+            _manifest_segments: manifest_segments,
+            _manifest_tombstones: manifest_tombstones,
+            _cache: prepared.retired_cache,
+            _transaction_generations: transaction_generations,
+        }
     }
 
     /// Remove all segments and tombstones (for DROP TABLE / TRUNCATE).
@@ -2532,6 +2883,9 @@ impl SegmentManager {
         new_meta: SegmentMeta,
         old_segment_ids: &[u64],
     ) {
+        if let Some(backing) = new_volume.backing.get() {
+            self.file_catalog.track(backing);
+        }
         // Atomic: manifest + segments updated under both write locks.
         // Bitmap computation runs inside — safe because writers are serialized.
         {
@@ -2587,6 +2941,11 @@ impl SegmentManager {
         new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
         old_segment_ids: &[u64],
     ) {
+        for (_, volume, _) in &new_volumes {
+            if let Some(backing) = volume.backing.get() {
+                self.file_catalog.track(backing);
+            }
+        }
         if new_volumes.is_empty() {
             self.replace_segments_atomic_remove_only(old_segment_ids);
             return;
@@ -2741,7 +3100,7 @@ impl SegmentManager {
         // Serialize reloads — prevents concurrent stampede on the same volume.
         // Second thread re-checks the fast path after acquiring the guard.
         let _guard = self.reloading.lock();
-        {
+        let source = {
             let segs = self.segments.read();
             match segs.get(&seg_id) {
                 None => return Ok(None),
@@ -2749,32 +3108,15 @@ impl SegmentManager {
                     cs.volume.mark_accessed();
                     return Ok(Some(Arc::clone(&cs.volume)));
                 }
-                Some(_) => {}
-            }
-        }
-        let vol_dir = self
-            .volume_dir
-            .as_ref()
-            .ok_or_else(|| crate::core::Error::Internal {
-                message: format!(
-                    "table '{}': cold segment {} has no volume directory to reload from",
-                    self.table_name, seg_id
-                ),
-            })?;
-        let filename = format!("vol_{:016x}.vol", seg_id);
-        let full_path = vol_dir.join(self.table_name.as_str()).join(filename);
-        let volume = match crate::storage::volume::io::read_volume_from_disk(&full_path) {
-            Ok(v) => Arc::new(v),
-            Err(e) => {
-                return Err(crate::core::Error::Internal {
-                    message: format!(
-                        "table '{}': failed to reload cold volume seg={}: {}; \
-                         refusing to serve partial data",
-                        self.table_name, seg_id, e
-                    ),
-                });
+                Some(cs) => cs.volume.clone(),
             }
         };
+        let volume = Arc::new(source.reload_from_backing().map_err(|error| {
+            crate::core::Error::internal(format!(
+                "table '{}': failed to reload cold volume seg={}: {}; refusing to serve partial data",
+                self.table_name, seg_id, error
+            ))
+        })?);
         volume.mark_accessed();
         let mut segments = self.segments.write();
         let mut new_map = (**segments).clone();
@@ -2784,9 +3126,6 @@ impl SegmentManager {
             None => return Ok(None),
             Some(cs) => cs,
         };
-        if !cs.volume.unique_indices.read().is_empty() {
-            *volume.unique_indices.write() = std::mem::take(&mut *cs.volume.unique_indices.write());
-        }
         cs.volume = Arc::clone(&volume);
         let still_cold = new_map.values().any(|cs| cs.volume.is_cold());
         *segments = Arc::new(new_map);
@@ -2798,7 +3137,7 @@ impl SegmentManager {
     }
 
     /// Get the manifest for writing (e.g., to allocate segment IDs).
-    pub fn manifest_mut(&self) -> parking_lot::RwLockWriteGuard<'_, TableManifest> {
+    pub fn manifest_mut(&self) -> GenerationWriteGuard<'_, TableManifest> {
         self.manifest.write()
     }
 
@@ -2897,6 +3236,246 @@ fn read_i64(data: &[u8], pos: &mut usize) -> std::io::Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn idle_generation_cache_does_not_force_tombstone_cow() {
+        let manager = SegmentManager::new("idle_cache", None);
+        manager.add_tombstones(&[1], 1);
+        let pointer = Arc::as_ptr(&*manager.tombstones.read());
+        for sequence in 2..=8 {
+            let (_, generation) = manager.capture_with_hot(|| ()).unwrap();
+            drop(generation);
+            manager.add_tombstones(&[1], sequence);
+            assert_eq!(
+                Arc::as_ptr(&*manager.tombstones.read()),
+                pointer,
+                "an idle metadata cache is not a live snapshot reader"
+            );
+        }
+        let (_, active) = manager.capture_with_hot(|| ()).unwrap();
+        manager.add_tombstones(&[1], 9);
+        assert_ne!(Arc::as_ptr(&*manager.tombstones.read()), pointer);
+        assert_eq!(active.tombstones.get(&1), Some(&8));
+    }
+
+    #[test]
+    fn cold_generation_captures_without_loading_and_retires_stale_cache_owners() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+        let schema = SchemaBuilder::new("generation")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = super::super::writer::VolumeBuilder::new(&schema);
+        builder.add_row(1, &Row::from_values(vec![Value::Integer(42)]));
+        let volume = builder.finish();
+        let dir = tempfile::tempdir().unwrap();
+        let path =
+            super::super::io::write_volume_to_disk(dir.path(), "generation", 1, &volume).unwrap();
+        let manager = SegmentManager::new("generation", Some(dir.path().to_path_buf()));
+        manager.register_segment(
+            1,
+            Arc::new(volume.to_cold()),
+            SegmentMeta {
+                segment_id: 1,
+                file_path: path.clone(),
+                row_count: 1,
+                min_row_id: 1,
+                max_row_id: 1,
+                creation_lsn: 1,
+                seal_seq: 0,
+                schema_version: 0,
+            },
+            Some(&schema),
+        );
+        let (hot_marker, captured) = manager
+            .capture_with_hot(|| {
+                assert!(manager.seal_fence.try_read().is_none());
+                7
+            })
+            .unwrap();
+        assert_eq!(hot_marker, 7);
+        assert!(manager.seal_fence.try_write().is_some());
+        assert!(captured.segments[&1].volume.is_cold());
+        assert_eq!(captured.segment_ids_newest_first, vec![1]);
+        let (_, same) = manager.capture_with_hot(|| ()).unwrap();
+        assert!(Arc::ptr_eq(&captured, &same));
+        drop(same);
+        let old = Arc::downgrade(&captured);
+        manager.add_tombstones(&[1], 9);
+        let (_, newer) = manager.capture_with_hot(|| ()).unwrap();
+        assert!(!Arc::ptr_eq(&captured, &newer));
+        assert!(captured.tombstones.is_empty());
+        assert_eq!(newer.tombstones.get(&1), Some(&9));
+
+        // Durable compaction retires the file, but captured readers retain it.
+        let retirements = super::super::io::VolumeRetirementQueue::default();
+        manager.replace_segments_atomic_remove_only(&[1]);
+        retirements.retire(captured.segments[&1].volume.backing.get().unwrap());
+        retirements.sweep();
+        assert!(path.exists());
+        let loaded = captured.load_segment(1).unwrap();
+        assert_eq!(loaded.volume.get_row(0).unwrap()[0], Value::Integer(42));
+        drop(captured);
+        assert!(
+            old.upgrade().is_none(),
+            "the manager cache must not retain retired generations"
+        );
+        drop((loaded, newer, volume));
+        assert!(path.exists(), "final-owner Drop performs no filesystem I/O");
+        retirements.sweep();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cold_generation_rejects_missing_members_and_missing_backings() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+        let schema = SchemaBuilder::new("missing")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = super::super::writer::VolumeBuilder::new(&schema);
+        builder.add_row(1, &Row::from_values(vec![Value::Integer(1)]));
+        let manager = SegmentManager::new("missing", None);
+        let meta = SegmentMeta {
+            segment_id: 1,
+            file_path: PathBuf::from("missing.vol"),
+            row_count: 1,
+            min_row_id: 1,
+            max_row_id: 1,
+            creation_lsn: 0,
+            seal_seq: 0,
+            schema_version: 0,
+        };
+        manager.manifest_mut().add_segment(meta.clone());
+        assert!(manager.capture_with_hot(|| ()).is_err());
+        manager.register_segment(1, Arc::new(builder.finish().to_cold()), meta, Some(&schema));
+        let (_, generation) = manager.capture_with_hot(|| ()).unwrap();
+        assert!(generation.load_segment(1).is_err());
+    }
+
+    #[test]
+    fn failed_manifest_publication_keeps_old_identity_in_rename_catalog() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+        let directory = tempfile::tempdir().unwrap();
+        let schema = SchemaBuilder::new("before")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = super::super::writer::VolumeBuilder::new(&schema);
+        builder.add_row(1, &Row::from_values(vec![Value::Integer(42)]));
+        let volume = builder.finish();
+        let path =
+            super::super::io::write_volume_to_disk(directory.path(), "before", 1, &volume).unwrap();
+        let catalog = Arc::new(super::super::io::VolumeRetirementQueue::default());
+        let manager = SegmentManager::new_with_file_catalog(
+            "before",
+            Some(directory.path().to_path_buf()),
+            catalog.clone(),
+        );
+        manager.register_segment(
+            1,
+            Arc::new(volume.to_cold()),
+            SegmentMeta {
+                segment_id: 1,
+                file_path: path,
+                row_count: 1,
+                min_row_id: 1,
+                max_row_id: 1,
+                creation_lsn: 1,
+                seal_seq: 0,
+                schema_version: 0,
+            },
+            Some(&schema),
+        );
+        manager.persist_manifest_only().unwrap();
+        let (_, captured) = manager.capture_with_hot(|| ()).unwrap();
+        drop(volume);
+        manager.replace_segments_atomic_remove_only(&[1]);
+        std::fs::create_dir(directory.path().join("before/manifest.manifest.tmp")).unwrap();
+        assert!(manager.persist_manifest_only().is_err());
+        assert!(manager.segments_raw().is_empty());
+        // The old identity is neither current nor eligible for deletion.
+        catalog
+            .rename_directory(
+                &directory.path().join("before"),
+                &directory.path().join("after"),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            captured.load_segment(1).unwrap().volume.get_row(0).unwrap()[0],
+            Value::Integer(42)
+        );
+        drop(captured);
+        catalog.sweep();
+        assert!(directory
+            .path()
+            .join("after/vol_0000000000000001.vol")
+            .exists());
+    }
+
+    #[test]
+    fn both_manager_reload_paths_preserve_the_captured_identity_and_metadata() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+        for bulk in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let schema = SchemaBuilder::new("reload")
+                .column("before", DataType::Integer, false, true)
+                .build();
+            let mut builder = super::super::writer::VolumeBuilder::new(&schema);
+            builder.add_row(1, &Row::from_values(vec![Value::Integer(42)]));
+            let mut volume = builder.finish();
+            let path =
+                super::super::io::write_volume_to_disk(directory.path(), "reload", 1, &volume)
+                    .unwrap();
+            volume.merge_column_rename("after", "before");
+            volume.prebuild_unique_index(&[0]).unwrap();
+            let manager = SegmentManager::new("reload", Some(directory.path().to_path_buf()));
+            manager.register_segment(
+                1,
+                Arc::new(volume.to_cold()),
+                SegmentMeta {
+                    segment_id: 1,
+                    file_path: path.clone(),
+                    row_count: 1,
+                    min_row_id: 1,
+                    max_row_id: 1,
+                    creation_lsn: 1,
+                    seal_seq: 0,
+                    schema_version: 0,
+                },
+                Some(&schema),
+            );
+            let (_, captured) = manager.capture_with_hot(|| ()).unwrap();
+            let loaded = if bulk {
+                manager.reload_cold_volumes(vec![1]);
+                manager.segments_raw()[&1].volume.clone()
+            } else {
+                manager.ensure_volume(1).unwrap().unwrap()
+            };
+            assert!(!loaded.is_cold());
+            assert!(Arc::ptr_eq(
+                volume.backing.get().unwrap(),
+                loaded.backing.get().unwrap()
+            ));
+            assert!(Arc::ptr_eq(&volume.meta, &loaded.meta));
+            assert!(Arc::ptr_eq(&volume.unique_indices, &loaded.unique_indices));
+            assert_eq!(loaded.column_index("after"), Some(0));
+            let retirements = super::super::io::VolumeRetirementQueue::default();
+            retirements.retire(loaded.backing.get().unwrap());
+            manager.clear();
+            drop((loaded, volume));
+            retirements.sweep();
+            assert!(
+                path.exists(),
+                "the earlier generation still owns the same identity"
+            );
+            assert_eq!(
+                captured.load_segment(1).unwrap().volume.get_row(0).unwrap()[0],
+                Value::Integer(42)
+            );
+            drop(captured);
+            retirements.sweep();
+            assert!(!path.exists());
+        }
+    }
 
     #[test]
     fn test_manifest_new() {

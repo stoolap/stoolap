@@ -24,6 +24,147 @@ use rustc_hash::{FxHashMap, FxHasher};
 
 use super::expression::RowFilter;
 
+/// Retains the statement lease while the underlying lazy result can read.
+/// The inner result is declared first so captured views are destroyed before
+/// the registry may reclaim their transaction metadata.
+pub(crate) struct EpochResult {
+    inner: Option<Box<dyn QueryResult>>,
+    _epoch: Option<crate::storage::mvcc::registry::ReadEpoch>,
+    columns: Option<CompactArc<Vec<String>>>,
+    affected: i64,
+    insert_id: i64,
+    estimated: Option<usize>,
+    pending_error: Option<crate::core::Error>,
+}
+
+impl EpochResult {
+    pub(crate) fn new(
+        inner: Box<dyn QueryResult>,
+        epoch: crate::storage::mvcc::registry::ReadEpoch,
+    ) -> Self {
+        // Retain pure metadata, not the result's captured readers. Most result
+        // implementations already share this Arc. Plain names are copied once
+        // here so exhaustion/close never needs a replacement allocation.
+        let columns = inner.columns_arc().or_else(|| {
+            (!inner.columns().is_empty()).then(|| CompactArc::new(inner.columns().to_vec()))
+        });
+        Self {
+            inner: Some(inner),
+            _epoch: Some(epoch),
+            columns,
+            affected: 0,
+            insert_id: 0,
+            estimated: None,
+            pending_error: None,
+        }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        let Some(mut inner) = self.inner.take() else {
+            return Ok(());
+        };
+        self.affected = inner.rows_affected();
+        self.insert_id = inner.last_insert_id();
+        self.estimated = inner.estimated_count();
+        if self.pending_error.is_none() {
+            self.pending_error = inner.last_error();
+        }
+        let closed = inner.close();
+        if self.pending_error.is_none() {
+            if let Err(error) = &closed {
+                self.pending_error = Some(error.clone());
+            }
+        }
+        // Even a failed/default no-op close must not keep captured roots or
+        // inner epoch owners alive. Release the outer lease after those owners.
+        drop(inner);
+        self._epoch = None;
+        closed
+    }
+}
+
+impl QueryResult for EpochResult {
+    fn columns(&self) -> &[String] {
+        self.columns
+            .as_ref()
+            .map_or(EMPTY_COLUMNS, |columns| columns.as_slice())
+    }
+    fn columns_arc(&self) -> Option<CompactArc<Vec<String>>> {
+        self.columns.clone()
+    }
+    fn next(&mut self) -> bool {
+        let Some(inner) = &mut self.inner else {
+            return false;
+        };
+        if inner.next() {
+            return true;
+        }
+        let _ = self.finish();
+        false
+    }
+    fn scan(&self, dest: &mut [Value]) -> Result<()> {
+        self.inner
+            .as_ref()
+            .ok_or_else(|| crate::core::Error::internal("result is closed"))?
+            .scan(dest)
+    }
+    fn row(&self) -> &Row {
+        match &self.inner {
+            Some(inner) => inner.row(),
+            None => get_empty_row(),
+        }
+    }
+    fn take_row(&mut self) -> Row {
+        self.inner
+            .as_mut()
+            .map_or_else(Row::new, |inner| inner.take_row())
+    }
+    fn close(&mut self) -> Result<()> {
+        self.finish()
+    }
+    fn rows_affected(&self) -> i64 {
+        self.inner
+            .as_ref()
+            .map_or(self.affected, |inner| inner.rows_affected())
+    }
+    fn last_insert_id(&self) -> i64 {
+        self.inner
+            .as_ref()
+            .map_or(self.insert_id, |inner| inner.last_insert_id())
+    }
+    fn try_into_arc_rows(&mut self) -> Option<CompactArc<Vec<Row>>> {
+        let rows = self.inner.as_mut()?.try_into_arc_rows()?;
+        if self.finish().is_err() || self.pending_error.is_some() {
+            return None;
+        }
+        Some(rows)
+    }
+    fn estimated_count(&self) -> Option<usize> {
+        self.inner
+            .as_ref()
+            .map_or(self.estimated, |inner| inner.estimated_count())
+    }
+    fn exact_len(&self) -> Option<usize> {
+        self.inner
+            .as_ref()
+            .map_or(Some(0), |inner| inner.exact_len())
+    }
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        if self.pending_error.is_none() {
+            if let Some(inner) = &mut self.inner {
+                self.pending_error = inner.last_error();
+                if self.pending_error.is_some() {
+                    let _ = self.finish();
+                }
+            }
+        }
+        self.pending_error.take()
+    }
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
+        Box::new(AliasedResult::new(self, aliases))
+    }
+}
+
 /// Execution result for DML operations (INSERT, UPDATE, DELETE)
 ///
 /// This result type tracks the number of rows affected and the last insert ID
@@ -2171,6 +2312,295 @@ impl QueryResult for ColumnarResult {
 mod tests {
     use super::*;
     use crate::core::row_vec::RowVec;
+
+    struct EpochOwnerResult {
+        registry: std::sync::Arc<crate::storage::mvcc::TransactionRegistry>,
+        _epoch: Option<crate::storage::mvcc::registry::ReadEpoch>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        columns: CompactArc<Vec<String>>,
+        rows: Option<CompactArc<Vec<Row>>>,
+        remaining: usize,
+        estimate: usize,
+        runtime_error: Option<crate::core::Error>,
+        fail_close: bool,
+    }
+    impl Drop for EpochOwnerResult {
+        fn drop(&mut self) {
+            assert!(
+                self.registry.has_retention_obligations(),
+                "the outer epoch must outlive destruction of captured owners"
+            );
+            self.dropped
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    impl QueryResult for EpochOwnerResult {
+        fn columns(&self) -> &[String] {
+            &self.columns
+        }
+        fn columns_arc(&self) -> Option<CompactArc<Vec<String>>> {
+            Some(self.columns.clone())
+        }
+        fn next(&mut self) -> bool {
+            if self.remaining == 0 {
+                false
+            } else {
+                self.remaining -= 1;
+                true
+            }
+        }
+        fn scan(&self, _: &mut [Value]) -> Result<()> {
+            Ok(())
+        }
+        fn row(&self) -> &Row {
+            get_empty_row()
+        }
+        fn close(&mut self) -> Result<()> {
+            if self.fail_close {
+                Err(crate::core::Error::internal("close failure"))
+            } else {
+                Ok(())
+            }
+        }
+        fn rows_affected(&self) -> i64 {
+            7
+        }
+        fn last_insert_id(&self) -> i64 {
+            9
+        }
+        fn estimated_count(&self) -> Option<usize> {
+            Some(self.estimate)
+        }
+        fn exact_len(&self) -> Option<usize> {
+            Some(self.remaining)
+        }
+        fn last_error(&mut self) -> Option<crate::core::Error> {
+            if self.remaining == 0 {
+                self.runtime_error.take()
+            } else {
+                None
+            }
+        }
+        fn try_into_arc_rows(&mut self) -> Option<CompactArc<Vec<Row>>> {
+            self.rows.take()
+        }
+        fn with_aliases(
+            self: Box<Self>,
+            aliases: FxHashMap<String, String>,
+        ) -> Box<dyn QueryResult> {
+            Box::new(AliasedResult::new(self, aliases))
+        }
+    }
+
+    #[test]
+    fn epoch_result_releases_owners_on_every_terminal_path_and_keeps_metadata() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        for inner_owns_epoch in [false, true] {
+            for terminal in [
+                "exhaust",
+                "runtime_error",
+                "error_poll",
+                "close",
+                "close_error",
+                "extract",
+                "drop",
+            ] {
+                let registry = Arc::new(crate::storage::mvcc::TransactionRegistry::new());
+                let epoch = registry.capture_read_epoch();
+                let dropped = Arc::new(AtomicUsize::new(0));
+                let columns = CompactArc::new(vec!["x".to_string()]);
+                let inner = Box::new(EpochOwnerResult {
+                    registry: registry.clone(),
+                    _epoch: inner_owns_epoch.then(|| epoch.clone()),
+                    dropped: dropped.clone(),
+                    columns: columns.clone(),
+                    rows: (terminal == "extract")
+                        .then(|| CompactArc::new(vec![Row::from(vec![Value::Integer(1)])])),
+                    remaining: 1,
+                    estimate: 3,
+                    runtime_error: matches!(terminal, "runtime_error" | "error_poll")
+                        .then(|| crate::core::Error::internal("read failure")),
+                    fail_close: matches!(terminal, "close_error" | "runtime_error" | "error_poll"),
+                });
+                let mut result = Box::new(EpochResult::new(inner, epoch));
+                assert!(registry.has_retention_obligations());
+                assert!(CompactArc::ptr_eq(&result.columns_arc().unwrap(), &columns));
+                match terminal {
+                    "exhaust" | "runtime_error" => {
+                        assert!(result.next());
+                        assert!(!result.next());
+                    }
+                    "error_poll" => {
+                        assert!(result.next());
+                        assert!(result
+                            .last_error()
+                            .unwrap()
+                            .to_string()
+                            .contains("read failure"));
+                    }
+                    "close" => result.close().unwrap(),
+                    "close_error" => assert!(result
+                        .close()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("close failure")),
+                    "extract" => {
+                        assert_eq!(result.try_into_arc_rows().unwrap()[0][0], Value::Integer(1))
+                    }
+                    "drop" => {
+                        drop(result);
+                        assert_eq!(registry.oldest_retention_horizon(), None);
+                        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+                        continue;
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    registry.oldest_retention_horizon(),
+                    None,
+                    "{terminal}, inner={inner_owns_epoch}"
+                );
+                assert_eq!(dropped.load(Ordering::Relaxed), 1);
+                assert_eq!(result.columns(), &["x"]);
+                assert_eq!(result.rows_affected(), 7);
+                assert_eq!(result.last_insert_id(), 9);
+                assert_eq!(result.estimated_count(), Some(3));
+                assert_eq!(result.exact_len(), Some(0));
+                assert!(!result.next());
+                if terminal == "runtime_error" {
+                    assert!(
+                        result
+                            .last_error()
+                            .unwrap()
+                            .to_string()
+                            .contains("read failure"),
+                        "an inner close error cannot replace the original read error"
+                    );
+                } else if terminal == "close_error" {
+                    assert!(result
+                        .last_error()
+                        .unwrap()
+                        .to_string()
+                        .contains("close failure"));
+                } else {
+                    assert!(result.last_error().is_none());
+                }
+                result.close().unwrap();
+                let mut aliases = FxHashMap::default();
+                aliases.insert("renamed".to_string(), "x".to_string());
+                let mut aliased = result.with_aliases(aliases);
+                assert_eq!(aliased.columns(), &["renamed"]);
+                assert_eq!(aliased.rows_affected(), 7);
+                assert_eq!(aliased.last_insert_id(), 9);
+                assert!(!aliased.next());
+                assert!(aliased.last_error().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn epoch_result_empty_metadata_needs_no_shared_allocation() {
+        let registry = crate::storage::mvcc::TransactionRegistry::new();
+        let mut result = EpochResult::new(
+            Box::new(ExecResult::new(5, 11)),
+            registry.capture_read_epoch(),
+        );
+        assert!(result.columns.is_none());
+        assert!(!result.next());
+        assert_eq!(result.rows_affected(), 5);
+        assert_eq!(result.last_insert_id(), 11);
+        assert_eq!(registry.oldest_retention_horizon(), None);
+    }
+
+    #[test]
+    fn epoch_result_row_extraction_never_returns_success_after_an_error() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        for runtime_error in [false, true] {
+            let registry = Arc::new(crate::storage::mvcc::TransactionRegistry::new());
+            let epoch = registry.capture_read_epoch();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let inner = Box::new(EpochOwnerResult {
+                registry: registry.clone(),
+                _epoch: Some(epoch.clone()),
+                dropped: dropped.clone(),
+                columns: CompactArc::new(vec!["x".to_string()]),
+                rows: Some(CompactArc::new(vec![Row::from(vec![Value::Integer(1)])])),
+                remaining: 0,
+                estimate: 3,
+                runtime_error: runtime_error.then(|| crate::core::Error::internal("read failure")),
+                fail_close: true,
+            });
+            let mut result = EpochResult::new(inner, epoch);
+            assert!(result.try_into_arc_rows().is_none());
+            assert_eq!(dropped.load(Ordering::Relaxed), 1);
+            assert_eq!(registry.oldest_retention_horizon(), None);
+            assert!(!result.next());
+            let error = result.last_error().unwrap().to_string();
+            assert!(error.contains(if runtime_error {
+                "read failure"
+            } else {
+                "close failure"
+            }));
+            assert!(result.try_into_arc_rows().is_none());
+        }
+    }
+
+    #[test]
+    fn epoch_result_plain_columns_and_active_alias_survive_exhaustion() {
+        let registry = crate::storage::mvcc::TransactionRegistry::new();
+        let inner = crate::storage::traits::MemoryResult::with_rows(
+            vec!["x".to_string()],
+            vec![Row::from(vec![Value::Integer(1)])],
+        );
+        let result = Box::new(EpochResult::new(
+            Box::new(inner),
+            registry.capture_read_epoch(),
+        ));
+        assert!(result.columns_arc().is_some());
+        let mut aliases = FxHashMap::default();
+        aliases.insert("renamed".to_string(), "x".to_string());
+        let mut result = result.with_aliases(aliases);
+        assert!(result.next());
+        assert!(!result.next());
+        assert_eq!(registry.oldest_retention_horizon(), None);
+        assert_eq!(result.columns(), &["renamed"]);
+        result.close().unwrap();
+    }
+
+    #[test]
+    fn epoch_result_failed_extraction_checks_error_before_large_fallback_allocation() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let registry = Arc::new(crate::storage::mvcc::TransactionRegistry::new());
+        let epoch = registry.capture_read_epoch();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let inner = Box::new(EpochOwnerResult {
+            registry: registry.clone(),
+            _epoch: Some(epoch.clone()),
+            dropped: dropped.clone(),
+            columns: CompactArc::new(vec!["x".to_string()]),
+            rows: Some(CompactArc::new(vec![Row::from(vec![Value::Integer(1)])])),
+            remaining: 0,
+            estimate: usize::MAX,
+            runtime_error: None,
+            fail_close: true,
+        });
+        let result = Box::new(EpochResult::new(inner, epoch));
+        // Vec<Row>::with_capacity(usize::MAX) would deterministically panic
+        // with capacity overflow. The original close error must win instead.
+        let error = crate::executor::Executor::materialize_result_arc(result).unwrap_err();
+        assert!(error.to_string().contains("close failure"));
+        assert_eq!(dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(registry.oldest_retention_horizon(), None);
+    }
 
     /// Helper to create RowVec from Vec<Row> for tests
     fn make_rows(rows: Vec<Row>) -> RowVec {

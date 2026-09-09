@@ -36,6 +36,7 @@
 //!
 
 pub mod arena;
+mod captured_scanner;
 pub mod engine;
 pub mod file_lock;
 pub mod persistence;

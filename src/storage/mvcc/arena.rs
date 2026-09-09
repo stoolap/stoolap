@@ -411,6 +411,19 @@ impl RowArena {
         self.bytes.store(0, Ordering::Relaxed);
     }
 
+    /// Detach ownership without dropping row payloads inside a transfer fence.
+    /// The caller drops the returned vectors after publication unlocks.
+    pub(crate) fn take_all_for_truncate(&self) -> (ArenaInner, Vec<usize>) {
+        let mut inner = self.inner.write();
+        let retired = ArenaInner {
+            data: std::mem::take(&mut inner.data),
+            meta: std::mem::take(&mut inner.meta),
+        };
+        let free = std::mem::take(&mut *self.free_list.lock());
+        self.bytes.store(0, Ordering::Relaxed);
+        (retired, free)
+    }
+
     /// Get the number of rows (including deleted)
     #[inline]
     pub fn len(&self) -> usize {

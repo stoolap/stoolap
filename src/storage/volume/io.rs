@@ -19,13 +19,373 @@
 //! corruption from crashes during writes.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use crate::core::Result;
 
 use super::column::ROW_GROUP_SIZE;
 use super::format::{deserialize_volume_metadata, serialize_volume_metadata};
 use super::writer::{CompressedBlockStore, FrozenVolume, LazyColumns};
+
+/// Immutable identity plus a managed location, with no idle file descriptor.
+/// Residency transitions share this allocation. Only managed directory renames
+/// may change its location; every open still validates the captured identity.
+pub(crate) struct VolumeFile {
+    path: parking_lot::RwLock<PathBuf>,
+    identity: FileIdentity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct FileIdentity {
+    device: u64,
+    #[cfg(not(windows))]
+    file: u64,
+    #[cfg(windows)]
+    file: [u8; 16],
+    length: u64,
+}
+
+impl FileIdentity {
+    fn capture(file: &std::fs::File) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = file.metadata()?;
+            Ok(Self {
+                device: metadata.dev(),
+                file: metadata.ino(),
+                length: metadata.len(),
+            })
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FileIdInfo, GetFileInformationByHandleEx, FILE_ID_INFO,
+            };
+            let mut information = FILE_ID_INFO::default();
+            // SAFETY: File owns a valid live handle, and information points to
+            // writable, correctly aligned storage of exactly the advertised
+            // size for FileIdInfo. The synchronous API does not retain it.
+            let success = unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle(),
+                    FileIdInfo,
+                    (&mut information as *mut FILE_ID_INFO).cast(),
+                    std::mem::size_of::<FILE_ID_INFO>() as u32,
+                )
+            };
+            if success == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // ReFS needs the full 128-bit ID. Unsupported/unknown IDs must
+            // never collapse distinct files onto the same fallback identity.
+            let file_id = information.FileId.Identifier;
+            if file_id == [0; 16] || file_id == [u8::MAX; 16] {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "filesystem did not provide a stable volume file identity",
+                ));
+            }
+            Ok(Self {
+                device: information.VolumeSerialNumber,
+                file: file_id,
+                length: file.metadata()?.len(),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = file;
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "persistent volumes require stable file identities on this platform",
+            ))
+        }
+    }
+}
+
+impl VolumeFile {
+    fn from_file(path: &Path, file: &std::fs::File) -> std::io::Result<Arc<Self>> {
+        Ok(Arc::new(Self {
+            path: parking_lot::RwLock::new(path.to_path_buf()),
+            identity: FileIdentity::capture(file)?,
+        }))
+    }
+
+    fn open_reader(self: &Arc<Self>) -> std::io::Result<VolumeReadLease> {
+        // A managed rename holds the write guard through rename + path update.
+        // The active file handle then remains valid independently of the path.
+        let path = self.path.read();
+        let file = std::fs::File::open(&*path)?;
+        if FileIdentity::capture(&file)? != self.identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "captured volume file identity changed",
+            ));
+        }
+        Ok(VolumeReadLease {
+            file,
+            backing: self.clone(),
+        })
+    }
+}
+
+/// One decoder owns one open handle. Its backing owner also prevents a
+/// retirement sweep from unlinking the file until this read has completed.
+struct VolumeReadLease {
+    file: std::fs::File,
+    backing: Arc<VolumeFile>,
+}
+
+struct RetiredVolume {
+    backing: Weak<VolumeFile>,
+    path: PathBuf,
+    identity: FileIdentity,
+}
+
+/// Fully allocated before a destructive WAL operation. Linking this node after
+/// success is allocation-free; dropping an uncommitted node never schedules IO.
+pub(crate) struct PreparedRetirement {
+    entries: Vec<RetiredVolume>,
+    pub(crate) omitted_segment_ids: Vec<u64>,
+    pub(crate) next: Option<Box<PreparedRetirement>>,
+}
+
+impl PreparedRetirement {
+    /// Allocate every replacement before the directory is renamed. Parked
+    /// batches are owned by the manager until durable omission grants cleanup.
+    pub(crate) fn prepare_relocation(&self, old: &Path, new: &Path) -> Vec<Option<PathBuf>> {
+        self.entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .path
+                    .strip_prefix(old)
+                    .ok()
+                    .map(|suffix| new.join(suffix))
+            })
+            .collect()
+    }
+
+    pub(crate) fn apply_relocation(&mut self, replacements: Vec<Option<PathBuf>>) {
+        debug_assert_eq!(self.entries.len(), replacements.len());
+        for (entry, replacement) in self.entries.iter_mut().zip(replacements) {
+            if let Some(replacement) = replacement {
+                entry.path = replacement;
+            }
+        }
+    }
+}
+
+impl Drop for PreparedRetirement {
+    fn drop(&mut self) {
+        // Repeated failed manifest writes can retain several exact batches.
+        // Release only metadata here, iteratively, without stack growth or IO.
+        let mut next = self.next.take();
+        while let Some(mut batch) = next {
+            next = batch.next.take();
+        }
+    }
+}
+
+#[derive(Default)]
+struct FileCatalog {
+    // One inline Weak for the normal one-descriptor case. Independent decodes
+    // registered in this engine remain aliases of the same physical identity.
+    live: rustc_hash::FxHashMap<FileIdentity, smallvec::SmallVec<[Weak<VolumeFile>; 1]>>,
+    pending: Vec<RetiredVolume>,
+    prepared: Option<Box<PreparedRetirement>>,
+}
+
+impl FileCatalog {
+    fn track(&mut self, backing: &Arc<VolumeFile>) {
+        let aliases = self.live.entry(backing.identity).or_default();
+        aliases.retain(|alias| alias.strong_count() != 0);
+        let weak = Arc::downgrade(backing);
+        if !aliases.iter().any(|alias| Weak::ptr_eq(alias, &weak)) {
+            aliases.push(weak);
+        }
+    }
+}
+
+/// Engine-owned deferred cleanup. Enqueue and sweep happen outside transfer
+/// fences; neither a generation nor a file descriptor performs I/O on Drop.
+/// Dropping the engine with live readers may leave an orphan for startup cleanup.
+#[derive(Default)]
+pub(crate) struct VolumeRetirementQueue {
+    catalog: parking_lot::Mutex<FileCatalog>,
+}
+
+impl VolumeRetirementQueue {
+    /// Register before publishing a volume into any manager generation. This
+    /// authority is independent of whether its file is eligible for deletion.
+    pub(crate) fn track(&self, backing: &Arc<VolumeFile>) {
+        self.catalog.lock().track(backing);
+    }
+
+    pub(crate) fn retire(&self, backing: &Arc<VolumeFile>) {
+        let mut catalog = self.catalog.lock();
+        catalog.track(backing);
+        catalog.pending.push(RetiredVolume {
+            backing: Arc::downgrade(backing),
+            path: backing.path.read().clone(),
+            identity: backing.identity,
+        });
+    }
+
+    pub(crate) fn prepare_retirement<'a>(
+        &self,
+        backings: impl Iterator<Item = &'a Arc<VolumeFile>>,
+    ) -> Box<PreparedRetirement> {
+        let mut catalog = self.catalog.lock();
+        let entries = backings
+            .map(|backing| {
+                catalog.track(backing);
+                RetiredVolume {
+                    backing: Arc::downgrade(backing),
+                    path: backing.path.read().clone(),
+                    identity: backing.identity,
+                }
+            })
+            .collect();
+        Box::new(PreparedRetirement {
+            entries,
+            omitted_segment_ids: Vec::new(),
+            next: None,
+        })
+    }
+
+    /// Exact batch eligibility is granted after truncate WAL and a durable
+    /// manifest image omitting its old identities. Storage already exists.
+    pub(crate) fn commit_retirement(&self, mut batch: Box<PreparedRetirement>) {
+        let mut catalog = self.catalog.lock();
+        batch.next = catalog.prepared.take();
+        catalog.prepared = Some(batch);
+    }
+
+    pub(crate) fn sweep(&self) {
+        let mut catalog = self.catalog.lock();
+        let FileCatalog {
+            live,
+            pending,
+            prepared,
+        } = &mut *catalog;
+        let keep = |entry: &RetiredVolume| {
+            if entry.backing.strong_count() != 0
+                || live
+                    .get(&entry.identity)
+                    .is_some_and(|aliases| aliases.iter().any(|alias| alias.strong_count() != 0))
+            {
+                return true;
+            }
+            // No strong owner can reappear after the count reaches zero.
+            // Never knowingly unlink a different file placed at the old path.
+            let file = match std::fs::File::open(&entry.path) {
+                Ok(file) => file,
+                Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+            };
+            let identity = FileIdentity::capture(&file);
+            drop(file);
+            match identity {
+                Ok(identity) if identity == entry.identity => {
+                    if let Err(error) = std::fs::remove_file(&entry.path) {
+                        return error.kind() != std::io::ErrorKind::NotFound;
+                    }
+                    if let Some(parent) = entry.path.parent() {
+                        let _ = std::fs::remove_dir(parent);
+                    }
+                    false
+                }
+                Ok(_) => false,
+                Err(_) => true,
+            }
+        };
+        pending.retain(keep);
+        let mut batches = prepared.take();
+        let mut retained = None;
+        while let Some(mut batch) = batches {
+            batches = batch.next.take();
+            batch.entries.retain(keep);
+            if !batch.entries.is_empty() {
+                batch.next = retained;
+                retained = Some(batch);
+            }
+        }
+        *prepared = retained;
+        live.retain(|_, aliases| {
+            aliases.retain(|alias| alias.strong_count() != 0);
+            !aliases.is_empty()
+        });
+        if pending.is_empty() {
+            pending.shrink_to_fit();
+        }
+    }
+
+    /// Serialize a managed parent rename with reader opens and retirement.
+    /// The caller serializes seal/compaction before collecting current volumes.
+    pub(crate) fn rename_directory(
+        &self,
+        old: &Path,
+        new: &Path,
+        current: &[Arc<FrozenVolume>],
+    ) -> std::io::Result<()> {
+        let mut catalog = self.catalog.lock();
+        for volume in current {
+            if let Some(backing) = volume.backing.get() {
+                catalog.track(backing);
+            }
+        }
+        let mut backings: Vec<_> = current
+            .iter()
+            .filter_map(|volume| volume.backing.get().cloned())
+            .chain(
+                catalog
+                    .live
+                    .values()
+                    .flat_map(|aliases| aliases.iter().filter_map(Weak::upgrade)),
+            )
+            .collect();
+        backings.sort_unstable_by_key(Arc::as_ptr);
+        backings.dedup_by(|left, right| Arc::ptr_eq(left, right));
+        let mut locations: Vec<_> = backings.iter().map(|file| file.path.write()).collect();
+        // Allocate replacement paths before changing anything on disk.
+        let replacements: Vec<_> = locations
+            .iter()
+            .map(|path| path.strip_prefix(old).ok().map(|suffix| new.join(suffix)))
+            .collect();
+        let FileCatalog {
+            pending, prepared, ..
+        } = &mut *catalog;
+        let mut entries: Vec<&mut RetiredVolume> = pending.iter_mut().collect();
+        let mut batch = prepared.as_mut();
+        while let Some(current) = batch {
+            entries.extend(current.entries.iter_mut());
+            batch = current.next.as_mut();
+        }
+        let retired_replacements: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .path
+                    .strip_prefix(old)
+                    .ok()
+                    .map(|suffix| new.join(suffix))
+            })
+            .collect();
+        std::fs::rename(old, new)?;
+        for (path, replacement) in locations.iter_mut().zip(replacements) {
+            if let Some(replacement) = replacement {
+                **path = replacement;
+            }
+        }
+        for (entry, replacement) in entries.into_iter().zip(retired_replacements) {
+            if let Some(replacement) = replacement {
+                entry.path = replacement;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Volume file extension
 const VOLUME_EXT: &str = "vol";
@@ -75,18 +435,25 @@ pub fn write_volume_to_disk_opts(
     let (data, store) = serialize_v4_opts(volume, compress)
         .map_err(|e| crate::core::Error::internal(format!("V4 serialize failed: {}", e)))?;
 
-    {
+    let file = {
         use std::io::Write;
-        let mut f = std::fs::File::create(&tmp_path).map_err(|e| {
-            crate::core::Error::internal(format!("failed to create volume tmp file: {}", e))
-        })?;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .map_err(|e| {
+                crate::core::Error::internal(format!("failed to create volume tmp file: {}", e))
+            })?;
         f.write_all(&data).map_err(|e| {
             crate::core::Error::internal(format!("failed to write volume file: {}", e))
         })?;
         f.sync_all().map_err(|e| {
             crate::core::Error::internal(format!("failed to fsync volume tmp file: {}", e))
         })?;
-    }
+        f
+    };
     drop(data);
 
     std::fs::rename(&tmp_path, &final_path).map_err(|e| {
@@ -99,6 +466,15 @@ pub fn write_volume_to_disk_opts(
             crate::core::Error::internal(format!("failed to fsync volume directory: {}", e))
         })?;
     }
+
+    // Capture the exact written handle; never reopen the published path here.
+    let backing = VolumeFile::from_file(&final_path, &file).map_err(|e| {
+        crate::core::Error::internal(format!("failed to bind written volume: {}", e))
+    })?;
+    drop(file);
+    // A volume is immutable. A later copy to another path cannot replace the
+    // backing already held by existing captured readers.
+    let _ = volume.backing.set(backing);
 
     Ok((final_path, store))
 }
@@ -196,23 +572,26 @@ fn serialize_v4_opts(
 /// CRC32 is computed incrementally as sections are read.
 /// Blocks are read one at a time into a reusable buffer and decompressed
 /// directly into final column vectors. No intermediate compressed storage.
-fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
+pub(crate) fn read_volume_file(backing: Arc<VolumeFile>) -> Result<FrozenVolume> {
+    let lease = backing.open_reader().map_err(|e| {
+        crate::core::Error::internal(format!("failed to open captured volume: {}", e))
+    })?;
+    read_volume_lease(lease)
+}
+
+fn read_volume_lease(lease: VolumeReadLease) -> Result<FrozenVolume> {
     use std::io::Read;
 
     let inv = |msg: &str| crate::core::Error::internal(format!("V4: {}", msg));
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| crate::core::Error::internal(format!("V4 open {:?}: {}", path, e)))?;
-    let file_len = usize::try_from(
-        file.metadata()
-            .map_err(|e| crate::core::Error::internal(format!("V4 stat {:?}: {}", path, e)))?
-            .len(),
-    )
-    .map_err(|_| inv("file length exceeds address space"))?;
+    let file_len = usize::try_from(lease.backing.identity.length)
+        .map_err(|_| inv("file length exceeds address space"))?;
     if file_len < 24 {
         return Err(inv("file too small"));
     }
 
+    let VolumeReadLease { file, backing } = lease;
+    // Each decode owns its File, so the seek position cannot be shared.
     let mut reader = std::io::BufReader::new(file);
     let mut hasher = crc32fast::Hasher::new();
 
@@ -416,6 +795,7 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     let columns = LazyColumns::deferred(store, col_data_types);
 
     Ok(FrozenVolume {
+        backing: std::sync::OnceLock::from(backing.clone()),
         columns,
         meta: Arc::new(super::writer::VolumeMeta {
             zone_maps: meta.zone_maps,
@@ -440,26 +820,13 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
 
 /// Read a frozen volume from disk. Only V4 (STV4) format is supported.
 pub fn read_volume_from_disk(path: &Path) -> Result<FrozenVolume> {
-    use std::io::Read;
-
-    let mut magic = [0u8; 4];
-    {
-        let mut f = std::fs::File::open(path).map_err(|e| {
-            crate::core::Error::internal(format!("failed to open volume {:?}: {}", path, e))
-        })?;
-        f.read_exact(&mut magic).map_err(|e| {
-            crate::core::Error::internal(format!("failed to read magic {:?}: {}", path, e))
-        })?;
-    }
-
-    if magic == V4_MAGIC {
-        read_volume_v4(path)
-    } else {
-        Err(crate::core::Error::internal(format!(
-            "unsupported volume format {:?}: expected STV4 magic, got {:?}",
-            path, magic
-        )))
-    }
+    let file = std::fs::File::open(path).map_err(|e| {
+        crate::core::Error::internal(format!("failed to open volume {:?}: {}", path, e))
+    })?;
+    let backing = VolumeFile::from_file(path, &file).map_err(|e| {
+        crate::core::Error::internal(format!("failed to bind volume {:?}: {}", path, e))
+    })?;
+    read_volume_lease(VolumeReadLease { file, backing })
 }
 
 /// List all volume files for a table, sorted by volume ID (oldest first).
@@ -801,6 +1168,276 @@ mod tests {
     use super::super::writer::VolumeBuilder;
     use super::*;
     use crate::core::{DataType, Row, SchemaBuilder, Value};
+
+    fn file_lease_fixture(dir: &Path, table: &str, id: u64, value: i64) -> (PathBuf, FrozenVolume) {
+        let schema = SchemaBuilder::new(table)
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(1, &Row::from_values(vec![Value::Integer(value)]));
+        let volume = builder.finish();
+        let path = write_volume_to_disk(dir, table, id, &volume).unwrap();
+        (path, volume)
+    }
+
+    #[test]
+    fn captured_file_rejects_replacement_but_active_read_keeps_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, original) = file_lease_fixture(dir.path(), "captured", 1, 42);
+        let backing = original.backing.get().unwrap().clone();
+        let active = backing.open_reader().unwrap();
+        let (replacement, _) = file_lease_fixture(dir.path(), "replacement", 1, 99);
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(
+            read_volume_from_disk(&path).unwrap().get_row(0).unwrap()[0],
+            Value::Integer(99)
+        );
+        assert!(read_volume_file(backing).is_err());
+        let old = read_volume_lease(active).unwrap();
+        assert_eq!(old.get_row(0).unwrap()[0], Value::Integer(42));
+    }
+
+    #[test]
+    fn captured_file_rejects_external_unlink_without_an_active_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, volume) = file_lease_fixture(dir.path(), "unlinked", 1, 42);
+        std::fs::remove_file(path).unwrap();
+        assert!(volume.reload_from_backing().is_err());
+    }
+
+    #[test]
+    fn retirement_waits_for_last_reader_and_never_performs_io_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, volume) = file_lease_fixture(dir.path(), "retired", 1, 42);
+        let queue = VolumeRetirementQueue::default();
+        let backing = volume.backing.get().unwrap().clone();
+        queue.retire(&backing);
+        let active = backing.open_reader().unwrap();
+        drop((volume, backing));
+        queue.sweep();
+        assert!(
+            path.exists(),
+            "an active decoder retains the identity lease"
+        );
+        let loaded = read_volume_lease(active).unwrap();
+        assert_eq!(loaded.get_row(0).unwrap()[0], Value::Integer(42));
+        queue.sweep();
+        assert!(
+            path.exists(),
+            "the decoded volume also retains its identity"
+        );
+        drop(loaded);
+        assert!(path.exists(), "Drop must not perform filesystem I/O");
+        queue.sweep();
+        assert!(!path.exists());
+        assert!(queue.catalog.lock().pending.is_empty());
+    }
+
+    #[test]
+    fn retirement_never_deletes_a_known_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, volume) = file_lease_fixture(dir.path(), "replaced", 1, 42);
+        let original_inode = std::fs::File::open(&path).unwrap();
+        let queue = VolumeRetirementQueue::default();
+        queue.retire(volume.backing.get().unwrap());
+        drop(volume);
+        let (replacement, _) = file_lease_fixture(dir.path(), "replacement", 1, 99);
+        std::fs::rename(&replacement, &path).unwrap();
+        queue.sweep();
+        assert_eq!(
+            read_volume_from_disk(&path).unwrap().get_row(0).unwrap()[0],
+            Value::Integer(99)
+        );
+        assert!(queue.catalog.lock().pending.is_empty());
+        drop(original_inode);
+    }
+
+    #[test]
+    fn retirement_waits_for_independently_decoded_registered_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, first) = file_lease_fixture(dir.path(), "aliases", 1, 42);
+        let second = read_volume_from_disk(&path).unwrap();
+        assert!(!Arc::ptr_eq(
+            first.backing.get().unwrap(),
+            second.backing.get().unwrap()
+        ));
+        let queue = VolumeRetirementQueue::default();
+        queue.track(first.backing.get().unwrap());
+        queue.track(second.backing.get().unwrap());
+        queue.retire(first.backing.get().unwrap());
+        drop(first);
+        queue.sweep();
+        assert!(path.exists());
+        assert_eq!(
+            second.reload_from_backing().unwrap().get_row(0).unwrap()[0],
+            Value::Integer(42)
+        );
+        drop(second);
+        queue.sweep();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn engine_queue_drop_with_live_reader_leaves_a_safe_orphan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, volume) = file_lease_fixture(dir.path(), "orphan", 1, 42);
+        let queue = VolumeRetirementQueue::default();
+        queue.retire(volume.backing.get().unwrap());
+        drop(queue);
+        assert_eq!(
+            volume.reload_from_backing().unwrap().get_row(0).unwrap()[0],
+            Value::Integer(42)
+        );
+        drop(volume);
+        assert!(
+            path.exists(),
+            "startup can later reclaim an unreferenced file"
+        );
+    }
+
+    #[test]
+    fn managed_directory_rename_updates_current_and_retired_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, live) = file_lease_fixture(dir.path(), "old", 1, 42);
+        let (_, retired) = file_lease_fixture(dir.path(), "old", 2, 99);
+        let live = Arc::new({
+            let cold = live.to_cold();
+            drop(live);
+            cold
+        });
+        let retired = Arc::new({
+            let cold = retired.to_cold();
+            drop(retired);
+            cold
+        });
+        let queue = VolumeRetirementQueue::default();
+        queue.retire(retired.backing.get().unwrap());
+        let old = dir.path().join("old");
+        let new = dir.path().join("new");
+        std::thread::scope(|scope| {
+            for volume in [&live, &retired] {
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        let loaded = volume.reload_from_backing().unwrap();
+                        assert!(Arc::ptr_eq(
+                            volume.backing.get().unwrap(),
+                            loaded.backing.get().unwrap()
+                        ));
+                    }
+                });
+            }
+            for _ in 0..10 {
+                queue
+                    .rename_directory(&old, &new, &[live.clone(), live.clone()])
+                    .unwrap();
+                queue.rename_directory(&new, &old, &[live.clone()]).unwrap();
+            }
+        });
+        queue.rename_directory(&old, &new, &[live.clone()]).unwrap();
+        assert_eq!(
+            retired.reload_from_backing().unwrap().get_row(0).unwrap()[0],
+            Value::Integer(99)
+        );
+        drop(retired);
+        queue.sweep();
+        assert!(!new.join("vol_0000000000000002.vol").exists());
+        assert!(new.join("vol_0000000000000001.vol").exists());
+    }
+
+    #[test]
+    fn failed_managed_rename_keeps_original_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, live) = file_lease_fixture(dir.path(), "old", 1, 42);
+        let live = Arc::new(live);
+        let queue = VolumeRetirementQueue::default();
+        queue.retire(live.backing.get().unwrap());
+        assert!(queue
+            .rename_directory(
+                &dir.path().join("old"),
+                &dir.path().join("missing/new"),
+                &[live.clone()]
+            )
+            .is_err());
+        assert_eq!(*live.backing.get().unwrap().path.read(), path);
+        assert_eq!(queue.catalog.lock().pending[0].path, path);
+        assert_eq!(
+            live.reload_from_backing().unwrap().get_row(0).unwrap()[0],
+            Value::Integer(42)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_descriptor_count_does_not_grow_open_file_count() {
+        const CHILD_MARKER: &str = "STOOLAP_FILE_LEASE_FD_PROBE";
+        if std::env::var_os(CHILD_MARKER).is_none() {
+            // Other parallel unit tests may open files in this process.
+            // The child runs only this probe, so its FD delta is attributable.
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "idle_descriptor_count_does_not_grow_open_file_count",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .env(CHILD_MARKER, "1")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        fn fd_count() -> usize {
+            std::fs::read_dir("/dev/fd").unwrap().count()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = file_lease_fixture(dir.path(), "descriptors", 1, 42);
+        let before = fd_count();
+        let backings: Vec<_> = (0..512)
+            .map(|_| {
+                let file = std::fs::File::open(&path).unwrap();
+                VolumeFile::from_file(&path, &file).unwrap()
+            })
+            .collect();
+        assert!(
+            fd_count() <= before + 1,
+            "metadata identities do not retain descriptors"
+        );
+        let readers: Vec<_> = backings
+            .iter()
+            .take(8)
+            .map(|b| b.open_reader().unwrap())
+            .collect();
+        assert!(
+            fd_count() >= before + 8,
+            "only active reads open descriptors"
+        );
+        drop(readers);
+        assert!(fd_count() <= before + 1);
+        drop(backings);
+    }
+
+    #[test]
+    fn residency_reload_preserves_aliases_unique_cache_and_backing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, mut volume) = file_lease_fixture(dir.path(), "aliases", 1, 42);
+        volume.merge_column_rename("renamed", "id");
+        volume.prebuild_unique_index(&[0]).unwrap();
+        let cold = volume.to_cold();
+        let loaded = cold.reload_from_backing().unwrap();
+        assert!(Arc::ptr_eq(&cold.meta, &loaded.meta));
+        assert!(Arc::ptr_eq(&cold.unique_indices, &loaded.unique_indices));
+        assert!(Arc::ptr_eq(
+            cold.backing.get().unwrap(),
+            loaded.backing.get().unwrap()
+        ));
+        assert_eq!(loaded.column_index("renamed"), Some(0));
+        assert!(!loaded.unique_indices.read().is_empty());
+        assert_eq!(loaded.get_row(0).unwrap()[0], Value::Integer(42));
+    }
 
     #[test]
     fn malformed_v4_lengths_fail_before_allocating_or_decoding() {

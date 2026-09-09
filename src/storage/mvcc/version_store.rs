@@ -46,6 +46,7 @@ use crate::storage::mvcc::arena::RowArena;
 use crate::storage::mvcc::get_fast_timestamp;
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
+use crate::storage::mvcc::registry::{EpochReader, ReadEpoch};
 use crate::storage::mvcc::streaming_result::{StreamingResult, VisibleRowInfo};
 use crate::storage::Index;
 use ahash::AHashMap;
@@ -204,6 +205,383 @@ struct VersionChainEntry {
     /// Index into the arena for zero-copy access (None if data not in arena)
     /// Stored as `idx + 1` to enable niche optimization (NonZeroU64)
     arena_idx: Option<NonZeroU64>,
+}
+
+/// An immutable hot-tree root captured while the hot/cold publication fence is
+/// held. Cloning only retains existing tree nodes; it performs no allocation or
+/// I/O. Payloads belong to the captured tree, never to mutable arena slots.
+#[derive(Clone)]
+pub struct CapturedHotRoot {
+    inner: crate::common::CowBTree<VersionChainEntry>,
+}
+
+/// Epoch authority retaining original version identities for DML conflict
+/// detection. A Value's raw deletion marker may be nonzero but invisible in
+/// this epoch; callers must use this state rather than RowVersion::is_deleted.
+#[derive(Debug)]
+pub enum CapturedHotVersion<'a> {
+    Value(&'a RowVersion),
+    Deleted,
+    NoVisibleVersion,
+}
+
+impl CapturedHotRoot {
+    /// Metadata-only proof that this root has no possible hot authority.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn chain_state<'a>(
+        mut entry: &'a VersionChainEntry,
+        reader: &mut EpochReader<'_>,
+    ) -> CapturedHotVersion<'a> {
+        loop {
+            let version = &entry.version;
+            if reader.is_visible(version.txn_id) {
+                return if version.deleted_at_txn_id != 0
+                    && reader.is_visible(version.deleted_at_txn_id)
+                {
+                    CapturedHotVersion::Deleted
+                } else {
+                    CapturedHotVersion::Value(version)
+                };
+            }
+            match entry.prev.as_deref() {
+                Some(previous) => entry = previous,
+                None => return CapturedHotVersion::NoVisibleVersion,
+            }
+        }
+    }
+
+    pub fn version_state(&self, row_id: i64, epoch: &ReadEpoch) -> CapturedHotVersion<'_> {
+        self.inner
+            .get(row_id)
+            .map_or(CapturedHotVersion::NoVisibleVersion, |entry| {
+                Self::chain_state(entry, &mut epoch.reader())
+            })
+    }
+
+    /// Return original metadata for an epoch-visible value, without copying
+    /// the transaction's own overlay. DML checks its latest own write first.
+    pub fn visible_version(&self, row_id: i64, epoch: &ReadEpoch) -> Option<&RowVersion> {
+        match self.version_state(row_id, epoch) {
+            CapturedHotVersion::Value(version) => Some(version),
+            CapturedHotVersion::Deleted | CapturedHotVersion::NoVisibleVersion => None,
+        }
+    }
+
+    pub fn for_each_visible_version(
+        &self,
+        epoch: &ReadEpoch,
+        mut visit: impl FnMut(i64, &RowVersion),
+    ) {
+        self.for_each_visible_version_until(epoch, |id, version| {
+            visit(id, version);
+            true
+        });
+    }
+
+    pub fn for_each_visible_version_until(
+        &self,
+        epoch: &ReadEpoch,
+        mut visit: impl FnMut(i64, &RowVersion) -> bool,
+    ) -> bool {
+        let mut reader = epoch.reader();
+        for (&id, entry) in self.inner.iter() {
+            if let CapturedHotVersion::Value(version) = Self::chain_state(entry, &mut reader) {
+                if !visit(id, version) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Frozen latest writes of the reading transaction. Built before the capture
+/// fence and shared by lazy results, including after commit drains local writes.
+#[derive(Clone)]
+pub struct CapturedHotOverlay {
+    rows: Arc<Vec<(i64, RowVersion)>>,
+}
+
+/// Authority of the captured hot store for one row identity. An invisible hot
+/// version must not hide an older visible cold value.
+#[derive(Debug, PartialEq)]
+pub enum CapturedHotRow<'a> {
+    Value(&'a Row),
+    Deleted,
+    NoVisibleVersion,
+}
+
+/// An owning result for consumers that cannot retain a borrow of the view.
+#[derive(Debug, PartialEq)]
+pub enum CapturedHotRowOwned {
+    Value(Row),
+    Deleted,
+    NoVisibleVersion,
+}
+
+/// A fixed statement's hot view. Clones share the epoch lease and payloads.
+/// Binding the epoch and copying the local overlay happen outside publication
+/// fences; replacing the root after capture also happens outside those fences.
+#[derive(Clone)]
+pub struct CapturedHotView {
+    root: CapturedHotRoot,
+    epoch: ReadEpoch,
+    own: Option<CapturedHotOverlay>,
+}
+
+impl CapturedHotView {
+    /// Conservative O(1) check; invisible or deleted tree entries still count.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.root.is_empty() && self.own.as_ref().is_none_or(|own| own.rows.is_empty())
+    }
+
+    pub fn new(root: CapturedHotRoot, epoch: ReadEpoch, own: Option<CapturedHotOverlay>) -> Self {
+        Self { root, epoch, own }
+    }
+
+    #[inline]
+    pub fn same_epoch(&self, epoch: &ReadEpoch) -> bool {
+        self.epoch.same_epoch(epoch)
+    }
+
+    pub fn epoch(&self) -> &ReadEpoch {
+        &self.epoch
+    }
+
+    /// Call outside the capture fence: dropping the old root can release nodes.
+    pub fn replace_root(&mut self, root: CapturedHotRoot) {
+        self.root = root;
+    }
+
+    #[inline]
+    fn overlay_state(version: &RowVersion) -> CapturedHotRow<'_> {
+        if version.is_deleted() {
+            CapturedHotRow::Deleted
+        } else {
+            CapturedHotRow::Value(&version.data)
+        }
+    }
+
+    fn chain_state<'a>(
+        entry: &'a VersionChainEntry,
+        reader: &mut EpochReader<'_>,
+    ) -> CapturedHotRow<'a> {
+        match CapturedHotRoot::chain_state(entry, reader) {
+            CapturedHotVersion::Value(version) => CapturedHotRow::Value(&version.data),
+            CapturedHotVersion::Deleted => CapturedHotRow::Deleted,
+            CapturedHotVersion::NoVisibleVersion => CapturedHotRow::NoVisibleVersion,
+        }
+    }
+
+    fn row_state_with_reader(
+        &self,
+        row_id: i64,
+        reader: &mut EpochReader<'_>,
+    ) -> CapturedHotRow<'_> {
+        if let Some(own) = &self.own {
+            if let Ok(index) = own.rows.binary_search_by_key(&row_id, |(id, _)| *id) {
+                return Self::overlay_state(&own.rows[index].1);
+            }
+        }
+        self.root
+            .inner
+            .get(row_id)
+            .map_or(CapturedHotRow::NoVisibleVersion, |entry| {
+                Self::chain_state(entry, reader)
+            })
+    }
+
+    pub fn row_state(&self, row_id: i64) -> CapturedHotRow<'_> {
+        self.row_state_with_reader(row_id, &mut self.epoch.reader())
+    }
+
+    /// Conservative bounds over every retained head and own write, including
+    /// invisible versions and delete markers. Captured roots are immutable, so
+    /// probing their left edge and cached right edge cannot race publication.
+    fn authority_bounds(&self) -> Option<(i64, i64)> {
+        let mut bounds = self.root.inner.iter().next().map(|(&first, _)| {
+            (
+                first,
+                self.root.inner.max_key().expect("nonempty captured root"),
+            )
+        });
+        if let Some(own) = &self.own {
+            if let Some((first, last)) = own.rows.first().zip(own.rows.last()) {
+                bounds = Some(bounds.map_or((first.0, last.0), |(min, max)| {
+                    (min.min(first.0), max.max(last.0))
+                }));
+            }
+        }
+        bounds
+    }
+
+    /// Mark hot authority for a bounded cold-row batch using one epoch cache.
+    /// Required words are overwritten, including unused tail bits; any extra
+    /// caller-owned words are untouched. No predicate is evaluated here.
+    pub fn mark_authoritative(&self, row_ids: &[i64], bits: &mut [u64]) {
+        let words = row_ids.len().div_ceil(64);
+        assert!(bits.len() >= words, "hot authority output is too short");
+        bits[..words].fill(0);
+        if self.is_empty() {
+            return;
+        }
+        let (min, max) = self.authority_bounds().expect("nonempty captured view");
+        let mut reader = self.epoch.reader();
+        for (ordinal, &row_id) in row_ids.iter().enumerate() {
+            // Recent hot INSERTs commonly lie beyond all older cold identities.
+            // Reject those misses without a B-tree/overlay lookup per cold row.
+            // Input order is unrestricted; endpoints are never used as a proof.
+            if row_id < min || row_id > max {
+                continue;
+            }
+            if !matches!(
+                self.row_state_with_reader(row_id, &mut reader),
+                CapturedHotRow::NoVisibleVersion
+            ) {
+                bits[ordinal / 64] |= 1u64 << (ordinal % 64);
+            }
+        }
+    }
+
+    pub fn row_state_owned(&self, row_id: i64) -> CapturedHotRowOwned {
+        match self.row_state(row_id) {
+            CapturedHotRow::Value(row) => CapturedHotRowOwned::Value(row.clone()),
+            CapturedHotRow::Deleted => CapturedHotRowOwned::Deleted,
+            CapturedHotRow::NoVisibleVersion => CapturedHotRowOwned::NoVisibleVersion,
+        }
+    }
+
+    pub fn for_each_visible(&self, mut visit: impl FnMut(i64, &Row)) {
+        self.for_each_visible_until(|id, row| {
+            visit(id, row);
+            true
+        });
+    }
+
+    /// Visit visible rows in ascending identity order. Return false from the
+    /// callback to stop; the method returns true only if the range was exhausted.
+    pub fn for_each_visible_until(&self, visit: impl FnMut(i64, &Row) -> bool) -> bool {
+        self.for_each_visible_range_until(.., visit)
+    }
+
+    pub fn for_each_visible_range<R>(&self, range: R, mut visit: impl FnMut(i64, &Row))
+    where
+        R: std::ops::RangeBounds<i64>,
+    {
+        self.for_each_visible_range_until(range, |id, row| {
+            visit(id, row);
+            true
+        });
+    }
+
+    /// Allocation-free range traversal; the root and the sorted own overlay are
+    /// merged once, and one visibility cache serves the complete traversal.
+    pub fn for_each_visible_range_until<R>(
+        &self,
+        range: R,
+        mut visit: impl FnMut(i64, &Row) -> bool,
+    ) -> bool
+    where
+        R: std::ops::RangeBounds<i64>,
+    {
+        use std::ops::Bound;
+        let rows = self.own.as_ref().map_or(&[][..], |own| own.rows.as_slice());
+        let start = match range.start_bound() {
+            Bound::Included(id) => rows.partition_point(|(key, _)| key < id),
+            Bound::Excluded(id) => rows.partition_point(|(key, _)| key <= id),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(id) => rows.partition_point(|(key, _)| key <= id),
+            Bound::Excluded(id) => rows.partition_point(|(key, _)| key < id),
+            Bound::Unbounded => rows.len(),
+        };
+        let mut own = rows[start.min(end)..end].iter().peekable();
+        let mut committed = self.root.inner.range(range).peekable();
+        let mut reader = self.epoch.reader();
+        loop {
+            let (id, state) = match (committed.peek(), own.peek()) {
+                (Some((id, _)), Some((own_id, _))) if own_id <= *id => {
+                    if own_id == *id {
+                        committed.next();
+                    }
+                    let (id, version) = own.next().unwrap();
+                    (*id, Self::overlay_state(version))
+                }
+                (Some(_), _) => {
+                    let (&id, entry) = committed.next().unwrap();
+                    (id, Self::chain_state(entry, &mut reader))
+                }
+                (None, Some(_)) => {
+                    let (id, version) = own.next().unwrap();
+                    (*id, Self::overlay_state(version))
+                }
+                (None, None) => return true,
+            };
+            if let CapturedHotRow::Value(row) = state {
+                if !visit(id, row) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    /// Descending identity traversal with the same own-write authority and
+    /// fixed epoch as the forward visitor. Stops without collecting row IDs.
+    pub fn for_each_visible_range_rev_until<R>(
+        &self,
+        range: R,
+        mut visit: impl FnMut(i64, &Row) -> bool,
+    ) -> bool
+    where
+        R: std::ops::RangeBounds<i64>,
+    {
+        use std::ops::Bound;
+        let rows = self.own.as_ref().map_or(&[][..], |own| own.rows.as_slice());
+        let start = match range.start_bound() {
+            Bound::Included(id) => rows.partition_point(|(key, _)| key < id),
+            Bound::Excluded(id) => rows.partition_point(|(key, _)| key <= id),
+            Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            Bound::Included(id) => rows.partition_point(|(key, _)| key <= id),
+            Bound::Excluded(id) => rows.partition_point(|(key, _)| key < id),
+            Bound::Unbounded => rows.len(),
+        };
+        let mut own = rows[start.min(end)..end].iter().rev().peekable();
+        let mut committed = self.root.inner.range_rev(range).peekable();
+        let mut reader = self.epoch.reader();
+        loop {
+            let (id, state) = match (committed.peek(), own.peek()) {
+                (Some((id, _)), Some((own_id, _))) if own_id >= *id => {
+                    if own_id == *id {
+                        committed.next();
+                    }
+                    let (id, version) = own.next().unwrap();
+                    (*id, Self::overlay_state(version))
+                }
+                (Some(_), _) => {
+                    let (&id, entry) = committed.next().unwrap();
+                    (id, Self::chain_state(entry, &mut reader))
+                }
+                (None, Some(_)) => {
+                    let (id, version) = own.next().unwrap();
+                    (*id, Self::overlay_state(version))
+                }
+                (None, None) => return true,
+            };
+            if let CapturedHotRow::Value(row) = state {
+                if !visit(id, row) {
+                    return false;
+                }
+            }
+        }
+    }
 }
 
 /// Count the depth of a version chain by traversing prev pointers.
@@ -411,10 +789,25 @@ enum AggregateAccumulator {
     Avg(i128, f64, usize),
 }
 
+/// Retention decision for a bounded newest-to-oldest history prefix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryRetention {
+    /// No transaction/read/build lease can need this old history.
+    Unprotected,
+    /// Retain this prefix through its first creator visible at the floor.
+    KeepThrough(usize),
+    /// The required baseline lies outside the supplied prefix (or is unknown).
+    Protected,
+}
+
 /// Visibility checker trait - will be implemented by TransactionRegistry
 ///
 /// This allows VersionStore to check visibility without circular dependencies
 pub trait VisibilityChecker: Send + Sync {
+    fn begin_logical_mutation(&self) -> Option<super::registry::LogicalMutationGuard> {
+        None
+    }
+
     /// Check if a version created by `version_txn_id` is visible to `viewing_txn_id`
     fn is_visible(&self, version_txn_id: i64, viewing_txn_id: i64) -> bool;
 
@@ -423,6 +816,41 @@ pub trait VisibilityChecker: Send + Sync {
 
     /// Get all active transaction IDs (for cleanup operations)
     fn get_active_transaction_ids(&self) -> Vec<i64>;
+
+    /// Capture a fresh committed view for catalog builds, independent of the
+    /// transaction that requested DDL. Test-only checkers may use the legacy
+    /// current-committed visibility fallback instead.
+    fn capture_current_read_epoch(&self) -> Option<ReadEpoch> {
+        None
+    }
+
+    /// Oldest registered read/build or transaction begin horizon. A lease can
+    /// outlive the transaction that created it.
+    fn oldest_retention_horizon(&self) -> Option<i64> {
+        None
+    }
+
+    /// Presence-only hot-path check; the registry overrides this without
+    /// computing the minimum across its registered readers.
+    fn has_retention_obligations(&self) -> bool {
+        self.oldest_retention_horizon().is_some()
+    }
+
+    fn cached_retention_horizon(&self) -> Option<i64> {
+        self.oldest_retention_horizon()
+    }
+
+    /// The registry overrides this to classify the complete bounded prefix
+    /// under one mutex, without scanning registrations or allocating.
+    fn history_retention(&self, creators: &[i64]) -> HistoryRetention {
+        match self.cached_retention_horizon() {
+            None => HistoryRetention::Unprotected,
+            Some(floor) => creators
+                .iter()
+                .position(|&id| self.is_committed_before(id, floor))
+                .map_or(HistoryRetention::Protected, HistoryRetention::KeepThrough),
+        }
+    }
 
     /// Check if a transaction was committed before a given commit sequence cutoff.
     ///
@@ -444,6 +872,30 @@ pub trait VisibilityChecker: Send + Sync {
     fn needs_snapshot_isolation(&self, _txn_id: i64) -> bool {
         false // Default: ReadCommitted (arena fast path is safe)
     }
+}
+
+/// Shared engine operation. A store keeps one engine-owned coordinator; table
+/// handles only borrow it. The engine context never owns the store map strongly.
+pub(crate) trait TruncateCoordinator: Send + Sync {
+    fn truncate(
+        &self,
+        store: &VersionStore,
+        txn_id: i64,
+        private_epoch: Option<(&ReadEpoch, usize)>,
+    ) -> crate::core::Result<i32>;
+}
+
+pub(crate) struct PreparedHotTruncate {
+    versions: crate::common::CowBTree<VersionChainEntry>,
+    indexes: FxHashMap<String, Arc<dyn Index>>,
+}
+
+/// All displaced ownership leaves the publication fence as one stack value.
+pub(crate) struct RetiredHotTruncate {
+    _versions: crate::common::CowBTree<VersionChainEntry>,
+    _indexes: FxHashMap<String, Arc<dyn Index>>,
+    _arena: (crate::storage::mvcc::arena::ArenaInner, Vec<usize>),
+    _zone_maps: Option<Arc<crate::storage::mvcc::zonemap::TableZoneMap>>,
 }
 
 /// Opaque snapshot of the version store at extraction time.
@@ -525,6 +977,26 @@ struct IndexUndo {
     removed: Vec<(i64, Vec<Value>)>,
 }
 
+/// Schema lock plus logical mutation lifetime. Field order releases the schema
+/// lock before making cache proofs eligible again; no registry mutex is held.
+pub struct SchemaMutationGuard<'a> {
+    schema: parking_lot::RwLockWriteGuard<'a, CompactArc<Schema>>,
+    _logical: Option<super::registry::LogicalMutationGuard>,
+}
+
+impl std::ops::Deref for SchemaMutationGuard<'_> {
+    type Target = CompactArc<Schema>;
+    fn deref(&self) -> &Self::Target {
+        &self.schema
+    }
+}
+
+impl std::ops::DerefMut for SchemaMutationGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.schema
+    }
+}
+
 /// VersionStore tracks the latest committed version of each row for a table
 ///
 /// Uses CowBTreeMap (RwLock<CowBTree>) for the version store because:
@@ -581,11 +1053,19 @@ pub struct VersionStore {
     publishing: AtomicUsize,
     publication_keys: Mutex<ahash::AHashMap<PublicationKey, i64>>,
     index_catalog: Arc<AtomicUsize>,
+    truncate_coordinator: std::sync::OnceLock<Arc<dyn TruncateCoordinator>>,
     /// Publishes completed
     publish_epoch: AtomicU64,
 }
 
 impl VersionStore {
+    /// Retain the immutable hot root only; safe inside the capture fence.
+    pub fn capture_hot_root(&self) -> CapturedHotRoot {
+        CapturedHotRoot {
+            inner: self.versions.read().clone(),
+        }
+    }
+
     /// Creates a new version store
     pub fn new(table_name: impl Into<SmartString>, schema: Schema) -> Self {
         Self::with_capacity(table_name, schema, None, 0)
@@ -621,6 +1101,7 @@ impl VersionStore {
             publishing: AtomicUsize::new(0),
             publication_keys: Mutex::new(ahash::AHashMap::new()),
             index_catalog: Arc::new(AtomicUsize::new(0)),
+            truncate_coordinator: std::sync::OnceLock::new(),
             publish_epoch: AtomicU64::new(0),
         }
     }
@@ -652,6 +1133,7 @@ impl VersionStore {
             publishing: AtomicUsize::new(0),
             publication_keys: Mutex::new(ahash::AHashMap::new()),
             index_catalog: Arc::new(AtomicUsize::new(0)),
+            truncate_coordinator: std::sync::OnceLock::new(),
             publish_epoch: AtomicU64::new(0),
         }
     }
@@ -659,7 +1141,8 @@ impl VersionStore {
     /// Sets the maximum version history limit per row
     ///
     /// This controls how many previous versions are kept for each row.
-    /// Lower values reduce memory usage but limit time-travel query range.
+    /// Lower values reduce idle history but cannot evict a version protected by
+    /// a registered transaction, read epoch, or build lease.
     /// - 0 = unlimited (not recommended for write-heavy workloads)
     /// - 1 = only keep immediate previous (minimal memory, limited AS OF range)
     /// - 10 = default, good balance for most workloads
@@ -717,10 +1200,28 @@ impl VersionStore {
         self.schema.read().clone()
     }
 
+    /// Destructive DDL pins schema metadata without waiting behind a public
+    /// mutation that may subsequently need the engine catalog lock.
+    pub(crate) fn try_schema_for_ddl(
+        &self,
+    ) -> Option<parking_lot::RwLockReadGuard<'_, CompactArc<Schema>>> {
+        self.schema.try_read()
+    }
+
     /// Returns a mutable reference to the schema (for modifications)
     /// Callers must use CompactArc::make_mut() to get &mut Schema
-    pub fn schema_mut(&self) -> parking_lot::RwLockWriteGuard<'_, CompactArc<Schema>> {
-        self.schema.write()
+    pub fn schema_mut(&self) -> SchemaMutationGuard<'_> {
+        let logical = self.begin_logical_mutation();
+        SchemaMutationGuard {
+            schema: self.schema.write(),
+            _logical: logical,
+        }
+    }
+
+    pub(crate) fn begin_logical_mutation(&self) -> Option<super::registry::LogicalMutationGuard> {
+        self.visibility_checker
+            .as_ref()
+            .and_then(|checker| VisibilityChecker::begin_logical_mutation(checker.as_ref()))
     }
 
     /// Returns the current auto-increment counter value
@@ -773,8 +1274,70 @@ impl VersionStore {
         self.auto_increment_counter.load(Ordering::Acquire)
     }
 
+    /// Clone one historical head while retaining its existing immutable tail.
+    fn retain_history(existing: &VersionChainEntry) -> Option<Arc<VersionChainEntry>> {
+        Some(Arc::new(VersionChainEntry {
+            version: existing.version.clone(),
+            prev: existing.prev.clone(),
+            arena_idx: None,
+        }))
+    }
+
+    /// Bound work by the configured cap, even when a long reader protects an
+    /// arbitrarily deep chain. Prune only below a baseline proven safe for the
+    /// oldest retained epoch; an unseen baseline keeps the shared tail intact.
+    fn history_for_next_version(
+        &self,
+        existing: &VersionChainEntry,
+    ) -> Option<Arc<VersionChainEntry>> {
+        let limit = self.max_version_history;
+        if limit == 0 || (limit > 1 && existing.prev.is_none()) {
+            return Self::retain_history(existing);
+        }
+        let mut prefix: SmallVec<[&VersionChainEntry; 10]> = SmallVec::new();
+        let mut current = Some(existing);
+        while prefix.len() < limit {
+            let Some(entry) = current else {
+                return Self::retain_history(existing);
+            };
+            prefix.push(entry);
+            current = entry.prev.as_deref();
+        }
+        let decision =
+            self.visibility_checker
+                .as_ref()
+                .map_or(HistoryRetention::Unprotected, |checker| {
+                    let creators: SmallVec<[i64; 10]> =
+                        prefix.iter().map(|entry| entry.version.txn_id).collect();
+                    checker.history_retention(&creators)
+                });
+        match decision {
+            HistoryRetention::Unprotected => None,
+            HistoryRetention::Protected => Self::retain_history(existing),
+            HistoryRetention::KeepThrough(index) => {
+                if prefix[index].prev.is_none() {
+                    return Self::retain_history(existing);
+                }
+                let mut prev = None;
+                for entry in prefix[..=index].iter().rev() {
+                    prev = Some(Arc::new(VersionChainEntry {
+                        version: entry.version.clone(),
+                        prev,
+                        arena_idx: None,
+                    }));
+                }
+                prev
+            }
+        }
+    }
+
     /// Adds a new version for a row
     pub fn add_version(&self, row_id: i64, version: RowVersion) {
+        let _logical_change = self.begin_logical_mutation();
+        self.add_version_raw(row_id, version);
+    }
+
+    fn add_version_raw(&self, row_id: i64, version: RowVersion) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
@@ -800,13 +1363,6 @@ impl VersionStore {
                     // Row was visible, now being deleted -> decrement
                     self.committed_row_count.fetch_sub(1, Ordering::Relaxed);
                 }
-
-                // O(k) chain management - depth computed by traversal
-                // When limit exceeded: drop old chain AND reuse arena slot
-                let existing_depth = count_chain_depth(existing);
-                let new_depth = existing_depth + 1;
-                let can_reuse_arena =
-                    self.max_version_history > 0 && new_depth > self.max_version_history;
 
                 // Only clone existing version data when needed:
                 // 1. For delete operations that need to preserve data
@@ -858,20 +1414,7 @@ impl VersionStore {
                 // Build version chain entry
                 // When limit exceeded: drop entire history (no prev_chain allocation)
                 // When under limit: create prev_chain with existing version
-                let final_prev = if can_reuse_arena {
-                    // Exceeded limit - drop all history, no allocation
-                    None
-                } else {
-                    // Under limit - clone existing version and create chain
-                    let existing_version = existing.version.clone();
-                    let existing_prev = existing.prev.clone();
-                    Some(Arc::new(VersionChainEntry {
-                        version: existing_version,
-                        prev: existing_prev,
-                        // Historical versions don't use arena (slot reused by new HEAD)
-                        arena_idx: None,
-                    }))
-                };
+                let final_prev = self.history_for_next_version(existing);
 
                 let new_entry = VersionChainEntry {
                     version: new_version,
@@ -923,6 +1466,12 @@ impl VersionStore {
     /// Version data uses Arc-backed storage for O(1) clones on read.
     #[inline]
     pub fn add_versions_batch(&self, batch: Vec<(i64, RowVersion)>) {
+        let _logical_change = self.begin_logical_mutation();
+        self.add_versions_batch_raw(batch);
+    }
+
+    #[inline]
+    fn add_versions_batch_raw(&self, batch: Vec<(i64, RowVersion)>) {
         if self.closed.load(Ordering::Acquire) || batch.is_empty() {
             return;
         }
@@ -950,13 +1499,6 @@ impl VersionStore {
                     } else if !was_deleted && is_new_version_deleted {
                         count_delta -= 1; // Row deleted
                     }
-
-                    // O(k) chain management - depth computed by traversal
-                    // When limit exceeded: drop old chain AND reuse arena slot
-                    let existing_depth = count_chain_depth(existing);
-                    let new_depth = existing_depth + 1;
-                    let can_reuse_arena =
-                        self.max_version_history > 0 && new_depth > self.max_version_history;
 
                     // Only clone existing version data when needed:
                     // 1. For delete operations that need to preserve data
@@ -1008,20 +1550,7 @@ impl VersionStore {
                     // Build version chain entry
                     // When limit exceeded: drop entire history (no prev_chain allocation)
                     // When under limit: create prev_chain with existing version
-                    let final_prev = if can_reuse_arena {
-                        // Exceeded limit - drop all history, no allocation
-                        None
-                    } else {
-                        // Under limit - clone existing version and create chain
-                        let existing_version = existing.version.clone();
-                        let existing_prev = existing.prev.clone();
-                        Some(Arc::new(VersionChainEntry {
-                            version: existing_version,
-                            prev: existing_prev,
-                            // Historical versions don't use arena (slot reused by new HEAD)
-                            arena_idx: None,
-                        }))
-                    };
+                    let final_prev = self.history_for_next_version(existing);
 
                     let new_entry = VersionChainEntry {
                         version: new_version,
@@ -1080,6 +1609,12 @@ impl VersionStore {
     /// This avoids Vec allocation for the common single-row commit case.
     #[inline]
     pub fn add_version_single(&self, row_id: i64, version: RowVersion) {
+        let _logical_change = self.begin_logical_mutation();
+        self.add_version_single_raw(row_id, version);
+    }
+
+    #[inline]
+    fn add_version_single_raw(&self, row_id: i64, version: RowVersion) {
         if self.closed.load(Ordering::Acquire) {
             return;
         }
@@ -1102,13 +1637,6 @@ impl VersionStore {
                     // Row was visible, now being deleted -> decrement
                     self.committed_row_count.fetch_sub(1, Ordering::Relaxed);
                 }
-
-                // O(k) chain management - depth computed by traversal
-                // When limit exceeded: drop old chain AND reuse arena slot
-                let existing_depth = count_chain_depth(existing);
-                let new_depth = existing_depth + 1;
-                let can_reuse_arena =
-                    self.max_version_history > 0 && new_depth > self.max_version_history;
 
                 // Only clone existing version data when needed:
                 // 1. For delete operations that need to preserve data
@@ -1157,20 +1685,7 @@ impl VersionStore {
                 // Build version chain entry
                 // When limit exceeded: drop entire history (no prev_chain allocation)
                 // When under limit: create prev_chain with existing version
-                let final_prev = if can_reuse_arena {
-                    // Exceeded limit - drop all history, no allocation
-                    None
-                } else {
-                    // Under limit - clone existing version and create chain
-                    let existing_version = existing.version.clone();
-                    let existing_prev = existing.prev.clone();
-                    Some(Arc::new(VersionChainEntry {
-                        version: existing_version,
-                        prev: existing_prev,
-                        // Historical versions don't use arena (slot reused by new HEAD)
-                        arena_idx: None,
-                    }))
-                };
+                let final_prev = self.history_for_next_version(existing);
 
                 let new_entry = VersionChainEntry {
                     version: new_version,
@@ -2128,6 +2643,138 @@ impl VersionStore {
             .is_some_and(|c| c.needs_snapshot_isolation(txn_id))
     }
 
+    pub(crate) fn set_truncate_coordinator(&self, coordinator: &Arc<dyn TruncateCoordinator>) {
+        if self.truncate_coordinator.get().is_none() {
+            let _ = self.truncate_coordinator.set(coordinator.clone());
+        }
+    }
+
+    pub(crate) fn coordinated_truncate(
+        &self,
+        txn_id: i64,
+        private_epoch: Option<(&ReadEpoch, usize)>,
+    ) -> crate::core::Result<i32> {
+        self.truncate_coordinator
+            .get()
+            .ok_or_else(|| Error::internal("physical TRUNCATE requires an engine coordinator"))?
+            .truncate(self, txn_id, private_epoch)
+    }
+
+    /// Call while registry DDL admission excludes writers, before WAL. Native
+    /// empty replacements remove fallible Index::clear calls from publication.
+    /// Unknown custom indexes fail here, while all prior state still exists.
+    pub(crate) fn prepare_hot_truncate(&self) -> crate::core::Result<PreparedHotTruncate> {
+        use crate::storage::index::{
+            BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex, PkIndex,
+        };
+        if self.is_closed() {
+            return Err(Error::TableClosed);
+        }
+        if !self.uncommitted_writes.read().is_empty()
+            || self.publishing.load(Ordering::Acquire) != 0
+        {
+            return Err(Error::TableHasActiveTransactions);
+        }
+        let indexes = self.indexes.read();
+        let mut empty = FxHashMap::with_capacity_and_hasher(indexes.len(), Default::default());
+        for (key, index) in indexes.iter() {
+            let name = index.name().to_owned();
+            let table = index.table_name().to_owned();
+            let ids = index.column_ids();
+            let names = index.column_names();
+            let types = index.data_types();
+            let unique = index.is_unique();
+            let replacement: Arc<dyn Index> = if index.as_any().is::<PkIndex>() {
+                Arc::new(PkIndex::new(name, table, ids[0], names[0].clone()))
+            } else if index.as_any().is::<BTreeIndex>() {
+                Arc::new(BTreeIndex::new(
+                    name,
+                    table,
+                    ids[0],
+                    names[0].clone(),
+                    types[0],
+                    unique,
+                    0,
+                ))
+            } else if index.as_any().is::<HashIndex>() {
+                Arc::new(HashIndex::new(
+                    name,
+                    table,
+                    names.to_vec(),
+                    ids.to_vec(),
+                    types.to_vec(),
+                    unique,
+                    0,
+                ))
+            } else if index.as_any().is::<BitmapIndex>() {
+                Arc::new(BitmapIndex::new(
+                    name,
+                    table,
+                    names.to_vec(),
+                    ids.to_vec(),
+                    types.to_vec(),
+                    unique,
+                    0,
+                ))
+            } else if index.as_any().is::<MultiColumnIndex>() {
+                Arc::new(MultiColumnIndex::new(
+                    name,
+                    table,
+                    names.to_vec(),
+                    ids.to_vec(),
+                    types.to_vec(),
+                    unique,
+                    0,
+                ))
+            } else if let Some(hnsw) = index.as_any().downcast_ref::<HnswIndex>() {
+                let dims = hnsw.dimensions();
+                let (m, construction, search, metric) = hnsw.params();
+                let mut replacement = HnswIndex::new(
+                    name,
+                    table,
+                    names[0].clone(),
+                    ids[0],
+                    dims,
+                    m,
+                    construction,
+                    search,
+                    metric,
+                );
+                replacement.set_unique(unique);
+                Arc::new(replacement)
+            } else {
+                return Err(Error::internal(
+                    "physical TRUNCATE does not support this custom index",
+                ));
+            };
+            empty.insert(key.clone(), replacement);
+        }
+        Ok(PreparedHotTruncate {
+            versions: crate::common::CowBTree::new(),
+            indexes: empty,
+        })
+    }
+
+    /// Infallible after preparation: only swaps/moves and atomics. All old
+    /// ownership is returned for destruction after the transfer fence unlocks.
+    pub(crate) fn apply_hot_truncate(&self, prepared: PreparedHotTruncate) -> RetiredHotTruncate {
+        let _claims = self.uncommitted_writes.write();
+        let mut versions = self.versions.write();
+        let old_versions = std::mem::replace(&mut *versions, prepared.versions);
+        let old_arena = self.arena.take_all_for_truncate();
+        let old_indexes = std::mem::replace(&mut *self.indexes.write(), prepared.indexes);
+        let old_zone_maps = self.zone_maps.write().take();
+        self.committed_row_count.store(0, Ordering::SeqCst);
+        self.auto_increment_counter.store(0, Ordering::Release);
+        self.publish_epoch.fetch_add(1, Ordering::Release);
+        RetiredHotTruncate {
+            _versions: old_versions,
+            _indexes: old_indexes,
+            _arena: old_arena,
+            _zone_maps: old_zone_maps,
+        }
+    }
+
     /// Clears all data in O(1) for TRUNCATE.
     /// Drops all versions, arena data, indexes, and resets row count.
     /// Returns the number of rows that were truncated.
@@ -2141,6 +2788,7 @@ impl VersionStore {
     /// Fails with `TableHasActiveTransactions` if another transaction holds
     /// uncommitted UPDATE/DELETE claims on this table.
     pub fn truncate_all(&self) -> crate::core::Result<i32> {
+        let _logical_change = self.begin_logical_mutation();
         // Hold uncommitted_writes(W) for the ENTIRE check-and-clear sequence
         // to prevent TOCTOU race: without this, a concurrent try_claim_row()
         // could add a claim between the check and the clear, and truncate would
@@ -2207,6 +2855,24 @@ impl VersionStore {
     pub fn extract_for_seal(&self, txn_id: i64) -> (RowVec, ExtractionSnapshot) {
         let snapshot = self.versions.read().clone();
         let rows = self.get_all_visible_rows_internal(txn_id);
+        (rows, ExtractionSnapshot { inner: snapshot })
+    }
+
+    /// Select only eligible heads from the exact root later used by removal.
+    /// An older version must never stand in for an ineligible head: removing
+    /// that head would destroy the newer value. Deletions stay hot for transfer.
+    pub(crate) fn extract_for_seal_in_build(
+        &self,
+        build: &super::registry::BuildLease,
+    ) -> (RowVec, ExtractionSnapshot) {
+        let snapshot = self.versions.read().clone();
+        let mut reader = build.reader();
+        let mut rows = RowVec::new();
+        for (&row_id, entry) in snapshot.iter() {
+            if entry.version.deleted_at_txn_id == 0 && reader.is_visible(entry.version.txn_id) {
+                rows.push((row_id, entry.version.data.clone()));
+            }
+        }
         (rows, ExtractionSnapshot { inner: snapshot })
     }
 
@@ -4739,6 +5405,87 @@ impl VersionStore {
         parking_lot::Mutex::lock_arc(&self.upsert_mutex)
     }
 
+    /// Visit current committed payloads while the caller owns the index build
+    /// lease. The fresh epoch never inherits the DDL transaction's snapshot or
+    /// uncommitted overlay. A raw unresolved head is a retryable conflict: the
+    /// public local-store commit API can release its catalog lease before its
+    /// caller publishes the registry outcome. Building an older visible version
+    /// in that gap would leave the new index missing the later committed key.
+    fn for_each_current_index_row(
+        &self,
+        mut visit: impl FnMut(i64, &Row),
+    ) -> crate::core::Result<()> {
+        let epoch = self
+            .visibility_checker
+            .as_ref()
+            .and_then(|checker| checker.capture_current_read_epoch());
+        let root = self.capture_hot_root();
+        let mut reader = epoch.as_ref().map(ReadEpoch::reader);
+        let mut is_visible = |txn_id| {
+            if let Some(reader) = reader.as_mut() {
+                return reader.is_visible(txn_id);
+            }
+            // Standalone stores and lightweight test checkers have no epoch
+            // registry. Their unregistered viewer means current committed.
+            self.visibility_checker.as_ref().is_none_or(|checker| {
+                checker.is_visible(
+                    txn_id,
+                    crate::storage::mvcc::registry::INVALID_TRANSACTION_ID + 1,
+                )
+            })
+        };
+        for (&row_id, entry) in root.inner.iter() {
+            let version = &entry.version;
+            if !is_visible(version.txn_id)
+                || (version.deleted_at_txn_id != 0 && !is_visible(version.deleted_at_txn_id))
+            {
+                // Also conservatively reject a definitely aborted raw head;
+                // its owner's undo must complete before rebuilding the catalog.
+                return Err(Error::internal(
+                    "write conflict: index build encountered an unresolved row mutation",
+                ));
+            }
+            if version.deleted_at_txn_id == 0 {
+                visit(row_id, &version.data);
+            }
+        }
+        Ok(())
+    }
+
+    /// Project only indexed columns, applying the same schema defaults as row
+    /// readers. Older payloads can be shorter after ADD COLUMN.
+    fn current_index_values(row: &Row, schema: &Schema, columns: &[usize]) -> Vec<Value> {
+        columns
+            .iter()
+            .map(|&column| {
+                row.get(column).cloned().unwrap_or_else(|| {
+                    schema
+                        .columns
+                        .get(column)
+                        .map_or_else(Value::null_unknown, |col| {
+                            col.default_value
+                                .clone()
+                                .unwrap_or(Value::Null(col.data_type))
+                        })
+                })
+            })
+            .collect()
+    }
+
+    /// Collect a detached index's keys while its catalog build lease is held.
+    /// No full normalized row or transaction-local overlay is copied.
+    pub(crate) fn current_index_entries(
+        &self,
+        schema: &Schema,
+        columns: &[usize],
+    ) -> crate::core::Result<Vec<(i64, Vec<Value>)>> {
+        let mut entries = Vec::new();
+        self.for_each_current_index_row(|row_id, row| {
+            entries.push((row_id, Self::current_index_values(row, schema, columns)));
+        })?;
+        Ok(entries)
+    }
+
     /// Exclude publishers for the complete index build, before scanning rows.
     pub(crate) fn begin_index_build(&self) -> Result<IndexCatalogLease, Error> {
         IndexCatalogLease::try_acquire(&self.index_catalog, true).ok_or_else(|| {
@@ -4952,6 +5699,7 @@ impl VersionStore {
 
     /// Close the version store
     pub fn close(&self) {
+        let _logical_change = self.begin_logical_mutation();
         self.closed.store(true, Ordering::Release);
     }
 
@@ -4976,6 +5724,7 @@ impl VersionStore {
     /// occur when snapshot and WAL both contain the same committed data due to race
     /// conditions during snapshot creation.
     pub fn apply_recovered_version(&self, row_id: i64, version: RowVersion) {
+        let _logical_change = self.begin_logical_mutation();
         let is_deleted = version.is_deleted();
         let row_data = version.data.clone();
 
@@ -5000,7 +5749,7 @@ impl VersionStore {
         }
 
         // Add the version to the store
-        self.add_version(row_id, version);
+        self.add_version_raw(row_id, version);
 
         // Update auto_increment counter if this row_id is higher
         // This ensures the counter is restored to at least the max seen row_id
@@ -5042,6 +5791,7 @@ impl VersionStore {
     /// This creates a deleted version for the row during recovery.
     /// Also removes the row from any existing indexes.
     pub fn mark_deleted(&self, row_id: i64, txn_id: i64) {
+        let _logical_change = self.begin_logical_mutation();
         // Get the old row data for index removal BEFORE creating the deleted version
         let old_row = self
             .get_visible_version(row_id, txn_id)
@@ -5057,7 +5807,7 @@ impl VersionStore {
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0),
         };
-        self.add_version(row_id, deleted_version);
+        self.add_version_raw(row_id, deleted_version);
 
         // Remove from indexes using old row data
         if let Some(old_data) = old_row {
@@ -5120,6 +5870,9 @@ impl VersionStore {
     ) -> crate::core::Result<()> {
         use crate::core::IndexType;
         use crate::storage::index::{BitmapIndex, HashIndex};
+
+        let catalog_build = self.begin_index_build()?;
+        let schema = self.schema();
 
         // Check if we have the required column information
         if meta.column_names.is_empty() {
@@ -5292,27 +6045,17 @@ impl VersionStore {
             // Populate the index with existing data unless deferred
             // Uses batch_slice for better performance
             if !skip_population {
-                let col_idx = column_id as usize;
-                let versions = self.versions.read().clone();
-                let mut entries: Vec<(i64, Vec<crate::core::Value>)> = Vec::new();
-                for (&row_id, version_chain) in versions.iter() {
-                    let version = &version_chain.version;
-                    if !version.is_deleted() {
-                        if let Some(value) = version.data.get(col_idx) {
-                            entries.push((row_id, vec![value.clone()]));
-                        }
-                    }
-                }
+                let entries = self.current_index_entries(&schema, &[column_id as usize])?;
                 if !entries.is_empty() {
                     let entry_refs: Vec<(i64, &[crate::core::Value])> = entries
                         .iter()
                         .map(|(row_id, values)| (*row_id, values.as_slice()))
                         .collect();
-                    let _ = index.add_batch_slice(&entry_refs);
+                    index.add_batch_slice(&entry_refs)?;
                 }
             }
 
-            self.add_index(meta.name.clone(), index)?;
+            self.add_index_under_build(meta.name.clone(), index, &catalog_build)?;
         } else {
             // Multi-column index: use MultiColumnIndex
             let index = crate::storage::index::MultiColumnIndex::new(
@@ -5332,33 +6075,17 @@ impl VersionStore {
             if !skip_population {
                 let col_indices: Vec<usize> =
                     meta.column_ids.iter().map(|&id| id as usize).collect();
-                let versions = self.versions.read().clone();
-                let mut entries: Vec<(i64, Vec<crate::core::Value>)> = Vec::new();
-                for (&row_id, version_chain) in versions.iter() {
-                    let version = &version_chain.version;
-                    if !version.is_deleted() {
-                        let values: Vec<crate::core::Value> =
-                            col_indices
-                                .iter()
-                                .map(|&idx| {
-                                    version.data.get(idx).cloned().unwrap_or(
-                                        crate::core::Value::Null(crate::core::DataType::Null),
-                                    )
-                                })
-                                .collect();
-                        entries.push((row_id, values));
-                    }
-                }
+                let entries = self.current_index_entries(&schema, &col_indices)?;
                 if !entries.is_empty() {
                     let entry_refs: Vec<(i64, &[crate::core::Value])> = entries
                         .iter()
                         .map(|(row_id, values)| (*row_id, values.as_slice()))
                         .collect();
-                    let _ = index.add_batch_slice(&entry_refs);
+                    index.add_batch_slice(&entry_refs)?;
                 }
             }
 
-            self.add_index(meta.name.clone(), index)?;
+            self.add_index_under_build(meta.name.clone(), index, &catalog_build)?;
         }
 
         Ok(())
@@ -5366,17 +6093,18 @@ impl VersionStore {
 
     /// Populate all indexes in a single pass over the version store
     ///
-    /// This is O(N + M) where N = number of rows and M = number of indexes,
-    /// compared to O(N * M) when populating each index separately.
+    /// Walks the tree once and projects each index from the same committed view.
     ///
     /// OPTIMIZATION: Uses batch_slice operations to reduce lock acquisitions
     /// from O(rows × indexes) to O(indexes).
     ///
     /// Call this after WAL replay completes with skip_population=true.
-    pub fn populate_all_indexes(&self) {
+    pub fn populate_all_indexes(&self) -> crate::core::Result<()> {
+        let _catalog_build = self.begin_index_build()?;
+        let schema = self.schema();
         let indexes = self.indexes.read();
         if indexes.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Collect index info: (column_ids as Vec<usize>, index_arc)
@@ -5397,7 +6125,7 @@ impl VersionStore {
         drop(indexes); // Release lock before iteration
 
         if index_infos.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Pre-allocate per-index batch vectors
@@ -5405,37 +6133,12 @@ impl VersionStore {
         let mut batches: Vec<Vec<(i64, Vec<crate::core::Value>)>> =
             (0..num_indexes).map(|_| Vec::new()).collect();
 
-        // First pass: Collect all entries per index
-        let versions = self.versions.read().clone();
-        for (&row_id, version_chain) in versions.iter() {
-            let version = &version_chain.version;
-
-            if version.is_deleted() {
-                continue;
+        // One canonical row walk; materialize only each index's columns.
+        self.for_each_current_index_row(|row_id, row| {
+            for (idx, (columns, _)) in index_infos.iter().enumerate() {
+                batches[idx].push((row_id, Self::current_index_values(row, &schema, columns)));
             }
-
-            // Collect entries for each index
-            for (idx, (col_indices, _)) in index_infos.iter().enumerate() {
-                if col_indices.len() == 1 {
-                    // Single-column index
-                    if let Some(value) = version.data.get(col_indices[0]) {
-                        batches[idx].push((row_id, vec![value.clone()]));
-                    }
-                } else {
-                    // Multi-column index
-                    let values: Vec<crate::core::Value> =
-                        col_indices
-                            .iter()
-                            .map(|&col_idx| {
-                                version.data.get(col_idx).cloned().unwrap_or(
-                                    crate::core::Value::Null(crate::core::DataType::Null),
-                                )
-                            })
-                            .collect();
-                    batches[idx].push((row_id, values));
-                }
-            }
-        }
+        })?;
 
         // Second pass: Apply batch operations per index
         // This reduces lock acquisitions from O(rows × indexes) to O(indexes)
@@ -5445,9 +6148,10 @@ impl VersionStore {
                     .iter()
                     .map(|(row_id, values)| (*row_id, values.as_slice()))
                     .collect();
-                let _ = index.add_batch_slice(&entry_refs);
+                index.add_batch_slice(&entry_refs)?;
             }
         }
+        Ok(())
     }
 
     /// Populate HNSW indexes from external rows (e.g., cold segment data).
@@ -5459,10 +6163,15 @@ impl VersionStore {
     ///
     /// HnswInner::insert skips duplicate row_ids, so calling this after
     /// populate_all_indexes() is safe (hot rows already in the index).
-    pub fn populate_hnsw_from_rows(&self, rows: &[(i64, crate::core::Row)]) {
+    pub fn populate_hnsw_from_rows(
+        &self,
+        rows: &[(i64, crate::core::Row)],
+    ) -> crate::core::Result<()> {
+        let _catalog_build = self.begin_index_build()?;
+        let schema = self.schema();
         let indexes = self.indexes.read();
         if indexes.is_empty() || rows.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Collect only HNSW indexes with their column indices
@@ -5482,7 +6191,7 @@ impl VersionStore {
         drop(indexes);
 
         if hnsw_infos.is_empty() {
-            return;
+            return Ok(());
         }
 
         // Pre-allocate per-index batch vectors
@@ -5491,22 +6200,8 @@ impl VersionStore {
             .collect();
 
         for &(row_id, ref row) in rows {
-            for (idx, (col_indices, _)) in hnsw_infos.iter().enumerate() {
-                if col_indices.len() == 1 {
-                    if let Some(value) = row.get(col_indices[0]) {
-                        batches[idx].push((row_id, vec![value.clone()]));
-                    }
-                } else {
-                    let values: Vec<crate::core::Value> = col_indices
-                        .iter()
-                        .map(|&col_idx| {
-                            row.get(col_idx)
-                                .cloned()
-                                .unwrap_or(crate::core::Value::Null(crate::core::DataType::Null))
-                        })
-                        .collect();
-                    batches[idx].push((row_id, values));
-                }
+            for (idx, (columns, _)) in hnsw_infos.iter().enumerate() {
+                batches[idx].push((row_id, Self::current_index_values(row, &schema, columns)));
             }
         }
 
@@ -5516,9 +6211,10 @@ impl VersionStore {
                     .iter()
                     .map(|(row_id, values)| (*row_id, values.as_slice()))
                     .collect();
-                let _ = index.add_batch_slice(&entry_refs);
+                index.add_batch_slice(&entry_refs)?;
             }
         }
+        Ok(())
     }
 
     // =========================================================================
@@ -5550,6 +6246,18 @@ impl VersionStore {
         row_ids: &[i64],
         extraction_snapshot: &ExtractionSnapshot,
     ) -> (usize, SealedIndexCleanup, Vec<i64>) {
+        let _logical_change = self.begin_logical_mutation();
+        self.remove_sealed_rows_after_cold_publication(row_ids, extraction_snapshot)
+    }
+
+    /// Engine-only physical relocation after equivalent cold data was published
+    /// under the common seal fence. Public removal lacks that proof and must
+    /// invalidate reusable logical read provenance.
+    pub(crate) fn remove_sealed_rows_after_cold_publication(
+        &self,
+        row_ids: &[i64],
+        extraction_snapshot: &ExtractionSnapshot,
+    ) -> (usize, SealedIndexCleanup, Vec<i64>) {
         if row_ids.is_empty() {
             return (0, SealedIndexCleanup::default(), Vec::new());
         }
@@ -5577,12 +6285,13 @@ impl VersionStore {
                     // If they differ, a concurrent commit changed this row
                     // after we extracted it — the sealed volume has stale data
                     // for this row. Keep the newer version in hot.
-                    let extracted_txn_id = extraction_snapshot
+                    let extracted_identity = extraction_snapshot
                         .inner
                         .get(row_id)
-                        .map(|e| e.version.txn_id)
-                        .unwrap_or(0);
-                    if entry.version.txn_id != extracted_txn_id {
+                        .map(|e| (e.version.txn_id, e.version.deleted_at_txn_id));
+                    if Some((entry.version.txn_id, entry.version.deleted_at_txn_id))
+                        != extracted_identity
+                    {
                         skipped_ids.push(row_id);
                         continue;
                     }
@@ -5805,6 +6514,17 @@ impl VersionStore {
             None => return true, // No checker, assume safe
         };
 
+        // A captured result may outlive every active transaction. Remove a
+        // deletion only when both identities are committed at/before the oldest
+        // retained horizon; newer/excluded deletions may still expose payloads.
+        if let Some(horizon) = checker.oldest_retention_horizon() {
+            return checker.is_committed_before(version.txn_id, horizon)
+                && checker.is_committed_before(version.deleted_at_txn_id, horizon);
+        }
+        if !checker.is_committed_before(version.deleted_at_txn_id, checker.get_current_sequence()) {
+            return false;
+        }
+
         // Get all active transaction IDs
         let active_txns = checker.get_active_transaction_ids();
 
@@ -5878,6 +6598,9 @@ impl VersionStore {
         for chunk in candidate_row_ids.chunks(2_000) {
             let uncommitted = self.uncommitted_writes.read();
             let mut versions = self.versions.write();
+            // Sample after taking the live tree lock. A new publisher cannot
+            // replace HEAD between this horizon decision and the pruning below.
+            let horizon = checker.oldest_retention_horizon();
 
             for &row_id in chunk {
                 if uncommitted.contains_key(row_id) {
@@ -5899,19 +6622,32 @@ impl VersionStore {
                     continue;
                 }
 
-                // Check each previous version independently — do NOT assume monotonic
-                // visibility. With rapid updates, a newer prev version may be invisible
-                // to an active txn while an older one IS visible (e.g., HEAD seq=120,
-                // prev_0 seq=110, prev_1 seq=80, active txn snapshot at seq=100 needs prev_1).
+                // Preserve every newer/uncertain version through the first
+                // committed creator at/before the floor. That baseline answers
+                // the oldest epoch; all newer retained versions answer later
+                // epochs, including non-monotonic commit order and exclusions.
+                // A deletion with a distinct, newer publisher keeps its payload,
+                // so the creator is sufficient to choose the baseline here.
+                let mut needs_baseline = horizon.is_some_and(|floor| {
+                    !checker.is_committed_before(chain_entry.version.txn_id, floor)
+                });
                 let mut keep_count = 0;
                 for (i, prev_entry) in prev_versions.iter().enumerate() {
-                    let mut keep = false;
+                    let mut keep = needs_baseline;
+                    if needs_baseline
+                        && checker.is_committed_before(prev_entry.version.txn_id, horizon.unwrap())
+                    {
+                        needs_baseline = false;
+                    }
 
-                    // Rule 1: Keep if needed by any active transaction
-                    for &txn_id in &active_txns {
-                        if checker.is_visible(prev_entry.version.txn_id, txn_id) {
-                            keep = true;
-                            break;
+                    // Compatibility for custom visibility checkers that do not
+                    // expose epochs. The registry uses the bounded floor above.
+                    if horizon.is_none() {
+                        for &txn_id in &active_txns {
+                            if checker.is_visible(prev_entry.version.txn_id, txn_id) {
+                                keep = true;
+                                break;
+                            }
                         }
                     }
 
@@ -6088,7 +6824,8 @@ impl VersionStore {
     /// detection (First-Committer-Wins).
     ///
     /// Returns:
-    /// - Some(txn_id) if the row exists
+    /// - Some(mutation_txn_id) if the row exists (deleter for a deletion,
+    ///   otherwise creator)
     /// - None if the row does not exist
     pub fn get_latest_version_id(&self, row_id: i64) -> Option<i64> {
         if self.closed.load(Ordering::Acquire) {
@@ -6096,7 +6833,36 @@ impl VersionStore {
         }
 
         let versions = self.versions.read();
-        versions.get(row_id).map(|entry| entry.version.txn_id)
+        versions.get(row_id).map(|entry| {
+            // A version can retain its creator while a different transaction
+            // publishes its deletion. Both are writes for conflict detection.
+            if entry.version.deleted_at_txn_id != 0 {
+                entry.version.deleted_at_txn_id
+            } else {
+                entry.version.txn_id
+            }
+        })
+    }
+
+    /// The caller holds this row's write claim. Inspect the current head, not
+    /// an older visible chain entry, when validating a captured cold baseline.
+    pub(crate) fn validate_mutation_epoch(
+        &self,
+        row_id: i64,
+        epoch: &super::registry::ReadEpoch,
+    ) -> Result<(), Error> {
+        let versions = self.versions.read();
+        if let Some(entry) = versions.get(row_id) {
+            if !epoch.is_visible(entry.version.txn_id)
+                || (entry.version.deleted_at_txn_id != 0
+                    && !epoch.is_visible(entry.version.deleted_at_txn_id))
+            {
+                return Err(Error::internal(format!(
+                    "write conflict: row {row_id} changed after the captured read epoch"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Compute grouped aggregates directly from arena storage.
@@ -7133,6 +7899,27 @@ impl TransactionVersionStore {
             .and_then(|versions| versions.last())
     }
 
+    /// Freeze the transaction's latest writes before binding a read epoch. The
+    /// empty/read-only path allocates nothing. All payloads become shared here,
+    /// so subsequent lazy reads and owning row results do not clone value arrays.
+    pub fn capture_hot_overlay(&self) -> Option<CapturedHotOverlay> {
+        if !self.has_local_changes() {
+            return None;
+        }
+        let mut rows: Vec<_> = self
+            .iter_local()
+            .map(|(id, version)| {
+                let mut version = version.clone();
+                version.data = version.data.into_shared();
+                (id, version)
+            })
+            .collect();
+        rows.sort_unstable_by_key(|(id, _)| *id);
+        Some(CapturedHotOverlay {
+            rows: Arc::new(rows),
+        })
+    }
+
     /// Iterate over local versions (returns most recent version per row)
     pub fn iter_local(&self) -> impl Iterator<Item = (i64, &RowVersion)> {
         self.local_versions
@@ -7404,6 +8191,15 @@ impl TransactionVersionStore {
     }
 
     pub fn apply_prepared_publication(&mut self) -> Result<(), Error> {
+        let _logical_change = self.parent_store.begin_logical_mutation();
+        self.apply_prepared_publication_in_transaction()
+    }
+
+    /// Engine-only path: the owning MvccTransaction started registry commit and
+    /// will either publish its outcome or guard the complete abort/undo interval.
+    /// Direct callers may supply an already-visible creator and use the guarded
+    /// public entry point instead. This keeps normal DML free of per-row hooks.
+    pub(crate) fn apply_prepared_publication_in_transaction(&mut self) -> Result<(), Error> {
         let indexes = self
             .mutation
             .as_ref()
@@ -7419,7 +8215,7 @@ impl TransactionVersionStore {
             if let Some((row_id, versions)) = local.iter().next() {
                 if let Some(version) = versions.last() {
                     self.parent_store
-                        .add_version_single(row_id, version.clone());
+                        .add_version_single_raw(row_id, version.clone());
                 }
             }
         } else {
@@ -7430,7 +8226,7 @@ impl TransactionVersionStore {
                 })
                 .collect();
             batch.sort_unstable_by_key(|(row_id, _)| *row_id);
-            self.parent_store.add_versions_batch(batch);
+            self.parent_store.add_versions_batch_raw(batch);
         }
         Ok(())
     }
@@ -7439,6 +8235,7 @@ impl TransactionVersionStore {
         let Some(mut mutation) = self.mutation.take() else {
             return Ok(());
         };
+        let _logical_undo = (!committed).then(|| self.parent_store.begin_logical_mutation());
         if !committed {
             if let Err(error) = self.undo_index_updates() {
                 self.mutation = Some(mutation);
@@ -8187,6 +8984,462 @@ mod tests {
     use super::*;
     use crate::core::Value;
     use std::sync::atomic::AtomicI64;
+
+    fn epoch_test_store() -> (
+        Arc<crate::storage::mvcc::registry::TransactionRegistry>,
+        Arc<VersionStore>,
+    ) {
+        let registry = Arc::new(crate::storage::mvcc::registry::TransactionRegistry::new());
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "epoch_test",
+            test_schema(),
+            registry.clone(),
+        ));
+        (registry, store)
+    }
+
+    fn commit_epoch_row(
+        registry: &crate::storage::mvcc::registry::TransactionRegistry,
+        store: &VersionStore,
+        id: i64,
+        value: i64,
+    ) -> i64 {
+        let (txn, _) = registry.begin_transaction();
+        registry.start_commit(txn);
+        store.add_version(
+            id,
+            RowVersion::new_with_timestamp(txn, Row::from(vec![Value::Integer(value)]), 0),
+        );
+        registry.complete_commit(txn);
+        txn
+    }
+
+    #[test]
+    fn seal_build_removal_preserves_a_distinct_deleter_after_extraction() {
+        let (registry, store) = epoch_test_store();
+        let creator = commit_epoch_row(&registry, &store, 1, 10);
+        let build = registry.register_build_lease();
+        let (rows, snapshot) = store.extract_for_seal_in_build(&build);
+        assert_eq!(rows.len(), 1);
+        let (deleter, _) = registry.begin_transaction();
+        registry.start_commit(deleter);
+        let mut deleted = snapshot.inner.get(1).unwrap().version.clone();
+        assert_eq!(deleted.txn_id, creator);
+        deleted.deleted_at_txn_id = deleter;
+        store.add_version(1, deleted);
+        registry.complete_commit(deleter);
+        let (removed, _, skipped) = store.remove_sealed_rows(&[1], &snapshot);
+        assert_eq!(
+            removed, 0,
+            "a changed deleter is a changed extraction identity"
+        );
+        assert_eq!(skipped, vec![1]);
+        assert_eq!(
+            store
+                .versions
+                .read()
+                .get(1)
+                .unwrap()
+                .version
+                .deleted_at_txn_id,
+            deleter
+        );
+    }
+
+    #[test]
+    fn seal_build_zero_cutoff_and_late_heads_never_mean_unfiltered() {
+        let (registry, store) = epoch_test_store();
+        let earliest = registry.capture_read_epoch();
+        assert_eq!(earliest.cutoff(), 0);
+        let (inflight, _) = registry.begin_transaction();
+        let committed_sequence = registry.start_commit(inflight);
+        store.add_version(
+            1,
+            RowVersion::new(inflight, Row::from(vec![Value::Integer(10)])),
+        );
+        let zero = registry.register_build_lease();
+        assert_eq!(zero.cutoff(), 0);
+        assert!(store.extract_for_seal_in_build(&zero).0.is_empty());
+        registry.complete_commit(inflight);
+        assert!(
+            store.extract_for_seal_in_build(&zero).0.is_empty(),
+            "a publisher completing cannot broaden the fixed build eligibility"
+        );
+        drop(zero);
+        drop(earliest);
+
+        let build = registry.register_build_lease();
+        assert_eq!(build.cutoff(), committed_sequence);
+        let (rows, _) = store.extract_for_seal_in_build(&build);
+        assert_eq!(rows[0], (1, Row::from(vec![Value::Integer(10)])));
+        let (later, _) = registry.begin_transaction();
+        registry.start_commit(later);
+        store.add_version(
+            1,
+            RowVersion::new(later, Row::from(vec![Value::Integer(20)])),
+        );
+        store.add_version(
+            2,
+            RowVersion::new(later, Row::from(vec![Value::Integer(30)])),
+        );
+        registry.complete_commit(later);
+        assert!(
+            store.extract_for_seal_in_build(&build).0.is_empty(),
+            "an older eligible historical version must never stand in for an ineligible head"
+        );
+        drop(build);
+        let newer = registry.register_build_lease();
+        assert_eq!(store.extract_for_seal_in_build(&newer).0.len(), 2);
+    }
+
+    #[test]
+    fn captured_authority_bounds_preserve_unsorted_extremes_own_writes_and_replaced_roots() {
+        use crate::storage::mvcc::registry::{TransactionRegistry, RECOVERY_TRANSACTION_ID};
+        let registry = TransactionRegistry::new();
+        let root_for = |ids: &[i64]| {
+            let mut inner = crate::common::CowBTree::new();
+            for &id in ids {
+                inner.insert(
+                    id,
+                    VersionChainEntry {
+                        version: RowVersion::new(
+                            RECOVERY_TRANSACTION_ID,
+                            Row::from(vec![Value::Integer(id)]),
+                        ),
+                        prev: None,
+                        arena_idx: None,
+                    },
+                );
+            }
+            CapturedHotRoot { inner }
+        };
+        let own = CapturedHotOverlay {
+            rows: Arc::new(vec![
+                (
+                    i64::MIN,
+                    RowVersion::new(17, Row::from(vec![Value::Integer(1)])),
+                ),
+                (i64::MAX, RowVersion::new_deleted(17, Row::new())),
+            ]),
+        };
+        let mut view = CapturedHotView::new(
+            root_for(&[10, 20]),
+            registry.capture_read_epoch(),
+            Some(own),
+        );
+        let ids = [i64::MAX, 21, 10, i64::MIN, 9, 20, -1];
+        let mut bits = [u64::MAX; 2];
+        view.mark_authoritative(&ids, &mut bits);
+        assert_eq!(bits, [0b10_1101, u64::MAX]);
+        assert_eq!(view.authority_bounds(), Some((i64::MIN, i64::MAX)));
+        view.own = None;
+        assert_eq!(view.authority_bounds(), Some((10, 20)));
+        view.mark_authoritative(&ids, &mut bits);
+        assert_eq!(bits, [0b10_0100, u64::MAX]);
+        // Bounds belong to the currently captured root, not a stale cached view.
+        view.replace_root(root_for(&[-3, -1]));
+        view.mark_authoritative(&ids, &mut bits);
+        assert_eq!(bits, [1 << 6, u64::MAX]);
+        view.replace_root(root_for(&[i64::MIN, i64::MAX]));
+        view.mark_authoritative(&ids, &mut bits);
+        assert_eq!(bits, [0b1001, u64::MAX]);
+        view.replace_root(root_for(&[]));
+        view.mark_authoritative(&ids, &mut bits);
+        assert_eq!(bits, [0, u64::MAX]);
+    }
+
+    #[test]
+    fn captured_hot_epoch_excludes_late_commit_and_owns_payload_after_arena_changes() {
+        let (registry, store) = epoch_test_store();
+        let creator = commit_epoch_row(&registry, &store, 0, 10);
+        commit_epoch_row(&registry, &store, -9, 9);
+        let (pending, _) = registry.begin_transaction();
+        registry.start_commit(pending);
+        store.add_versions_batch(vec![
+            (
+                0,
+                RowVersion::new(pending, Row::from(vec![Value::Integer(20)])),
+            ),
+            (
+                100,
+                RowVersion::new(pending, Row::from(vec![Value::Integer(100)])),
+            ),
+        ]);
+        let epoch = registry.capture_read_epoch();
+        let view = CapturedHotView::new(store.capture_hot_root(), epoch.clone(), None);
+        assert!(view.same_epoch(&epoch));
+        registry.complete_commit(pending);
+        commit_epoch_row(&registry, &store, 0, 30);
+        registry.run_gc();
+        // The frozen root contains the pending head, but the excluded publisher
+        // remains invisible even after completion. Mutable arena now holds 30.
+        assert_eq!(
+            view.row_state(0),
+            CapturedHotRow::Value(&Row::from(vec![Value::Integer(10)]))
+        );
+        assert_eq!(view.row_state(100), CapturedHotRow::NoVisibleVersion);
+        assert_eq!(view.row_state(999), CapturedHotRow::NoVisibleVersion);
+        assert_eq!(
+            view.root.visible_version(0, &epoch).unwrap().txn_id,
+            creator
+        );
+        assert!(view.root.visible_version(100, &epoch).is_none());
+        let mut original_ids = Vec::new();
+        view.root
+            .for_each_visible_version(&epoch, |id, _| original_ids.push(id));
+        assert_eq!(original_ids, vec![-9, 0]);
+        let mut cold_ids = [999; 66];
+        cold_ids[0] = 0;
+        cold_ids[1] = 100;
+        cold_ids[2] = -9;
+        cold_ids[63] = -9;
+        cold_ids[64] = 0;
+        cold_ids[65] = 100;
+        let mut authority = [u64::MAX; 3];
+        view.mark_authoritative(&cold_ids, &mut authority);
+        assert_eq!(authority, [1 | 4 | (1u64 << 63), 1, u64::MAX]);
+
+        let mut ids = Vec::new();
+        view.for_each_visible(|id, _| ids.push(id));
+        assert_eq!(ids, vec![-9, 0]);
+        drop(store);
+        assert_eq!(
+            view.row_state_owned(0),
+            CapturedHotRowOwned::Value(Row::from(vec![Value::Integer(10)]))
+        );
+    }
+
+    #[test]
+    fn captured_hot_own_overlay_is_sorted_frozen_and_survives_commit() {
+        let (registry, store) = epoch_test_store();
+        for id in [-3, 0, 5] {
+            commit_epoch_row(&registry, &store, id, id);
+        }
+        let (txn, _) = registry.begin_transaction();
+        let mut local = TransactionVersionStore::new(store.clone(), txn);
+        assert!(local.capture_hot_overlay().is_none());
+        assert!(local.local_versions.is_none());
+        local
+            .put(10, Row::from(vec![Value::Integer(10)]), false)
+            .unwrap();
+        local
+            .put(-3, Row::from(vec![Value::Integer(30)]), false)
+            .unwrap();
+        local.put(0, Row::new(), true).unwrap();
+        local
+            .put(10, Row::from(vec![Value::Integer(11)]), false)
+            .unwrap();
+        let epoch = registry.read_epoch_for_transaction(txn).unwrap();
+        let view =
+            CapturedHotView::new(store.capture_hot_root(), epoch, local.capture_hot_overlay());
+        assert_eq!(view.row_state(0), CapturedHotRow::Deleted);
+        let mut authority = [u64::MAX];
+        view.mark_authoritative(&[-3, 0, 10, 999], &mut authority);
+        assert_eq!(authority, [0b111]);
+
+        local
+            .put(10, Row::from(vec![Value::Integer(99)]), false)
+            .unwrap();
+        registry.start_commit(txn);
+        local.commit().unwrap();
+        registry.complete_commit(txn);
+        assert!(!local.has_local_changes());
+        drop(local);
+        drop(store);
+        assert_eq!(
+            view.row_state(10),
+            CapturedHotRow::Value(&Row::from(vec![Value::Integer(11)]))
+        );
+        let mut rows = Vec::new();
+        view.for_each_visible(|id, row| rows.push((id, row.get(0).unwrap().clone())));
+        assert_eq!(
+            rows,
+            vec![
+                (-3, Value::Integer(30)),
+                (5, Value::Integer(5)),
+                (10, Value::Integer(11))
+            ]
+        );
+        let mut range = Vec::new();
+        view.for_each_visible_range(-3..10, |id, _| range.push(id));
+        assert_eq!(range, vec![-3, 5]);
+        range.clear();
+        assert!(view.for_each_visible_range_until(
+            (std::ops::Bound::Excluded(-3), std::ops::Bound::Included(10)),
+            |id, _| {
+                range.push(id);
+                true
+            }
+        ));
+        assert_eq!(range, vec![5, 10]);
+        let mut visited = 0;
+        assert!(!view.for_each_visible_until(|_, _| {
+            visited += 1;
+            false
+        }));
+        assert_eq!(visited, 1);
+    }
+
+    #[test]
+    fn captured_hot_lease_overrides_history_limit_until_delayed_root_capture() {
+        let registry = Arc::new(crate::storage::mvcc::registry::TransactionRegistry::new());
+        let mut store =
+            VersionStore::with_visibility_checker("epoch_test", test_schema(), registry.clone());
+        store.set_max_version_history(0);
+        for value in 1..=3 {
+            commit_epoch_row(&registry, &store, 7, value);
+        }
+        store.set_max_version_history(1);
+        let epoch = registry.capture_read_epoch();
+        // A statement registered its horizon but has not captured this table.
+        // Exercise all publication entry points beyond the former hard cap.
+        for value in 4..=33 {
+            let (txn, _) = registry.begin_transaction();
+            registry.start_commit(txn);
+            let row =
+                RowVersion::new_with_timestamp(txn, Row::from(vec![Value::Integer(value)]), 0);
+            match value % 3 {
+                0 => store.add_version(7, row),
+                1 => store.add_version_single(7, row),
+                _ => store.add_versions_batch(vec![(7, row)]),
+            }
+            registry.complete_commit(txn);
+            registry.run_gc();
+        }
+        assert_eq!(
+            store.cleanup_old_previous_versions_with_retention(std::time::Duration::ZERO),
+            0
+        );
+        let view = CapturedHotView::new(store.capture_hot_root(), epoch, None);
+        assert_eq!(
+            view.row_state(7),
+            CapturedHotRow::Value(&Row::from(vec![Value::Integer(3)]))
+        );
+        assert_eq!(count_chain_depth(store.versions.read().get(7).unwrap()), 31);
+        drop(view);
+        assert_eq!(
+            store.cleanup_old_previous_versions_with_retention(std::time::Duration::ZERO),
+            30
+        );
+        assert_eq!(count_chain_depth(store.versions.read().get(7).unwrap()), 1);
+    }
+
+    #[test]
+    fn transactional_history_cap_keeps_only_required_self_begin_baseline() {
+        for limit in [1, 4, 10] {
+            let registry = Arc::new(crate::storage::mvcc::registry::TransactionRegistry::new());
+            let mut store =
+                VersionStore::with_visibility_checker("bounded", test_schema(), registry.clone());
+            store.set_max_version_history(limit);
+            for value in 1..=200 {
+                let (txn, _) = registry.begin_transaction();
+                registry.start_commit(txn);
+                let row = RowVersion::new(txn, Row::from(vec![Value::Integer(value)]));
+                match value % 3 {
+                    0 => store.add_version(1, row),
+                    1 => store.add_version_single(1, row),
+                    _ => store.add_versions_batch(vec![(1, row)]),
+                }
+                registry.complete_commit(txn);
+                assert!(count_chain_depth(store.versions.read().get(1).unwrap()) <= limit.max(2));
+                assert_eq!(registry.cached_retention_horizon(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_result_floor_refresh_allows_bounded_prefix_pruning() {
+        let registry = Arc::new(crate::storage::mvcc::registry::TransactionRegistry::new());
+        let mut store =
+            VersionStore::with_visibility_checker("overlap", test_schema(), registry.clone());
+        store.set_max_version_history(3);
+        commit_epoch_row(&registry, &store, 1, 1);
+        let older = registry.capture_read_epoch();
+        for value in 2..=12 {
+            commit_epoch_row(&registry, &store, 1, value);
+        }
+        let newer = registry.capture_read_epoch();
+        let old_floor = registry.cached_retention_horizon();
+        drop(older);
+        for value in 13..=14 {
+            commit_epoch_row(&registry, &store, 1, value);
+        }
+        // Continuous overlap conservatively inherits a stale low cache. It
+        // cannot silently advance while any registration may need that floor.
+        assert_eq!(registry.cached_retention_horizon(), old_floor);
+        assert_eq!(count_chain_depth(store.versions.read().get(1).unwrap()), 14);
+        assert_eq!(
+            registry.refresh_retention_horizon(),
+            Some(newer.retention_horizon())
+        );
+        commit_epoch_row(&registry, &store, 1, 15);
+        assert_eq!(count_chain_depth(store.versions.read().get(1).unwrap()), 4);
+        let view = CapturedHotView::new(store.capture_hot_root(), newer, None);
+        assert_eq!(
+            view.row_state(1),
+            CapturedHotRow::Value(&Row::from(vec![Value::Integer(12)]))
+        );
+    }
+
+    #[test]
+    fn captured_hot_empty_metadata_never_discards_possible_authority() {
+        let (registry, store) = epoch_test_store();
+        let epoch = registry.capture_read_epoch();
+        assert!(store.capture_hot_root().is_empty());
+        assert!(CapturedHotView::new(store.capture_hot_root(), epoch.clone(), None).is_empty());
+        let (txn, _) = registry.begin_transaction();
+        let mut local = TransactionVersionStore::new(store.clone(), txn);
+        local.put(1, Row::new(), true).unwrap();
+        assert!(!CapturedHotView::new(
+            store.capture_hot_root(),
+            epoch.clone(),
+            local.capture_hot_overlay()
+        )
+        .is_empty());
+        commit_epoch_row(&registry, &store, 2, 2);
+        let view = CapturedHotView::new(store.capture_hot_root(), epoch, None);
+        assert_eq!(view.row_state(2), CapturedHotRow::NoVisibleVersion);
+        assert!(!view.is_empty());
+    }
+
+    #[test]
+    fn captured_hot_distinct_deleter_and_result_lease_protect_deleted_row() {
+        let (registry, store) = epoch_test_store();
+        let creator = commit_epoch_row(&registry, &store, 7, 70);
+        let epoch = registry.capture_read_epoch();
+        let (deleter, _) = registry.begin_transaction();
+        registry.start_commit(deleter);
+        let mut deleted =
+            RowVersion::new_with_timestamp(creator, Row::from(vec![Value::Integer(70)]), 0);
+        deleted.deleted_at_txn_id = deleter;
+        store.add_version(7, deleted);
+        registry.complete_commit(deleter);
+        assert!(registry.get_active_transaction_ids().is_empty());
+        assert_eq!(store.cleanup_deleted_rows(std::time::Duration::ZERO), 0);
+        let old = CapturedHotView::new(store.capture_hot_root(), epoch, None);
+        assert_eq!(
+            old.row_state(7),
+            CapturedHotRow::Value(&Row::from(vec![Value::Integer(70)]))
+        );
+        let current = CapturedHotView::new(
+            store.capture_hot_root(),
+            registry.capture_read_epoch(),
+            None,
+        );
+        assert_eq!(current.row_state(7), CapturedHotRow::Deleted);
+        let original = old.root.visible_version(7, old.epoch()).unwrap();
+        assert_eq!(original.txn_id, creator);
+        assert_eq!(original.deleted_at_txn_id, deleter);
+        assert!(current.root.visible_version(7, current.epoch()).is_none());
+        assert!(matches!(
+            current.root.version_state(7, current.epoch()),
+            CapturedHotVersion::Deleted
+        ));
+
+        drop(current);
+        drop(old);
+        assert_eq!(store.cleanup_deleted_rows(std::time::Duration::ZERO), 1);
+    }
 
     /// Simple visibility checker for testing
     struct TestVisibilityChecker {
