@@ -26,3 +26,4 @@ pub mod metadata_runs;
 pub mod page_io;
 pub mod payload_writer;
 pub mod row_identity;
+pub mod row_spool;
