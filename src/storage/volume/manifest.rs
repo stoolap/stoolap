@@ -2079,9 +2079,9 @@ impl SegmentManager {
         let mut undo = self.pending_tombstone_undo.write();
         let mut journal = match undo.entry(txn_id) {
             HashEntry::Occupied(entry) => entry.into_mut(),
-            HashEntry::Vacant(entry) => entry.insert(PendingJournal::new(&self.hot_memory)),
+            HashEntry::Vacant(entry) => entry.insert(PendingJournal::new()),
         };
-        journal.push((row_id, previous));
+        journal.push((row_id, previous), &self.hot_memory);
     }
 
     pub fn pending_statement_checkpoint(&self, txn_id: i64) -> usize {
@@ -2123,10 +2123,11 @@ impl SegmentManager {
             return;
         };
         let committed = self.tombstones.read();
-        let mut undo = PublishedJournal::new(&self.hot_memory);
+        let mut undo = PublishedJournal::new();
         undo.extend(
             rows.keys()
                 .map(|row_id| (row_id, committed.get(&row_id).copied())),
+            &self.hot_memory,
         );
         self.published_tombstone_undo
             .write()
