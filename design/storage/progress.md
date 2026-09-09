@@ -9,10 +9,10 @@ independently reviewable without claiming unmerged work is shipped.
 | 0 | K1–K8 concrete protocols and validation gates | Design complete | Passed after corrections | [#115](https://github.com/stoolap/stoolap/pull/115) |
 | 1 | Fallible access and complete statement rollback | Implemented; local gates and CI passed | Passed after corrections | [#116](https://github.com/stoolap/stoolap/pull/116) |
 | 2 | Chunked arena and retained-hot accounting | Implemented; local gates and CI passed | Passed after corrections | [#117](https://github.com/stoolap/stoolap/pull/117) |
-| 3 | Coherent two-layer execution | Implemented; local gates passed; final CI running | Passed after corrections | [#118](https://github.com/stoolap/stoolap/pull/118) (draft) |
-| 4 | V5 envelope and bounded streaming seal | Format, row spool and sort implemented; seal integration pending | Foundations passed independent review | [#119](https://github.com/stoolap/stoolap/pull/119) (draft) |
-| 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |
-| 6 | Paged reads, four ledgers and DML preflight | Pending | Pending | — |
+| 3 | Coherent two-layer execution | Capture correction verified; abort correction pending application | Passed after corrections | [#118](https://github.com/stoolap/stoolap/pull/118) (draft) |
+| 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
+| 5 | Remover, durable WAL/catalog and pressure seal | Catalog foundations verified; lifecycle integration in progress | Catalog passed; next components in review | [#120](https://github.com/stoolap/stoolap/pull/120) (draft) |
+| 6 | Paged reads, four ledgers and DML preflight | Legacy decoder foundations verified; metadata integration in progress | Foundations passed | [#121](https://github.com/stoolap/stoolap/pull/121) (draft) |
 | 7 | Explicit clustering and compatibility fallback | Pending | Pending | — |
 | 8 | Identity-first compaction and bounded migration | Pending | Pending | — |
 | 9 | Index ownership, write batching and allocation reduction | Pending | Pending | — |
@@ -211,6 +211,24 @@ improves 24.65–29.74%, with 41.94% fewer allocation calls. INSERT p50 changes
 residual costs remain in the report with their noise ranges; both earlier
 comparisons are preserved. The remote CI rerun remains the readiness gate.
 
+
+The follow-up capture correction permits reads alongside ordinary DML holding
+the shared physical-transfer fence. It revalidates exact physical membership
+and mappings; tombstone-only churn refreshes a private immutable shell outside
+the fence instead of exhausting physical-change retries. Prior readers keep
+their original generation, and final old owners are dropped after unlocking.
+Independent source reviews pass, as do four generation tests, five concurrent
+cold-update executions, eleven all-feature file-database top-k tests and 24
+fixed-epoch/DDL cases. All-target/all-feature Clippy passes.
+
+A separate abort/undo visibility correction is prepared and independently
+reviewed but remains unapplied. Its real cold scan reproduction, 330 MVCC tests,
+Clippy and Rust 1.88 pass in an isolated one-module candidate. Exact successful
+undo must retain the provisional sequence exclusion until acknowledgment.
+Phase 3 remains draft until that correction is applied and the combined branch
+completes final tests, performance provenance and CI. Previously recorded
+performance describes the earlier admission-retry source, not this follow-up.
+
 ## Phase 4 foundations
 
 The V5 envelope, bounded directory codecs, positioned page I/O, directory
@@ -292,10 +310,43 @@ All-target/all-feature Clippy, Windows no-default compilation and Rust 1.88
 no-default compilation pass. This is file-layer evidence; typed coverage,
 reservations and engine-wide accounting remain activation requirements.
 
-The stage remains incomplete: actual hot capture, byte-capped group planning,
-reservation ownership, durable identity
-activation and replacement of the eager V4 readback path are still required. The actual cold
-reader and engine-wide admission guarantee remain later integration gates.
+The sorted-spool coordinator now plans the complete checksummed group-boundary
+stream before emitting V5 bytes. A group's cap includes every decoded column
+page, group metadata, row IDs and source LSNs. A prepared batch validates metadata
+once, and per-row descriptor-derived size bounds avoid repeated suffix scans.
+Rounded NULL maps and fixed overhead stay exact; timestamps and a lower column
+cap may conservatively underpack. Exact one-row sizing preserves fitting narrow
+timestamps. Oversized existing rows fail before V5 emission and remain retained.
+
+The original 117 V5 units pass; the two Raw actual-file allocation/reopen tests
+process an 8,193-row, 64,282,760-byte spool using 2,795,544 or 3,229,208 bytes of reserved
+caller scratch, within their 16/64 MiB caps. The measured pipeline performs zero
+allocation calls after preparation. Reverse physical order still amplifies reads:
+planning reads about 593–595 MB and emission about 464–465 MB. This cost is
+explicit in [the component measurements](measurements/phase-04-streaming.json).
+A late-wide-column case proves linear read-count scaling as rows increase.
+Independent source reviews and final all-target/all-feature Clippy pass, as does
+Rust 1.88 all-target/all-feature compilation. CI formatting discrepancies were
+corrected using the repository edition. The Windows rename fixture now verifies
+old aliases after an open-handle PermissionDenied and retries after lease release;
+its Windows runtime gate remains CI because local C cross dependencies lack GCC.
+
+Optional coordinator compression now reserves its maximum output and reusable
+LZ4 table before emitting the header. No dependency table upgrade or output growth
+can occur inside the operation. Incompressible pages retain the Raw fallback.
+Two new unit tests cover unchanged output on insufficient reservations and exact
+Raw/compressed payload equivalence including random vectors and NULL. A third
+actual-file allocation/reopen test uses 3,965,381 bytes of caller scratch and zero
+allocation calls for the same 64 MB spool. The highly repetitive fixture produces
+a 475,572-byte complete file; this is not a general compression or latency claim.
+Independent source review passes. The final 119 V5 units with test failpoints,
+three allocation/reopen tests, all-target/all-feature Clippy and Rust 1.88
+all-target/all-feature compilation pass.
+
+The stage remains incomplete: actual hot capture, job reservation ownership,
+durable identity activation and replacement of the eager V4 seal call path are
+still required. Large-value integration remains activation work. Actual cold readers and the
+engine-wide admission guarantee remain later integration gates.
 
 ## Phase 5 catalog foundations
 

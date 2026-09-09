@@ -869,25 +869,81 @@ impl SegmentManager {
     ) -> Result<(T, Arc<ColdGeneration>)> {
         for _attempt in 0..3 {
             let generation = self.prepare_cold_generation()?;
-            let _fence = self.acquire_seal_write();
-            let manifest = self.manifest.read();
-            let segments = self.segments.read();
-            let tombstones = self.tombstones.read();
-            if generation.revisions
-                != [
-                    self.manifest.revision(),
-                    self.segments.revision(),
-                    self.tombstones.revision(),
-                ]
-            {
-                continue;
+            if let Some(captured) = self.capture_prepared_with_hot(generation, &mut capture_hot) {
+                return Ok(captured);
             }
-            drop((manifest, segments, tombstones));
-            return Ok((capture_hot(), generation));
         }
         Err(crate::core::Error::internal(
             "retryable read conflict: cold generation changed during three capture attempts",
         ))
+    }
+
+    /// Only physical membership/mapping changes require another preparation.
+    /// A fixed ReadEpoch filters sequenced DML; its shared fence need only
+    /// exclude physical hot/cold transfers, not other ordinary DML readers.
+    fn capture_prepared_with_hot<T>(
+        &self,
+        mut generation: Arc<ColdGeneration>,
+        capture_hot: &mut impl FnMut() -> T,
+    ) -> Option<(T, Arc<ColdGeneration>)> {
+        loop {
+            // Declare retired ownership before the fence, including for unwind:
+            // destroying a last tombstone-map owner must happen after unlocking.
+            let mut retired_tombstones = None;
+            let captured = {
+                let _fence = self.acquire_seal_read();
+                let manifest = self.manifest.read();
+                let segments = self.segments.read();
+                let tombstones = self.tombstones.read();
+                let revisions = [
+                    self.manifest.revision(),
+                    self.segments.revision(),
+                    self.tombstones.revision(),
+                ];
+                // Manifest tombstone writes also advance its broad revision.
+                // When that changes, compare the actual ordered membership;
+                // segments revision separately protects mappings and backings.
+                if generation.revisions[1] != revisions[1]
+                    || (generation.revisions[0] != revisions[0]
+                        && (generation.segment_ids_newest_first.len() != manifest.segments.len()
+                            || generation
+                                .segment_ids_newest_first
+                                .iter()
+                                .copied()
+                                .ne(manifest.segments.iter().rev().map(|meta| meta.segment_id))))
+                {
+                    return None;
+                }
+                let ready = if generation.revisions == revisions {
+                    true
+                } else if let Some(private) = Arc::get_mut(&mut generation) {
+                    retired_tombstones = Some(std::mem::replace(
+                        &mut private.tombstones,
+                        Arc::clone(&tombstones),
+                    ));
+                    private.revisions = revisions;
+                    true
+                } else {
+                    false
+                };
+                // Preserve the source-lock -> hot-root lock order boundary.
+                drop((manifest, segments, tombstones));
+                ready.then(&mut *capture_hot)
+            };
+            drop(retired_tombstones);
+            if let Some(hot) = captured {
+                return Some((hot, generation));
+            }
+            // Shared old readers retain their immutable generation. Prepare a
+            // private shell outside the fence; later tombstone churn needs only
+            // an Arc swap into it, not another allocation or bounded retry.
+            generation = Arc::new(ColdGeneration {
+                segment_ids_newest_first: generation.segment_ids_newest_first.clone(),
+                segments: Arc::clone(&generation.segments),
+                tombstones: Arc::clone(&generation.tombstones),
+                revisions: generation.revisions,
+            });
+        }
     }
 
     /// Create a new segment manager for a table.
@@ -3316,6 +3372,87 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cold_generation_capture_does_not_wait_for_shared_dml_fence() {
+        let manager = Arc::new(SegmentManager::new("shared_capture", None));
+        let paused_dml = manager.acquire_seal_read();
+        let other = manager.clone();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            sender.send(other.capture_with_hot(|| 7)).unwrap();
+        });
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(2));
+        drop(paused_dml);
+        reader.join().unwrap();
+        let (hot, generation) = result
+            .expect("a reader must not wait for an ordinary DML shared fence")
+            .unwrap();
+        assert_eq!(hot, 7);
+        assert!(generation.segment_ids_newest_first.is_empty());
+    }
+
+    #[test]
+    fn cold_generation_refreshes_tombstones_but_revalidates_order_and_mapping() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+        let manager = SegmentManager::new("refresh_capture", None);
+        let schema = SchemaBuilder::new("refresh_capture")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        for id in 1..=2 {
+            let mut builder = super::super::writer::VolumeBuilder::new(&schema);
+            builder.add_row(id, &Row::from_values(vec![Value::Integer(id)]));
+            manager.register_segment(
+                id as u64,
+                Arc::new(builder.finish()),
+                SegmentMeta {
+                    segment_id: id as u64,
+                    file_path: PathBuf::new(),
+                    row_count: 1,
+                    min_row_id: id,
+                    max_row_id: id,
+                    creation_lsn: 1,
+                    seal_seq: 0,
+                    schema_version: 0,
+                },
+                Some(&schema),
+            );
+        }
+        for sequence in 1..=8 {
+            let old_reader = manager.prepare_cold_generation().unwrap();
+            // Force mutation between the real preparation and capture paths;
+            // retaining this reader also forces private-shell allocation.
+            manager.add_tombstones(&[sequence], sequence as u64);
+            let (_, current) = manager
+                .capture_prepared_with_hot(old_reader.clone(), &mut || {
+                    assert!(manager.manifest.value.try_write().is_some());
+                    assert!(manager.segments.value.try_write().is_some());
+                    assert!(manager.tombstones.value.try_write().is_some());
+                })
+                .expect("tombstone churn does not invalidate physical membership");
+            assert_eq!(current.segment_ids_newest_first, [2, 1]);
+            assert_eq!(current.tombstones.len(), sequence as usize);
+            assert_eq!(current.tombstones.get(&sequence), Some(&(sequence as u64)));
+            assert_eq!(old_reader.tombstones.len(), sequence as usize - 1);
+        }
+        let old_order = manager.prepare_cold_generation().unwrap();
+        manager.manifest.write().segments.swap(0, 1);
+        assert!(manager
+            .capture_prepared_with_hot(old_order, &mut || panic!("stale membership"))
+            .is_none());
+        let (_, reordered) = manager.capture_with_hot(|| ()).unwrap();
+        assert_eq!(reordered.segment_ids_newest_first, [1, 2]);
+        {
+            let mut segments = manager.segments.write();
+            Arc::make_mut(&mut *segments)
+                .get_mut(&1)
+                .unwrap()
+                .schema_version = 1;
+        }
+        assert!(manager
+            .capture_prepared_with_hot(reordered, &mut || panic!("stale mapping"))
+            .is_none());
+    }
+
+    #[test]
     fn idle_generation_cache_does_not_force_tombstone_cow() {
         let manager = SegmentManager::new("idle_cache", None);
         manager.add_tombstones(&[1], 1);
@@ -3366,7 +3503,7 @@ mod tests {
         );
         let (hot_marker, captured) = manager
             .capture_with_hot(|| {
-                assert!(manager.seal_fence.try_read().is_none());
+                assert!(manager.seal_fence.try_write().is_none());
                 7
             })
             .unwrap();

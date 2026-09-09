@@ -15,13 +15,13 @@
 use super::*;
 use std::io::{self, Cursor};
 use std::num::NonZeroU64;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use super::super::column_block::{ColumnBlockRef, ColumnCell};
 use super::super::directory::{RootSummary, RowBounds};
 use super::super::directory_reader::DirectoryWalker;
 use super::super::envelope::{FileIdentity, REQUIRED_LEGACY_BASE};
-use super::super::metadata_runs::{IO_BYTES, MergeScratch, SortedReader, merge_pass};
+use super::super::metadata_runs::{merge_pass, MergeScratch, SortedReader, IO_BYTES};
 use super::super::page_io::{OpenedEnvelope, PageReadPlan, ReadAt};
 use super::super::row_identity::{SourceContext, VerifiedLegacyBase};
 
@@ -247,55 +247,49 @@ fn preheader_shape_schema_context_and_capacity_fail_without_io() {
         max: i64::MAX,
     });
     for shape in variants {
-        assert!(
-            PayloadWriter::new(
-                &mut sink,
-                header(),
-                shape,
-                None,
-                &SPEC,
-                limits(),
-                ColumnLimits::default(),
-                &mut entries
-            )
-            .is_err()
-        );
-        assert!(sink.is_empty());
-    }
-    let mut h = header();
-    h.required_features |= REQUIRED_LEGACY_BASE;
-    assert!(
-        PayloadWriter::new(
+        assert!(PayloadWriter::new(
             &mut sink,
-            h,
-            shape(1),
+            header(),
+            shape,
             None,
             &SPEC,
             limits(),
             ColumnLimits::default(),
             &mut entries
         )
-        .is_err()
-    );
+        .is_err());
+        assert!(sink.is_empty());
+    }
+    let mut h = header();
+    h.required_features |= REQUIRED_LEGACY_BASE;
+    assert!(PayloadWriter::new(
+        &mut sink,
+        h,
+        shape(1),
+        None,
+        &SPEC,
+        limits(),
+        ColumnLimits::default(),
+        &mut entries
+    )
+    .is_err());
     let base = LegacyBase {
         generation: NonZeroU64::new(4).unwrap(),
         barrier_lsn: 100,
     };
     let wrong =
         PlannedCheckpoint::assert_captured_checkpoint(FileIdentity::new(1, 2, 99).unwrap(), base);
-    assert!(
-        PayloadWriter::new(
-            &mut sink,
-            h,
-            shape(1),
-            Some(&wrong),
-            &SPEC,
-            limits(),
-            ColumnLimits::default(),
-            &mut entries
-        )
-        .is_err()
-    );
+    assert!(PayloadWriter::new(
+        &mut sink,
+        h,
+        shape(1),
+        Some(&wrong),
+        &SPEC,
+        limits(),
+        ColumnLimits::default(),
+        &mut entries
+    )
+    .is_err());
     assert!(sink.is_empty());
 }
 
@@ -430,37 +424,27 @@ fn invalid_inputs_do_not_append_and_incomplete_groups_never_finish() {
     )
     .unwrap();
     let mut encoding = [0; 128];
-    assert!(
-        writer
-            .begin_group(record(0), &[9], &[source()], &mut encoding)
-            .is_err()
-    );
-    assert!(
-        writer
-            .begin_group(record(0), &[0], &[RowSource::LegacyBase], &mut encoding)
-            .is_err()
-    );
+    assert!(writer
+        .begin_group(record(0), &[9], &[source()], &mut encoding)
+        .is_err());
+    assert!(writer
+        .begin_group(record(0), &[0], &[RowSource::LegacyBase], &mut encoding)
+        .is_err());
     assert_eq!(writer.position(), 64);
     writer
         .begin_group(record(0), &[0], &[source()], &mut encoding)
         .unwrap();
     let before = writer.position();
-    assert!(
-        writer
-            .write_column(&[false], ColumnInput::F64(&[2.0]), &mut encoding)
-            .is_err()
-    );
-    assert!(
-        writer
-            .write_column(&[false], ColumnInput::I64(&[2]), &mut [])
-            .is_err()
-    );
+    assert!(writer
+        .write_column(&[false], ColumnInput::F64(&[2.0]), &mut encoding)
+        .is_err());
+    assert!(writer
+        .write_column(&[false], ColumnInput::I64(&[2]), &mut [])
+        .is_err());
     assert_eq!(writer.position(), before);
-    assert!(
-        writer
-            .begin_group(record(0), &[0], &[source()], &mut encoding)
-            .is_err()
-    );
+    assert!(writer
+        .begin_group(record(0), &[0], &[source()], &mut encoding)
+        .is_err());
     assert!(matches!(
         writer.finish_payloads(),
         Err(PayloadError::Incomplete)
@@ -557,7 +541,11 @@ fn compressed_typed_blocks_fit_stored_limits_and_raw_fallback_roundtrips() {
                 random ^= random << 13;
                 random ^= random >> 7;
                 random ^= random << 17;
-                if repeated { b'a' } else { random as u8 }
+                if repeated {
+                    b'a'
+                } else {
+                    random as u8
+                }
             })
             .collect();
         let kind = if repeated {
