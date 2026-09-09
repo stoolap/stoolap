@@ -171,16 +171,18 @@ fn captured_root_clone_and_visible_callbacks_do_not_allocate() {
     );
     let (txn, _) = registry.begin_transaction();
     registry.start_commit(txn);
-    store.add_versions_batch(
-        (0..20_000)
-            .map(|id| {
-                (
-                    id,
-                    RowVersion::new(txn, Row::from(vec![Value::Integer(id)])),
-                )
-            })
-            .collect(),
-    );
+    store
+        .add_versions_batch(
+            (0..20_000)
+                .map(|id| {
+                    (
+                        id,
+                        RowVersion::new(txn, Row::from(vec![Value::Integer(id)])),
+                    )
+                })
+                .collect(),
+        )
+        .unwrap();
     registry.complete_commit(txn);
     let epoch = registry.capture_read_epoch();
     let ((count, sum, stopped_count, version_count, authority), calls) = allocation_calls(|| {
@@ -242,13 +244,15 @@ fn point_update_does_not_copy_a_large_prior_write_set() {
         registry.clone(),
     ));
     let (creator, _) = registry.begin_transaction();
-    store.add_version(
-        1,
-        RowVersion::new(
-            creator,
-            Row::from(vec![Value::Integer(1), Value::Integer(10)]),
-        ),
-    );
+    store
+        .add_version(
+            1,
+            RowVersion::new(
+                creator,
+                Row::from(vec![Value::Integer(1), Value::Integer(10)]),
+            ),
+        )
+        .unwrap();
     registry.commit_transaction(creator);
     let (txn, _) = registry.begin_transaction();
     let mut local = TransactionVersionStore::new(store.clone(), txn);
@@ -326,7 +330,7 @@ fn captured_aggregates_allocate_per_group_not_per_input_row() {
             if cold {
                 volume.add_row(id, &row);
             } else {
-                store.add_version(id, RowVersion::new(writer, row));
+                store.add_version(id, RowVersion::new(writer, row)).unwrap();
             }
         }
         registry.commit_transaction(writer);

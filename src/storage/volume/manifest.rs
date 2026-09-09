@@ -663,8 +663,42 @@ fn compute_visibility_bitmaps(
     }
 }
 
-type PendingTombstoneUndo = FxHashMap<i64, Vec<(i64, Option<i64>)>>;
-type PublishedTombstoneUndo = FxHashMap<i64, (u64, Vec<(i64, Option<u64>)>)>;
+use crate::common::memory::{MemoryAccount, MemoryCharge};
+use crate::storage::index::accounted_map::{HashEntry, HeapBytes, PrivateHeap, TrackedHash};
+use crate::storage::mvcc::accounting::RetainedSmallVec;
+
+type HotTxnMap<V> = TrackedHash<i64, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+type PendingJournal = RetainedSmallVec<[(i64, Option<i64>); 0]>;
+type PublishedJournal = RetainedSmallVec<[(i64, Option<u64>); 0]>;
+type PendingTombstoneUndo = HotTxnMap<PendingJournal>;
+type PublishedTombstoneUndo = HotTxnMap<(u64, PublishedJournal)>;
+
+// These nested containers carry their own capacity owner when moved out of a
+// transaction map; the enclosing map must not release or count that charge.
+impl PrivateHeap for PendingJournal {
+    const HAS_HEAP: bool = false;
+    fn private_heap(&self) -> HeapBytes {
+        HeapBytes::default()
+    }
+}
+impl PrivateHeap for PublishedJournal {
+    const HAS_HEAP: bool = false;
+    fn private_heap(&self) -> HeapBytes {
+        HeapBytes::default()
+    }
+}
+impl PrivateHeap for crate::common::I64Map<i64> {
+    const HAS_HEAP: bool = false;
+    fn private_heap(&self) -> HeapBytes {
+        HeapBytes::default()
+    }
+}
+
+fn hot_txn_map<V: PrivateHeap>(account: &MemoryAccount) -> HotTxnMap<V> {
+    let mut map = HotTxnMap::default();
+    map.attach(account);
+    map
+}
 
 /// Per-table segment manager.
 ///
@@ -735,7 +769,7 @@ pub struct SegmentManager {
     /// access to SegmentedTable state.
     /// Each row_id carries the timestamp it was tombstoned at, so a savepoint
     /// rollback can discard the tombstones made after the savepoint.
-    pending_txn_tombstones: RwLock<FxHashMap<i64, FxHashMap<i64, i64>>>,
+    pending_txn_tombstones: RwLock<HotTxnMap<crate::common::I64Map<i64>>>,
     pending_tombstone_undo: RwLock<PendingTombstoneUndo>,
     published_tombstone_undo: RwLock<PublishedTombstoneUndo>,
     // Unique constraint checks use per-volume hash indices (on FrozenVolume).
@@ -760,11 +794,13 @@ pub struct SegmentManager {
     seal_generation: std::sync::atomic::AtomicU64,
     /// Per-txn seal generation at INSERT time. Small map — only active
     /// transactions with pending inserts on this table.
-    txn_seal_gens: parking_lot::Mutex<rustc_hash::FxHashMap<i64, u64>>,
+    txn_seal_gens: parking_lot::Mutex<HotTxnMap<u64>>,
     /// Number of rows currently being sealed (exist in both hot and cold).
     /// Set to N before register_segment, cleared after remove_sealed_rows.
     /// Subtracted from row_count() to prevent double-counting during the seal window.
     seal_overlap_count: std::sync::atomic::AtomicUsize,
+    hot_memory: MemoryAccount,
+    _hot_object_charge: MemoryCharge,
 }
 
 /// Prepared allocations and exact old ownership for one physical truncate.
@@ -773,6 +809,7 @@ pub(crate) struct PreparedColdTruncate {
     pub(crate) old_segments: Arc<FxHashMap<u64, ColdSegment>>,
     empty_segments: Arc<FxHashMap<u64, ColdSegment>>,
     empty_tombstones: Arc<FxHashMap<i64, u64>>,
+    empty_transaction_generations: HotTxnMap<u64>,
     retired_cache: Option<Arc<ColdGeneration>>,
 }
 
@@ -782,7 +819,7 @@ pub(crate) struct RetiredColdTruncate {
     _manifest_segments: Vec<SegmentMeta>,
     _manifest_tombstones: Vec<(i64, u64)>,
     _cache: Option<Arc<ColdGeneration>>,
-    _transaction_generations: FxHashMap<i64, u64>,
+    _transaction_generations: HotTxnMap<u64>,
 }
 
 impl SegmentManager {
@@ -855,60 +892,62 @@ impl SegmentManager {
 
     /// Create a new segment manager for a table.
     pub fn new(table_name: &str, volume_dir: Option<PathBuf>) -> Self {
-        Self::new_with_file_catalog(
+        Self::new_in(table_name, volume_dir, MemoryAccount::new())
+    }
+
+    pub(crate) fn new_in(
+        table_name: &str,
+        volume_dir: Option<PathBuf>,
+        memory: MemoryAccount,
+    ) -> Self {
+        Self::new_with_file_catalog_in(
             table_name,
             volume_dir,
             Arc::new(super::io::VolumeRetirementQueue::default()),
+            memory,
         )
     }
 
-    pub(crate) fn new_with_file_catalog(
+    pub(crate) fn new_with_file_catalog_in(
         table_name: &str,
         volume_dir: Option<PathBuf>,
         file_catalog: Arc<super::io::VolumeRetirementQueue>,
+        memory: MemoryAccount,
     ) -> Self {
-        let generation_cache = Arc::new(parking_lot::Mutex::new(None));
-        Self {
-            table_name: SmartString::from(table_name),
-            manifest: GenerationSource::new(TableManifest::new(table_name), &generation_cache),
-            segments: GenerationSource::new(Arc::new(FxHashMap::default()), &generation_cache),
+        Self::from_manifest_with_file_catalog_in(
+            TableManifest::new(table_name),
             volume_dir,
             file_catalog,
-            truncate_retirements: parking_lot::Mutex::new(None),
-            has_segments_flag: std::sync::atomic::AtomicBool::new(false),
-            has_cold: std::sync::atomic::AtomicBool::new(false),
-            current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
-            reloading: parking_lot::Mutex::new(()),
-            tombstones: GenerationSource::new(Arc::new(FxHashMap::default()), &generation_cache),
-            generation_cache,
-            pending_txn_tombstones: RwLock::new(FxHashMap::default()),
-            pending_tombstone_undo: RwLock::new(FxHashMap::default()),
-            published_tombstone_undo: RwLock::new(FxHashMap::default()),
-            cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
-            seal_fence: RwLock::new(()),
-            visibility_seen: parking_lot::Mutex::new(rustc_hash::FxHashSet::default()),
-            seal_generation: std::sync::atomic::AtomicU64::new(0),
-            txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
-            seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
-        }
+            memory,
+        )
     }
 
     /// Create from an existing manifest loaded from disk.
     pub fn from_manifest(manifest: TableManifest, volume_dir: Option<PathBuf>) -> Self {
-        Self::from_manifest_with_file_catalog(
+        Self::from_manifest_in(manifest, volume_dir, MemoryAccount::new())
+    }
+
+    pub(crate) fn from_manifest_in(
+        manifest: TableManifest,
+        volume_dir: Option<PathBuf>,
+        memory: MemoryAccount,
+    ) -> Self {
+        Self::from_manifest_with_file_catalog_in(
             manifest,
             volume_dir,
             Arc::new(super::io::VolumeRetirementQueue::default()),
+            memory,
         )
     }
 
-    fn from_manifest_with_file_catalog(
+    fn from_manifest_with_file_catalog_in(
         manifest: TableManifest,
         volume_dir: Option<PathBuf>,
         file_catalog: Arc<super::io::VolumeRetirementQueue>,
+        memory: MemoryAccount,
     ) -> Self {
         let generation_cache = Arc::new(parking_lot::Mutex::new(None));
-        let table_name = manifest.table_name.clone();
+        let table_name = manifest.table_name.clone().into_hot(&memory);
         let tombstone_map: FxHashMap<i64, u64> = manifest.tombstones.iter().copied().collect();
         Self {
             table_name,
@@ -923,21 +962,30 @@ impl SegmentManager {
             reloading: parking_lot::Mutex::new(()),
             tombstones: GenerationSource::new(Arc::new(tombstone_map), &generation_cache),
             generation_cache,
-            pending_txn_tombstones: RwLock::new(FxHashMap::default()),
-            pending_tombstone_undo: RwLock::new(FxHashMap::default()),
-            published_tombstone_undo: RwLock::new(FxHashMap::default()),
+            pending_txn_tombstones: RwLock::new(hot_txn_map(&memory)),
+            pending_tombstone_undo: RwLock::new(hot_txn_map(&memory)),
+            published_tombstone_undo: RwLock::new(hot_txn_map(&memory)),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_fence: RwLock::new(()),
             visibility_seen: parking_lot::Mutex::new(rustc_hash::FxHashSet::default()),
             seal_generation: std::sync::atomic::AtomicU64::new(0),
-            txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
+            txn_seal_gens: parking_lot::Mutex::new(hot_txn_map(&memory)),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
+            _hot_object_charge: MemoryCharge::conservative(
+                &memory,
+                std::mem::size_of::<Self>() + 4 * std::mem::size_of::<usize>(),
+            ),
+            hot_memory: memory,
         }
     }
 
     /// Get the table name.
     pub fn table_name(&self) -> &str {
         &self.table_name
+    }
+
+    pub(crate) fn hot_memory_account(&self) -> &MemoryAccount {
+        &self.hot_memory
     }
 
     /// Ensure all volumes have column data before column access.
@@ -1881,7 +1929,7 @@ impl SegmentManager {
 
     /// Rename this segment manager's table (for ALTER TABLE RENAME).
     pub fn rename(&mut self, new_name: &str) {
-        self.table_name = SmartString::from(new_name);
+        self.table_name = SmartString::from(new_name).into_hot(&self.hot_memory);
         self.manifest.write().table_name = SmartString::from(new_name);
     }
 
@@ -2021,29 +2069,38 @@ impl SegmentManager {
     /// Called during DML (UPDATE/DELETE of cold rows).
     pub fn add_pending_tombstone(&self, txn_id: i64, row_id: i64) {
         let mut pending = self.pending_txn_tombstones.write();
-        let previous = pending
-            .entry(txn_id)
-            .or_default()
-            .insert(row_id, get_fast_timestamp());
-        self.pending_tombstone_undo
-            .write()
-            .entry(txn_id)
-            .or_default()
-            .push((row_id, previous));
+        let mut rows = match pending.entry(txn_id) {
+            HashEntry::Occupied(entry) => entry.into_mut(),
+            HashEntry::Vacant(entry) => {
+                entry.insert(crate::common::I64Map::new_in(&self.hot_memory))
+            }
+        };
+        let previous = rows.insert(row_id, get_fast_timestamp());
+        let mut undo = self.pending_tombstone_undo.write();
+        let mut journal = match undo.entry(txn_id) {
+            HashEntry::Occupied(entry) => entry.into_mut(),
+            HashEntry::Vacant(entry) => entry.insert(PendingJournal::new(&self.hot_memory)),
+        };
+        journal.push((row_id, previous));
     }
 
     pub fn pending_statement_checkpoint(&self, txn_id: i64) -> usize {
         self.pending_tombstone_undo
             .read()
             .get(&txn_id)
-            .map_or(0, Vec::len)
+            .map_or(0, |journal| journal.len())
     }
 
     pub fn finish_pending_statement(&self, txn_id: i64, checkpoint: usize, success: bool) {
         let mut pending = self.pending_txn_tombstones.write();
-        if let Some(mut journal) = self.pending_tombstone_undo.write().remove(&txn_id) {
+        if let Some(mut journal) = self.pending_tombstone_undo.write().remove_value(&txn_id) {
             if !success {
-                let rows = pending.entry(txn_id).or_default();
+                let mut rows = match pending.entry(txn_id) {
+                    HashEntry::Occupied(entry) => entry.into_mut(),
+                    HashEntry::Vacant(entry) => {
+                        entry.insert(crate::common::I64Map::new_in(&self.hot_memory))
+                    }
+                };
                 while journal.len() > checkpoint {
                     let (row_id, previous) = journal.pop().unwrap();
                     match previous {
@@ -2051,7 +2108,7 @@ impl SegmentManager {
                             rows.insert(row_id, timestamp);
                         }
                         None => {
-                            rows.remove(&row_id);
+                            rows.remove(row_id);
                         }
                     }
                 }
@@ -2066,10 +2123,11 @@ impl SegmentManager {
             return;
         };
         let committed = self.tombstones.read();
-        let undo = rows
-            .keys()
-            .map(|&row_id| (row_id, committed.get(&row_id).copied()))
-            .collect();
+        let mut undo = PublishedJournal::new(&self.hot_memory);
+        undo.extend(
+            rows.keys()
+                .map(|row_id| (row_id, committed.get(&row_id).copied())),
+        );
         self.published_tombstone_undo
             .write()
             .insert(txn_id, (commit_seq, undo));
@@ -2080,7 +2138,8 @@ impl SegmentManager {
         if !success {
             self.rollback_pending_tombstones(txn_id);
         }
-        let Some((sequence, undo)) = self.published_tombstone_undo.write().remove(&txn_id) else {
+        let Some((sequence, undo)) = self.published_tombstone_undo.write().remove_value(&txn_id)
+        else {
             return;
         };
         if success {
@@ -2117,7 +2176,7 @@ impl SegmentManager {
         self.pending_txn_tombstones
             .read()
             .get(&txn_id)
-            .map(|set| set.keys().copied().collect())
+            .map(|set| set.keys().collect())
             .unwrap_or_default()
     }
 
@@ -2128,7 +2187,7 @@ impl SegmentManager {
         dest: &mut rustc_hash::FxHashSet<i64>,
     ) {
         if let Some(ids) = self.pending_txn_tombstones.read().get(&txn_id) {
-            for &id in ids.keys() {
+            for id in ids.keys() {
                 dest.insert(id);
             }
         }
@@ -2148,18 +2207,18 @@ impl SegmentManager {
         self.pending_txn_tombstones
             .read()
             .get(&txn_id)
-            .is_some_and(|set| set.contains_key(&row_id))
+            .is_some_and(|set| set.contains_key(row_id))
     }
 
     /// Commit pending tombstones: move from per-txn pending to shared tombstone set.
     /// The commit_seq is the transaction's commit sequence, used for snapshot
     /// isolation: older snapshots won't see these tombstones.
     pub fn commit_pending_tombstones(&self, txn_id: i64, commit_seq: u64) {
-        let pending = self.pending_txn_tombstones.write().remove(&txn_id);
+        let pending = self.pending_txn_tombstones.write().remove_value(&txn_id);
         self.pending_tombstone_undo.write().remove(&txn_id);
         if let Some(ids) = pending {
             if !ids.is_empty() {
-                let id_vec: Vec<i64> = ids.into_keys().collect();
+                let id_vec: Vec<i64> = ids.keys().collect();
                 self.add_tombstones(&id_vec, commit_seq);
             }
         }
@@ -2175,8 +2234,8 @@ impl SegmentManager {
     /// and return the row_ids discarded, so their row claims can be released.
     pub fn rollback_pending_tombstones_after(&self, txn_id: i64, timestamp: i64) -> Vec<i64> {
         let mut discarded = Vec::new();
-        if let Some(ids) = self.pending_txn_tombstones.write().get_mut(&txn_id) {
-            ids.retain(|&row_id, tombstoned_at| {
+        if let Some(mut ids) = self.pending_txn_tombstones.write().get_mut(&txn_id) {
+            ids.retain(|row_id, tombstoned_at| {
                 let keep = *tombstoned_at <= timestamp;
                 if !keep {
                     discarded.push(row_id);
@@ -2490,9 +2549,15 @@ impl SegmentManager {
     #[inline]
     pub fn record_txn_seal_generation_at(&self, txn_id: i64, generation: u64) {
         let mut map = self.txn_seal_gens.lock();
-        map.entry(txn_id)
-            .and_modify(|existing| *existing = (*existing).min(generation))
-            .or_insert(generation);
+        match map.entry(txn_id) {
+            HashEntry::Occupied(entry) => {
+                let mut existing = entry.into_mut();
+                *existing = (*existing).min(generation);
+            }
+            HashEntry::Vacant(entry) => {
+                entry.insert(generation);
+            }
+        }
     }
 
     /// Get the seal generation recorded for a transaction.
@@ -2728,32 +2793,40 @@ impl SegmentManager {
 
     /// Load manifest from disk.
     pub fn load_from_disk(table_name: &str, volume_dir: &Path) -> Result<Option<Self>> {
-        Self::load_from_disk_with_file_catalog(
+        Self::load_from_disk_in(table_name, volume_dir, MemoryAccount::new())
+    }
+
+    pub(crate) fn load_from_disk_in(
+        table_name: &str,
+        volume_dir: &Path,
+        memory: MemoryAccount,
+    ) -> Result<Option<Self>> {
+        Self::load_from_disk_with_file_catalog_in(
             table_name,
             volume_dir,
             Arc::new(super::io::VolumeRetirementQueue::default()),
+            memory,
         )
     }
 
-    pub(crate) fn load_from_disk_with_file_catalog(
+    pub(crate) fn load_from_disk_with_file_catalog_in(
         table_name: &str,
         volume_dir: &Path,
         file_catalog: Arc<super::io::VolumeRetirementQueue>,
+        memory: MemoryAccount,
     ) -> Result<Option<Self>> {
         let table_dir = volume_dir.join(table_name);
         let manifest_path = table_dir.join("manifest.bin");
-
         if !manifest_path.exists() {
             return Ok(None);
         }
-
         let manifest = TableManifest::read_from_disk(&manifest_path)?;
-        let manager = Self::from_manifest_with_file_catalog(
+        let manager = Self::from_manifest_with_file_catalog_in(
             manifest,
             Some(volume_dir.to_path_buf()),
             file_catalog,
+            memory,
         );
-
         Ok(Some(manager))
     }
 
@@ -2782,6 +2855,7 @@ impl SegmentManager {
             old_segments,
             empty_segments: Arc::new(FxHashMap::default()),
             empty_tombstones: Arc::new(FxHashMap::default()),
+            empty_transaction_generations: hot_txn_map(&self.hot_memory),
             retired_cache: self.generation_cache.lock().take(),
         })
     }
@@ -2799,7 +2873,10 @@ impl SegmentManager {
         let segments = std::mem::replace(&mut *self.segments.write(), prepared.empty_segments);
         let tombstones =
             std::mem::replace(&mut *self.tombstones.write(), prepared.empty_tombstones);
-        let transaction_generations = std::mem::take(&mut *self.txn_seal_gens.lock());
+        let transaction_generations = std::mem::replace(
+            &mut *self.txn_seal_gens.lock(),
+            prepared.empty_transaction_generations,
+        );
         self.cached_deduped_count
             .store(0, std::sync::atomic::Ordering::Relaxed);
         self.has_segments_flag
@@ -3364,10 +3441,11 @@ mod tests {
         let path =
             super::super::io::write_volume_to_disk(directory.path(), "before", 1, &volume).unwrap();
         let catalog = Arc::new(super::super::io::VolumeRetirementQueue::default());
-        let manager = SegmentManager::new_with_file_catalog(
+        let manager = SegmentManager::new_with_file_catalog_in(
             "before",
             Some(directory.path().to_path_buf()),
             catalog.clone(),
+            MemoryAccount::new(),
         );
         manager.register_segment(
             1,
@@ -4154,15 +4232,151 @@ mod publication_undo_tests {
     use super::*;
 
     #[test]
+    fn truncate_retires_generation_capacity_and_keeps_the_replacement_accounted() {
+        let account = MemoryAccount::new();
+        let initial = account.snapshot().accounted_bytes;
+        let manager = SegmentManager::new_in("truncate_memory", None, account.child());
+        let empty = account.snapshot().retained_bytes;
+        for txn in 1..=128 {
+            manager.record_txn_seal_generation_at(txn, 9);
+        }
+        let grown = account.snapshot().retained_bytes;
+        assert!(grown > empty);
+        let prepared = manager.prepare_truncate().unwrap();
+        let fence = manager.acquire_seal_write();
+        let retired = manager.apply_truncate(prepared);
+        drop(fence);
+        assert_eq!(manager.get_txn_seal_generation(1), None);
+        assert_eq!(account.snapshot().retained_bytes, grown);
+        manager.record_txn_seal_generation_at(1000, 10);
+        let both = account.snapshot().retained_bytes;
+        assert!(both > grown, "the replacement map must remain attached");
+        drop(retired);
+        assert_eq!(account.snapshot().retained_bytes, both - (grown - empty));
+        assert_eq!(manager.get_txn_seal_generation(1000), Some(10));
+        drop(manager);
+        assert_eq!(account.snapshot().accounted_bytes, initial);
+    }
+
+    #[test]
+    fn reopened_manager_keeps_pending_hot_bytes_in_its_engine_origin() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = SegmentManager::new("reopened_memory", Some(directory.path().to_path_buf()));
+        original.persist().unwrap();
+        drop(original);
+
+        let engine = MemoryAccount::new();
+        let origin = engine.child();
+        let baseline = engine.snapshot().accounted_bytes;
+        let manager =
+            SegmentManager::load_from_disk_in("reopened_memory", directory.path(), origin.clone())
+                .unwrap()
+                .unwrap();
+        assert!(manager.hot_memory_account().same_origin(&origin));
+        let loaded = engine.snapshot().retained_bytes;
+        for row_id in 0..1024 {
+            manager.add_pending_tombstone(7, row_id);
+        }
+        manager.prepare_tombstone_publication(7, 10);
+        assert!(engine.snapshot().retained_bytes > loaded);
+        assert_eq!(
+            engine.snapshot().retained_bytes,
+            origin.snapshot().retained_bytes
+        );
+        assert_eq!(manager.pending_tombstone_count(7), 1024);
+        drop(manager);
+        assert_eq!(engine.snapshot().retained_bytes, 0);
+        assert_eq!(engine.snapshot().accounted_bytes, baseline);
+    }
+
+    #[test]
+    fn pending_tombstone_buffers_remain_charged_until_their_last_owner_drops() {
+        let root = MemoryAccount::new();
+        let empty = root.snapshot().accounted_bytes;
+        let manager = SegmentManager::new_in("pending_memory", None, root.child());
+        for row_id in 1..=1024 {
+            manager.add_pending_tombstone(7, row_id);
+        }
+        let checkpoint = manager.pending_statement_checkpoint(7);
+        let before_failed_statement = root.snapshot().retained_bytes;
+        manager.add_pending_tombstone(7, 1025);
+        manager.finish_pending_statement(7, checkpoint, false);
+        assert_eq!(manager.pending_tombstone_count(7), 1024);
+        assert!(!manager.is_pending_tombstone(7, 1025));
+        assert!(
+            root.snapshot().retained_bytes < before_failed_statement,
+            "the completed statement journal releases its physical buffer"
+        );
+
+        manager.prepare_tombstone_publication(7, 10);
+        let published_bytes = manager.published_tombstone_undo.read()[&7]
+            .1
+            .allocation_size();
+        assert!(published_bytes >= 1024 * std::mem::size_of::<(i64, Option<u64>)>());
+        manager.commit_pending_tombstones(7, 10);
+        assert!(
+            root.snapshot().retained_bytes >= published_bytes,
+            "published undo must remain charged through the commit outcome"
+        );
+        let before_finish = root.snapshot().retained_bytes;
+        manager.finish_tombstone_publication(7, true);
+        assert_eq!(
+            root.snapshot().retained_bytes + published_bytes,
+            before_finish
+        );
+
+        manager.add_pending_tombstone(8, 1);
+        let held_rows = manager
+            .pending_txn_tombstones
+            .write()
+            .remove_value(&8)
+            .unwrap();
+        let held_bytes = held_rows.allocation_size();
+        drop(manager);
+        assert_eq!(
+            root.snapshot().retained_bytes,
+            held_bytes,
+            "a moved row map retains its origin after the manager is dropped"
+        );
+        drop(held_rows);
+        assert_eq!(root.snapshot().accounted_bytes, empty);
+    }
+
+    #[test]
+    fn rollback_releases_pending_rows_and_journals_without_releasing_other_transactions() {
+        let root = MemoryAccount::new();
+        let empty = root.snapshot().accounted_bytes;
+        let manager = SegmentManager::new_in("rollback_memory", None, root.child());
+        for txn in [1, 2] {
+            for row_id in 0..128 {
+                manager.add_pending_tombstone(txn, row_id);
+            }
+            manager.record_txn_seal_generation(txn);
+        }
+        let before = root.snapshot().retained_bytes;
+        manager.rollback_pending_tombstones(1);
+        manager.clear_txn_seal_generation(1);
+        assert!(root.snapshot().retained_bytes < before);
+        assert_eq!(manager.pending_tombstone_count(1), 0);
+        assert_eq!(manager.pending_tombstone_count(2), 128);
+        assert_eq!(manager.get_txn_seal_generation(2), Some(0));
+        drop(manager);
+        assert_eq!(root.snapshot().accounted_bytes, empty);
+    }
+
+    #[test]
     fn failed_prepare_discards_pending_tombstones_without_an_undo_receipt() {
         let manager = SegmentManager::new("pending_undo", None);
         manager.add_pending_tombstone(7, 1);
         let checkpoint = manager.pending_statement_checkpoint(7);
-        let original = manager.pending_txn_tombstones.read()[&7][&1];
+        let original = *manager.pending_txn_tombstones.read()[&7].get(1).unwrap();
         manager.add_pending_tombstone(7, 1);
         manager.add_pending_tombstone(7, 2);
         manager.finish_pending_statement(7, checkpoint, false);
-        assert_eq!(manager.pending_txn_tombstones.read()[&7][&1], original);
+        assert_eq!(
+            *manager.pending_txn_tombstones.read()[&7].get(1).unwrap(),
+            original
+        );
         assert!(!manager.is_pending_tombstone(7, 2));
         // Failure before prepare_tombstone_publication creates any receipt.
         manager.finish_tombstone_publication(7, false);

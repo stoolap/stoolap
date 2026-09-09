@@ -4930,6 +4930,10 @@ impl Table for SegmentedTable {
         self.hot.has_local_changes() || self.segment_mgr.has_pending_tombstones(self.txn_id())
     }
 
+    fn record_source_lsn(&self, row_id: i64, lsn: Option<std::num::NonZeroU64>) {
+        self.hot.record_source_lsn(row_id, lsn);
+    }
+
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
         self.hot.get_pending_versions()
     }
@@ -7402,14 +7406,18 @@ mod tests {
         ));
         let (committed, _) = registry.begin_transaction();
         registry.start_commit(committed);
-        store.add_version(1, RowVersion::new(committed, row(1, 20)));
+        store
+            .add_version(1, RowVersion::new(committed, row(1, 20)))
+            .unwrap();
         let mut deleted = RowVersion::new(committed, row(2, 10));
         deleted.deleted_at_txn_id = committed;
-        store.add_version(2, deleted);
+        store.add_version(2, deleted).unwrap();
         registry.complete_commit(committed);
         let (inflight, _) = registry.begin_transaction();
         registry.start_commit(inflight);
-        store.add_version(3, RowVersion::new(inflight, row(3, 300)));
+        store
+            .add_version(3, RowVersion::new(inflight, row(3, 300)))
+            .unwrap();
         let (reader, _) = registry.begin_transaction();
         let hot = MVCCTable::new(
             reader,
@@ -7492,7 +7500,9 @@ mod tests {
         let mut scanner = table.scan(&[1], None).unwrap();
         manager.rollback_pending_tombstones(reader);
         manager.clear();
-        store.add_version(1, RowVersion::new(inflight, row(1, 999)));
+        store
+            .add_version(1, RowVersion::new(inflight, row(1, 999)))
+            .unwrap();
         let mut actual = Vec::new();
         while scanner.next() {
             actual.push(scanner.take_row_with_id());
@@ -7594,7 +7604,7 @@ mod tests {
         assert!(scanner.err().is_some());
         let (writer, _) = registry.begin_transaction();
         registry.start_commit(writer);
-        store.add_version(1, RowVersion::new(writer, row));
+        store.add_version(1, RowVersion::new(writer, row)).unwrap();
         registry.complete_commit(writer);
         let mut hidden = SegmentedTable::new(Box::new(make_hot()), manager);
         hidden

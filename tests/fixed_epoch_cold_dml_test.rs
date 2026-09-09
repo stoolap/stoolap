@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::{Arc, RwLock};
+use stoolap::common::CompactArc;
 use stoolap::core::{DataType, Row, Schema, SchemaBuilder, Value};
 use stoolap::storage::expression::{ComparisonExpr, Expression};
 use stoolap::storage::mvcc::{
@@ -57,7 +58,7 @@ struct Fixture {
     registry: Arc<TransactionRegistry>,
     store: Arc<VersionStore>,
     manager: Arc<SegmentManager>,
-    local: Arc<RwLock<TransactionVersionStore>>,
+    local: CompactArc<RwLock<TransactionVersionStore>>,
     table: SegmentedTable,
     txn: i64,
 }
@@ -76,7 +77,7 @@ fn fixture() -> Fixture {
     register(&manager, &schema, 1, &[(1, 10), (2, 20)]);
     let epoch = registry.capture_read_epoch();
     let (txn, _) = registry.begin_transaction();
-    let local = Arc::new(RwLock::new(TransactionVersionStore::new(
+    let local = CompactArc::new(RwLock::new(TransactionVersionStore::new(
         store.clone(),
         txn,
     )));
@@ -166,7 +167,9 @@ fn captured_cold_dml_rejects_new_hot_authority_before_mirroring() {
             let mut f = fixture();
             let (writer, _) = f.registry.begin_transaction();
             f.registry.start_commit(writer);
-            f.store.add_version(1, RowVersion::new(writer, row(1, 99)));
+            f.store
+                .add_version(1, RowVersion::new(writer, row(1, 99)))
+                .unwrap();
             f.registry.complete_commit(writer);
             let mut seen = Vec::new();
             let error = change(&mut f, mode, delete, &mut seen).unwrap_err();

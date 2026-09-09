@@ -675,6 +675,9 @@ pub trait Table: Send + Sync {
         Vec::new() // Default implementation returns empty - override in concrete tables
     }
 
+    /// Retain the actual appended row record until transaction publication.
+    fn record_source_lsn(&self, _row_id: i64, _lsn: Option<std::num::NonZeroU64>) {}
+
     // ---- Index Operations ----
 
     /// Creates an index on the table

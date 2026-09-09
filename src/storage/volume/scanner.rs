@@ -1842,14 +1842,18 @@ mod tests {
         let (registry, store) = captured_store();
         let (committed, _) = registry.begin_transaction();
         registry.start_commit(committed);
-        store.add_version(1, RowVersion::new(committed, Row::new()));
+        store
+            .add_version(1, RowVersion::new(committed, Row::new()))
+            .unwrap();
         let mut deleted = RowVersion::new(committed, Row::new());
         deleted.deleted_at_txn_id = committed;
-        store.add_version(2, deleted);
+        store.add_version(2, deleted).unwrap();
         registry.complete_commit(committed);
         let (inflight, _) = registry.begin_transaction();
         registry.start_commit(inflight);
-        store.add_version(3, RowVersion::new(inflight, Row::new()));
+        store
+            .add_version(3, RowVersion::new(inflight, Row::new()))
+            .unwrap();
         let epoch = registry.capture_read_epoch();
         let view = Arc::new(CapturedHotView::new(store.capture_hot_root(), epoch, None));
         registry.complete_commit(inflight);
@@ -1915,7 +1919,9 @@ mod tests {
         let (txn, _) = registry.begin_transaction();
         registry.start_commit(txn);
         for id in [2, 3] {
-            store.add_version(id, RowVersion::new(txn, Row::new()));
+            store
+                .add_version(id, RowVersion::new(txn, Row::new()))
+                .unwrap();
         }
         registry.complete_commit(txn);
         let view = Arc::new(CapturedHotView::new(
@@ -2024,7 +2030,9 @@ mod tests {
             let row = Row::from_values(vec![Value::Integer(id as i64)]);
             builder.add_row(id as i64, &row);
             if id != target {
-                store.add_version(id as i64, RowVersion::new(writer, row));
+                store
+                    .add_version(id as i64, RowVersion::new(writer, row))
+                    .unwrap();
             }
         }
         registry.complete_commit(writer);

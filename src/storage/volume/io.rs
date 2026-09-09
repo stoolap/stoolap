@@ -1330,10 +1330,14 @@ mod tests {
                 queue
                     .rename_directory(&old, &new, &[live.clone(), live.clone()])
                     .unwrap();
-                queue.rename_directory(&new, &old, &[live.clone()]).unwrap();
+                queue
+                    .rename_directory(&new, &old, std::slice::from_ref(&live))
+                    .unwrap();
             }
         });
-        queue.rename_directory(&old, &new, &[live.clone()]).unwrap();
+        queue
+            .rename_directory(&old, &new, std::slice::from_ref(&live))
+            .unwrap();
         assert_eq!(
             retired.reload_from_backing().unwrap().get_row(0).unwrap()[0],
             Value::Integer(99)
@@ -1355,7 +1359,7 @@ mod tests {
             .rename_directory(
                 &dir.path().join("old"),
                 &dir.path().join("missing/new"),
-                &[live.clone()]
+                std::slice::from_ref(&live)
             )
             .is_err());
         assert_eq!(*live.backing.get().unwrap().path.read(), path);

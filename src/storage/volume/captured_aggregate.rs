@@ -1237,14 +1237,18 @@ mod tests {
             let (registry, store) = store(&schema);
             let (writer, _) = registry.begin_transaction();
             registry.start_commit(writer);
-            store.add_version(1, RowVersion::new(writer, row(1, "changed", "x", 10)));
+            store
+                .add_version(1, RowVersion::new(writer, row(1, "changed", "x", 10)))
+                .unwrap();
             let mut deleted = RowVersion::new(writer, row(2, "b", "y", 2));
             deleted.deleted_at_txn_id = writer;
-            store.add_version(2, deleted);
+            store.add_version(2, deleted).unwrap();
             registry.complete_commit(writer);
             let (inflight, _) = registry.begin_transaction();
             let inflight_sequence = registry.start_commit(inflight);
-            store.add_version(3, RowVersion::new(inflight, row(3, "wrong", "wrong", 300)));
+            store
+                .add_version(3, RowVersion::new(inflight, row(3, "wrong", "wrong", 300)))
+                .unwrap();
             let (reader, _) =
                 registry.begin_transaction_with_isolation(IsolationLevel::SnapshotIsolation);
             manager.add_tombstones(&[3], inflight_sequence as u64);
@@ -1318,9 +1322,15 @@ mod tests {
         second.set(4, Value::Float(0.0)).unwrap();
         let mut third = row(3, "a", "x", 3);
         third.set(4, Value::Float(-0.0)).unwrap();
-        store.add_version(1, RowVersion::new(writer, first));
-        store.add_version(2, RowVersion::new(writer, second));
-        store.add_version(3, RowVersion::new(writer, third));
+        store
+            .add_version(1, RowVersion::new(writer, first))
+            .unwrap();
+        store
+            .add_version(2, RowVersion::new(writer, second))
+            .unwrap();
+        store
+            .add_version(3, RowVersion::new(writer, third))
+            .unwrap();
         registry.complete_commit(writer);
         let (reader, _) = registry.begin_transaction();
         let mut hot = MVCCTable::new(
@@ -1413,7 +1423,9 @@ mod tests {
                     let (writer, _) = registry.begin_transaction();
                     registry.start_commit(writer);
                     for (id, value) in &seed {
-                        store.add_version(*id, RowVersion::new(writer, value.clone()));
+                        store
+                            .add_version(*id, RowVersion::new(writer, value.clone()))
+                            .unwrap();
                     }
                     registry.complete_commit(writer);
                 }
@@ -1543,7 +1555,9 @@ mod tests {
                 let (writer, _) = registry.begin_transaction();
                 registry.start_commit(writer);
                 for (i, row) in expected.iter().enumerate() {
-                    store.add_version(i as i64 + 1, RowVersion::new(writer, row.clone()));
+                    store
+                        .add_version(i as i64 + 1, RowVersion::new(writer, row.clone()))
+                        .unwrap();
                 }
                 registry.complete_commit(writer);
             }
@@ -1551,10 +1565,12 @@ mod tests {
                 let (writer, _) = registry.begin_transaction();
                 registry.start_commit(writer);
                 expected[0] = floating(1, Some((-0.0f64).to_bits()), 11);
-                store.add_version(1, RowVersion::new(writer, expected[0].clone()));
+                store
+                    .add_version(1, RowVersion::new(writer, expected[0].clone()))
+                    .unwrap();
                 let mut deletion = RowVersion::new(writer, expected[3].clone());
                 deletion.deleted_at_txn_id = writer;
-                store.add_version(4, deletion);
+                store.add_version(4, deletion).unwrap();
                 registry.complete_commit(writer);
                 expected.remove(3);
                 manager.set_seal_overlap(2);
@@ -1576,7 +1592,9 @@ mod tests {
             // A later committed change must not rewrite the captured group key.
             let (later, _) = registry.begin_transaction();
             registry.start_commit(later);
-            store.add_version(2, RowVersion::new(later, floating(2, Some(NAN_A), 2000)));
+            store
+                .add_version(2, RowVersion::new(later, floating(2, Some(NAN_A), 2000)))
+                .unwrap();
             registry.complete_commit(later);
             let operations = [(AggregateOp::CountStar, 0), (AggregateOp::Sum, 3)];
             let mut expected_bits = std::collections::BTreeMap::<Option<u64>, (i64, f64)>::new();
@@ -1633,7 +1651,9 @@ mod tests {
         {
             let mut data = row(id as i64 + 1, "same", "same", 1);
             data.set(4, key).unwrap();
-            store.add_version(id as i64 + 1, RowVersion::new(writer, data));
+            store
+                .add_version(id as i64 + 1, RowVersion::new(writer, data))
+                .unwrap();
         }
         registry.complete_commit(writer);
         let view = CapturedHotView::new(
@@ -2097,7 +2117,9 @@ mod tests {
         registry.start_commit(writer);
         let mut original = row(1, "a", "x", 10);
         original.set(2, Value::json("{}")).unwrap();
-        store.add_version(1, RowVersion::new(writer, original.clone()));
+        store
+            .add_version(1, RowVersion::new(writer, original.clone()))
+            .unwrap();
         registry.complete_commit(writer);
         let (reader, _) = registry.begin_transaction();
         let mut table = MVCCTable::new(

@@ -267,6 +267,7 @@ fn public_already_visible_version_ingress_invalidates_cached_results() {
             3 => store.apply_recovered_version(3, version),
             _ => unreachable!(),
         }
+        .unwrap();
         assert!(db.engine().cache_provenance(&epoch).is_none());
         let expected = vec![(1, 10), (2, 20), (3, 30)];
         assert_eq!(values(&reader), expected, "operation {operation}");
@@ -291,7 +292,7 @@ fn public_recovery_delete_and_physical_removal_invalidate_cached_results() {
             assert!(skipped.is_empty());
             store.subtract_committed_row_count(removed);
         } else {
-            store.mark_deleted(1, RECOVERY_TRANSACTION_ID);
+            store.mark_deleted(1, RECOVERY_TRANSACTION_ID).unwrap();
         }
         assert!(db.engine().cache_provenance(&epoch).is_none());
         assert_eq!(values(&reader), vec![(2, 20)]);

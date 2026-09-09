@@ -137,7 +137,7 @@ fn sql_default_columns_populate_all_native_index_builders() {
 fn publish(registry: &TransactionRegistry, store: &VersionStore, row_id: i64, row: Row) {
     let (id, _) = registry.begin_transaction();
     registry.start_commit(id);
-    store.add_version(row_id, RowVersion::new(id, row));
+    store.add_version(row_id, RowVersion::new(id, row)).unwrap();
     registry.complete_commit(id);
 }
 
@@ -485,7 +485,7 @@ fn visible_creator_with_unresolved_distinct_deleter_blocks_index_build() {
         .clone();
     let (deleter, _) = registry.begin_transaction();
     deleted.deleted_at_txn_id = deleter;
-    store.add_version(1, deleted);
+    store.add_version(1, deleted).unwrap();
     let (builder, _) = registry.begin_transaction();
     let table = MVCCTable::new(
         builder,

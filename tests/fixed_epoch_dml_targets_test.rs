@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::{Arc, RwLock};
+use stoolap::common::CompactArc;
 use stoolap::core::{DataType, Error, Row, SchemaBuilder, Value};
 use stoolap::storage::expression::{AndExpr, ComparisonExpr, Expression};
 use stoolap::storage::mvcc::registry::ReadEpoch;
@@ -45,17 +46,19 @@ fn fixture() -> (Arc<TransactionRegistry>, Arc<VersionStore>, ReadEpoch) {
 fn publish(registry: &TransactionRegistry, store: &VersionStore, rows: &[(i64, i64)]) {
     let (txn, _) = registry.begin_transaction();
     registry.start_commit(txn);
-    store.add_versions_batch(
-        rows.iter()
-            .map(|&(id, g)| (id, RowVersion::new(txn, row(id, g))))
-            .collect(),
-    );
+    store
+        .add_versions_batch(
+            rows.iter()
+                .map(|&(id, g)| (id, RowVersion::new(txn, row(id, g))))
+                .collect(),
+        )
+        .unwrap();
     registry.complete_commit(txn);
 }
 
 fn bind(registry: &TransactionRegistry, store: Arc<VersionStore>, epoch: ReadEpoch) -> MVCCTable {
     let (txn, _) = registry.begin_transaction();
-    let local = Arc::new(RwLock::new(TransactionVersionStore::new(
+    let local = CompactArc::new(RwLock::new(TransactionVersionStore::new(
         store.clone(),
         txn,
     )));
@@ -189,7 +192,7 @@ fn captured_value_rejects_a_later_distinct_committed_deleter() {
         registry.start_commit(deleter);
         let mut deletion = RowVersion::new(creator, row(1, 10));
         deletion.deleted_at_txn_id = deleter;
-        store.add_version(1, deletion);
+        store.add_version(1, deletion).unwrap();
         registry.complete_commit(deleter);
         let mut table = bind(&registry, store, epoch);
         let pk = ComparisonExpr::eq("id", Value::Integer(1));
@@ -227,12 +230,14 @@ fn aborted_distinct_deleter_keeps_the_visible_original_for_index_undo() {
     registry.start_commit(deleter);
     let mut deletion = RowVersion::new(creator, row(1, 10));
     deletion.deleted_at_txn_id = deleter;
-    store.add_version(1, deletion);
+    store.add_version(1, deletion).unwrap();
     // The captured tree owns the excluded deletion head even after undo puts
     // the original value back into the live store.
     let mut table = bind(&registry, store.clone(), epoch);
     registry.abort_transaction(deleter);
-    store.add_version(1, RowVersion::new(creator, row(1, 10)));
+    store
+        .add_version(1, RowVersion::new(creator, row(1, 10)))
+        .unwrap();
     registry.acknowledge_rollback(deleter);
     let pk = ComparisonExpr::eq("id", Value::Integer(1));
     assert_eq!(

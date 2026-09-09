@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::sync::{Arc, RwLock};
+use stoolap::common::CompactArc;
 use stoolap::core::{DataType, Error, Result, Row, RowVec, Schema, SchemaBuilder, Value};
 use stoolap::storage::expression::{ComparisonExpr, Expression};
 use stoolap::storage::mvcc::{
@@ -37,12 +38,14 @@ fn schema() -> Schema {
 fn publish(registry: &TransactionRegistry, store: &VersionStore, values: &[(i64, i64)]) {
     let (id, _) = registry.begin_transaction();
     registry.start_commit(id);
-    store.add_versions_batch(
-        values
-            .iter()
-            .map(|&(key, value)| (key, RowVersion::new(id, row(key, value))))
-            .collect(),
-    );
+    store
+        .add_versions_batch(
+            values
+                .iter()
+                .map(|&(key, value)| (key, RowVersion::new(id, row(key, value))))
+                .collect(),
+        )
+        .unwrap();
     registry.complete_commit(id);
 }
 fn hot_fixture() -> MVCCTable {
@@ -229,7 +232,7 @@ fn cold_fixture() -> SegmentedTable {
     publish(&registry, &store, &[(0, 10), (2, 20)]);
     let epoch = registry.capture_read_epoch();
     let (txn, _) = registry.begin_transaction();
-    let local = Arc::new(RwLock::new(TransactionVersionStore::new(
+    let local = CompactArc::new(RwLock::new(TransactionVersionStore::new(
         store.clone(),
         txn,
     )));
@@ -464,10 +467,12 @@ fn captured_dictionary_partitions_merge_nulls_and_authoritative_versions() {
     ));
     let (creator, _) = registry.begin_transaction();
     registry.start_commit(creator);
-    store.add_versions_batch(vec![
-        (1, RowVersion::new(creator, make_row(1, Some("c")))),
-        (7, RowVersion::new(creator, make_row(7, None))),
-    ]);
+    store
+        .add_versions_batch(vec![
+            (1, RowVersion::new(creator, make_row(1, Some("c")))),
+            (7, RowVersion::new(creator, make_row(7, None))),
+        ])
+        .unwrap();
     registry.complete_commit(creator);
     let epoch = registry.capture_read_epoch();
     let (txn, _) = registry.begin_transaction();
@@ -477,10 +482,12 @@ fn captured_dictionary_partitions_merge_nulls_and_authoritative_versions() {
     local.put(8, make_row(8, Some("d")), false).unwrap();
     let (later, _) = registry.begin_transaction();
     registry.start_commit(later);
-    store.add_versions_batch(vec![
-        (5, RowVersion::new(later, make_row(5, Some("later")))),
-        (9, RowVersion::new(later, make_row(9, Some("later")))),
-    ]);
+    store
+        .add_versions_batch(vec![
+            (5, RowVersion::new(later, make_row(5, Some("later")))),
+            (9, RowVersion::new(later, make_row(9, Some("later")))),
+        ])
+        .unwrap();
     registry.complete_commit(later);
     let hot = MVCCTable::new(txn, store, local);
     let mut table = SegmentedTable::new(Box::new(hot), manager);

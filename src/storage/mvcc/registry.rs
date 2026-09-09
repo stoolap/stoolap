@@ -25,7 +25,7 @@ use std::sync::Arc;
 use parking_lot::{Condvar, Mutex};
 use smallvec::SmallVec;
 
-use crate::common::I64Map;
+use crate::common::{CompactArc, I64Map};
 use crate::core::IsolationLevel;
 use crate::storage::VisibilityChecker;
 
@@ -191,7 +191,7 @@ struct EpochData {
     // views must never inherit the generation current when they are reopened.
     cache_generation: u64,
     // None avoids an empty-slice allocation in the common case.
-    excluded: Option<Arc<[i64]>>,
+    excluded: Option<CompactArc<[i64]>>,
 }
 
 impl EpochData {
@@ -387,10 +387,11 @@ struct RegistryState {
     snapshot_seqs: I64Map<i64>,
     // Preserve begin-time exclusions for legacy callers that set isolation
     // after begin. Empty exclusions need no map entry/allocation.
-    begin_exclusions: I64Map<Arc<[i64]>>,
+    begin_exclusions: I64Map<CompactArc<[i64]>>,
     // Only committing transactions, normally inline. Avoid scanning all active
     // transactions whenever a statement or transaction captures an epoch.
     committing: SmallVec<[CommittingTxn; 4]>,
+    committing_charge: Option<crate::common::memory::MemoryCharge>,
     leases: I64Map<i64>,
     // Lowered atomically with each registration; stale low floors only retain
     // extra history. Exact GC/pressure refresh raises it without per-row scans.
@@ -433,7 +434,10 @@ impl RegistryState {
             } else {
                 0
             },
-            excluded: (!excluded.is_empty()).then(|| Arc::from(excluded.as_slice())),
+            excluded: (!excluded.is_empty()).then(|| match self.transactions.memory_account() {
+                Some(account) => CompactArc::from_slice_in(excluded.as_slice(), account),
+                None => CompactArc::from_slice(excluded.as_slice()),
+            }),
         }
     }
 
@@ -537,6 +541,27 @@ impl RegistryState {
         }
     }
 
+    fn push_committing(&mut self, txn: CommittingTxn) {
+        if let Some(charge) = self.committing_charge.as_mut() {
+            if self.committing.len() == self.committing.capacity() {
+                let capacity = self
+                    .committing
+                    .capacity()
+                    .checked_mul(2)
+                    .expect("committing capacity exhausted");
+                let replacement = SmallVec::with_capacity(capacity);
+                let new_bytes = capacity * std::mem::size_of::<CommittingTxn>();
+                // Charge both live buffers before moving values and releasing
+                // the old allocation. No counter update on the inline path.
+                charge.resize(charge.bytes() + new_bytes);
+                let previous = std::mem::replace(&mut self.committing, replacement);
+                self.committing.extend(previous);
+                charge.resize(new_bytes);
+            }
+        }
+        self.committing.push(txn);
+    }
+
     fn remove_committing(&mut self, txn_id: i64) {
         if let Some(index) = self.committing.iter().position(|txn| txn.id == txn_id) {
             self.committing.swap_remove(index);
@@ -554,12 +579,14 @@ struct RegistryShared {
     accepting: AtomicBool,
     current_sequence: AtomicI64,
     committed_cache: CommittedCache,
+    _object_charge: Option<crate::common::memory::MemoryCharge>,
 }
 
 /// Registry facade. Leases keep the state and retention metadata alive without
 /// a cycle: registry state stores only lease IDs/horizons, never lease handles.
 pub struct TransactionRegistry {
     shared: Arc<RegistryShared>,
+    _object_charge: Option<crate::common::memory::MemoryCharge>,
 }
 
 /// Marks a logical mutation which does not wait for transaction visibility.
@@ -697,6 +724,13 @@ impl TransactionRegistry {
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_optional_account(capacity, None)
+    }
+
+    fn with_optional_account(
+        capacity: usize,
+        account: Option<&crate::common::memory::MemoryAccount>,
+    ) -> Self {
         Self {
             shared: Arc::new(RegistryShared {
                 namespace: NEXT_REGISTRY_NAMESPACE
@@ -708,11 +742,16 @@ impl TransactionRegistry {
                     destructive_ddl: false,
                     logical_generation: 1,
                     immediate_mutations: 0,
-                    transactions: I64Map::with_capacity(capacity),
-                    snapshot_seqs: I64Map::new(),
-                    begin_exclusions: I64Map::new(),
+                    transactions: account.map_or_else(
+                        || I64Map::with_capacity(capacity),
+                        |origin| I64Map::with_capacity_in(capacity, origin),
+                    ),
+                    snapshot_seqs: account.map_or_else(I64Map::new, I64Map::new_in),
+                    begin_exclusions: account.map_or_else(I64Map::new, I64Map::new_in),
                     committing: SmallVec::new(),
-                    leases: I64Map::new(),
+                    committing_charge: account
+                        .map(|origin| crate::common::memory::MemoryCharge::new(origin, 0)),
+                    leases: account.map_or_else(I64Map::new, I64Map::new_in),
                     cached_retention_horizon: None,
                     next_registration: 0,
                     next_txn_id: 0,
@@ -726,8 +765,26 @@ impl TransactionRegistry {
                 accepting: AtomicBool::new(true),
                 current_sequence: AtomicI64::new(0),
                 committed_cache: CommittedCache::new(),
+                // std::Arc headers are opaque. Keep the allowance with this
+                // physical owner: external epochs can outlive the facade.
+                _object_charge: account.map(|origin| {
+                    crate::common::memory::MemoryCharge::conservative(
+                        origin,
+                        std::mem::size_of::<RegistryShared>() + 4 * std::mem::size_of::<usize>(),
+                    )
+                }),
+            }),
+            _object_charge: account.map(|origin| {
+                crate::common::memory::MemoryCharge::conservative(
+                    origin,
+                    std::mem::size_of::<Self>() + 4 * std::mem::size_of::<usize>(),
+                )
             }),
         }
+    }
+
+    pub(crate) fn new_in(account: &crate::common::memory::MemoryAccount) -> Self {
+        Self::with_optional_account(16, Some(account))
     }
 
     #[inline]
@@ -1037,7 +1094,7 @@ impl TransactionRegistry {
         // Grow the bounded in-flight list before overwriting the Active word,
         // which is still the sole owner of this begin registration. If a spill
         // allocation unwinds, the transaction remains Active and fully tracked.
-        state.committing.push(CommittingTxn {
+        state.push_committing(CommittingTxn {
             id: txn_id,
             commit_seq,
             begin_registration,
@@ -2849,5 +2906,97 @@ mod cache_provenance_tests {
                 .cache_provenance(&registry.capture_read_epoch())
                 .is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_ownership_tests {
+    use super::*;
+    use crate::common::memory::MemoryAccount;
+
+    #[test]
+    fn committing_spill_accounts_replacement_overlap_without_charging_inline_entries() {
+        let account = MemoryAccount::new();
+        let initial = account.snapshot().accounted_bytes;
+        let registry = TransactionRegistry::new_in(&account);
+        let txns: [i64; 9] = std::array::from_fn(|_| registry.begin_transaction().0);
+        let before = account.snapshot();
+        for &txn in &txns[..4] {
+            registry.start_commit(txn);
+        }
+        assert_eq!(account.snapshot().accounted_bytes, before.accounted_bytes);
+        registry.start_commit(txns[4]);
+        let first_capacity = 8 * std::mem::size_of::<CommittingTxn>();
+        assert_eq!(
+            account.snapshot().retained_bytes,
+            before.retained_bytes + first_capacity
+        );
+        for &txn in &txns[5..] {
+            registry.start_commit(txn);
+        }
+        let second_capacity = 16 * std::mem::size_of::<CommittingTxn>();
+        let after = account.snapshot();
+        assert_eq!(
+            after.retained_bytes,
+            before.retained_bytes + second_capacity
+        );
+        assert!(
+            after.peak_accounted_bytes >= before.accounted_bytes + first_capacity + second_capacity
+        );
+        for txn in txns {
+            registry.complete_commit(txn);
+        }
+        let state = registry.shared.state.lock();
+        assert!(state.committing.is_empty());
+        assert_eq!(
+            state.committing_charge.as_ref().unwrap().bytes(),
+            second_capacity
+        );
+        drop(state);
+        drop(registry);
+        assert_eq!(account.snapshot().accounted_bytes, initial);
+    }
+
+    #[test]
+    fn shared_exclusions_and_registry_state_keep_their_own_last_owner_charges() {
+        let account = MemoryAccount::new();
+        let initial = account.snapshot();
+        let registry = TransactionRegistry::new_in(&account);
+        let txns: [i64; 6] = std::array::from_fn(|_| registry.begin_transaction().0);
+        for txn in txns {
+            registry.start_commit(txn);
+        }
+        let (reader, _) =
+            registry.begin_transaction_with_isolation(IsolationLevel::SnapshotIsolation);
+        let epoch = registry.read_epoch_for_transaction(reader).unwrap();
+        let exclusions = epoch.lease.data.excluded.as_ref().unwrap().clone();
+        {
+            let state = registry.shared.state.lock();
+            assert!(CompactArc::ptr_eq(
+                state.begin_exclusions.get(reader).unwrap(),
+                &exclusions
+            ));
+            assert!(exclusions.belongs_to(&account));
+        }
+        for txn in txns {
+            registry.complete_commit(txn);
+            assert!(!epoch.is_visible(txn));
+        }
+        registry.abort_transaction(reader);
+        registry.acknowledge_rollback(reader);
+        drop(registry);
+        // The read lease retains RegistryShared, but not its original facade.
+        assert!(account.snapshot().retained_bytes > exclusions.allocation_size());
+        drop(epoch);
+        assert_eq!(
+            account.snapshot().retained_bytes,
+            exclusions.allocation_size()
+        );
+        assert_eq!(
+            account.snapshot().conservative_bytes,
+            initial.conservative_bytes
+        );
+        drop(exclusions);
+        assert_eq!(account.snapshot().accounted_bytes, initial.accounted_bytes);
     }
 }

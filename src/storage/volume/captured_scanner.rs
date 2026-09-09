@@ -393,7 +393,9 @@ mod tests {
         let (_, registry, store, manager) = fixture();
         let (inflight, _) = registry.begin_transaction();
         registry.start_commit(inflight);
-        store.add_version(6, RowVersion::new(inflight, row(6, 600)));
+        store
+            .add_version(6, RowVersion::new(inflight, row(6, 600)))
+            .unwrap();
         let (reader, _) = registry.begin_transaction();
         let mut local = TransactionVersionStore::new(store.clone(), reader);
         local.put(2, row(2, 200), false).unwrap();
@@ -425,7 +427,9 @@ mod tests {
         let mut scanner = table.scan(&[1], Some(&filter)).unwrap();
         let (newer, _) = registry.begin_transaction();
         registry.start_commit(newer);
-        store.add_version(5, RowVersion::new(newer, row(5, 500)));
+        store
+            .add_version(5, RowVersion::new(newer, row(5, 500)))
+            .unwrap();
         registry.complete_commit(newer);
         manager.rollback_pending_tombstones(reader);
         manager.clear();
@@ -440,10 +444,12 @@ mod tests {
         let (schema, registry, store, manager) = fixture();
         let (writer, _) = registry.begin_transaction();
         registry.start_commit(writer);
-        store.add_version(1, RowVersion::new(writer, row(1, 100)));
+        store
+            .add_version(1, RowVersion::new(writer, row(1, 100)))
+            .unwrap();
         let mut deleted = RowVersion::new(writer, row(2, 20));
         deleted.deleted_at_txn_id = writer;
-        store.add_version(2, deleted);
+        store.add_version(2, deleted).unwrap();
         registry.complete_commit(writer);
         manager.add_tombstones(&[4], registry.get_commit_sequence(writer).unwrap() as u64);
         let (_, mut generation) = manager.capture_with_hot(|| ()).unwrap();
