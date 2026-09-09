@@ -11,7 +11,7 @@ independently reviewable without claiming unmerged work is shipped.
 | 2 | Chunked arena and retained-hot accounting | Pending | Pending | — |
 | 3 | Coherent two-layer execution | Pending | Pending | — |
 | 4 | V5 envelope and bounded streaming seal | Pending | Pending | — |
-| 5 | Remover, durable WAL/catalog and pressure seal | Pending | Pending | — |
+| 5 | Remover, durable WAL/catalog and pressure seal | Catalog foundations implemented; lifecycle integration pending | Foundations passed independent review | — |
 | 6 | Paged reads, four ledgers and DML preflight | Pending | Pending | — |
 | 7 | Explicit clustering and compatibility fallback | Pending | Pending | — |
 | 8 | Identity-first compaction and bounded migration | Pending | Pending | — |
@@ -88,3 +88,28 @@ baseline. No hard memory bound or competitor claim follows from this probe.
 The exact fixture, source digest, medians, ranges and limitations are recorded
 in [measurements](measurements/README.md). Clippy with FFI and failpoints,
 no-default compilation and final targeted tests passed.
+
+## Phase 5 catalog foundations
+
+Stable table/incarnation/column identities and immutable schema history now
+retain introduction defaults and historical DDL/FK/index bindings. Catalog
+validation checks exact revision lifetimes, name reuse and covered DDL effects;
+it does not establish durable installation or WAL coverage by itself.
+
+The STCG codec streams immutable generations without a whole-catalog buffer.
+Decoding checks explicit wire lengths, counts, nested record boundaries, CRCs,
+strict tags and EOF before publishing the reconstructed model. Requested
+metadata and payload quotas precede reservations; one mutable history builder
+avoids repeatedly cloning the growing history. All Value variants retain their
+representation, including signed zero, NaN bits and wide/leap timestamps.
+
+Independent review and root validation passed 33 catalog tests. Three allocation
+tests passed, including zero allocation calls while encoding a borrowed 1 MiB
+default. The writer receives that original payload pointer. Feature-enabled
+clippy passes. Decode quotas are conservative structural limits, not the final
+retained-allocation ledger or an RSS guarantee.
+
+This stage remains incomplete: engine DDL/WAL identity wiring, complete legacy
+bootstrap, durable installation/receipts, witness/remover coordination and
+memory-pressure activation are still required. The codec descriptor cannot
+acknowledge durability, and production lifecycle behavior is not enabled.
