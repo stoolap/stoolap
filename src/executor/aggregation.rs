@@ -5439,7 +5439,7 @@ impl Executor {
                         }
                     } else if agg.column == "*" {
                         // COUNT(*) - use row_count
-                        let count = table.row_count();
+                        let count = table.row_count()?;
                         result_values.push(Value::Integer(count as i64));
                     } else {
                         // COUNT(col) - need to count non-null values, can't pushdown easily
@@ -5822,7 +5822,7 @@ impl Executor {
                     "COUNT" => {
                         if agg.column == "*" {
                             // COUNT(*) - use row_count()
-                            Some(Value::Integer(table.row_count() as i64))
+                            Some(Value::Integer(table.row_count()? as i64))
                         } else {
                             // COUNT(col) - need scanner for NULL checking
                             // Could optimize with a dedicated count_non_null method
@@ -7170,7 +7170,7 @@ impl Executor {
         let tx = self.engine.begin_transaction()?;
         let table = tx.get_table(&cs.table_name)?;
 
-        let count = table.row_count();
+        let count = table.row_count()?;
 
         // Build result
         let mut result_values = CompactVec::with_capacity(1);
@@ -7388,7 +7388,10 @@ impl Executor {
         };
 
         // Get the count
-        let count = table.row_count();
+        let count = match table.row_count() {
+            Ok(count) => count,
+            Err(error) => return Some(Err(error)),
+        };
 
         // Cache the compiled state
         let compiled_cs = CompiledCountStar {

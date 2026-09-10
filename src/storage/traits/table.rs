@@ -870,8 +870,11 @@ pub trait Table: Send + Sync {
     ///
     /// # Returns
     /// The number of visible rows in the table
-    fn row_count(&self) -> usize {
-        0 // Default implementation - override in concrete tables
+    ///
+    /// # Errors
+    /// Returns a storage error if visible rows cannot be read.
+    fn row_count(&self) -> Result<usize> {
+        Ok(0) // Default implementation - override in concrete tables
     }
 
     /// Fast O(1) row count hint for optimizer decisions
@@ -879,7 +882,7 @@ pub trait Table: Send + Sync {
     /// Returns an upper bound estimate without expensive visibility checks.
     /// Use for cache eligibility and similar decisions where exact count isn't needed.
     fn row_count_hint(&self) -> usize {
-        self.row_count() // Default falls back to row_count
+        usize::MAX // Unknown cardinality, without loading table data
     }
 
     /// Fast O(1) exact row count for COUNT(*) queries
@@ -999,8 +1002,11 @@ pub trait Table: Send + Sync {
     ///
     /// # Returns
     /// Some(Vec<Value>) with distinct non-null values, or None if fast path unavailable
-    fn compute_distinct_values(&self, _col_idx: usize) -> Option<Vec<Value>> {
-        None
+    ///
+    /// # Errors
+    /// Returns a storage error if the required rows or columns cannot be read.
+    fn compute_distinct_values(&self, _col_idx: usize) -> Result<Option<Vec<Value>>> {
+        Ok(None)
     }
 
     /// Get the count of distinct non-null values from an indexed column.
