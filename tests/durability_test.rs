@@ -2782,6 +2782,57 @@ fn test_manifest_deleted() {
 }
 
 #[test]
+fn test_volume_directory_error_fails_before_wal_replay() {
+    let (fixture, _) = setup_db_with_volumes();
+    let volumes = fixture.db_path.join("volumes");
+    let saved = fixture.db_path.join("saved_volumes");
+    fs::rename(&volumes, &saved).unwrap();
+    fs::write(&volumes, b"directory unavailable").unwrap();
+
+    let error = match Database::open(&fixture.dsn) {
+        Err(error) => error,
+        Ok(_) => panic!("volume directory errors must fail opening"),
+    };
+    assert!(error.to_string().contains("volume directory"), "{error}");
+    fs::remove_file(&volumes).unwrap();
+    fs::rename(&saved, &volumes).unwrap();
+    let db = Database::open(&fixture.dsn).unwrap();
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT COUNT(*) FROM vol_test", ())
+            .unwrap(),
+        40
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_manifest_metadata_error_fails_before_wal_replay() {
+    let (fixture, _) = setup_db_with_volumes();
+    let manifest = find_manifest_file(&fixture.db_path, "vol_test").unwrap();
+    let saved = manifest.with_extension("saved");
+    fs::rename(&manifest, &saved).unwrap();
+    std::os::unix::fs::symlink("manifest.bin", &manifest).unwrap();
+
+    let error = match Database::open(&fixture.dsn) {
+        Err(error) => error,
+        Ok(_) => panic!("manifest metadata errors must fail opening"),
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("manifest") && message.contains("vol_test"),
+        "{message}"
+    );
+    fs::remove_file(&manifest).unwrap();
+    fs::rename(&saved, &manifest).unwrap();
+    let db = Database::open(&fixture.dsn).unwrap();
+    assert_eq!(
+        db.query_one::<i64, _>("SELECT COUNT(*) FROM vol_test", ())
+            .unwrap(),
+        40
+    );
+}
+
+#[test]
 fn test_volume_truncated() {
     // Truncate a .vol file to partial state (simulates torn write during seal)
     let (fixture, _) = setup_db_with_volumes();

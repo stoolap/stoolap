@@ -645,24 +645,13 @@ impl MVCCEngine {
                 // 2. If volumes/ exists with manifests -> new checkpoint-to-volume recovery
                 // 3. Otherwise -> pure WAL replay from beginning
                 let snapshot_dir = pm.path().join("snapshots");
-                let vol_dir = pm.path().join("volumes");
 
-                // Check for volumes/ with manifests (new architecture).
-                // This takes priority over snapshots/ because PRAGMA SNAPSHOT
-                // now creates backup .bin files in snapshots/ alongside volumes/.
-                let has_volumes = vol_dir.exists()
-                    && std::fs::read_dir(&vol_dir)
-                        .ok()
-                        .map(|entries| {
-                            entries
-                                .flatten()
-                                .any(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
-                        })
-                        .unwrap_or(false);
+                // Volume recovery takes priority over snapshot backup files.
+                let volume_lsn = self.load_manifests_from_volumes()?;
 
                 // Legacy snapshots: only used when volumes/ does NOT exist.
                 // This handles migration from pre-volume databases.
-                let has_legacy_snapshots = !has_volumes
+                let has_legacy_snapshots = volume_lsn.is_none()
                     && snapshot_dir.exists()
                     && std::fs::read_dir(&snapshot_dir)
                         .ok()
@@ -673,11 +662,10 @@ impl MVCCEngine {
                         })
                         .unwrap_or(false);
 
-                let replay_from_lsn = if has_volumes {
+                let replay_from_lsn = if let Some(lsn) = volume_lsn {
                     // New path: load manifests + volumes BEFORE WAL replay.
                     // Volumes must be loaded so is_row_id_in_volume() can check
                     // row_ids for idempotent INSERT during replay.
-                    let lsn = self.load_manifests_from_volumes()?;
                     self.load_standalone_volumes_no_schema_check();
                     lsn
                 } else if has_legacy_snapshots {
@@ -3143,42 +3131,38 @@ impl MVCCEngine {
         );
     }
 
-    /// Load manifests from the volumes/ directory for checkpoint-to-volume recovery.
-    ///
-    /// This is called during startup when no snapshot files exist but volumes/ has
-    /// manifest.bin files from a previous checkpoint cycle. Loads manifest metadata
-    /// (segment list, tombstones, checkpoint_lsn) into segment managers so that:
-    /// - WAL replay can check `is_row_id_in_volume_range()` for tombstone creation
-    /// - The minimum checkpoint_lsn determines where WAL replay starts
-    ///
-    /// Returns the minimum checkpoint_lsn across all loaded manifests (0 if none found).
-    /// Fails closed on an unreadable or unsupported manifest: opening with a
-    /// partially visible catalog lets the orphan reaper destroy live volumes.
-    /// Actual .vol files are loaded later by `load_standalone_volumes()` after WAL replay
-    /// creates the required schemas and version stores.
-    fn load_manifests_from_volumes(&self) -> Result<u64> {
+    /// Discover volume table directories and load their manifests before WAL replay.
+    /// None selects legacy recovery when there are no volume table directories.
+    /// Some selects volume recovery with its manifest-derived replay LSN.
+    fn load_manifests_from_volumes(&self) -> Result<Option<u64>> {
         let pm = match self.persistence.as_ref() {
             Some(pm) if pm.is_enabled() => pm,
-            _ => return Ok(0),
+            _ => return Ok(None),
         };
 
         let vol_dir = pm.path().join("volumes");
-        if !vol_dir.exists() {
-            return Ok(0);
-        }
-
         let entries = match std::fs::read_dir(&vol_dir) {
             Ok(e) => e,
-            Err(_) => return Ok(0),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                return Err(Error::internal(format!(
+                    "failed to read volume directory '{}': {}",
+                    vol_dir.display(),
+                    e
+                )));
+            }
         };
 
         let mut min_checkpoint_lsn: u64 = u64::MAX;
+        let mut has_table_dirs = false;
         let mut any_loaded = false;
 
-        for entry in entries.flatten() {
-            if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
                 continue;
             }
+            has_table_dirs = true;
 
             let table_name = entry.file_name().to_string_lossy().to_lowercase();
 
@@ -3215,19 +3199,22 @@ impl MVCCEngine {
             }
         }
 
+        if !has_table_dirs {
+            return Ok(None);
+        }
         if !any_loaded {
             // No manifests found, remove checkpoint.meta if present
             // to ensure full WAL replay
             let checkpoint_path = pm.path().join("wal").join("checkpoint.meta");
             let _ = std::fs::remove_file(checkpoint_path);
-            return Ok(0);
+            return Ok(Some(0));
         }
 
-        Ok(if min_checkpoint_lsn == u64::MAX {
+        Ok(Some(if min_checkpoint_lsn == u64::MAX {
             0
         } else {
             min_checkpoint_lsn
-        })
+        }))
     }
 
     /// Load standalone volumes from the volumes/ directory.
