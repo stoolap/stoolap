@@ -2034,17 +2034,13 @@ impl Executor {
                 let outer_tables = vec![table_name.to_string()];
 
                 // Try EXISTS semi-join optimization
-                let exists_optimized = self
-                    .try_optimize_exists_to_semi_join(where_clause, ctx, &outer_tables, None)
-                    .ok()
-                    .flatten();
+                let exists_optimized =
+                    self.try_optimize_exists_to_semi_join(where_clause, ctx, &outer_tables, None)?;
 
                 // Try IN semi-join optimization (on EXISTS result or original)
                 let expr_for_in = exists_optimized.as_ref().unwrap_or(where_clause.as_ref());
-                let in_optimized = self
-                    .try_optimize_in_to_semi_join(expr_for_in, ctx, &outer_tables)
-                    .ok()
-                    .flatten();
+                let in_optimized =
+                    self.try_optimize_in_to_semi_join(expr_for_in, ctx, &outer_tables)?;
 
                 // Determine final expression without unnecessary clones
                 let current_expr = in_optimized
@@ -2177,8 +2173,9 @@ impl Executor {
                                     outer_row_map,
                                     CompactArc::clone(&column_names),
                                 );
-                                self.process_correlated_where(mem_where, &correlated_ctx)
-                                    .and_then(|processed| evaluator.evaluate_bool(&processed))
+                                let processed =
+                                    self.process_correlated_where(mem_where, &correlated_ctx)?;
+                                evaluator.evaluate_bool(&processed)
                             } else {
                                 evaluator.evaluate_bool(mem_where)
                             };
@@ -2273,8 +2270,9 @@ impl Executor {
                 if needs_memory_filter {
                     if let Some(ref where_clause) = memory_where_clause {
                         let held = if where_is_correlated {
-                            self.process_correlated_where(where_clause, &correlated_ctx)
-                                .and_then(|processed| evaluator.evaluate_bool(&processed))
+                            let processed =
+                                self.process_correlated_where(where_clause, &correlated_ctx)?;
+                            evaluator.evaluate_bool(&processed)
                         } else {
                             evaluator.evaluate_bool(where_clause)
                         };
@@ -2290,17 +2288,14 @@ impl Executor {
                 for (idx, col_type, vec_dims, expr, is_correlated) in update_indices.iter() {
                     let evaluated = if *is_correlated {
                         // Process correlated expression - this executes the subquery
-                        match self.process_correlated_expression(expr, &correlated_ctx) {
-                            Ok(processed_expr) => {
-                                // Now evaluate the processed expression (subquery replaced with value)
-                                let mut eval = CompiledEvaluator::new(function_registry)
-                                    .with_context(&correlated_ctx);
-                                eval.init_columns_arc(CompactArc::clone(&column_names));
-                                eval.set_row_array(row);
-                                eval.evaluate(&processed_expr).ok()
-                            }
-                            Err(_) => None,
-                        }
+                        let processed_expr =
+                            self.process_correlated_expression(expr, &correlated_ctx)?;
+                        // Now evaluate the processed expression (subquery replaced with value)
+                        let mut eval =
+                            CompiledEvaluator::new(function_registry).with_context(&correlated_ctx);
+                        eval.init_columns_arc(CompactArc::clone(&column_names));
+                        eval.set_row_array(row);
+                        eval.evaluate(&processed_expr).ok()
                     } else {
                         evaluator.evaluate(expr).ok()
                     };
@@ -2324,6 +2319,9 @@ impl Executor {
                 if !new_values.is_empty() {
                     precomputed.insert(pk_value, new_values);
                 }
+            }
+            if let Some(error) = scanner.err() {
+                return Err(error.clone());
             }
             drop(scanner);
 
@@ -2526,11 +2524,10 @@ impl Executor {
                                     std::mem::take(&mut outer_row_map),
                                     CompactArc::clone(&column_names),
                                 );
-                                let held = self
-                                    .process_correlated_where(where_expr, &correlated_ctx)
-                                    .and_then(|processed| evaluator.evaluate_bool(&processed));
+                                let processed =
+                                    self.process_correlated_where(where_expr, &correlated_ctx);
                                 outer_row_map = correlated_ctx.outer_row.take().unwrap_or_default();
-                                held
+                                evaluator.evaluate_bool(&processed?)
                             } else {
                                 evaluator.evaluate_bool(where_expr)
                             };
@@ -2840,17 +2837,13 @@ impl Executor {
                 let outer_tables = vec![table_name.to_string()];
 
                 // Try EXISTS semi-join optimization
-                let exists_optimized = self
-                    .try_optimize_exists_to_semi_join(where_clause, ctx, &outer_tables, None)
-                    .ok()
-                    .flatten();
+                let exists_optimized =
+                    self.try_optimize_exists_to_semi_join(where_clause, ctx, &outer_tables, None)?;
 
                 // Try IN semi-join optimization (on EXISTS result or original)
                 let expr_for_in = exists_optimized.as_ref().unwrap_or(where_clause.as_ref());
-                let in_optimized = self
-                    .try_optimize_in_to_semi_join(expr_for_in, ctx, &outer_tables)
-                    .ok()
-                    .flatten();
+                let in_optimized =
+                    self.try_optimize_in_to_semi_join(expr_for_in, ctx, &outer_tables)?;
 
                 // Determine final expression without unnecessary clones
                 let (current_expr, any_optimized) = match (&exists_optimized, &in_optimized) {
@@ -3034,25 +3027,16 @@ impl Executor {
                             );
 
                             // Process correlated subquery with outer context
-                            match self.process_correlated_where(where_expr, &correlated_ctx) {
-                                Ok(processed) => {
-                                    // OPTIMIZATION: Take ownership instead of cloning
-                                    evaluator.set_outer_row_owned(
-                                        correlated_ctx.outer_row.take().unwrap_or_default(),
-                                    );
-                                    let result =
-                                        evaluator.evaluate_bool(&processed).unwrap_or(false);
-                                    // Take back map for reuse instead of clearing
-                                    outer_row_map = evaluator.take_outer_row();
-                                    result
-                                }
-                                Err(_) => {
-                                    // Take back map from context even on error
-                                    outer_row_map =
-                                        correlated_ctx.outer_row.take().unwrap_or_default();
-                                    false
-                                }
-                            }
+                            let processed =
+                                self.process_correlated_where(where_expr, &correlated_ctx)?;
+                            // OPTIMIZATION: Take ownership instead of cloning
+                            evaluator.set_outer_row_owned(
+                                correlated_ctx.outer_row.take().unwrap_or_default(),
+                            );
+                            let result = evaluator.evaluate_bool(&processed).unwrap_or(false);
+                            // Take back map for reuse instead of clearing
+                            outer_row_map = evaluator.take_outer_row();
+                            result
                         } else if let Some(ref program) = memory_where_program {
                             let mut exec_ctx =
                                 ExecuteContext::new(row).with_transaction_id(transaction_id);
@@ -3093,6 +3077,9 @@ impl Executor {
                         None => rows_to_delete_by_row_id.push((scanner.current_row_id(), row_data)),
                     }
                 }
+            }
+            if let Some(error) = scanner.err() {
+                return Err(error.clone());
             }
             // Drop scanner to release borrow
             drop(scanner);
@@ -3732,7 +3719,11 @@ impl Executor {
             None
         };
 
+        let scan_error = scanner.err().cloned();
         scanner.close()?;
+        if let Some(error) = scan_error {
+            return Err(error);
+        }
         Ok(result)
     }
 

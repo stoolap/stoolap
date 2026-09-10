@@ -3201,22 +3201,17 @@ impl Executor {
                     // Avoid cloning upfront - only clone if no optimization succeeds
 
                     // 1. Try EXISTS semi-join optimization
-                    let exists_optimized = self
-                        .try_optimize_exists_to_semi_join(
-                            where_expr,
-                            ctx,
-                            &outer_tables,
-                            outer_limit,
-                        )
-                        .ok()
-                        .flatten();
+                    let exists_optimized = self.try_optimize_exists_to_semi_join(
+                        where_expr,
+                        ctx,
+                        &outer_tables,
+                        outer_limit,
+                    )?;
 
                     // 2. Try IN semi-join optimization (on EXISTS result or original)
                     let expr_for_in = exists_optimized.as_ref().unwrap_or(where_expr);
-                    let in_optimized = self
-                        .try_optimize_in_to_semi_join(expr_for_in, ctx, &outer_tables)
-                        .ok()
-                        .flatten();
+                    let in_optimized =
+                        self.try_optimize_in_to_semi_join(expr_for_in, ctx, &outer_tables)?;
 
                     // Determine final expression without unnecessary clones
                     let (current_expr, any_optimized) = match (exists_optimized, in_optimized) {
@@ -3433,6 +3428,9 @@ impl Executor {
                         RowVec::with_capacity(scanner.estimated_count().unwrap_or(64));
                     while scanner.next() {
                         all_rows.push(scanner.take_row_with_id());
+                    }
+                    if let Some(error) = scanner.err() {
+                        return Err(error.clone());
                     }
                     all_rows
                 };
@@ -3678,6 +3676,9 @@ impl Executor {
                             break;
                         }
                     }
+                }
+                if let Some(error) = scanner.err() {
+                    return Err(error.clone());
                 }
                 (rows, None, None)
             }
