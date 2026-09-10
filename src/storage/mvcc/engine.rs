@@ -715,7 +715,7 @@ impl MVCCEngine {
 
                 // Sync auto-increment counters from segment data so the next
                 // generated row_id doesn't collide with cold rows.
-                self.sync_auto_increment_from_segments();
+                self.sync_auto_increment_from_segments()?;
 
                 // Migration: if we loaded from legacy snapshots, seal all data
                 // into volumes and remove the old snapshots/ directory.
@@ -1498,8 +1498,9 @@ impl MVCCEngine {
 
                 for (_, cs) in volumes.iter() {
                     let vol = &cs.volume;
+                    let row_ids = vol.row_ids()?;
                     let Some(start) = (0..vol.meta.row_count).find(|&i| {
-                        let row_id = vol.meta.row_ids[i];
+                        let row_id = row_ids[i];
                         !tombstones.contains_key(&row_id) && !seen.contains(&row_id)
                     }) else {
                         continue;
@@ -1514,8 +1515,7 @@ impl MVCCEngine {
                             }
                         }
                     }
-                    for i in start..vol.meta.row_count {
-                        let row_id = vol.meta.row_ids[i];
+                    for (i, &row_id) in row_ids.iter().enumerate().skip(start) {
                         if tombstones.contains_key(&row_id) || !seen.insert(row_id) {
                             continue;
                         }
@@ -3430,46 +3430,34 @@ impl MVCCEngine {
     /// the max row_id in segments (which may be higher than hot buffer).
     /// Normal secondary indexes are NOT populated from cold data.
     /// HNSW is the one cold index that needs explicit graph rebuild.
-    fn sync_auto_increment_from_segments(&self) {
-        // Collect segment data under segment_managers lock, then drop it
-        // before acquiring version_stores lock to avoid multi-lock deadlock.
-        let segment_data: Vec<(String, i64)> = {
+    fn sync_auto_increment_from_segments(&self) -> Result<()> {
+        let mut segment_data: Vec<_> = {
             let mgrs = self.segment_managers.read().unwrap();
             if mgrs.is_empty() {
-                return;
+                return Ok(());
             }
             mgrs.iter()
-                .filter_map(|(table_name, mgr)| {
-                    let segments = mgr.get_segments_ordered_meta();
-                    let mut max_vol_row_id: i64 = 0;
-                    for vol in &segments {
-                        // Row IDs are sorted (from B-tree iteration during seal).
-                        // Use last() for O(1) instead of iterating all row_ids.
-                        if let Some(&last_id) = vol.meta.row_ids.last() {
-                            if last_id > max_vol_row_id {
-                                max_vol_row_id = last_id;
-                            }
-                        }
-                    }
-                    if max_vol_row_id > 0 {
-                        Some((table_name.clone(), max_vol_row_id))
-                    } else {
-                        None
-                    }
-                })
+                .map(|(table_name, mgr)| (table_name.clone(), Arc::clone(mgr), 0i64))
                 .collect()
         };
 
-        if segment_data.is_empty() {
-            return;
+        for (_, mgr, max_vol_row_id) in &mut segment_data {
+            for vol in mgr.get_segments_ordered_meta() {
+                if let Some(&last_id) = vol.row_ids()?.last() {
+                    *max_vol_row_id = (*max_vol_row_id).max(last_id);
+                }
+            }
         }
 
         let stores = self.version_stores.read().unwrap();
-        for (table_name, max_vol_row_id) in &segment_data {
-            if let Some(store) = stores.get(table_name) {
-                store.set_auto_increment_counter(*max_vol_row_id);
+        for (table_name, _, max_vol_row_id) in &segment_data {
+            if *max_vol_row_id > 0 {
+                if let Some(store) = stores.get(table_name) {
+                    store.set_auto_increment_counter(*max_vol_row_id);
+                }
             }
         }
+        Ok(())
     }
 
     /// Drops a column from a table
@@ -4209,9 +4197,14 @@ impl MVCCEngine {
                     let vol = &cs.volume;
                     let mapping = mgr.get_volume_mapping(*seg_id, schema);
 
-                    for i in 0..vol.meta.row_count {
-                        let row_id = vol.meta.row_ids[i];
-
+                    let row_ids = match vol.row_ids() {
+                        Ok(ids) => ids,
+                        Err(_) => {
+                            write_error = true;
+                            break;
+                        }
+                    };
+                    for (i, &row_id) in row_ids.iter().enumerate() {
                         // Skip tombstoned rows not already in hot snapshot.
                         // For int-PK tables, pre-cutoff deletes are in `seen`.
                         // For non-int-PK tables, tombstones are the only signal.
@@ -5047,7 +5040,10 @@ impl MVCCEngine {
         // Sync auto-increment counters from segment managers.
         // Without this, tables loaded as volumes would have stale counters
         // and new INSERTs could collide with existing row IDs.
-        self.sync_auto_increment_from_segments();
+        if let Err(error) = self.sync_auto_increment_from_segments() {
+            self.registry.start_accepting_transactions();
+            return Err(error);
+        }
 
         // Increment schema epoch to invalidate all caches
         self.schema_epoch
@@ -5613,8 +5609,7 @@ impl MVCCEngine {
                 };
 
             for (vol_idx, (_seg_id, vol)) in volumes.iter().enumerate() {
-                for i in 0..vol.meta.row_count {
-                    let row_id = vol.meta.row_ids[i];
+                for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
                     // Apply tombstone only if it was committed before the earliest
                     // snapshot (safe to physically remove). Tombstones created after
                     // are preserved — the row stays in the merged volume so snapshots
@@ -5640,14 +5635,15 @@ impl MVCCEngine {
             if live_refs.is_empty() {
                 // All rows in merged volumes are tombstoned. Remove those
                 // volumes and their tombstones, but keep unmerged volumes intact.
-                let merged_row_ids: FxHashSet<i64> = volumes
-                    .iter()
-                    .flat_map(|(_, vol)| vol.meta.row_ids.iter().copied())
-                    .collect();
+                for (_, vol) in volumes.iter() {
+                    for &row_id in vol.row_ids()? {
+                        seen.insert(row_id);
+                    }
+                }
                 mgr.replace_segments_atomic_remove_only(&old_ids);
                 // Only clear tombstones that were actually applied during compaction.
                 // Post-snapshot tombstones are preserved for snapshot visibility.
-                mgr.remove_tombstones_matching_snapshot(&applied_tombstones, &merged_row_ids);
+                mgr.remove_tombstones_matching_snapshot(&applied_tombstones, &seen);
 
                 // Persist manifest BEFORE deleting files (same safety as non-empty path).
                 if let Err(e) = mgr.persist_manifest_only() {
@@ -5778,6 +5774,22 @@ impl MVCCEngine {
                 }
             }
 
+            if prepare_error.is_none() && !new_volumes.is_empty() {
+                for (_, vol) in volumes.iter() {
+                    match vol.row_ids() {
+                        Ok(ids) => {
+                            for &row_id in ids {
+                                seen.insert(row_id);
+                            }
+                        }
+                        Err(error) => {
+                            prepare_error = Some(error.into());
+                            break;
+                        }
+                    }
+                }
+            }
+
             if prepare_error.is_some() || new_volumes.is_empty() {
                 // Clean up any volumes we did write before failure
                 let vol_table_dir = vol_dir.join(table_name);
@@ -5796,13 +5808,7 @@ impl MVCCEngine {
 
             // Clear only tombstones that existed at snapshot time for
             // row_ids in the merged volumes.
-            {
-                let merged_row_ids: FxHashSet<i64> = volumes
-                    .iter()
-                    .flat_map(|(_, vol)| vol.meta.row_ids.iter().copied())
-                    .collect();
-                mgr.remove_tombstones_matching_snapshot(&applied_tombstones, &merged_row_ids);
-            }
+            mgr.remove_tombstones_matching_snapshot(&applied_tombstones, &seen);
 
             // CRITICAL: Persist manifest BEFORE deleting old files.
             if let Err(e) = mgr.persist_manifest_only() {

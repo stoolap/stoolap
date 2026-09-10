@@ -1040,7 +1040,8 @@ pub(crate) struct VolumeMetadata {
 /// The caller LZ4-compresses the result before writing to disk.
 pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8>> {
     let col_count = vol.columns.len();
-    let estimated = 12 + col_count * 6 + vol.meta.row_ids.len() * 8 + col_count * 40;
+    let row_ids = vol.row_ids()?;
+    let estimated = 12 + col_count * 6 + row_ids.len() * 8 + col_count * 40;
     let mut buf = Vec::with_capacity(estimated);
 
     // Row count + col count
@@ -1099,7 +1100,7 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     }
 
     // Row IDs (bulk — single memcpy on LE)
-    write_i64_bulk(&mut buf, &vol.meta.row_ids);
+    write_i64_bulk(&mut buf, row_ids);
 
     // Zone maps
     for zm in &vol.meta.zone_maps {
