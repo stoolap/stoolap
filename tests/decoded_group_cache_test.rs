@@ -210,6 +210,60 @@ mod invariants {
     }
 
     #[test]
+    fn failed_decode_preserves_error_kind_and_can_retry() {
+        let _serial = serial();
+        DECODED_GROUPS.set_budget_bytes(1024);
+        let error = DECODED_GROUPS
+            .get_or_decode((700, 0, 0), || {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid group payload",
+                ))
+            })
+            .err()
+            .unwrap();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(error.to_string(), "invalid group payload");
+        let stats = DECODED_GROUPS.stats();
+        assert_eq!((stats.bytes, stats.entries), (0, 0));
+        let column = DECODED_GROUPS
+            .get_or_decode((700, 0, 0), || Ok(ints(2)))
+            .unwrap();
+        assert_eq!(column.len(), 2);
+        DECODED_GROUPS.remove_store(700);
+    }
+
+    #[test]
+    fn failed_decode_does_not_remove_a_replacement_entry() {
+        let _serial = serial();
+        DECODED_GROUPS.set_budget_bytes(1024);
+        let mut replacement = None;
+        let result = DECODED_GROUPS.get_or_decode((800, 0, 0), || {
+            DECODED_GROUPS.remove_store(800);
+            replacement = Some(
+                DECODED_GROUPS
+                    .get_or_decode((800, 0, 0), || Ok(ints(2)))
+                    .unwrap(),
+            );
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "obsolete decode failed",
+            ))
+        });
+        assert!(result.is_err());
+        let replacement = replacement.unwrap();
+        let stats = DECODED_GROUPS.stats();
+        assert_eq!((stats.bytes, stats.entries), (replacement.cache_size(), 1));
+        let cached = DECODED_GROUPS
+            .get_or_decode((800, 0, 0), || panic!("replacement was evicted"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&cached, &replacement));
+        DECODED_GROUPS.remove_store(800);
+        let stats = DECODED_GROUPS.stats();
+        assert_eq!((stats.bytes, stats.entries), (0, 0));
+    }
+
+    #[test]
     fn an_entry_evicted_while_decoding_leaves_no_phantom_bytes() {
         let _serial = serial();
         DECODED_GROUPS.set_budget_bytes(18);
