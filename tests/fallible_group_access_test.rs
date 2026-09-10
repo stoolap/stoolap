@@ -89,6 +89,22 @@ impl<T> ColumnErrorKind for Option<T> {
     }
 }
 
+trait BoundaryResult {
+    fn into_boundary_result(self) -> std::io::Result<Option<usize>>;
+}
+
+impl BoundaryResult for Option<usize> {
+    fn into_boundary_result(self) -> std::io::Result<Option<usize>> {
+        Ok(self)
+    }
+}
+
+impl BoundaryResult for std::io::Result<Option<usize>> {
+    fn into_boundary_result(self) -> std::io::Result<Option<usize>> {
+        self
+    }
+}
+
 // Keep the guards executable when only production changes are reverted.
 #[allow(dead_code)]
 trait BaselineUnwrap: Sized {
@@ -155,6 +171,255 @@ fn two_group_store(
         2,
         4,
     )
+}
+
+fn boundary_block(values: [i64; 2]) -> Vec<u8> {
+    let mut raw = vec![0, 0];
+    for value in values {
+        raw.extend_from_slice(&value.to_le_bytes());
+    }
+    raw
+}
+
+fn boundary_groups() -> Vec<stoolap::storage::volume::column::RowGroupMeta> {
+    use stoolap::core::Value;
+    use stoolap::storage::volume::column::{RowGroupMeta, ZoneMap};
+    [(0, 1, 2), (2, 2, 3)]
+        .into_iter()
+        .map(|(start, min, max)| RowGroupMeta {
+            start_idx: start,
+            end_idx: start + 2,
+            zone_maps: vec![ZoneMap {
+                min: Value::Integer(min),
+                max: Value::Integer(max),
+                null_count: 0,
+                row_count: 2,
+            }],
+        })
+        .collect()
+}
+
+#[test]
+fn boundary_reads_propagate_single_group_errors() {
+    let store = store(vec![0xff], 18, DataType::Integer);
+    assert_io_failure(|| store.binary_search_ge(0, 1, &[]), ErrorKind::InvalidData);
+    assert_io_failure(|| store.binary_search_gt(0, 1, &[]), ErrorKind::InvalidData);
+}
+
+#[test]
+fn boundary_reads_propagate_selected_group_errors() {
+    let store = two_group_store(
+        boundary_block([1, 2]),
+        vec![0xff],
+        vec![18, 18],
+        DataType::Integer,
+    );
+    let groups = boundary_groups();
+    assert_io_failure(
+        || store.binary_search_ge(0, 3, &groups),
+        ErrorKind::InvalidData,
+    );
+    assert_io_failure(
+        || store.binary_search_gt(0, 3, &groups),
+        ErrorKind::InvalidData,
+    );
+}
+
+#[test]
+fn boundary_reads_reject_invalid_column_indices() {
+    let store = store(boundary_block([1, 2]), 18, DataType::Integer);
+    assert_io_failure(
+        || store.binary_search_ge(1, 1, &[]),
+        ErrorKind::InvalidInput,
+    );
+    assert_io_failure(
+        || store.binary_search_gt(1, 1, &[]),
+        ErrorKind::InvalidInput,
+    );
+}
+
+#[test]
+fn boundary_reads_leave_unusable_metadata_unnarrowed() {
+    let store = two_group_store(
+        boundary_block([1, 2]),
+        boundary_block([2, 3]),
+        vec![18, 18],
+        DataType::Integer,
+    );
+    for variant in 0..4 {
+        let mut groups = boundary_groups();
+        match variant {
+            0 => groups.clear(),
+            1 => {
+                groups.pop();
+            }
+            2 => groups[0].zone_maps.clear(),
+            _ => groups[0].zone_maps[0].max = stoolap::core::Value::Float(2.0),
+        }
+        assert_eq!(
+            store
+                .binary_search_ge(0, 3, &groups)
+                .into_boundary_result()
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .binary_search_gt(0, 3, &groups)
+                .into_boundary_result()
+                .unwrap(),
+            None
+        );
+    }
+}
+
+#[test]
+fn boundary_reads_reject_contradictory_group_bounds() {
+    let store = two_group_store(
+        boundary_block([1, 2]),
+        boundary_block([2, 3]),
+        vec![18, 18],
+        DataType::Integer,
+    );
+    for (start, end) in [(1, 2), (0, 1), (2, 1), (0, 3)] {
+        let mut groups = boundary_groups();
+        groups[0].start_idx = start;
+        groups[0].end_idx = end;
+        assert_io_failure(
+            || store.binary_search_ge(0, 2, &groups),
+            ErrorKind::InvalidData,
+        );
+        assert_io_failure(
+            || store.binary_search_gt(0, 2, &groups),
+            ErrorKind::InvalidData,
+        );
+    }
+}
+
+#[test]
+fn boundary_reads_leave_unsupported_types_unnarrowed() {
+    let columns = LazyColumns::eager(
+        vec![ColumnData::Float64 {
+            values: vec![1.0, 2.0],
+            nulls: vec![false; 2],
+        }],
+        vec![DataType::Float],
+    );
+    let store = CompressedBlockStore::compress_columns(&columns, &[DataType::Float], 2).unwrap();
+    assert_eq!(
+        store
+            .binary_search_ge(0, 1, &[])
+            .into_boundary_result()
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .binary_search_gt(0, 1, &[])
+            .into_boundary_result()
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn boundary_reads_preserve_exact_duplicate_boundaries() {
+    let store = two_group_store(
+        boundary_block([1, 2]),
+        boundary_block([2, 3]),
+        vec![18, 18],
+        DataType::Integer,
+    );
+    let groups = boundary_groups();
+    for (target, ge, gt) in [(0, 0, 0), (1, 0, 1), (2, 1, 3), (3, 3, 4), (4, 4, 4)] {
+        assert_eq!(
+            store
+                .binary_search_ge(0, target, &groups)
+                .into_boundary_result()
+                .unwrap(),
+            Some(ge)
+        );
+        assert_eq!(
+            store
+                .binary_search_gt(0, target, &groups)
+                .into_boundary_result()
+                .unwrap(),
+            Some(gt)
+        );
+    }
+}
+
+#[test]
+fn boundary_reads_do_not_decode_pruned_groups() {
+    let store = two_group_store(
+        vec![0xff],
+        boundary_block([2, 3]),
+        vec![18, 18],
+        DataType::Integer,
+    );
+    let groups = boundary_groups();
+    assert_eq!(
+        store
+            .binary_search_ge(0, 3, &groups)
+            .into_boundary_result()
+            .unwrap(),
+        Some(3)
+    );
+    assert_eq!(
+        store
+            .binary_search_gt(0, 3, &groups)
+            .into_boundary_result()
+            .unwrap(),
+        Some(4)
+    );
+}
+
+#[test]
+fn range_scan_setup_propagates_boundary_failure() {
+    use stoolap::core::{Error, Value};
+    use stoolap::storage::expression::ComparisonExpr;
+    use stoolap::storage::traits::Table;
+    let table = malformed_warm_table();
+    let filter = ComparisonExpr::gte("b", Value::Integer(1));
+    match table.scan(&[0], Some(&filter)) {
+        Err(Error::Io { message }) => assert_eq!(message, "invalid column block length"),
+        Err(error) => panic!("unexpected error: {error:?}"),
+        Ok(_) => panic!("boundary failure became a successful scan"),
+    }
+}
+
+#[test]
+fn range_scan_without_group_metadata_preserves_matching_rows() {
+    use std::sync::Arc;
+    use stoolap::core::{Row, SchemaBuilder, Value};
+    use stoolap::storage::expression::ComparisonExpr;
+    use stoolap::storage::traits::Table;
+    use stoolap::storage::volume::writer::VolumeBuilder;
+    let schema = SchemaBuilder::new("group_access")
+        .column("a", DataType::Integer, false, true)
+        .column("b", DataType::Integer, false, false)
+        .build();
+    let mut builder = VolumeBuilder::new(&schema);
+    let rows = ROW_GROUP_SIZE + 2;
+    for id in 1..=rows as i64 {
+        builder.add_row(id, &Row::from_values(vec![Value::Integer(id); 2]));
+    }
+    let mut volume = builder.finish();
+    let store =
+        CompressedBlockStore::compress_columns(&volume.columns, &[DataType::Integer; 2], rows)
+            .unwrap();
+    volume.columns = LazyColumns::deferred(store, vec![DataType::Integer; 2]);
+    Arc::get_mut(&mut volume.meta).unwrap().row_groups.clear();
+    let table = warm_table(volume);
+    let filter = ComparisonExpr::gte("b", Value::Integer(ROW_GROUP_SIZE as i64 + 1));
+    let mut scanner = table.scan(&[0], Some(&filter)).unwrap();
+    let mut ids = Vec::new();
+    while scanner.next() {
+        ids.push(scanner.current_row_id());
+        assert_eq!(scanner.row()[0], Value::Integer(scanner.current_row_id()));
+    }
+    assert!(scanner.err().is_none());
+    assert_eq!(ids, vec![ROW_GROUP_SIZE as i64 + 1, rows as i64]);
 }
 
 #[test]
@@ -848,6 +1113,14 @@ fn scanner_whole_column_failures_are_sticky_in_both_directions() {
 }
 
 fn malformed_warm_table() -> stoolap::storage::volume::table::SegmentedTable {
+    let mut volume = two_column_volume();
+    volume.columns = malformed_columns();
+    warm_table(volume)
+}
+
+fn warm_table(
+    volume: stoolap::storage::volume::writer::FrozenVolume,
+) -> stoolap::storage::volume::table::SegmentedTable {
     use std::sync::Arc;
     use stoolap::core::SchemaBuilder;
     use stoolap::storage::mvcc::{MVCCTable, TransactionVersionStore, VersionStore};
@@ -858,8 +1131,7 @@ fn malformed_warm_table() -> stoolap::storage::volume::table::SegmentedTable {
         .column("a", DataType::Integer, false, true)
         .column("b", DataType::Integer, false, false)
         .build();
-    let mut volume = two_column_volume();
-    volume.columns = malformed_columns();
+    let rows = volume.meta.row_count;
     let manager = Arc::new(SegmentManager::new("group_access", None));
     manager.register_segment(
         1,
@@ -867,9 +1139,9 @@ fn malformed_warm_table() -> stoolap::storage::volume::table::SegmentedTable {
         SegmentMeta {
             segment_id: 1,
             file_path: Default::default(),
-            row_count: 2,
+            row_count: rows,
             min_row_id: 1,
-            max_row_id: 2,
+            max_row_id: rows as i64,
             creation_lsn: 0,
             seal_seq: 0,
             schema_version: 0,

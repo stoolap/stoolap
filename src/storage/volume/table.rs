@@ -750,12 +750,9 @@ impl SegmentedTable {
                             None
                         };
                         match op {
-                            // A search that hits a block it cannot decode
-                            // leaves the range as it is: the scan then reaches
-                            // the block and reports the error
                             crate::core::Operator::Gte => {
                                 let idx = if let Some(st) = store {
-                                    st.binary_search_ge(col_idx, target, &vol.meta.row_groups)
+                                    st.binary_search_ge(col_idx, target, &vol.meta.row_groups)?
                                 } else {
                                     Some(vol.columns.get(col_idx)?.binary_search_ge(target))
                                 };
@@ -767,7 +764,7 @@ impl SegmentedTable {
                             }
                             crate::core::Operator::Gt => {
                                 let idx = if let Some(st) = store {
-                                    st.binary_search_gt(col_idx, target, &vol.meta.row_groups)
+                                    st.binary_search_gt(col_idx, target, &vol.meta.row_groups)?
                                 } else {
                                     Some(vol.columns.get(col_idx)?.binary_search_gt(target))
                                 };
@@ -779,7 +776,7 @@ impl SegmentedTable {
                             }
                             crate::core::Operator::Lte => {
                                 let idx = if let Some(st) = store {
-                                    st.binary_search_gt(col_idx, target, &vol.meta.row_groups)
+                                    st.binary_search_gt(col_idx, target, &vol.meta.row_groups)?
                                 } else {
                                     Some(vol.columns.get(col_idx)?.binary_search_gt(target))
                                 };
@@ -791,7 +788,7 @@ impl SegmentedTable {
                             }
                             crate::core::Operator::Lt => {
                                 let idx = if let Some(st) = store {
-                                    st.binary_search_ge(col_idx, target, &vol.meta.row_groups)
+                                    st.binary_search_ge(col_idx, target, &vol.meta.row_groups)?
                                 } else {
                                     Some(vol.columns.get(col_idx)?.binary_search_ge(target))
                                 };
