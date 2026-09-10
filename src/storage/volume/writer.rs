@@ -1590,6 +1590,7 @@ impl VolumeBuilder {
 
     /// Freeze the builder into a FrozenVolume.
     pub fn finish(mut self) -> FrozenVolume {
+        debug_assert_eq!(self.row_ids.len(), self.row_count);
         let mut columns = Vec::with_capacity(self.num_cols);
         let mut sorted_columns = Vec::with_capacity(self.num_cols);
 
@@ -1844,15 +1845,9 @@ pub fn compute_column_mapping_with_drops(
 }
 
 impl FrozenVolume {
-    /// Borrow the resident physical row IDs, rejecting incomplete identity metadata.
+    /// Borrow the resident physical row IDs.
     #[inline]
     pub fn row_ids(&self) -> std::io::Result<&[i64]> {
-        if self.meta.row_ids.len() != self.meta.row_count {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "row ID count does not match volume row count",
-            ));
-        }
         Ok(&self.meta.row_ids)
     }
 

@@ -1104,8 +1104,11 @@ impl SegmentedTable {
         Ok(rows)
     }
 
-    /// Find a row in the statement's pinned segments without reloading columns.
-    /// Propagate identity failures before treating a cold row as absent.
+    /// Find a non-tombstoned, non-hot-shadowed row in the statement's segments.
+    /// The snapshot is pre-verified warm (see segments_snapshot), so this
+    /// statement-scoped lookup never reloads a volume after hot mutations.
+    /// Compaction can remove live segments, but the snapshot pins their older
+    /// volumes for the statement's original view.
     fn find_segment_row_in(
         &self,
         snap: &super::manifest::StatementSnapshot,
