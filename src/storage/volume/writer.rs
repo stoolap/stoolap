@@ -732,15 +732,14 @@ impl CompressedBlockStore {
 
     /// Binary search on a sorted column using row-group zone maps.
     /// Decompresses only the group(s) containing the target value.
-    /// Returns global row index (same as ColumnData::binary_search_ge/gt),
-    /// or None when a block fails to decode: the caller must then keep the
-    /// range unnarrowed so the scan reaches the block and reports the error.
+    /// Returns a proven global row index, or None when optional group metadata
+    /// cannot support narrowing. Invalid geometry and decode failures propagate.
     pub fn binary_search_ge(
         &self,
         col_idx: usize,
         target: i64,
         row_groups: &[super::column::RowGroupMeta],
-    ) -> Option<usize> {
+    ) -> std::io::Result<Option<usize>> {
         self.binary_search_impl(col_idx, target, row_groups, false)
     }
 
@@ -749,7 +748,7 @@ impl CompressedBlockStore {
         col_idx: usize,
         target: i64,
         row_groups: &[super::column::RowGroupMeta],
-    ) -> Option<usize> {
+    ) -> std::io::Result<Option<usize>> {
         self.binary_search_impl(col_idx, target, row_groups, true)
     }
 
@@ -759,53 +758,93 @@ impl CompressedBlockStore {
         target: i64,
         row_groups: &[super::column::RowGroupMeta],
         strict: bool,
-    ) -> Option<usize> {
-        let num_groups = self.blocks[col_idx].len();
+    ) -> std::io::Result<Option<usize>> {
+        let num_groups = self
+            .blocks
+            .get(col_idx)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "column index out of range",
+                )
+            })?
+            .len();
+        match self.col_type_tags.get(col_idx).copied() {
+            Some(super::format::COL_INT64 | super::format::COL_TIMESTAMP) => {}
+            Some(
+                super::format::COL_FLOAT64
+                | super::format::COL_BOOLEAN
+                | COL_DICTIONARY
+                | COL_BYTES,
+            ) => {
+                return Ok(None);
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid column type tag",
+                ))
+            }
+        }
+        if self.group_size == 0 || num_groups != self.row_count.div_ceil(self.group_size) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid row group geometry",
+            ));
+        }
+        if num_groups == 0 {
+            return Ok(Some(0));
+        }
 
-        // Use zone maps to find the group containing the target.
-        // When duplicates span group boundaries, continue to the next group
-        // if the search result lands at the group end.
         if !row_groups.is_empty() {
+            if row_groups.len() != num_groups {
+                return Ok(None);
+            }
             for (gi, rg) in row_groups.iter().enumerate() {
-                if gi >= num_groups || col_idx >= rg.zone_maps.len() {
-                    continue;
+                let start = gi * self.group_size;
+                let group_rows = (self.row_count - start).min(self.group_size);
+                if rg.start_idx as usize != start || rg.end_idx as usize != start + group_rows {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid row group bounds",
+                    ));
                 }
-                let zm = &rg.zone_maps[col_idx];
+                let Some(zm) = rg.zone_maps.get(col_idx) else {
+                    return Ok(None);
+                };
                 let max_i64 = match &zm.max {
                     crate::core::Value::Integer(v) => *v,
                     crate::core::Value::Timestamp(ts) => {
                         ts.timestamp_nanos_opt().unwrap_or(i64::MAX)
                     }
-                    _ => continue,
+                    _ => return Ok(None),
                 };
                 if target > max_i64 {
                     continue;
                 }
-                let col = self.group_column(col_idx, gi).ok()?;
-                let group_rows = (rg.end_idx - rg.start_idx) as usize;
+                let col = self.group_column(col_idx, gi)?;
                 let local = if strict {
                     col.binary_search_gt(target)
                 } else {
                     col.binary_search_ge(target)
                 };
                 if local < group_rows {
-                    return Some(rg.start_idx as usize + local);
+                    return Ok(Some(start + local));
                 }
             }
-            return Some(self.row_count);
+            return Ok(Some(self.row_count));
         }
 
         if num_groups == 1 {
-            let col = self.group_column(col_idx, 0).ok()?;
-            return Some(if strict {
+            let col = self.group_column(col_idx, 0)?;
+            return Ok(Some(if strict {
                 col.binary_search_gt(target)
             } else {
                 col.binary_search_ge(target)
-            });
+            }));
         }
 
-        // Fallback: full column (shouldn't happen for V4 with zone maps)
-        Some(self.row_count)
+        Ok(None)
     }
 
     /// Number of groups for a given column.
