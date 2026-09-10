@@ -3915,13 +3915,13 @@ impl Table for MVCCTable {
         None
     }
 
-    fn row_count(&self) -> usize {
+    fn row_count(&self) -> Result<usize> {
         // Try O(1) fast path first
         if let Some(count) = MVCCTable::fast_row_count(self) {
-            return count;
+            return Ok(count);
         }
         // Fall back to optimized single-pass counting
-        MVCCTable::row_count(self)
+        Ok(MVCCTable::row_count(self))
     }
 
     fn row_count_hint(&self) -> usize {

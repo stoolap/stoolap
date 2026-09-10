@@ -2425,11 +2425,11 @@ impl Table for SegmentedTable {
     // Row count
     // =========================================================================
 
-    fn row_count(&self) -> usize {
+    fn row_count(&self) -> Result<usize> {
         // Snapshot isolation: deduped_row_count and the fast path subtract ALL
         // tombstones, but a snapshot may not see newer ones. Use full scan.
         if self.snapshot_seq.is_some() {
-            return self.collect_all_rows(None).map_or(0, |r| r.len());
+            return self.collect_all_rows(None).map(|rows| rows.len());
         }
         // During seal, rows temporarily exist in both hot and cold.
         // Use the same O(1) formula with overlap correction. The count
@@ -2440,7 +2440,7 @@ impl Table for SegmentedTable {
         let seg = self.segment_mgr.deduped_row_count();
         let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
         let overlap = self.segment_mgr.seal_overlap();
-        seg.saturating_sub(pending) + self.hot.row_count().saturating_sub(overlap)
+        Ok(seg.saturating_sub(pending) + self.hot.row_count()?.saturating_sub(overlap))
     }
 
     fn row_count_hint(&self) -> usize {
@@ -3356,19 +3356,19 @@ impl Table for SegmentedTable {
         Some(distinct.into_iter().collect())
     }
 
-    fn compute_distinct_values(&self, col_idx: usize) -> Option<Vec<Value>> {
+    fn compute_distinct_values(&self, col_idx: usize) -> Result<Option<Vec<Value>>> {
         // Bail for snapshot isolation — tombstone visibility is snapshot-dependent
         if self.snapshot_seq.is_some() {
-            return None;
+            return Ok(None);
         }
         // Bail during seal overlap — hot and cold may have duplicates
         if self.segment_mgr.seal_overlap() > 0 {
-            return None;
+            return Ok(None);
         }
 
         let schema = self.hot.schema();
         if col_idx >= schema.columns.len() {
-            return None;
+            return Ok(None);
         }
         let col_name = &schema.columns[col_idx].name;
 
@@ -3378,19 +3378,19 @@ impl Table for SegmentedTable {
             for v in hot_values {
                 distinct.insert(v);
             }
-        } else if self.hot.row_count() > 0 {
+        } else if self.hot.row_count()? > 0 {
             // Hot has rows but no index on this column — cannot enumerate without full scan
-            return None;
+            return Ok(None);
         }
 
         if !self.segment_mgr.has_segments() {
-            return Some(distinct.into_iter().collect());
+            return Ok(Some(distinct.into_iter().collect()));
         }
 
         let no_tombstones = self.segment_mgr.is_tombstone_set_empty()
             && !self.segment_mgr.has_pending_tombstones(self.txn_id());
 
-        let volumes = self.segment_mgr.get_volumes_newest_first().ok()?;
+        let volumes = self.segment_mgr.get_volumes_newest_first()?;
         let tombstones_arc = if no_tombstones {
             // Avoid cloning the Arc when we know the set is empty
             Arc::new(FxHashMap::default())
@@ -3474,7 +3474,7 @@ impl Table for SegmentedTable {
             }
         }
 
-        Some(distinct.into_iter().collect())
+        Ok(Some(distinct.into_iter().collect()))
     }
 
     fn collect_rows_grouped_by_partition(&self, column_name: &str) -> Option<Vec<(Value, RowVec)>> {
@@ -6400,8 +6400,8 @@ mod tests {
         ) -> Result<Box<dyn QueryResult>> {
             Err(crate::core::Error::internal("not implemented"))
         }
-        fn row_count(&self) -> usize {
-            self.rows.len()
+        fn row_count(&self) -> Result<usize> {
+            Ok(self.rows.len())
         }
         fn fast_row_count(&self) -> Option<usize> {
             Some(self.rows.len())
@@ -6469,7 +6469,7 @@ mod tests {
         );
         let table = SegmentedTable::hot_only(Box::new(hot));
 
-        assert_eq!(table.row_count(), 2);
+        assert_eq!(table.row_count().unwrap(), 2);
         assert_eq!(table.segment_count(), 0);
     }
 
@@ -6509,7 +6509,7 @@ mod tests {
 
         let table = SegmentedTable::new(Box::new(hot), mgr);
 
-        assert_eq!(table.row_count(), 5); // 3 segment + 2 hot
+        assert_eq!(table.row_count().unwrap(), 5); // 3 segment + 2 hot
         assert_eq!(table.fast_row_count(), Some(5));
     }
 
@@ -6651,7 +6651,7 @@ mod tests {
         let hot = MockHotTable::new(schema.clone(), vec![]);
 
         let mut table = SegmentedTable::hot_only(Box::new(hot));
-        assert_eq!(table.row_count(), 0);
+        assert_eq!(table.row_count().unwrap(), 0);
 
         table
             .insert(Row::from_values(vec![
@@ -6659,7 +6659,7 @@ mod tests {
                 Value::Float(10.0),
             ]))
             .unwrap();
-        assert_eq!(table.row_count(), 1);
+        assert_eq!(table.row_count().unwrap(), 1);
     }
 
     #[test]

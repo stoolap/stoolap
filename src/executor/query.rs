@@ -2176,12 +2176,13 @@ impl Executor {
         }
 
         // Try to get distinct values from the index
-        let distinct_values = table.get_partition_values(&column_name).or_else(|| {
-            // Fallback: dictionary-based extraction from cold volumes
-            let schema = table.schema();
-            let col_idx = *schema.column_index_map().get(&column_name)?;
-            table.compute_distinct_values(col_idx)
-        });
+        let distinct_values = match table.get_partition_values(&column_name) {
+            Some(values) => Some(values),
+            None => match table.schema().column_index_map().get(&column_name) {
+                Some(&col_idx) => table.compute_distinct_values(col_idx)?,
+                None => None,
+            },
+        };
 
         if let Some(distinct_values) = distinct_values {
             // Build output column name (use alias if present)
