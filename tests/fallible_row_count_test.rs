@@ -99,12 +99,16 @@ fn snapshot_count_propagates_reload_failure_and_keeps_local_rows() {
     let bytes = std::fs::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
     for _ in 0..2 {
-        let expected = table.collect_all_rows(None).map(|rows| rows.len());
+        let expected = table.segment_manager().ensure_volume(1).map(|_| 0usize);
         assert!(expected
             .as_ref()
             .unwrap_err()
             .to_string()
-            .contains("cold volume reload failed"));
+            .contains("failed to reload cold volume seg=1"));
+        assert_eq!(
+            format!("{:?}", table.collect_all_rows(None).map(|rows| rows.len())),
+            format!("{expected:?}")
+        );
         assert_eq!(format!("{:?}", table.row_count()), format!("{expected:?}"));
     }
     std::fs::write(&path, bytes).unwrap();
