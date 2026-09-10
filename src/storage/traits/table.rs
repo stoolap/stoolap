@@ -1207,8 +1207,8 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `col_idx` - Column index to sum
-    fn sum_column(&self, _col_idx: usize) -> Option<(f64, usize)> {
-        None // Default implementation - override in concrete tables
+    fn sum_column(&self, _col_idx: usize) -> Result<Option<(f64, usize)>> {
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Compute AVG of a column without materializing rows (deferred aggregation)
@@ -1218,7 +1218,7 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `col_idx` - Column index to average
-    fn avg_column(&self, _col_idx: usize) -> Option<(f64, usize)> {
+    fn avg_column(&self, _col_idx: usize) -> Result<Option<(f64, usize)>> {
         // Default: use sum_column if available
         self.sum_column(_col_idx)
     }

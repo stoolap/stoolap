@@ -5449,7 +5449,7 @@ impl Executor {
                 "SUM" => {
                     let col_idx = col_index_map.get(&agg.column_lower).copied();
                     if let Some(idx) = col_idx {
-                        if let Some((sum, count)) = table.sum_column(idx) {
+                        if let Some((sum, count)) = table.sum_column(idx)? {
                             if count == 0 {
                                 result_values.push(Value::null(crate::core::DataType::Float));
                             } else {
@@ -5471,7 +5471,7 @@ impl Executor {
                 "AVG" => {
                     let col_idx = col_index_map.get(&agg.column_lower).copied();
                     if let Some(idx) = col_idx {
-                        if let Some((sum, count)) = table.avg_column(idx) {
+                        if let Some((sum, count)) = table.avg_column(idx)? {
                             if count == 0 {
                                 result_values.push(Value::null(crate::core::DataType::Float));
                             } else {
@@ -5831,7 +5831,7 @@ impl Executor {
                     }
                     "SUM" => {
                         if let Some(idx) = col_idx {
-                            if let Some((sum, count)) = table.sum_column(idx) {
+                            if let Some((sum, count)) = table.sum_column(idx)? {
                                 if count == 0 {
                                     Some(Value::null(crate::core::DataType::Float))
                                 } else if sum.fract() == 0.0 && sum.abs() < i64::MAX as f64 {
@@ -5848,7 +5848,7 @@ impl Executor {
                     }
                     "AVG" => {
                         if let Some(idx) = col_idx {
-                            if let Some((sum, count)) = table.avg_column(idx) {
+                            if let Some((sum, count)) = table.avg_column(idx)? {
                                 if count == 0 {
                                     Some(Value::null(crate::core::DataType::Float))
                                 } else {
