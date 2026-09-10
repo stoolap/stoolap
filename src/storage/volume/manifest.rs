@@ -974,7 +974,7 @@ impl SegmentManager {
     ) -> crate::core::Result<Option<crate::core::Value>> {
         for seg_id in seg_ids {
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                if let Ok(idx) = cold.volume.row_ids()?.binary_search(&row_id) {
                     let pi = if cold.mapping.is_identity {
                         col_idx
                     } else if col_idx < cold.mapping.sources.len() {
@@ -1890,10 +1890,10 @@ impl SegmentManager {
     /// Check if a row_id exists in any segment (not tombstoned).
     ///
     /// Used for constraint checking (PK/UNIQUE).
-    pub fn row_exists(&self, row_id: i64) -> bool {
+    pub fn row_exists(&self, row_id: i64) -> Result<bool> {
         let ts = Arc::clone(&*self.tombstones.read());
         if ts.contains_key(&row_id) {
-            return false;
+            return Ok(false);
         }
         // Metadata-only check (binary search on row_ids). Does not access
         // column data, so no mark_accessed — should not pin volumes.
@@ -1912,12 +1912,12 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if cold.volume.meta.row_ids.binary_search(&row_id).is_ok() {
-                    return true;
+                if cold.volume.row_ids()?.binary_search(&row_id).is_ok() {
+                    return Ok(true);
                 }
             }
         }
-        false
+        Ok(false)
     }
 
     /// Get a cold row by row_id. Returns the Row if found and not tombstoned.
@@ -1944,7 +1944,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                if let Ok(idx) = cold.volume.row_ids()?.binary_search(&row_id) {
                     if cold.volume.is_cold() {
                         if let Some(vol) = self.ensure_volume(*seg_id)? {
                             return Ok(Some(vol.get_row(idx)?));
@@ -1976,7 +1976,7 @@ impl SegmentManager {
         };
         for seg_id in &seg_ids {
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                if let Ok(idx) = cold.volume.row_ids()?.binary_search(&row_id) {
                     if cold.volume.is_cold() {
                         return Err(crate::core::Error::Internal {
                             message: format!(
@@ -2024,7 +2024,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                if let Ok(idx) = cold.volume.row_ids()?.binary_search(&row_id) {
                     let vol = if cold.volume.is_cold() {
                         match self.ensure_volume(*seg_id)? {
                             Some(v) => v,
@@ -2068,7 +2068,7 @@ impl SegmentManager {
         };
         for seg_id in &seg_ids {
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
+                if let Ok(idx) = cold.volume.row_ids()?.binary_search(&row_id) {
                     if cold.volume.is_cold() {
                         return Err(crate::core::Error::Internal {
                             message: format!(
@@ -2093,7 +2093,7 @@ impl SegmentManager {
     /// Check if a row_id actually exists in any loaded volume.
     /// Does NOT check tombstones. Used for idempotent WAL replay.
     /// Uses binary search on the volume's row_ids for O(log n) per segment.
-    pub fn is_row_id_in_volume(&self, row_id: i64) -> bool {
+    pub fn is_row_id_in_volume(&self, row_id: i64) -> Result<bool> {
         let (seg_ids, segments) = {
             let manifest = self.manifest.read();
             let seg_ids: Vec<(u64, i64, i64)> = manifest
@@ -2109,12 +2109,12 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if cold.volume.meta.row_ids.binary_search(&row_id).is_ok() {
-                    return true;
+                if cold.volume.row_ids()?.binary_search(&row_id).is_ok() {
+                    return Ok(true);
                 }
             }
         }
-        false
+        Ok(false)
     }
 
     /// Get the total live row count across all segments (minus tombstones).
@@ -2129,17 +2129,17 @@ impl SegmentManager {
 
     /// Get the exact deduplicated row count across all segments.
     /// Uses a cached value that is invalidated on segment/tombstone changes.
-    pub fn deduped_row_count(&self) -> usize {
+    pub fn deduped_row_count(&self) -> Result<usize> {
         let cached = self
             .cached_deduped_count
             .load(std::sync::atomic::Ordering::Relaxed);
         if cached != u64::MAX {
-            return cached as usize;
+            return Ok(cached as usize);
         }
-        let count = self.compute_deduped_row_count();
+        let count = self.compute_deduped_row_count()?;
         self.cached_deduped_count
             .store(count as u64, std::sync::atomic::Ordering::Relaxed);
-        count
+        Ok(count)
     }
 
     /// Acquire a shared guard while performing a cold check + hot insert.
@@ -2194,15 +2194,18 @@ impl SegmentManager {
 
     /// Count visible rows using pre-computed visibility bitmaps.
     /// Falls back to hash-based dedup only when bitmaps are not available.
-    fn compute_deduped_row_count(&self) -> usize {
+    fn compute_deduped_row_count(&self) -> Result<usize> {
         let segments = Arc::clone(&*self.segments.read());
         if segments.is_empty() {
-            return 0;
+            return Ok(0);
         }
         let tombstones = Arc::clone(&*self.tombstones.read());
         if segments.len() == 1 {
-            let total: usize = segments.values().map(|cs| cs.volume.meta.row_count).sum();
-            return total.saturating_sub(tombstones.len());
+            let mut total = 0;
+            for cs in segments.values() {
+                total += cs.volume.row_ids()?.len();
+            }
+            return Ok(total.saturating_sub(tombstones.len()));
         }
 
         // Fast path: use visibility bitmaps (O(1) per row, zero allocation).
@@ -2211,17 +2214,18 @@ impl SegmentManager {
             let mut count = 0usize;
             for cs in segments.values() {
                 let vol = &cs.volume;
-                for i in 0..vol.meta.row_count {
+                let ids = vol.row_ids()?;
+                for (i, &row_id) in ids.iter().enumerate() {
                     if !cs.is_visible(i) {
                         continue;
                     }
-                    if !tombstones.is_empty() && tombstones.contains_key(&vol.meta.row_ids[i]) {
+                    if !tombstones.is_empty() && tombstones.contains_key(&row_id) {
                         continue;
                     }
                     count += 1;
                 }
             }
-            count
+            Ok(count)
         }
     }
 
@@ -2976,8 +2980,8 @@ mod tests {
 
         assert_eq!(mgr.segment_count(), 1);
         assert_eq!(mgr.total_row_count(), 10);
-        assert!(mgr.row_exists(5));
-        assert!(!mgr.row_exists(11));
+        assert!(mgr.row_exists(5).unwrap());
+        assert!(!mgr.row_exists(11).unwrap());
     }
 
     #[test]
@@ -3013,16 +3017,16 @@ mod tests {
 
         // Tombstone row_id=5 (commit_seq=1)
         mgr.add_tombstones(&[5], 1);
-        assert!(!mgr.row_exists(5));
-        assert!(mgr.row_exists(4));
-        assert!(mgr.row_exists(6));
+        assert!(!mgr.row_exists(5).unwrap());
+        assert!(mgr.row_exists(4).unwrap());
+        assert!(mgr.row_exists(6).unwrap());
         assert_eq!(mgr.total_row_count(), 9);
         assert!(mgr.is_tombstoned(5));
         assert!(!mgr.is_tombstoned(4));
 
         // Clear tombstones
         mgr.clear_tombstones();
-        assert!(mgr.row_exists(5));
+        assert!(mgr.row_exists(5).unwrap());
         assert_eq!(mgr.total_row_count(), 10);
     }
 
@@ -3256,7 +3260,10 @@ mod tests {
         }
 
         // Metadata still accessible on cold volumes.
-        assert!(mgr.row_exists(50), "metadata (row_ids) should work on cold");
+        assert!(
+            mgr.row_exists(50).unwrap(),
+            "metadata (row_ids) should work on cold"
+        );
         assert_eq!(mgr.total_row_count(), 100);
 
         // Volume is still in the map (not removed).

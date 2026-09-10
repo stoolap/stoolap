@@ -16,14 +16,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use stoolap::core::{DataType, Result, Row, RowVec, SchemaBuilder, Value};
+use stoolap::core::{DataType, Error, Result, Row, RowVec, SchemaBuilder, Value};
+use stoolap::executor::context::{
+    cache_count_counter, cache_exists_fetcher, cache_exists_index, clear_all_thread_local_caches,
+    ExecutionContext,
+};
 use stoolap::executor::expression::clear_program_cache;
+use stoolap::executor::Executor;
 use stoolap::functions::scalar::SleepFunction;
 use stoolap::functions::{global_registry, FunctionInfo, ScalarFunction};
 use stoolap::storage::expression::ComparisonExpr;
 use stoolap::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
 use stoolap::storage::mvcc::{MVCCTable, TransactionVersionStore, VersionStore};
-use stoolap::storage::traits::Table;
+use stoolap::storage::traits::{Engine, Table};
 use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
 use stoolap::storage::volume::manifest::{SegmentManager, SegmentMeta};
 use stoolap::storage::volume::table::SegmentedTable;
@@ -495,4 +500,152 @@ fn cold_distinct_preserves_local_unindexed_values() {
         .collect();
     assert_eq!(values, [10, 20, 30]);
     tx.rollback().unwrap();
+}
+
+#[test]
+fn resident_identity_and_counts_do_not_reload_column_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (table, path) = cold_table(dir.path(), false);
+    std::fs::remove_file(path).unwrap();
+    for id in [1, 2, 3] {
+        let expected = id != 3;
+        let found = format!("{:?}", table.has_row_id(id));
+        assert!(found == format!("Ok({expected})") || found == expected.to_string());
+    }
+    assert_eq!(table.row_count().unwrap(), 2);
+    table.segment_manager().add_tombstones(&[1], 1);
+    assert_eq!(table.row_count().unwrap(), 1);
+    let exists = format!("{:?}", table.segment_manager().row_exists(1));
+    assert!(exists == "Ok(false)" || exists == "false");
+    let physical = format!("{:?}", table.segment_manager().is_row_id_in_volume(1));
+    assert!(physical == "Ok(true)" || physical == "true");
+    assert!(table.segment_manager().segments_raw()[&1].volume.is_cold());
+}
+
+struct CounterCacheScope;
+
+impl CounterCacheScope {
+    fn new() -> Self {
+        clear_all_thread_local_caches();
+        Self
+    }
+}
+
+impl Drop for CounterCacheScope {
+    fn drop(&mut self) {
+        clear_all_thread_local_caches();
+    }
+}
+
+fn nested_count(executor: &Executor) -> Result<Value> {
+    let ctx = ExecutionContext::new().with_outer_row(
+        [("outer_t.k".into(), Value::Integer(7))]
+            .into_iter()
+            .collect(),
+        stoolap::common::CompactArc::new(vec!["outer_t.k".to_string()]),
+    );
+    let mut rows = executor.execute_with_context(
+        "SELECT (SELECT COUNT(*) FROM inner_t WHERE inner_t.k = outer_t.k)",
+        &ctx,
+    )?;
+    if let Some(error) = rows.last_error() {
+        return Err(error);
+    }
+    assert!(rows.next());
+    let value = rows.row()[0].clone();
+    assert!(!rows.next());
+    if let Some(error) = rows.last_error() {
+        return Err(error);
+    }
+    Ok(value)
+}
+
+fn counter_database(dsn: &str) -> Database {
+    let db = Database::open(dsn).unwrap();
+    db.execute(
+        "CREATE TABLE inner_t (id INTEGER PRIMARY KEY, k INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_inner_k ON inner_t(k)", ())
+        .unwrap();
+    db.execute("INSERT INTO inner_t VALUES (1, 7)", ()).unwrap();
+    db
+}
+
+#[test]
+fn counter_factory_failure_does_not_use_cached_fetcher() {
+    let db = counter_database("memory://counter_factory_failure_does_not_use_cached_fetcher");
+    let engine = db.engine();
+    let index = engine
+        .get_all_indexes("inner_t")
+        .unwrap()
+        .into_iter()
+        .find(|index| index.column_names() == ["k"])
+        .unwrap();
+    let mut config = engine.config();
+    config.persistence.checkpoint_on_close = false;
+    engine.update_engine_config(config).unwrap();
+    engine.close_engine().unwrap();
+    assert_eq!(&*index.get_row_ids_equal(&[Value::Integer(7)]), &[1]);
+    let _caches = CounterCacheScope::new();
+    cache_exists_index("inner_t:k".to_string(), index);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fallback_calls = Arc::clone(&calls);
+    cache_exists_fetcher(
+        "inner_t".to_string(),
+        Box::new(move |_| {
+            fallback_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(RowVec::new())
+        }),
+    );
+    let result = nested_count(&Executor::new(Arc::clone(engine)));
+    assert!(matches!(result, Err(Error::EngineNotOpen)), "{result:?}");
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+trait CounterResult {
+    fn from_result(result: Result<usize>) -> Self;
+}
+
+impl CounterResult for Result<usize> {
+    fn from_result(result: Result<usize>) -> Self {
+        result
+    }
+}
+
+impl CounterResult for usize {
+    fn from_result(result: Result<usize>) -> Self {
+        result.unwrap_or(0)
+    }
+}
+
+#[test]
+fn counter_callback_failure_reaches_sql_without_fallback() {
+    let db = counter_database("memory://counter_callback_failure_reaches_sql_without_fallback");
+    let _caches = CounterCacheScope::new();
+    let index = db
+        .engine()
+        .get_all_indexes("inner_t")
+        .unwrap()
+        .into_iter()
+        .find(|index| index.column_names() == ["k"])
+        .unwrap();
+    cache_exists_index("inner_t:k".to_string(), index);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter_calls = Arc::clone(&calls);
+    cache_count_counter(
+        "inner_t".to_string(),
+        Box::new(move |ids| {
+            assert_eq!(ids, [1]);
+            counter_calls.fetch_add(1, Ordering::Relaxed);
+            CounterResult::from_result(Err(Error::internal("identity read failed")))
+        }),
+    );
+    let result = nested_count(&Executor::new(Arc::clone(db.engine())));
+    assert!(
+        matches!(&result, Err(Error::Internal { message }) if message == "identity read failed"),
+        "{result:?}"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
 }

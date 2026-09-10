@@ -1761,7 +1761,7 @@ impl MVCCEngine {
                 if let Ok(row_version) = deserialize_row_version(&entry.data) {
                     let table_name = entry.table_name.to_lowercase();
                     let mgr = self.get_or_create_segment_manager(&table_name);
-                    let in_volume = mgr.is_row_id_in_volume(entry.row_id);
+                    let in_volume = mgr.is_row_id_in_volume(entry.row_id)?;
 
                     if in_volume {
                         // Row exists in a cold volume. Two cases:
@@ -1803,13 +1803,14 @@ impl MVCCEngine {
             WALOperationType::Delete => {
                 // For deletes, mark the row as deleted in the hot store.
                 let table_name = entry.table_name.to_lowercase();
+                let mgr = self.get_or_create_segment_manager(&table_name);
+                let in_volume = mgr.is_row_id_in_volume(entry.row_id)?;
                 if let Ok(store) = self.get_version_store(&table_name) {
                     store.mark_deleted(entry.row_id, entry.txn_id);
                 }
                 // If the deleted row_id lives in a cold segment, add a tombstone
                 // so it is excluded from scans and point lookups.
-                let mgr = self.get_or_create_segment_manager(&table_name);
-                if mgr.is_row_id_in_volume(entry.row_id) {
+                if in_volume {
                     // Recovery tombstones get commit_seq=0, which is always visible
                     // to all new snapshots (any begin_seq > 0). This is correct:
                     // these tombstones were committed before the restart.
@@ -6651,7 +6652,7 @@ impl Engine for MVCCEngine {
     fn get_row_counter(
         &self,
         table_name: &str,
-    ) -> Result<Box<dyn Fn(&[i64]) -> usize + Send + Sync>> {
+    ) -> Result<Option<Box<dyn Fn(&[i64]) -> Result<usize> + Send + Sync>>> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -6660,17 +6661,17 @@ impl Engine for MVCCEngine {
         let mgr = self.get_or_create_segment_manager(table_name);
         let read_txn_id = INVALID_TRANSACTION_ID + 1;
 
-        Ok(Box::new(move |row_ids: &[i64]| {
+        Ok(Some(Box::new(move |row_ids: &[i64]| {
             let mut count = store.count_visible_versions_batch(row_ids, read_txn_id);
             if count < row_ids.len() && mgr.has_segments() {
                 for &rid in row_ids {
-                    if !store.has_committed_row(rid) && mgr.row_exists(rid) {
+                    if !store.has_committed_row(rid) && mgr.row_exists(rid)? {
                         count += 1;
                     }
                 }
             }
-            count
-        }))
+            Ok(count)
+        })))
     }
 }
 

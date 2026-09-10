@@ -1590,6 +1590,7 @@ impl VolumeBuilder {
 
     /// Freeze the builder into a FrozenVolume.
     pub fn finish(mut self) -> FrozenVolume {
+        debug_assert_eq!(self.row_ids.len(), self.row_count);
         let mut columns = Vec::with_capacity(self.num_cols);
         let mut sorted_columns = Vec::with_capacity(self.num_cols);
 
@@ -1844,6 +1845,12 @@ pub fn compute_column_mapping_with_drops(
 }
 
 impl FrozenVolume {
+    /// Borrow the resident physical row IDs.
+    #[inline]
+    pub fn row_ids(&self) -> std::io::Result<&[i64]> {
+        Ok(&self.meta.row_ids)
+    }
+
     /// Get a row using a precomputed column mapping.
     /// Materializes all schema columns through the mapping.
     pub fn get_row_mapped(&self, idx: usize, mapping: &ColumnMapping) -> std::io::Result<Row> {
