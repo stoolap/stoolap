@@ -887,7 +887,7 @@ impl VolumeScanner {
         let mut columns: Vec<Option<Arc<super::column::ColumnData>>> = vec![None; col_count];
         if let Some(ref needed) = self.needed_cols {
             for (ci, &need) in needed.iter().enumerate() {
-                if need && ci < col_count && group_idx < store.num_groups(ci) {
+                if need && ci < col_count {
                     match store.group_column(ci, group_idx) {
                         Ok(col) => columns[ci] = Some(col),
                         Err(e) => {
@@ -899,13 +899,11 @@ impl VolumeScanner {
             }
         } else {
             for (ci, slot) in columns.iter_mut().enumerate() {
-                if group_idx < store.num_groups(ci) {
-                    match store.group_column(ci, group_idx) {
-                        Ok(col) => *slot = Some(col),
-                        Err(e) => {
-                            self.error = Some(Error::internal(format!("corrupt V4 block: {}", e)));
-                            return;
-                        }
+                match store.group_column(ci, group_idx) {
+                    Ok(col) => *slot = Some(col),
+                    Err(e) => {
+                        self.error = Some(Error::internal(format!("corrupt V4 block: {}", e)));
+                        return;
                     }
                 }
             }

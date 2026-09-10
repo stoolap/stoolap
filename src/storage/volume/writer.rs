@@ -92,10 +92,18 @@ impl CompressedBlockStore {
         col_idx: usize,
         group_idx: usize,
     ) -> std::io::Result<Arc<ColumnData>> {
-        super::group_cache::DECODED_GROUPS
-            .get_or_decode((self.id, col_idx as u32, group_idx as u32), || {
-                self.decompress_single_group(col_idx, group_idx)
-            })
+        let key_col = u32::try_from(col_idx).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "column index out of range",
+            )
+        })?;
+        let key_group = u32::try_from(group_idx).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "group index out of range")
+        })?;
+        super::group_cache::DECODED_GROUPS.get_or_decode((self.id, key_col, key_group), || {
+            self.decompress_single_group(col_idx, group_idx)
+        })
     }
 
     /// Compress existing columns into per-group LZ4 blocks.
@@ -505,12 +513,44 @@ impl CompressedBlockStore {
         dict: Option<Arc<[SmartString]>>,
         ext_type: DataType,
     ) -> std::io::Result<ColumnData> {
-        let decomp_len = self.decompressed_lens[col_idx][gi];
-        let group_rows = self.group_row_count(gi, num_groups);
+        let decomp_len = *self
+            .decompressed_lens
+            .get(col_idx)
+            .and_then(|lens| lens.get(gi))
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "missing block length")
+            })?;
+        let group_rows = self.group_row_count(gi, num_groups)?;
+        let row_bytes = match type_tag {
+            super::format::COL_INT64
+            | super::format::COL_FLOAT64
+            | super::format::COL_TIMESTAMP => 9,
+            super::format::COL_BOOLEAN => 2,
+            COL_DICTIONARY => 5,
+            COL_BYTES => 0,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unknown column type tag",
+                ));
+            }
+        };
+        if (row_bytes != 0 && group_rows.checked_mul(row_bytes) != Some(decomp_len))
+            || decomp_len > isize::MAX as usize
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid column block length",
+            ));
+        }
         let raw_bytes = if block.len() == decomp_len {
             return deserialize_column_block(block, type_tag, group_rows, dict, ext_type);
         } else {
-            lz4_flex::decompress(block, decomp_len).map_err(|e| {
+            let mut raw = Vec::new();
+            raw.try_reserve_exact(decomp_len)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
+            raw.resize(decomp_len, 0);
+            let decoded_len = lz4_flex::decompress_into(block, &mut raw).map_err(|e| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
@@ -518,7 +558,14 @@ impl CompressedBlockStore {
                         col_idx, gi, num_groups, e
                     ),
                 )
-            })?
+            })?;
+            if decoded_len != decomp_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "LZ4 decoded length does not match block length",
+                ));
+            }
+            raw
         };
         deserialize_column_block(&raw_bytes, type_tag, group_rows, dict, ext_type)
     }
@@ -545,7 +592,7 @@ impl CompressedBlockStore {
         bytes_offsets_out: Option<&mut Vec<(u64, u64)>>,
     ) -> std::io::Result<()> {
         let decomp_len = self.decompressed_lens[col_idx][gi];
-        let group_rows = self.group_row_count(gi, num_groups);
+        let group_rows = self.group_row_count(gi, num_groups)?;
         if block.len() == decomp_len {
             return deserialize_column_block_into(
                 block,
@@ -594,9 +641,29 @@ impl CompressedBlockStore {
         col_idx: usize,
         group_idx: usize,
     ) -> std::io::Result<ColumnData> {
-        let num_groups = self.blocks[col_idx].len();
-        let type_tag = self.col_type_tags[col_idx];
-        let ext_type = DataType::from_u8(self.col_ext_types[col_idx]).unwrap_or(DataType::Null);
+        let col_blocks = self.blocks.get(col_idx).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "column index out of range",
+            )
+        })?;
+        let block = col_blocks.get(group_idx).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "group index out of range")
+        })?;
+        let num_groups = col_blocks.len();
+        let type_tag = *self.col_type_tags.get(col_idx).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "missing column type tag")
+        })?;
+        let ext_type = self
+            .col_ext_types
+            .get(col_idx)
+            .and_then(|&tag| DataType::from_u8(tag))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid extension type tag",
+                )
+            })?;
         let dict: Option<Arc<[SmartString]>> = if type_tag == COL_DICTIONARY {
             self.col_dicts
                 .iter()
@@ -606,13 +673,7 @@ impl CompressedBlockStore {
             None
         };
         self.decompress_block(
-            col_idx,
-            group_idx,
-            &self.blocks[col_idx][group_idx],
-            type_tag,
-            num_groups,
-            dict,
-            ext_type,
+            col_idx, group_idx, block, type_tag, num_groups, dict, ext_type,
         )
     }
 
@@ -715,12 +776,17 @@ impl CompressedBlockStore {
     }
 
     /// Number of rows in a specific group.
-    fn group_row_count(&self, group_idx: usize, num_groups: usize) -> usize {
-        if group_idx == num_groups - 1 {
-            self.row_count - group_idx * self.group_size
-        } else {
-            self.group_size
+    fn group_row_count(&self, group_idx: usize, num_groups: usize) -> std::io::Result<usize> {
+        if self.group_size == 0
+            || num_groups != self.row_count.div_ceil(self.group_size)
+            || group_idx >= num_groups
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid row group geometry",
+            ));
         }
+        Ok((self.row_count - group_idx * self.group_size).min(self.group_size))
     }
 
     /// Number of columns.

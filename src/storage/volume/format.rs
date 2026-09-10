@@ -885,7 +885,7 @@ pub(crate) fn deserialize_column_block(
     ext_type: DataType,
 ) -> io::Result<ColumnData> {
     let mut pos = 0;
-    match col_type_tag {
+    let column = match col_type_tag {
         COL_INT64 => {
             let nulls = read_nulls(data, &mut pos, row_count)?;
             let values = read_i64_bulk(data, &mut pos, row_count)?;
@@ -932,21 +932,33 @@ pub(crate) fn deserialize_column_block(
         }
         COL_BYTES => {
             let nulls = read_nulls(data, &mut pos, row_count)?;
-            let offset_count = read_u64(data, &mut pos)? as usize;
-            let mut offsets = Vec::with_capacity(offset_count);
-            for _ in 0..offset_count {
+            let offset_count = read_u64(data, &mut pos)?;
+            if offset_count != row_count as u64 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bytes offset count does not match row count",
+                ));
+            }
+            if row_count > data.len().saturating_sub(pos) / 16 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated column block: bytes offsets",
+                ));
+            }
+            let mut offsets = Vec::with_capacity(row_count);
+            for _ in 0..row_count {
                 let off = read_u64(data, &mut pos)?;
                 let len = read_u64(data, &mut pos)?;
                 offsets.push((off, len));
             }
-            let data_len = read_u64(data, &mut pos)? as usize;
-            if pos + data_len > data.len() {
+            let data_len = read_u64(data, &mut pos)?;
+            if data_len > data.len().saturating_sub(pos) as u64 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated column block: bytes data",
                 ));
             }
-            let blob = data[pos..pos + data_len].to_vec();
+            let end_pos = pos + data_len as usize;
             // Validate offsets to prevent panics on corrupted volumes
             for (i, &(off, len)) in offsets.iter().enumerate() {
                 if !nulls[i] {
@@ -956,20 +968,19 @@ pub(crate) fn deserialize_column_block(
                             format!("bytes offset overflow at row {}", i),
                         )
                     })?;
-                    if (end as usize) > blob.len() {
+                    if end > data_len {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
                                 "bytes offset {}+{} exceeds data length {} at row {}",
-                                off,
-                                len,
-                                blob.len(),
-                                i
+                                off, len, data_len, i
                             ),
                         ));
                     }
                 }
             }
+            let blob = data[pos..end_pos].to_vec();
+            pos = end_pos;
             Ok(ColumnData::Bytes {
                 data: blob,
                 offsets,
@@ -981,7 +992,14 @@ pub(crate) fn deserialize_column_block(
             io::ErrorKind::InvalidData,
             format!("unknown column type tag {}", col_type_tag),
         )),
+    }?;
+    if pos != data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing bytes in column block",
+        ));
     }
+    Ok(column)
 }
 
 /// Metadata parsed from a V4 volume file (everything except column data).
