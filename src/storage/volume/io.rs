@@ -145,7 +145,7 @@ fn serialize_v4_opts(
         &vol.meta.column_types,
         vol.meta.row_count,
         compress,
-    );
+    )?;
 
     // 3. Compute total size for pre-allocation
     let all_blocks = store.raw_blocks();
@@ -761,8 +761,8 @@ mod tests {
 
         let loaded = read_volume_from_disk(&path).unwrap();
         assert_eq!(loaded.meta.row_count, 2);
-        assert_eq!(loaded.columns[0].get_i64(0), 1);
-        assert_eq!(loaded.columns[1].get_str(1), "world");
+        assert_eq!(loaded.columns.get(0).unwrap().get_i64(0), 1);
+        assert_eq!(loaded.columns.get(1).unwrap().get_str(1), "world");
     }
 
     #[test]
@@ -928,11 +928,11 @@ mod tests {
         assert_eq!(loaded.meta.row_count, 3);
 
         // Access columns triggers decompression from RAM
-        assert_eq!(loaded.columns[0].get_i64(0), 1);
-        assert_eq!(loaded.columns[0].get_i64(2), 3);
-        assert_eq!(loaded.columns[1].get_str(0), "apple");
-        assert_eq!(loaded.columns[1].get_str(1), "banana");
-        assert_eq!(loaded.columns[2].get_f64(1), 0.75);
+        assert_eq!(loaded.columns.get(0).unwrap().get_i64(0), 1);
+        assert_eq!(loaded.columns.get(0).unwrap().get_i64(2), 3);
+        assert_eq!(loaded.columns.get(1).unwrap().get_str(0), "apple");
+        assert_eq!(loaded.columns.get(1).unwrap().get_str(1), "banana");
+        assert_eq!(loaded.columns.get(2).unwrap().get_f64(1), 0.75);
 
         // Zone maps survived
         assert_eq!(loaded.meta.zone_maps[0].min, Value::Integer(1));
@@ -976,11 +976,11 @@ mod tests {
         let loaded = read_volume_from_disk(&path).unwrap();
 
         assert_eq!(loaded.meta.row_count, 3);
-        assert!(!loaded.columns[1].is_null(0));
-        assert!(loaded.columns[1].is_null(1));
-        assert!(!loaded.columns[1].is_null(2));
-        assert_eq!(loaded.columns[1].get_f64(0), 10.0);
-        assert_eq!(loaded.columns[1].get_f64(2), 30.0);
+        assert!(!loaded.columns.get(1).unwrap().is_null(0));
+        assert!(loaded.columns.get(1).unwrap().is_null(1));
+        assert!(!loaded.columns.get(1).unwrap().is_null(2));
+        assert_eq!(loaded.columns.get(1).unwrap().get_f64(0), 10.0);
+        assert_eq!(loaded.columns.get(1).unwrap().get_f64(2), 30.0);
     }
 
     #[test]
@@ -1011,12 +1011,18 @@ mod tests {
         assert_eq!(loaded.meta.row_count, n);
 
         // Check first, middle, and last rows
-        assert_eq!(loaded.columns[0].get_i64(0), 0);
-        assert_eq!(loaded.columns[0].get_i64(n / 2), (n / 2) as i64);
-        assert_eq!(loaded.columns[0].get_i64(n - 1), (n - 1) as i64);
-        assert_eq!(loaded.columns[1].get_str(0), "even");
-        assert_eq!(loaded.columns[1].get_str(1), "odd");
-        assert_eq!(loaded.columns[1].get_str(n - 1), "odd");
+        assert_eq!(loaded.columns.get(0).unwrap().get_i64(0), 0);
+        assert_eq!(
+            loaded.columns.get(0).unwrap().get_i64(n / 2),
+            (n / 2) as i64
+        );
+        assert_eq!(
+            loaded.columns.get(0).unwrap().get_i64(n - 1),
+            (n - 1) as i64
+        );
+        assert_eq!(loaded.columns.get(1).unwrap().get_str(0), "even");
+        assert_eq!(loaded.columns.get(1).unwrap().get_str(1), "odd");
+        assert_eq!(loaded.columns.get(1).unwrap().get_str(n - 1), "odd");
 
         // Row groups present
         assert!(!loaded.meta.row_groups.is_empty());
@@ -1050,13 +1056,13 @@ mod tests {
 
         assert_eq!(loaded.meta.row_count, 2);
         // Timestamp nanosecond precision
-        if let Value::Timestamp(loaded_ts) = loaded.columns[0].get_value(0) {
+        if let Value::Timestamp(loaded_ts) = loaded.columns.get(0).unwrap().get_value(0) {
             assert_eq!(loaded_ts.timestamp_nanos_opt(), ts.timestamp_nanos_opt());
         } else {
             panic!("expected Timestamp");
         }
-        assert!(loaded.columns[1].get_bool(0));
-        assert!(!loaded.columns[1].get_bool(1));
+        assert!(loaded.columns.get(1).unwrap().get_bool(0));
+        assert!(!loaded.columns.get(1).unwrap().get_bool(1));
     }
 
     #[test]
@@ -1077,7 +1083,7 @@ mod tests {
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
         let loaded = read_volume_from_disk(&path).unwrap();
 
-        let row = loaded.get_row(0);
+        let row = loaded.get_row(0).unwrap();
         assert_eq!(row.get(0), Some(&Value::Integer(42)));
         assert_eq!(row.get(1), Some(&Value::text("test")));
     }

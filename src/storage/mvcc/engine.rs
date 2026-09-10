@@ -724,10 +724,8 @@ impl MVCCEngine {
                     self.loading_from_disk.store(false, Ordering::Release);
 
                     // Force seal ALL hot rows into volumes
-                    if let Err(e) = self.checkpoint_cycle_inner(true) {
-                        eprintln!("Warning: snapshot-to-volume conversion failed: {}", e);
-                    }
-                    self.compact_after_checkpoint_forced();
+                    self.checkpoint_cycle_inner(true)?;
+                    self.compact_after_checkpoint_forced()?;
 
                     // Only remove snapshots/ if this is a real v0.3.7 migration
                     // (no ddl-*.bin). If DDL metadata exists, these are user-created
@@ -1443,13 +1441,18 @@ impl MVCCEngine {
     fn populate_hnsw_from_segments(&self) -> Result<()> {
         let stores = self.version_stores.read().unwrap();
         let mgrs = self.segment_managers.read().unwrap();
+        let tables: Vec<_> = stores
+            .iter()
+            .filter_map(|(name, store)| {
+                mgrs.get(name)
+                    .map(|mgr| (Arc::clone(store), Arc::clone(mgr)))
+            })
+            .collect();
+        drop(mgrs);
+        drop(stores);
 
-        for (table_name, store) in stores.iter() {
-            if let Some(mgr) = mgrs.get(table_name) {
-                if !mgr.has_segments() {
-                    continue;
-                }
-
+        for (store, mgr) in tables {
+            if mgr.has_segments() {
                 // Collect HNSW index info before iterating volumes
                 let indexes = store.get_all_indexes();
                 let hnsw_infos: Vec<(Vec<usize>, std::sync::Arc<dyn Index>)> = indexes
@@ -1495,7 +1498,23 @@ impl MVCCEngine {
 
                 for (_, cs) in volumes.iter() {
                     let vol = &cs.volume;
-                    for i in 0..vol.meta.row_count {
+                    let Some(start) = (0..vol.meta.row_count).find(|&i| {
+                        let row_id = vol.meta.row_ids[i];
+                        !tombstones.contains_key(&row_id) && !seen.contains(&row_id)
+                    }) else {
+                        continue;
+                    };
+                    let mut columns: smallvec::SmallVec<
+                        [Option<&crate::storage::volume::column::ColumnData>; 16],
+                    > = smallvec::smallvec![None; vol.columns.len()];
+                    for (col_indices, _) in &hnsw_infos {
+                        for &ci in col_indices {
+                            if ci < columns.len() {
+                                columns[ci] = Some(vol.columns.get(ci)?);
+                            }
+                        }
+                    }
+                    for i in start..vol.meta.row_count {
                         let row_id = vol.meta.row_ids[i];
                         if tombstones.contains_key(&row_id) || !seen.insert(row_id) {
                             continue;
@@ -1504,8 +1523,8 @@ impl MVCCEngine {
                             values_buf.clear();
                             let mut has_null = false;
                             for &ci in col_indices {
-                                let v = if ci < vol.columns.len() {
-                                    vol.columns[ci].get_value(i)
+                                let v = if let Some(Some(col)) = columns.get(ci) {
+                                    col.get_value(i)
                                 } else {
                                     crate::core::Value::Null(crate::core::DataType::Null)
                                 };
@@ -1536,7 +1555,8 @@ impl MVCCEngine {
                             if let Err(e) = index.add_batch_slice(&entry_refs) {
                                 eprintln!(
                                     "Warning: HNSW index population failed for {}: {}",
-                                    table_name, e
+                                    store.table_name(),
+                                    e
                                 );
                             }
                             batches[idx].clear();
@@ -1554,7 +1574,8 @@ impl MVCCEngine {
                         if let Err(e) = index.add_batch_slice(&entry_refs) {
                             eprintln!(
                                 "Warning: HNSW index population failed for {}: {}",
-                                table_name, e
+                                store.table_name(),
+                                e
                             );
                         }
                     }
@@ -2158,7 +2179,9 @@ impl MVCCEngine {
                             std::thread::sleep(std::time::Duration::from_millis(10));
                         }
                     }
-                    self.compact_after_checkpoint_forced();
+                    if let Err(e) = self.compact_after_checkpoint_forced() {
+                        eprintln!("Warning: final compaction during close failed: {}", e);
+                    }
                 }
             }
         } // checkpoint_on_close
@@ -4200,10 +4223,21 @@ impl MVCCEngine {
                             continue;
                         }
 
-                        let mut row = if mapping.is_identity {
+                        let row = if mapping.is_identity {
                             vol.get_row(i)
                         } else {
                             vol.get_row_mapped(i, &mapping)
+                        };
+                        let mut row = match row {
+                            Ok(row) => row,
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: Failed to read cold row {} for snapshot: {}",
+                                    row_id, e
+                                );
+                                write_error = true;
+                                break;
+                            }
                         };
 
                         if row.len() < schema_cols {
@@ -5046,10 +5080,11 @@ impl MVCCEngine {
                 message: format!("Restore data not persisted (crash may lose it): {}", e),
             }
         })?;
-        self.compact_after_checkpoint_forced();
+        let compaction_result = self.compact_after_checkpoint_forced();
 
         // Resume accepting transactions only after data is persisted
         self.registry.start_accepting_transactions();
+        compaction_result?;
 
         Ok(format!(
             "Restored {} tables ({} rows) from snapshot",
@@ -5075,8 +5110,7 @@ impl MVCCEngine {
         // trait users) get the full seal + compact behavior.
         // The background thread bypasses this by calling
         // checkpoint_cycle_inner + spawn_compaction directly.
-        self.compact_after_checkpoint_forced();
-        Ok(())
+        self.compact_after_checkpoint_forced()
     }
 
     /// Inner checkpoint implementation. When `force` is true, seals ALL hot rows
@@ -5101,9 +5135,7 @@ impl MVCCEngine {
         if force {
             self.force_seal_all.store(true, Ordering::Release);
         }
-        if let Err(e) = self.seal_hot_buffers() {
-            eprintln!("Warning: seal_hot_buffers failed: {}", e);
-        }
+        let mut seal_result = self.seal_hot_buffers();
         if force {
             self.force_seal_all.store(false, Ordering::Release);
         }
@@ -5118,12 +5150,10 @@ impl MVCCEngine {
                 .all(|store| store.committed_row_count() == 0)
         };
 
-        if !all_hot_empty && !force {
+        if seal_result.is_ok() && !all_hot_empty && !force {
             // Force-seal the stragglers (small tables below threshold)
             self.force_seal_all.store(true, Ordering::Release);
-            if let Err(e) = self.seal_hot_buffers() {
-                eprintln!("Warning: force-seal stragglers failed: {}", e);
-            }
+            seal_result = self.seal_hot_buffers();
             self.force_seal_all.store(false, Ordering::Release);
         }
 
@@ -5133,6 +5163,7 @@ impl MVCCEngine {
             let _admission = self.hot_limits.admission.0.lock().unwrap();
             self.hot_limits.admission.1.notify_all();
         }
+        seal_result?;
 
         // Step 3: Brief fence — block commits just long enough to check if all
         // hot buffers are empty and capture checkpoint_lsn. NO disk I/O inside
@@ -5232,11 +5263,9 @@ impl MVCCEngine {
     /// Run compaction synchronously under the compaction_running flag.
     /// The flag prevents concurrent compaction from background and forced
     /// callers. Clears the flag on exit (including panics via drop guard).
-    fn run_compaction_guarded(&self) {
+    fn run_compaction_guarded(&self) -> Result<()> {
         let _guard = AtomicBoolGuard(&self.compaction_running);
-        if let Err(e) = self.compact_volumes() {
-            eprintln!("Warning: compact_volumes failed: {}", e);
-        }
+        self.compact_volumes()
     }
 
     /// Evict idle volume data to save memory. Volumes not accessed since the
@@ -5270,7 +5299,9 @@ impl MVCCEngine {
         }
         let engine = Arc::clone(self);
         std::thread::spawn(move || {
-            engine.run_compaction_guarded();
+            if let Err(e) = engine.run_compaction_guarded() {
+                eprintln!("Warning: compact_volumes failed: {}", e);
+            }
             engine.evict_idle_volumes();
         });
     }
@@ -5278,7 +5309,7 @@ impl MVCCEngine {
     /// Run compaction synchronously, waiting for any in-flight background
     /// compaction to finish first. Used by PRAGMA CHECKPOINT, close_engine,
     /// restore, and v0.3.7 migration.
-    fn compact_after_checkpoint_forced(&self) {
+    fn compact_after_checkpoint_forced(&self) -> Result<()> {
         // Claim the compaction slot, waiting for any background compaction.
         // CAS loop: if background thread holds the flag, spin until it clears.
         // Once we claim it, no background thread can start a new compaction.
@@ -5289,7 +5320,7 @@ impl MVCCEngine {
         {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        self.run_compaction_guarded();
+        self.run_compaction_guarded()
     }
 
     /// Re-record all DDL entries to WAL after checkpoint.
@@ -5527,19 +5558,29 @@ impl MVCCEngine {
                         .filter_map(|&i| {
                             let seg = &manifest.segments[i];
                             let vol = segs.get(&seg.segment_id)?;
-                            if vol.volume.is_cold() {
-                                // Load only this merge candidate from disk.
-                                let loaded = mgr.ensure_volume(seg.segment_id).ok()??;
-                                Some((seg.segment_id, loaded))
-                            } else {
-                                Some((seg.segment_id, Arc::clone(&vol.volume)))
-                            }
+                            Some((seg.segment_id, Arc::clone(&vol.volume)))
                         })
                         .collect();
                 drop(segs);
+                drop(manifest);
 
                 // Every manifest entry must have a loaded volume.
                 if vols.len() != old_ids.len() {
+                    continue;
+                }
+                let mut removed = false;
+                for (seg_id, vol) in &mut vols {
+                    if vol.is_cold() {
+                        match mgr.ensure_volume(*seg_id)? {
+                            Some(loaded) => *vol = loaded,
+                            None => {
+                                removed = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if removed {
                     continue;
                 }
                 // Sort by segment_id descending (newest first) for correct dedup.
@@ -5660,9 +5701,18 @@ impl MVCCEngine {
                 Arc<crate::storage::volume::writer::FrozenVolume>,
                 crate::storage::volume::manifest::SegmentMeta,
             )> = Vec::new();
-            let mut write_failed = false;
+            let mut prepare_error: Option<Error> = None;
+            let store = self
+                .version_stores
+                .read()
+                .map_err(|_| Error::internal("version stores lock poisoned"))?
+                .get(table_name)
+                .cloned();
+            let unique_columns = store
+                .map(|store| store.get_unique_non_pk_index_columns())
+                .unwrap_or_default();
 
-            for chunk in live_refs.chunks(chunk_size) {
+            'prepare: for chunk in live_refs.chunks(chunk_size) {
                 let mut builder = crate::storage::volume::writer::VolumeBuilder::with_capacity(
                     &schema,
                     chunk.len(),
@@ -5675,9 +5725,22 @@ impl MVCCEngine {
                     } else {
                         vol.get_row_mapped(row_idx, mapping)
                     };
+                    let row = match row {
+                        Ok(row) => row,
+                        Err(e) => {
+                            prepare_error = Some(e.into());
+                            break 'prepare;
+                        }
+                    };
                     builder.add_row(row_id, &row);
                 }
                 let mut compacted = builder.finish();
+                for (col_indices, _) in &unique_columns {
+                    if let Err(e) = compacted.prebuild_unique_index(col_indices) {
+                        prepare_error = Some(e.into());
+                        break 'prepare;
+                    }
+                }
 
                 let compact_vol_id = crate::storage::volume::io::next_volume_id();
                 match crate::storage::volume::io::write_volume_to_disk_opts(
@@ -5690,15 +5753,6 @@ impl MVCCEngine {
                     Ok((_path, store)) => {
                         // Retain compressed store for hot→warm eviction.
                         compacted.columns.attach_compressed_store(store);
-                        // Pre-build unique hash indices before registration.
-                        {
-                            let stores = self.version_stores.read().unwrap();
-                            if let Some(store) = stores.get(table_name) {
-                                for (col_indices, _) in store.get_unique_non_pk_index_columns() {
-                                    compacted.prebuild_unique_index(&col_indices);
-                                }
-                            }
-                        }
                         let min_id = chunk.first().map(|(id, _, _)| *id).unwrap_or(0);
                         let max_id = chunk.last().map(|(id, _, _)| *id).unwrap_or(0);
                         new_volumes.push((
@@ -5717,22 +5771,21 @@ impl MVCCEngine {
                         ));
                     }
                     Err(e) => {
-                        eprintln!(
-                            "Warning: Failed to write compacted volume for {}: {}",
-                            table_name, e
-                        );
-                        write_failed = true;
+                        prepare_error = Some(e);
                         break;
                     }
                 }
             }
 
-            if write_failed || new_volumes.is_empty() {
+            if prepare_error.is_some() || new_volumes.is_empty() {
                 // Clean up any volumes we did write before failure
                 let vol_table_dir = vol_dir.join(table_name);
                 for (vid, _, _) in &new_volumes {
                     let fname = format!("vol_{:016x}.vol", vid);
                     let _ = std::fs::remove_file(vol_table_dir.join(fname));
+                }
+                if let Some(error) = prepare_error {
+                    return Err(error);
                 }
                 continue;
             }
@@ -5966,113 +6019,103 @@ impl MVCCEngine {
                 .read()
                 .map(|c| c.persistence.volume_compression)
                 .unwrap_or(true);
-            match crate::storage::volume::seal::seal_and_persist_multi(
+            let sealed_volumes = crate::storage::volume::seal::seal_and_persist_multi(
                 &schema,
                 &all_rows,
                 &vol_dir,
                 &table_name,
                 compress,
                 target_volume_rows,
-            ) {
-                Ok(sealed_volumes) => {
-                    // Pre-build unique hash indices BEFORE registration so the
-                    // first INSERT after seal doesn't pay a ~60ms stall scanning
-                    // all rows. Safe: volumes are not yet visible to other threads.
-                    {
-                        let stores = self.version_stores.read().unwrap();
-                        if let Some(store) = stores.get(&table_name) {
-                            for (col_indices, _) in store.get_unique_non_pk_index_columns() {
-                                for (vol, _, _) in &sealed_volumes {
-                                    vol.prebuild_unique_index(&col_indices);
-                                }
-                            }
+            )?;
+            // Pre-build unique hash indices BEFORE registration so the
+            // first INSERT after seal doesn't pay a ~60ms stall scanning
+            // all rows. Safe: volumes are not yet visible to other threads.
+            for (col_indices, _) in store.get_unique_non_pk_index_columns() {
+                for (vol, _, _) in &sealed_volumes {
+                    if let Err(error) = vol.prebuild_unique_index(&col_indices) {
+                        for (_, path, _) in &sealed_volumes {
+                            let _ = std::fs::remove_file(path);
                         }
-                    }
-                    let mgr = self.get_or_create_segment_manager(&table_name);
-
-                    // Seal critical section under exclusive fence: register cold
-                    // segments + remove hot rows + remove hot index entries.
-                    // DML operations hold the shared fence, so they cannot race
-                    // between cold constraint checks and hot publication.
-                    {
-                        let _seal_guard = mgr.acquire_seal_write();
-
-                        mgr.set_seal_overlap(total_rows);
-
-                        // Stamp seal_seq to reflect what data the volume contains:
-                        // - With cutoff: volume has rows committed before cutoff, so use cutoff
-                        // - Without cutoff: all committed rows, use current sequence
-                        // Compaction skips volumes with seal_seq >= min_snap_begin_seq.
-                        let current_seal_seq = per_table_cutoff
-                            .map(|s| s as u64)
-                            .unwrap_or_else(|| self.registry.get_current_sequence() as u64);
-                        for (volume, _path, volume_id) in &sealed_volumes {
-                            self.register_volume_with_id_and_seal_seq(
-                                &table_name,
-                                Arc::clone(volume),
-                                *volume_id,
-                                current_seal_seq,
-                            );
-                        }
-
-                        let mut index_cleanups = Vec::new();
-                        let mut all_skipped_inner: Vec<i64> = Vec::new();
-                        let all_row_ids: Vec<i64> = all_rows.iter().map(|(id, _)| *id).collect();
-                        for batch in all_row_ids.chunks(REMOVE_BATCH_SIZE) {
-                            let (removed, cleanup, skipped) =
-                                store.remove_sealed_rows(batch, &extraction_snapshot);
-                            store.subtract_committed_row_count(removed);
-                            index_cleanups.push(cleanup);
-                            all_skipped_inner.extend(skipped);
-                        }
-
-                        if !all_skipped_inner.is_empty() {
-                            let seal_seq = self.registry.get_current_sequence() as u64;
-                            mgr.add_tombstones(&all_skipped_inner, seal_seq);
-                        }
-
-                        if let Some(&(max_id, _)) = all_rows.last() {
-                            let current = store.get_auto_increment_counter();
-                            if max_id > current {
-                                store.set_auto_increment_counter(max_id);
-                            }
-                        }
-
-                        mgr.clear_seal_overlap();
-
-                        for cleanup in index_cleanups {
-                            store.remove_sealed_index_entries(cleanup, &all_rows);
-                        }
-
-                        // Clear tombstones for sealed row_ids INSIDE the fence.
-                        {
-                            let skip_set: FxHashSet<i64> =
-                                all_skipped_inner.iter().copied().collect();
-                            let ts = mgr.tombstone_set_arc();
-                            if !ts.is_empty() {
-                                let mut sealed_ids: FxHashSet<i64> = FxHashSet::default();
-                                for (vol, _, _) in &sealed_volumes {
-                                    for &rid in &vol.meta.row_ids {
-                                        if ts.contains_key(&rid) && !skip_set.contains(&rid) {
-                                            sealed_ids.insert(rid);
-                                        }
-                                    }
-                                }
-                                if !sealed_ids.is_empty() {
-                                    mgr.remove_tombstones_for_rows(&sealed_ids);
-                                }
-                            }
-                        }
-
-                        // _seal_guard dropped here — DML unblocked
+                        return Err(error.into());
                     }
                 }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to seal hot buffer for {}: {}",
-                        table_name, e
+            }
+            let mgr = self.get_or_create_segment_manager(&table_name);
+
+            // Seal critical section under exclusive fence: register cold
+            // segments + remove hot rows + remove hot index entries.
+            // DML operations hold the shared fence, so they cannot race
+            // between cold constraint checks and hot publication.
+            {
+                let _seal_guard = mgr.acquire_seal_write();
+
+                mgr.set_seal_overlap(total_rows);
+
+                // Stamp seal_seq to reflect what data the volume contains:
+                // - With cutoff: volume has rows committed before cutoff, so use cutoff
+                // - Without cutoff: all committed rows, use current sequence
+                // Compaction skips volumes with seal_seq >= min_snap_begin_seq.
+                let current_seal_seq = per_table_cutoff
+                    .map(|s| s as u64)
+                    .unwrap_or_else(|| self.registry.get_current_sequence() as u64);
+                for (volume, _path, volume_id) in &sealed_volumes {
+                    self.register_volume_with_id_and_seal_seq(
+                        &table_name,
+                        Arc::clone(volume),
+                        *volume_id,
+                        current_seal_seq,
                     );
                 }
+
+                let mut index_cleanups = Vec::new();
+                let mut all_skipped_inner: Vec<i64> = Vec::new();
+                let all_row_ids: Vec<i64> = all_rows.iter().map(|(id, _)| *id).collect();
+                for batch in all_row_ids.chunks(REMOVE_BATCH_SIZE) {
+                    let (removed, cleanup, skipped) =
+                        store.remove_sealed_rows(batch, &extraction_snapshot);
+                    store.subtract_committed_row_count(removed);
+                    index_cleanups.push(cleanup);
+                    all_skipped_inner.extend(skipped);
+                }
+
+                if !all_skipped_inner.is_empty() {
+                    let seal_seq = self.registry.get_current_sequence() as u64;
+                    mgr.add_tombstones(&all_skipped_inner, seal_seq);
+                }
+
+                if let Some(&(max_id, _)) = all_rows.last() {
+                    let current = store.get_auto_increment_counter();
+                    if max_id > current {
+                        store.set_auto_increment_counter(max_id);
+                    }
+                }
+
+                mgr.clear_seal_overlap();
+
+                for cleanup in index_cleanups {
+                    store.remove_sealed_index_entries(cleanup, &all_rows);
+                }
+
+                // Clear tombstones for sealed row_ids INSIDE the fence.
+                {
+                    let skip_set: FxHashSet<i64> = all_skipped_inner.iter().copied().collect();
+                    let ts = mgr.tombstone_set_arc();
+                    if !ts.is_empty() {
+                        let mut sealed_ids: FxHashSet<i64> = FxHashSet::default();
+                        for (vol, _, _) in &sealed_volumes {
+                            for &rid in &vol.meta.row_ids {
+                                if ts.contains_key(&rid) && !skip_set.contains(&rid) {
+                                    sealed_ids.insert(rid);
+                                }
+                            }
+                        }
+                        if !sealed_ids.is_empty() {
+                            mgr.remove_tombstones_for_rows(&sealed_ids);
+                        }
+                    }
+                }
+
+                // _seal_guard dropped here — DML unblocked
             }
         }
 
@@ -6266,8 +6309,7 @@ impl Engine for MVCCEngine {
 
     fn force_checkpoint_cycle(&self) -> Result<()> {
         MVCCEngine::checkpoint_cycle_inner(self, true)?;
-        self.compact_after_checkpoint_forced();
-        Ok(())
+        self.compact_after_checkpoint_forced()
     }
 
     fn create_snapshot(&self) -> Result<()> {

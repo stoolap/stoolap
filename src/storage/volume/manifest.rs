@@ -987,12 +987,12 @@ impl SegmentManager {
                     };
                     if cold.volume.is_cold() {
                         if let Some(vol) = self.ensure_volume(*seg_id)? {
-                            return Ok(Some(vol.columns[pi].get_value(idx)));
+                            return Ok(Some(vol.columns.get(pi)?.get_value(idx)));
                         }
                         return Ok(None);
                     }
                     cold.volume.mark_accessed();
-                    return Ok(Some(cold.volume.columns[pi].get_value(idx)));
+                    return Ok(Some(cold.volume.columns.get(pi)?.get_value(idx)));
                 }
             }
         }
@@ -1055,10 +1055,11 @@ impl SegmentManager {
                 _ => None,
             };
             if let Some(target) = target {
+                let col = vol.columns.get(pi)?;
                 if vol.is_sorted(pi) {
-                    let start = vol.columns[pi].binary_search_ge(target);
+                    let start = col.binary_search_ge(target);
                     let mut i = start;
-                    while i < vol.meta.row_count && vol.columns[pi].get_i64(i) == target {
+                    while i < vol.meta.row_count && col.get_i64(i) == target {
                         let rid = vol.meta.row_ids[i];
                         if seen.insert(rid) && !ts.contains_key(&rid) {
                             if seg_ids.len() > 1 {
@@ -1081,10 +1082,7 @@ impl SegmentManager {
                         if !seen.insert(rid) {
                             continue;
                         }
-                        if !vol.columns[pi].is_null(i)
-                            && vol.columns[pi].get_i64(i) == target
-                            && !ts.contains_key(&rid)
-                        {
+                        if !col.is_null(i) && col.get_i64(i) == target && !ts.contains_key(&rid) {
                             if seg_ids.len() > 1 {
                                 if let Some(current_val) =
                                     self.get_authoritative_value(seg_ids, segs, rid, col_idx)?
@@ -1268,23 +1266,23 @@ impl SegmentManager {
                     } else {
                         false
                     }
-                });
+                })?;
             } else {
                 // Schema-evolved volume: some columns missing (default matches).
                 // Check only the columns that exist in the volume.
-                let present_cols: Vec<(usize, usize)> = vol_col_indices
+                let present_cols: Vec<_> = vol_col_indices
                     .iter()
                     .enumerate()
                     .filter(|(_, &vi)| vi != usize::MAX)
-                    .map(|(i, &vi)| (i, vi))
-                    .collect();
+                    .map(|(i, &vi)| vol.columns.get(vi).map(|col| (i, col)))
+                    .collect::<std::io::Result<_>>()?;
                 for i in 0..vol.meta.row_count {
                     let rid = vol.meta.row_ids[i];
                     if ts.contains_key(&rid) || !seen.insert(rid) {
                         continue;
                     }
-                    let matches = present_cols.iter().all(|&(val_idx, ci)| {
-                        let v = vol.columns[ci].get_value(i);
+                    let matches = present_cols.iter().all(|&(val_idx, col)| {
+                        let v = col.get_value(i);
                         !v.is_null() && v == *values[val_idx]
                     });
                     if matches {
@@ -1949,13 +1947,13 @@ impl SegmentManager {
                 if let Ok(idx) = cold.volume.meta.row_ids.binary_search(&row_id) {
                     if cold.volume.is_cold() {
                         if let Some(vol) = self.ensure_volume(*seg_id)? {
-                            return Ok(Some(vol.get_row(idx)));
+                            return Ok(Some(vol.get_row(idx)?));
                         }
                         // Segment removed by compaction — retry with fresh state.
                         return self.get_cold_row_retry(row_id);
                     }
                     cold.volume.mark_accessed();
-                    return Ok(Some(cold.volume.get_row(idx)));
+                    return Ok(Some(cold.volume.get_row(idx)?));
                 }
             }
         }
@@ -1989,7 +1987,7 @@ impl SegmentManager {
                         });
                     }
                     cold.volume.mark_accessed();
-                    return Ok(Some(cold.volume.get_row(idx)));
+                    return Ok(Some(cold.volume.get_row(idx)?));
                 }
             }
         }
@@ -2041,9 +2039,9 @@ impl SegmentManager {
                     };
                     let mapping = self.get_volume_mapping(*seg_id, schema);
                     if mapping.is_identity {
-                        return Ok(Some(vol.get_row(idx)));
+                        return Ok(Some(vol.get_row(idx)?));
                     }
-                    return Ok(Some(vol.get_row_mapped(idx, &mapping)));
+                    return Ok(Some(vol.get_row_mapped(idx, &mapping)?));
                 }
             }
         }
@@ -2083,9 +2081,9 @@ impl SegmentManager {
                     cold.volume.mark_accessed();
                     let mapping = self.get_volume_mapping(*seg_id, schema);
                     if mapping.is_identity {
-                        return Ok(Some(cold.volume.get_row(idx)));
+                        return Ok(Some(cold.volume.get_row(idx)?));
                     }
-                    return Ok(Some(cold.volume.get_row_mapped(idx, &mapping)));
+                    return Ok(Some(cold.volume.get_row_mapped(idx, &mapping)?));
                 }
             }
         }
@@ -3152,7 +3150,7 @@ mod tests {
         {
             let vols = mgr.get_volumes_newest_first().unwrap();
             let (_, cs) = &vols[0];
-            let row = cs.volume.get_row(0);
+            let row = cs.volume.get_row(0).unwrap();
             assert_eq!(row[0], Value::Integer(1));
         }
 
@@ -3208,7 +3206,7 @@ mod tests {
         {
             let vols = mgr.get_volumes_newest_first().unwrap();
             let (_, cs) = &vols[0];
-            let row = cs.volume.get_row(49);
+            let row = cs.volume.get_row(49).unwrap();
             assert_eq!(row[0], Value::Integer(50));
         }
 
@@ -3393,7 +3391,7 @@ mod tests {
         let vols = snap.volumes_newest_first();
         assert_eq!(vols.len(), 1, "snapshot must not lose its segment");
         assert_eq!(vols[0].0, 1);
-        assert_eq!(vols[0].1.volume.get_row(0)[0], Value::Integer(1));
+        assert_eq!(vols[0].1.volume.get_row(0).unwrap()[0], Value::Integer(1));
     }
     #[test]
     fn test_unique_lookup_uses_statement_snapshot_not_live_state() {

@@ -1051,7 +1051,7 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     let mut shared_dict: Vec<SmartString> = Vec::new();
     let mut dict_counts: Vec<u32> = Vec::new();
     for i in 0..col_count {
-        if let ColumnData::Dictionary { dictionary, .. } = &vol.columns[i] {
+        if let ColumnData::Dictionary { dictionary, .. } = vol.columns.get(i)? {
             dict_counts.push(dictionary.len() as u32);
             shared_dict.extend(dictionary.iter().cloned());
         }
@@ -1060,7 +1060,7 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     // Column directory: type(1) + flags(1) + extra(4) per column
     let mut dict_col_idx = 0usize;
     for i in 0..col_count {
-        let col = &vol.columns[i];
+        let col = vol.columns.get(i)?;
         let type_tag = match col {
             ColumnData::Int64 { .. } => COL_INT64,
             ColumnData::Float64 { .. } => COL_FLOAT64,

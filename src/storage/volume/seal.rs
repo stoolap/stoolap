@@ -165,8 +165,8 @@ mod tests {
 
         let volume = seal_rows(&schema, &rows);
         assert_eq!(volume.meta.row_count, 3);
-        assert_eq!(volume.columns[0].get_i64(0), 1);
-        assert_eq!(volume.columns[1].get_str(2), "carol");
+        assert_eq!(volume.columns.get(0).unwrap().get_i64(0), 1);
+        assert_eq!(volume.columns.get(1).unwrap().get_str(2), "carol");
         assert!(volume.is_sorted(0)); // id is sorted
     }
 
@@ -199,7 +199,7 @@ mod tests {
         // Read it back
         let loaded = io::read_volume_from_disk(&path).unwrap();
         assert_eq!(loaded.meta.row_count, 2);
-        assert_eq!(loaded.columns[0].get_i64(0), 1);
+        assert_eq!(loaded.columns.get(0).unwrap().get_i64(0), 1);
         assert_eq!(loaded.meta.stats.sum(1), 30.0);
     }
 }

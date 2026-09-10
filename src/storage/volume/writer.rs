@@ -112,7 +112,7 @@ impl CompressedBlockStore {
         columns: &LazyColumns,
         col_data_types: &[DataType],
         row_count: usize,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         Self::compress_columns_opts(columns, col_data_types, row_count, true)
     }
 
@@ -124,7 +124,7 @@ impl CompressedBlockStore {
         col_data_types: &[DataType],
         row_count: usize,
         compress: bool,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let group_size = ROW_GROUP_SIZE;
         let col_count = columns.len();
         let num_groups = if row_count == 0 {
@@ -141,7 +141,7 @@ impl CompressedBlockStore {
         let mut col_ext_types = Vec::with_capacity(col_count);
 
         for col_idx in 0..col_count {
-            let col = &columns[col_idx];
+            let col = columns.get(col_idx)?;
             let type_tag = match col {
                 ColumnData::Int64 { .. } => super::format::COL_INT64,
                 ColumnData::Float64 { .. } => super::format::COL_FLOAT64,
@@ -191,8 +191,8 @@ impl CompressedBlockStore {
             use rayon::prelude::*;
             let results: Vec<(Vec<Vec<u8>>, Vec<usize>)> = (0..col_count)
                 .into_par_iter()
-                .map(|col_idx| compress_blocks(&columns[col_idx]))
-                .collect();
+                .map(|col_idx| columns.get(col_idx).map(compress_blocks))
+                .collect::<std::io::Result<_>>()?;
             let mut all_blocks = Vec::with_capacity(col_count);
             let mut all_decomp_lens = Vec::with_capacity(col_count);
             for (blocks, lens) in results {
@@ -207,7 +207,7 @@ impl CompressedBlockStore {
             let mut all_blocks = Vec::with_capacity(col_count);
             let mut all_decomp_lens = Vec::with_capacity(col_count);
             for col_idx in 0..col_count {
-                let (blocks, lens) = compress_blocks(&columns[col_idx]);
+                let (blocks, lens) = compress_blocks(columns.get(col_idx)?);
                 all_blocks.push(blocks);
                 all_decomp_lens.push(lens);
             }
@@ -218,7 +218,7 @@ impl CompressedBlockStore {
             .iter()
             .map(|(ci, start, end)| (*ci, Arc::from(&shared_dict[*start..*end])))
             .collect();
-        Self {
+        Ok(Self {
             blocks: all_blocks,
             decompressed_lens: all_decomp_lens,
             col_type_tags,
@@ -228,7 +228,7 @@ impl CompressedBlockStore {
             group_size,
             row_count,
             id: next_store_id(),
-        }
+        })
     }
 
     /// Build a CompressedBlockStore from pre-compressed blocks (V4 file read).
@@ -889,14 +889,14 @@ impl CompressedBlockStore {
 }
 
 // =============================================================================
-// LazyColumns: per-column OnceLock with transparent Index<usize> access
+// LazyColumns: cached, fallible whole-column access
 // =============================================================================
 
 /// Column storage that decompresses from CompressedBlockStore on first access.
 /// After OnceLock init, subsequent access is a pointer dereference (free).
 pub struct LazyColumns {
     /// Per-column OnceLock slots. Empty until first access.
-    slots: Vec<OnceLock<ColumnData>>,
+    slots: Vec<OnceLock<std::io::Result<ColumnData>>>,
     /// Compressed backing store. None for eagerly-loaded columns.
     /// Wrapped in Arc so warm-tier volumes can share the store cheaply.
     compressed_store: Option<Arc<CompressedBlockStore>>,
@@ -912,11 +912,11 @@ impl LazyColumns {
     /// Create from pre-loaded columns (VolumeBuilder::finish(), V4 eager load).
     /// All OnceLock slots are pre-initialized. No compressed store.
     pub fn eager(columns: Vec<ColumnData>, col_data_types: Vec<DataType>) -> Self {
-        let slots: Vec<OnceLock<ColumnData>> = columns
+        let slots = columns
             .into_iter()
             .map(|col| {
                 let cell = OnceLock::new();
-                let _ = cell.set(col);
+                let _ = cell.set(Ok(col));
                 cell
             })
             .collect();
@@ -958,8 +958,7 @@ impl LazyColumns {
     }
 
     /// Create columns with only data types (for cold-tier volumes).
-    /// No columns, no compressed store. Column access will panic;
-    /// the volume must be reloaded from disk before scanning.
+    /// The volume must be reloaded from disk before column access.
     pub fn metadata_only(col_data_types: Vec<DataType>) -> Self {
         let col_count = col_data_types.len();
         Self {
@@ -1028,7 +1027,7 @@ impl LazyColumns {
         }
         // Loaded (decompressed) columns
         for slot in &self.slots {
-            if let Some(col) = slot.get() {
+            if let Some(Ok(col)) = slot.get() {
                 size += col.memory_size();
             }
         }
@@ -1052,19 +1051,32 @@ impl LazyColumns {
     /// Return the dictionary for a dictionary-encoded column without
     /// decompressing column data. Checks loaded OnceLock slots first,
     /// then falls back to the CompressedBlockStore's pre-built dictionary.
-    /// Returns None for non-dictionary columns or cold-tier volumes.
-    pub fn get_column_dictionary(&self, col_idx: usize) -> Option<Arc<[SmartString]>> {
+    /// Returns None for non-dictionary columns and propagates cached failures.
+    pub fn get_column_dictionary(
+        &self,
+        col_idx: usize,
+    ) -> std::io::Result<Option<Arc<[SmartString]>>> {
+        let slot = self.slots.get(col_idx).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "column index out of range",
+            )
+        })?;
         // Fast path: column already loaded in OnceLock
-        if let Some(col) = self.slots.get(col_idx).and_then(|s| s.get()) {
+        if let Some(col) = slot.get() {
+            let col = col
+                .as_ref()
+                .map_err(|e| std::io::Error::new(e.kind(), e.to_string()))?;
             if let ColumnData::Dictionary { dictionary, .. } = col {
-                return Some(Arc::clone(dictionary));
+                return Ok(Some(Arc::clone(dictionary)));
             }
-            return None;
+            return Ok(None);
         }
         // Slow path: extract from compressed store without decompressing
-        self.compressed_store
-            .as_ref()
-            .and_then(|store| store.get_column_dictionary(col_idx).cloned())
+        let store = self.compressed_store.as_ref().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
+        })?;
+        Ok(store.get_column_dictionary(col_idx).cloned())
     }
 
     /// Access the compressed store (for V4 write).
@@ -1077,57 +1089,53 @@ impl LazyColumns {
         self.compressed_store.as_ref()
     }
 
-    /// Take ownership of all loaded columns, consuming the LazyColumns.
-    /// Used by compress_and_release to avoid cloning.
-    pub fn take_columns(self) -> Vec<ColumnData> {
+    /// Decode and take ownership of every column, consuming the LazyColumns.
+    pub fn take_columns(self) -> std::io::Result<Vec<ColumnData>> {
+        for idx in 0..self.len() {
+            self.get(idx)?;
+        }
         let mut result = Vec::with_capacity(self.slots.len());
         for slot in self.slots {
             if let Some(col) = slot.into_inner() {
-                result.push(col);
+                result.push(col?);
             }
         }
-        result
+        Ok(result)
     }
-}
 
-impl std::ops::Index<usize> for LazyColumns {
-    type Output = ColumnData;
-
+    /// Borrow a column, caching both successful decodes and failures.
     #[inline]
-    fn index(&self, idx: usize) -> &ColumnData {
+    pub fn get(&self, idx: usize) -> std::io::Result<&ColumnData> {
+        let slot = self.slots.get(idx).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "column index out of range",
+            )
+        })?;
         // Fast path: already initialized
-        if let Some(col) = self.slots[idx].get() {
-            return col;
+        if let Some(Ok(col)) = slot.get() {
+            return Ok(col);
         }
-        // Slow path: decompress on first access via get_or_init (runs closure
-        // exactly once per slot, even under concurrent access).
+        self.load_column(idx)
+    }
+
+    #[cold]
+    fn load_column(&self, idx: usize) -> std::io::Result<&ColumnData> {
         let col = self.slots[idx].get_or_init(|| {
-            self.compressed_store
-                .as_ref()
-                .map(|store| {
-                    store
-                        .decompress_column(idx)
-                        .unwrap_or_else(|e| panic!("corrupt V4 column: col={idx}: {e}"))
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "BUG: column {} accessed on cold volume (no compressed store). \
-                         A caller is missing is_cold() check before column access. \
-                         Run with RUST_BACKTRACE=1 to find the caller.",
-                        idx
-                    )
-                })
+            let store = self.compressed_store.as_ref().ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
+            })?;
+            store.decompress_column(idx)
         });
-        // Check if all slots are now populated. This is O(C) where C = column
-        // count, but only runs on the slow path (first access per column).
-        // Avoids the loaded_count race where concurrent threads double-increment.
+        // Promote only after every column has decoded successfully.
         if !self.is_eager.load(std::sync::atomic::Ordering::Relaxed)
-            && self.slots.iter().all(|s| s.get().is_some())
+            && self.slots.iter().all(|s| matches!(s.get(), Some(Ok(_))))
         {
             self.is_eager
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        col
+        col.as_ref()
+            .map_err(|e| std::io::Error::new(e.kind(), e.to_string()))
     }
 }
 
@@ -1138,11 +1146,11 @@ pub struct LazyColumnsIter<'a> {
 }
 
 impl<'a> Iterator for LazyColumnsIter<'a> {
-    type Item = &'a ColumnData;
+    type Item = std::io::Result<&'a ColumnData>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.idx < self.columns.len() {
-            let col = &self.columns[self.idx];
+            let col = self.columns.get(self.idx);
             self.idx += 1;
             Some(col)
         } else {
@@ -1159,7 +1167,7 @@ impl<'a> Iterator for LazyColumnsIter<'a> {
 impl ExactSizeIterator for LazyColumnsIter<'_> {}
 
 impl<'a> IntoIterator for &'a LazyColumns {
-    type Item = &'a ColumnData;
+    type Item = std::io::Result<&'a ColumnData>;
     type IntoIter = LazyColumnsIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -1237,12 +1245,10 @@ pub struct FrozenVolume {
     pub meta: Arc<VolumeMeta>,
     /// Per-volume unique index: lazily built, never invalidated (volume is immutable).
     /// Key: sorted column indices for a UNIQUE constraint.
-    /// Value: sorted Vec of (hash, row_idx) pairs -- binary search for lookup.
-    /// Uses 12 bytes per entry vs ~80 bytes for FxHashMap<u64, Vec<u32>>, and
-    /// zero tiny heap allocations (single contiguous allocation).
+    /// Value: shared sorted (hash, row_idx) pairs, 16 bytes per entry.
     #[allow(clippy::type_complexity)]
     pub unique_indices:
-        Arc<parking_lot::RwLock<rustc_hash::FxHashMap<Vec<usize>, Vec<(u64, u32)>>>>,
+        Arc<parking_lot::RwLock<rustc_hash::FxHashMap<Vec<usize>, Arc<Vec<(u64, u32)>>>>>,
     /// Access epoch counter. Bumped per scan for eviction tracking.
     pub last_access_epoch: std::sync::atomic::AtomicU64,
 }
@@ -1801,16 +1807,15 @@ pub fn compute_column_mapping_with_drops(
 impl FrozenVolume {
     /// Get a row using a precomputed column mapping.
     /// Materializes all schema columns through the mapping.
-    pub fn get_row_mapped(&self, idx: usize, mapping: &ColumnMapping) -> Row {
-        let values: Vec<Value> = mapping
-            .sources
-            .iter()
-            .map(|src| match src {
-                ColSource::Volume(vol_idx) => self.columns[*vol_idx].get_value(idx),
+    pub fn get_row_mapped(&self, idx: usize, mapping: &ColumnMapping) -> std::io::Result<Row> {
+        let mut values = Vec::with_capacity(mapping.sources.len());
+        for src in &mapping.sources {
+            values.push(match src {
+                ColSource::Volume(vol_idx) => self.columns.get(*vol_idx)?.get_value(idx),
                 ColSource::Default(val) => val.clone(),
-            })
-            .collect();
-        Row::from_values(values)
+            });
+        }
+        Ok(Row::from_values(values))
     }
 
     /// Get specific columns of a row using a precomputed column mapping.
@@ -1820,15 +1825,15 @@ impl FrozenVolume {
         idx: usize,
         mapping: &ColumnMapping,
         col_indices: &[usize],
-    ) -> Row {
-        let values: Vec<Value> = col_indices
-            .iter()
-            .map(|&ci| match &mapping.sources[ci] {
-                ColSource::Volume(vol_idx) => self.columns[*vol_idx].get_value(idx),
+    ) -> std::io::Result<Row> {
+        let mut values = Vec::with_capacity(col_indices.len());
+        for &ci in col_indices {
+            values.push(match &mapping.sources[ci] {
+                ColSource::Volume(vol_idx) => self.columns.get(*vol_idx)?.get_value(idx),
                 ColSource::Default(val) => val.clone(),
-            })
-            .collect();
-        Row::from_values(values)
+            });
+        }
+        Ok(Row::from_values(values))
     }
 
     /// Get a row materializing only columns marked true in the mask.
@@ -1836,17 +1841,16 @@ impl FrozenVolume {
     /// The row has full schema width so filter column indices work.
     /// Uses LazyColumns::data_type() for unneeded columns to avoid decompression.
     #[inline]
-    pub fn get_row_needed(&self, idx: usize, needed: &[bool]) -> Row {
-        let values: Vec<Value> = (0..self.columns.len())
-            .map(|ci| {
-                if ci < needed.len() && needed[ci] {
-                    self.columns[ci].get_value(idx)
-                } else {
-                    Value::Null(self.columns.data_type(ci))
-                }
-            })
-            .collect();
-        Row::from_values(values)
+    pub fn get_row_needed(&self, idx: usize, needed: &[bool]) -> std::io::Result<Row> {
+        let mut values = Vec::with_capacity(self.columns.len());
+        for ci in 0..self.columns.len() {
+            values.push(if ci < needed.len() && needed[ci] {
+                self.columns.get(ci)?.get_value(idx)
+            } else {
+                Value::Null(self.columns.data_type(ci))
+            });
+        }
+        Ok(Row::from_values(values))
     }
 
     /// Get a row using a mapping, materializing only needed columns.
@@ -1858,41 +1862,40 @@ impl FrozenVolume {
         idx: usize,
         mapping: &ColumnMapping,
         needed: &[bool],
-    ) -> Row {
-        let values: Vec<Value> = mapping
-            .sources
-            .iter()
-            .enumerate()
-            .map(|(ci, src)| {
-                if ci < needed.len() && needed[ci] {
-                    match src {
-                        ColSource::Volume(vol_idx) => self.columns[*vol_idx].get_value(idx),
-                        ColSource::Default(val) => val.clone(),
-                    }
-                } else {
-                    match src {
-                        ColSource::Volume(vol_idx) => Value::Null(self.columns.data_type(*vol_idx)),
-                        ColSource::Default(val) => Value::Null(val.data_type()),
-                    }
+    ) -> std::io::Result<Row> {
+        let mut values = Vec::with_capacity(mapping.sources.len());
+        for (ci, src) in mapping.sources.iter().enumerate() {
+            values.push(if ci < needed.len() && needed[ci] {
+                match src {
+                    ColSource::Volume(vol_idx) => self.columns.get(*vol_idx)?.get_value(idx),
+                    ColSource::Default(val) => val.clone(),
                 }
-            })
-            .collect();
-        Row::from_values(values)
+            } else {
+                match src {
+                    ColSource::Volume(vol_idx) => Value::Null(self.columns.data_type(*vol_idx)),
+                    ColSource::Default(val) => Value::Null(val.data_type()),
+                }
+            });
+        }
+        Ok(Row::from_values(values))
     }
 
     /// Get a row as a Vec of Values (for executor compatibility).
-    pub fn get_row(&self, idx: usize) -> Row {
-        let values: Vec<Value> = self.columns.iter().map(|col| col.get_value(idx)).collect();
-        Row::from_values(values)
+    pub fn get_row(&self, idx: usize) -> std::io::Result<Row> {
+        let mut values = Vec::with_capacity(self.columns.len());
+        for col in &self.columns {
+            values.push(col?.get_value(idx));
+        }
+        Ok(Row::from_values(values))
     }
 
     /// Get specific columns of a row (projection pushdown).
-    pub fn get_row_projected(&self, idx: usize, col_indices: &[usize]) -> Row {
-        let values: Vec<Value> = col_indices
-            .iter()
-            .map(|&col| self.columns[col].get_value(idx))
-            .collect();
-        Row::from_values(values)
+    pub fn get_row_projected(&self, idx: usize, col_indices: &[usize]) -> std::io::Result<Row> {
+        let mut values = Vec::with_capacity(col_indices.len());
+        for &col in col_indices {
+            values.push(self.columns.get(col)?.get_value(idx));
+        }
+        Ok(Row::from_values(values))
     }
 
     /// Check if a column is sorted (enables binary search).
@@ -1914,12 +1917,8 @@ impl FrozenVolume {
         col_indices: &[usize],
         values: &[&Value],
         mut f: impl FnMut(u32) -> bool, // return true to stop early
-    ) {
+    ) -> std::io::Result<()> {
         use std::hash::{Hash, Hasher};
-
-        if col_indices.iter().any(|&idx| idx >= self.columns.len()) {
-            return;
-        }
 
         // Compute hash of query values
         let mut hasher = ahash::AHasher::default();
@@ -1928,89 +1927,73 @@ impl FrozenVolume {
         }
         let hash = hasher.finish();
 
-        // Fast path: check if index is already built
-        {
+        let cached = {
             let indices = self.unique_indices.read();
-            if let Some(sorted_idx) = indices.get(col_indices) {
-                // Binary search for the hash, then scan all entries with same hash
-                let pos = sorted_idx.partition_point(|&(h, _)| h < hash);
-                for &(h, row_idx) in &sorted_idx[pos..] {
-                    if h != hash {
-                        break;
-                    }
-                    let matches = col_indices.iter().zip(values.iter()).all(|(&ci, &val)| {
-                        let vol_val = self.columns[ci].get_value(row_idx as usize);
-                        !vol_val.is_null() && vol_val == *val
-                    });
-                    if matches && f(row_idx) {
-                        return;
-                    }
+            if let Some(entries) = indices.get(col_indices) {
+                let pos = entries.partition_point(|&(h, _)| h < hash);
+                if entries.get(pos).is_none_or(|&(h, _)| h != hash) {
+                    return Ok(());
                 }
-                return;
+                Some((Arc::clone(entries), pos))
+            } else {
+                None
             }
-        }
-
-        // Build sorted index for this column set (first use)
-        let mut entries: Vec<(u64, u32)> = Vec::with_capacity(self.meta.row_count);
-        for row_idx in 0..self.meta.row_count {
-            let mut row_hasher = ahash::AHasher::default();
-            let mut has_null = false;
-            for &ci in col_indices {
-                if self.columns[ci].is_null(row_idx) {
-                    has_null = true;
-                    break;
-                }
-                self.columns[ci].get_value(row_idx).hash(&mut row_hasher);
+        };
+        let (entries, pos) = match cached {
+            Some(cached) => cached,
+            None => {
+                let entries = self.unique_index(col_indices)?;
+                let pos = entries.partition_point(|&(h, _)| h < hash);
+                (entries, pos)
             }
-            if has_null {
-                continue;
-            }
-            entries.push((row_hasher.finish(), row_idx as u32));
-        }
-        entries.sort_unstable_by_key(|&(h, _)| h);
-
-        // Look up before storing
-        let pos = entries.partition_point(|&(h, _)| h < hash);
+        };
         for &(h, row_idx) in &entries[pos..] {
             if h != hash {
                 break;
             }
-            let matches = col_indices.iter().zip(values.iter()).all(|(&ci, &val)| {
-                let vol_val = self.columns[ci].get_value(row_idx as usize);
-                !vol_val.is_null() && vol_val == *val
-            });
+            let mut matches = true;
+            for (&ci, &val) in col_indices.iter().zip(values) {
+                let vol_val = self.columns.get(ci)?.get_value(row_idx as usize);
+                if vol_val.is_null() || vol_val != *val {
+                    matches = false;
+                    break;
+                }
+            }
             if matches && f(row_idx) {
                 break;
             }
         }
 
-        // Store the built index
-        self.unique_indices
-            .write()
-            .insert(col_indices.to_vec(), entries);
+        Ok(())
     }
 
     /// Pre-build the unique sorted index for a set of column indices.
     /// Called during seal/compaction so the first INSERT after seal doesn't
     /// pay a ~60ms stall scanning all rows to build the index.
-    pub fn prebuild_unique_index(&self, col_indices: &[usize]) {
+    pub fn prebuild_unique_index(&self, col_indices: &[usize]) -> std::io::Result<()> {
+        self.unique_index(col_indices).map(|_| ())
+    }
+
+    fn unique_index(&self, col_indices: &[usize]) -> std::io::Result<Arc<Vec<(u64, u32)>>> {
         use std::hash::{Hash, Hasher};
-        if col_indices.iter().any(|&idx| idx >= self.columns.len()) {
-            return;
+        let cached = self.unique_indices.read().get(col_indices).cloned();
+        if let Some(entries) = cached {
+            return Ok(entries);
         }
-        if self.unique_indices.read().contains_key(col_indices) {
-            return;
-        }
+        let columns = col_indices
+            .iter()
+            .map(|&ci| self.columns.get(ci))
+            .collect::<std::io::Result<smallvec::SmallVec<[&ColumnData; 4]>>>()?;
         let mut entries: Vec<(u64, u32)> = Vec::with_capacity(self.meta.row_count);
         for row_idx in 0..self.meta.row_count {
             let mut row_hasher = ahash::AHasher::default();
             let mut has_null = false;
-            for &ci in col_indices {
-                if self.columns[ci].is_null(row_idx) {
+            for &col in &columns {
+                if col.is_null(row_idx) {
                     has_null = true;
                     break;
                 }
-                self.columns[ci].get_value(row_idx).hash(&mut row_hasher);
+                col.get_value(row_idx).hash(&mut row_hasher);
             }
             if has_null {
                 continue;
@@ -2018,9 +2001,14 @@ impl FrozenVolume {
             entries.push((row_hasher.finish(), row_idx as u32));
         }
         entries.sort_unstable_by_key(|&(h, _)| h);
-        self.unique_indices
+        let entries = Arc::new(entries);
+        let key = col_indices.to_vec();
+        let replaced = self
+            .unique_indices
             .write()
-            .insert(col_indices.to_vec(), entries);
+            .insert(key, Arc::clone(&entries));
+        drop(replaced);
+        Ok(entries)
     }
 
     /// Find the column index by name. O(1) via precomputed hashmap.
@@ -2050,8 +2038,11 @@ impl FrozenVolume {
     /// Return the dictionary for a dictionary-encoded column.
     /// Avoids decompressing the full column — extracts from the shared
     /// dictionary stored in the compressed block store or OnceLock slot.
-    /// Returns None for non-dictionary columns or cold-tier volumes.
-    pub fn get_column_dictionary(&self, col_idx: usize) -> Option<Arc<[SmartString]>> {
+    /// Returns None for non-dictionary columns and propagates cached failures.
+    pub fn get_column_dictionary(
+        &self,
+        col_idx: usize,
+    ) -> std::io::Result<Option<Arc<[SmartString]>>> {
         self.columns.get_column_dictionary(col_idx)
     }
 
@@ -2172,18 +2163,18 @@ mod tests {
         assert_eq!(volume.meta.stats.count_star(), 3);
 
         // Check typed access
-        assert_eq!(volume.columns[0].get_i64(0), 1);
-        assert_eq!(volume.columns[0].get_i64(2), 3);
-        assert_eq!(volume.columns[3].get_f64(1), 101.5);
+        assert_eq!(volume.columns.get(0).unwrap().get_i64(0), 1);
+        assert_eq!(volume.columns.get(0).unwrap().get_i64(2), 3);
+        assert_eq!(volume.columns.get(3).unwrap().get_f64(1), 101.5);
 
         // Check dictionary encoding
-        assert_eq!(volume.columns[2].get_str(0), "binance");
-        assert_eq!(volume.columns[2].get_str(1), "coinbase");
-        assert_eq!(volume.columns[2].get_str(2), "binance");
+        assert_eq!(volume.columns.get(2).unwrap().get_str(0), "binance");
+        assert_eq!(volume.columns.get(2).unwrap().get_str(1), "coinbase");
+        assert_eq!(volume.columns.get(2).unwrap().get_str(2), "binance");
         // binance appears twice but uses same dict ID
         assert_eq!(
-            volume.columns[2].get_dict_id(0),
-            volume.columns[2].get_dict_id(2)
+            volume.columns.get(2).unwrap().get_dict_id(0),
+            volume.columns.get(2).unwrap().get_dict_id(2)
         );
 
         // Check zone maps
@@ -2200,7 +2191,7 @@ mod tests {
         assert!(volume.is_sorted(1)); // time is sorted
 
         // Check row reconstruction
-        let row = volume.get_row(0);
+        let row = volume.get_row(0).unwrap();
         assert_eq!(row.get(0), Some(&Value::Integer(1)));
         assert_eq!(row.get(2), Some(&Value::text("binance")));
     }
@@ -2221,11 +2212,11 @@ mod tests {
         );
 
         let volume = builder.finish();
-        assert!(volume.columns[1].is_null(0));
-        assert!(volume.columns[3].is_null(0));
-        assert!(!volume.columns[0].is_null(0));
+        assert!(volume.columns.get(1).unwrap().is_null(0));
+        assert!(volume.columns.get(3).unwrap().is_null(0));
+        assert!(!volume.columns.get(0).unwrap().is_null(0));
 
-        let row = volume.get_row(0);
+        let row = volume.get_row(0).unwrap();
         assert_eq!(row.get(0), Some(&Value::Integer(1)));
         assert!(row.get(1).unwrap().is_null());
     }
@@ -2252,7 +2243,11 @@ mod tests {
             ts.timestamp_nanos_opt()
                 .unwrap_or(ts.timestamp() * 1_000_000_000)
         };
-        let idx = volume.columns[0].binary_search_ge(target_nanos);
+        let idx = volume
+            .columns
+            .get(0)
+            .unwrap()
+            .binary_search_ge(target_nanos);
         assert_eq!(idx, 50);
     }
 
@@ -2274,7 +2269,7 @@ mod tests {
         let volume = builder.finish();
 
         // Project only id and price (columns 0 and 3)
-        let row = volume.get_row_projected(0, &[0, 3]);
+        let row = volume.get_row_projected(0, &[0, 3]).unwrap();
         assert_eq!(row.len(), 2);
         assert_eq!(row.get(0), Some(&Value::Integer(1)));
         assert_eq!(row.get(1), Some(&Value::Float(100.0)));
