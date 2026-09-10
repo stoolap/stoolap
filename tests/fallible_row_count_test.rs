@@ -145,6 +145,82 @@ fn exact_counts_include_transaction_local_rows() {
     );
 }
 
+fn assert_sum_reload_failure(aggregate: impl Fn(&SegmentedTable) -> String) {
+    let dir = tempfile::tempdir().unwrap();
+    let (table, path) = cold_table(dir.path(), false);
+    table.segment_manager().add_tombstones(&[1], 1);
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    for _ in 0..2 {
+        let expected = table
+            .segment_manager()
+            .get_volumes_newest_first()
+            .map(|_| Some((0.0, 0_usize)));
+        assert!(expected
+            .as_ref()
+            .unwrap_err()
+            .to_string()
+            .contains("cold volume reload failed"));
+        assert_eq!(aggregate(&table), format!("{expected:?}"));
+    }
+    std::fs::write(&path, bytes).unwrap();
+    let restored = aggregate(&table);
+    assert!(restored == "Some((20.0, 1))" || restored == "Ok(Some((20.0, 1)))");
+}
+
+#[test]
+fn sum_propagates_cold_reload_failure() {
+    assert_sum_reload_failure(|table| format!("{:?}", table.sum_column(1)));
+}
+
+#[test]
+fn avg_propagates_cold_reload_failure() {
+    assert_sum_reload_failure(|table| format!("{:?}", table.avg_column(1)));
+}
+
+#[test]
+fn sum_and_avg_use_resident_stats_without_reloading() {
+    let dir = tempfile::tempdir().unwrap();
+    let (table, path) = cold_table(dir.path(), false);
+    std::fs::remove_file(&path).unwrap();
+    for result in [
+        format!("{:?}", table.sum_column(1)),
+        format!("{:?}", table.avg_column(1)),
+    ] {
+        assert!(result == "Some((30.0, 2))" || result == "Ok(Some((30.0, 2)))");
+    }
+    assert!(table.segment_manager().segments_raw()[&1].volume.is_cold());
+}
+
+#[test]
+fn sum_and_avg_preserve_local_rows_and_wrapped_expressions() {
+    let db =
+        Database::open("memory://sum_and_avg_preserve_local_rows_and_wrapped_expressions").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
+        .unwrap();
+    let mut tx = db.begin().unwrap();
+    tx.execute("INSERT INTO t VALUES (3, 30)", ()).unwrap();
+    for (query, expected) in [
+        ("SELECT SUM(v) FROM t", 60.0),
+        ("SELECT AVG(v) FROM t", 20.0),
+        ("SELECT SUM(v) + 1 FROM t", 61.0),
+        ("SELECT AVG(v) * 2 FROM t", 40.0),
+    ] {
+        assert_eq!(tx.query_one::<f64, _>(query, ()).unwrap(), expected);
+    }
+    tx.rollback().unwrap();
+    for (query, expected) in [
+        ("SELECT SUM(v) FROM t", 30.0),
+        ("SELECT AVG(v) FROM t", 15.0),
+        ("SELECT SUM(v) + 1 FROM t", 31.0),
+        ("SELECT AVG(v) * 2 FROM t", 30.0),
+    ] {
+        assert_eq!(db.query_one::<f64, _>(query, ()).unwrap(), expected);
+    }
+}
+
 #[test]
 fn prepared_count_tracks_committed_changes() {
     let db = Database::open("memory://prepared_count_tracks_committed_changes").unwrap();

@@ -4671,16 +4671,16 @@ impl Table for MVCCTable {
             .get_segments_to_scan(column, operator, value)
     }
 
-    fn sum_column(&self, col_idx: usize) -> Option<(f64, usize)> {
+    fn sum_column(&self, col_idx: usize) -> Result<Option<(f64, usize)>> {
         // Only use deferred aggregation if no uncommitted local changes
         // (local changes are in txn_versions, not the main version_store)
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
-            return None;
+            return Ok(None);
         }
         drop(txn_versions);
 
-        Some(self.version_store.sum_column(self.txn_id, col_idx))
+        Ok(Some(self.version_store.sum_column(self.txn_id, col_idx)))
     }
 
     fn min_column(&self, col_idx: usize) -> Option<Option<Value>> {

@@ -2472,25 +2472,27 @@ impl Table for SegmentedTable {
     // Aggregation pushdown
     // =========================================================================
 
-    fn sum_column(&self, col_idx: usize) -> Option<(f64, usize)> {
+    fn sum_column(&self, col_idx: usize) -> Result<Option<(f64, usize)>> {
         // Snapshot isolation: cold aggregation uses tombstones without snapshot
         // filtering. Bail so the executor falls back to full scan.
         if self.snapshot_seq.is_some() {
-            return None;
+            return Ok(None);
         }
         let _seal_guard = self.segment_mgr.acquire_seal_read();
-        let hot_result = self.hot.sum_column(col_idx);
+        let hot_result = self.hot.sum_column(col_idx)?;
 
         if !self.segment_mgr.has_segments() {
-            return hot_result;
+            return Ok(hot_result);
         }
 
         // During seal, hot+cold overlap — can't reliably sum
         if self.segment_mgr.seal_overlap() > 0 {
-            return None;
+            return Ok(None);
         }
 
-        let (hot_sum, hot_count) = hot_result?;
+        let Some((hot_sum, hot_count)) = hot_result else {
+            return Ok(None);
+        };
 
         // Pre-compute default contribution for schema-evolved volumes
         // that are missing this column (added via ALTER TABLE ADD COLUMN).
@@ -2556,11 +2558,11 @@ impl Table for SegmentedTable {
                 }
             }
             let total_sum = hot_sum + cold_sum_int as f64 + cold_sum_float;
-            return Some((total_sum, total_count));
+            return Ok(Some((total_sum, total_count)));
         }
 
         // Tombstones exist: scan columnar data with dedup (avoids full Row materialization)
-        let volumes = self.segment_mgr.get_volumes_newest_first().ok()?;
+        let volumes = self.segment_mgr.get_volumes_newest_first()?;
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
@@ -2615,7 +2617,7 @@ impl Table for SegmentedTable {
                 }
             }
         }
-        Some((total_sum, total_count))
+        Ok(Some((total_sum, total_count)))
     }
 
     fn min_column(&self, col_idx: usize) -> Option<Option<Value>> {
@@ -6424,7 +6426,7 @@ mod tests {
             }
             Some(max)
         }
-        fn sum_column(&self, col_idx: usize) -> Option<(f64, usize)> {
+        fn sum_column(&self, col_idx: usize) -> Result<Option<(f64, usize)>> {
             let mut sum = 0.0;
             let mut count = 0;
             for (_, row) in &self.rows {
@@ -6440,7 +6442,7 @@ mod tests {
                     _ => {}
                 }
             }
-            Some((sum, count))
+            Ok(Some((sum, count)))
         }
     }
 
@@ -6599,7 +6601,7 @@ mod tests {
 
         let table = SegmentedTable::new(Box::new(hot), mgr);
 
-        let (sum, count) = table.sum_column(1).unwrap();
+        let (sum, count) = table.sum_column(1).unwrap().unwrap();
         assert_eq!(sum, 530.0);
         assert_eq!(count, 3);
     }
