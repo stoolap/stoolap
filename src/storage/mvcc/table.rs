@@ -2649,8 +2649,8 @@ impl Table for MVCCTable {
         self.version_store.collect_row_ids_into(dest);
     }
 
-    fn has_row_id(&self, row_id: i64) -> bool {
-        self.version_store.has_committed_row(row_id)
+    fn has_row_id(&self, row_id: i64) -> Result<bool> {
+        Ok(self.version_store.has_committed_row(row_id))
     }
 
     fn try_claim_row(&self, row_id: i64) -> Result<()> {
@@ -3934,8 +3934,8 @@ impl Table for MVCCTable {
         self.version_store.committed_row_count()
     }
 
-    fn fast_row_count(&self) -> Option<usize> {
-        MVCCTable::fast_row_count(self)
+    fn fast_row_count(&self) -> Result<Option<usize>> {
+        Ok(MVCCTable::fast_row_count(self))
     }
 
     fn collect_rows_ordered_by_index(

@@ -16,14 +16,19 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use stoolap::core::{DataType, Result, Row, RowVec, SchemaBuilder, Value};
+use stoolap::core::{DataType, Error, Result, Row, RowVec, SchemaBuilder, Value};
+use stoolap::executor::context::{
+    cache_count_counter, cache_exists_fetcher, cache_exists_index, clear_all_thread_local_caches,
+    ExecutionContext,
+};
 use stoolap::executor::expression::clear_program_cache;
+use stoolap::executor::Executor;
 use stoolap::functions::scalar::SleepFunction;
 use stoolap::functions::{global_registry, FunctionInfo, ScalarFunction};
 use stoolap::storage::expression::ComparisonExpr;
 use stoolap::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
 use stoolap::storage::mvcc::{MVCCTable, TransactionVersionStore, VersionStore};
-use stoolap::storage::traits::Table;
+use stoolap::storage::traits::{Engine, Table};
 use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
 use stoolap::storage::volume::manifest::{SegmentManager, SegmentMeta};
 use stoolap::storage::volume::table::SegmentedTable;
@@ -495,4 +500,276 @@ fn cold_distinct_preserves_local_unindexed_values() {
         .collect();
     assert_eq!(values, [10, 20, 30]);
     tx.rollback().unwrap();
+}
+
+fn malformed_identity_table(id_count: usize, snapshot: bool) -> SegmentedTable {
+    let schema = SchemaBuilder::new("identity")
+        .column("id", DataType::Integer, false, true)
+        .build();
+    let mut builder = VolumeBuilder::new(&schema);
+    for id in [1, 2] {
+        builder.add_row(id, &Row::from_values(vec![Value::Integer(id)]));
+    }
+    let mut volume = builder.finish();
+    Arc::make_mut(&mut volume.meta).row_ids.resize(id_count, 3);
+    let manager = Arc::new(SegmentManager::new("identity", None));
+    manager.register_segment(
+        1,
+        Arc::new(volume),
+        SegmentMeta {
+            segment_id: 1,
+            file_path: PathBuf::new(),
+            row_count: 2,
+            min_row_id: 1,
+            max_row_id: 2,
+            creation_lsn: 0,
+            seal_seq: 0,
+            schema_version: 0,
+        },
+        Some(&schema),
+    );
+    let store = Arc::new(VersionStore::new(schema.table_name.clone(), schema));
+    let local = TransactionVersionStore::new(Arc::clone(&store), 1);
+    let hot = Box::new(MVCCTable::new(1, store, local));
+    if snapshot {
+        SegmentedTable::with_snapshot_seq(hot, manager, 1)
+    } else {
+        SegmentedTable::new(hot, manager)
+    }
+}
+
+fn assert_identity_error(result: impl std::fmt::Debug) {
+    let result = format!("{result:?}");
+    assert!(result.starts_with("Err("), "{result}");
+    assert!(
+        result.contains("row ID count does not match volume row count"),
+        "{result}"
+    );
+}
+
+#[test]
+fn identity_accessor_reports_invalid_data_and_borrows_valid_ids() {
+    for id_count in [0, 1, 3] {
+        let table = malformed_identity_table(id_count, false);
+        let segments = table.segment_manager().segments_raw();
+        assert_eq!(
+            segments[&1].volume.row_ids().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+    let table = malformed_identity_table(2, false);
+    let segments = table.segment_manager().segments_raw();
+    let volume = &segments[&1].volume;
+    let ids = volume.row_ids().unwrap();
+    assert_eq!(ids, [1, 2]);
+    assert_eq!(ids.as_ptr(), volume.meta.row_ids.as_ptr());
+}
+
+#[test]
+fn cold_membership_rejects_inconsistent_identity_metadata() {
+    for id_count in [0, 1, 3] {
+        for snapshot in [false, true] {
+            let table = malformed_identity_table(id_count, snapshot);
+            assert_identity_error(table.has_row_id(2));
+            assert_identity_error(table.segment_manager().row_exists(2));
+            assert_identity_error(table.segment_manager().is_row_id_in_volume(2));
+        }
+    }
+}
+
+#[test]
+fn cold_fetch_rejects_inconsistent_identity_metadata() {
+    for id_count in [0, 1, 3] {
+        let table = malformed_identity_table(id_count, false);
+        assert_identity_error(table.collect_rows_by_ids(&[2]));
+        assert_identity_error(table.segment_manager().get_cold_row(2));
+        assert_identity_error(
+            table
+                .segment_manager()
+                .get_cold_row_normalized(2, table.schema()),
+        );
+    }
+}
+
+#[test]
+fn exact_counts_do_not_cache_inconsistent_identity_metadata() {
+    for id_count in [0, 1, 3] {
+        let table = malformed_identity_table(id_count, false);
+        for _ in 0..2 {
+            assert_identity_error(table.row_count());
+            assert_identity_error(table.fast_row_count());
+            assert_identity_error(table.segment_manager().deduped_row_count());
+        }
+    }
+}
+
+#[test]
+fn cold_update_rejects_inconsistent_identity_before_setter() {
+    for id_count in [0, 1, 3] {
+        let mut table = malformed_identity_table(id_count, false);
+        let mut calls = 0;
+        assert_identity_error(table.update_by_row_ids(&[2], &mut |row| {
+            calls += 1;
+            Ok((row, false))
+        }));
+        assert_eq!(calls, 0);
+        assert!(!table.segment_manager().has_pending_tombstones(1));
+    }
+}
+
+#[test]
+fn cold_delete_rejects_inconsistent_identity_before_tombstone() {
+    for id_count in [0, 1, 3] {
+        let mut table = malformed_identity_table(id_count, false);
+        assert_identity_error(table.delete_by_row_ids(&[2]));
+        assert!(!table.segment_manager().has_pending_tombstones(1));
+    }
+}
+
+#[test]
+fn resident_identity_and_counts_do_not_reload_column_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (table, path) = cold_table(dir.path(), false);
+    std::fs::remove_file(path).unwrap();
+    for id in [1, 2, 3] {
+        let expected = id != 3;
+        let found = format!("{:?}", table.has_row_id(id));
+        assert!(found == format!("Ok({expected})") || found == expected.to_string());
+    }
+    assert_eq!(table.row_count().unwrap(), 2);
+    table.segment_manager().add_tombstones(&[1], 1);
+    assert_eq!(table.row_count().unwrap(), 1);
+    let exists = format!("{:?}", table.segment_manager().row_exists(1));
+    assert!(exists == "Ok(false)" || exists == "false");
+    let physical = format!("{:?}", table.segment_manager().is_row_id_in_volume(1));
+    assert!(physical == "Ok(true)" || physical == "true");
+    assert!(table.segment_manager().segments_raw()[&1].volume.is_cold());
+}
+
+struct CounterCacheScope;
+
+impl CounterCacheScope {
+    fn new() -> Self {
+        clear_all_thread_local_caches();
+        Self
+    }
+}
+
+impl Drop for CounterCacheScope {
+    fn drop(&mut self) {
+        clear_all_thread_local_caches();
+    }
+}
+
+fn nested_count(executor: &Executor) -> Result<Value> {
+    let ctx = ExecutionContext::new().with_outer_row(
+        [("outer_t.k".into(), Value::Integer(7))]
+            .into_iter()
+            .collect(),
+        stoolap::common::CompactArc::new(vec!["outer_t.k".to_string()]),
+    );
+    let mut rows = executor.execute_with_context(
+        "SELECT (SELECT COUNT(*) FROM inner_t WHERE inner_t.k = outer_t.k)",
+        &ctx,
+    )?;
+    if let Some(error) = rows.last_error() {
+        return Err(error);
+    }
+    assert!(rows.next());
+    let value = rows.row()[0].clone();
+    assert!(!rows.next());
+    if let Some(error) = rows.last_error() {
+        return Err(error);
+    }
+    Ok(value)
+}
+
+fn counter_database(dsn: &str) -> Database {
+    let db = Database::open(dsn).unwrap();
+    db.execute(
+        "CREATE TABLE inner_t (id INTEGER PRIMARY KEY, k INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_inner_k ON inner_t(k)", ())
+        .unwrap();
+    db.execute("INSERT INTO inner_t VALUES (1, 7)", ()).unwrap();
+    db
+}
+
+#[test]
+fn counter_factory_failure_does_not_use_cached_fetcher() {
+    let db = counter_database("memory://counter_factory_failure_does_not_use_cached_fetcher");
+    let engine = db.engine();
+    let index = engine
+        .get_all_indexes("inner_t")
+        .unwrap()
+        .into_iter()
+        .find(|index| index.column_names() == ["k"])
+        .unwrap();
+    let mut config = engine.config();
+    config.persistence.checkpoint_on_close = false;
+    engine.update_engine_config(config).unwrap();
+    engine.close_engine().unwrap();
+    assert_eq!(&*index.get_row_ids_equal(&[Value::Integer(7)]), &[1]);
+    let _caches = CounterCacheScope::new();
+    cache_exists_index("inner_t:k".to_string(), index);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fallback_calls = Arc::clone(&calls);
+    cache_exists_fetcher(
+        "inner_t".to_string(),
+        Box::new(move |_| {
+            fallback_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(RowVec::new())
+        }),
+    );
+    let result = nested_count(&Executor::new(Arc::clone(engine)));
+    assert!(matches!(result, Err(Error::EngineNotOpen)), "{result:?}");
+    assert_eq!(calls.load(Ordering::Relaxed), 0);
+}
+
+trait CounterResult {
+    fn from_result(result: Result<usize>) -> Self;
+}
+
+impl CounterResult for Result<usize> {
+    fn from_result(result: Result<usize>) -> Self {
+        result
+    }
+}
+
+impl CounterResult for usize {
+    fn from_result(result: Result<usize>) -> Self {
+        result.unwrap_or(0)
+    }
+}
+
+#[test]
+fn counter_callback_failure_reaches_sql_without_fallback() {
+    let db = counter_database("memory://counter_callback_failure_reaches_sql_without_fallback");
+    let _caches = CounterCacheScope::new();
+    let index = db
+        .engine()
+        .get_all_indexes("inner_t")
+        .unwrap()
+        .into_iter()
+        .find(|index| index.column_names() == ["k"])
+        .unwrap();
+    cache_exists_index("inner_t:k".to_string(), index);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter_calls = Arc::clone(&calls);
+    cache_count_counter(
+        "inner_t".to_string(),
+        Box::new(move |ids| {
+            assert_eq!(ids, [1]);
+            counter_calls.fetch_add(1, Ordering::Relaxed);
+            CounterResult::from_result(Err(Error::internal("identity read failed")))
+        }),
+    );
+    let result = nested_count(&Executor::new(Arc::clone(db.engine())));
+    assert!(
+        matches!(&result, Err(Error::Internal { message }) if message == "identity read failed"),
+        "{result:?}"
+    );
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
 }

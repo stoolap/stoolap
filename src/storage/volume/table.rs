@@ -1104,55 +1104,49 @@ impl SegmentedTable {
         Ok(rows)
     }
 
-    /// Find a row in segments by row_id. Returns (volume, local_offset) if found
-    /// and not tombstoned or hot-shadowed. Uses manifest min/max for fast segment
-    /// identification, then binary search within the segment.
-    /// Statement-scoped variant of find_segment_row over a pre-verified
-    /// warm snapshot (see segments_snapshot): never needs a reload, so a
-    /// DML statement that already mutated the hot buffer cannot fail
-    /// mid-statement on cold-volume access. Segments compacted away after
-    /// the snapshot are simply found in the snapshot's older volumes,
-    /// which is exactly the statement's view of the data.
+    /// Find a row in the statement's pinned segments without reloading columns.
+    /// Propagate identity failures before treating a cold row as absent.
     fn find_segment_row_in(
         &self,
         snap: &super::manifest::StatementSnapshot,
         row_id: i64,
-    ) -> Option<(u64, super::manifest::ColdSegment, usize)> {
-        if self.hot.has_row_id(row_id) {
-            return None;
+    ) -> Result<Option<(u64, super::manifest::ColdSegment, usize)>> {
+        if self.hot.has_row_id(row_id)? {
+            return Ok(None);
         }
         // Tombstone view from the SAME snapshot; only the pending set is
         // read live because it is this transaction's own state.
         if self.is_row_tombstoned(&snap.tombstones, row_id) {
-            return None;
+            return Ok(None);
         }
         if self.segment_mgr.is_pending_tombstone(self.txn_id(), row_id) {
-            return None;
+            return Ok(None);
         }
         for &seg_id in &snap.seg_ids_newest_first {
             let Some(cold) = snap.segs.get(&seg_id) else {
                 continue;
             };
             let vol = &cold.volume;
-            if vol.meta.row_ids.is_empty() {
+            let ids = vol.row_ids()?;
+            if ids.is_empty() {
                 continue;
             }
-            let min_id = vol.meta.row_ids[0];
-            let max_id = vol.meta.row_ids[vol.meta.row_count - 1];
+            let min_id = ids[0];
+            let max_id = ids[ids.len() - 1];
             if row_id < min_id || row_id > max_id {
                 continue;
             }
-            if let Ok(idx) = vol.meta.row_ids.binary_search(&row_id) {
+            if let Ok(idx) = ids.binary_search(&row_id) {
                 vol.mark_accessed();
-                return Some((seg_id, cold.clone(), idx));
+                return Ok(Some((seg_id, cold.clone(), idx)));
             }
         }
-        None
+        Ok(None)
     }
 
     fn find_segment_row(&self, row_id: i64) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
         // Hot buffer shadows cold: if the row exists in hot, the cold copy is stale
-        if self.hot.has_row_id(row_id) {
+        if self.hot.has_row_id(row_id)? {
             return Ok(None);
         }
         // Check committed tombstones (snapshot-aware: newer tombstones are invisible)
@@ -1187,15 +1181,16 @@ impl SegmentedTable {
                 continue;
             };
             let vol = &cold.volume;
-            if vol.meta.row_ids.is_empty() {
+            let ids = vol.row_ids()?;
+            if ids.is_empty() {
                 continue;
             }
-            let min_id = vol.meta.row_ids[0];
-            let max_id = vol.meta.row_ids[vol.meta.row_count - 1];
+            let min_id = ids[0];
+            let max_id = ids[ids.len() - 1];
             if row_id < min_id || row_id > max_id {
                 continue;
             }
-            if let Ok(idx) = vol.meta.row_ids.binary_search(&row_id) {
+            if let Ok(idx) = ids.binary_search(&row_id) {
                 if vol.is_cold() {
                     drop(segs);
                     if let Some(loaded) = self.segment_mgr.ensure_volume(seg_id)? {
@@ -1236,7 +1231,7 @@ impl SegmentedTable {
                 continue;
             };
             let vol = &cold.volume;
-            if let Ok(idx) = vol.meta.row_ids.binary_search(&row_id) {
+            if let Ok(idx) = vol.row_ids()?.binary_search(&row_id) {
                 // segments_snapshot fails closed, so vol is never cold here.
                 vol.mark_accessed();
                 return Ok(Some((seg_id, Arc::clone(vol), idx)));
@@ -1602,7 +1597,7 @@ impl Table for SegmentedTable {
         let mut unique_indexes = None;
         for &row_id in row_ids {
             let found = match &cold_snapshot {
-                Some(snap) => self.find_segment_row_in(snap, row_id),
+                Some(snap) => self.find_segment_row_in(snap, row_id)?,
                 None => None,
             };
             if let Some((_seg_id, cs, idx)) = found {
@@ -1699,7 +1694,7 @@ impl Table for SegmentedTable {
 
         for &row_id in row_ids {
             let found = match &cold_snapshot {
-                Some(snap) => self.find_segment_row_in(snap, row_id),
+                Some(snap) => self.find_segment_row_in(snap, row_id)?,
                 None => None,
             };
             if let Some((_seg_id, _cs, _idx)) = found {
@@ -2431,19 +2426,19 @@ impl Table for SegmentedTable {
             .collect())
     }
 
-    fn has_row_id(&self, row_id: i64) -> bool {
-        if self.hot.has_row_id(row_id) {
-            return true;
+    fn has_row_id(&self, row_id: i64) -> Result<bool> {
+        if self.hot.has_row_id(row_id)? {
+            return Ok(true);
         }
         if !self.segment_mgr.has_segments() {
-            return false;
+            return Ok(false);
         }
         // Snapshot-aware: row_exists() checks all tombstones unconditionally,
         // but a snapshot txn should still see rows tombstoned after its begin_seq.
         if self.snapshot_seq.is_some() {
             let ts = self.segment_mgr.tombstone_set_arc();
             if self.is_row_tombstoned(&ts, row_id) {
-                return false;
+                return Ok(false);
             }
             return self.segment_mgr.is_row_id_in_volume(row_id);
         }
@@ -2470,7 +2465,7 @@ impl Table for SegmentedTable {
         // this avoids an O(total_rows) HashSet collection that made ALL
         // queries slow during checkpoint.
         let _seal_guard = self.segment_mgr.acquire_seal_read();
-        let seg = self.segment_mgr.deduped_row_count();
+        let seg = self.segment_mgr.deduped_row_count()?;
         let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
         let overlap = self.segment_mgr.seal_overlap();
         Ok(seg.saturating_sub(pending) + self.hot.row_count()?.saturating_sub(overlap))
@@ -2483,22 +2478,26 @@ impl Table for SegmentedTable {
         seg.saturating_sub(pending) + self.hot.row_count_hint().saturating_sub(overlap)
     }
 
-    fn fast_row_count(&self) -> Option<usize> {
+    fn fast_row_count(&self) -> Result<Option<usize>> {
         // Snapshot isolation: deduped_row_count subtracts ALL tombstones, but
         // this snapshot may not see newer tombstones. Fall back to scan which
         // correctly filters by snapshot_seq.
         if self.snapshot_seq.is_some() {
-            return None;
+            return Ok(None);
         }
         let _seal_guard = self.segment_mgr.acquire_seal_read();
-        let hot_count = self.hot.fast_row_count()?;
-        let seg = self.segment_mgr.deduped_row_count();
+        let Some(hot_count) = self.hot.fast_row_count()? else {
+            return Ok(None);
+        };
+        let seg = self.segment_mgr.deduped_row_count()?;
         let pending = self.segment_mgr.pending_tombstone_count(self.txn_id());
         let overlap = self.segment_mgr.seal_overlap();
         // During seal, rows temporarily exist in both hot and cold.
         // Subtract overlap to avoid double-counting. May drift by a few rows
         // during the brief window, but O(1) vs O(N) is worth it.
-        Some(seg.saturating_sub(pending) + hot_count.saturating_sub(overlap))
+        Ok(Some(
+            seg.saturating_sub(pending) + hot_count.saturating_sub(overlap),
+        ))
     }
 
     // =========================================================================
@@ -2556,7 +2555,7 @@ impl Table for SegmentedTable {
         let can_use_stats = !is_boolean_column
             && self.segment_mgr.is_tombstone_set_empty()
             && !self.segment_mgr.has_pending_tombstones(self.txn_id())
-            && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count();
+            && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
         if can_use_stats {
             // Fast path: use pre-computed volume stats.
@@ -2687,7 +2686,7 @@ impl Table for SegmentedTable {
 
         let can_use_stats = self.segment_mgr.is_tombstone_set_empty()
             && !self.segment_mgr.has_pending_tombstones(self.txn_id())
-            && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count();
+            && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
         if can_use_stats {
             // Fast path: use pre-computed volume stats (zone map min)
@@ -2994,7 +2993,7 @@ impl Table for SegmentedTable {
 
         let can_use_stats = self.segment_mgr.is_tombstone_set_empty()
             && !self.segment_mgr.has_pending_tombstones(self.txn_id())
-            && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count();
+            && self.segment_mgr.total_row_count() == self.segment_mgr.deduped_row_count()?;
 
         if can_use_stats {
             // Fast path: use pre-computed volume stats (zone map max)
@@ -4252,7 +4251,7 @@ impl Table for SegmentedTable {
                 }
                 while scanner.next() {
                     let (row_id, row) = scanner.take_row_with_id();
-                    if sealed_copies_checked && self.hot.has_row_id(row_id) {
+                    if sealed_copies_checked && self.hot.has_row_id(row_id)? {
                         continue;
                     }
                     keep.offer(row_id, row);
@@ -6582,8 +6581,8 @@ mod tests {
         fn row_count(&self) -> Result<usize> {
             Ok(self.rows.len())
         }
-        fn fast_row_count(&self) -> Option<usize> {
-            Some(self.rows.len())
+        fn fast_row_count(&self) -> Result<Option<usize>> {
+            Ok(Some(self.rows.len()))
         }
         fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
             let mut max: Option<Value> = None;
@@ -6689,7 +6688,7 @@ mod tests {
         let table = SegmentedTable::new(Box::new(hot), mgr);
 
         assert_eq!(table.row_count().unwrap(), 5); // 3 segment + 2 hot
-        assert_eq!(table.fast_row_count(), Some(5));
+        assert_eq!(table.fast_row_count().unwrap(), Some(5));
     }
 
     #[test]
@@ -6877,8 +6876,8 @@ mod tests {
         table.commit().unwrap();
         assert_eq!(mgr.total_row_count(), 2);
         assert!(mgr.is_tombstoned(2));
-        assert!(mgr.row_exists(1));
-        assert!(mgr.row_exists(3));
-        assert!(!mgr.row_exists(2));
+        assert!(mgr.row_exists(1).unwrap());
+        assert!(mgr.row_exists(3).unwrap());
+        assert!(!mgr.row_exists(2).unwrap());
     }
 }

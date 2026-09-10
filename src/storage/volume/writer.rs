@@ -1844,6 +1844,18 @@ pub fn compute_column_mapping_with_drops(
 }
 
 impl FrozenVolume {
+    /// Borrow the resident physical row IDs, rejecting incomplete identity metadata.
+    #[inline]
+    pub fn row_ids(&self) -> std::io::Result<&[i64]> {
+        if self.meta.row_ids.len() != self.meta.row_count {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "row ID count does not match volume row count",
+            ));
+        }
+        Ok(&self.meta.row_ids)
+    }
+
     /// Get a row using a precomputed column mapping.
     /// Materializes all schema columns through the mapping.
     pub fn get_row_mapped(&self, idx: usize, mapping: &ColumnMapping) -> std::io::Result<Row> {

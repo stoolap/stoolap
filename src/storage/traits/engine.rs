@@ -304,11 +304,9 @@ pub trait Engine: Send + Sync {
     fn get_row_counter(
         &self,
         table_name: &str,
-    ) -> Result<Box<dyn Fn(&[i64]) -> usize + Send + Sync>> {
+    ) -> Result<Option<Box<dyn Fn(&[i64]) -> Result<usize> + Send + Sync>>> {
         let _ = table_name;
-        Err(crate::core::Error::internal(
-            "get_row_counter not supported by this engine",
-        ))
+        Ok(None)
     }
 }
 

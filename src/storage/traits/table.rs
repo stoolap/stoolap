@@ -397,10 +397,9 @@ pub trait Table: Send + Sync {
     /// (no default): implementations must stay infallible for hot data.
     fn collect_hot_row_ids_into(&self, dest: &mut rustc_hash::FxHashSet<i64>);
 
-    /// Check if a specific row_id exists in the hot buffer.
-    /// O(log n) lookup instead of collecting all row_ids.
-    fn has_row_id(&self, _row_id: i64) -> bool {
-        false
+    /// Check whether a row ID exists, propagating failures from cold identity reads.
+    fn has_row_id(&self, _row_id: i64) -> Result<bool> {
+        Ok(false)
     }
 
     /// Claim a row for update to prevent concurrent cold-row modifications.
@@ -892,8 +891,8 @@ pub trait Table: Send + Sync {
     ///
     /// This is different from row_count_hint() because it returns the EXACT count,
     /// not an estimate. It's designed for COUNT(*) without WHERE clause.
-    fn fast_row_count(&self) -> Option<usize> {
-        None // Default: no fast path available
+    fn fast_row_count(&self) -> Result<Option<usize>> {
+        Ok(None)
     }
 
     /// Collects rows sorted by an indexed column with limit (ORDER BY + LIMIT pushdown)

@@ -933,7 +933,7 @@ impl Executor {
             // Use row_counter for COUNT (avoids cloning row data)
             let row_counter = match get_cached_count_counter(&correlation.inner_table) {
                 Some(c) => c,
-                None => match self.get_or_create_row_counter(&correlation.inner_table) {
+                None => match self.get_or_create_row_counter(&correlation.inner_table)? {
                     Some(c) => c,
                     None => {
                         // Fall back to row_fetcher if counter not available
@@ -953,7 +953,7 @@ impl Executor {
                 },
             };
             // Count visible rows without cloning
-            let count = row_counter(&row_ids);
+            let count = row_counter(&row_ids)?;
             return Ok(Some(count as i64));
         }
 
@@ -1300,25 +1300,16 @@ impl Executor {
     fn get_or_create_row_counter(
         &self,
         table_name: &str,
-    ) -> Option<std::sync::Arc<super::context::RowCounter>> {
+    ) -> Result<Option<std::sync::Arc<super::context::RowCounter>>> {
         if let Some(c) = get_cached_count_counter(table_name) {
-            return Some(c);
+            return Ok(Some(c));
         }
 
-        let counter = match self.engine.get_row_counter(table_name) {
-            Ok(c) => c,
-            Err(_e) => {
-                // Fall back to slower path if counter creation fails
-                #[cfg(debug_assertions)]
-                eprintln!(
-                    "[WARN] get_row_counter failed for '{}': {:?}",
-                    table_name, _e
-                );
-                return None;
-            }
+        let Some(counter) = self.engine.get_row_counter(table_name)? else {
+            return Ok(None);
         };
         cache_count_counter(table_name.to_string(), counter);
-        get_cached_count_counter(table_name)
+        Ok(get_cached_count_counter(table_name))
     }
 
     /// Extract correlation pair from two expressions.

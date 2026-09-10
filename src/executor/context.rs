@@ -348,7 +348,7 @@ pub type RowFetcher = Box<dyn Fn(&[i64]) -> crate::core::Result<crate::core::Row
 
 /// Type alias for row counter function used in COUNT(*) optimization.
 /// This only counts visible rows without cloning their data.
-pub type RowCounter = Box<dyn Fn(&[i64]) -> usize + Send + Sync>;
+pub type RowCounter = Box<dyn Fn(&[i64]) -> crate::core::Result<usize> + Send + Sync>;
 
 // Cache for EXISTS row fetchers to avoid repeated version store lookups.
 // The key is the table name, the value is the row fetcher function.
