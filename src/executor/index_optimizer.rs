@@ -259,7 +259,7 @@ impl Executor {
 
         // Try to use index-ordered scan
         if let Some(rows) =
-            table.collect_rows_ordered_by_index(&column_name, ascending, limit, offset)
+            table.collect_rows_ordered_by_index(&column_name, ascending, limit, offset)?
         {
             // Project rows according to SELECT expressions
             let projected_rows = self.project_rows(&stmt.columns, rows, all_columns, ctx)?;

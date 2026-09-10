@@ -916,9 +916,9 @@ pub trait Table: Send + Sync {
         ascending: bool,
         limit: usize,
         offset: usize,
-    ) -> Option<RowVec> {
+    ) -> Result<Option<RowVec>> {
         let _ = (column_name, ascending, limit, offset);
-        None // Default implementation - override in concrete tables
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// The first `limit` rows after `offset` in the order of `column_name`,
@@ -974,9 +974,12 @@ pub trait Table: Send + Sync {
     /// # Returns
     /// Some(Vec<(Value, RowVec)>) where each tuple is (partition_value, rows_in_partition)
     /// Returns None if the column has no index
-    fn collect_rows_grouped_by_partition(&self, column_name: &str) -> Option<Vec<(Value, RowVec)>> {
+    fn collect_rows_grouped_by_partition(
+        &self,
+        column_name: &str,
+    ) -> Result<Option<Vec<(Value, RowVec)>>> {
         let _ = column_name;
-        None // Default implementation - override in concrete tables
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Get distinct partition values from an indexed column.
@@ -987,9 +990,9 @@ pub trait Table: Send + Sync {
     ///
     /// # Returns
     /// Some(Vec<Value>) with distinct values, or None if column has no index
-    fn get_partition_values(&self, column_name: &str) -> Option<Vec<Value>> {
+    fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
         let _ = column_name;
-        None // Default implementation - override in concrete tables
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Compute distinct non-null values for a column by exploiting cold volume
@@ -1017,9 +1020,9 @@ pub trait Table: Send + Sync {
     ///
     /// # Returns
     /// Some(count) excluding NULL values, or None if column has no index
-    fn get_partition_count(&self, column_name: &str) -> Option<usize> {
+    fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
         let _ = column_name;
-        None // Default implementation - override in concrete tables
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Get rows for a specific partition value.
@@ -1230,8 +1233,8 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `col_idx` - Column index to find minimum
-    fn min_column(&self, _col_idx: usize) -> Option<Option<Value>> {
-        None // Default implementation - override in concrete tables
+    fn min_column(&self, _col_idx: usize) -> Result<Option<Option<Value>>> {
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Compute MAX of a column without materializing rows (deferred aggregation)
@@ -1241,8 +1244,8 @@ pub trait Table: Send + Sync {
     ///
     /// # Arguments
     /// * `col_idx` - Column index to find maximum
-    fn max_column(&self, _col_idx: usize) -> Option<Option<Value>> {
-        None // Default implementation - override in concrete tables
+    fn max_column(&self, _col_idx: usize) -> Result<Option<Option<Value>>> {
+        Ok(None) // Default implementation - override in concrete tables
     }
 
     /// Compute aggregates with a WHERE filter at the storage level.
@@ -1261,8 +1264,8 @@ pub trait Table: Send + Sync {
         &self,
         _aggregates: &[(AggregateOp, usize)],
         _where_expr: &dyn Expression,
-    ) -> Option<Vec<crate::core::Value>> {
-        None // Default: not supported
+    ) -> Result<Option<Vec<crate::core::Value>>> {
+        Ok(None) // Default: not supported
     }
 
     /// Compute grouped aggregates at the storage level.
@@ -1280,8 +1283,8 @@ pub trait Table: Send + Sync {
         &self,
         _group_by_indices: &[usize],
         _aggregates: &[(AggregateOp, usize)],
-    ) -> Option<Vec<GroupedAggregateResult>> {
-        None // Default: not supported
+    ) -> Result<Option<Vec<GroupedAggregateResult>>> {
+        Ok(None) // Default: not supported
     }
 }
 
