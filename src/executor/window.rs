@@ -1130,14 +1130,12 @@ impl Executor {
         base_columns: &[String],
         partition_col: &str,
         limit: usize,
-    ) -> Result<Box<dyn QueryResult>> {
+    ) -> Result<Option<Box<dyn QueryResult>>> {
         // Parse window functions from SELECT list
         let mut window_functions = self.parse_window_functions(stmt, base_columns)?;
         self.fold_window_control_arguments(&mut window_functions, ctx)?;
         if window_functions.is_empty() {
-            return Err(Error::internal(
-                "No window functions found for lazy partition fetch",
-            ));
+            return Ok(None);
         }
 
         // Build column index map
@@ -1168,9 +1166,9 @@ impl Executor {
             select_items.iter().map(|i| i.output_name.clone()).collect();
 
         // Get partition values from the index (lazy iteration key!)
-        let partition_values = match table.get_partition_values(partition_col) {
+        let partition_values = match table.get_partition_values(partition_col)? {
             Some(values) => values,
-            None => return Err(Error::internal("Failed to get partition values from index")),
+            None => return Ok(None),
         };
 
         // Process partitions one at a time, stopping when we have enough rows
@@ -1341,7 +1339,10 @@ impl Executor {
             }
         }
 
-        Ok(Box::new(ExecutorResult::new(result_columns, result_rows)))
+        Ok(Some(Box::new(ExecutorResult::new(
+            result_columns,
+            result_rows,
+        ))))
     }
 
     /// Parse SELECT list to determine output order and sources

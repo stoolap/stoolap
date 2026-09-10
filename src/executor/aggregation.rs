@@ -5430,7 +5430,7 @@ impl Executor {
                 "COUNT" => {
                     if agg.distinct {
                         // COUNT(DISTINCT col) - try to get count from index without cloning values
-                        if let Some(count) = table.get_partition_count(&agg.column_lower) {
+                        if let Some(count) = table.get_partition_count(&agg.column_lower)? {
                             // get_partition_count already excludes NULL values per SQL standard
                             result_values.push(Value::Integer(count as i64));
                         } else {
@@ -5487,7 +5487,7 @@ impl Executor {
                 "MIN" => {
                     let col_idx = col_index_map.get(&agg.column_lower).copied();
                     if let Some(idx) = col_idx {
-                        if let Some(min_val) = table.min_column(idx) {
+                        if let Some(min_val) = table.min_column(idx)? {
                             result_values
                                 .push(min_val.unwrap_or_else(|| {
                                     Value::null(crate::core::DataType::Integer)
@@ -5502,7 +5502,7 @@ impl Executor {
                 "MAX" => {
                     let col_idx = col_index_map.get(&agg.column_lower).copied();
                     if let Some(idx) = col_idx {
-                        if let Some(max_val) = table.max_column(idx) {
+                        if let Some(max_val) = table.max_column(idx)? {
                             result_values
                                 .push(max_val.unwrap_or_else(|| {
                                     Value::null(crate::core::DataType::Integer)
@@ -5699,7 +5699,7 @@ impl Executor {
 
         // --- Call storage-level filtered aggregation ---
 
-        let values = match table.compute_filtered_aggregates(&agg_ops, storage_expr.as_ref()) {
+        let values = match table.compute_filtered_aggregates(&agg_ops, storage_expr.as_ref())? {
             Some(v) => v,
             None => return Ok(None),
         };
@@ -5861,16 +5861,18 @@ impl Executor {
                             None
                         }
                     }
-                    "MIN" => col_idx.and_then(|idx| {
-                        table.min_column(idx).map(|min_opt| {
+                    "MIN" => match col_idx {
+                        Some(idx) => table.min_column(idx)?.map(|min_opt| {
                             min_opt.unwrap_or_else(|| Value::null(crate::core::DataType::Integer))
-                        })
-                    }),
-                    "MAX" => col_idx.and_then(|idx| {
-                        table.max_column(idx).map(|max_opt| {
+                        }),
+                        None => None,
+                    },
+                    "MAX" => match col_idx {
+                        Some(idx) => table.max_column(idx)?.map(|max_opt| {
                             max_opt.unwrap_or_else(|| Value::null(crate::core::DataType::Integer))
-                        })
-                    }),
+                        }),
+                        None => None,
+                    },
                     _ => None,
                 };
 
@@ -6550,7 +6552,7 @@ impl Executor {
         stmt: &SelectStatement,
         all_columns: &[String],
         classification: &QueryClassification,
-    ) -> Option<Box<dyn QueryResult>> {
+    ) -> Option<Result<Box<dyn QueryResult>>> {
         use crate::parser::ast::GroupByModifier;
         use crate::storage::mvcc::version_store::AggregateOp;
 
@@ -6824,7 +6826,10 @@ impl Executor {
         }
 
         // Call storage-level aggregation
-        let results = table.compute_grouped_aggregates(&group_by_indices, &aggregates)?;
+        let results = match table.compute_grouped_aggregates(&group_by_indices, &aggregates) {
+            Ok(results) => results?,
+            Err(error) => return Some(Err(error)),
+        };
 
         // Convert to rows
         let mut rows = RowVec::new();
@@ -6837,7 +6842,7 @@ impl Executor {
             ));
         }
 
-        Some(Box::new(ExecutorResult::new(result_columns, rows)))
+        Some(Ok(Box::new(ExecutorResult::new(result_columns, rows))))
     }
 
     /// Try fast COUNT(DISTINCT col) using compiled cache
@@ -6901,7 +6906,7 @@ impl Executor {
         let table = tx.get_table(&cd.table_name)?;
 
         let count = table
-            .get_partition_count(&cd.column_name)
+            .get_partition_count(&cd.column_name)?
             .ok_or_else(|| crate::core::Error::internal("Index no longer available for column"))?;
 
         // Build result
@@ -7076,15 +7081,14 @@ impl Executor {
             }
         };
 
-        // Check if column has an index (required for fast path). Reuse the
-        // value: a second call could return None (e.g. seal overlap or a
-        // cold-volume reload failure) and an unwrap would panic.
+        // Cache only an available count; storage failures must reach the caller.
         let count = match table.get_partition_count(&column_name) {
-            Some(c) => c,
-            None => {
+            Ok(Some(c)) => c,
+            Ok(None) => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;
             }
+            Err(error) => return Some(Err(error)),
         };
 
         // Cache the compiled state

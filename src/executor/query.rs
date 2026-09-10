@@ -2176,7 +2176,7 @@ impl Executor {
         }
 
         // Try to get distinct values from the index
-        let distinct_values = match table.get_partition_values(&column_name) {
+        let distinct_values = match table.get_partition_values(&column_name)? {
             Some(values) => Some(values),
             None => match table.schema().column_index_map().get(&column_name) {
                 Some(&col_idx) => table.compute_distinct_values(col_idx)?,
@@ -2335,6 +2335,7 @@ impl Executor {
                 if let Some(result) =
                     self.try_storage_aggregation(table.as_ref(), stmt, &all_columns, classification)
                 {
+                    let result = result?;
                     let columns = CompactArc::new(result.columns().to_vec());
                     return Ok((result, columns, false, None));
                 }
@@ -3737,18 +3738,18 @@ impl Executor {
                                         &all_columns,
                                         &partition_col,
                                         limit_val,
-                                    );
-                                if let Ok(query_result) = result {
+                                    )?;
+                                if let Some(query_result) = result {
                                     let columns = CompactArc::new(query_result.columns().to_vec());
                                     return Ok((query_result, columns, false, None));
                                 }
-                                // Fall through to regular path if optimization fails
+                                // Fall through when the optimization is unavailable.
                             }
                         }
 
                         // Regular path: Fetch rows grouped by partition (no hash grouping needed)
                         if let Some(grouped_data) =
-                            table.collect_rows_grouped_by_partition(&partition_col)
+                            table.collect_rows_grouped_by_partition(&partition_col)?
                         {
                             // Flatten rows and build partition map
                             let mut all_rows = RowVec::new();
@@ -3826,7 +3827,7 @@ impl Executor {
                             ascending,
                             fetch_limit,
                             0,
-                        ) {
+                        )? {
                             (
                                 sorted_rows,
                                 Some(WindowPreSortedState {

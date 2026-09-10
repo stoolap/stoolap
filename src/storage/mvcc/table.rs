@@ -3939,14 +3939,14 @@ impl Table for MVCCTable {
         ascending: bool,
         limit: usize,
         offset: usize,
-    ) -> Option<RowVec> {
+    ) -> Result<Option<RowVec>> {
         // If transaction has local changes (inserts/updates/deletes), fall back to
         // the regular path which correctly merges local changes via collect_visible_rows.
         // This optimization only reads from the global version store and indexes.
         {
             let txn_versions = self.txn_versions.read().unwrap();
             if txn_versions.has_local_changes() {
-                return None;
+                return Ok(None);
             }
         }
 
@@ -3956,17 +3956,19 @@ impl Table for MVCCTable {
         if let Some(pk_idx) = self.cached_schema.pk_column_index() {
             let pk_col = &self.cached_schema.columns[pk_idx];
             if pk_col.name_lower == column_name.to_lowercase() {
-                return self.version_store.collect_rows_pk_ordered(
+                return Ok(self.version_store.collect_rows_pk_ordered(
                     self.txn_id,
                     ascending,
                     limit,
                     offset,
-                );
+                ));
             }
         }
 
         // Check if column has an index
-        let index = self.version_store.get_index_by_column(column_name)?;
+        let Some(index) = self.version_store.get_index_by_column(column_name) else {
+            return Ok(None);
+        };
 
         // Try using the efficient ordered iteration method (available in B-tree indexes)
         // We request more row IDs than needed to account for invisible rows
@@ -4000,7 +4002,7 @@ impl Table for MVCCTable {
 
                     // Check if we've reached the limit
                     if rows.len() >= limit {
-                        return Some(rows);
+                        return Ok(Some(rows));
                     }
                 }
             }
@@ -4008,7 +4010,7 @@ impl Table for MVCCTable {
             // If we got all needed rows, return them
             // If not, we may need to fetch more (rare case with many invisible rows)
             if !rows.is_empty() {
-                return Some(rows);
+                return Ok(Some(rows));
             }
         }
 
@@ -4018,7 +4020,7 @@ impl Table for MVCCTable {
         // If the index doesn't support get_all_values (returns empty), return None
         // to let the regular query execution path handle ORDER BY + LIMIT
         if all_values.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Sort values using partial_cmp (Value implements PartialOrd)
@@ -4059,13 +4061,13 @@ impl Table for MVCCTable {
 
                     // Check if we've reached the limit
                     if rows.len() >= limit {
-                        return Some(rows);
+                        return Ok(Some(rows));
                     }
                 }
             }
         }
 
-        Some(rows)
+        Ok(Some(rows))
     }
 
     fn collect_rows_pk_keyset(
@@ -4097,22 +4099,27 @@ impl Table for MVCCTable {
         ))
     }
 
-    fn collect_rows_grouped_by_partition(&self, column_name: &str) -> Option<Vec<(Value, RowVec)>> {
+    fn collect_rows_grouped_by_partition(
+        &self,
+        column_name: &str,
+    ) -> Result<Option<Vec<(Value, RowVec)>>> {
         // If transaction has local changes, fall back to regular path
         {
             let txn_versions = self.txn_versions.read().unwrap();
             if txn_versions.has_local_changes() {
-                return None;
+                return Ok(None);
             }
         }
 
         // Check if column has an index
-        let index = self.version_store.get_index_by_column(column_name)?;
+        let Some(index) = self.version_store.get_index_by_column(column_name) else {
+            return Ok(None);
+        };
 
         // Get all unique values from the index (partition keys)
         let all_values = index.get_all_values();
         if all_values.is_empty() {
-            return Some(Vec::new());
+            return Ok(Some(Vec::new()));
         }
 
         // Collect rows grouped by partition value
@@ -4139,36 +4146,40 @@ impl Table for MVCCTable {
             }
         }
 
-        Some(result)
+        Ok(Some(result))
     }
 
-    fn get_partition_values(&self, column_name: &str) -> Option<Vec<Value>> {
+    fn get_partition_values(&self, column_name: &str) -> Result<Option<Vec<Value>>> {
         // Only use index-based distinct values if no uncommitted local changes
         // (local changes are in txn_versions, not reflected in the index)
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
-            return None;
+            return Ok(None);
         }
         drop(txn_versions);
 
         // Get index for the column
-        let index = self.version_store.get_index_by_column(column_name)?;
+        let Some(index) = self.version_store.get_index_by_column(column_name) else {
+            return Ok(None);
+        };
         // Return all distinct values from the index
-        Some(index.get_all_values())
+        Ok(Some(index.get_all_values()))
     }
 
-    fn get_partition_count(&self, column_name: &str) -> Option<usize> {
+    fn get_partition_count(&self, column_name: &str) -> Result<Option<usize>> {
         // Only use index-based count if no uncommitted local changes
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
-            return None;
+            return Ok(None);
         }
         drop(txn_versions);
 
         // Get index for the column
-        let index = self.version_store.get_index_by_column(column_name)?;
+        let Some(index) = self.version_store.get_index_by_column(column_name) else {
+            return Ok(None);
+        };
         // Return count of distinct non-null values without cloning
-        index.get_distinct_count_excluding_null()
+        Ok(index.get_distinct_count_excluding_null())
     }
 
     fn get_rows_for_partition_value(
@@ -4683,42 +4694,43 @@ impl Table for MVCCTable {
         Ok(Some(self.version_store.sum_column(self.txn_id, col_idx)))
     }
 
-    fn min_column(&self, col_idx: usize) -> Option<Option<Value>> {
+    fn min_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
         // Only use deferred aggregation if no uncommitted local changes
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
-            return None;
+            return Ok(None);
         }
         drop(txn_versions);
 
-        Some(self.version_store.min_column(self.txn_id, col_idx))
+        Ok(Some(self.version_store.min_column(self.txn_id, col_idx)))
     }
 
-    fn max_column(&self, col_idx: usize) -> Option<Option<Value>> {
+    fn max_column(&self, col_idx: usize) -> Result<Option<Option<Value>>> {
         // Only use deferred aggregation if no uncommitted local changes
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
-            return None;
+            return Ok(None);
         }
         drop(txn_versions);
 
-        Some(self.version_store.max_column(self.txn_id, col_idx))
+        Ok(Some(self.version_store.max_column(self.txn_id, col_idx)))
     }
 
     fn compute_grouped_aggregates(
         &self,
         group_by_indices: &[usize],
         aggregates: &[(crate::storage::mvcc::version_store::AggregateOp, usize)],
-    ) -> Option<Vec<crate::storage::mvcc::version_store::GroupedAggregateResult>> {
+    ) -> Result<Option<Vec<crate::storage::mvcc::version_store::GroupedAggregateResult>>> {
         // Only use storage-level aggregation if no uncommitted local changes
         let txn_versions = self.txn_versions.read().unwrap();
         if txn_versions.has_local_changes() {
-            return None;
+            return Ok(None);
         }
         drop(txn_versions);
 
-        self.version_store
-            .compute_grouped_aggregates(self.txn_id, group_by_indices, aggregates)
+        Ok(self
+            .version_store
+            .compute_grouped_aggregates(self.txn_id, group_by_indices, aggregates))
     }
 }
 

@@ -13,9 +13,15 @@
 // limitations under the License.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use stoolap::core::{DataType, Row, SchemaBuilder, Value};
+use stoolap::core::{DataType, Result, Row, RowVec, SchemaBuilder, Value};
+use stoolap::executor::expression::clear_program_cache;
+use stoolap::functions::scalar::SleepFunction;
+use stoolap::functions::{global_registry, FunctionInfo, ScalarFunction};
+use stoolap::storage::expression::ComparisonExpr;
+use stoolap::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
 use stoolap::storage::mvcc::{MVCCTable, TransactionVersionStore, VersionStore};
 use stoolap::storage::traits::Table;
 use stoolap::storage::volume::io::{read_volume_from_disk, write_volume_to_disk};
@@ -25,6 +31,10 @@ use stoolap::storage::volume::writer::VolumeBuilder;
 use stoolap::Database;
 
 fn cold_table(dir: &Path, snapshot: bool) -> (SegmentedTable, PathBuf) {
+    cold_table_with_index(dir, snapshot, false)
+}
+
+fn cold_table_with_index(dir: &Path, snapshot: bool, indexed: bool) -> (SegmentedTable, PathBuf) {
     let schema = SchemaBuilder::new("t")
         .column("id", DataType::Integer, false, true)
         .column("v", DataType::Integer, false, false)
@@ -71,6 +81,9 @@ fn cold_table(dir: &Path, snapshot: bool) -> (SegmentedTable, PathBuf) {
             .unwrap();
     }
     let hot = Box::new(MVCCTable::new(1, store, local));
+    if indexed {
+        hot.create_btree_index("v", false, Some("idx_t_v")).unwrap();
+    }
     let table = if snapshot {
         SegmentedTable::with_snapshot_seq(hot, manager, 1)
     } else {
@@ -176,6 +189,230 @@ fn sum_propagates_cold_reload_failure() {
 #[test]
 fn avg_propagates_cold_reload_failure() {
     assert_sum_reload_failure(|table| format!("{:?}", table.avg_column(1)));
+}
+
+fn assert_optional_reload_failure(
+    read: impl Fn(&SegmentedTable) -> String,
+    expected_value: impl std::fmt::Debug,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let (table, path) = cold_table_with_index(dir.path(), false, true);
+    table.segment_manager().add_tombstones(&[1], 1);
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    for _ in 0..2 {
+        let expected = table
+            .segment_manager()
+            .get_volumes_newest_first()
+            .map(|_| ());
+        let error = expected.as_ref().unwrap_err();
+        assert!(error.to_string().contains("cold volume reload failed"));
+        assert_eq!(read(&table), format!("Err({error:?})"));
+    }
+    std::fs::write(&path, bytes).unwrap();
+    let restored = read(&table);
+    let expected = format!("Some({expected_value:?})");
+    assert!(
+        restored == expected || restored == format!("Ok({expected})"),
+        "{restored}"
+    );
+}
+
+#[test]
+fn min_propagates_cold_reload_failure() {
+    assert_optional_reload_failure(
+        |table| format!("{:?}", table.min_column(1)),
+        Some(Value::Integer(20)),
+    );
+}
+
+#[test]
+fn max_propagates_cold_reload_failure() {
+    assert_optional_reload_failure(
+        |table| format!("{:?}", table.max_column(1)),
+        Some(Value::Integer(20)),
+    );
+}
+
+#[test]
+fn partition_count_propagates_cold_reload_failure() {
+    assert_optional_reload_failure(|table| format!("{:?}", table.get_partition_count("v")), 1);
+}
+
+#[test]
+fn partition_values_propagate_cold_reload_failure() {
+    assert_optional_reload_failure(
+        |table| format!("{:?}", table.get_partition_values("v")),
+        vec![Value::Integer(20)],
+    );
+}
+
+fn surviving_rows() -> RowVec {
+    RowVec::from_vec(vec![(
+        2,
+        Row::from_values(vec![Value::Integer(2), Value::Integer(20)]),
+    )])
+}
+
+#[test]
+fn grouped_partition_rows_propagate_cold_reload_failure() {
+    assert_optional_reload_failure(
+        |table| format!("{:?}", table.collect_rows_grouped_by_partition("v")),
+        vec![(Value::Integer(20), surviving_rows())],
+    );
+}
+
+#[test]
+fn ordered_rows_propagate_cold_reload_failure() {
+    assert_optional_reload_failure(
+        |table| {
+            format!(
+                "{:?}",
+                table.collect_rows_ordered_by_index("id", true, 2, 0)
+            )
+        },
+        surviving_rows(),
+    );
+}
+
+#[test]
+fn filtered_aggregates_propagate_cold_reload_failure() {
+    assert_optional_reload_failure(
+        |table| {
+            format!(
+                "{:?}",
+                table.compute_filtered_aggregates(
+                    &[(AggregateOp::Sum, 1)],
+                    &ComparisonExpr::gte("v", Value::Integer(0)),
+                )
+            )
+        },
+        vec![Value::Integer(20)],
+    );
+}
+
+#[test]
+fn grouped_aggregates_propagate_cold_reload_failure() {
+    assert_optional_reload_failure(
+        |table| {
+            format!(
+                "{:?}",
+                table.compute_grouped_aggregates(&[1], &[(AggregateOp::Sum, 1)])
+            )
+        },
+        vec![GroupedAggregateResult {
+            group_values: vec![Value::Integer(20)],
+            aggregate_values: vec![Value::Integer(20)],
+        }],
+    );
+}
+
+static WINDOW_HOOK_LOCK: Mutex<()> = Mutex::new(());
+static WINDOW_HOOK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Default)]
+struct InvalidFirstPattern;
+
+impl ScalarFunction for InvalidFirstPattern {
+    fn name(&self) -> &str {
+        "SLEEP"
+    }
+
+    fn info(&self) -> FunctionInfo {
+        SleepFunction.info()
+    }
+
+    fn evaluate(&self, _args: &[Value]) -> Result<Value> {
+        Ok(Value::Integer(
+            WINDOW_HOOK_CALLS.fetch_add(1, Ordering::SeqCst) as i64,
+        ))
+    }
+
+    fn clone_box(&self) -> Box<dyn ScalarFunction> {
+        Box::new(Self)
+    }
+}
+
+struct WindowHook {
+    _serial: MutexGuard<'static, ()>,
+}
+
+impl Drop for WindowHook {
+    fn drop(&mut self) {
+        global_registry().register_scalar::<SleepFunction>();
+        clear_program_cache();
+    }
+}
+
+#[test]
+fn lazy_window_propagates_first_error_without_retrying() {
+    let db =
+        Database::open("memory://lazy_window_propagates_first_error_without_retrying").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE INDEX idx_t_v ON t(v)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10)", ()).unwrap();
+    let _hook = WindowHook {
+        _serial: WINDOW_HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+    };
+    WINDOW_HOOK_CALLS.store(0, Ordering::SeqCst);
+    global_registry().register_scalar::<InvalidFirstPattern>();
+    clear_program_cache();
+    let result = db.query_one::<bool, _>(
+        "SELECT 'x' REGEXP CASE WHEN SLEEP(v) = 0 THEN '[' ELSE 'x' END, \
+         ROW_NUMBER() OVER (PARTITION BY v) FROM t LIMIT 1",
+        (),
+    );
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("Invalid regular expression"));
+    assert_eq!(WINDOW_HOOK_CALLS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn optional_reads_preserve_fallbacks_with_local_changes() {
+    let db =
+        Database::open("memory://optional_reads_preserve_fallbacks_with_local_changes").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)", ())
+        .unwrap();
+    let count = db.prepare("SELECT COUNT(DISTINCT v) FROM t").unwrap();
+    for indexed in [false, true] {
+        if indexed {
+            db.execute("CREATE INDEX idx_t_v ON t(v)", ()).unwrap();
+        }
+        assert_eq!(count.query_one::<i64, _>(()).unwrap(), 2);
+        let mut tx = db.begin().unwrap();
+        tx.execute("INSERT INTO t VALUES (3, 30)", ()).unwrap();
+        for (query, expected) in [
+            ("SELECT MIN(v) FROM t", 10),
+            ("SELECT MAX(v) FROM t", 30),
+            ("SELECT COUNT(DISTINCT v) FROM t", 3),
+            ("SELECT SUM(v) FROM t WHERE v >= 20", 50),
+            (
+                "SELECT SUM(v) FROM t GROUP BY v ORDER BY v DESC LIMIT 1",
+                30,
+            ),
+            (
+                "SELECT ROW_NUMBER() OVER (PARTITION BY v) FROM t LIMIT 1",
+                1,
+            ),
+            (
+                "SELECT ROW_NUMBER() OVER (ORDER BY id DESC) FROM t ORDER BY id DESC LIMIT 1",
+                1,
+            ),
+        ] {
+            assert_eq!(
+                tx.query_one::<i64, _>(query, ()).unwrap(),
+                expected,
+                "{query}"
+            );
+        }
+        tx.rollback().unwrap();
+        assert_eq!(count.query_one::<i64, _>(()).unwrap(), 2);
+    }
 }
 
 #[test]
