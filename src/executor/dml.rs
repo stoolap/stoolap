@@ -25,7 +25,7 @@ use crate::common::SmartString;
 use crate::core::{DataType, Error, Result, Row, RowVec, Schema, Value, ValueMap};
 use crate::parser::ast::*;
 use crate::storage::expression::{ComparisonExpr, Expression as StorageExpr};
-use crate::storage::traits::{Engine, QueryResult, Table};
+use crate::storage::traits::{Engine, QueryResult, Table, Transaction};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -36,7 +36,7 @@ use super::context::{
 use super::expression::CompiledEvaluator;
 use super::pushdown;
 use super::query_cache::{CompiledExecution, CompiledInsert};
-use super::result::ExecResult;
+use super::result::{ExecResult, ExecutorResult};
 use super::utils::dummy_token_clone;
 use super::Executor;
 use std::sync::RwLock;
@@ -910,6 +910,17 @@ impl Executor {
                 invalidate_in_subquery_cache_for_table(table_name);
             }
 
+            let mut returning_result = if let Some(column_names) = &schema_column_names_arc {
+                Some(self.build_returning_result(
+                    &stmt.returning,
+                    returning_rows,
+                    column_names,
+                    ctx,
+                )?)
+            } else {
+                None
+            };
+
             // Commit if this is a standalone (auto-commit) transaction
             if should_auto_commit {
                 if let Some(mut tx) = standalone_tx {
@@ -922,6 +933,7 @@ impl Executor {
                             if stmt.on_duplicate && ctx.query_depth == 0 {
                                 // Commit-time PK/unique violation during upsert:
                                 // a concurrent plain INSERT committed first. Retry once.
+                                drop(returning_result);
                                 drop(_upsert_guard);
                                 let retry_ctx = ctx.with_incremented_query_depth();
                                 return self.execute_insert(stmt, &retry_ctx);
@@ -929,7 +941,11 @@ impl Executor {
                             if stmt.do_nothing {
                                 // DO NOTHING: returning 0 rows is the correct semantic
                                 rows_affected = 0;
-                                returning_rows.clear();
+                                if let Some(result) = &mut returning_result {
+                                    *result = Box::new(ExecutorResult::with_columns(
+                                        result.columns().to_vec(),
+                                    ));
+                                }
                             } else {
                                 return Err(e);
                             }
@@ -939,14 +955,8 @@ impl Executor {
                 }
             }
 
-            // Handle RETURNING clause for INSERT...SELECT
-            if has_returning {
-                return statement_rollback.finish(self.build_returning_result(
-                    &stmt.returning,
-                    returning_rows,
-                    schema_column_names_arc.as_ref().unwrap(),
-                    ctx,
-                ));
+            if let Some(result) = returning_result {
+                return statement_rollback.finish(Ok(result));
             }
 
             return statement_rollback
@@ -1267,6 +1277,12 @@ impl Executor {
             invalidate_in_subquery_cache_for_table(table_name);
         }
 
+        let mut returning_result = if let Some(column_names) = &schema_column_names_arc {
+            Some(self.build_returning_result(&stmt.returning, returning_rows, column_names, ctx)?)
+        } else {
+            None
+        };
+
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             if let Some(mut tx) = standalone_tx {
@@ -1277,6 +1293,7 @@ impl Executor {
                             && e.is_pk_or_unique_violation() =>
                     {
                         if stmt.on_duplicate && ctx.query_depth == 0 {
+                            drop(returning_result);
                             drop(_upsert_guard);
                             let retry_ctx = ctx.with_incremented_query_depth();
                             return self.execute_insert(stmt, &retry_ctx);
@@ -1284,7 +1301,11 @@ impl Executor {
                         if stmt.do_nothing {
                             // DO NOTHING: returning 0 rows is the correct semantic
                             rows_affected = 0;
-                            returning_rows.clear();
+                            if let Some(result) = &mut returning_result {
+                                *result = Box::new(ExecutorResult::with_columns(
+                                    result.columns().to_vec(),
+                                ));
+                            }
                         } else {
                             return Err(e);
                         }
@@ -1294,14 +1315,8 @@ impl Executor {
             }
         }
 
-        // Handle RETURNING clause
-        if has_returning {
-            return statement_rollback.finish(self.build_returning_result(
-                &stmt.returning,
-                returning_rows,
-                schema_column_names_arc.as_ref().unwrap(),
-                ctx,
-            ));
+        if let Some(result) = returning_result {
+            return statement_rollback.finish(Ok(result));
         }
 
         statement_rollback.finish(Ok(Box::new(ExecResult::with_rows_affected(rows_affected))))
@@ -1707,21 +1722,21 @@ impl Executor {
             invalidate_in_subquery_cache_for_table(table_name);
         }
 
+        if let Some(column_names) = &schema_column_names_arc {
+            return statement_rollback.finish(self.finish_returning(
+                &stmt.returning,
+                returning_rows,
+                column_names,
+                ctx,
+                standalone_tx,
+            ));
+        }
+
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             if let Some(mut tx) = standalone_tx {
                 tx.commit()?;
             }
-        }
-
-        // Handle RETURNING clause
-        if has_returning {
-            return statement_rollback.finish(self.build_returning_result(
-                &stmt.returning,
-                returning_rows,
-                schema_column_names_arc.as_ref().unwrap(),
-                ctx,
-            ));
         }
 
         statement_rollback.finish(Ok(Box::new(ExecResult::with_rows_affected(rows_affected))))
@@ -2691,23 +2706,22 @@ impl Executor {
             invalidate_in_subquery_cache_for_table(table_name);
         }
 
+        if has_returning {
+            return statement_rollback.finish(self.finish_returning(
+                &stmt.returning,
+                returning_rows.into_inner(),
+                &column_names,
+                ctx,
+                standalone_tx,
+            ));
+        }
+
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             // Commit the transaction - it will commit all tables via commit_all_tables()
             if let Some(mut tx) = standalone_tx {
                 tx.commit()?;
             }
-        }
-
-        // Handle RETURNING clause
-        if has_returning {
-            let rows = returning_rows.into_inner();
-            return statement_rollback.finish(self.build_returning_result(
-                &stmt.returning,
-                rows,
-                &column_names,
-                ctx,
-            ));
         }
 
         statement_rollback.finish(Ok(Box::new(ExecResult::with_rows_affected(
@@ -3199,22 +3213,22 @@ impl Executor {
             invalidate_in_subquery_cache_for_table(table_name);
         }
 
+        if has_returning {
+            return statement_rollback.finish(self.finish_returning(
+                &stmt.returning,
+                returning_rows,
+                &column_names_owned,
+                ctx,
+                standalone_tx,
+            ));
+        }
+
         // Commit if this is a standalone (auto-commit) transaction
         if should_auto_commit {
             // Commit the transaction - it will commit all tables via commit_all_tables()
             if let Some(mut tx) = standalone_tx {
                 tx.commit()?;
             }
-        }
-
-        // Handle RETURNING clause
-        if has_returning {
-            return statement_rollback.finish(self.build_returning_result(
-                &stmt.returning,
-                returning_rows,
-                &column_names_owned,
-                ctx,
-            ));
         }
 
         statement_rollback.finish(Ok(Box::new(ExecResult::with_rows_affected(
@@ -3829,6 +3843,22 @@ impl Executor {
         }
     }
 
+    #[inline(never)]
+    fn finish_returning(
+        &self,
+        returning: &[Expression],
+        source_rows: Vec<Row>,
+        column_names: &[String],
+        ctx: &ExecutionContext,
+        standalone_tx: Option<Box<dyn Transaction>>,
+    ) -> Result<Box<dyn QueryResult>> {
+        let result = self.build_returning_result(returning, source_rows, column_names, ctx)?;
+        if let Some(mut tx) = standalone_tx {
+            tx.commit()?;
+        }
+        Ok(result)
+    }
+
     /// Build a result from RETURNING clause expressions
     ///
     /// Evaluates the RETURNING expressions for each affected row and returns
@@ -3840,11 +3870,8 @@ impl Executor {
         column_names: &[String],
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        use super::result::ExecutorResult;
         use crate::parser::{Identifier, Position, Token, TokenType};
 
-        // Expand Star expressions to all columns
-        let mut expanded_exprs: Vec<Expression> = Vec::new();
         let mut result_columns: Vec<String> = Vec::new();
 
         for (i, expr) in returning.iter().enumerate() {
@@ -3853,20 +3880,10 @@ impl Executor {
                     // Expand * to all columns
                     for col_name in column_names {
                         result_columns.push(col_name.clone());
-                        let token = Token::new(
-                            TokenType::Identifier,
-                            col_name.clone(),
-                            Position::new(0, 0, 0),
-                        );
-                        expanded_exprs.push(Expression::Identifier(Identifier::new(
-                            token,
-                            col_name.clone(),
-                        )));
                     }
                 }
                 _ => {
                     result_columns.push(Self::get_returning_column_name(expr, i));
-                    expanded_exprs.push(expr.clone());
                 }
             }
         }
@@ -3879,10 +3896,24 @@ impl Executor {
         use super::expression::{compile_expression, ExecuteContext, ExprVM, SharedProgram};
 
         // Pre-compile all RETURNING expressions
-        let compiled_exprs: Vec<SharedProgram> = expanded_exprs
-            .iter()
-            .map(|expr| compile_expression(expr, column_names))
-            .collect::<Result<Vec<_>>>()?;
+        let mut compiled_exprs: Vec<SharedProgram> = Vec::with_capacity(result_columns.len());
+        for expr in returning {
+            match expr {
+                Expression::Star(_) => {
+                    for col_name in column_names {
+                        let token = Token::new(
+                            TokenType::Identifier,
+                            col_name.clone(),
+                            Position::new(0, 0, 0),
+                        );
+                        let column =
+                            Expression::Identifier(Identifier::new(token, col_name.clone()));
+                        compiled_exprs.push(compile_expression(&column, column_names)?);
+                    }
+                }
+                _ => compiled_exprs.push(compile_expression(expr, column_names)?),
+            }
+        }
 
         // Create VM for execution (reused for all rows)
         let mut vm = ExprVM::new();
