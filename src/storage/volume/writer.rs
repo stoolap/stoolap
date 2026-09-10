@@ -265,10 +265,36 @@ impl CompressedBlockStore {
 
     /// Decompress a single column from RAM. Concatenates all row-group blocks.
     /// Runs at ~4 GB/s (LZ4 from RAM), typically <1ms per column.
-    pub fn decompress_column(&self, col_idx: usize) -> ColumnData {
-        let col_blocks = &self.blocks[col_idx];
-        let type_tag = self.col_type_tags[col_idx];
-        let ext_type = DataType::from_u8(self.col_ext_types[col_idx]).unwrap_or(DataType::Null);
+    pub fn decompress_column(&self, col_idx: usize) -> std::io::Result<ColumnData> {
+        let col_blocks = self.blocks.get(col_idx).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "column index out of range",
+            )
+        })?;
+        let type_tag = *self.col_type_tags.get(col_idx).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "missing column type tag")
+        })?;
+        let ext_type = self
+            .col_ext_types
+            .get(col_idx)
+            .and_then(|&tag| DataType::from_u8(tag))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid extension type tag",
+                )
+            })?;
+        let num_groups = col_blocks.len();
+        if self.group_size == 0
+            || num_groups != self.row_count.div_ceil(self.group_size)
+            || self.decompressed_lens.get(col_idx).map(Vec::len) != Some(num_groups)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid column block geometry",
+            ));
+        }
 
         // Find pre-built dictionary Arc for this column (Arc clone = ~5ns)
         let dict: Option<Arc<[SmartString]>> = if type_tag == COL_DICTIONARY {
@@ -280,53 +306,29 @@ impl CompressedBlockStore {
             None
         };
 
-        if col_blocks.len() == 1 {
-            let decomp_len = self.decompressed_lens[col_idx][0];
-            let group_rows = self.row_count.min(self.group_size);
-            if col_blocks[0].len() == decomp_len {
-                return deserialize_column_block(
-                    &col_blocks[0],
-                    type_tag,
-                    group_rows,
-                    dict,
-                    ext_type,
-                )
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "corrupt V4 block: col={}, raw, {} rows: {}",
-                        col_idx, group_rows, e
-                    )
-                });
-            }
-            let mut raw = vec![0u8; decomp_len];
-            lz4_flex::decompress_into(&col_blocks[0], &mut raw).unwrap_or_else(|e| {
-                panic!(
-                    "corrupt V4 block: col={}, {} bytes: {}",
-                    col_idx,
-                    col_blocks[0].len(),
-                    e
-                )
-            });
-            return deserialize_column_block(&raw, type_tag, group_rows, dict, ext_type)
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "corrupt V4 block: col={}, {} rows: {}",
-                        col_idx, group_rows, e
-                    )
-                });
+        if num_groups == 1 {
+            return self.decompress_block(
+                col_idx,
+                0,
+                &col_blocks[0],
+                type_tag,
+                num_groups,
+                dict,
+                ext_type,
+            );
         }
 
-        // Multiple groups — decompress each block directly into pre-allocated
-        // output buffers, avoiding one intermediate ColumnData per group.
-        // Reusable LZ4 scratch buffer — allocated once, reused across all groups.
-        let max_decomp = self.decompressed_lens[col_idx]
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0);
-        let mut lz4_buf = Vec::with_capacity(max_decomp);
-        let num_groups = col_blocks.len();
-        match type_tag {
+        // Validate all group lengths before reserving the full-column buffers.
+        let mut max_decomp = 0;
+        for gi in 0..num_groups {
+            let (len, _) = self.block_layout(col_idx, gi, type_tag, num_groups)?;
+            max_decomp = max_decomp.max(len);
+        }
+        let mut lz4_buf = Vec::new();
+        lz4_buf
+            .try_reserve_exact(max_decomp)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
+        Ok(match type_tag {
             super::format::COL_INT64 => {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
@@ -345,8 +347,7 @@ impl CompressedBlockStore {
                         None,
                         None,
                         None,
-                    )
-                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
+                    )?;
                 }
                 ColumnData::Int64 {
                     values: all_values,
@@ -371,8 +372,7 @@ impl CompressedBlockStore {
                         None,
                         None,
                         None,
-                    )
-                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
+                    )?;
                 }
                 ColumnData::Float64 {
                     values: all_values,
@@ -397,8 +397,7 @@ impl CompressedBlockStore {
                         None,
                         None,
                         None,
-                    )
-                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
+                    )?;
                 }
                 ColumnData::TimestampNanos {
                     values: all_values,
@@ -423,8 +422,7 @@ impl CompressedBlockStore {
                         Some(&mut all_values),
                         None,
                         None,
-                    )
-                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
+                    )?;
                 }
                 ColumnData::Boolean {
                     values: all_values,
@@ -449,12 +447,22 @@ impl CompressedBlockStore {
                         None,
                         None,
                         None,
-                    )
-                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
+                    )?;
+                }
+                let dictionary = dict.unwrap_or_else(|| Arc::from(Vec::<SmartString>::new()));
+                if all_ids
+                    .iter()
+                    .zip(&all_nulls)
+                    .any(|(&id, &is_null)| !is_null && id as usize >= dictionary.len())
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "dictionary id out of range",
+                    ));
                 }
                 ColumnData::Dictionary {
                     ids: all_ids,
-                    dictionary: dict.unwrap_or_else(|| Arc::from(Vec::<SmartString>::new())),
+                    dictionary,
                     nulls: all_nulls,
                 }
             }
@@ -477,8 +485,7 @@ impl CompressedBlockStore {
                         None,
                         Some(&mut all_data),
                         Some(&mut all_offsets),
-                    )
-                    .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}, group={gi}: {e}"));
+                    )?;
                 }
                 ColumnData::Bytes {
                     data: all_data,
@@ -487,32 +494,22 @@ impl CompressedBlockStore {
                     nulls: all_nulls,
                 }
             }
-            _ => self
-                .decompress_block(
-                    col_idx,
-                    0,
-                    &col_blocks[0],
-                    type_tag,
-                    num_groups,
-                    dict,
-                    ext_type,
-                )
-                .unwrap_or_else(|e| panic!("corrupt V4 block: col={col_idx}: {e}")),
-        }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unknown column type tag",
+                ));
+            }
+        })
     }
 
-    /// Decompress and deserialize a single block with context in error messages.
-    #[allow(clippy::too_many_arguments)]
-    fn decompress_block(
+    fn block_layout(
         &self,
         col_idx: usize,
         gi: usize,
-        block: &[u8],
         type_tag: u8,
         num_groups: usize,
-        dict: Option<Arc<[SmartString]>>,
-        ext_type: DataType,
-    ) -> std::io::Result<ColumnData> {
+    ) -> std::io::Result<(usize, usize)> {
         let decomp_len = *self
             .decompressed_lens
             .get(col_idx)
@@ -543,6 +540,33 @@ impl CompressedBlockStore {
                 "invalid column block length",
             ));
         }
+        if type_tag == COL_BYTES
+            && group_rows
+                .checked_mul(17)
+                .and_then(|len| len.checked_add(16))
+                .is_none_or(|len| len > decomp_len)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid bytes block length",
+            ));
+        }
+        Ok((decomp_len, group_rows))
+    }
+
+    /// Decompress and deserialize a single block with context in error messages.
+    #[allow(clippy::too_many_arguments)]
+    fn decompress_block(
+        &self,
+        col_idx: usize,
+        gi: usize,
+        block: &[u8],
+        type_tag: u8,
+        num_groups: usize,
+        dict: Option<Arc<[SmartString]>>,
+        ext_type: DataType,
+    ) -> std::io::Result<ColumnData> {
+        let (decomp_len, group_rows) = self.block_layout(col_idx, gi, type_tag, num_groups)?;
         let raw_bytes = if block.len() == decomp_len {
             return deserialize_column_block(block, type_tag, group_rows, dict, ext_type);
         } else {
@@ -591,8 +615,7 @@ impl CompressedBlockStore {
         bytes_data_out: Option<&mut Vec<u8>>,
         bytes_offsets_out: Option<&mut Vec<(u64, u64)>>,
     ) -> std::io::Result<()> {
-        let decomp_len = self.decompressed_lens[col_idx][gi];
-        let group_rows = self.group_row_count(gi, num_groups)?;
+        let (decomp_len, group_rows) = self.block_layout(col_idx, gi, type_tag, num_groups)?;
         if block.len() == decomp_len {
             return deserialize_column_block_into(
                 block,
@@ -611,15 +634,22 @@ impl CompressedBlockStore {
         if lz4_buf.len() < decomp_len {
             lz4_buf.resize(decomp_len, 0);
         }
-        lz4_flex::decompress_into(block, &mut lz4_buf[..decomp_len]).map_err(|e| {
-            std::io::Error::new(
+        let decoded_len =
+            lz4_flex::decompress_into(block, &mut lz4_buf[..decomp_len]).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "corrupt V4 block: col={}, group={}/{}: {}",
+                        col_idx, gi, num_groups, e
+                    ),
+                )
+            })?;
+        if decoded_len != decomp_len {
+            return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!(
-                    "corrupt V4 block: col={}, group={}/{}: {}",
-                    col_idx, gi, num_groups, e
-                ),
-            )
-        })?;
+                "LZ4 decoded length does not match block length",
+            ));
+        }
         deserialize_column_block_into(
             &lz4_buf[..decomp_len],
             type_tag,
@@ -1066,7 +1096,11 @@ impl std::ops::Index<usize> for LazyColumns {
         let col = self.slots[idx].get_or_init(|| {
             self.compressed_store
                 .as_ref()
-                .map(|store| store.decompress_column(idx))
+                .map(|store| {
+                    store
+                        .decompress_column(idx)
+                        .unwrap_or_else(|e| panic!("corrupt V4 column: col={idx}: {e}"))
+                })
                 .unwrap_or_else(|| {
                     panic!(
                         "BUG: column {} accessed on cold volume (no compressed store). \

@@ -43,6 +43,191 @@ fn bytes_block(offset_count: u64) -> Vec<u8> {
     raw
 }
 
+trait ColumnErrorKind {
+    fn error_kind(self) -> Option<ErrorKind>;
+}
+
+impl ColumnErrorKind for ColumnData {
+    fn error_kind(self) -> Option<ErrorKind> {
+        None
+    }
+}
+
+impl ColumnErrorKind for std::io::Result<ColumnData> {
+    fn error_kind(self) -> Option<ErrorKind> {
+        self.err().map(|error| error.kind())
+    }
+}
+
+fn assert_column_error(store: &CompressedBlockStore, col: usize, kind: ErrorKind) {
+    for _ in 0..2 {
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            store.decompress_column(col).error_kind()
+        }));
+        assert!(outcome.is_ok(), "whole-column decode panicked");
+        assert_eq!(outcome.unwrap(), Some(kind));
+    }
+}
+
+fn two_group_store(
+    first: Vec<u8>,
+    second: Vec<u8>,
+    lengths: Vec<usize>,
+    data_type: DataType,
+) -> CompressedBlockStore {
+    let dictionary = data_type == DataType::Text;
+    CompressedBlockStore::from_raw_blocks(
+        vec![vec![first, second]],
+        vec![lengths],
+        vec![match data_type {
+            DataType::Text => 5,
+            DataType::Json => 6,
+            _ => 1,
+        }],
+        vec![data_type],
+        vec![data_type as u8],
+        if dictionary {
+            vec!["value".into()]
+        } else {
+            Vec::new()
+        },
+        if dictionary {
+            vec![(0, 0, 1)]
+        } else {
+            Vec::new()
+        },
+        2,
+        4,
+    )
+}
+
+#[test]
+fn whole_column_rejects_incorrect_lz4_output_length() {
+    let store = store(lz4_flex::compress(&[0; 17]), 18, DataType::Integer);
+    assert_column_error(&store, 0, ErrorKind::InvalidData);
+}
+
+#[test]
+fn whole_column_rejects_late_short_lz4_output() {
+    let store = two_group_store(
+        lz4_flex::compress(&[0; 18]),
+        lz4_flex::compress(&[0; 17]),
+        vec![18, 18],
+        DataType::Integer,
+    );
+    assert_column_error(&store, 0, ErrorKind::InvalidData);
+}
+
+#[test]
+fn whole_column_rejects_late_trailing_payload() {
+    for data_type in [DataType::Integer, DataType::Json] {
+        let raw = if data_type == DataType::Json {
+            bytes_block(2)
+        } else {
+            vec![0; 18]
+        };
+        let mut trailing = raw.clone();
+        trailing.push(0);
+        for compressed in [false, true] {
+            let store = two_group_store(
+                raw.clone(),
+                if compressed {
+                    lz4_flex::compress(&trailing)
+                } else {
+                    trailing.clone()
+                },
+                vec![raw.len(), trailing.len()],
+                data_type,
+            );
+            assert_column_error(&store, 0, ErrorKind::InvalidData);
+        }
+    }
+}
+
+#[test]
+fn whole_column_rejects_late_invalid_bytes_offsets() {
+    for count in [1, 3, u64::MAX] {
+        let raw = bytes_block(2);
+        let bad = bytes_block(count);
+        let lengths = vec![raw.len(), bad.len()];
+        let store = two_group_store(raw, bad, lengths, DataType::Json);
+        assert_column_error(&store, 0, ErrorKind::InvalidData);
+    }
+}
+
+#[test]
+fn whole_column_rejects_late_overflowing_blob_length() {
+    let raw = bytes_block(2);
+    let mut bad = raw.clone();
+    let len_offset = bad.len() - 8;
+    bad[len_offset..].copy_from_slice(&u64::MAX.to_le_bytes());
+    let lengths = vec![raw.len(), bad.len()];
+    let store = two_group_store(raw, bad, lengths, DataType::Json);
+    assert_column_error(&store, 0, ErrorKind::InvalidData);
+}
+
+#[test]
+fn whole_column_rejects_late_invalid_dictionary_ids() {
+    let raw = vec![0; 10];
+    let mut bad = raw.clone();
+    bad[2..6].copy_from_slice(&1u32.to_le_bytes());
+    let store = two_group_store(raw, bad, vec![10, 10], DataType::Text);
+    assert_column_error(&store, 0, ErrorKind::InvalidData);
+}
+
+#[test]
+fn whole_column_rejects_missing_group_lengths() {
+    let store = two_group_store(vec![0; 18], vec![0; 18], vec![18], DataType::Integer);
+    assert_column_error(&store, 0, ErrorKind::InvalidData);
+}
+
+#[test]
+fn whole_column_rejects_inconsistent_row_geometry() {
+    let store = CompressedBlockStore::from_raw_blocks(
+        vec![vec![vec![0; 18]]],
+        vec![vec![18]],
+        vec![1],
+        vec![DataType::Integer],
+        vec![0],
+        Vec::new(),
+        Vec::new(),
+        1,
+        2,
+    );
+    assert_column_error(&store, 0, ErrorKind::InvalidData);
+}
+
+#[test]
+fn whole_column_rejects_unrepresentable_decoded_length() {
+    let store = store(vec![0xff], usize::MAX, DataType::Json);
+    assert_column_error(&store, 0, ErrorKind::InvalidData);
+}
+
+#[test]
+fn whole_column_rejects_out_of_range_indices() {
+    let store = store(vec![0; 18], 18, DataType::Integer);
+    for col in [1, usize::MAX] {
+        assert_column_error(&store, col, ErrorKind::InvalidInput);
+    }
+}
+
+#[test]
+fn empty_whole_column_preserves_its_type() {
+    let types = vec![DataType::Integer];
+    let columns = LazyColumns::eager(
+        vec![ColumnData::Int64 {
+            values: Vec::new(),
+            nulls: Vec::new(),
+        }],
+        types.clone(),
+    );
+    let store = CompressedBlockStore::compress_columns(&columns, &types, 0);
+    let decoded = LazyColumns::deferred(store, types);
+    assert!(
+        matches!(&decoded[0], ColumnData::Int64 { values, nulls } if values.is_empty() && nulls.is_empty())
+    );
+}
+
 fn assert_invalid_block(raw: Vec<u8>, data_type: DataType) {
     let store = store(raw.clone(), raw.len(), data_type);
     for _ in 0..2 {
@@ -266,6 +451,34 @@ fn valid_group_round_trip_preserves_all_column_types_and_nulls() {
                 assert_eq!(group.get_value(row), columns[ci].get_value(row));
             }
         }
+        let two_groups = CompressedBlockStore::from_raw_blocks(
+            store
+                .raw_blocks()
+                .iter()
+                .map(|blocks| vec![blocks[0].clone(); 2])
+                .collect(),
+            store
+                .decompressed_lens()
+                .iter()
+                .map(|lengths| vec![lengths[0]; 2])
+                .collect(),
+            store.col_type_tags().to_vec(),
+            types.clone(),
+            store.col_ext_types().to_vec(),
+            vec!["value".into()],
+            vec![(4, 0, 1)],
+            2,
+            4,
+        );
+        for (store, rows) in [(store, 2), (two_groups, 4)] {
+            let decoded = LazyColumns::deferred(store, types.clone());
+            for ci in 0..types.len() {
+                assert_eq!(decoded[ci].len(), rows);
+                for row in 0..rows {
+                    assert_eq!(decoded[ci].get_value(row), columns[ci].get_value(row % 2));
+                }
+            }
+        }
     }
 }
 
@@ -291,6 +504,11 @@ fn valid_final_partial_group_preserves_rows() {
         assert_eq!(last.len(), 3);
         for i in 0..3 {
             assert_eq!(last.get_i64(i), (ROW_GROUP_SIZE + i) as i64);
+        }
+        let decoded = LazyColumns::deferred(store, vec![DataType::Integer]);
+        assert_eq!(decoded[0].len(), rows);
+        for i in [0, ROW_GROUP_SIZE - 1, ROW_GROUP_SIZE, rows - 1] {
+            assert_eq!(decoded[0].get_i64(i), i as i64);
         }
     }
 }

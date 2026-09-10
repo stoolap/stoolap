@@ -802,7 +802,7 @@ pub(crate) fn deserialize_column_block_into(
         }
         COL_BYTES => {
             read_nulls_into(data, &mut pos, row_count, nulls_out)?;
-            let offset_count = read_u64(data, &mut pos)? as usize;
+            let offset_count = read_u64(data, &mut pos)?;
             let bytes_data = bytes_data_out.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, "missing bytes_data_out buffer")
             })?;
@@ -812,7 +812,7 @@ pub(crate) fn deserialize_column_block_into(
                     "missing bytes_offsets_out buffer",
                 )
             })?;
-            if offset_count != row_count {
+            if offset_count != row_count as u64 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
@@ -821,9 +821,15 @@ pub(crate) fn deserialize_column_block_into(
                     ),
                 ));
             }
+            if row_count > data.len().saturating_sub(pos) / 16 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "truncated column block: bytes offsets",
+                ));
+            }
             let base = bytes_data.len() as u64;
-            bytes_offsets.reserve(offset_count);
-            for _ in 0..offset_count {
+            bytes_offsets.reserve(row_count);
+            for _ in 0..row_count {
                 let off = read_u64(data, &mut pos)?;
                 let len = read_u64(data, &mut pos)?;
                 let adjusted = off.checked_add(base).ok_or_else(|| {
@@ -831,18 +837,20 @@ pub(crate) fn deserialize_column_block_into(
                 })?;
                 bytes_offsets.push((adjusted, len));
             }
-            let data_len = read_u64(data, &mut pos)? as usize;
-            if pos + data_len > data.len() {
+            let data_len = read_u64(data, &mut pos)?;
+            if data_len > data.len().saturating_sub(pos) as u64 {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated column block: bytes data",
                 ));
             }
-            bytes_data.extend_from_slice(&data[pos..pos + data_len]);
+            let end_pos = pos + data_len as usize;
+            bytes_data.extend_from_slice(&data[pos..end_pos]);
+            pos = end_pos;
             // Validate offsets against the data blob
             for (i, &(off, len)) in bytes_offsets
                 .iter()
-                .skip(bytes_offsets.len() - offset_count)
+                .skip(bytes_offsets.len() - row_count)
                 .enumerate()
             {
                 let end = off.checked_add(len).ok_or_else(|| {
@@ -851,7 +859,7 @@ pub(crate) fn deserialize_column_block_into(
                         format!("bytes offset overflow at row {}", i),
                     )
                 })?;
-                if (end as usize) > bytes_data.len() {
+                if end > bytes_data.len() as u64 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -871,6 +879,12 @@ pub(crate) fn deserialize_column_block_into(
                 format!("unknown column type tag {}", col_type_tag),
             ));
         }
+    }
+    if pos != data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing bytes in column block",
+        ));
     }
     Ok(())
 }
