@@ -1089,7 +1089,7 @@ fn scanner_whole_column_failures_are_sticky_in_both_directions() {
         for mode in 0..3 {
             let mut volume = two_column_volume();
             volume.columns = LazyColumns::metadata_only(vec![DataType::Integer; 2]);
-            let mut scanner = VolumeScanner::new(Arc::new(volume), vec![1], None);
+            let mut scanner = VolumeScanner::new(Arc::new(volume), vec![1], None).unwrap();
             scanner.set_ordered_walk(ascending);
             if mode == 1 {
                 scanner.set_stop_key(1, &Value::Integer(1), ascending);
@@ -1497,7 +1497,7 @@ fn scanner_reports_a_missing_group_for_full_and_partial_projections() {
             2,
         );
         volume.columns = LazyColumns::deferred(store, vec![DataType::Integer; 2]);
-        let mut scanner = VolumeScanner::new(Arc::new(volume), projection, None);
+        let mut scanner = VolumeScanner::new(Arc::new(volume), projection, None).unwrap();
         let outcome = catch_unwind(AssertUnwindSafe(|| scanner.next()));
         assert!(outcome.is_ok(), "scanner panicked on missing group");
         assert!(!outcome.unwrap());
@@ -1528,7 +1528,7 @@ fn scanner_reports_structural_payload_corruption_after_reopen() {
     bytes.extend_from_slice(&crc32fast::hash(&bytes).to_le_bytes());
     std::fs::write(&path, bytes).unwrap();
     let volume = Arc::new(read_volume_from_disk(&path).unwrap());
-    let mut scanner = VolumeScanner::new(volume, vec![1], None);
+    let mut scanner = VolumeScanner::new(volume, vec![1], None).unwrap();
     assert!(!scanner.next(), "malformed block yielded a row");
     assert!(
         scanner.err().is_some(),

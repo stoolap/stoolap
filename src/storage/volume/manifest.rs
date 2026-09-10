@@ -1055,12 +1055,13 @@ impl SegmentManager {
                 _ => None,
             };
             if let Some(target) = target {
+                let row_ids = vol.row_ids()?;
                 let col = vol.columns.get(pi)?;
                 if vol.is_sorted(pi) {
                     let start = col.binary_search_ge(target);
                     let mut i = start;
                     while i < vol.meta.row_count && col.get_i64(i) == target {
-                        let rid = vol.meta.row_ids[i];
+                        let rid = row_ids[i];
                         if seen.insert(rid) && !ts.contains_key(&rid) {
                             if seg_ids.len() > 1 {
                                 if let Some(current_val) =
@@ -1077,8 +1078,7 @@ impl SegmentManager {
                         i += 1;
                     }
                 } else {
-                    for i in 0..vol.meta.row_count {
-                        let rid = vol.meta.row_ids[i];
+                    for (i, &rid) in row_ids.iter().enumerate() {
                         if !seen.insert(rid) {
                             continue;
                         }
@@ -1253,11 +1253,12 @@ impl SegmentManager {
                 vol
             };
             // Tier 3: Per-volume hash index
+            let row_ids = vol.row_ids()?;
             let mut vol_result: Option<i64> = None;
             if !has_missing {
                 // Common path: no schema evolution, pass values directly (zero alloc)
                 vol.unique_lookup_all(&vol_col_indices, values, |row_idx| {
-                    let rid = vol.meta.row_ids[row_idx as usize];
+                    let rid = row_ids[row_idx as usize];
                     if ts.contains_key(&rid) {
                         false
                     } else if seen.insert(rid) {
@@ -1276,8 +1277,7 @@ impl SegmentManager {
                     .filter(|(_, &vi)| vi != usize::MAX)
                     .map(|(i, &vi)| vol.columns.get(vi).map(|col| (i, col)))
                     .collect::<std::io::Result<_>>()?;
-                for i in 0..vol.meta.row_count {
-                    let rid = vol.meta.row_ids[i];
+                for (i, &rid) in row_ids.iter().enumerate() {
                     if ts.contains_key(&rid) || !seen.insert(rid) {
                         continue;
                     }

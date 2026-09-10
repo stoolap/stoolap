@@ -325,7 +325,8 @@ impl VolumeScanner {
         volume: Arc<FrozenVolume>,
         project_cols: Vec<usize>,
         _delete_vector: Option<()>,
-    ) -> Self {
+    ) -> Result<Self> {
+        let end_idx = volume.row_ids()?.len();
         let project = if project_cols.is_empty() {
             (0..volume.columns.len()).collect()
         } else {
@@ -335,7 +336,7 @@ impl VolumeScanner {
         // Stamp with current global eviction epoch so the volume ages correctly.
         volume.mark_accessed();
         let mut s = Self {
-            end_idx: volume.meta.row_count,
+            end_idx,
             volume,
             project_cols: project,
             is_full_projection,
@@ -373,7 +374,7 @@ impl VolumeScanner {
             }
             s.needed_cols = Some(mask);
         }
-        s
+        Ok(s)
     }
 
     /// Create a scanner with a start/end range (for binary-search narrowing).
@@ -383,7 +384,8 @@ impl VolumeScanner {
         start_idx: usize,
         end_idx: usize,
         _delete_vector: Option<()>,
-    ) -> Self {
+    ) -> Result<Self> {
+        volume.row_ids()?;
         let project = if project_cols.is_empty() {
             (0..volume.columns.len()).collect()
         } else {
@@ -430,7 +432,7 @@ impl VolumeScanner {
             }
             s.needed_cols = Some(mask);
         }
-        s
+        Ok(s)
     }
 
     /// Set per-transaction pending cold deletes. The owning transaction
@@ -1488,7 +1490,7 @@ mod tests {
     #[test]
     fn test_full_scan() {
         let vol = make_test_volume();
-        let mut scanner = VolumeScanner::new(vol, vec![], None);
+        let mut scanner = VolumeScanner::new(vol, vec![], None).unwrap();
 
         let mut count = 0;
         while scanner.next() {
@@ -1504,7 +1506,7 @@ mod tests {
     fn test_projected_scan() {
         let vol = make_test_volume();
         // Only scan name and price (columns 1, 2)
-        let mut scanner = VolumeScanner::new(vol, vec![1, 2], None);
+        let mut scanner = VolumeScanner::new(vol, vec![1, 2], None).unwrap();
 
         assert!(scanner.next());
         let row = scanner.row();
@@ -1517,7 +1519,7 @@ mod tests {
     fn test_range_scan() {
         let vol = make_test_volume();
         // Scan rows 2..4 (indices 2, 3)
-        let mut scanner = VolumeScanner::with_range(Arc::clone(&vol), vec![], 2, 4, None);
+        let mut scanner = VolumeScanner::with_range(Arc::clone(&vol), vec![], 2, 4, None).unwrap();
 
         let mut count = 0;
         let mut ids = Vec::new();
@@ -1541,7 +1543,7 @@ mod tests {
     #[test]
     fn test_take_row() {
         let vol = make_test_volume();
-        let mut scanner = VolumeScanner::new(vol, vec![0], None);
+        let mut scanner = VolumeScanner::new(vol, vec![0], None).unwrap();
 
         assert!(scanner.next());
         let row = scanner.take_row();
@@ -1553,20 +1555,10 @@ mod tests {
         let vol = make_test_volume();
 
         // Create two scanners: first 2 rows, then last 2 rows
-        let scanner1 = Box::new(VolumeScanner::with_range(
-            Arc::clone(&vol),
-            vec![0],
-            0,
-            2,
-            None,
-        ));
-        let scanner2 = Box::new(VolumeScanner::with_range(
-            Arc::clone(&vol),
-            vec![0],
-            3,
-            5,
-            None,
-        ));
+        let scanner1 =
+            Box::new(VolumeScanner::with_range(Arc::clone(&vol), vec![0], 0, 2, None).unwrap());
+        let scanner2 =
+            Box::new(VolumeScanner::with_range(Arc::clone(&vol), vec![0], 3, 5, None).unwrap());
 
         let mut merger = MergingScanner::new(vec![scanner1, scanner2]);
 
@@ -1583,10 +1575,10 @@ mod tests {
     #[test]
     fn test_estimated_count() {
         let vol = make_test_volume();
-        let scanner = VolumeScanner::new(Arc::clone(&vol), vec![], None);
+        let scanner = VolumeScanner::new(Arc::clone(&vol), vec![], None).unwrap();
         assert_eq!(scanner.estimated_count(), Some(5));
 
-        let scanner = VolumeScanner::with_range(vol, vec![], 2, 4, None);
+        let scanner = VolumeScanner::with_range(vol, vec![], 2, 4, None).unwrap();
         assert_eq!(scanner.estimated_count(), Some(2));
     }
 }

@@ -308,10 +308,11 @@ impl SegmentedTable {
             // Use column mapping to translate schema indices to physical volume indices.
             // After DROP COLUMN + ADD COLUMN, schema positions may not match volume layout.
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+            let row_ids = vol.row_ids()?;
             let Some(start) = (0..vol.meta.row_count).find(|&i| {
                 cs.is_visible(i)
-                    && !self.is_row_tombstoned(&ts, vol.meta.row_ids[i])
-                    && !hot_skip.contains(&vol.meta.row_ids[i])
+                    && !self.is_row_tombstoned(&ts, row_ids[i])
+                    && !hot_skip.contains(&row_ids[i])
             }) else {
                 continue;
             };
@@ -319,11 +320,10 @@ impl SegmentedTable {
                 Some(super::writer::ColSource::Volume(phys)) => vol.columns.get(*phys).map(Some),
                 _ => Ok(None),
             }).collect::<std::io::Result<smallvec::SmallVec<[Option<&super::column::ColumnData>; 4]>>>()?;
-            for i in start..vol.meta.row_count {
+            for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                let rid = vol.meta.row_ids[i];
                 if self.is_row_tombstoned(&ts, rid) {
                     continue;
                 }
@@ -393,8 +393,9 @@ impl SegmentedTable {
             let vol = &cs.volume;
             // Use column mapping to translate schema indices to physical volume indices.
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, schema);
+            let row_ids = vol.row_ids()?;
             let Some(start) = (0..vol.meta.row_count)
-                .find(|&i| cs.is_visible(i) && !self.is_row_tombstoned(&ts, vol.meta.row_ids[i]))
+                .find(|&i| cs.is_visible(i) && !self.is_row_tombstoned(&ts, row_ids[i]))
             else {
                 continue;
             };
@@ -402,11 +403,10 @@ impl SegmentedTable {
                 Some(super::writer::ColSource::Volume(phys)) => vol.columns.get(*phys).map(Some),
                 _ => Ok(None),
             }).collect::<std::io::Result<smallvec::SmallVec<[Option<&super::column::ColumnData>; 4]>>>()?;
-            for i in start..vol.meta.row_count {
+            for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                let rid = vol.meta.row_ids[i];
                 if self.is_row_tombstoned(&ts, rid) {
                     continue;
                 }
@@ -877,7 +877,7 @@ impl SegmentedTable {
                 )
             } else {
                 VolumeScanner::new(Arc::clone(vol), column_indices.to_vec(), None)
-            };
+            }?;
             // Each scanner gets the same small hot_skip Arc (no clone of hot IDs).
             // Inter-volume dedup is handled by the per-volume visibility bitmap.
             scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
@@ -1030,12 +1030,13 @@ impl SegmentedTable {
                     }
                 };
 
+                let row_ids = vol.row_ids()?;
                 let mut vol_rows = RowVec::new();
                 while let Some(i) = next_row() {
                     if !cs.is_visible(i) {
                         continue;
                     }
-                    let row_id = vol.meta.row_ids[i];
+                    let row_id = row_ids[i];
                     if self.is_row_tombstoned(tombstones_ref, row_id)
                         || hot_skip_ref.contains(&row_id)
                     {
@@ -1249,7 +1250,7 @@ impl SegmentedTable {
     #[allow(clippy::too_many_arguments)]
     fn min_column_scan_generic(
         &self,
-        vol: &FrozenVolume,
+        row_ids: &[i64],
         cs: &super::manifest::ColdSegment,
         col: &super::column::ColumnData,
         overall_min: &mut Option<Value>,
@@ -1257,11 +1258,10 @@ impl SegmentedTable {
         hot_skip: &FxHashSet<i64>,
         no_tombstones: bool,
     ) {
-        for i in 0..vol.meta.row_count {
+        for (i, &rid) in row_ids.iter().enumerate() {
             if col.is_null(i) || !cs.is_visible(i) {
                 continue;
             }
-            let rid = vol.meta.row_ids[i];
             if hot_skip.contains(&rid) {
                 continue;
             }
@@ -1284,7 +1284,7 @@ impl SegmentedTable {
     #[allow(clippy::too_many_arguments)]
     fn max_column_scan_generic(
         &self,
-        vol: &FrozenVolume,
+        row_ids: &[i64],
         cs: &super::manifest::ColdSegment,
         col: &super::column::ColumnData,
         overall_max: &mut Option<Value>,
@@ -1292,11 +1292,10 @@ impl SegmentedTable {
         hot_skip: &FxHashSet<i64>,
         no_tombstones: bool,
     ) {
-        for i in 0..vol.meta.row_count {
+        for (i, &rid) in row_ids.iter().enumerate() {
             if col.is_null(i) || !cs.is_visible(i) {
                 continue;
             }
-            let rid = vol.meta.row_ids[i];
             if hot_skip.contains(&rid) {
                 continue;
             }
@@ -1498,11 +1497,10 @@ impl Table for SegmentedTable {
 
             let mapping = cs.mapping.clone();
 
-            for i in 0..vol.meta.row_count {
+            for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                let row_id = vol.meta.row_ids[i];
                 if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
                     continue;
                 }
@@ -1745,11 +1743,10 @@ impl Table for SegmentedTable {
         let mut ids = Vec::new();
         for (_, cs) in volumes.iter() {
             let vol = &cs.volume;
-            for i in 0..vol.meta.row_count {
+            for (i, &id) in vol.row_ids()?.iter().enumerate() {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                let id = vol.meta.row_ids[i];
                 if !self.is_row_tombstoned(&tombstones_arc, id) && !hot_skip.contains(&id) {
                     ids.push(id);
                 }
@@ -1855,11 +1852,10 @@ impl Table for SegmentedTable {
 
             let mapping = cs.mapping.clone();
 
-            for i in 0..vol.meta.row_count {
+            for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                let row_id = vol.meta.row_ids[i];
                 if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
                     continue;
                 }
@@ -2183,7 +2179,7 @@ impl Table for SegmentedTable {
             Default::default(),
         );
         for (nf_idx, (_seg_id, cs)) in volumes.iter().enumerate() {
-            for &rid in &cs.volume.meta.row_ids {
+            for &rid in cs.volume.row_ids()? {
                 if hot_skip.contains(&rid) || self.is_row_tombstoned(&tombstones_arc, rid) {
                     continue;
                 }
@@ -2225,8 +2221,7 @@ impl Table for SegmentedTable {
 
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
 
-            for i in 0..vol.meta.row_count {
-                let rid = vol.meta.row_ids[i];
+            for (i, &rid) in vol.row_ids()?.iter().enumerate() {
                 if authority.get(&rid) != Some(&nf_idx) {
                     continue;
                 }
@@ -2342,11 +2337,10 @@ impl Table for SegmentedTable {
 
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
 
-            for i in 0..vol.meta.row_count {
+            for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                let row_id = vol.meta.row_ids[i];
                 if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
                     continue;
                 }
@@ -2610,10 +2604,11 @@ impl Table for SegmentedTable {
 
         for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
+            let row_ids = vol.row_ids()?;
             let Some(start) = (0..vol.meta.row_count).find(|&i| {
                 cs.is_visible(i)
-                    && !self.is_row_tombstoned(&tombstones_arc, vol.meta.row_ids[i])
-                    && !hot_skip.contains(&vol.meta.row_ids[i])
+                    && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                    && !hot_skip.contains(&row_ids[i])
             }) else {
                 continue;
             };
@@ -2631,7 +2626,7 @@ impl Table for SegmentedTable {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                let rid = vol.meta.row_ids[i];
+                let rid = row_ids[i];
                 if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
@@ -2795,6 +2790,7 @@ impl Table for SegmentedTable {
                 }
             }
 
+            let row_ids = vol.row_ids()?;
             // Typed direct scan: compare on primitive types to avoid Value alloc
             if let Some(pi) = phys {
                 let col = vol.columns.get(pi)?;
@@ -2806,7 +2802,7 @@ impl Table for SegmentedTable {
                             _ => {
                                 // Type mismatch: fall through to generic path
                                 self.min_column_scan_generic(
-                                    vol,
+                                    row_ids,
                                     cs,
                                     col,
                                     &mut overall_min,
@@ -2821,7 +2817,7 @@ impl Table for SegmentedTable {
                             if nulls[i] || !cs.is_visible(i) {
                                 continue;
                             }
-                            let rid = vol.meta.row_ids[i];
+                            let rid = row_ids[i];
                             if hot_skip.contains(&rid) {
                                 continue;
                             }
@@ -2843,7 +2839,7 @@ impl Table for SegmentedTable {
                             None => None,
                             _ => {
                                 self.min_column_scan_generic(
-                                    vol,
+                                    row_ids,
                                     cs,
                                     col,
                                     &mut overall_min,
@@ -2858,7 +2854,7 @@ impl Table for SegmentedTable {
                             if nulls[i] || !cs.is_visible(i) {
                                 continue;
                             }
-                            let rid = vol.meta.row_ids[i];
+                            let rid = row_ids[i];
                             if hot_skip.contains(&rid) {
                                 continue;
                             }
@@ -2889,7 +2885,7 @@ impl Table for SegmentedTable {
                             None => None,
                             _ => {
                                 self.min_column_scan_generic(
-                                    vol,
+                                    row_ids,
                                     cs,
                                     col,
                                     &mut overall_min,
@@ -2904,7 +2900,7 @@ impl Table for SegmentedTable {
                             if nulls[i] || !cs.is_visible(i) {
                                 continue;
                             }
-                            let rid = vol.meta.row_ids[i];
+                            let rid = row_ids[i];
                             if hot_skip.contains(&rid) {
                                 continue;
                             }
@@ -2929,7 +2925,7 @@ impl Table for SegmentedTable {
                     _ => {
                         // Dictionary, Boolean, Bytes: use generic get_value path
                         self.min_column_scan_generic(
-                            vol,
+                            row_ids,
                             cs,
                             col,
                             &mut overall_min,
@@ -2946,7 +2942,7 @@ impl Table for SegmentedTable {
                     if !cs.is_visible(i) {
                         return false;
                     }
-                    let rid = vol.meta.row_ids[i];
+                    let rid = row_ids[i];
                     if hot_skip.contains(&rid) {
                         return false;
                     }
@@ -3095,6 +3091,7 @@ impl Table for SegmentedTable {
                 }
             }
 
+            let row_ids = vol.row_ids()?;
             // Typed direct scan: compare on primitive types to avoid Value alloc
             if let Some(pi) = phys {
                 let col = vol.columns.get(pi)?;
@@ -3105,7 +3102,7 @@ impl Table for SegmentedTable {
                             None => None,
                             _ => {
                                 self.max_column_scan_generic(
-                                    vol,
+                                    row_ids,
                                     cs,
                                     col,
                                     &mut overall_max,
@@ -3120,7 +3117,7 @@ impl Table for SegmentedTable {
                             if nulls[i] || !cs.is_visible(i) {
                                 continue;
                             }
-                            let rid = vol.meta.row_ids[i];
+                            let rid = row_ids[i];
                             if hot_skip.contains(&rid) {
                                 continue;
                             }
@@ -3142,7 +3139,7 @@ impl Table for SegmentedTable {
                             None => None,
                             _ => {
                                 self.max_column_scan_generic(
-                                    vol,
+                                    row_ids,
                                     cs,
                                     col,
                                     &mut overall_max,
@@ -3157,7 +3154,7 @@ impl Table for SegmentedTable {
                             if nulls[i] || !cs.is_visible(i) {
                                 continue;
                             }
-                            let rid = vol.meta.row_ids[i];
+                            let rid = row_ids[i];
                             if hot_skip.contains(&rid) {
                                 continue;
                             }
@@ -3188,7 +3185,7 @@ impl Table for SegmentedTable {
                             None => None,
                             _ => {
                                 self.max_column_scan_generic(
-                                    vol,
+                                    row_ids,
                                     cs,
                                     col,
                                     &mut overall_max,
@@ -3203,7 +3200,7 @@ impl Table for SegmentedTable {
                             if nulls[i] || !cs.is_visible(i) {
                                 continue;
                             }
-                            let rid = vol.meta.row_ids[i];
+                            let rid = row_ids[i];
                             if hot_skip.contains(&rid) {
                                 continue;
                             }
@@ -3228,7 +3225,7 @@ impl Table for SegmentedTable {
                     _ => {
                         // Dictionary, Boolean, Bytes: use generic get_value path
                         self.max_column_scan_generic(
-                            vol,
+                            row_ids,
                             cs,
                             col,
                             &mut overall_max,
@@ -3243,7 +3240,7 @@ impl Table for SegmentedTable {
                     if !cs.is_visible(i) {
                         return false;
                     }
-                    let rid = vol.meta.row_ids[i];
+                    let rid = row_ids[i];
                     if hot_skip.contains(&rid) {
                         return false;
                     }
@@ -3315,10 +3312,11 @@ impl Table for SegmentedTable {
         let has_non_null_default = !default_val.is_null();
         for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
+            let row_ids = vol.row_ids()?;
             let Some(start) = (0..vol.meta.row_count).find(|&i| {
                 cs.is_visible(i)
-                    && !self.is_row_tombstoned(&tombstones_arc, vol.meta.row_ids[i])
-                    && !hot_skip.contains(&vol.meta.row_ids[i])
+                    && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                    && !hot_skip.contains(&row_ids[i])
             }) else {
                 continue;
             };
@@ -3332,11 +3330,10 @@ impl Table for SegmentedTable {
                 None
             };
             let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
-            for i in start..vol.meta.row_count {
+            for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                let rid = vol.meta.row_ids[i];
                 if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
@@ -3393,10 +3390,11 @@ impl Table for SegmentedTable {
         let has_non_null_default = !default_val.is_null();
         for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
+            let row_ids = vol.row_ids()?;
             let Some(start) = (0..vol.meta.row_count).find(|&i| {
                 cs.is_visible(i)
-                    && !self.is_row_tombstoned(&tombstones_arc, vol.meta.row_ids[i])
-                    && !hot_skip.contains(&vol.meta.row_ids[i])
+                    && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                    && !hot_skip.contains(&row_ids[i])
             }) else {
                 continue;
             };
@@ -3410,11 +3408,10 @@ impl Table for SegmentedTable {
                 None
             };
             let column = phys.map(|pi| vol.columns.get(pi)).transpose()?;
-            for i in start..vol.meta.row_count {
+            for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                let rid = vol.meta.row_ids[i];
                 if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
@@ -3513,20 +3510,19 @@ impl Table for SegmentedTable {
                 }
 
                 // Fallback: row-by-row scan on this volume's column
+                let row_ids = vol.row_ids()?;
                 let Some(start) = (0..vol.meta.row_count).find(|&i| {
                     cs.is_visible(i)
-                        && !hot_skip.contains(&vol.meta.row_ids[i])
-                        && (no_tombstones
-                            || !self.is_row_tombstoned(&tombstones_arc, vol.meta.row_ids[i]))
+                        && !hot_skip.contains(&row_ids[i])
+                        && (no_tombstones || !self.is_row_tombstoned(&tombstones_arc, row_ids[i]))
                 }) else {
                     continue;
                 };
                 let col = vol.columns.get(pi)?;
-                for i in start..vol.meta.row_count {
+                for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                     if !cs.is_visible(i) {
                         continue;
                     }
-                    let rid = vol.meta.row_ids[i];
                     if hot_skip.contains(&rid) {
                         continue;
                     }
@@ -3539,11 +3535,12 @@ impl Table for SegmentedTable {
                 }
             } else if has_non_null_default {
                 // Column was added after this volume was sealed — use default
+                let row_ids = vol.row_ids()?;
                 let has_visible = (0..vol.meta.row_count).any(|i| {
                     if !cs.is_visible(i) {
                         return false;
                     }
-                    let rid = vol.meta.row_ids[i];
+                    let rid = row_ids[i];
                     if hot_skip.contains(&rid) {
                         return false;
                     }
@@ -3604,10 +3601,11 @@ impl Table for SegmentedTable {
         for (_seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
             let mapping = &cs.mapping;
+            let row_ids = vol.row_ids()?;
             let Some(start) = (0..vol.meta.row_count).find(|&i| {
                 cs.is_visible(i)
-                    && !self.is_row_tombstoned(&tombstones_arc, vol.meta.row_ids[i])
-                    && !hot_skip.contains(&vol.meta.row_ids[i])
+                    && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                    && !hot_skip.contains(&row_ids[i])
             }) else {
                 continue;
             };
@@ -3622,11 +3620,10 @@ impl Table for SegmentedTable {
             };
 
             let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
-            for i in start..vol.meta.row_count {
+            for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                let rid = vol.meta.row_ids[i];
                 if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
@@ -3719,10 +3716,11 @@ impl Table for SegmentedTable {
                     continue;
                 }
             }
+            let row_ids = vol.row_ids()?;
             let Some(start) = (0..vol.meta.row_count).find(|&i| {
                 cs.is_visible(i)
-                    && !self.is_row_tombstoned(&tombstones_arc, vol.meta.row_ids[i])
-                    && !hot_skip.contains(&vol.meta.row_ids[i])
+                    && !self.is_row_tombstoned(&tombstones_arc, row_ids[i])
+                    && !hot_skip.contains(&row_ids[i])
             }) else {
                 continue;
             };
@@ -3740,11 +3738,10 @@ impl Table for SegmentedTable {
             };
 
             let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
-            for i in start..vol.meta.row_count {
+            for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                let rid = vol.meta.row_ids[i];
                 if self.is_row_tombstoned(&tombstones_arc, rid) || hot_skip.contains(&rid) {
                     continue;
                 }
@@ -3847,8 +3844,8 @@ impl Table for SegmentedTable {
         //    For DESC, we iterate each source from the end.
 
         // Pre-compute column mappings for each volume.
-        struct VolSource {
-            row_ids: Vec<i64>,
+        struct VolSource<'a> {
+            row_ids: &'a [i64],
             cursor: usize,
             mapping: super::writer::ColumnMapping,
             volume: Arc<FrozenVolume>,
@@ -3864,7 +3861,7 @@ impl Table for SegmentedTable {
             }
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
             vol_sources.push(VolSource {
-                row_ids: vol.meta.row_ids.clone(),
+                row_ids: vol.row_ids()?,
                 cursor: if ascending { 0 } else { vol.meta.row_count },
                 mapping,
                 volume: Arc::clone(&cs.volume),
@@ -4234,7 +4231,7 @@ impl Table for SegmentedTable {
                     }
                 }
                 let mut scanner =
-                    VolumeScanner::with_range(Arc::clone(vol), all_cols.clone(), start, end, None);
+                    VolumeScanner::with_range(Arc::clone(vol), all_cols.clone(), start, end, None)?;
                 scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
                 scanner.set_visibility_bitmap(cs.visible.clone());
                 scanner.snapshot_seq = self.snapshot_seq;
@@ -4640,11 +4637,10 @@ impl Table for SegmentedTable {
             for (seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
-                for i in 0..vol.meta.row_count {
+                for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
                     if !cs.is_visible(i) {
                         continue;
                     }
-                    let row_id = vol.meta.row_ids[i];
                     if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id)
                     {
                         continue;
@@ -5378,6 +5374,7 @@ impl Table for SegmentedTable {
                 let mut agg_columns =
                     smallvec::SmallVec::<[Option<&super::column::ColumnData>; 4]>::new();
                 let mut group_candidates: Vec<usize> = Vec::new();
+                let row_ids = vol.row_ids()?;
                 let row_count = vol.meta.row_count;
                 let rg_size = super::column::ROW_GROUP_SIZE;
                 let num_groups = row_count.div_ceil(rg_size);
@@ -5431,7 +5428,7 @@ impl Table for SegmentedTable {
                         if !cs.is_visible(i) {
                             continue;
                         }
-                        let row_id = vol.meta.row_ids[i];
+                        let row_id = row_ids[i];
                         if self.is_row_tombstoned(tombstones_ref, row_id)
                             || hot_skip_ref.contains(&row_id)
                         {
@@ -6128,10 +6125,11 @@ impl Table for SegmentedTable {
                     return Ok(None);
                 }
 
+                let row_ids = vol.row_ids()?;
                 let Some(start) = (0..vol.meta.row_count).find(|&i| {
                     cs.is_visible(i)
-                        && !self.is_row_tombstoned(tombstones_ref, vol.meta.row_ids[i])
-                        && !hot_skip_ref.contains(&vol.meta.row_ids[i])
+                        && !self.is_row_tombstoned(tombstones_ref, row_ids[i])
+                        && !hot_skip_ref.contains(&row_ids[i])
                 }) else {
                     return Ok(None);
                 };
@@ -6193,7 +6191,7 @@ impl Table for SegmentedTable {
                                     if !cs.is_visible(i) {
                                         continue;
                                     }
-                                    let rid = vol.meta.row_ids[i];
+                                    let rid = row_ids[i];
                                     if self.is_row_tombstoned(tombstones_ref, rid)
                                         || hot_skip_ref.contains(&rid)
                                     {
@@ -6235,11 +6233,10 @@ impl Table for SegmentedTable {
                             let mut null_acc: Vec<Accum> = vec![Accum::default(); agg_count];
                             let mut null_cnt: u32 = 0;
 
-                            for i in start..vol.meta.row_count {
+                            for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                                 if !cs.is_visible(i) {
                                     continue;
                                 }
-                                let rid = vol.meta.row_ids[i];
                                 if self.is_row_tombstoned(tombstones_ref, rid)
                                     || hot_skip_ref.contains(&rid)
                                 {
@@ -6291,11 +6288,10 @@ impl Table for SegmentedTable {
                     super::writer::ColSource::Default(default_val) => {
                         let mut la = vec![Accum::default(); agg_count];
                         let mut visible = 0usize;
-                        for i in start..vol.meta.row_count {
+                        for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                             if !cs.is_visible(i) {
                                 continue;
                             }
-                            let rid = vol.meta.row_ids[i];
                             if self.is_row_tombstoned(tombstones_ref, rid)
                                 || hot_skip_ref.contains(&rid)
                             {
