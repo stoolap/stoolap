@@ -450,10 +450,18 @@ impl CompressedBlockStore {
                     )?;
                 }
                 let dictionary = dict.unwrap_or_else(|| Arc::from(Vec::<SmartString>::new()));
-                if all_ids
+                // One pass over the ids clears a valid column; the null-aware
+                // scan runs only when some id is out of range
+                let out_of_range = all_ids
                     .iter()
-                    .zip(&all_nulls)
-                    .any(|(&id, &is_null)| !is_null && id as usize >= dictionary.len())
+                    .copied()
+                    .max()
+                    .is_some_and(|max_id| max_id as usize >= dictionary.len());
+                if out_of_range
+                    && all_ids
+                        .iter()
+                        .zip(&all_nulls)
+                        .any(|(&id, &is_null)| !is_null && id as usize >= dictionary.len())
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
