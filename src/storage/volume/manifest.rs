@@ -2362,7 +2362,7 @@ impl SegmentManager {
         let table_dir = volume_dir.join(table_name);
         let manifest_path = table_dir.join("manifest.bin");
 
-        if !manifest_path.exists() {
+        if !manifest_path.try_exists()? {
             return Ok(None);
         }
 
