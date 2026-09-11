@@ -105,8 +105,8 @@ jobs:
     - name: Differential oracle tests (Stoolap vs SQLite)
       run: cargo test --test differential_oracle_test --features sqlite
 
-    - name: Failpoint I/O tests
-      run: cargo test --test failpoint_io_test --features test-failpoints -- --test-threads=1
+    - name: Failpoint tests
+      run: cargo test --test failpoint_io_test --test captured_version_payload_test --features test-failpoints -- --test-threads=1
 
   coverage:
     name: Code Coverage

@@ -705,6 +705,14 @@ impl VersionStore {
         &self.table_name
     }
 
+    #[inline]
+    fn snapshot_versions(&self) -> crate::common::CowBTree<VersionChainEntry> {
+        let versions = self.versions.read().clone();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::version_root_captured();
+        versions
+    }
+
     /// Returns the schema (cheap CompactArc clone)
     pub fn schema(&self) -> CompactArc<Schema> {
         self.schema.read().clone()
@@ -1725,21 +1733,8 @@ impl VersionStore {
         let mut results = Vec::with_capacity(row_ids.len());
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
+        let versions = self.snapshot_versions();
 
-        // Pre-acquire arena lock for O(1) Arc clones
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-
-        // Helper: get row from arena (O(1)) or version (O(n) clone)
-        let get_row = |entry: &VersionChainEntry| -> Row {
-            if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
-                if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(CompactArc::clone(arc_row));
-                }
-            }
-            entry.version.data.clone()
-        };
         for &row_id in row_ids {
             if let Some(chain) = versions.get(row_id) {
                 // FAST PATH: Check HEAD version first - O(1) for common case
@@ -1751,7 +1746,7 @@ impl VersionStore {
                     if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
                         let mut version_copy = chain.version.clone();
                         version_copy.create_time = current_seq;
-                        results.push((row_id, get_row(chain), version_copy));
+                        results.push((row_id, chain.version.data.clone(), version_copy));
                     }
                     continue;
                 }
@@ -1771,7 +1766,7 @@ impl VersionStore {
                             // Store the current sequence in create_time for later retrieval
                             // (This is a bit of a hack, but avoids changing the struct)
                             version_copy.create_time = current_seq;
-                            results.push((row_id, get_row(e), version_copy));
+                            results.push((row_id, e.version.data.clone(), version_copy));
                         }
                         break;
                     }
@@ -2236,21 +2231,8 @@ impl VersionStore {
         };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
+        let versions = self.snapshot_versions();
 
-        // Pre-acquire arena lock for O(1) Arc clones
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-
-        // Helper: get row from arena (O(1)) or version (O(n) clone)
-        let get_row = |entry: &VersionChainEntry| -> Row {
-            if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
-                if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(CompactArc::clone(arc_row));
-                }
-            }
-            entry.version.data.clone()
-        };
         let mut results = RowVec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -2261,7 +2243,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    results.push((row_id, get_row(chain)));
+                    results.push((row_id, chain.version.data.clone()));
                 }
                 continue;
             }
@@ -2274,7 +2256,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        results.push((row_id, get_row(e)));
+                        results.push((row_id, e.version.data.clone()));
                     }
                     break;
                 }
@@ -2285,12 +2267,7 @@ impl VersionStore {
         results
     }
 
-    /// Returns all visible rows using arena for zero-copy scanning
-    ///
-    /// This method provides 50x+ faster full table scans by:
-    /// 1. Pre-acquiring arena locks once
-    /// 2. Reading directly during visibility iteration (single pass)
-    /// 3. Using contiguous arena memory for cache locality
+    /// Returns all visible rows from a captured version root.
     #[inline]
     pub fn get_all_visible_rows_arena(&self, txn_id: i64) -> RowVec {
         if self.closed.load(Ordering::Acquire) {
@@ -2303,23 +2280,8 @@ impl VersionStore {
         };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
+        let versions = self.snapshot_versions();
 
-        // Pre-acquire arena lock ONCE for the entire operation
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-
-        // Helper closure to get row data from arena or version
-        let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(CompactArc::clone(arc_row));
-                }
-            }
-            e.version.data.clone()
-        };
-
-        // Single-pass: read directly from arena during visibility check
         let mut result = RowVec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -2330,7 +2292,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, get_row_data(chain)));
+                    result.push((row_id, chain.version.data.clone()));
                 }
                 continue;
             }
@@ -2343,7 +2305,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, get_row_data(e)));
+                        result.push((row_id, e.version.data.clone()));
                     }
                     break;
                 }
@@ -2372,23 +2334,7 @@ impl VersionStore {
         };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
-
-        // Pre-acquire arena lock ONCE for the entire operation
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-
-        // Helper closure to get row data from arena or version
-        let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(CompactArc::clone(arc_row));
-                }
-            }
-            e.version.data.clone()
-        };
-
-        // Single-pass: read directly from arena during visibility check
+        let versions = self.snapshot_versions();
 
         // Ensure capacity
         let current_capacity = result.capacity();
@@ -2405,7 +2351,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, get_row_data(chain)));
+                    result.push((row_id, chain.version.data.clone()));
                 }
                 continue;
             }
@@ -2418,7 +2364,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, get_row_data(e)));
+                        result.push((row_id, e.version.data.clone()));
                     }
                     break;
                 }
@@ -2452,23 +2398,8 @@ impl VersionStore {
         let current_seq = checker.get_current_sequence();
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
+        let versions = self.snapshot_versions();
 
-        // Pre-acquire arena lock ONCE for the entire operation
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-
-        // Helper closure to get row data from arena or version
-        let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(CompactArc::clone(arc_row));
-                }
-            }
-            e.version.data.clone()
-        };
-
-        // Single-pass: read directly from arena during visibility check
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -2481,7 +2412,7 @@ impl VersionStore {
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
                     let mut version_copy = chain.version.clone();
                     version_copy.create_time = current_seq;
-                    result.push((row_id, get_row_data(chain), version_copy));
+                    result.push((row_id, chain.version.data.clone(), version_copy));
                 }
                 continue;
             }
@@ -2496,7 +2427,7 @@ impl VersionStore {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
                         let mut version_copy = e.version.clone();
                         version_copy.create_time = current_seq;
-                        result.push((row_id, get_row_data(e), version_copy));
+                        result.push((row_id, e.version.data.clone(), version_copy));
                     }
                     break;
                 }
@@ -2535,13 +2466,17 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema); // Release lock early
+        let fully_compiled = compiled_filter.is_fully_compiled();
+        let matches_row = |row: &Row| {
+            if fully_compiled {
+                compiled_filter.matches_arc_slice(row.as_slice())
+            } else {
+                compiled_filter.matches(row)
+            }
+        };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
-
-        // Pre-acquire arena lock ONCE for the entire operation
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
+        let versions = self.snapshot_versions();
 
         // Single-pass: read, filter, and collect in one loop
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len() / 4);
@@ -2553,29 +2488,12 @@ impl VersionStore {
 
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
-                if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    // Try arena path first (zero-copy filter check using matches_arc_slice)
-                    if let Some(idx) = unpack_arena_idx(chain.arena_idx) {
-                        if let Some(arc_row) = arena_data.get(idx) {
-                            // Filter directly on Arc slice - no Row allocation for non-matching rows
-                            if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
-                                let mut version_copy = chain.version.clone();
-                                version_copy.create_time = current_seq;
-                                result.push((
-                                    row_id,
-                                    Row::from_arc(CompactArc::clone(arc_row)),
-                                    version_copy,
-                                ));
-                            }
-                            continue;
-                        }
-                    }
-                    // Fallback: filter on version data
-                    if compiled_filter.matches(&chain.version.data) {
-                        let mut version_copy = chain.version.clone();
-                        version_copy.create_time = current_seq;
-                        result.push((row_id, chain.version.data.clone(), version_copy));
-                    }
+                if (head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id))
+                    && matches_row(&chain.version.data)
+                {
+                    let mut version_copy = chain.version.clone();
+                    version_copy.create_time = current_seq;
+                    result.push((row_id, chain.version.data.clone(), version_copy));
                 }
                 continue;
             }
@@ -2587,29 +2505,12 @@ impl VersionStore {
                 let deleted_at_txn_id = e.version.deleted_at_txn_id;
 
                 if checker.is_visible(version_txn_id, txn_id) {
-                    if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        // Try arena path first (zero-copy filter check using matches_arc_slice)
-                        if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                            if let Some(arc_row) = arena_data.get(idx) {
-                                // Filter directly on Arc slice - no Row allocation for non-matching rows
-                                if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
-                                    let mut version_copy = e.version.clone();
-                                    version_copy.create_time = current_seq;
-                                    result.push((
-                                        row_id,
-                                        Row::from_arc(CompactArc::clone(arc_row)),
-                                        version_copy,
-                                    ));
-                                }
-                                break;
-                            }
-                        }
-                        // Fallback: filter on version data
-                        if compiled_filter.matches(&e.version.data) {
-                            let mut version_copy = e.version.clone();
-                            version_copy.create_time = current_seq;
-                            result.push((row_id, e.version.data.clone(), version_copy));
-                        }
+                    if (deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id))
+                        && matches_row(&e.version.data)
+                    {
+                        let mut version_copy = e.version.clone();
+                        version_copy.create_time = current_seq;
+                        result.push((row_id, e.version.data.clone(), version_copy));
                     }
                     break;
                 }
@@ -2635,23 +2536,8 @@ impl VersionStore {
         };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
+        let versions = self.snapshot_versions();
 
-        // Pre-acquire arena lock ONCE for the entire operation
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-
-        // Helper closure to get row data from arena or version
-        let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(CompactArc::clone(arc_row));
-                }
-            }
-            e.version.data.clone()
-        };
-
-        // Single-pass: read directly from arena during visibility check
         let mut result = RowVec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -2662,7 +2548,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, get_row_data(chain)));
+                    result.push((row_id, chain.version.data.clone()));
                 }
                 continue;
             }
@@ -2675,7 +2561,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, get_row_data(e)));
+                        result.push((row_id, e.version.data.clone()));
                     }
                     break;
                 }
@@ -2708,21 +2594,7 @@ impl VersionStore {
         };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
-
-        // Pre-acquire arena lock ONCE for the entire operation
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-
-        // Helper closure to get row data from arena or version
-        let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(CompactArc::clone(arc_row));
-                }
-            }
-            e.version.data.clone()
-        };
+        let versions = self.snapshot_versions();
 
         // Collect with early termination
         // A user-supplied limit can be i64::MAX; only pre-allocate what
@@ -2770,7 +2642,7 @@ impl VersionStore {
                 if skipped < offset {
                     skipped += 1;
                 } else {
-                    result.push((row_id, get_row_data(entry)));
+                    result.push((row_id, entry.version.data.clone()));
                     if result.len() >= limit {
                         break; // Early termination!
                     }
@@ -2868,21 +2740,7 @@ impl VersionStore {
         };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
-
-        // Pre-acquire arena lock ONCE for this batch
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-
-        // Helper closure to get row data from arena or version
-        let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(CompactArc::clone(arc_row));
-                }
-            }
-            e.version.data.clone()
-        };
+        let versions = self.snapshot_versions();
 
         // Use range for efficient cursor-based iteration
         let mut result = RowVec::with_capacity(batch_size);
@@ -2933,7 +2791,7 @@ impl VersionStore {
                     has_more = true;
                     break; // Early termination - found one more than needed
                 }
-                result.push((row_id, get_row_data(entry)));
+                result.push((row_id, entry.version.data.clone()));
             }
         }
 
@@ -2972,21 +2830,7 @@ impl VersionStore {
         };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
-
-        // Pre-acquire arena lock ONCE for this batch
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-
-        // Helper closure to get row data from arena or version
-        let get_row_data = |e: &VersionChainEntry| -> Row {
-            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(CompactArc::clone(arc_row));
-                }
-            }
-            e.version.data.clone()
-        };
+        let versions = self.snapshot_versions();
 
         // Use range for efficient cursor-based iteration
         buffer.reserve(batch_size);
@@ -3037,7 +2881,7 @@ impl VersionStore {
                     has_more = true;
                     break; // Early termination - found one more than needed
                 }
-                buffer.push((row_id, get_row_data(entry)));
+                buffer.push((row_id, entry.version.data.clone()));
             }
         }
 
@@ -3075,21 +2919,7 @@ impl VersionStore {
         };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
-
-        // Pre-acquire arena lock ONCE for this entire operation
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-
-        // Helper to get row data from an entry
-        let get_row_from_entry = |entry: &VersionChainEntry| -> Row {
-            if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
-                if let Some(arc_row) = arena_data.get(idx) {
-                    return Row::from_arc(CompactArc::clone(arc_row));
-                }
-            }
-            entry.version.data.clone()
-        };
+        let versions = self.snapshot_versions();
 
         // Collect with offset/limit
         // Cap capacity to avoid overflow when limit is usize::MAX
@@ -3111,7 +2941,7 @@ impl VersionStore {
                             if skipped < offset {
                                 skipped += 1;
                             } else {
-                                result.push((*row_id, get_row_from_entry(entry)));
+                                result.push((*row_id, entry.version.data.clone()));
                                 if result.len() >= limit {
                                     return Some(result);
                                 }
@@ -3134,7 +2964,7 @@ impl VersionStore {
                             if skipped < offset {
                                 skipped += 1;
                             } else {
-                                result.push((row_id, get_row_from_entry(entry)));
+                                result.push((row_id, entry.version.data.clone()));
                                 if result.len() >= limit {
                                     return Some(result);
                                 }
@@ -3182,11 +3012,7 @@ impl VersionStore {
         };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
-
-        // Pre-acquire arena lock ONCE for this entire operation
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
+        let versions = self.snapshot_versions();
 
         // Helper to find visible version and get row data
         let find_visible_row = |chain: &VersionChainEntry| -> Option<Row> {
@@ -3200,17 +3026,7 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    // Read row data from arena or version
-                    let row_data = if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                        if let Some(arc_row) = arena_data.get(idx) {
-                            Row::from_arc(CompactArc::clone(arc_row))
-                        } else {
-                            e.version.data.clone()
-                        }
-                    } else {
-                        e.version.data.clone()
-                    };
-                    return Some(row_data);
+                    return Some(e.version.data.clone());
                 }
                 current = e.prev.as_ref().map(|b| b.as_ref());
             }
@@ -3285,13 +3101,17 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema); // Release lock early
+        let fully_compiled = compiled_filter.is_fully_compiled();
+        let matches_row = |row: &Row| {
+            if fully_compiled {
+                compiled_filter.matches_arc_slice(row.as_slice())
+            } else {
+                compiled_filter.matches(row)
+            }
+        };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
-
-        // Pre-acquire arena lock ONCE
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
+        let versions = self.snapshot_versions();
 
         // Single-pass: read, filter, and collect in one loop
         let mut result = RowVec::with_capacity(versions.len() / 4);
@@ -3308,19 +3128,7 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    // OPTIMIZATION: Filter BEFORE cloning to avoid allocation for non-matching rows
-                    // Try arena path first (zero-copy filter check using matches_arc_slice)
-                    if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                        if let Some(arc_row) = arena_data.get(idx) {
-                            // Filter directly on Arc slice - no Row allocation for non-matching rows
-                            if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
-                                result.push((row_id, Row::from_arc(CompactArc::clone(arc_row))));
-                            }
-                            break;
-                        }
-                    }
-                    // Fallback: filter on version data (already allocated)
-                    if compiled_filter.matches(&e.version.data) {
+                    if matches_row(&e.version.data) {
                         result.push((row_id, e.version.data.clone()));
                     }
                     break;
@@ -3357,10 +3165,16 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema);
+        let fully_compiled = compiled_filter.is_fully_compiled();
+        let matches_row = |row: &Row| {
+            if fully_compiled {
+                compiled_filter.matches_arc_slice(row.as_slice())
+            } else {
+                compiled_filter.matches(row)
+            }
+        };
 
-        let versions = self.versions.read().clone();
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
+        let versions = self.snapshot_versions();
 
         for (&row_id, chain) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain);
@@ -3374,20 +3188,7 @@ impl VersionStore {
                         break;
                     }
 
-                    if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                        if let Some(arc_row) = arena_data.get(idx) {
-                            if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
-                                let row = Row::from_arc(CompactArc::clone(arc_row));
-                                if !callback(row_id, row) {
-                                    return;
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    if compiled_filter.matches(&e.version.data)
-                        && !callback(row_id, e.version.data.clone())
-                    {
+                    if matches_row(&e.version.data) && !callback(row_id, e.version.data.clone()) {
                         return;
                     }
                     break;
@@ -3428,13 +3229,17 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema);
+        let fully_compiled = compiled_filter.is_fully_compiled();
+        let matches_row = |row: &Row| {
+            if fully_compiled {
+                compiled_filter.matches_arc_slice(row.as_slice())
+            } else {
+                compiled_filter.matches(row)
+            }
+        };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
-
-        // Pre-acquire arena lock ONCE
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
+        let versions = self.snapshot_versions();
 
         // Collect with offset/limit and early termination
         // A user-supplied limit can be i64::MAX; only pre-allocate what
@@ -3454,27 +3259,7 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    // OPTIMIZATION: Filter BEFORE cloning to avoid allocation for non-matching rows
-                    // Try arena path first (zero-copy filter check using matches_arc_slice)
-                    if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                        if let Some(arc_row) = arena_data.get(idx) {
-                            // Filter directly on Arc slice - no Row allocation for non-matching rows
-                            if compiled_filter.matches_arc_slice(arc_row.as_ref()) {
-                                if skipped < offset {
-                                    skipped += 1;
-                                } else {
-                                    result
-                                        .push((row_id, Row::from_arc(CompactArc::clone(arc_row))));
-                                    if result.len() >= limit {
-                                        return result; // Early termination!
-                                    }
-                                }
-                            }
-                            break;
-                        }
-                    }
-                    // Fallback: filter on version data (already allocated)
-                    if compiled_filter.matches(&e.version.data) {
+                    if matches_row(&e.version.data) {
                         if skipped < offset {
                             skipped += 1;
                         } else {
@@ -3884,9 +3669,7 @@ impl VersionStore {
         // SLOW PATH: CowBTree iteration — materialize during collection because
         // the visible version may be a chain entry (not HEAD), and RowIndex-based
         // deferred materialization would lose track of which version was visible.
-        let versions = self.versions.read().clone();
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
+        let versions = self.snapshot_versions();
 
         let mut materialized: Vec<(i64, Row, Option<Value>)> = Vec::with_capacity(versions.len());
 
@@ -3897,15 +3680,7 @@ impl VersionStore {
                     if e.version.deleted_at_txn_id == 0
                         || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
                     {
-                        let row = if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                            if let Some(arc_row) = arena_data.get(idx) {
-                                Row::from_arc(CompactArc::clone(arc_row))
-                            } else {
-                                e.version.data.clone()
-                            }
-                        } else {
-                            e.version.data.clone()
-                        };
+                        let row = e.version.data.clone();
                         let sort_val = row.get(sort_col_idx).cloned();
                         materialized.push((row_id, row, sort_val));
                     }
@@ -3915,8 +3690,6 @@ impl VersionStore {
             }
         }
 
-        // Drop locks before sort
-        drop(arena_guard);
         drop(versions);
 
         if materialized.is_empty() {
@@ -4450,10 +4223,8 @@ impl VersionStore {
             }
         }
 
-        // SLOW PATH: CowBTree iteration with arena data retrieval
-        let versions = self.versions.read().clone();
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
+        // SLOW PATH: Read the payload owned by each captured version.
+        let versions = self.snapshot_versions();
 
         for chain in versions.values() {
             let mut current: Option<&VersionChainEntry> = Some(chain);
@@ -4462,15 +4233,7 @@ impl VersionStore {
                     if e.version.deleted_at_txn_id == 0
                         || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
                     {
-                        if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                            if let Some(arc_row) = arena_data.get(idx) {
-                                accumulate_from!(arc_row, results, aggregates);
-                            } else {
-                                accumulate_from!(e.version.data, results, aggregates);
-                            }
-                        } else {
-                            accumulate_from!(e.version.data, results, aggregates);
-                        }
+                        accumulate_from!(e.version.data, results, aggregates);
                     }
                     break;
                 }

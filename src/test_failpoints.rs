@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Test-only failpoint flags for injecting I/O errors.
-//!
-//! Each flag is an `AtomicBool` that can be armed from integration tests.
-//! Source code checks these flags inside `#[cfg(test)]` guards, so they
-//! have zero cost in release builds.
+//! Test failpoints for I/O errors and deterministic reader/writer rendezvous.
+//! Flags and hooks are enabled by unit tests or the `test-failpoints` feature.
+//! Normal builds without that feature compile out the failpoints and their calls.
 
+use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, MutexGuard};
 
@@ -44,6 +43,22 @@ pub static CHECKPOINT_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 /// interfere with each other without this lock.
 static FAILPOINT_LOCK: Mutex<()> = Mutex::new(());
 
+thread_local! {
+    static VERSION_ROOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread immediately after its next version root is copied.
+pub fn after_version_root(hook: impl FnOnce() + 'static) {
+    VERSION_ROOT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn version_root_captured() {
+    let hook = VERSION_ROOT_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Reset all failpoints to disabled state
 pub fn reset_all() {
     use std::sync::atomic::Ordering::Release;
@@ -53,6 +68,7 @@ pub fn reset_all() {
     SNAPSHOT_SYNC_FAIL.store(false, Release);
     SNAPSHOT_RENAME_FAIL.store(false, Release);
     CHECKPOINT_WRITE_FAIL.store(false, Release);
+    VERSION_ROOT_HOOK.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.
