@@ -471,7 +471,7 @@ impl PersistenceManager {
         Ok(())
     }
 
-    /// Record a DML operation (INSERT, UPDATE, DELETE)
+    /// Record DML and return its assigned WAL LSN, or None when persistence is disabled.
     pub fn record_dml_operation(
         &self,
         txn_id: i64,
@@ -479,9 +479,9 @@ impl PersistenceManager {
         row_id: i64,
         op: WALOperationType,
         version: &RowVersion,
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         if !self.is_enabled() {
-            return Ok(());
+            return Ok(None);
         }
 
         let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
@@ -491,8 +491,7 @@ impl PersistenceManager {
 
         let entry = WALEntry::new(txn_id, table_name.to_string(), row_id, op, data);
 
-        wal.append_entry(entry)?;
-        Ok(())
+        wal.append_entry(entry).map(Some)
     }
 
     /// Record a transaction commit
