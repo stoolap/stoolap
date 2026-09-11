@@ -427,7 +427,7 @@ fn read_value(data: &[u8], pos: &mut usize) -> io::Result<Value> {
         2 => Ok(Value::Float(read_f64(data, pos)?)),
         3 => {
             let slen = read_u32(data, pos)? as usize;
-            if *pos + slen > data.len() {
+            if slen > data.len() - *pos {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated volume: text value data",
@@ -460,7 +460,7 @@ fn read_value(data: &[u8], pos: &mut usize) -> io::Result<Value> {
         }
         6 => {
             let len = read_u32(data, pos)? as usize;
-            if *pos + len > data.len() {
+            if len > data.len() - *pos {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     "truncated extension data",
@@ -1160,14 +1160,30 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     Ok(buf)
 }
 
+fn check_metadata_count(data: &[u8], pos: usize, count: usize, width: usize) -> io::Result<()> {
+    if count > (data.len() - pos) / width {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 metadata count exceeds remaining bytes",
+        ));
+    }
+    Ok(())
+}
+
 /// Deserialize volume metadata from V4 format bytes.
 pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetadata> {
     let mut pos = 0;
 
-    let row_count = read_u64(data, &mut pos)? as usize;
+    let row_count = usize::try_from(read_u64(data, &mut pos)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 row count exceeds address space",
+        )
+    })?;
     let col_count = read_u32(data, &mut pos)? as usize;
 
     // Column directory
+    check_metadata_count(data, pos, col_count, 6)?;
     let mut col_type_tags = Vec::with_capacity(col_count);
     let mut col_ext_types = Vec::with_capacity(col_count);
     let mut col_sorted = Vec::with_capacity(col_count);
@@ -1196,10 +1212,22 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
 
     // Shared dictionary
     let dict_len = read_u32(data, &mut pos)? as usize;
+    let declared_dict_len = col_dict_counts.iter().try_fold(0usize, |sum, &count| {
+        sum.checked_add(count as usize).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "V4 dictionary count overflow")
+        })
+    })?;
+    if declared_dict_len != dict_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 dictionary counts do not match shared dictionary length",
+        ));
+    }
+    check_metadata_count(data, pos, dict_len, 4)?;
     let mut shared_dict = Vec::with_capacity(dict_len);
     for _ in 0..dict_len {
         let slen = read_u32(data, &mut pos)? as usize;
-        if pos + slen > data.len() {
+        if slen > data.len() - pos {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated V4 metadata: dictionary string",
@@ -1212,9 +1240,11 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
     }
 
     // Row IDs (bulk read — single memcpy on LE platforms)
+    check_metadata_count(data, pos, row_count, 8)?;
     let row_ids = read_i64_bulk(data, &mut pos, row_count)?;
 
     // Zone maps
+    check_metadata_count(data, pos, col_count, 12)?;
     let mut zone_maps = Vec::with_capacity(col_count);
     for _ in 0..col_count {
         let min = read_value(data, &mut pos)?;
@@ -1231,11 +1261,17 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
 
     // Bloom filters
     let num_blooms = read_u32(data, &mut pos)? as usize;
+    check_metadata_count(data, pos, num_blooms, 20)?;
     let mut bloom_filters = Vec::with_capacity(num_blooms);
     for _ in 0..num_blooms {
-        let num_bits = read_u64(data, &mut pos)? as usize;
+        let num_bits = usize::try_from(read_u64(data, &mut pos)?).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "V4 bloom size exceeds address space",
+            )
+        })?;
         let data_len = read_u32(data, &mut pos)? as usize;
-        if pos + data_len > data.len() {
+        if data_len > data.len() - pos {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated V4 metadata: bloom filter",
@@ -1243,6 +1279,12 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
         }
         let bits_bytes = &data[pos..pos + data_len];
         pos += data_len;
+        if num_bits == 0 || !data_len.is_multiple_of(8) || num_bits.div_ceil(64) != data_len / 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid V4 bloom backing geometry",
+            ));
+        }
         bloom_filters.push(super::column::ColumnBloomFilter::from_parts(
             num_bits, bits_bytes,
         ));
@@ -1252,6 +1294,13 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
     let total_rows = read_u64(data, &mut pos)?;
     let live_rows = read_u64(data, &mut pos)?;
     let stats_col_count = read_u32(data, &mut pos)? as usize;
+    if stats_col_count != col_count {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "V4 statistics column count mismatch",
+        ));
+    }
+    check_metadata_count(data, pos, stats_col_count, 44)?;
     let mut stat_columns = Vec::with_capacity(stats_col_count);
     for _ in 0..stats_col_count {
         let sum_int = read_i128(data, &mut pos)?;
@@ -1271,10 +1320,11 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
     }
 
     // Column names
+    check_metadata_count(data, pos, col_count, 4)?;
     let mut column_names = Vec::with_capacity(col_count);
     for _ in 0..col_count {
         let slen = read_u32(data, &mut pos)? as usize;
-        if pos + slen > data.len() {
+        if slen > data.len() - pos {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "truncated V4 metadata: column name",
@@ -1301,6 +1351,11 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
 
     // Row groups
     let num_groups = read_u32(data, &mut pos)? as usize;
+    let group_width = col_count
+        .checked_mul(12)
+        .and_then(|width| width.checked_add(8))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "V4 group width overflow"))?;
+    check_metadata_count(data, pos, num_groups, group_width)?;
     let mut row_groups = Vec::with_capacity(num_groups);
     for _ in 0..num_groups {
         let start_idx = read_u32(data, &mut pos)?;
@@ -1323,6 +1378,13 @@ pub(crate) fn deserialize_volume_metadata(data: &[u8]) -> io::Result<VolumeMetad
             end_idx,
             zone_maps: group_zone_maps,
         });
+    }
+
+    if pos != data.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing bytes in V4 metadata",
+        ));
     }
 
     let column_name_map = column_names

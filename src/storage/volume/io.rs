@@ -203,10 +203,12 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
 
     let file = std::fs::File::open(path)
         .map_err(|e| crate::core::Error::internal(format!("V4 open {:?}: {}", path, e)))?;
-    let file_len = file
-        .metadata()
-        .map_err(|e| crate::core::Error::internal(format!("V4 stat {:?}: {}", path, e)))?
-        .len() as usize;
+    let file_len = usize::try_from(
+        file.metadata()
+            .map_err(|e| crate::core::Error::internal(format!("V4 stat {:?}: {}", path, e)))?
+            .len(),
+    )
+    .map_err(|_| inv("file length exceeds address space"))?;
     if file_len < 24 {
         return Err(inv("file too small"));
     }
@@ -238,6 +240,11 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     let col_count = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
     let num_groups = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
     let meta_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    let mut remaining = file_len - 24;
+    if meta_len > remaining {
+        return Err(inv("metadata length exceeds file payload"));
+    }
+    remaining -= meta_len;
 
     // 2. Compressed metadata (read into temp buffer, decompress, drop)
     let mut meta_compressed = vec![0u8; meta_len];
@@ -247,9 +254,18 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     // to avoid lz4_flex::decompress_size_prepended allocating a fresh Vec.
     let meta_raw = if meta_compressed.len() >= 4 {
         let uncomp_size = u32::from_le_bytes(meta_compressed[..4].try_into().unwrap()) as usize;
+        // Each LZ4 length-extension byte adds at most 255 output bytes.
+        if uncomp_size > (meta_compressed.len() - 4).saturating_mul(255)
+            || uncomp_size > isize::MAX as usize
+        {
+            return Err(inv("metadata LZ4 size exceeds possible expansion"));
+        }
         let mut buf = vec![0u8; uncomp_size];
-        lz4_flex::decompress_into(&meta_compressed[4..], &mut buf)
+        let decoded = lz4_flex::decompress_into(&meta_compressed[4..], &mut buf)
             .map_err(|e| inv(&format!("metadata LZ4: {}", e)))?;
+        if decoded != uncomp_size {
+            return Err(inv("metadata LZ4 decoded length mismatch"));
+        }
         drop(meta_compressed);
         buf
     } else {
@@ -267,20 +283,43 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
             meta.col_type_tags.len()
         )));
     }
+    if num_groups != meta.row_count.div_ceil(ROW_GROUP_SIZE) {
+        return Err(inv("block group count does not match row count"));
+    }
 
     // 3. Block index: (compressed_len: u64, decompressed_len: u64) pairs
-    let total_blocks = col_count * num_groups;
-    let mut index_buf = vec![0u8; total_blocks * 16];
+    let total_blocks = col_count
+        .checked_mul(num_groups)
+        .ok_or_else(|| inv("block count overflow"))?;
+    let index_len = total_blocks
+        .checked_mul(16)
+        .filter(|&len| len <= remaining)
+        .ok_or_else(|| inv("block index exceeds file payload"))?;
+    remaining -= index_len;
+    let mut index_buf = vec![0u8; index_len];
     crc_read!(&mut index_buf);
 
     let mut compressed_lens = Vec::with_capacity(total_blocks);
     let mut decompressed_lens_flat = Vec::with_capacity(total_blocks);
     for i in 0..total_blocks {
         let off = i * 16;
-        compressed_lens
-            .push(u64::from_le_bytes(index_buf[off..off + 8].try_into().unwrap()) as usize);
-        decompressed_lens_flat
-            .push(u64::from_le_bytes(index_buf[off + 8..off + 16].try_into().unwrap()) as usize);
+        let compressed_len = usize::try_from(u64::from_le_bytes(
+            index_buf[off..off + 8].try_into().unwrap(),
+        ))
+        .map_err(|_| inv("compressed block length exceeds address space"))?;
+        let decompressed_len = usize::try_from(u64::from_le_bytes(
+            index_buf[off + 8..off + 16].try_into().unwrap(),
+        ))
+        .map_err(|_| inv("decoded block length exceeds address space"))?;
+        if compressed_len > remaining {
+            return Err(inv("compressed block exceeds file payload"));
+        }
+        remaining -= compressed_len;
+        compressed_lens.push(compressed_len);
+        decompressed_lens_flat.push(decompressed_len);
+    }
+    if remaining != 0 {
+        return Err(inv("trailing bytes after volume payload"));
     }
     drop(index_buf);
 
