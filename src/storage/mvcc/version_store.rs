@@ -27,7 +27,7 @@
 //!
 
 use std::fmt;
-use std::num::{NonZeroU64, NonZeroUsize};
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -46,7 +46,6 @@ use crate::storage::mvcc::arena::RowArena;
 use crate::storage::mvcc::get_fast_timestamp;
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
-use crate::storage::mvcc::streaming_result::{StreamingResult, VisibleRowInfo};
 use crate::storage::Index;
 use ahash::AHashMap;
 #[cfg(feature = "parallel")]
@@ -234,19 +233,6 @@ fn unpack_arena_idx(packed: Option<NonZeroU64>) -> Option<usize> {
     packed.map(|nz| (nz.get() - 1) as usize)
 }
 
-/// Convert Option<usize> to Option<NonZeroUsize> for RowIndex
-/// Stores `idx + 1` so that 0 can represent None via niche optimization
-#[inline(always)]
-fn pack_row_arena_idx(idx: Option<usize>) -> Option<NonZeroUsize> {
-    idx.and_then(|i| NonZeroUsize::new(i.wrapping_add(1)))
-}
-
-/// Convert Option<NonZeroUsize> back to Option<usize> for RowIndex
-#[inline(always)]
-fn unpack_row_arena_idx(packed: Option<NonZeroUsize>) -> Option<usize> {
-    packed.map(|nz| nz.get().wrapping_sub(1))
-}
-
 /// Tracks write operations with the version read for conflict detection
 ///
 
@@ -330,45 +316,6 @@ pub fn clear_version_map_pools() {
 
 /// Capacity hint for transaction version maps - used by pool functions
 const TX_VERSION_MAP_INITIAL_CAPACITY: usize = 16;
-
-/// Lightweight row index for deferred materialization
-///
-/// Instead of cloning row data during scans, we return indices that can be
-/// materialized later. This enables zero-copy filtering and limiting.
-///
-/// # Performance
-/// For `SELECT * FROM t WHERE x > 100 LIMIT 10` on 100K rows:
-/// - Old: Clone 100K rows, filter to 50K, limit to 10 (100K allocations)
-/// - New: Get 100K indices, filter to 50K, limit to 10, clone 10 (10 allocations)
-///
-/// # Memory Optimization
-/// Uses `Option<NonZeroUsize>` (8 bytes) instead of `Option<usize>` (16 bytes)
-/// for arena_idx, reducing struct size from 24 to 16 bytes (33% smaller).
-#[derive(Clone, Copy, Debug)]
-pub struct RowIndex {
-    /// Row ID
-    pub row_id: i64,
-    /// Arena index (None if row data is not in arena, must clone from version)
-    /// Stored as `idx + 1` to enable niche optimization (0 = None)
-    arena_idx: Option<NonZeroUsize>,
-}
-
-impl RowIndex {
-    /// Create a new RowIndex with the given row_id and arena index
-    #[inline(always)]
-    pub fn new(row_id: i64, arena_idx: Option<usize>) -> Self {
-        Self {
-            row_id,
-            arena_idx: pack_row_arena_idx(arena_idx),
-        }
-    }
-
-    /// Get the arena index (unpacked to Option<usize>)
-    #[inline(always)]
-    pub fn arena_idx(&self) -> Option<usize> {
-        unpack_row_arena_idx(self.arena_idx)
-    }
-}
 
 /// Aggregate operation type for deferred aggregation
 ///
@@ -1888,7 +1835,7 @@ impl VersionStore {
         };
 
         // FAST PATH: Scan arena directly when no uncommitted writes.
-        // SAFETY: Only valid under ReadCommitted (see get_visible_row_indices).
+        // SAFETY: Arena heads are used only under ReadCommitted isolation.
         {
             let uncommitted_empty = self.uncommitted_writes.read().is_empty();
             if uncommitted_empty && !checker.needs_snapshot_isolation(txn_id) {
@@ -1962,7 +1909,7 @@ impl VersionStore {
         };
 
         // FAST PATH: Scan arena directly when no uncommitted writes.
-        // SAFETY: Only valid under ReadCommitted (see get_visible_row_indices).
+        // SAFETY: Arena heads are used only under ReadCommitted isolation.
         {
             let uncommitted_empty = self.uncommitted_writes.read().is_empty();
             if uncommitted_empty && !checker.needs_snapshot_isolation(txn_id) {
@@ -3293,433 +3240,6 @@ impl VersionStore {
         self.get_visible_rows_filtered_with_limit(txn_id, filter, limit, offset)
     }
 
-    /// Get visible row indices without materializing row data (ZERO ALLOCATION SCAN!)
-    ///
-    /// This method returns lightweight `RowIndex` structs instead of cloning row data.
-    /// Callers can then filter/sort/limit these indices and only materialize the final
-    /// set of rows needed using `materialize_rows()`.
-    ///
-    /// # Performance
-    /// For `SELECT * FROM t WHERE x > 100 LIMIT 10` on 100K rows:
-    /// - Old approach: Clone 100K rows, filter, limit (100K allocations)
-    /// - New approach: Get 100K indices (0 allocations), filter, limit, clone 10 rows
-    ///
-    /// # Returns
-    /// Vector of `RowIndex` structs containing row_id and arena location
-    pub fn get_visible_row_indices(&self, txn_id: i64) -> Vec<RowIndex> {
-        let checker = self.visibility_checker.as_ref();
-
-        // FAST PATH: If uncommitted_writes is empty, scan arena directly.
-        // SAFETY: This fast path is only valid under ReadCommitted isolation.
-        // Under SnapshotIsolation, HEAD versions may not be visible and the correct
-        // behavior requires walking version chains to find older visible versions.
-        //
-        // LOCK ORDERING: Check uncommitted_writes BEFORE acquiring arena to maintain
-        // consistent ordering with truncate_all (uncommitted_writes → arena).
-        if let Some(checker) = checker {
-            let uncommitted_empty = self.uncommitted_writes.read().is_empty();
-
-            // Get arena metadata for fast path detection
-            let arena_guard = self.arena.read_guard();
-            let arena_meta = arena_guard.meta();
-            let arena_len = arena_guard.len();
-
-            if uncommitted_empty && arena_len > 0 && !checker.needs_snapshot_isolation(txn_id) {
-                let mut indices: Vec<RowIndex> = Vec::with_capacity(arena_len);
-
-                for (idx, meta) in arena_meta.iter().enumerate() {
-                    if meta.txn_id != 0
-                        && meta.deleted_at_txn_id == 0
-                        && checker.is_visible(meta.txn_id, txn_id)
-                    {
-                        indices.push(RowIndex::new(meta.row_id, Some(idx)));
-                    }
-                }
-
-                // Sort by row_id for consistent ordering
-                indices.sort_unstable_by_key(|idx| idx.row_id);
-                return indices;
-            }
-            // arena_guard dropped here — no need to hold it for slow path
-        }
-
-        // SLOW PATH: Full iteration
-        let versions = self.versions.read().clone();
-        let mut indices: Vec<RowIndex> = Vec::with_capacity(versions.len());
-
-        if let Some(checker) = checker {
-            for (&row_id, chain) in versions.iter() {
-                let mut current: Option<&VersionChainEntry> = Some(chain);
-
-                while let Some(e) = current {
-                    let version_txn_id = e.version.txn_id;
-                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                    if checker.is_visible(version_txn_id, txn_id) {
-                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
-                        {
-                            // Found visible, non-deleted version
-                            indices.push(RowIndex::new(row_id, unpack_arena_idx(e.arena_idx)));
-                        }
-                        break;
-                    }
-                    current = e.prev.as_ref().map(|b| b.as_ref());
-                }
-            }
-        }
-
-        indices
-    }
-
-    /// Get visible row indices without guaranteed ordering.
-    ///
-    /// This is optimized for aggregation operations (SUM, MIN, MAX, COUNT) that
-    /// don't need row ordering. It skips the expensive sort in the arena fast path.
-    #[inline]
-    pub fn get_visible_row_indices_unordered(&self, txn_id: i64) -> Vec<RowIndex> {
-        let checker = self.visibility_checker.as_ref();
-
-        // FAST PATH: If uncommitted_writes is empty, scan arena directly (NO SORT!)
-        // SAFETY: Only valid under ReadCommitted (see get_visible_row_indices).
-        //
-        // LOCK ORDERING: Check uncommitted_writes BEFORE acquiring arena to maintain
-        // consistent ordering with truncate_all (uncommitted_writes → arena).
-        if let Some(checker) = checker {
-            let uncommitted_empty = self.uncommitted_writes.read().is_empty();
-
-            let arena_guard = self.arena.read_guard();
-            let arena_meta = arena_guard.meta();
-            let arena_len = arena_guard.len();
-
-            if uncommitted_empty && arena_len > 0 && !checker.needs_snapshot_isolation(txn_id) {
-                let mut indices: Vec<RowIndex> = Vec::with_capacity(arena_len);
-
-                for (idx, meta) in arena_meta.iter().enumerate() {
-                    if meta.txn_id != 0
-                        && meta.deleted_at_txn_id == 0
-                        && checker.is_visible(meta.txn_id, txn_id)
-                    {
-                        indices.push(RowIndex::new(meta.row_id, Some(idx)));
-                    }
-                }
-
-                // Skip sorting - aggregations don't need ordering
-                return indices;
-            }
-            // arena_guard dropped here — no need to hold it for slow path
-        }
-
-        // SLOW PATH: Full iteration
-        let versions = self.versions.read().clone();
-        let mut indices: Vec<RowIndex> = Vec::with_capacity(versions.len());
-
-        if let Some(checker) = checker {
-            for (&row_id, chain) in versions.iter() {
-                let mut current: Option<&VersionChainEntry> = Some(chain);
-
-                while let Some(e) = current {
-                    let version_txn_id = e.version.txn_id;
-                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                    if checker.is_visible(version_txn_id, txn_id) {
-                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
-                        {
-                            indices.push(RowIndex::new(row_id, unpack_arena_idx(e.arena_idx)));
-                        }
-                        break;
-                    }
-                    current = e.prev.as_ref().map(|b| b.as_ref());
-                }
-            }
-        }
-
-        indices
-    }
-
-    /// Materialize selected row indices into actual Row data
-    ///
-    /// This is the second step of deferred materialization. After filtering/limiting
-    /// `RowIndex` values, call this to get the actual row data.
-    ///
-    /// Same HEAD-fallback caveat as `materialize_row` — see its doc comment.
-    ///
-    /// # Performance
-    /// - Only clones the rows you actually need
-    /// - Falls back to version chain for non-arena rows
-    pub fn materialize_rows(&self, indices: &[RowIndex]) -> RowVec {
-        if indices.is_empty() {
-            return RowVec::new();
-        }
-
-        // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
-
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-        let arena_len = arena_guard.len();
-
-        let mut result = RowVec::with_capacity(indices.len());
-
-        for idx in indices {
-            if let Some(arena_idx) = idx.arena_idx() {
-                // Fast path: get from arena
-                if arena_idx < arena_len {
-                    if let Some(arc_row) = arena_data.get(arena_idx) {
-                        result.push((idx.row_id, Row::from_arc(CompactArc::clone(arc_row))));
-                        continue;
-                    }
-                }
-            }
-
-            // Slow path: look up in version chain (CowBTree clone already held)
-            if let Some(entry) = versions.get(idx.row_id) {
-                result.push((idx.row_id, entry.version.data.clone()));
-            }
-        }
-
-        result
-    }
-
-    /// Materialize a single row by index (for use in iterators)
-    ///
-    /// NOTE: When `arena_idx` is `None` (chain entries under snapshot isolation),
-    /// the fallback reads `chain.version.data` which is HEAD. If a concurrent
-    /// transaction updated the row after the RowIndex was collected, this returns
-    /// the newer HEAD instead of the older visible version. This is a known
-    /// limitation; `get_visible_rows_sorted_limit` avoids it with inline
-    /// materialization during collection. Narrow scenario: snapshot isolation
-    /// with concurrent updates between collect and materialize.
-    #[inline]
-    pub fn materialize_row(&self, idx: &RowIndex) -> Option<(i64, Row)> {
-        if let Some(arena_idx) = idx.arena_idx() {
-            let arena_guard = self.arena.read_guard();
-            let arena_data = arena_guard.data();
-            if let Some(arc_row) = arena_data.get(arena_idx) {
-                return Some((idx.row_id, Row::from_arc(CompactArc::clone(arc_row))));
-            }
-        }
-
-        // Slow path: look up in version chain (returns HEAD — see doc note above)
-        self.versions
-            .read()
-            .get(idx.row_id)
-            .map(|chain| (idx.row_id, chain.version.data.clone()))
-    }
-
-    /// Get a single column value from a row index WITHOUT full row materialization
-    ///
-    /// This is the key optimization for ORDER BY + LIMIT queries:
-    /// - Load only the sort column, not all columns
-    /// - Enables sorting indices by column value before materializing
-    ///
-    /// # Performance
-    /// For `SELECT * FROM t ORDER BY col LIMIT 10` on 100K rows with 20 columns:
-    /// - Old: Clone 100K rows (2M values), sort, take 10
-    /// - New: Load 100K single values, sort indices, clone 10 rows (200 values)
-    #[inline]
-    pub fn get_column_value(&self, idx: &RowIndex, col_idx: usize) -> Option<Value> {
-        if let Some(arena_idx) = idx.arena_idx() {
-            let arena_guard = self.arena.read_guard();
-            let arena_data = arena_guard.data();
-            if let Some(arc_row) = arena_data.get(arena_idx) {
-                return arc_row.get(col_idx).cloned();
-            }
-        }
-
-        // Slow path: look up in version chain (returns HEAD — same caveat as materialize_row)
-        self.versions
-            .read()
-            .get(idx.row_id)
-            .and_then(|entry| entry.version.data.get(col_idx).cloned())
-    }
-
-    /// Batch get column values for multiple indices
-    ///
-    /// Optimized for ORDER BY: loads sort key values for all indices at once.
-    #[inline]
-    pub fn get_column_values_batch(
-        &self,
-        indices: &[RowIndex],
-        col_idx: usize,
-    ) -> Vec<Option<Value>> {
-        if indices.is_empty() {
-            return Vec::new();
-        }
-
-        // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
-
-        let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-        let arena_len = arena_guard.len();
-        indices
-            .iter()
-            .map(|idx| {
-                if let Some(arena_idx) = idx.arena_idx() {
-                    if arena_idx < arena_len {
-                        if let Some(arc_row) = arena_data.get(arena_idx) {
-                            return arc_row.get(col_idx).cloned();
-                        }
-                    }
-                }
-                // Slow path: version chain lookup (returns HEAD — same caveat as materialize_row)
-                versions
-                    .get(idx.row_id)
-                    .and_then(|entry| entry.version.data.get(col_idx).cloned())
-            })
-            .collect()
-    }
-
-    /// Optimized ORDER BY + LIMIT scan using deferred materialization
-    ///
-    /// This is the FAST PATH for queries like `SELECT * FROM t ORDER BY col LIMIT 10`:
-    /// 1. Get row indices (no cloning)
-    /// 2. Load only sort column values (not full rows)
-    /// 3. Sort indices by sort values
-    /// 4. Take top N indices
-    /// 5. Materialize only N rows
-    ///
-    /// # Performance
-    /// For 100K rows with 20 columns, LIMIT 10:
-    /// - Old: Clone 2M values, sort 100K rows, take 10 → ~100ms
-    /// - New: Load 100K values, sort indices, clone 200 values → ~10ms
-    ///
-    /// # Arguments
-    /// * `txn_id` - Transaction ID for visibility
-    /// * `sort_col_idx` - Column index to sort by
-    /// * `ascending` - Sort direction
-    /// * `limit` - Maximum rows to return
-    /// * `offset` - Rows to skip before collecting
-    pub fn get_visible_rows_sorted_limit(
-        &self,
-        txn_id: i64,
-        sort_col_idx: usize,
-        ascending: bool,
-        limit: usize,
-        offset: usize,
-    ) -> RowVec {
-        if limit == 0 {
-            return RowVec::new();
-        }
-
-        let checker = match self.visibility_checker.as_ref() {
-            Some(c) => c,
-            None => return RowVec::new(),
-        };
-
-        // Steps 1+2 combined: collect (RowIndex, sort_value) in a single lock scope
-        let mut paired: Vec<(RowIndex, Option<Value>)>;
-
-        // FAST PATH: Scan arena directly when no uncommitted writes.
-        // SAFETY: Only valid under ReadCommitted (see get_visible_row_indices).
-        let uncommitted_empty = self.uncommitted_writes.read().is_empty();
-        if uncommitted_empty && !checker.needs_snapshot_isolation(txn_id) {
-            let arena_guard = self.arena.read_guard();
-            let arena_meta = arena_guard.meta();
-            let arena_data = arena_guard.data();
-            let arena_len = arena_guard.len();
-
-            if arena_len > 0 {
-                paired = Vec::with_capacity(arena_len);
-                for (idx, meta) in arena_meta.iter().enumerate() {
-                    if meta.txn_id != 0
-                        && meta.deleted_at_txn_id == 0
-                        && checker.is_visible(meta.txn_id, txn_id)
-                    {
-                        let sort_val = arena_data
-                            .get(idx)
-                            .and_then(|row| row.get(sort_col_idx).cloned());
-                        paired.push((RowIndex::new(meta.row_id, Some(idx)), sort_val));
-                    }
-                }
-
-                if paired.is_empty() {
-                    return RowVec::new();
-                }
-
-                // Drop arena guard before sort and materialize
-                drop(arena_guard);
-
-                // Sort, take limit, materialize
-                paired.sort_by(|(_, a), (_, b)| {
-                    let cmp = match (a, b) {
-                        (None, None) => std::cmp::Ordering::Equal,
-                        (None, Some(_)) => std::cmp::Ordering::Less,
-                        (Some(_), None) => std::cmp::Ordering::Greater,
-                        (Some(va), Some(vb)) => va.compare(vb).unwrap_or(std::cmp::Ordering::Equal),
-                    };
-                    if ascending {
-                        cmp
-                    } else {
-                        cmp.reverse()
-                    }
-                });
-
-                let selected: Vec<RowIndex> = paired
-                    .into_iter()
-                    .skip(offset)
-                    .take(limit)
-                    .map(|(idx, _)| idx)
-                    .collect();
-
-                return self.materialize_rows(&selected);
-            }
-        }
-
-        // SLOW PATH: CowBTree iteration — materialize during collection because
-        // the visible version may be a chain entry (not HEAD), and RowIndex-based
-        // deferred materialization would lose track of which version was visible.
-        let versions = self.snapshot_versions();
-
-        let mut materialized: Vec<(i64, Row, Option<Value>)> = Vec::with_capacity(versions.len());
-
-        for (&row_id, chain) in versions.iter() {
-            let mut current: Option<&VersionChainEntry> = Some(chain);
-            while let Some(e) = current {
-                if checker.is_visible(e.version.txn_id, txn_id) {
-                    if e.version.deleted_at_txn_id == 0
-                        || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
-                    {
-                        let row = e.version.data.clone();
-                        let sort_val = row.get(sort_col_idx).cloned();
-                        materialized.push((row_id, row, sort_val));
-                    }
-                    break;
-                }
-                current = e.prev.as_ref().map(|b| b.as_ref());
-            }
-        }
-
-        drop(versions);
-
-        if materialized.is_empty() {
-            return RowVec::new();
-        }
-
-        // Sort by sort values
-        materialized.sort_by(|(_, _, a), (_, _, b)| {
-            let cmp = match (a, b) {
-                (None, None) => std::cmp::Ordering::Equal,
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (Some(va), Some(vb)) => va.compare(vb).unwrap_or(std::cmp::Ordering::Equal),
-            };
-            if ascending {
-                cmp
-            } else {
-                cmp.reverse()
-            }
-        });
-
-        // Apply offset/limit and strip sort values
-        materialized
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(row_id, row, _)| (row_id, row))
-            .collect()
-    }
-
     /// Compute COUNT(*) without materializing any rows
     ///
     /// This is the FASTEST path for `SELECT COUNT(*) FROM table`:
@@ -3771,7 +3291,7 @@ impl VersionStore {
         }
 
         // FAST PATH: If uncommitted_writes is empty, scan arena directly (single pass).
-        // SAFETY: Only valid under ReadCommitted (see get_visible_row_indices).
+        // SAFETY: Arena heads are used only under ReadCommitted isolation.
         //
         // LOCK ORDERING: Check uncommitted_writes BEFORE acquiring arena to maintain
         // consistent ordering with truncate_all (uncommitted_writes → arena).
@@ -3882,7 +3402,7 @@ impl VersionStore {
         }
 
         // FAST PATH: If uncommitted_writes is empty, scan arena directly (single pass).
-        // SAFETY: Only valid under ReadCommitted (see get_visible_row_indices).
+        // SAFETY: Arena heads are used only under ReadCommitted isolation.
         //
         // LOCK ORDERING: Check uncommitted_writes BEFORE acquiring arena to maintain
         // consistent ordering with truncate_all (uncommitted_writes → arena).
@@ -3989,7 +3509,7 @@ impl VersionStore {
         }
 
         // FAST PATH: If uncommitted_writes is empty, scan arena directly (single pass).
-        // SAFETY: Only valid under ReadCommitted (see get_visible_row_indices).
+        // SAFETY: Arena heads are used only under ReadCommitted isolation.
         //
         // LOCK ORDERING: Check uncommitted_writes BEFORE acquiring arena to maintain
         // consistent ordering with truncate_all (uncommitted_writes → arena).
@@ -4186,7 +3706,7 @@ impl VersionStore {
         }
 
         // FAST PATH: Scan arena directly when no uncommitted writes.
-        // SAFETY: Only valid under ReadCommitted (see get_visible_row_indices).
+        // SAFETY: Arena heads are used only under ReadCommitted isolation.
         let uncommitted_empty = self.uncommitted_writes.read().is_empty();
         if uncommitted_empty && !checker.needs_snapshot_isolation(txn_id) {
             let arena_guard = self.arena.read_guard();
@@ -4252,138 +3772,6 @@ impl VersionStore {
                 AggregateAccumulator::Avg(is, fs, c) => AggregateResult::Avg(is as f64 + fs, c),
             })
             .collect()
-    }
-
-    /// Returns a zero-copy streaming iterator over visible rows
-    ///
-    /// This is the TRUE zero-copy approach that leverages Rust's borrowing system.
-    /// Instead of cloning row data, it:
-    /// 1. Pre-computes visible row indices in a single pass
-    /// 2. Holds arena locks for the duration of iteration
-    /// 3. Yields &[Value] slices directly from arena memory
-    ///
-    /// # Performance
-    /// - Eliminates ALL cloning during iteration
-    /// - Single lock acquisition for entire scan
-    /// - Cache-friendly contiguous memory access
-    /// - Fast path: O(n) arena scan when all rows are visible (skips version map)
-    ///
-    /// # Usage
-    /// ```ignore
-    /// let mut stream = version_store.stream_visible_rows(txn_id);
-    /// while stream.next() {
-    ///     let values: &[Value] = stream.row_slice(); // Zero-copy!
-    ///     let row_id = stream.row_id();
-    ///     // Process values...
-    /// }
-    /// ```
-    pub fn stream_visible_rows(&self, txn_id: i64) -> StreamingResult<'_> {
-        let checker = self.visibility_checker.as_ref();
-
-        // Clone CowBTree to release read lock early, allowing concurrent commits
-        let versions = self.versions.read().clone();
-
-        // LOCK ORDERING: Check uncommitted_writes BEFORE acquiring arena to maintain
-        // consistent ordering with truncate_all (uncommitted_writes → arena).
-        let uncommitted_empty = if checker.is_some() {
-            self.uncommitted_writes.read().is_empty()
-        } else {
-            false
-        };
-
-        // Pre-acquire arena lock (after uncommitted_writes check)
-        let arena_guard = self.arena.read_guard();
-        let arena_len = arena_guard.len();
-
-        // Get column names from schema
-        let columns: Vec<String> = self
-            .schema
-            .read()
-            .columns
-            .iter()
-            .map(|c| c.name.clone())
-            .collect();
-
-        // FAST PATH: If we can iterate arena directly without version map lookup
-        // This is possible when:
-        // 1. No active uncommitted writes
-        // 2. ReadCommitted isolation (all committed versions are visible)
-        // SAFETY: Only valid under ReadCommitted (see get_visible_row_indices).
-        if let Some(checker) = checker {
-            if uncommitted_empty && arena_len > 0 && !checker.needs_snapshot_isolation(txn_id) {
-                // Fast path: scan arena directly, skip version map iteration
-                let mut visible_indices: Vec<VisibleRowInfo> = Vec::with_capacity(arena_len);
-
-                for (idx, meta) in arena_guard.meta().iter().enumerate() {
-                    // Check visibility and deleted status
-                    if meta.txn_id != 0
-                        && meta.deleted_at_txn_id == 0
-                        && checker.is_visible(meta.txn_id, txn_id)
-                    {
-                        visible_indices.push(VisibleRowInfo {
-                            row_id: meta.row_id,
-                            arena_idx: idx,
-                        });
-                    }
-                }
-
-                // Sort by row_id for consistent ordering
-                visible_indices.sort_unstable_by_key(|info| info.row_id);
-
-                return StreamingResult::new(arena_guard, visible_indices, columns);
-            }
-        }
-
-        // SLOW PATH: Full iteration (includes chain entries for snapshot isolation)
-        let mut visible_indices: Vec<VisibleRowInfo> = Vec::with_capacity(versions.len());
-        let mut fallback_data: Vec<CompactArc<[crate::core::Value]>> = Vec::new();
-
-        if let Some(checker) = checker {
-            for (&row_id, chain) in versions.iter() {
-                let mut current: Option<&VersionChainEntry> = Some(chain);
-
-                while let Some(e) = current {
-                    let version_txn_id = e.version.txn_id;
-                    let deleted_at_txn_id = e.version.deleted_at_txn_id;
-
-                    if checker.is_visible(version_txn_id, txn_id) {
-                        if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id)
-                        {
-                            // Found visible, non-deleted version
-                            if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                                if idx < arena_len {
-                                    visible_indices.push(VisibleRowInfo {
-                                        row_id,
-                                        arena_idx: idx,
-                                    });
-                                } else {
-                                    // Arena index out of bounds — use fallback
-                                    let fb_idx = arena_len + fallback_data.len();
-                                    fallback_data.push(e.version.data.clone().into_arc());
-                                    visible_indices.push(VisibleRowInfo {
-                                        row_id,
-                                        arena_idx: fb_idx,
-                                    });
-                                }
-                            } else {
-                                // Chain entry without arena index — store data in fallback
-                                let fb_idx = arena_len + fallback_data.len();
-                                fallback_data.push(e.version.data.clone().into_arc());
-                                visible_indices.push(VisibleRowInfo {
-                                    row_id,
-                                    arena_idx: fb_idx,
-                                });
-                            }
-                        }
-                        break;
-                    }
-                    current = e.prev.as_ref().map(|b| b.as_ref());
-                }
-            }
-        }
-        drop(versions); // Release lock before returning
-
-        StreamingResult::new_with_fallback(arena_guard, visible_indices, fallback_data, columns)
     }
 
     /// Returns the count of rows
@@ -7548,38 +6936,6 @@ mod tests {
         }
     }
 
-    /// Visibility checker that reports snapshot isolation, causing arena fast
-    /// paths to be bypassed and version chain traversal to be used.
-    struct SnapshotVisibilityChecker {
-        current_seq: AtomicI64,
-    }
-
-    impl SnapshotVisibilityChecker {
-        fn new() -> Self {
-            Self {
-                current_seq: AtomicI64::new(0),
-            }
-        }
-    }
-
-    impl VisibilityChecker for SnapshotVisibilityChecker {
-        fn is_visible(&self, version_txn_id: i64, viewing_txn_id: i64) -> bool {
-            version_txn_id <= viewing_txn_id
-        }
-
-        fn get_current_sequence(&self) -> i64 {
-            self.current_seq.fetch_add(1, Ordering::AcqRel)
-        }
-
-        fn get_active_transaction_ids(&self) -> Vec<i64> {
-            Vec::new()
-        }
-
-        fn needs_snapshot_isolation(&self, _txn_id: i64) -> bool {
-            true
-        }
-    }
-
     /// A visibility checker that does not force snapshot isolation, so the
     /// arena-backed grouped aggregation path is reachable.
     struct ReadCommittedChecker;
@@ -8085,32 +7441,6 @@ mod tests {
     }
 
     #[test]
-    fn test_row_index() {
-        let idx = RowIndex::new(100, Some(5));
-
-        // Test Copy trait
-        let copied = idx;
-        assert_eq!(copied.row_id, 100);
-        assert_eq!(copied.arena_idx(), Some(5));
-
-        // Test Clone trait (use Clone::clone to avoid clone_on_copy warning)
-        let cloned = Clone::clone(&idx);
-        assert_eq!(cloned.row_id, 100);
-
-        // Test with None arena_idx
-        let idx_none = RowIndex::new(200, None);
-        assert!(idx_none.arena_idx().is_none());
-
-        // Test Debug
-        let debug = format!("{:?}", idx);
-        assert!(debug.contains("RowIndex"));
-        assert!(debug.contains("100"));
-
-        // Test memory optimization: RowIndex should be 16 bytes (not 24)
-        assert_eq!(std::mem::size_of::<RowIndex>(), 16);
-    }
-
-    #[test]
     fn test_aggregate_op() {
         // Test equality
         assert_eq!(AggregateOp::Count, AggregateOp::Count);
@@ -8458,31 +7788,6 @@ mod tests {
     }
 
     #[test]
-    fn test_version_store_stream_visible_rows() {
-        let checker = Arc::new(TestVisibilityChecker::new());
-        let store =
-            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
-
-        // Add rows
-        for i in 1..=3 {
-            let row = Row::from(vec![Value::from(i * 10)]);
-            let version = RowVersion::new(1, row);
-            store.add_version(i, version);
-        }
-
-        let mut stream = store.stream_visible_rows(2);
-        let mut count = 0;
-
-        while stream.next() {
-            count += 1;
-            let slice = stream.row_arc_slice().unwrap();
-            assert!(!slice.is_empty());
-        }
-
-        assert_eq!(count, 3);
-    }
-
-    #[test]
     fn test_version_store_row_claim() {
         let store = VersionStore::new("test_table".to_string(), test_schema());
 
@@ -8549,53 +7854,6 @@ mod tests {
         let seq1 = store.get_current_sequence();
         let seq2 = store.get_current_sequence();
         assert!(seq2 > seq1);
-    }
-
-    #[test]
-    fn test_version_store_get_visible_row_indices() {
-        let checker = Arc::new(TestVisibilityChecker::new());
-        let store =
-            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
-
-        // Add rows
-        for i in 1..=5 {
-            let row = Row::from(vec![Value::from(i)]);
-            let version = RowVersion::new(1, row);
-            store.add_version(i, version);
-        }
-
-        let indices = store.get_visible_row_indices(2);
-        assert_eq!(indices.len(), 5);
-
-        // Verify indices can be materialized
-        let materialized = store.materialize_rows(&indices);
-        assert_eq!(materialized.len(), 5);
-    }
-
-    #[test]
-    fn test_version_store_get_column_value() {
-        let checker = Arc::new(TestVisibilityChecker::new());
-        let store =
-            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
-
-        // Add a row with multiple columns
-        let row = Row::from(vec![Value::from(42), Value::from("test")]);
-        let version = RowVersion::new(1, row);
-        store.add_version(1, version);
-
-        let indices = store.get_visible_row_indices(2);
-        assert_eq!(indices.len(), 1);
-
-        // Get column values
-        let val = store.get_column_value(&indices[0], 0);
-        assert_eq!(val, Some(Value::from(42)));
-
-        let val = store.get_column_value(&indices[0], 1);
-        assert_eq!(val, Some(Value::from("test")));
-
-        // Out of bounds column
-        let val = store.get_column_value(&indices[0], 99);
-        assert!(val.is_none());
     }
 
     #[test]
@@ -8824,33 +8082,6 @@ mod tests {
         }
 
         assert_eq!(store.count_visible(2), 10);
-    }
-
-    #[test]
-    fn test_materialize_single_row() {
-        let checker = Arc::new(TestVisibilityChecker::new());
-        let store =
-            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
-
-        // Add a row
-        let row = Row::from(vec![Value::from(42)]);
-        let version = RowVersion::new(1, row);
-        store.add_version(100, version);
-
-        let indices = store.get_visible_row_indices(2);
-        assert_eq!(indices.len(), 1);
-
-        // Materialize single row
-        let result = store.materialize_row(&indices[0]);
-        assert!(result.is_some());
-        let (row_id, row) = result.unwrap();
-        assert_eq!(row_id, 100);
-        assert_eq!(row.get(0), Some(&Value::from(42)));
-
-        // Invalid index
-        let invalid_idx = RowIndex::new(999, None);
-        let result = store.materialize_row(&invalid_idx);
-        assert!(result.is_none());
     }
 
     // =========================================================================
@@ -9091,13 +8322,6 @@ mod tests {
 
     #[test]
     fn test_descending_order_returns_correct_version_under_snapshot_isolation() {
-        // Reproducer: under snapshot isolation, the descending path uses deferred
-        // materialization (RowIndex → materialize_rows). For chain entries where HEAD
-        // is not visible, materialization falls back to versions.get(row_id) which
-        // returns HEAD data — not the correct older visible version.
-        //
-        // TestVisibilityChecker: is_visible(txn_id, viewer) = txn_id <= viewer.
-        // So viewer=2 sees txn_id=1 but NOT txn_id=3. This simulates snapshot isolation.
         let checker = Arc::new(TestVisibilityChecker::new());
         let store =
             VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
@@ -9138,52 +8362,6 @@ mod tests {
             data1_desc.get(0),
             Some(&Value::from(100)),
             "Descending: row_id=1 should have original value 100, not updated 999"
-        );
-    }
-
-    #[test]
-    fn test_sorted_limit_returns_correct_version_under_snapshot_isolation() {
-        // Same scenario as descending test but via get_visible_rows_sorted_limit.
-        // The slow path (SnapshotIsolation) must materialize during iteration,
-        // not defer to materialize_rows which reads HEAD data.
-        // Uses SnapshotVisibilityChecker so arena fast paths are bypassed.
-        let checker = Arc::new(SnapshotVisibilityChecker::new());
-        let store =
-            VersionStore::with_visibility_checker("test_table".to_string(), test_schema(), checker);
-
-        // Tx 1: insert row_id=1 with value=100, row_id=2 with value=200
-        let row1 = Row::from(vec![Value::from(100)]);
-        store.add_version(1, RowVersion::new(1, row1));
-        let row2 = Row::from(vec![Value::from(200)]);
-        store.add_version(2, RowVersion::new(1, row2));
-
-        // Tx 3: update row_id=1 with new value=999
-        let updated_row = Row::from(vec![Value::from(999)]);
-        store.add_version(1, RowVersion::new(3, updated_row));
-
-        // Viewer txn_id=2: sees txn<=2
-        // Sort by column 0, ascending — row_id=1 (val=100) should come first
-        let sorted = store.get_visible_rows_sorted_limit(2, 0, true, 100, 0);
-        assert_eq!(sorted.len(), 2, "Should see 2 rows");
-
-        // First row should be row_id=1 with value=100 (not 999)
-        let (rid, data) = &sorted[0];
-        assert_eq!(*rid, 1);
-        assert_eq!(
-            data.get(0),
-            Some(&Value::from(100)),
-            "Sorted ascending: row_id=1 should have value 100, not 999"
-        );
-
-        // Descending — row_id=2 (val=200) first, then row_id=1 (val=100)
-        let sorted_desc = store.get_visible_rows_sorted_limit(2, 0, false, 100, 0);
-        assert_eq!(sorted_desc.len(), 2);
-        let (rid2, data2) = &sorted_desc[1];
-        assert_eq!(*rid2, 1);
-        assert_eq!(
-            data2.get(0),
-            Some(&Value::from(100)),
-            "Sorted descending: row_id=1 should have value 100, not 999"
         );
     }
 
