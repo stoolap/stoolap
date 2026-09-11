@@ -269,6 +269,10 @@ cargo fmt --check
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Security
+
+To report a vulnerability, see [SECURITY.md](SECURITY.md). Dependencies are audited against the RustSec advisory database in CI.
+
 ## License
 
 Apache License 2.0. See [LICENSE](LICENSE).
