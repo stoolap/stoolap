@@ -1286,16 +1286,35 @@ impl<'a> ExprCompiler<'a> {
         let is_glob = op_upper.contains("GLOB");
         let is_regexp = op_upper.contains("REGEXP") || op_upper.contains("RLIKE");
 
-        // Extract escape character if present
-        let escape_char: Option<char> = if let Some(ref escape_expr) = like.escape {
-            if let Expression::StringLiteral(lit) = &**escape_expr {
-                lit.value.chars().next()
-            } else {
-                None
+        // ESCAPE is baked in when it is a literal or folds to one. Anything else
+        // is evaluated per row, never dropped.
+        let mut runtime_escape: Option<&Expression> = None;
+        let escape_char: Option<char> = match like.escape.as_deref() {
+            None => None,
+            Some(Expression::StringLiteral(lit)) => lit.value.chars().next(),
+            Some(escape_expr) => {
+                match is_column_free(escape_expr)
+                    .then(|| self.try_fold_constant(escape_expr))
+                    .flatten()
+                {
+                    Some(Value::Text(text)) => text.chars().next(),
+                    _ => {
+                        runtime_escape = Some(escape_expr);
+                        None
+                    }
+                }
             }
-        } else {
-            None
         };
+
+        if let Some(escape_expr) = runtime_escape.filter(|_| !is_glob && !is_regexp) {
+            self.compile_expr(&like.pattern, builder)?;
+            self.compile_expr(escape_expr, builder)?;
+            builder.emit(Op::LikeDynamicEscapeExpr(case_insensitive));
+            if negated {
+                builder.emit(Op::Not);
+            }
+            return Ok(());
+        }
 
         // Try to compile pattern at compile time
         let pattern_str = Self::extract_pattern_string(&like.pattern);

@@ -109,3 +109,57 @@ fn test_like_escape_underscore_with_escape_clause() {
     let ids = query_ids(&db, "SELECT id FROM t WHERE val LIKE '%!_%' ESCAPE '!'");
     assert_eq!(ids, vec![5], "ESCAPE '!' should treat !_ as literal '_'");
 }
+
+#[test]
+fn test_like_escape_from_folded_expression() {
+    let db = setup_db("like_escape_folded");
+    let ids = query_ids(
+        &db,
+        "SELECT id FROM t WHERE val LIKE '%!_%' ESCAPE SUBSTR('!x', 1, 1)",
+    );
+    assert_eq!(ids, vec![5], "a folded ESCAPE must act like the literal");
+}
+
+#[test]
+fn test_like_escape_negated_from_folded_expression() {
+    let db = setup_db("like_escape_folded_not");
+    let ids = query_ids(
+        &db,
+        "SELECT id FROM t WHERE val NOT LIKE '%!_%' ESCAPE UPPER('!')",
+    );
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4, 6, 7, 8],
+        "NOT LIKE must honour a folded ESCAPE"
+    );
+}
+
+#[test]
+fn test_like_escape_from_parameter() {
+    let db = setup_db("like_escape_param");
+    let mut rows = db
+        .query("SELECT id FROM t WHERE val LIKE ? ESCAPE ?", ("%!_%", "!"))
+        .unwrap();
+    let mut ids = Vec::new();
+    while let Some(Ok(row)) = rows.next() {
+        ids.push(row.get::<i64>(0).unwrap());
+    }
+    assert_eq!(ids, vec![5], "a parameter ESCAPE must be honoured");
+}
+
+#[test]
+fn test_like_escape_from_column() {
+    let db = Database::open("memory://like_escape_column").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, esc TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, 'under_score', '!'), (2, 'underXscore', '!')",
+        (),
+    )
+    .unwrap();
+    let ids = query_ids(&db, "SELECT id FROM t WHERE val LIKE '%!_%' ESCAPE esc");
+    assert_eq!(ids, vec![1], "a column ESCAPE must be evaluated per row");
+}
