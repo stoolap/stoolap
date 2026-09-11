@@ -15,6 +15,14 @@ description: Release history and version notes for Stoolap
 
 <section class="changelog-list">
   <div class="container">
+    <article class="changelog-release">
+      <header class="changelog-release-header">
+        <span class="changelog-tag">Unreleased</span>
+      </header>
+      <div class="changelog-body">
+        <p>Fixed captured-version scans reading a newer row payload after a concurrent UPDATE reused its arena slot. These scans now read the payload retained by the visible version, preserving snapshot values, filter results, ordering, and aggregates.</p>
+      </div>
+    </article>
     <div id="changelogContent">
       <div class="changelog-loading" id="changelogLoading">
         <div class="changelog-spinner"></div>
