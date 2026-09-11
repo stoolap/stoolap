@@ -21,6 +21,7 @@ description: Release history and version notes for Stoolap
       </header>
       <div class="changelog-body">
         <p>Fixed captured-version scans reading a newer row payload after a concurrent UPDATE reused its arena slot. These scans now read the payload retained by the visible version, preserving snapshot values, filter results, ordering, and aggregates.</p>
+        <p>Removed the unused storage sorted-limit and RowIndex materialization APIs, plus the MVCC StreamingResult module. This removes public Rust symbols; SQL queries continue to use the existing index-order and top-k scans.</p>
       </div>
     </article>
     <div id="changelogContent">

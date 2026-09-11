@@ -2386,43 +2386,6 @@ impl Table for SegmentedTable {
         Ok(result)
     }
 
-    fn collect_rows_sorted_with_limit(
-        &self,
-        sort_col_idx: usize,
-        ascending: bool,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<Row>> {
-        if let Some(result) = self.unsealed(|hot| {
-            hot.collect_rows_sorted_with_limit(sort_col_idx, ascending, limit, offset)
-        }) {
-            return result;
-        }
-        // Collect all merged rows, sort, take limit
-        let mut rows = self.collect_all_rows(None)?;
-        rows.sort_by(|(_, a), (_, b)| {
-            let va = a.get(sort_col_idx);
-            let vb = b.get(sort_col_idx);
-            let cmp = match (va, vb) {
-                (None, None) => std::cmp::Ordering::Equal,
-                (None, Some(_)) => std::cmp::Ordering::Less,
-                (Some(_), None) => std::cmp::Ordering::Greater,
-                (Some(va), Some(vb)) => va.compare(vb).unwrap_or(std::cmp::Ordering::Equal),
-            };
-            if ascending {
-                cmp
-            } else {
-                cmp.reverse()
-            }
-        });
-        Ok(rows
-            .into_iter()
-            .skip(offset)
-            .take(limit)
-            .map(|(_, row)| row)
-            .collect())
-    }
-
     fn has_row_id(&self, row_id: i64) -> Result<bool> {
         if self.hot.has_row_id(row_id)? {
             return Ok(true);

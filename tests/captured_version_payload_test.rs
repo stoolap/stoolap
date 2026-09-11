@@ -155,8 +155,6 @@ captured_rows_test!(captured_filtered_callback, |store, id| {
 });
 captured_rows_test!(captured_filtered_limit, |store, id| store
     .get_visible_rows_filtered_with_limit(id, &balance_filter(), 1, 0));
-captured_rows_test!(captured_sorted_rows, |store, id| store
-    .get_visible_rows_sorted_limit(id, 1, true, 1, 0));
 
 #[test]
 fn captured_aggregate() {

@@ -42,7 +42,6 @@ pub mod persistence;
 pub mod registry;
 pub mod scanner;
 pub mod snapshot;
-pub mod streaming_result;
 pub mod table;
 pub mod timestamp;
 pub mod transaction;
@@ -67,7 +66,6 @@ pub use persistence::{
 pub use registry::{TransactionRegistry, INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID};
 pub use scanner::{EmptyScanner, MVCCScanner, RangeScanner, SingleRowScanner};
 pub use snapshot::{DiskVersionStore, SnapshotReader, SnapshotWriter};
-pub use streaming_result::{AggregationScanner, StreamingResult, VisibleRowInfo};
 pub use table::MVCCTable;
 pub use timestamp::get_fast_timestamp;
 pub(crate) use timestamp::last_timestamp;
@@ -75,8 +73,8 @@ pub use transaction::{
     MvccTransaction, SealFenceGuard, TransactionEngineOperations, TransactionState,
 };
 pub use version_store::{
-    clear_version_map_pools, AggregateOp, AggregateResult, RowIndex, RowVersion,
-    SealedIndexCleanup, TransactionVersionStore, VersionStore, VisibilityChecker, WriteSetEntry,
+    clear_version_map_pools, AggregateOp, AggregateResult, RowVersion, SealedIndexCleanup,
+    TransactionVersionStore, VersionStore, VisibilityChecker, WriteSetEntry,
 };
 pub use wal_manager::{
     CheckpointMetadata, WALEntry, WALManager, WALOperationType, DEFAULT_WAL_BUFFER_SIZE,
