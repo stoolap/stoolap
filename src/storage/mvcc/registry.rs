@@ -30,6 +30,78 @@ use crate::common::I64Map;
 use crate::core::IsolationLevel;
 use crate::storage::VisibilityChecker;
 
+use super::memory::{HotObjectCharge, RetainedBytes};
+
+static REGISTRY_BYTES: RetainedBytes = RetainedBytes::new();
+
+pub(crate) fn registry_bytes() -> usize {
+    REGISTRY_BYTES.get()
+}
+
+struct RegistryMap<V> {
+    entries: I64Map<V>,
+    charge: RegistryMapCharge,
+}
+
+struct RegistryMapCharge(usize);
+
+impl Drop for RegistryMapCharge {
+    fn drop(&mut self) {
+        REGISTRY_BYTES.remove(self.0 as u128);
+    }
+}
+
+impl<V> RegistryMap<V> {
+    fn new(entries: I64Map<V>) -> Self {
+        let bytes = entries.allocation_bytes();
+        REGISTRY_BYTES.add(bytes as u128);
+        Self {
+            entries,
+            charge: RegistryMapCharge(bytes),
+        }
+    }
+
+    #[inline]
+    fn update_charge(&mut self) {
+        let bytes = self.entries.allocation_bytes();
+        REGISTRY_BYTES.resize(self.charge.0 as u128, bytes as u128);
+        self.charge.0 = bytes;
+    }
+
+    #[inline]
+    fn insert(&mut self, key: i64, value: V) -> Option<V> {
+        let previous = self.entries.insert(key, value);
+        self.update_charge();
+        previous
+    }
+
+    #[inline]
+    fn remove(&mut self, key: i64) -> Option<V> {
+        let previous = self.entries.remove(key);
+        self.update_charge();
+        previous
+    }
+
+    #[inline]
+    fn get_mut(&mut self, key: i64) -> Option<&mut V> {
+        self.entries.get_mut(key)
+    }
+
+    fn retain(&mut self, predicate: impl FnMut(i64, &mut V) -> bool) {
+        self.entries.retain(predicate);
+        self.update_charge();
+    }
+}
+
+impl<V> std::ops::Deref for RegistryMap<V> {
+    type Target = I64Map<V>;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
 /// Invalid transaction ID returned when registry is not accepting new transactions.
 pub const INVALID_TRANSACTION_ID: i64 = -999999999;
 
@@ -188,11 +260,11 @@ impl CommittedCache {
 pub struct TransactionRegistry {
     /// All tracked transactions (Active, Committing, Aborted).
     /// Committed transactions are REMOVED from this map.
-    transactions: Mutex<I64Map<TxnState>>,
+    transactions: Mutex<RegistryMap<TxnState>>,
 
     /// For SNAPSHOT ISOLATION: txn_id -> commit_seq.
     /// GC removes old entries when commit_seq < min_active_begin_seq.
-    snapshot_seqs: Mutex<I64Map<i64>>,
+    snapshot_seqs: Mutex<RegistryMap<i64>>,
 
     /// Last assigned transaction ID (after begin_transaction, equals txn_id).
     next_txn_id: AtomicI64,
@@ -204,7 +276,7 @@ pub struct TransactionRegistry {
     global_isolation_level: AtomicU8,
 
     /// Per-transaction isolation level overrides.
-    isolation_overrides: Mutex<I64Map<u8>>,
+    isolation_overrides: Mutex<RegistryMap<u8>>,
 
     /// Count of active isolation overrides (skip lookup when 0).
     override_count: AtomicUsize,
@@ -214,6 +286,7 @@ pub struct TransactionRegistry {
 
     /// Whether new transactions are being accepted.
     accepting: AtomicBool,
+    _object: HotObjectCharge<Self>,
 }
 
 impl TransactionRegistry {
@@ -225,15 +298,16 @@ impl TransactionRegistry {
     /// Creates a new transaction registry with pre-allocated capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            transactions: Mutex::new(I64Map::with_capacity(capacity)),
-            snapshot_seqs: Mutex::new(I64Map::new()),
+            transactions: Mutex::new(RegistryMap::new(I64Map::with_capacity(capacity))),
+            snapshot_seqs: Mutex::new(RegistryMap::new(I64Map::new())),
             next_txn_id: AtomicI64::new(0),
             next_sequence: AtomicI64::new(0),
             global_isolation_level: AtomicU8::new(0),
-            isolation_overrides: Mutex::new(I64Map::new()),
+            isolation_overrides: Mutex::new(RegistryMap::new(I64Map::new())),
             override_count: AtomicUsize::new(0),
             active_txn_count: AtomicUsize::new(0),
             accepting: AtomicBool::new(true),
+            _object: HotObjectCharge::new(),
         }
     }
 
@@ -998,6 +1072,42 @@ impl VisibilityChecker for TransactionRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registry_map_charges_follow_growth_recovery_and_gc() {
+        let registry = TransactionRegistry::with_capacity(8);
+        let check = || {
+            let transactions = registry.transactions.lock();
+            assert_eq!(transactions.charge.0, transactions.allocation_bytes());
+            let sequences = registry.snapshot_seqs.lock();
+            assert_eq!(sequences.charge.0, sequences.allocation_bytes());
+            let overrides = registry.isolation_overrides.lock();
+            assert_eq!(overrides.charge.0, overrides.allocation_bytes());
+        };
+        check();
+        let initial = registry.transactions.lock().charge.0;
+        registry.set_global_isolation_level(IsolationLevel::SnapshotIsolation);
+        let ids: Vec<_> = (0..2048).map(|_| registry.begin_transaction().0).collect();
+        assert!(registry.transactions.lock().allocation_bytes() > initial);
+        check();
+        for id in ids {
+            registry.set_transaction_isolation_level(id, IsolationLevel::ReadCommitted);
+            registry.start_commit(id);
+            registry.complete_commit(id);
+        }
+        check();
+        for id in 4096..8192 {
+            registry.recover_committed_transaction(id, id);
+            registry.recover_aborted_transaction(id);
+        }
+        check();
+        registry.recover_committed_transaction(100_000, 100_000);
+        registry.run_gc();
+        check();
+        assert!(registry.transactions.lock().is_empty());
+        assert!(registry.snapshot_seqs.lock().is_empty());
+        assert!(registry.isolation_overrides.lock().is_empty());
+    }
 
     #[test]
     fn test_begin_transaction() {

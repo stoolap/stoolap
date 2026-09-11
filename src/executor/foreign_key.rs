@@ -158,7 +158,7 @@ fn parent_row_exists(
 pub(crate) fn find_referencing_fks(
     engine: &MVCCEngine,
     parent_table: &str,
-) -> Arc<Vec<(String, ForeignKeyConstraint)>> {
+) -> Arc<crate::storage::mvcc::ReferencingFks> {
     engine.find_referencing_fks(parent_table)
 }
 

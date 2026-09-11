@@ -17,12 +17,107 @@
 //! This module provides result types for SQL query execution.
 
 use crate::common::CompactArc;
-use crate::core::{Result, Row, RowVec, Value};
+use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::Expression;
 use crate::storage::traits::QueryResult;
 use rustc_hash::{FxHashMap, FxHasher};
 
 use super::expression::RowFilter;
+use crate::storage::mvcc::memory::HotMetadataCharge;
+use crate::storage::mvcc::read_memory::{current_scope, ReadScope};
+use std::sync::Arc;
+
+pub(super) fn with_read_scope(
+    execute: impl FnOnce() -> Result<Box<dyn QueryResult>>,
+) -> Result<Box<dyn QueryResult>> {
+    let scope = current_scope().unwrap_or_default();
+    let _active = scope.enter();
+    let inner = execute()?;
+    Ok(retain_read_scope(inner, scope))
+}
+
+pub(super) fn retain_read_scope(
+    inner: Box<dyn QueryResult>,
+    scope: Arc<ReadScope>,
+) -> Box<dyn QueryResult> {
+    if inner.columns().is_empty() {
+        return inner;
+    }
+    Box::new(ScopedResult { inner, scope })
+}
+
+struct ScopedResult {
+    inner: Box<dyn QueryResult>,
+    scope: Arc<ReadScope>,
+}
+
+impl QueryResult for ScopedResult {
+    fn columns(&self) -> &[String] {
+        self.inner.columns()
+    }
+
+    fn columns_arc(&self) -> Option<CompactArc<Vec<String>>> {
+        self.inner.columns_arc()
+    }
+
+    fn next(&mut self) -> bool {
+        let _active = self.scope.enter();
+        self.inner.next()
+    }
+
+    fn scan(&self, dest: &mut [Value]) -> Result<()> {
+        let _active = self.scope.enter();
+        self.inner.scan(dest)
+    }
+
+    fn row(&self) -> &Row {
+        self.inner.row()
+    }
+
+    fn take_row(&mut self) -> Row {
+        let _active = self.scope.enter();
+        self.inner.take_row()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        let _active = self.scope.enter();
+        self.inner.close()
+    }
+
+    fn rows_affected(&self) -> i64 {
+        self.inner.rows_affected()
+    }
+
+    fn last_insert_id(&self) -> i64 {
+        self.inner.last_insert_id()
+    }
+
+    fn try_into_arc_rows(&mut self) -> Option<CompactArc<Vec<Row>>> {
+        let _active = self.scope.enter();
+        self.inner.try_into_arc_rows()
+    }
+
+    fn estimated_count(&self) -> Option<usize> {
+        self.inner.estimated_count()
+    }
+
+    fn exact_len(&self) -> Option<usize> {
+        self.inner.exact_len()
+    }
+
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        self.inner.last_error()
+    }
+
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
+        let Self { inner, scope } = *self;
+        let _active = scope.enter();
+        Box::new(Self {
+            inner: inner.with_aliases(aliases),
+            scope,
+        })
+    }
+}
 
 /// Execution result for DML operations (INSERT, UPDATE, DELETE)
 ///
@@ -167,26 +262,19 @@ pub struct ExecutorResult {
     affected: i64,
     /// Last insert ID (0 for SELECT)
     insert_id: i64,
+    _column_memory: HotMetadataCharge,
 }
 
 impl ExecutorResult {
     /// Create a new memory result with columns and pooled rows
     pub fn new(columns: Vec<String>, rows: RowVec) -> Self {
-        let len = rows.len();
-        Self {
-            columns: CompactArc::new(columns),
-            rows: RowStorage::Owned(rows),
-            len,
-            current_index: None,
-            closed: false,
-            affected: 0,
-            insert_id: 0,
-        }
+        Self::with_arc_columns(CompactArc::new(columns), rows)
     }
 
     /// Create a new memory result with Arc columns (zero-copy)
     pub fn with_arc_columns(columns: CompactArc<Vec<String>>, rows: RowVec) -> Self {
         let len = rows.len();
+        let column_memory = HotMetadataCharge::new(Schema::column_names_bytes(&columns));
         Self {
             columns,
             rows: RowStorage::Owned(rows),
@@ -195,22 +283,14 @@ impl ExecutorResult {
             closed: false,
             affected: 0,
             insert_id: 0,
+            _column_memory: column_memory,
         }
     }
 
     /// Create a new memory result with shared rows from cache (zero-copy for rows)
     /// This avoids cloning the entire Vec<Row> when reading from semantic cache
     pub fn with_shared_rows(columns: Vec<String>, rows: CompactArc<Vec<Row>>) -> Self {
-        let len = rows.len();
-        Self {
-            columns: CompactArc::new(columns),
-            rows: RowStorage::Shared(rows),
-            len,
-            current_index: None,
-            closed: false,
-            affected: 0,
-            insert_id: 0,
-        }
+        Self::with_arc_columns_shared_rows(CompactArc::new(columns), rows)
     }
 
     /// Create a new memory result with Arc columns and shared rows (zero-copy for both)
@@ -219,6 +299,7 @@ impl ExecutorResult {
         rows: CompactArc<Vec<Row>>,
     ) -> Self {
         let len = rows.len();
+        let column_memory = HotMetadataCharge::new(Schema::column_names_bytes(&columns));
         Self {
             columns,
             rows: RowStorage::Shared(rows),
@@ -227,22 +308,14 @@ impl ExecutorResult {
             closed: false,
             affected: 0,
             insert_id: 0,
+            _column_memory: column_memory,
         }
     }
 
     /// Create a new memory result with both Arc columns and Arc rows (fully zero-copy)
     /// This is the most efficient constructor for cached/shared results
     pub fn with_arc_all(columns: CompactArc<Vec<String>>, rows: CompactArc<Vec<Row>>) -> Self {
-        let len = rows.len();
-        Self {
-            columns,
-            rows: RowStorage::Shared(rows),
-            len,
-            current_index: None,
-            closed: false,
-            affected: 0,
-            insert_id: 0,
-        }
+        Self::with_arc_columns_shared_rows(columns, rows)
     }
 
     /// Create an empty memory result
@@ -429,6 +502,8 @@ impl QueryResult for ExecutorResult {
                 }
             }
         }
+        self._column_memory
+            .resize(Schema::column_names_bytes(&self.columns));
         self
     }
 }
@@ -1774,6 +1849,7 @@ pub struct ScannerResult {
     current_row: Row,
     /// Whether we have a valid current row
     has_current: bool,
+    _column_memory: HotMetadataCharge,
 }
 
 impl ScannerResult {
@@ -1782,11 +1858,13 @@ impl ScannerResult {
         scanner: Box<dyn crate::storage::traits::Scanner>,
         columns: CompactArc<Vec<String>>,
     ) -> Self {
+        let column_memory = HotMetadataCharge::new(Schema::column_names_bytes(&columns));
         Self {
             scanner,
             columns,
             current_row: Row::new(),
             has_current: false,
+            _column_memory: column_memory,
         }
     }
 }
@@ -2004,6 +2082,7 @@ pub struct ColumnarResult {
     current_row: Row,
     /// Whether the result is closed
     closed: bool,
+    _column_memory: HotMetadataCharge,
 }
 
 impl ColumnarResult {
@@ -2039,6 +2118,7 @@ impl ColumnarResult {
 
         // Pre-allocate the row buffer with capacity for all columns
         let num_cols = columns.len();
+        let column_memory = HotMetadataCharge::new(Schema::column_names_bytes(&columns));
 
         Self {
             columns: CompactArc::new(columns),
@@ -2047,6 +2127,7 @@ impl ColumnarResult {
             current_index: None,
             current_row: Row::with_capacity(num_cols),
             closed: false,
+            _column_memory: column_memory,
         }
     }
 
@@ -2054,6 +2135,7 @@ impl ColumnarResult {
     pub fn with_arc_columns(columns: CompactArc<Vec<String>>, data: Vec<Vec<Value>>) -> Self {
         let num_rows = data.first().map(|c| c.len()).unwrap_or(0);
         let num_cols = columns.len();
+        let column_memory = HotMetadataCharge::new(Schema::column_names_bytes(&columns));
 
         Self {
             columns,
@@ -2062,6 +2144,7 @@ impl ColumnarResult {
             current_index: None,
             current_row: Row::with_capacity(num_cols),
             closed: false,
+            _column_memory: column_memory,
         }
     }
 
@@ -2171,6 +2254,41 @@ impl QueryResult for ColumnarResult {
 mod tests {
     use super::*;
     use crate::core::row_vec::RowVec;
+
+    #[test]
+    fn result_names_stay_charged_after_schema_release() {
+        let name = "retained_column_name".repeat(512);
+        let schema = Schema::new(
+            "result_names",
+            vec![crate::core::SchemaColumn::nullable(
+                0,
+                &name,
+                crate::core::DataType::Text,
+            )],
+        );
+        let columns = schema.column_names_arc();
+        let mut owned = ExecutorResult::with_arc_columns(columns.clone(), RowVec::new());
+        let shared = ExecutorResult::with_arc_all(columns.clone(), CompactArc::new(Vec::new()));
+        let scanner = ScannerResult::new(
+            Box::new(crate::storage::mvcc::EmptyScanner::new()),
+            columns.clone(),
+        );
+        let columnar = ColumnarResult::with_arc_columns(columns.clone(), vec![Vec::new()]);
+        drop(columns);
+        drop(schema);
+        owned.close().unwrap();
+        for bytes in [
+            owned._column_memory.bytes(),
+            shared._column_memory.bytes(),
+            scanner._column_memory.bytes(),
+            columnar._column_memory.bytes(),
+        ] {
+            assert!(bytes >= name.len() as u128);
+        }
+        let alias = name.repeat(2);
+        let aliased = Box::new(owned).with_aliases(FxHashMap::from_iter([(alias.clone(), name)]));
+        assert_eq!(aliased.columns()[0], alias);
+    }
 
     /// Helper to create RowVec from Vec<Row> for tests
     fn make_rows(rows: Vec<Row>) -> RowVec {

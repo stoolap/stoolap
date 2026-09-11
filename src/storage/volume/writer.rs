@@ -32,6 +32,7 @@ pub static GLOBAL_EVICTION_EPOCH: std::sync::atomic::AtomicU64 =
 
 use crate::common::SmartString;
 use crate::core::{DataType, Row, Schema, Value};
+use crate::storage::mvcc::read_memory::{charge_bytes_export, PayloadCharge};
 
 use super::column::{ColumnData, ZoneMap, ROW_GROUP_SIZE};
 use super::format::{
@@ -1774,6 +1775,24 @@ pub struct ColumnMapping {
     /// in the same order. When true, callers can skip the mapping and
     /// use get_row()/get_row_projected() directly.
     pub is_identity: bool,
+    _payload: PayloadCharge,
+}
+
+impl ColumnMapping {
+    pub fn new(sources: Vec<ColSource>, is_identity: bool) -> Self {
+        let bytes = sources
+            .iter()
+            .map(|source| match source {
+                ColSource::Default(value) => value.heap_bytes() as u128,
+                ColSource::Volume(_) => 0,
+            })
+            .sum();
+        Self {
+            sources,
+            is_identity,
+            _payload: PayloadCharge::unshared(bytes),
+        }
+    }
 }
 
 /// Compute column mapping from current schema to a frozen volume.
@@ -1838,10 +1857,7 @@ pub fn compute_column_mapping_with_drops(
         }
     }
 
-    ColumnMapping {
-        sources,
-        is_identity,
-    }
+    ColumnMapping::new(sources, is_identity)
 }
 
 impl FrozenVolume {
@@ -1855,12 +1871,17 @@ impl FrozenVolume {
     /// Materializes all schema columns through the mapping.
     pub fn get_row_mapped(&self, idx: usize, mapping: &ColumnMapping) -> std::io::Result<Row> {
         let mut values = Vec::with_capacity(mapping.sources.len());
+        let mut exported = 0;
         for src in &mapping.sources {
             values.push(match src {
                 ColSource::Volume(vol_idx) => self.columns.get(*vol_idx)?.get_value(idx),
-                ColSource::Default(val) => val.clone(),
+                ColSource::Default(val) => {
+                    exported += val.heap_bytes() as u128;
+                    val.clone()
+                }
             });
         }
+        charge_bytes_export(exported);
         Ok(Row::from_values(values))
     }
 
@@ -1873,12 +1894,17 @@ impl FrozenVolume {
         col_indices: &[usize],
     ) -> std::io::Result<Row> {
         let mut values = Vec::with_capacity(col_indices.len());
+        let mut exported = 0;
         for &ci in col_indices {
             values.push(match &mapping.sources[ci] {
                 ColSource::Volume(vol_idx) => self.columns.get(*vol_idx)?.get_value(idx),
-                ColSource::Default(val) => val.clone(),
+                ColSource::Default(val) => {
+                    exported += val.heap_bytes() as u128;
+                    val.clone()
+                }
             });
         }
+        charge_bytes_export(exported);
         Ok(Row::from_values(values))
     }
 
@@ -1910,11 +1936,15 @@ impl FrozenVolume {
         needed: &[bool],
     ) -> std::io::Result<Row> {
         let mut values = Vec::with_capacity(mapping.sources.len());
+        let mut exported = 0;
         for (ci, src) in mapping.sources.iter().enumerate() {
             values.push(if ci < needed.len() && needed[ci] {
                 match src {
                     ColSource::Volume(vol_idx) => self.columns.get(*vol_idx)?.get_value(idx),
-                    ColSource::Default(val) => val.clone(),
+                    ColSource::Default(val) => {
+                        exported += val.heap_bytes() as u128;
+                        val.clone()
+                    }
                 }
             } else {
                 match src {
@@ -1923,6 +1953,7 @@ impl FrozenVolume {
                 }
             });
         }
+        charge_bytes_export(exported);
         Ok(Row::from_values(values))
     }
 
@@ -2155,6 +2186,53 @@ impl FrozenVolume {
 mod tests {
     use super::*;
     use crate::core::SchemaBuilder;
+
+    #[test]
+    fn column_mapping_clones_keep_default_payload_charges() {
+        let value = Value::text("retained mapped default ".repeat(256));
+        let bytes = value.heap_bytes() as u128;
+        let mapping = ColumnMapping::new(vec![ColSource::Default(value)], false);
+        assert_eq!(mapping._payload.bytes(), bytes);
+        let retained_mapping = mapping.clone();
+        drop(mapping);
+        assert_eq!(retained_mapping._payload.bytes(), bytes);
+    }
+
+    #[test]
+    fn mapped_defaults_export_only_selected_children() {
+        let schema = SchemaBuilder::new("mapped")
+            .add_primary_key("id", DataType::Integer)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(1, &Row::from_values(vec![Value::Integer(1)]));
+        let volume = builder.finish();
+        let value = Value::text("retained mapped default ".repeat(256));
+        let bytes = value.heap_bytes() as u128;
+        let mapping =
+            ColumnMapping::new(vec![ColSource::Volume(0), ColSource::Default(value)], false);
+        let retained_mapping = mapping.clone();
+        drop(mapping);
+        drop(schema);
+        let scope = Arc::new(crate::storage::mvcc::read_memory::ReadScope::default());
+        let _active = scope.enter();
+        let full = volume.get_row_mapped(0, &retained_mapping).unwrap();
+        let projected = volume
+            .get_row_mapped_projected(0, &retained_mapping, &[1])
+            .unwrap();
+        let needed = volume
+            .get_row_mapped_needed(0, &retained_mapping, &[false, true])
+            .unwrap();
+        volume
+            .get_row_mapped_projected(0, &retained_mapping, &[0])
+            .unwrap();
+        volume
+            .get_row_mapped_needed(0, &retained_mapping, &[true, false])
+            .unwrap();
+        drop(retained_mapping);
+        assert_eq!(scope.exported_bytes(), 3 * bytes);
+        assert_eq!(full.get(1), projected.get(0));
+        assert_eq!(full.get(1), needed.get(1));
+    }
 
     fn test_schema() -> Schema {
         SchemaBuilder::new("test")

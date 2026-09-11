@@ -145,6 +145,10 @@ impl<V> I64Map<V> {
         self.slots.len()
     }
 
+    pub(crate) fn allocation_bytes(&self) -> usize {
+        self.slots.len() * std::mem::size_of::<Slot<V>>()
+    }
+
     /// Reserves capacity for at least `additional` more elements to be inserted
     /// in the map. The collection may reserve more space to avoid frequent reallocations.
     pub fn reserve(&mut self, additional: usize) {

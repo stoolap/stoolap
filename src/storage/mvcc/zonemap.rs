@@ -45,6 +45,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustc_hash::FxHashMap;
 
+use super::memory::{arc_allocation_bytes, hash_table_bytes, HotMetadataCharge};
 use crate::core::{Operator, Value};
 
 /// Default segment size for zone maps (number of rows per segment)
@@ -239,16 +240,20 @@ pub struct TableZoneMap {
     pub segment_count: u32,
     /// Whether zone maps need rebuilding (after inserts/updates)
     pub stale: AtomicBool,
+    memory: HotMetadataCharge,
 }
 
 impl Clone for TableZoneMap {
     fn clone(&self) -> Self {
-        Self {
+        let mut copy = Self {
             columns: self.columns.clone(),
             segment_size: self.segment_size,
             segment_count: self.segment_count,
             stale: AtomicBool::new(self.stale.load(Ordering::SeqCst)),
-        }
+            memory: HotMetadataCharge::default(),
+        };
+        copy.refresh_memory();
+        copy
     }
 }
 
@@ -260,7 +265,25 @@ impl TableZoneMap {
             segment_size,
             segment_count: 0,
             stale: AtomicBool::new(false),
+            memory: HotMetadataCharge::default(),
         }
+    }
+
+    pub(crate) fn refresh_memory(&mut self) {
+        let mut bytes = arc_allocation_bytes::<Self>() as u128
+            + hash_table_bytes::<String, ColumnZoneMap>(self.columns.capacity());
+        for (name, column) in &self.columns {
+            bytes += name.capacity() as u128
+                + column.column_name.capacity() as u128
+                + (column.segments.capacity() * std::mem::size_of::<ZoneMapEntry>()) as u128
+                + column.global_min.as_ref().map_or(0, Value::heap_bytes) as u128
+                + column.global_max.as_ref().map_or(0, Value::heap_bytes) as u128;
+            for segment in &column.segments {
+                bytes += segment.min_value.as_ref().map_or(0, Value::heap_bytes) as u128
+                    + segment.max_value.as_ref().map_or(0, Value::heap_bytes) as u128;
+            }
+        }
+        self.memory.resize(bytes);
     }
 
     /// Get segment ID for a given row index
@@ -385,6 +408,36 @@ impl ZoneMapBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installed_zone_maps_retain_capacity_and_stale_payloads_after_replacement() {
+        let store = crate::storage::mvcc::VersionStore::new(
+            "zone_owner",
+            crate::core::Schema::new("zone_owner", Vec::new()),
+        );
+        let mut map = TableZoneMap::new(1);
+        let value = Value::text("retained_zone_value".repeat(1024));
+        map.update_row(0, &[("payload".to_string(), value.clone())]);
+        map.columns
+            .get_mut("payload")
+            .unwrap()
+            .segments
+            .reserve(512);
+        let capacity =
+            map.columns["payload"].segments.capacity() * std::mem::size_of::<ZoneMapEntry>();
+        store.set_zone_maps(map);
+        let old = store.get_zone_maps().unwrap();
+        let charged = old.memory.bytes();
+        assert!(charged >= capacity as u128 + 4 * value.heap_bytes() as u128);
+        store.mark_zone_maps_stale();
+        assert!(old.is_stale());
+        assert_eq!(old.memory.bytes(), charged);
+        let copy = (*old).clone();
+        assert!(copy.memory.bytes() >= 4 * value.heap_bytes() as u128);
+        store.set_zone_maps(TableZoneMap::new(1));
+        drop(store);
+        assert_eq!(old.memory.bytes(), charged);
+    }
 
     #[test]
     fn test_zone_map_entry_basic() {

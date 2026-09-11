@@ -27,7 +27,6 @@
 //!
 
 use std::fmt;
-use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -36,14 +35,17 @@ use parking_lot::{Mutex, RwLock};
 use crate::common::SmartString;
 
 use crate::common::i64_map::{f64_from_key, key_from_f64};
-use crate::common::{
-    new_cow_btree_map, new_i64_map, new_i64_map_with_capacity, CompactArc, CowBTreeMap, I64Map,
-};
+use crate::common::{new_i64_map, new_i64_map_with_capacity, CompactArc, CowBTree, I64Map};
 use crate::core::types::DataType;
 use crate::core::{Error, Row, RowVec, Schema, Value};
 use crate::storage::expression::CompiledFilter;
-use crate::storage::mvcc::arena::RowArena;
+use crate::storage::mvcc::arena::{ArenaReservation, ArenaRetirement, ArenaSlot, RowArena};
 use crate::storage::mvcc::get_fast_timestamp;
+use crate::storage::mvcc::memory::{
+    arc_allocation_bytes, name_bytes, smallvec_bytes, HotMetadataCharge, HotObjectCharge, NamedMap,
+    RetainedBytes, TableMemory,
+};
+use crate::storage::mvcc::read_memory::{charge_export, charge_value_export, ExportBatch};
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
 use crate::storage::Index;
@@ -51,7 +53,7 @@ use ahash::AHashMap;
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::{smallvec, SmallVec};
+use smallvec::SmallVec;
 
 /// Type alias for version lists - uses SmallVec to avoid heap allocation
 /// for the common case of a single version per row within a transaction.
@@ -189,20 +191,105 @@ impl fmt::Display for RowVersion {
     }
 }
 
-/// Entry in the version chain (linked list of versions)
-/// Uses Arc for the prev pointer to enable O(1) cloning of the chain
-///
-/// # Memory Optimization
-/// - `arena_idx`: Uses `Option<NonZeroU64>` (8 bytes) instead of `Option<usize>` (16 bytes)
-///   Stored as `idx + 1` to enable niche optimization (0 = None)
+/// Version payload and history, with an optional compact arena address for the head.
 struct VersionChainEntry {
     /// Current version
     version: RowVersion,
     /// Previous version in the chain (Arc allows cheap cloning)
     prev: Option<Arc<VersionChainEntry>>,
-    /// Index into the arena for zero-copy access (None if data not in arena)
-    /// Stored as `idx + 1` to enable niche optimization (NonZeroU64)
-    arena_idx: Option<NonZeroU64>,
+    arena_idx: Option<ArenaSlot>,
+}
+
+impl VersionChainEntry {
+    fn payloads(&self) -> VersionPayloads {
+        let mut payloads = VersionPayloads::default();
+        payloads.add_row(&self.version.data);
+        let mut current = self.prev.as_deref();
+        while let Some(entry) = current {
+            payloads.add_row(&entry.version.data);
+            current = entry.prev.as_deref();
+        }
+        payloads
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct VersionPayloads {
+    shared_and_children: u128,
+    versions: usize,
+    owned_rows: usize,
+    // COW clones may shrink vectors. This maximum bounds every remaining owner.
+    owned_capacity: usize,
+}
+
+impl VersionPayloads {
+    fn add_row(&mut self, row: &Row) {
+        self.versions += 1;
+        let mut bytes = row.heap_bytes();
+        if let Some(capacity) = row.owned_capacity() {
+            bytes -= (capacity * std::mem::size_of::<Value>()) as u128;
+            self.owned_rows += 1;
+            self.owned_capacity = self.owned_capacity.max(capacity);
+        }
+        self.shared_and_children += bytes;
+    }
+
+    fn remove(&mut self, removed: Self) {
+        self.shared_and_children -= removed.shared_and_children;
+        self.versions -= removed.versions;
+        self.owned_rows -= removed.owned_rows;
+        if self.owned_rows == 0 {
+            self.owned_capacity = 0;
+        }
+    }
+
+    fn bytes(&self) -> u128 {
+        self.shared_and_children
+            + self.owned_rows as u128
+                * self.owned_capacity as u128
+                * std::mem::size_of::<Value>() as u128
+    }
+}
+
+#[derive(Default)]
+struct VersionTree {
+    entries: CowBTree<VersionChainEntry>,
+    payloads: VersionPayloads,
+}
+
+impl VersionTree {
+    fn tree_bytes(&self) -> u128 {
+        let links = self.payloads.versions - self.entries.len();
+        self.entries.node_bytes() as u128
+            + links as u128
+                * (2 * std::mem::size_of::<usize>() + std::mem::size_of::<VersionChainEntry>())
+                    as u128
+    }
+
+    fn publish_memory(&self, account: &TableMemory) {
+        account.version_payloads.store(
+            self.payloads.bytes().min(usize::MAX as u128) as usize,
+            Ordering::Release,
+        );
+        account.version_tree.store(
+            self.tree_bytes().min(usize::MAX as u128) as usize,
+            Ordering::Release,
+        );
+    }
+}
+
+impl std::ops::Deref for VersionTree {
+    type Target = CowBTree<VersionChainEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+impl std::ops::DerefMut for VersionTree {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.entries
+    }
 }
 
 /// Count the depth of a version chain by traversing prev pointers.
@@ -216,21 +303,6 @@ fn count_chain_depth(entry: &VersionChainEntry) -> usize {
         current = &prev.prev;
     }
     depth
-}
-
-/// Convert arena index (usize) to compact representation (Option<NonZeroU64>)
-/// Stores `idx + 1` so that 0 can represent None via niche optimization
-#[inline(always)]
-fn pack_arena_idx(idx: usize) -> Option<NonZeroU64> {
-    // idx + 1 is always > 0, supports full usize range on 64-bit systems
-    NonZeroU64::new((idx as u64).saturating_add(1))
-}
-
-/// Convert compact arena index back to usize
-/// Returns None if the stored value was None
-#[inline(always)]
-fn unpack_arena_idx(packed: Option<NonZeroU64>) -> Option<usize> {
-    packed.map(|nz| (nz.get() - 1) as usize)
 }
 
 /// Tracks write operations with the version read for conflict detection
@@ -265,13 +337,30 @@ static VERSION_LIST_MAP_POOL: Mutex<Vec<I64Map<VersionList>>> = Mutex::new(Vec::
 /// Global pool for WriteSetEntry maps (write_set in TransactionVersionStore)
 static WRITE_SET_MAP_POOL: Mutex<Vec<I64Map<WriteSetEntry>>> = Mutex::new(Vec::new());
 
+static TRANSACTION_MAP_BYTES: RetainedBytes = RetainedBytes::new();
+
+pub(crate) fn transaction_map_bytes() -> usize {
+    TRANSACTION_MAP_BYTES.get()
+}
+
+fn account_map_capacity<V>(before: usize, map: &I64Map<V>) {
+    let after = map.allocation_bytes();
+    if after > before {
+        TRANSACTION_MAP_BYTES.add((after - before) as u128);
+    } else if before > after {
+        TRANSACTION_MAP_BYTES.remove((before - after) as u128);
+    }
+}
+
 /// Get a VersionList map from pool or create a new one
 #[inline]
 fn get_version_list_map() -> I64Map<VersionList> {
     if let Some(map) = VERSION_LIST_MAP_POOL.lock().pop() {
         map
     } else {
-        new_i64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY)
+        let map = new_i64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY);
+        account_map_capacity(0, &map);
+        map
     }
 }
 
@@ -281,7 +370,9 @@ fn get_write_set_map() -> I64Map<WriteSetEntry> {
     if let Some(map) = WRITE_SET_MAP_POOL.lock().pop() {
         map
     } else {
-        new_i64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY)
+        let map = new_i64_map_with_capacity(TX_VERSION_MAP_INITIAL_CAPACITY);
+        account_map_capacity(0, &map);
+        map
     }
 }
 
@@ -291,9 +382,18 @@ fn return_version_list_map(mut map: I64Map<VersionList>) {
     map.clear();
     let mut pool = VERSION_LIST_MAP_POOL.lock();
     if pool.len() < MAP_POOL_MAX_SIZE {
+        let before = pool.capacity();
         pool.push(map);
+        let added = (pool.capacity() - before) * std::mem::size_of::<I64Map<VersionList>>();
+        if added != 0 {
+            TRANSACTION_MAP_BYTES.add(added as u128);
+        }
+    } else {
+        drop(pool);
+        let removed = map.allocation_bytes();
+        drop(map);
+        TRANSACTION_MAP_BYTES.remove(removed as u128);
     }
-    // If pool is full, map is dropped (deallocated)
 }
 
 /// Return a WriteSetEntry map to the pool for reuse
@@ -302,16 +402,34 @@ fn return_write_set_map(mut map: I64Map<WriteSetEntry>) {
     map.clear();
     let mut pool = WRITE_SET_MAP_POOL.lock();
     if pool.len() < MAP_POOL_MAX_SIZE {
+        let before = pool.capacity();
         pool.push(map);
+        let added = (pool.capacity() - before) * std::mem::size_of::<I64Map<WriteSetEntry>>();
+        if added != 0 {
+            TRANSACTION_MAP_BYTES.add(added as u128);
+        }
+    } else {
+        drop(pool);
+        let removed = map.allocation_bytes();
+        drop(map);
+        TRANSACTION_MAP_BYTES.remove(removed as u128);
     }
-    // If pool is full, map is dropped (deallocated)
+}
+
+fn clear_map_pool<V>(pool: &Mutex<Vec<I64Map<V>>>) {
+    let mut pool = pool.lock();
+    let removed: usize = pool.iter().map(I64Map::allocation_bytes).sum();
+    pool.clear();
+    if removed != 0 {
+        TRANSACTION_MAP_BYTES.remove(removed as u128);
+    }
 }
 
 /// Clear the transaction version map pools.
 /// Call this when dropping the database to release pooled memory.
 pub fn clear_version_map_pools() {
-    VERSION_LIST_MAP_POOL.lock().clear();
-    WRITE_SET_MAP_POOL.lock().clear();
+    clear_map_pool(&VERSION_LIST_MAP_POOL);
+    clear_map_pool(&WRITE_SET_MAP_POOL);
 }
 
 /// Capacity hint for transaction version maps - used by pool functions
@@ -396,7 +514,52 @@ pub trait VisibilityChecker: Send + Sync {
 /// Opaque snapshot of the version store at extraction time.
 /// Used by `remove_sealed_rows` to detect concurrent commits.
 pub struct ExtractionSnapshot {
+    inner: VersionSnapshot,
+}
+
+struct VersionSnapshot {
     inner: crate::common::CowBTree<VersionChainEntry>,
+    // Fields drop in order: release the tree before its charge.
+    _charge: VersionSnapshotCharge,
+}
+
+impl std::ops::Deref for VersionSnapshot {
+    type Target = crate::common::CowBTree<VersionChainEntry>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+struct VersionSnapshotCharge {
+    account: Arc<TableMemory>,
+    bytes: u128,
+    tree_bytes: u128,
+}
+
+impl VersionSnapshotCharge {
+    fn new(account: &Arc<TableMemory>, versions: &VersionTree) -> Self {
+        let bytes = versions.payloads.bytes();
+        let tree_bytes = versions.tree_bytes();
+        {
+            let mut pinned = account.pinned_versions.lock();
+            pinned.payloads += bytes;
+            pinned.tree += tree_bytes;
+        }
+        Self {
+            account: Arc::clone(account),
+            bytes,
+            tree_bytes,
+        }
+    }
+}
+
+impl Drop for VersionSnapshotCharge {
+    fn drop(&mut self) {
+        let mut pinned = self.account.pinned_versions.lock();
+        pinned.payloads -= self.bytes;
+        pinned.tree -= self.tree_bytes;
+    }
 }
 
 /// Token holding pre-removal snapshot data needed for deferred index cleanup.
@@ -405,6 +568,23 @@ pub struct ExtractionSnapshot {
 pub struct SealedIndexCleanup {
     /// Row IDs that were removed from the version store.
     pub removed_ids: Vec<i64>,
+}
+
+/// Truncated storage is released when this result leaves the caller's fence.
+pub struct TruncateResult {
+    pub rows_affected: i32,
+    _versions: Option<VersionSnapshot>,
+    _arena: ArenaRetirement,
+}
+
+impl From<i32> for TruncateResult {
+    fn from(rows_affected: i32) -> Self {
+        Self {
+            rows_affected,
+            _versions: None,
+            _arena: ArenaRetirement::default(),
+        }
+    }
 }
 
 /// Held for a table from the first index update of a commit until the
@@ -425,8 +605,66 @@ impl Drop for PublishGuard {
 /// undone if the commit fails after they were applied
 #[derive(Default)]
 pub struct PublishHold {
-    guards: Vec<PublishGuard>,
-    stores: Vec<Arc<std::sync::RwLock<TransactionVersionStore>>>,
+    guards: SmallVec<[PublishGuard; 4]>,
+    stores: SmallVec<[Arc<std::sync::RwLock<TransactionVersionStore>>; 4]>,
+    metadata: HotMetadataCharge,
+}
+
+/// Keeps prepared slots and table heads owned until publication guards are gone.
+#[derive(Default)]
+pub struct PreparedCommit {
+    pub(crate) tables: SmallVec<[PreparedTable; 4]>,
+    _metadata: HotMetadataCharge,
+}
+
+pub(crate) struct PreparedTable {
+    pub name: crate::common::SmartString,
+    pub txn_store: Arc<std::sync::RwLock<TransactionVersionStore>>,
+    pub version_store: Option<Arc<VersionStore>>,
+}
+
+impl PreparedCommit {
+    pub(crate) fn new(tables: SmallVec<[PreparedTable; 4]>) -> Self {
+        let bytes = smallvec_bytes(&tables) as u128
+            + tables
+                .iter()
+                .map(|table| name_bytes(&table.name))
+                .sum::<u128>();
+        Self {
+            tables,
+            _metadata: HotMetadataCharge::new(bytes),
+        }
+    }
+
+    pub(crate) fn reserve(mut self) -> Result<Self, Error> {
+        for table in &mut self.tables {
+            let mut store = table
+                .txn_store
+                .write()
+                .map_err(|_| Error::internal("transaction version lock poisoned"))?;
+            if !store.has_local_changes() {
+                table.version_store = None;
+            }
+            if table.version_store.is_some() {
+                store.reserve_commit_capacity()?;
+            }
+        }
+        Ok(self)
+    }
+}
+
+impl Drop for PreparedCommit {
+    fn drop(&mut self) {
+        for table in &self.tables {
+            let reservation = table
+                .txn_store
+                .write()
+                .unwrap_or_else(|error| error.into_inner())
+                .arena_reservation
+                .take();
+            drop(reservation);
+        }
+    }
 }
 
 impl PublishHold {
@@ -437,6 +675,8 @@ impl PublishHold {
     ) {
         self.guards.push(version_store.begin_publish());
         self.stores.push(txn_store);
+        self.metadata
+            .resize((smallvec_bytes(&self.guards) + smallvec_bytes(&self.stores)) as u128);
     }
 
     /// True when a table this commit wrote holds `max_rows` committed hot
@@ -471,6 +711,90 @@ struct IndexUndo {
     removed: Vec<(i64, Vec<Value>)>,
 }
 
+impl IndexUndo {
+    fn heap_bytes(&self) -> u128 {
+        [&self.added, &self.removed]
+            .into_iter()
+            .map(|rows| {
+                rows.capacity() as u128 * std::mem::size_of::<(i64, Vec<Value>)>() as u128
+                    + rows
+                        .iter()
+                        .map(|(_, values)| {
+                            values.capacity() as u128 * std::mem::size_of::<Value>() as u128
+                                + values
+                                    .iter()
+                                    .map(|value| value.heap_bytes() as u128)
+                                    .sum::<u128>()
+                        })
+                        .sum::<u128>()
+            })
+            .sum()
+    }
+}
+
+#[derive(Default)]
+struct IndexUndoLog {
+    entries: Vec<IndexUndo>,
+    // Entries and their vector storage drop before the charge.
+    charge: IndexUndoCharge,
+}
+
+impl IndexUndoLog {
+    fn push(&mut self, entry: IndexUndo, account: &Arc<TableMemory>) {
+        let bytes = entry.heap_bytes();
+        let before = self.entries.capacity();
+        self.entries.push(entry);
+        let bytes =
+            bytes + ((self.entries.capacity() - before) * std::mem::size_of::<IndexUndo>()) as u128;
+        if self.charge.account.is_none() {
+            self.charge.account = Some(Arc::clone(account));
+        }
+        account.transaction_undo.add(bytes);
+        self.charge.bytes += bytes;
+    }
+}
+
+#[derive(Default)]
+struct IndexUndoCharge {
+    account: Option<Arc<TableMemory>>,
+    bytes: u128,
+}
+
+impl Drop for IndexUndoCharge {
+    fn drop(&mut self) {
+        if let Some(account) = &self.account {
+            account.transaction_undo.remove(self.bytes);
+        }
+    }
+}
+
+/// Refreshes retained schema metadata before releasing the write lock.
+pub struct SchemaWriteGuard<'a> {
+    inner: parking_lot::RwLockWriteGuard<'a, CompactArc<Schema>>,
+}
+
+impl std::ops::Deref for SchemaWriteGuard<'_> {
+    type Target = Schema;
+
+    fn deref(&self) -> &Schema {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for SchemaWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Schema {
+        CompactArc::make_mut(&mut self.inner)
+    }
+}
+
+impl Drop for SchemaWriteGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(schema) = CompactArc::get_mut(&mut self.inner) {
+            schema.refresh_memory_charge();
+        }
+    }
+}
+
 /// VersionStore tracks the latest committed version of each row for a table
 ///
 /// Uses CowBTreeMap (RwLock<CowBTree>) for the version store because:
@@ -486,13 +810,15 @@ struct IndexUndo {
 /// - Eliminating per-row allocation overhead
 pub struct VersionStore {
     /// Row versions indexed by row ID (CowBTree for O(1) snapshot cloning)
-    versions: CowBTreeMap<VersionChainEntry>,
+    versions: RwLock<VersionTree>,
+    /// Independent of table registration and retained through payload destruction.
+    memory: Arc<TableMemory>,
     /// The name of the table this store belongs to (SmartString inlines up to 15 bytes)
     table_name: SmartString,
     /// Table schema (Arc for zero-cost cloning on read)
     schema: RwLock<CompactArc<Schema>>,
     /// Indexes on this table (FxHashMap for fast string key lookups)
-    indexes: RwLock<FxHashMap<String, Arc<dyn Index>>>,
+    indexes: RwLock<NamedMap<Arc<dyn Index>>>,
     /// Whether this store has been closed
     closed: AtomicBool,
     /// Auto-increment counter for tables without explicit PK
@@ -527,6 +853,32 @@ pub struct VersionStore {
     publishing: AtomicUsize,
     /// Publishes completed
     publish_epoch: AtomicU64,
+    claim_memory: ClaimMemory,
+    _metadata: HotMetadataCharge,
+}
+
+struct ClaimMemory(Arc<TableMemory>);
+
+impl ClaimMemory {
+    fn new(memory: &Arc<TableMemory>, claims: &I64Map<i64>) -> Self {
+        memory
+            .row_claims
+            .store(claims.allocation_bytes(), Ordering::Release);
+        Self(Arc::clone(memory))
+    }
+
+    fn resize(&self, before: usize, claims: &I64Map<i64>) {
+        let after = claims.allocation_bytes();
+        if before != after {
+            self.0.row_claims.store(after, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for ClaimMemory {
+    fn drop(&mut self) {
+        self.0.row_claims.store(0, Ordering::Release);
+    }
 }
 
 impl VersionStore {
@@ -542,28 +894,39 @@ impl VersionStore {
     #[cfg(not(test))]
     pub fn with_capacity(
         table_name: impl Into<SmartString>,
-        schema: Schema,
+        mut schema: Schema,
         checker: Option<Arc<TransactionRegistry>>,
         expected_rows: usize,
     ) -> Self {
-        let versions = new_cow_btree_map();
-
+        schema.refresh_memory_charge();
+        let table_name = table_name.into();
+        let metadata = HotMetadataCharge::new(
+            arc_allocation_bytes::<Self>() as u128
+                + arc_allocation_bytes::<parking_lot::Mutex<()>>() as u128
+                + name_bytes(&table_name),
+        );
+        let memory = Arc::new(TableMemory::default());
+        let claims = new_i64_map();
+        let claim_memory = ClaimMemory::new(&memory, &claims);
         Self {
-            versions,
-            table_name: table_name.into(),
+            versions: RwLock::new(VersionTree::default()),
+            table_name,
             schema: RwLock::new(CompactArc::new(schema)),
-            indexes: RwLock::new(FxHashMap::default()),
+            indexes: RwLock::new(NamedMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
-            uncommitted_writes: RwLock::new(new_i64_map()),
+            uncommitted_writes: RwLock::new(claims),
             visibility_checker: checker,
-            arena: RowArena::with_capacity(expected_rows),
+            arena: RowArena::with_account(expected_rows, Arc::clone(&memory)),
+            memory,
             zone_maps: RwLock::new(None),
             max_version_history: 10, // Default: keep up to 10 previous versions
             committed_row_count: AtomicUsize::new(0),
             upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
             publishing: AtomicUsize::new(0),
             publish_epoch: AtomicU64::new(0),
+            claim_memory,
+            _metadata: metadata,
         }
     }
 
@@ -571,28 +934,39 @@ impl VersionStore {
     #[cfg(test)]
     pub fn with_capacity(
         table_name: impl Into<SmartString>,
-        schema: Schema,
+        mut schema: Schema,
         checker: Option<Arc<dyn VisibilityChecker>>,
         expected_rows: usize,
     ) -> Self {
-        let versions = new_cow_btree_map();
-
+        schema.refresh_memory_charge();
+        let table_name = table_name.into();
+        let metadata = HotMetadataCharge::new(
+            arc_allocation_bytes::<Self>() as u128
+                + arc_allocation_bytes::<parking_lot::Mutex<()>>() as u128
+                + name_bytes(&table_name),
+        );
+        let memory = Arc::new(TableMemory::default());
+        let claims = new_i64_map();
+        let claim_memory = ClaimMemory::new(&memory, &claims);
         Self {
-            versions,
-            table_name: table_name.into(),
+            versions: RwLock::new(VersionTree::default()),
+            table_name,
             schema: RwLock::new(CompactArc::new(schema)),
-            indexes: RwLock::new(FxHashMap::default()),
+            indexes: RwLock::new(NamedMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
-            uncommitted_writes: RwLock::new(new_i64_map()),
+            uncommitted_writes: RwLock::new(claims),
             visibility_checker: checker,
-            arena: RowArena::with_capacity(expected_rows),
+            arena: RowArena::with_account(expected_rows, Arc::clone(&memory)),
+            memory,
             zone_maps: RwLock::new(None),
             max_version_history: 10,
             committed_row_count: AtomicUsize::new(0),
             upsert_mutex: Arc::new(parking_lot::Mutex::new(())),
             publishing: AtomicUsize::new(0),
             publish_epoch: AtomicU64::new(0),
+            claim_memory,
+            _metadata: metadata,
         }
     }
 
@@ -653,8 +1027,17 @@ impl VersionStore {
     }
 
     #[inline]
-    fn snapshot_versions(&self) -> crate::common::CowBTree<VersionChainEntry> {
-        let versions = self.versions.read().clone();
+    fn capture_versions(&self) -> VersionSnapshot {
+        let versions = self.versions.read();
+        VersionSnapshot {
+            inner: versions.entries.clone(),
+            _charge: VersionSnapshotCharge::new(&self.memory, &versions),
+        }
+    }
+
+    #[inline]
+    fn snapshot_versions(&self) -> VersionSnapshot {
+        let versions = self.capture_versions();
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::version_root_captured();
         versions
@@ -665,10 +1048,15 @@ impl VersionStore {
         self.schema.read().clone()
     }
 
-    /// Returns a mutable reference to the schema (for modifications)
-    /// Callers must use CompactArc::make_mut() to get &mut Schema
-    pub fn schema_mut(&self) -> parking_lot::RwLockWriteGuard<'_, CompactArc<Schema>> {
-        self.schema.write()
+    /// Returns copy-on-write schema access with retained-memory accounting.
+    pub fn schema_mut(&self) -> SchemaWriteGuard<'_> {
+        SchemaWriteGuard {
+            inner: self.schema.write(),
+        }
+    }
+
+    pub(crate) fn replace_schema(&self, schema: CompactArc<Schema>) {
+        *self.schema.write() = schema;
     }
 
     /// Returns the current auto-increment counter value
@@ -722,15 +1110,47 @@ impl VersionStore {
     }
 
     /// Adds a new version for a row
-    pub fn add_version(&self, row_id: i64, version: RowVersion) {
+    pub fn add_version(&self, row_id: i64, version: RowVersion) -> Result<(), Error> {
+        let reuse = {
+            let versions = self.versions.read();
+            if versions
+                .get(row_id)
+                .is_some_and(|head| head.arena_idx.is_some())
+            {
+                Some(self.arena.reserve_existing())
+            } else {
+                None
+            }
+        };
+        let mut reservation = match reuse {
+            Some(reservation) => reservation,
+            None => self.arena.reserve(usize::from(!version.is_deleted()))?,
+        };
+        let mut versions = self.versions.write();
+        let VersionTree { entries, payloads } = &mut *versions;
+        let delta = self.install_version(entries, &mut reservation, payloads, row_id, version);
+        versions.publish_memory(&self.memory);
+        if delta != 0 {
+            self.committed_row_count
+                .fetch_add(delta as usize, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    fn install_version(
+        &self,
+        versions: &mut crate::common::CowBTree<VersionChainEntry>,
+        reservation: &mut ArenaReservation,
+        payloads: &mut VersionPayloads,
+        row_id: i64,
+        version: RowVersion,
+    ) -> isize {
         if self.closed.load(Ordering::Acquire) {
-            return;
+            return 0;
         }
 
         let is_new_version_deleted = version.deleted_at_txn_id != 0;
-
-        // Use write lock for the entire operation (MVCC single-writer semantics)
-        let mut versions = self.versions.write();
+        let delta;
 
         // Use entry API to avoid double traversal
         match versions.entry(row_id) {
@@ -740,14 +1160,7 @@ impl VersionStore {
                 let existing_arena_idx = existing.arena_idx;
                 let was_deleted = existing.version.deleted_at_txn_id != 0;
 
-                // Update committed row count based on delete state transitions
-                if was_deleted && !is_new_version_deleted {
-                    // Row was deleted, now being re-inserted -> increment
-                    self.committed_row_count.fetch_add(1, Ordering::Relaxed);
-                } else if !was_deleted && is_new_version_deleted {
-                    // Row was visible, now being deleted -> decrement
-                    self.committed_row_count.fetch_sub(1, Ordering::Relaxed);
-                }
+                delta = isize::from(was_deleted) - isize::from(is_new_version_deleted);
 
                 // O(k) chain management - depth computed by traversal
                 // When limit exceeded: drop old chain AND reuse arena slot
@@ -771,37 +1184,32 @@ impl VersionStore {
                     // Convert Row to Arc once (takes ownership, no copy if already Arc)
                     let arc_data = std::mem::take(&mut new_version.data).into_arc();
 
-                    // Always reuse existing arena slot if available
-                    // Historical versions are stored in prev_chain.version.data
-                    let idx = if let Some(old_idx) = unpack_arena_idx(existing_arena_idx) {
-                        // Reuse the arena slot - prevents unbounded growth
-                        self.arena.update_at(
-                            old_idx,
-                            row_id,
-                            new_version.txn_id,
-                            CompactArc::clone(&arc_data),
-                        );
-                        old_idx
-                    } else {
-                        // No existing slot (shouldn't happen for updates), append
-                        self.arena.insert_arc(
-                            row_id,
-                            new_version.txn_id,
-                            CompactArc::clone(&arc_data),
-                        )
-                    };
+                    let (idx, bytes) = self.arena.install(
+                        reservation,
+                        existing_arena_idx,
+                        row_id,
+                        new_version.txn_id,
+                        CompactArc::clone(&arc_data),
+                    );
 
                     // Reuse the Arc for the version's data - enables O(1) clone on read
                     new_version.data = Row::from_arc(arc_data);
 
-                    pack_arena_idx(idx)
+                    payloads.shared_and_children += bytes;
+                    payloads.versions += 1;
+                    Some(idx)
                 } else {
                     // Deleted version - mark arena as deleted for visibility
-                    if let Some(old_arena_idx) = unpack_arena_idx(existing_arena_idx) {
+                    if let Some(old_arena_idx) = existing_arena_idx {
                         self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
                     }
+                    payloads.add_row(&new_version.data);
                     existing_arena_idx
                 };
+
+                if can_reuse_arena {
+                    payloads.remove(existing.payloads());
+                }
 
                 // Build version chain entry
                 // When limit exceeded: drop entire history (no prev_chain allocation)
@@ -831,23 +1239,28 @@ impl VersionStore {
                 occupied.insert(new_entry);
             }
             crate::common::cow_btree::Entry::Vacant(vacant) => {
+                delta = isize::from(!is_new_version_deleted);
                 // First version for this row - store in arena
                 // OPTIMIZATION: Convert Row to Arc once, then just clone Arc (no data copy)
                 let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
-                    // New non-deleted row -> increment counter
-                    self.committed_row_count.fetch_add(1, Ordering::Relaxed);
-
                     let mut v = version;
                     // Convert Row to Arc once (takes ownership, no copy if already Arc)
                     let arc_data = std::mem::take(&mut v.data).into_arc();
                     // Insert Arc into arena (just Arc::clone, no data copy)
-                    let idx = self
-                        .arena
-                        .insert_arc(row_id, v.txn_id, CompactArc::clone(&arc_data));
+                    let (idx, bytes) = self.arena.install(
+                        reservation,
+                        None,
+                        row_id,
+                        v.txn_id,
+                        CompactArc::clone(&arc_data),
+                    );
                     // Create version with Arc-backed data for O(1) clone
                     v.data = Row::from_arc(arc_data);
-                    (pack_arena_idx(idx), v)
+                    payloads.shared_and_children += bytes;
+                    payloads.versions += 1;
+                    (Some(idx), v)
                 } else {
+                    payloads.add_row(&version.data);
                     (None, version)
                 };
 
@@ -861,297 +1274,24 @@ impl VersionStore {
                 vacant.insert(new_entry);
             }
         }
+        delta
     }
 
-    /// Adds multiple versions in batch - used by commit
-    ///
-    /// Updates both the version store and the arena atomically per row.
-    /// Arena updates are O(1) per row (just an insert), so this is efficient.
-    /// Row arena index updates are batched under a single lock acquisition.
-    /// Version data uses Arc-backed storage for O(1) clones on read.
-    #[inline]
-    pub fn add_versions_batch(&self, batch: Vec<(i64, RowVersion)>) {
-        if self.closed.load(Ordering::Acquire) || batch.is_empty() {
-            return;
-        }
-
-        // Use write lock for the entire batch operation (MVCC single-writer semantics)
+    fn install_versions(
+        &self,
+        reservation: &mut ArenaReservation,
+        batch: impl IntoIterator<Item = (i64, RowVersion)>,
+    ) {
         let mut versions = self.versions.write();
-
-        // Track row count delta: positive for inserts, negative for deletes
-        let mut count_delta: isize = 0;
-
+        let mut delta = 0;
+        let VersionTree { entries, payloads } = &mut *versions;
         for (row_id, version) in batch {
-            let is_new_version_deleted = version.deleted_at_txn_id != 0;
-
-            // Use entry API to avoid double traversal
-            match versions.entry(row_id) {
-                crate::common::cow_btree::Entry::Occupied(mut occupied) => {
-                    // Extract existing data from the entry
-                    let existing = occupied.get();
-                    let existing_arena_idx = existing.arena_idx;
-                    let was_deleted = existing.version.deleted_at_txn_id != 0;
-
-                    // Track row count changes based on delete state transitions
-                    if was_deleted && !is_new_version_deleted {
-                        count_delta += 1; // Row re-inserted
-                    } else if !was_deleted && is_new_version_deleted {
-                        count_delta -= 1; // Row deleted
-                    }
-
-                    // O(k) chain management - depth computed by traversal
-                    // When limit exceeded: drop old chain AND reuse arena slot
-                    let existing_depth = count_chain_depth(existing);
-                    let new_depth = existing_depth + 1;
-                    let can_reuse_arena =
-                        self.max_version_history > 0 && new_depth > self.max_version_history;
-
-                    // Only clone existing version data when needed:
-                    // 1. For delete operations that need to preserve data
-                    // 2. When keeping version history (not pruning)
-                    let mut new_version = version;
-                    if new_version.deleted_at_txn_id != 0 && new_version.data.is_empty() {
-                        // For deletes, preserve data from current version
-                        new_version.data = existing.version.data.clone();
-                    }
-
-                    // Update arena with Arc reuse for O(1) clones on read
-                    // OPTIMIZATION: Always reuse arena slot - historical data is in prev_chain
-                    let arena_idx = if new_version.deleted_at_txn_id == 0 {
-                        // Convert Row to Arc once (takes ownership, no copy if already Arc)
-                        let arc_data = std::mem::take(&mut new_version.data).into_arc();
-
-                        // Always reuse existing arena slot if available
-                        // Historical versions are stored in prev_chain.version.data
-                        let idx = if let Some(old_idx) = unpack_arena_idx(existing_arena_idx) {
-                            // Reuse the arena slot - prevents unbounded growth
-                            self.arena.update_at(
-                                old_idx,
-                                row_id,
-                                new_version.txn_id,
-                                CompactArc::clone(&arc_data),
-                            );
-                            old_idx
-                        } else {
-                            // No existing slot (shouldn't happen for updates), append
-                            self.arena.insert_arc(
-                                row_id,
-                                new_version.txn_id,
-                                CompactArc::clone(&arc_data),
-                            )
-                        };
-
-                        // Reuse the Arc for the version's data
-                        new_version.data = Row::from_arc(arc_data);
-
-                        pack_arena_idx(idx)
-                    } else {
-                        // Deleted version - mark arena as deleted for visibility
-                        if let Some(old_arena_idx) = unpack_arena_idx(existing_arena_idx) {
-                            self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
-                        }
-                        existing_arena_idx
-                    };
-
-                    // Build version chain entry
-                    // When limit exceeded: drop entire history (no prev_chain allocation)
-                    // When under limit: create prev_chain with existing version
-                    let final_prev = if can_reuse_arena {
-                        // Exceeded limit - drop all history, no allocation
-                        None
-                    } else {
-                        // Under limit - clone existing version and create chain
-                        let existing_version = existing.version.clone();
-                        let existing_prev = existing.prev.clone();
-                        Some(Arc::new(VersionChainEntry {
-                            version: existing_version,
-                            prev: existing_prev,
-                            // Historical versions don't use arena (slot reused by new HEAD)
-                            arena_idx: None,
-                        }))
-                    };
-
-                    let new_entry = VersionChainEntry {
-                        version: new_version,
-                        prev: final_prev,
-                        arena_idx,
-                    };
-
-                    // Replace entry in-place (no additional tree traversal)
-                    occupied.insert(new_entry);
-                }
-                crate::common::cow_btree::Entry::Vacant(vacant) => {
-                    // First version for this row - store in arena with Arc reuse
-                    // OPTIMIZATION: Convert Row to Arc once, then just clone Arc (no data copy)
-                    let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
-                        // New non-deleted row -> will increment counter
-                        count_delta += 1;
-
-                        let mut v = version;
-                        // Convert Row to Arc once (takes ownership, no copy if already Arc)
-                        let arc_data = std::mem::take(&mut v.data).into_arc();
-                        // Insert Arc into arena (just Arc::clone, no data copy)
-                        let idx =
-                            self.arena
-                                .insert_arc(row_id, v.txn_id, CompactArc::clone(&arc_data));
-                        // Create version with Arc-backed data for O(1) clone
-                        v.data = Row::from_arc(arc_data);
-                        (pack_arena_idx(idx), v)
-                    } else {
-                        (None, version)
-                    };
-
-                    let new_entry = VersionChainEntry {
-                        version: final_version,
-                        prev: None,
-                        arena_idx,
-                    };
-
-                    // Insert into vacant slot (no additional traversal)
-                    vacant.insert(new_entry);
-                }
-            }
+            delta += self.install_version(entries, reservation, payloads, row_id, version);
         }
-
-        // Apply count delta in a single atomic operation
-        if count_delta > 0 {
+        versions.publish_memory(&self.memory);
+        if delta != 0 {
             self.committed_row_count
-                .fetch_add(count_delta as usize, Ordering::Relaxed);
-        } else if count_delta < 0 {
-            self.committed_row_count
-                .fetch_sub((-count_delta) as usize, Ordering::Relaxed);
-        }
-    }
-
-    /// Add a single version to the store (optimized for auto-commit single-row inserts)
-    ///
-    /// This avoids Vec allocation for the common single-row commit case.
-    #[inline]
-    pub fn add_version_single(&self, row_id: i64, version: RowVersion) {
-        if self.closed.load(Ordering::Acquire) {
-            return;
-        }
-
-        let is_new_version_deleted = version.deleted_at_txn_id != 0;
-        let mut versions = self.versions.write();
-
-        match versions.entry(row_id) {
-            crate::common::cow_btree::Entry::Occupied(mut occupied) => {
-                // Extract existing data from the entry
-                let existing = occupied.get();
-                let existing_arena_idx = existing.arena_idx;
-                let was_deleted = existing.version.deleted_at_txn_id != 0;
-
-                // Update committed row count based on delete state transitions
-                if was_deleted && !is_new_version_deleted {
-                    // Row was deleted, now being re-inserted -> increment
-                    self.committed_row_count.fetch_add(1, Ordering::Relaxed);
-                } else if !was_deleted && is_new_version_deleted {
-                    // Row was visible, now being deleted -> decrement
-                    self.committed_row_count.fetch_sub(1, Ordering::Relaxed);
-                }
-
-                // O(k) chain management - depth computed by traversal
-                // When limit exceeded: drop old chain AND reuse arena slot
-                let existing_depth = count_chain_depth(existing);
-                let new_depth = existing_depth + 1;
-                let can_reuse_arena =
-                    self.max_version_history > 0 && new_depth > self.max_version_history;
-
-                // Only clone existing version data when needed:
-                // 1. For delete operations that need to preserve data
-                // 2. When keeping version history (not pruning)
-                let mut new_version = version;
-                if new_version.deleted_at_txn_id != 0 && new_version.data.is_empty() {
-                    // For deletes, preserve data from current version
-                    new_version.data = existing.version.data.clone();
-                }
-
-                // OPTIMIZATION: Always reuse arena slot - historical data is in prev_chain
-                let arena_idx = if new_version.deleted_at_txn_id == 0 {
-                    let arc_data = std::mem::take(&mut new_version.data).into_arc();
-
-                    // Always reuse existing arena slot if available
-                    // Historical versions are stored in prev_chain.version.data
-                    let idx = if let Some(old_idx) = unpack_arena_idx(existing_arena_idx) {
-                        // Reuse the arena slot - prevents unbounded growth
-                        self.arena.update_at(
-                            old_idx,
-                            row_id,
-                            new_version.txn_id,
-                            CompactArc::clone(&arc_data),
-                        );
-                        old_idx
-                    } else {
-                        // No existing slot (shouldn't happen for updates), append
-                        self.arena.insert_arc(
-                            row_id,
-                            new_version.txn_id,
-                            CompactArc::clone(&arc_data),
-                        )
-                    };
-
-                    new_version.data = Row::from_arc(arc_data);
-
-                    pack_arena_idx(idx)
-                } else {
-                    // Deleted version - mark arena as deleted for visibility
-                    if let Some(old_arena_idx) = unpack_arena_idx(existing_arena_idx) {
-                        self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
-                    }
-                    existing_arena_idx
-                };
-
-                // Build version chain entry
-                // When limit exceeded: drop entire history (no prev_chain allocation)
-                // When under limit: create prev_chain with existing version
-                let final_prev = if can_reuse_arena {
-                    // Exceeded limit - drop all history, no allocation
-                    None
-                } else {
-                    // Under limit - clone existing version and create chain
-                    let existing_version = existing.version.clone();
-                    let existing_prev = existing.prev.clone();
-                    Some(Arc::new(VersionChainEntry {
-                        version: existing_version,
-                        prev: existing_prev,
-                        // Historical versions don't use arena (slot reused by new HEAD)
-                        arena_idx: None,
-                    }))
-                };
-
-                let new_entry = VersionChainEntry {
-                    version: new_version,
-                    prev: final_prev,
-                    arena_idx,
-                };
-
-                occupied.insert(new_entry);
-            }
-            crate::common::cow_btree::Entry::Vacant(vacant) => {
-                let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
-                    // New non-deleted row -> increment counter
-                    self.committed_row_count.fetch_add(1, Ordering::Relaxed);
-
-                    let mut v = version;
-                    let arc_data = std::mem::take(&mut v.data).into_arc();
-                    let idx = self
-                        .arena
-                        .insert_arc(row_id, v.txn_id, CompactArc::clone(&arc_data));
-                    v.data = Row::from_arc(arc_data);
-                    (pack_arena_idx(idx), v)
-                } else {
-                    (None, version)
-                };
-
-                let new_entry = VersionChainEntry {
-                    version: final_version,
-                    prev: None,
-                    arena_idx,
-                };
-
-                vacant.insert(new_entry);
-            }
+                .fetch_add(delta as usize, Ordering::Relaxed);
         }
     }
 
@@ -1172,24 +1312,18 @@ impl VersionStore {
 
         let checker = self.visibility_checker.as_ref()?;
 
-        // Phase 1: Speculative arena probe (arena lock only, self-contained).
-        // For row_id N, probe arena slot N-1. Verify meta.row_id == row_id.
-        // Hit rate ~100% for sequential-insert tables (arena slot reused on UPDATE).
-        // Arena guard is acquired and dropped here to avoid lock ordering inversion
-        // with the commit path (which holds versions.write → arena.write).
-        if row_id > 0 {
-            let probe_idx = (row_id - 1) as usize;
+        // Drop the speculative arena guard before taking the versions lock.
+        {
             let arena_guard = self.arena.read_guard();
-            let arena_meta = arena_guard.meta();
-            if probe_idx < arena_meta.len() {
-                let meta = arena_meta[probe_idx];
-                if meta.row_id == row_id && checker.is_visible(meta.txn_id, txn_id) {
+            if let Some((meta, payload)) = arena_guard.probe(row_id) {
+                if checker.is_visible(meta.txn_id, txn_id) {
                     if meta.deleted_at_txn_id != 0
                         && checker.is_visible(meta.deleted_at_txn_id, txn_id)
                     {
                         return None;
                     }
-                    let data = Row::from_arc(CompactArc::clone(&arena_guard.data()[probe_idx]));
+                    let data = Row::from_arc(CompactArc::clone(payload));
+                    charge_export(&data);
                     return Some(RowVersion {
                         txn_id: meta.txn_id,
                         deleted_at_txn_id: meta.deleted_at_txn_id,
@@ -1217,17 +1351,8 @@ impl VersionStore {
             if head_deleted_at != 0 && checker.is_visible(head_deleted_at, txn_id) {
                 return None;
             }
-            // Use arena data via chain.arena_idx for O(1) Arc clone
-            let row = if let Some(idx) = unpack_arena_idx(chain.arena_idx) {
-                let arena_guard = self.arena.read_guard();
-                if let Some(arc_row) = arena_guard.data().get(idx) {
-                    Row::from_arc(CompactArc::clone(arc_row))
-                } else {
-                    chain.version.data.clone()
-                }
-            } else {
-                chain.version.data.clone()
-            };
+            let row = chain.version.data.clone();
+            charge_export(&row);
             return Some(RowVersion {
                 txn_id: head_txn_id,
                 deleted_at_txn_id: head_deleted_at,
@@ -1247,6 +1372,7 @@ impl VersionStore {
                 if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
                     return None;
                 }
+                charge_export(&e.version.data);
                 return Some(e.version.clone());
             }
             current = e.prev.as_ref().map(|b| b.as_ref());
@@ -1269,22 +1395,15 @@ impl VersionStore {
         // Lock ordering: versions first, then arena (matches commit path)
         let versions = self.versions.read();
         let arena_guard = self.arena.read_guard();
-        let arena_meta = arena_guard.meta();
-
         for &row_id in row_ids {
-            // Speculative arena probe: O(1) for auto-increment PKs
-            if row_id > 0 {
-                let probe_idx = (row_id - 1) as usize;
-                if probe_idx < arena_meta.len() {
-                    let meta = arena_meta[probe_idx];
-                    if meta.row_id == row_id && checker.is_visible(meta.txn_id, txn_id) {
-                        if meta.deleted_at_txn_id == 0
-                            || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
-                        {
-                            return Some(row_id); // Conflict!
-                        }
-                        continue; // Deleted, check next
+            if let Some((meta, _)) = arena_guard.probe(row_id) {
+                if checker.is_visible(meta.txn_id, txn_id) {
+                    if meta.deleted_at_txn_id == 0
+                        || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                    {
+                        return Some(row_id);
                     }
+                    continue;
                 }
             }
 
@@ -1337,12 +1456,11 @@ impl VersionStore {
         // Lock ordering: versions first, then arena (matches commit path)
         let versions = self.versions.read();
         let arena_guard = self.arena.read_guard();
-        let arena_meta = arena_guard.meta();
-        let arena_data = arena_guard.data();
+        let mut exports = ExportBatch::new();
 
         // Fast path: if both arena and version tree are empty, no rows can match.
         // This avoids iterating millions of phantom row_ids from volume-populated indexes.
-        if arena_meta.is_empty() && versions.is_empty() {
+        if arena_guard.is_empty() && versions.is_empty() {
             return RowVec::new();
         }
 
@@ -1350,20 +1468,16 @@ impl VersionStore {
         let mut results = RowVec::with_capacity(row_ids.len().min(4096));
 
         for &row_id in row_ids {
-            // Speculative arena probe: O(1) for auto-increment PKs
-            if row_id > 0 {
-                let probe_idx = (row_id - 1) as usize;
-                if probe_idx < arena_meta.len() {
-                    let meta = arena_meta[probe_idx];
-                    if meta.row_id == row_id && checker.is_visible(meta.txn_id, txn_id) {
-                        if meta.deleted_at_txn_id == 0
-                            || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
-                        {
-                            let row = Row::from_arc(CompactArc::clone(&arena_data[probe_idx]));
-                            results.push((row_id, row));
-                        }
-                        continue; // Skip CowBTree lookup
+            if let Some((meta, payload)) = arena_guard.probe(row_id) {
+                if checker.is_visible(meta.txn_id, txn_id) {
+                    if meta.deleted_at_txn_id == 0
+                        || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                    {
+                        let row = Row::from_arc(CompactArc::clone(payload));
+                        exports.record(&row);
+                        results.push((row_id, row));
                     }
+                    continue;
                 }
             }
 
@@ -1374,15 +1488,7 @@ impl VersionStore {
 
                 if checker.is_visible(head_txn_id, txn_id) {
                     if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                        let row = if let Some(idx) = unpack_arena_idx(chain.arena_idx) {
-                            if let Some(arc_row) = arena_data.get(idx) {
-                                Row::from_arc(CompactArc::clone(arc_row))
-                            } else {
-                                chain.version.data.clone()
-                            }
-                        } else {
-                            chain.version.data.clone()
-                        };
+                        let row = exports.capture(&chain.version.data);
                         results.push((row_id, row));
                     }
                     continue;
@@ -1396,15 +1502,7 @@ impl VersionStore {
                         if e.version.deleted_at_txn_id == 0
                             || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
                         {
-                            let row = if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                                if let Some(arc_row) = arena_data.get(idx) {
-                                    Row::from_arc(CompactArc::clone(arc_row))
-                                } else {
-                                    e.version.data.clone()
-                                }
-                            } else {
-                                e.version.data.clone()
-                            };
+                            let row = exports.capture(&e.version.data);
                             results.push((row_id, row));
                         }
                         break;
@@ -1416,15 +1514,7 @@ impl VersionStore {
         results
     }
 
-    /// Iterates visible versions for given row_ids with early termination support.
-    ///
-    /// Pre-acquires all locks ONCE, then performs per-key CowBTree lookups.
-    /// Calls `callback(row_id, row_data)` for each visible row.
-    /// Stops iteration if callback returns `false` (used for LIMIT).
-    ///
-    /// This is more efficient than calling get_visible_version() per row_id because:
-    /// - Single lock acquisition for CowBTree + arena (not per-row)
-    /// - Supports early termination (unlike get_visible_versions_batch which collects all)
+    /// Visits captured version payloads until the callback returns false.
     pub fn for_each_visible<F>(&self, row_ids: &[i64], txn_id: i64, mut callback: F)
     where
         F: FnMut(i64, Row) -> bool,
@@ -1433,86 +1523,69 @@ impl VersionStore {
             return;
         }
 
+        if let [row_id] = row_ids {
+            if let Some(version) = self.get_visible_version(*row_id, txn_id) {
+                callback(*row_id, version.data);
+            }
+            return;
+        }
+
         let checker = match self.visibility_checker.as_ref() {
             Some(c) => c,
             None => return,
         };
 
-        // Lock ordering: versions first, then arena (matches commit path)
-        let versions = self.versions.read();
-        let arena_guard = self.arena.read_guard();
-        let arena_meta = arena_guard.meta();
-        let arena_data = arena_guard.data();
-
-        for &row_id in row_ids {
-            // Speculative arena probe: O(1) for auto-increment PKs
-            if row_id > 0 {
-                let probe_idx = (row_id - 1) as usize;
-                if probe_idx < arena_meta.len() {
-                    let meta = arena_meta[probe_idx];
-                    if meta.row_id == row_id && checker.is_visible(meta.txn_id, txn_id) {
-                        if meta.deleted_at_txn_id == 0
-                            || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
+        let versions = self.capture_versions();
+        let mut exports = ExportBatch::new();
+        let mut payloads: [Option<CompactArc<[Value]>>; 128] = std::array::from_fn(|_| None);
+        let mut remaining = row_ids;
+        let mut batch_size = 1;
+        while !remaining.is_empty() {
+            let count = remaining.len().min(batch_size);
+            {
+                let current = self.versions.read();
+                let live = versions.shares_root(&current).then_some(current);
+                let arena = live.as_ref().map(|_| self.arena.read_guard());
+                let mut last_visible_txn = 0;
+                for (&row_id, slot) in remaining[..count].iter().zip(&mut payloads[..count]) {
+                    if let Some((meta, payload)) = arena.as_ref().and_then(|a| a.probe(row_id)) {
+                        if meta.txn_id == last_visible_txn
+                            || checker.is_visible(meta.txn_id, txn_id)
                         {
-                            let row = Row::from_arc(CompactArc::clone(&arena_data[probe_idx]));
-                            if !callback(row_id, row) {
-                                return;
+                            last_visible_txn = meta.txn_id;
+                            if meta.deleted_at_txn_id == 0
+                                || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                            {
+                                *slot = Some(CompactArc::clone(payload));
                             }
+                            continue;
                         }
-                        continue; // Skip CowBTree lookup
+                    }
+                    let mut current = versions.get(row_id);
+                    while let Some(entry) = current {
+                        if checker.is_visible(entry.version.txn_id, txn_id) {
+                            if entry.version.deleted_at_txn_id == 0
+                                || !checker.is_visible(entry.version.deleted_at_txn_id, txn_id)
+                            {
+                                *slot = Some(entry.version.data.clone().into_arc());
+                            }
+                            break;
+                        }
+                        current = entry.prev.as_deref();
                     }
                 }
             }
-
-            // CowBTree lookup: O(log n)
-            if let Some(chain) = versions.get(row_id) {
-                let head_txn_id = chain.version.txn_id;
-                let head_deleted_at = chain.version.deleted_at_txn_id;
-
-                if checker.is_visible(head_txn_id, txn_id) {
-                    if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                        let row = if let Some(idx) = unpack_arena_idx(chain.arena_idx) {
-                            if let Some(arc_row) = arena_data.get(idx) {
-                                Row::from_arc(CompactArc::clone(arc_row))
-                            } else {
-                                chain.version.data.clone()
-                            }
-                        } else {
-                            chain.version.data.clone()
-                        };
-                        if !callback(row_id, row) {
-                            return;
-                        }
+            for (&row_id, slot) in remaining[..count].iter().zip(&mut payloads[..count]) {
+                if let Some(payload) = slot.take() {
+                    let row = Row::from_arc(payload);
+                    exports.record(&row);
+                    if !callback(row_id, row) {
+                        return;
                     }
-                    continue;
-                }
-
-                // Traverse version chain for older visible versions
-                let mut current: Option<&VersionChainEntry> =
-                    chain.prev.as_ref().map(|b| b.as_ref());
-                while let Some(e) = current {
-                    if checker.is_visible(e.version.txn_id, txn_id) {
-                        if e.version.deleted_at_txn_id == 0
-                            || !checker.is_visible(e.version.deleted_at_txn_id, txn_id)
-                        {
-                            let row = if let Some(idx) = unpack_arena_idx(e.arena_idx) {
-                                if let Some(arc_row) = arena_data.get(idx) {
-                                    Row::from_arc(CompactArc::clone(arc_row))
-                                } else {
-                                    e.version.data.clone()
-                                }
-                            } else {
-                                e.version.data.clone()
-                            };
-                            if !callback(row_id, row) {
-                                return;
-                            }
-                        }
-                        break;
-                    }
-                    current = e.prev.as_ref().map(|b| b.as_ref());
                 }
             }
+            remaining = &remaining[count..];
+            batch_size = (batch_size * 2).min(128);
         }
     }
 
@@ -1542,9 +1615,8 @@ impl VersionStore {
 
         // Lock ordering: versions first, then arena (matches commit path)
         // Clone CowBTree for parallel path (O(1) Arc clone of root node)
-        let versions = self.versions.read().clone();
+        let versions = self.capture_versions();
         let arena_guard = self.arena.read_guard();
-        let arena_meta = arena_guard.meta();
 
         #[cfg(feature = "parallel")]
         if row_ids.len() >= PARALLEL_THRESHOLD {
@@ -1553,20 +1625,14 @@ impl VersionStore {
                 .map(|chunk| {
                     let mut chunk_count = 0;
                     for &row_id in chunk {
-                        // Speculative arena probe: O(1) for auto-increment PKs
-                        if row_id > 0 {
-                            let probe_idx = (row_id - 1) as usize;
-                            if probe_idx < arena_meta.len() {
-                                let meta = arena_meta[probe_idx];
-                                if meta.row_id == row_id && checker.is_visible(meta.txn_id, txn_id)
+                        if let Some((meta, _)) = arena_guard.probe(row_id) {
+                            if checker.is_visible(meta.txn_id, txn_id) {
+                                if meta.deleted_at_txn_id == 0
+                                    || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
                                 {
-                                    if meta.deleted_at_txn_id == 0
-                                        || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
-                                    {
-                                        chunk_count += 1;
-                                    }
-                                    continue;
+                                    chunk_count += 1;
                                 }
+                                continue;
                             }
                         }
 
@@ -1607,19 +1673,14 @@ impl VersionStore {
         // Sequential path for small batches (or when parallel feature is disabled)
         let mut count = 0;
         for &row_id in row_ids {
-            // Speculative arena probe: O(1) for auto-increment PKs
-            if row_id > 0 {
-                let probe_idx = (row_id - 1) as usize;
-                if probe_idx < arena_meta.len() {
-                    let meta = arena_meta[probe_idx];
-                    if meta.row_id == row_id && checker.is_visible(meta.txn_id, txn_id) {
-                        if meta.deleted_at_txn_id == 0
-                            || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
-                        {
-                            count += 1;
-                        }
-                        continue;
+            if let Some((meta, _)) = arena_guard.probe(row_id) {
+                if checker.is_visible(meta.txn_id, txn_id) {
+                    if meta.deleted_at_txn_id == 0
+                        || !checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                    {
+                        count += 1;
                     }
+                    continue;
                 }
             }
 
@@ -1681,6 +1742,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         for &row_id in row_ids {
             if let Some(chain) = versions.get(row_id) {
@@ -1693,7 +1755,7 @@ impl VersionStore {
                     if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
                         let mut version_copy = chain.version.clone();
                         version_copy.create_time = current_seq;
-                        results.push((row_id, chain.version.data.clone(), version_copy));
+                        results.push((row_id, exports.capture(&chain.version.data), version_copy));
                     }
                     continue;
                 }
@@ -1713,7 +1775,7 @@ impl VersionStore {
                             // Store the current sequence in create_time for later retrieval
                             // (This is a bit of a hack, but avoids changing the struct)
                             version_copy.create_time = current_seq;
-                            results.push((row_id, e.version.data.clone(), version_copy));
+                            results.push((row_id, exports.capture(&e.version.data), version_copy));
                         }
                         break;
                     }
@@ -1756,6 +1818,7 @@ impl VersionStore {
                 if e.version.deleted_at_txn_id != 0 && e.version.deleted_at_txn_id <= as_of_txn_id {
                     return None;
                 }
+                charge_export(&e.version.data);
                 return Some(e.version.clone());
             }
             current = e.prev.as_ref().map(|b| b.as_ref());
@@ -1788,6 +1851,7 @@ impl VersionStore {
                 if e.version.deleted_at_txn_id != 0 {
                     return None;
                 }
+                charge_export(&e.version.data);
                 return Some(e.version.clone());
             }
             current = e.prev.as_ref().map(|b| b.as_ref());
@@ -1803,7 +1867,7 @@ impl VersionStore {
         }
 
         // Clone tree to avoid holding lock for the duration of iteration
-        let versions = self.versions.read().clone();
+        let versions = self.capture_versions();
         versions.keys().collect()
     }
 
@@ -1840,12 +1904,10 @@ impl VersionStore {
             let uncommitted_empty = self.uncommitted_writes.read().is_empty();
             if uncommitted_empty && !checker.needs_snapshot_isolation(txn_id) {
                 let arena_guard = self.arena.read_guard();
-                let arena_meta = arena_guard.meta();
-                let arena_len = arena_guard.len();
-
-                if arena_len > 0 {
-                    let mut visible_row_ids = Vec::with_capacity(arena_len);
-                    for meta in arena_meta {
+                if !arena_guard.is_empty() {
+                    let mut visible_row_ids =
+                        Vec::with_capacity(self.committed_row_count.load(Ordering::Relaxed));
+                    for (meta, _) in arena_guard.rows() {
                         if meta.txn_id != 0
                             && meta.deleted_at_txn_id == 0
                             && checker.is_visible(meta.txn_id, txn_id)
@@ -1859,7 +1921,7 @@ impl VersionStore {
         }
 
         // SLOW PATH: Full CowBTree iteration
-        let versions = self.versions.read().clone();
+        let versions = self.capture_versions();
         let mut visible_row_ids = Vec::with_capacity(versions.len());
 
         for (&row_id, chain) in versions.iter() {
@@ -1914,12 +1976,9 @@ impl VersionStore {
             let uncommitted_empty = self.uncommitted_writes.read().is_empty();
             if uncommitted_empty && !checker.needs_snapshot_isolation(txn_id) {
                 let arena_guard = self.arena.read_guard();
-                let arena_meta = arena_guard.meta();
-                let arena_len = arena_guard.len();
-
-                if arena_len > 0 {
+                if !arena_guard.is_empty() {
                     let mut count = 0usize;
-                    for meta in arena_meta {
+                    for (meta, _) in arena_guard.rows() {
                         if meta.txn_id != 0
                             && meta.deleted_at_txn_id == 0
                             && checker.is_visible(meta.txn_id, txn_id)
@@ -1934,7 +1993,7 @@ impl VersionStore {
 
         // SLOW PATH: Full CowBTree iteration
         let mut count = 0;
-        let versions = self.versions.read().clone();
+        let versions = self.capture_versions();
         for chain in versions.values() {
             // FAST PATH: Check HEAD version first - O(1) for common case
             let head_txn_id = chain.version.txn_id;
@@ -1981,25 +2040,45 @@ impl VersionStore {
         self.committed_row_count.load(Ordering::Relaxed)
     }
 
-    /// Bytes of the rows the arena holds, kept exact by every mutation
+    /// Live arena payload requests used by the existing hot-size trigger.
     #[inline]
     pub fn hot_bytes(&self) -> usize {
         self.arena.bytes()
     }
 
+    /// Canonical, pinned-root and retired-arena payload bounds, with shared overcount.
+    #[cfg(test)]
+    pub(crate) fn version_payload_footprint(&self) -> (usize, usize, usize) {
+        let usage = self.memory.usage();
+        (
+            usage.version_payloads,
+            usage.pinned_version_payloads,
+            usage.retired_arena_payloads,
+        )
+    }
+
+    pub(crate) fn memory_account(&self) -> &Arc<TableMemory> {
+        &self.memory
+    }
+
     /// Arena slots in use (deleted and cleared ones included) and the bytes
     /// its slot vectors reserve
     pub fn arena_footprint(&self) -> (usize, usize) {
-        (self.arena.len(), self.arena.capacity_bytes())
+        (self.arena.slot_count(), self.arena.capacity_bytes())
+    }
+
+    pub(crate) fn prepare_arena_retirement(&self, rows: usize) -> ArenaRetirement {
+        self.arena.prepare_clear(rows)
+    }
+
+    pub(crate) fn finish_arena_retirement(&self, retirement: &mut ArenaRetirement) {
+        self.arena.finish_clear(retirement);
     }
 
     /// Previous versions kept alive by the version chains
     pub fn chain_entries(&self) -> usize {
-        let versions = self.versions.read().clone();
-        versions
-            .iter()
-            .map(|(_, chain)| count_chain_depth(chain).saturating_sub(1))
-            .sum()
+        let versions = self.versions.read();
+        versions.payloads.versions - versions.len()
     }
 
     /// Check if a row_id exists in the committed version store (B-tree).
@@ -2075,7 +2154,7 @@ impl VersionStore {
     ///
     /// Fails with `TableHasActiveTransactions` if another transaction holds
     /// uncommitted UPDATE/DELETE claims on this table.
-    pub fn truncate_all(&self) -> crate::core::Result<i32> {
+    pub fn truncate_all(&self) -> crate::core::Result<TruncateResult> {
         // Hold uncommitted_writes(W) for the ENTIRE check-and-clear sequence
         // to prevent TOCTOU race: without this, a concurrent try_claim_row()
         // could add a claim between the check and the clear, and truncate would
@@ -2098,12 +2177,23 @@ impl VersionStore {
         // version pointing to an arena slot that we then clear.
         // Reset committed_row_count inside the lock so COUNT(*) never sees 0
         // while data still exists.
-        let count;
+        let result;
         {
             let mut versions = self.versions.write();
-            count = self.committed_row_count.swap(0, Ordering::SeqCst) as i32;
-            versions.clear();
-            self.arena.clear_all();
+            let arena = self.arena.clear_all()?;
+            let count = self.committed_row_count.swap(0, Ordering::SeqCst) as i32;
+            let charge = VersionSnapshotCharge::new(&self.memory, &versions);
+            let entries = std::mem::take(&mut versions.entries);
+            versions.payloads = VersionPayloads::default();
+            versions.publish_memory(&self.memory);
+            result = TruncateResult {
+                rows_affected: count,
+                _versions: Some(VersionSnapshot {
+                    inner: entries,
+                    _charge: charge,
+                }),
+                _arena: arena,
+            };
         }
 
         // Clear uncommitted_writes (already held as write lock)
@@ -2123,7 +2213,7 @@ impl VersionStore {
         // 7. Invalidate zone maps (stale after truncate)
         *self.zone_maps.write() = None;
 
-        Ok(count)
+        Ok(result)
     }
 
     /// Returns all visible rows for a transaction (optimized batch operation)
@@ -2140,7 +2230,7 @@ impl VersionStore {
     /// Used by seal: the snapshot records each row's `txn_id` so that
     /// `remove_sealed_rows` can detect concurrent commits and skip them.
     pub fn extract_for_seal(&self, txn_id: i64) -> (RowVec, ExtractionSnapshot) {
-        let snapshot = self.versions.read().clone();
+        let snapshot = self.capture_versions();
         let rows = self.get_all_visible_rows_internal(txn_id);
         (rows, ExtractionSnapshot { inner: snapshot })
     }
@@ -2153,7 +2243,7 @@ impl VersionStore {
         &self,
         commit_seq_cutoff: i64,
     ) -> (RowVec, ExtractionSnapshot) {
-        let snapshot = self.versions.read().clone();
+        let snapshot = self.capture_versions();
         let mut rows = RowVec::with_capacity(self.committed_row_count());
         self.for_each_committed_version_with_cutoff(
             |row_id, version| {
@@ -2179,6 +2269,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         let mut results = RowVec::with_capacity(versions.len());
 
@@ -2190,7 +2281,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    results.push((row_id, chain.version.data.clone()));
+                    results.push((row_id, exports.capture(&chain.version.data)));
                 }
                 continue;
             }
@@ -2203,7 +2294,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        results.push((row_id, e.version.data.clone()));
+                        results.push((row_id, exports.capture(&e.version.data)));
                     }
                     break;
                 }
@@ -2228,6 +2319,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         let mut result = RowVec::with_capacity(versions.len());
 
@@ -2239,7 +2331,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, chain.version.data.clone()));
+                    result.push((row_id, exports.capture(&chain.version.data)));
                 }
                 continue;
             }
@@ -2252,7 +2344,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, e.version.data.clone()));
+                        result.push((row_id, exports.capture(&e.version.data)));
                     }
                     break;
                 }
@@ -2282,6 +2374,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         // Ensure capacity
         let current_capacity = result.capacity();
@@ -2298,7 +2391,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, chain.version.data.clone()));
+                    result.push((row_id, exports.capture(&chain.version.data)));
                 }
                 continue;
             }
@@ -2311,7 +2404,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, e.version.data.clone()));
+                        result.push((row_id, exports.capture(&e.version.data)));
                     }
                     break;
                 }
@@ -2346,6 +2439,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len());
 
@@ -2359,7 +2453,7 @@ impl VersionStore {
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
                     let mut version_copy = chain.version.clone();
                     version_copy.create_time = current_seq;
-                    result.push((row_id, chain.version.data.clone(), version_copy));
+                    result.push((row_id, exports.capture(&chain.version.data), version_copy));
                 }
                 continue;
             }
@@ -2374,7 +2468,7 @@ impl VersionStore {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
                         let mut version_copy = e.version.clone();
                         version_copy.create_time = current_seq;
-                        result.push((row_id, e.version.data.clone(), version_copy));
+                        result.push((row_id, exports.capture(&e.version.data), version_copy));
                     }
                     break;
                 }
@@ -2424,6 +2518,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         // Single-pass: read, filter, and collect in one loop
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len() / 4);
@@ -2440,7 +2535,7 @@ impl VersionStore {
                 {
                     let mut version_copy = chain.version.clone();
                     version_copy.create_time = current_seq;
-                    result.push((row_id, chain.version.data.clone(), version_copy));
+                    result.push((row_id, exports.capture(&chain.version.data), version_copy));
                 }
                 continue;
             }
@@ -2457,7 +2552,7 @@ impl VersionStore {
                     {
                         let mut version_copy = e.version.clone();
                         version_copy.create_time = current_seq;
-                        result.push((row_id, e.version.data.clone(), version_copy));
+                        result.push((row_id, exports.capture(&e.version.data), version_copy));
                     }
                     break;
                 }
@@ -2484,6 +2579,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         let mut result = RowVec::with_capacity(versions.len());
 
@@ -2495,7 +2591,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, chain.version.data.clone()));
+                    result.push((row_id, exports.capture(&chain.version.data)));
                 }
                 continue;
             }
@@ -2508,7 +2604,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, e.version.data.clone()));
+                        result.push((row_id, exports.capture(&e.version.data)));
                     }
                     break;
                 }
@@ -2542,6 +2638,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         // Collect with early termination
         // A user-supplied limit can be i64::MAX; only pre-allocate what
@@ -2589,7 +2686,7 @@ impl VersionStore {
                 if skipped < offset {
                     skipped += 1;
                 } else {
-                    result.push((row_id, entry.version.data.clone()));
+                    result.push((row_id, exports.capture(&entry.version.data)));
                     if result.len() >= limit {
                         break; // Early termination!
                     }
@@ -2688,6 +2785,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         // Use range for efficient cursor-based iteration
         let mut result = RowVec::with_capacity(batch_size);
@@ -2738,7 +2836,7 @@ impl VersionStore {
                     has_more = true;
                     break; // Early termination - found one more than needed
                 }
-                result.push((row_id, entry.version.data.clone()));
+                result.push((row_id, exports.capture(&entry.version.data)));
             }
         }
 
@@ -2778,6 +2876,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         // Use range for efficient cursor-based iteration
         buffer.reserve(batch_size);
@@ -2828,7 +2927,7 @@ impl VersionStore {
                     has_more = true;
                     break; // Early termination - found one more than needed
                 }
-                buffer.push((row_id, entry.version.data.clone()));
+                buffer.push((row_id, exports.capture(&entry.version.data)));
             }
         }
 
@@ -2867,6 +2966,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         // Collect with offset/limit
         // Cap capacity to avoid overflow when limit is usize::MAX
@@ -2888,7 +2988,7 @@ impl VersionStore {
                             if skipped < offset {
                                 skipped += 1;
                             } else {
-                                result.push((*row_id, entry.version.data.clone()));
+                                result.push((*row_id, exports.capture(&entry.version.data)));
                                 if result.len() >= limit {
                                     return Some(result);
                                 }
@@ -2911,7 +3011,7 @@ impl VersionStore {
                             if skipped < offset {
                                 skipped += 1;
                             } else {
-                                result.push((row_id, entry.version.data.clone()));
+                                result.push((row_id, exports.capture(&entry.version.data)));
                                 if result.len() >= limit {
                                     return Some(result);
                                 }
@@ -2960,9 +3060,10 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         // Helper to find visible version and get row data
-        let find_visible_row = |chain: &VersionChainEntry| -> Option<Row> {
+        let mut find_visible_row = |chain: &VersionChainEntry| -> Option<Row> {
             let mut current: Option<&VersionChainEntry> = Some(chain);
             while let Some(e) = current {
                 let version_txn_id = e.version.txn_id;
@@ -2973,7 +3074,7 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    return Some(e.version.data.clone());
+                    return Some(exports.capture(&e.version.data));
                 }
                 current = e.prev.as_ref().map(|b| b.as_ref());
             }
@@ -3059,6 +3160,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         // Single-pass: read, filter, and collect in one loop
         let mut result = RowVec::with_capacity(versions.len() / 4);
@@ -3076,7 +3178,7 @@ impl VersionStore {
                     }
 
                     if matches_row(&e.version.data) {
-                        result.push((row_id, e.version.data.clone()));
+                        result.push((row_id, exports.capture(&e.version.data)));
                     }
                     break;
                 }
@@ -3122,6 +3224,7 @@ impl VersionStore {
         };
 
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         for (&row_id, chain) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain);
@@ -3135,7 +3238,9 @@ impl VersionStore {
                         break;
                     }
 
-                    if matches_row(&e.version.data) && !callback(row_id, e.version.data.clone()) {
+                    if matches_row(&e.version.data)
+                        && !callback(row_id, exports.capture(&e.version.data))
+                    {
                         return;
                     }
                     break;
@@ -3187,6 +3292,7 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
+        let mut exports = ExportBatch::new();
 
         // Collect with offset/limit and early termination
         // A user-supplied limit can be i64::MAX; only pre-allocate what
@@ -3210,7 +3316,7 @@ impl VersionStore {
                         if skipped < offset {
                             skipped += 1;
                         } else {
-                            result.push((row_id, e.version.data.clone()));
+                            result.push((row_id, exports.capture(&e.version.data)));
                             if result.len() >= limit {
                                 return result; // Early termination!
                             }
@@ -3299,20 +3405,17 @@ impl VersionStore {
 
         {
             let arena_guard = self.arena.read_guard();
-            let arena_meta = arena_guard.meta();
-            let arena_data = arena_guard.data();
-            let arena_len = arena_guard.len();
-
-            if uncommitted_empty && arena_len > 0 && !checker.needs_snapshot_isolation(txn_id) {
+            if uncommitted_empty
+                && !arena_guard.is_empty()
+                && !checker.needs_snapshot_isolation(txn_id)
+            {
                 // OPTIMIZATION: Cache visibility result for repeated txn_ids
                 // When rows are inserted in batches, consecutive rows often have the same txn_id.
                 // Caching avoids repeated thread-local access overhead (~27ms per 100K rows).
                 let mut last_txn_id: i64 = 0;
                 let mut last_visible: bool = false;
 
-                let mut idx = 0;
-                while idx < arena_len {
-                    let meta = &arena_meta[idx];
+                for (meta, payload) in arena_guard.rows() {
                     if meta.txn_id != 0 && meta.deleted_at_txn_id == 0 {
                         // Check visibility with cache
                         let version_txn_id = meta.txn_id;
@@ -3326,12 +3429,11 @@ impl VersionStore {
                         };
 
                         if is_vis {
-                            if let Some(val) = arena_data[idx].get(col_idx) {
+                            if let Some(val) = payload.get(col_idx) {
                                 accumulate_sum(&mut int_sum, &mut float_sum, &mut count, val);
                             }
                         }
                     }
-                    idx += 1;
                 }
                 return (int_sum as f64 + float_sum, count);
             }
@@ -3339,7 +3441,7 @@ impl VersionStore {
         }
 
         // SLOW PATH: Full iteration over version chains (single pass)
-        let versions = self.versions.read().clone();
+        let versions = self.capture_versions();
 
         // Cache visibility for slow path too
         let mut last_txn_id: i64 = 0;
@@ -3410,18 +3512,15 @@ impl VersionStore {
 
         {
             let arena_guard = self.arena.read_guard();
-            let arena_meta = arena_guard.meta();
-            let arena_data = arena_guard.data();
-            let arena_len = arena_guard.len();
-
-            if uncommitted_empty && arena_len > 0 && !checker.needs_snapshot_isolation(txn_id) {
+            if uncommitted_empty
+                && !arena_guard.is_empty()
+                && !checker.needs_snapshot_isolation(txn_id)
+            {
                 // OPTIMIZATION: Cache visibility result for repeated txn_ids
                 let mut last_txn_id: i64 = 0;
                 let mut last_visible: bool = false;
 
-                let mut idx = 0;
-                while idx < arena_len {
-                    let meta = &arena_meta[idx];
+                for (meta, payload) in arena_guard.rows() {
                     if meta.txn_id != 0 && meta.deleted_at_txn_id == 0 {
                         let version_txn_id = meta.txn_id;
                         let is_vis = if version_txn_id == last_txn_id {
@@ -3434,12 +3533,14 @@ impl VersionStore {
                         };
 
                         if is_vis {
-                            if let Some(val) = arena_data[idx].get(col_idx) {
+                            if let Some(val) = payload.get(col_idx) {
                                 update_min(&mut min_val, val);
                             }
                         }
                     }
-                    idx += 1;
+                }
+                if let Some(value) = &min_val {
+                    charge_value_export(value);
                 }
                 return min_val;
             }
@@ -3447,7 +3548,7 @@ impl VersionStore {
         }
 
         // SLOW PATH: Full iteration over version chains (single pass)
-        let versions = self.versions.read().clone();
+        let versions = self.capture_versions();
 
         // Cache visibility for slow path too
         let mut last_txn_id: i64 = 0;
@@ -3482,6 +3583,9 @@ impl VersionStore {
             }
         }
 
+        if let Some(value) = &min_val {
+            charge_value_export(value);
+        }
         min_val
     }
 
@@ -3517,18 +3621,15 @@ impl VersionStore {
 
         {
             let arena_guard = self.arena.read_guard();
-            let arena_meta = arena_guard.meta();
-            let arena_data = arena_guard.data();
-            let arena_len = arena_guard.len();
-
-            if uncommitted_empty && arena_len > 0 && !checker.needs_snapshot_isolation(txn_id) {
+            if uncommitted_empty
+                && !arena_guard.is_empty()
+                && !checker.needs_snapshot_isolation(txn_id)
+            {
                 // OPTIMIZATION: Cache visibility result for repeated txn_ids
                 let mut last_txn_id: i64 = 0;
                 let mut last_visible: bool = false;
 
-                let mut idx = 0;
-                while idx < arena_len {
-                    let meta = &arena_meta[idx];
+                for (meta, payload) in arena_guard.rows() {
                     if meta.txn_id != 0 && meta.deleted_at_txn_id == 0 {
                         let version_txn_id = meta.txn_id;
                         let is_vis = if version_txn_id == last_txn_id {
@@ -3541,12 +3642,14 @@ impl VersionStore {
                         };
 
                         if is_vis {
-                            if let Some(val) = arena_data[idx].get(col_idx) {
+                            if let Some(val) = payload.get(col_idx) {
                                 update_max(&mut max_val, val);
                             }
                         }
                     }
-                    idx += 1;
+                }
+                if let Some(value) = &max_val {
+                    charge_value_export(value);
                 }
                 return max_val;
             }
@@ -3554,7 +3657,7 @@ impl VersionStore {
         }
 
         // SLOW PATH: Full iteration over version chains (single pass)
-        let versions = self.versions.read().clone();
+        let versions = self.capture_versions();
 
         // Cache visibility for slow path too
         let mut last_txn_id: i64 = 0;
@@ -3589,6 +3692,9 @@ impl VersionStore {
             }
         }
 
+        if let Some(value) = &max_val {
+            charge_value_export(value);
+        }
         max_val
     }
 
@@ -3710,19 +3816,13 @@ impl VersionStore {
         let uncommitted_empty = self.uncommitted_writes.read().is_empty();
         if uncommitted_empty && !checker.needs_snapshot_isolation(txn_id) {
             let arena_guard = self.arena.read_guard();
-            let arena_meta = arena_guard.meta();
-            let arena_data = arena_guard.data();
-            let arena_len = arena_guard.len();
-
-            if arena_len > 0 {
-                for (idx, meta) in arena_meta.iter().enumerate() {
+            if !arena_guard.is_empty() {
+                for (meta, arc_row) in arena_guard.rows() {
                     if meta.txn_id != 0
                         && meta.deleted_at_txn_id == 0
                         && checker.is_visible(meta.txn_id, txn_id)
                     {
-                        if let Some(arc_row) = arena_data.get(idx) {
-                            accumulate_from!(arc_row, results, aggregates);
-                        }
+                        accumulate_from!(arc_row, results, aggregates);
                     }
                 }
 
@@ -3733,8 +3833,18 @@ impl VersionStore {
                         AggregateAccumulator::Sum(is, fs, c) => {
                             AggregateResult::Sum(is as f64 + fs, c)
                         }
-                        AggregateAccumulator::Min(v) => AggregateResult::Min(v),
-                        AggregateAccumulator::Max(v) => AggregateResult::Max(v),
+                        AggregateAccumulator::Min(v) => {
+                            if let Some(value) = &v {
+                                charge_value_export(value);
+                            }
+                            AggregateResult::Min(v)
+                        }
+                        AggregateAccumulator::Max(v) => {
+                            if let Some(value) = &v {
+                                charge_value_export(value);
+                            }
+                            AggregateResult::Max(v)
+                        }
                         AggregateAccumulator::Avg(is, fs, c) => {
                             AggregateResult::Avg(is as f64 + fs, c)
                         }
@@ -3767,8 +3877,18 @@ impl VersionStore {
             .map(|acc| match acc {
                 AggregateAccumulator::Count(c) => AggregateResult::Count(c),
                 AggregateAccumulator::Sum(is, fs, c) => AggregateResult::Sum(is as f64 + fs, c),
-                AggregateAccumulator::Min(v) => AggregateResult::Min(v),
-                AggregateAccumulator::Max(v) => AggregateResult::Max(v),
+                AggregateAccumulator::Min(v) => {
+                    if let Some(value) = &v {
+                        charge_value_export(value);
+                    }
+                    AggregateResult::Min(v)
+                }
+                AggregateAccumulator::Max(v) => {
+                    if let Some(value) = &v {
+                        charge_value_export(value);
+                    }
+                    AggregateResult::Max(v)
+                }
                 AggregateAccumulator::Avg(is, fs, c) => AggregateResult::Avg(is as f64 + fs, c),
             })
             .collect()
@@ -3783,7 +3903,8 @@ impl VersionStore {
         use crate::common::i64_map::Entry;
 
         let mut map = self.uncommitted_writes.write();
-        match map.entry(row_id) {
+        let before = map.allocation_bytes();
+        let result = match map.entry(row_id) {
             Entry::Occupied(e) => {
                 let existing_txn = *e.get();
                 if existing_txn != txn_id {
@@ -3798,17 +3919,21 @@ impl VersionStore {
                 e.insert(txn_id);
                 Ok(())
             }
-        }
+        };
+        self.claim_memory.resize(before, &map);
+        result
     }
 
     /// Releases a row claim
     pub fn release_row_claim(&self, row_id: i64, txn_id: i64) {
         let mut map = self.uncommitted_writes.write();
+        let before = map.allocation_bytes();
         if let Some(&v) = map.get(row_id) {
             if v == txn_id {
                 map.remove(row_id);
             }
         }
+        self.claim_memory.resize(before, &map);
     }
 
     /// Releases multiple row claims in batch
@@ -3816,6 +3941,7 @@ impl VersionStore {
     #[inline]
     pub fn release_row_claims_batch(&self, row_ids: &[i64], txn_id: i64) {
         let mut map = self.uncommitted_writes.write();
+        let before = map.allocation_bytes();
         for &row_id in row_ids {
             if let Some(&v) = map.get(row_id) {
                 if v == txn_id {
@@ -3823,6 +3949,7 @@ impl VersionStore {
                 }
             }
         }
+        self.claim_memory.resize(before, &map);
     }
 
     /// Check if an index exists
@@ -3885,8 +4012,13 @@ impl VersionStore {
 
     /// Add an index
     pub fn add_index(&self, name: String, index: Arc<dyn Index>) {
+        if let Some(account) = index.memory_account() {
+            account.register(&self.memory);
+        }
         let mut indexes = self.indexes.write();
-        indexes.insert(name, index);
+        let replaced = indexes.insert(name, index);
+        drop(indexes);
+        drop(replaced);
     }
 
     /// Remove an index
@@ -3974,8 +4106,8 @@ impl VersionStore {
     #[inline]
     pub fn indexes_read(
         &self,
-    ) -> parking_lot::RwLockReadGuard<'_, FxHashMap<String, Arc<dyn Index>>> {
-        self.indexes.read()
+    ) -> parking_lot::MappedRwLockReadGuard<'_, FxHashMap<String, Arc<dyn Index>>> {
+        parking_lot::RwLockReadGuard::map(self.indexes.read(), |indexes| &**indexes)
     }
 
     /// Get column indices and names for all non-PK unique indexes.
@@ -4018,7 +4150,8 @@ impl VersionStore {
     ///
     /// Zone maps contain min/max statistics per segment, enabling the query
     /// executor to skip entire segments when predicates fall outside the range.
-    pub fn set_zone_maps(&self, zone_maps: crate::storage::mvcc::zonemap::TableZoneMap) {
+    pub fn set_zone_maps(&self, mut zone_maps: crate::storage::mvcc::zonemap::TableZoneMap) {
+        zone_maps.refresh_memory();
         let mut guard = self.zone_maps.write();
         *guard = Some(Arc::new(zone_maps));
     }
@@ -4093,7 +4226,7 @@ impl VersionStore {
     /// the version is skipped to avoid duplicate entries in the version chain. This can
     /// occur when snapshot and WAL both contain the same committed data due to race
     /// conditions during snapshot creation.
-    pub fn apply_recovered_version(&self, row_id: i64, version: RowVersion) {
+    pub fn apply_recovered_version(&self, row_id: i64, version: RowVersion) -> Result<(), Error> {
         let is_deleted = version.is_deleted();
         let row_data = version.data.clone();
 
@@ -4112,13 +4245,13 @@ impl VersionStore {
                     if row_id > 0 {
                         self.set_auto_increment_counter(row_id);
                     }
-                    return;
+                    return Ok(());
                 }
             }
         }
 
         // Add the version to the store
-        self.add_version(row_id, version);
+        self.add_version(row_id, version)?;
 
         // Update auto_increment counter if this row_id is higher
         // This ensures the counter is restored to at least the max seen row_id
@@ -4153,13 +4286,14 @@ impl VersionStore {
                 }
             }
         }
+        Ok(())
     }
 
     /// Mark a row as deleted during WAL replay
     ///
     /// This creates a deleted version for the row during recovery.
     /// Also removes the row from any existing indexes.
-    pub fn mark_deleted(&self, row_id: i64, txn_id: i64) {
+    pub fn mark_deleted(&self, row_id: i64, txn_id: i64) -> Result<(), Error> {
         // Get the old row data for index removal BEFORE creating the deleted version
         let old_row = self
             .get_visible_version(row_id, txn_id)
@@ -4175,7 +4309,7 @@ impl VersionStore {
                 .map(|d| d.as_nanos() as i64)
                 .unwrap_or(0),
         };
-        self.add_version(row_id, deleted_version);
+        self.add_version(row_id, deleted_version)?;
 
         // Remove from indexes using old row data
         if let Some(old_data) = old_row {
@@ -4204,6 +4338,7 @@ impl VersionStore {
                 }
             }
         }
+        Ok(())
     }
 
     /// Drop an index by name (alias for remove_index)
@@ -4411,7 +4546,7 @@ impl VersionStore {
             // Uses batch_slice for better performance
             if !skip_population {
                 let col_idx = column_id as usize;
-                let versions = self.versions.read().clone();
+                let versions = self.capture_versions();
                 let mut entries: Vec<(i64, Vec<crate::core::Value>)> = Vec::new();
                 for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
@@ -4450,7 +4585,7 @@ impl VersionStore {
             if !skip_population {
                 let col_indices: Vec<usize> =
                     meta.column_ids.iter().map(|&id| id as usize).collect();
-                let versions = self.versions.read().clone();
+                let versions = self.capture_versions();
                 let mut entries: Vec<(i64, Vec<crate::core::Value>)> = Vec::new();
                 for (&row_id, version_chain) in versions.iter() {
                     let version = &version_chain.version;
@@ -4524,7 +4659,7 @@ impl VersionStore {
             (0..num_indexes).map(|_| Vec::new()).collect();
 
         // First pass: Collect all entries per index
-        let versions = self.versions.read().clone();
+        let versions = self.capture_versions();
         for (&row_id, version_chain) in versions.iter() {
             let version = &version_chain.version;
 
@@ -4667,6 +4802,7 @@ impl VersionStore {
         &self,
         row_ids: &[i64],
         extraction_snapshot: &ExtractionSnapshot,
+        retirement: &mut ArenaRetirement,
     ) -> (usize, SealedIndexCleanup, Vec<i64>) {
         if row_ids.is_empty() {
             return (0, SealedIndexCleanup::default(), Vec::new());
@@ -4680,11 +4816,15 @@ impl VersionStore {
         const SUB_BATCH_SIZE: usize = 2_000;
         let mut removed_ids: Vec<i64> = Vec::with_capacity(row_ids.len());
         let mut skipped_ids: Vec<i64> = Vec::new();
-        let mut arena_indices_to_clear: Vec<usize> = Vec::new();
+        let mut arena_indices_to_clear: Vec<ArenaSlot> = Vec::new();
 
         for chunk in row_ids.chunks(SUB_BATCH_SIZE) {
             let uncommitted = self.uncommitted_writes.read();
             let mut versions = self.versions.write();
+            if self.arena.has_reserved_heads() {
+                skipped_ids.extend_from_slice(chunk);
+                continue;
+            }
             for &row_id in chunk {
                 if uncommitted.contains_key(row_id) {
                     skipped_ids.push(row_id);
@@ -4704,20 +4844,23 @@ impl VersionStore {
                         skipped_ids.push(row_id);
                         continue;
                     }
-                    if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
+                    if let Some(idx) = entry.arena_idx {
                         arena_indices_to_clear.push(idx);
                     }
+                    let removed_payloads = entry.payloads();
                     versions.remove(row_id);
+                    versions.payloads.remove(removed_payloads);
                     removed_ids.push(row_id);
                 }
             }
+            versions.publish_memory(&self.memory);
             // Locks released here — concurrent commits can proceed
         }
 
         // Invalidate sealed arena slots so speculative probes don't return
         // stale data. This sets row_id=0 in the meta, making the probe fail.
         if !arena_indices_to_clear.is_empty() {
-            self.arena.clear_batch(&arena_indices_to_clear);
+            self.arena.clear_batch(&arena_indices_to_clear, retirement);
         }
 
         let count = removed_ids.len();
@@ -4803,7 +4946,7 @@ impl VersionStore {
         let mut rows_to_delete = Vec::new();
 
         // Clone CowBTree once, reuse for index cleanup (O(1) Arc clone)
-        let versions = self.versions.read().clone();
+        let versions = self.capture_versions();
 
         // First pass: identify deleted rows older than retention period
         for (&row_id, chain) in versions.iter() {
@@ -4832,18 +4975,24 @@ impl VersionStore {
         let mut actual_arena_indices = Vec::with_capacity(rows_to_delete.len());
         {
             let mut versions = self.versions.write();
+            if self.arena.has_reserved_heads() {
+                return 0;
+            }
             for &row_id in &rows_to_delete {
                 // Re-check: the row must still exist AND still be deleted
                 if let Some(entry) = versions.get(row_id) {
                     if entry.version.is_deleted() {
-                        if let Some(idx) = unpack_arena_idx(entry.arena_idx) {
+                        if let Some(idx) = entry.arena_idx {
                             actual_arena_indices.push(idx);
                         }
+                        let removed_payloads = entry.payloads();
                         versions.remove(row_id);
+                        versions.payloads.remove(removed_payloads);
                         actually_deleted.push(row_id);
                     }
                 }
             }
+            versions.publish_memory(&self.memory);
         }
 
         if actually_deleted.is_empty() {
@@ -4905,7 +5054,10 @@ impl VersionStore {
         }
 
         // Clear arena slots only for rows we actually removed
-        self.arena.clear_batch(&actual_arena_indices);
+        let mut retirement = self.arena.prepare_clear(actual_arena_indices.len());
+        self.arena
+            .clear_batch(&actual_arena_indices, &mut retirement);
+        self.arena.finish_clear(&mut retirement);
 
         actually_deleted.len() as i32
     }
@@ -4969,7 +5121,7 @@ impl VersionStore {
         // First pass (read lock): identify row_ids that MAY need pruning
         let mut candidate_row_ids: Vec<i64> = Vec::new();
         {
-            let versions = self.versions.read().clone();
+            let versions = self.capture_versions();
             for (&row_id, chain_entry) in versions.iter() {
                 // Quick check: does this entry have any prev versions?
                 if chain_entry.prev.is_none() {
@@ -5037,6 +5189,10 @@ impl VersionStore {
             if keep_count < prev_versions.len() {
                 let to_remove = prev_versions.len() - keep_count;
                 cleaned += to_remove as i32;
+                let mut removed_payloads = VersionPayloads::default();
+                for entry in &prev_versions[keep_count..] {
+                    removed_payloads.add_row(&entry.version.data);
+                }
 
                 // Clone the LIVE entry (not stale snapshot) and modify
                 let mut modified_entry = chain_entry.clone();
@@ -5059,8 +5215,10 @@ impl VersionStore {
                 }
 
                 versions.insert(row_id, modified_entry);
+                versions.payloads.remove(removed_payloads);
             }
         }
+        versions.publish_memory(&self.memory);
 
         cleaned
     }
@@ -5108,7 +5266,8 @@ impl VersionStore {
         let use_cutoff = commit_seq_cutoff > 0;
 
         // Iterate all versions
-        let versions = self.versions.read().clone();
+        let versions = self.capture_versions();
+        let mut exports = ExportBatch::new();
         for (&row_id, chain_entry) in versions.iter() {
             // Walk the version chain to find the visible version
             let mut current: Option<&VersionChainEntry> = Some(chain_entry);
@@ -5141,6 +5300,7 @@ impl VersionStore {
                     }
 
                     // Found visible, non-deleted version
+                    exports.record(&e.version.data);
                     if !callback(row_id, &e.version) {
                         return; // Callback wants to stop
                     }
@@ -5167,7 +5327,7 @@ impl VersionStore {
         let snapshot_txn_id = i64::MAX;
         let mut count = 0;
 
-        let versions = self.versions.read().clone();
+        let versions = self.capture_versions();
         for (_, chain_entry) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain_entry);
 
@@ -5267,8 +5427,7 @@ impl VersionStore {
 
         // Pre-acquire arena lock ONCE
         let arena_guard = self.arena.read_guard();
-        let arena_data = arena_guard.data();
-        let arena_meta = arena_guard.meta();
+        let mut exports = ExportBatch::new();
 
         // Helper to update accumulators
         #[inline(always)]
@@ -5347,6 +5506,7 @@ impl VersionStore {
         fn compute_aggregate_values(
             aggregates: &[(AggregateOp, usize)],
             accums: &[Accum],
+            exports: &mut ExportBatch,
         ) -> Vec<Value> {
             aggregates
                 .iter()
@@ -5369,8 +5529,16 @@ impl VersionStore {
                             Value::Null(DataType::Float)
                         }
                     }
-                    AggregateOp::Min => accum.min.clone().unwrap_or(Value::Null(DataType::Null)),
-                    AggregateOp::Max => accum.max.clone().unwrap_or(Value::Null(DataType::Null)),
+                    AggregateOp::Min => accum
+                        .min
+                        .as_ref()
+                        .map(|v| exports.capture_value(v))
+                        .unwrap_or(Value::Null(DataType::Null)),
+                    AggregateOp::Max => accum
+                        .max
+                        .as_ref()
+                        .map(|v| exports.capture_value(v))
+                        .unwrap_or(Value::Null(DataType::Null)),
                 })
                 .collect()
         }
@@ -5405,7 +5573,7 @@ impl VersionStore {
             // Only used for String/other types that can't be mapped to i64
             let mut other_groups: GroupKeyMap<u32> = GroupKeyMap::default();
 
-            for (idx, meta) in arena_meta.iter().enumerate() {
+            for (meta, row_data) in arena_guard.rows() {
                 // Visibility check (standard pattern: check creation, then deletion)
                 if meta.txn_id == 0 || !checker.is_visible(meta.txn_id, txn_id) {
                     continue;
@@ -5414,11 +5582,6 @@ impl VersionStore {
                 {
                     continue;
                 }
-
-                let row_data = match arena_data.get(idx) {
-                    Some(data) => data,
-                    None => continue,
-                };
 
                 let row_slice = row_data.as_ref();
                 let val = if col_idx < row_slice.len() {
@@ -5532,7 +5695,11 @@ impl VersionStore {
                 group_values.push(group_value);
                 results.push(GroupedAggregateResult {
                     group_values,
-                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal)),
+                    aggregate_values: compute_aggregate_values(
+                        aggregates,
+                        slice_of(ordinal),
+                        &mut exports,
+                    ),
                 });
             }
 
@@ -5542,7 +5709,11 @@ impl VersionStore {
                 group_values.push(Value::Null(DataType::Null));
                 results.push(GroupedAggregateResult {
                     group_values,
-                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal)),
+                    aggregate_values: compute_aggregate_values(
+                        aggregates,
+                        slice_of(ordinal),
+                        &mut exports,
+                    ),
                 });
             }
 
@@ -5552,12 +5723,18 @@ impl VersionStore {
             for (group_key, ordinal) in other_groups {
                 let mut group_values = Vec::with_capacity(row_width);
                 match group_key {
-                    GroupKey::Single(v) => group_values.push((*v).clone()),
-                    GroupKey::Multi(vs) => group_values.extend(vs.iter().map(|v| (**v).clone())),
+                    GroupKey::Single(v) => group_values.push(exports.capture_value(&v)),
+                    GroupKey::Multi(vs) => {
+                        group_values.extend(vs.iter().map(|v| exports.capture_value(v)))
+                    }
                 }
                 results.push(GroupedAggregateResult {
                     group_values,
-                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal)),
+                    aggregate_values: compute_aggregate_values(
+                        aggregates,
+                        slice_of(ordinal),
+                        &mut exports,
+                    ),
                 });
             }
 
@@ -5567,7 +5744,7 @@ impl VersionStore {
         // SLOW PATH: Multi-column GROUP BY (currently not used from try_storage_aggregation)
         let mut groups: GroupKeyMap<Vec<Accum>> = GroupKeyMap::default();
 
-        for (idx, meta) in arena_meta.iter().enumerate() {
+        for (meta, row_data) in arena_guard.rows() {
             // Visibility check (standard pattern: check creation, then deletion)
             if meta.txn_id == 0 || !checker.is_visible(meta.txn_id, txn_id) {
                 continue;
@@ -5576,10 +5753,6 @@ impl VersionStore {
                 continue;
             }
 
-            let row_data = match arena_data.get(idx) {
-                Some(data) => data,
-                None => continue,
-            };
             let row_slice = row_data.as_ref();
 
             let key_values: Vec<CompactArc<Value>> = group_by_indices
@@ -5605,16 +5778,26 @@ impl VersionStore {
 
         for (group_key, accums) in groups {
             let group_values = match group_key {
-                GroupKey::Single(v) => vec![(*v).clone()],
-                GroupKey::Multi(vs) => vs.iter().map(|v| (**v).clone()).collect(),
+                GroupKey::Single(v) => vec![exports.capture_value(&v)],
+                GroupKey::Multi(vs) => vs.iter().map(|v| exports.capture_value(v)).collect(),
             };
             results.push(GroupedAggregateResult {
                 group_values,
-                aggregate_values: compute_aggregate_values(aggregates, &accums),
+                aggregate_values: compute_aggregate_values(aggregates, &accums, &mut exports),
             });
         }
 
         Some(results)
+    }
+}
+
+impl Drop for VersionStore {
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::hot_owner_dropping();
+        drop(std::mem::take(&mut self.versions.get_mut().entries));
+        self.memory.version_payloads.store(0, Ordering::Release);
+        self.memory.version_tree.store(0, Ordering::Release);
     }
 }
 
@@ -5653,7 +5836,10 @@ pub struct TransactionVersionStore {
     /// Lazily allocated on first write to avoid allocation overhead for read-only queries
     write_set: Option<I64Map<WriteSetEntry>>,
     /// Index updates applied by commit, until the commit is visible or undone
-    index_undo: Mutex<Vec<IndexUndo>>,
+    index_undo: Mutex<IndexUndoLog>,
+    arena_reservation: Option<ArenaReservation>,
+    version_bytes: u128,
+    _object_charge: HotObjectCharge<std::sync::RwLock<TransactionVersionStore>>,
 }
 
 impl TransactionVersionStore {
@@ -5669,14 +5855,17 @@ impl TransactionVersionStore {
             parent_store,
             txn_id,
             write_set: None,
-            index_undo: Mutex::new(Vec::new()),
+            index_undo: Mutex::new(IndexUndoLog::default()),
+            arena_reservation: None,
+            version_bytes: 0,
+            _object_charge: HotObjectCharge::new(),
         }
     }
 
     /// Takes back the index updates of this transaction's commit, in reverse
     pub fn undo_index_updates(&self) {
-        let undo: Vec<IndexUndo> = std::mem::take(&mut *self.index_undo.lock());
-        for entry in undo.iter().rev() {
+        let undo = std::mem::take(&mut *self.index_undo.lock());
+        for entry in undo.entries.iter().rev() {
             if !entry.added.is_empty() {
                 let batch: Vec<(i64, &[Value])> = entry
                     .added
@@ -5725,6 +5914,54 @@ impl TransactionVersionStore {
         self.write_set.get_or_insert_with(get_write_set_map)
     }
 
+    fn charge_versions(&mut self, bytes: u128) {
+        self.version_bytes += bytes;
+        self.parent_store.memory.transaction_versions.add(bytes);
+    }
+
+    fn release_versions(&mut self, bytes: u128) {
+        self.version_bytes -= bytes;
+        self.parent_store.memory.transaction_versions.remove(bytes);
+    }
+
+    fn push_local_version(versions: &mut VersionList, version: RowVersion) -> u128 {
+        let bytes = version.data.heap_bytes();
+        let before = if versions.spilled() {
+            versions.capacity()
+        } else {
+            0
+        };
+        versions.push(version);
+        let after = if versions.spilled() {
+            versions.capacity()
+        } else {
+            0
+        };
+        bytes + ((after - before) * std::mem::size_of::<RowVersion>()) as u128
+    }
+
+    fn append_local_version(&mut self, row_id: i64, version: RowVersion) {
+        let map = self.ensure_local_versions();
+        let before = map.allocation_bytes();
+        let versions = map.entry(row_id).or_default();
+        let bytes = Self::push_local_version(versions, version);
+        account_map_capacity(before, map);
+        self.charge_versions(bytes);
+    }
+
+    fn record_read_version(&mut self, row_id: i64, entry: WriteSetEntry) {
+        let bytes = entry
+            .read_version
+            .as_ref()
+            .map_or(0, |v| v.data.heap_bytes());
+        let map = self.ensure_write_set();
+        let before = map.allocation_bytes();
+        let previous = map.insert(row_id, entry);
+        account_map_capacity(before, map);
+        debug_assert!(previous.is_none());
+        self.charge_versions(bytes);
+    }
+
     /// Put adds or updates a row in the transaction's local store
     pub fn put(&mut self, row_id: i64, data: Row, is_delete: bool) -> Result<(), Error> {
         // Convert to Shared (Arc) storage immediately for efficient Arc sharing:
@@ -5747,13 +5984,7 @@ impl TransactionVersionStore {
             .as_ref()
             .is_some_and(|lv| lv.contains_key(row_id));
 
-        if has_local {
-            // Already have local version - just append
-            self.ensure_local_versions()
-                .get_mut(row_id)
-                .unwrap()
-                .push(rv);
-        } else {
+        if !has_local {
             // New row - need to check write-set and parent store
             let needs_write_set_entry = self
                 .write_set
@@ -5771,7 +6002,7 @@ impl TransactionVersionStore {
                     .map(|c| c.get_current_sequence())
                     .unwrap_or(0);
 
-                self.ensure_write_set().insert(
+                self.record_read_version(
                     row_id,
                     WriteSetEntry {
                         read_version,
@@ -5784,8 +6015,8 @@ impl TransactionVersionStore {
                     self.parent_store.try_claim_row(row_id, self.txn_id)?;
                 }
             }
-            self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
+        self.append_local_version(row_id, rv);
         Ok(())
     }
 
@@ -5831,13 +6062,7 @@ impl TransactionVersionStore {
             .as_ref()
             .is_some_and(|lv| lv.contains_key(row_id));
 
-        if has_local {
-            // Already have local version - just append
-            self.ensure_local_versions()
-                .get_mut(row_id)
-                .unwrap()
-                .push(rv);
-        } else {
+        if !has_local {
             // Track in write-set using the pre-fetched original version
             let needs_write_set_entry = self
                 .write_set
@@ -5852,7 +6077,7 @@ impl TransactionVersionStore {
                     .map(|c| c.get_current_sequence())
                     .unwrap_or(0);
 
-                self.ensure_write_set().insert(
+                self.record_read_version(
                     row_id,
                     WriteSetEntry {
                         read_version: Some(original_version),
@@ -5863,8 +6088,8 @@ impl TransactionVersionStore {
                 // Claim the row for update
                 self.parent_store.try_claim_row(row_id, self.txn_id)?;
             }
-            self.ensure_local_versions().insert(row_id, smallvec![rv]);
         }
+        self.append_local_version(row_id, rv);
         Ok(())
     }
 
@@ -5893,7 +6118,8 @@ impl TransactionVersionStore {
             // Check if already in local versions (already processed in this transaction)
             if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
                 // Append new version to history
-                versions.push(rv);
+                let bytes = Self::push_local_version(versions, rv);
+                self.charge_versions(bytes);
                 continue;
             }
 
@@ -5913,7 +6139,7 @@ impl TransactionVersionStore {
                     .as_ref()
                     .map(|c| c.get_current_sequence())
                     .unwrap_or(0);
-                self.ensure_write_set().insert(
+                self.record_read_version(
                     row_id,
                     WriteSetEntry {
                         read_version: Some(original_version),
@@ -5926,7 +6152,7 @@ impl TransactionVersionStore {
             }
 
             // Insert new version history for this row
-            self.ensure_local_versions().insert(row_id, smallvec![rv]);
+            self.append_local_version(row_id, rv);
         }
         Ok(())
     }
@@ -5967,7 +6193,7 @@ impl TransactionVersionStore {
                         .map(|c| c.get_current_sequence())
                         .unwrap_or(0);
 
-                    self.ensure_write_set().insert(
+                    self.record_read_version(
                         row_id,
                         WriteSetEntry {
                             read_version,
@@ -5987,12 +6213,7 @@ impl TransactionVersionStore {
             rv.deleted_at_txn_id = self.txn_id;
 
             // Append to version history for this row
-            let local_versions = self.ensure_local_versions();
-            if let Some(versions) = local_versions.get_mut(row_id) {
-                versions.push(rv);
-            } else {
-                local_versions.insert(row_id, smallvec![rv]);
-            }
+            self.append_local_version(row_id, rv);
         }
         Ok(())
     }
@@ -6016,7 +6237,8 @@ impl TransactionVersionStore {
 
             // Check if already in local versions (already processed in this transaction)
             if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
-                versions.push(rv);
+                let bytes = Self::push_local_version(versions, rv);
+                self.charge_versions(bytes);
                 continue;
             }
 
@@ -6034,7 +6256,7 @@ impl TransactionVersionStore {
                     .map(|c| c.get_current_sequence())
                     .unwrap_or(0);
 
-                self.ensure_write_set().insert(
+                self.record_read_version(
                     row_id,
                     WriteSetEntry {
                         read_version: Some(original_version),
@@ -6047,7 +6269,7 @@ impl TransactionVersionStore {
             }
 
             // Insert deleted version for this row
-            self.ensure_local_versions().insert(row_id, smallvec![rv]);
+            self.append_local_version(row_id, rv);
         }
         Ok(())
     }
@@ -6133,6 +6355,7 @@ impl TransactionVersionStore {
                     if local_version.is_deleted() {
                         return None;
                     }
+                    charge_export(&local_version.data);
                     return Some(local_version.data.clone());
                 }
             }
@@ -6218,12 +6441,51 @@ impl TransactionVersionStore {
         versions
     }
 
+    /// Reserve every possible new slot before any table starts publication.
+    pub fn reserve_commit_capacity(&mut self) -> Result<(), Error> {
+        if self.arena_reservation.is_some() {
+            return Ok(());
+        }
+        let Some(local) = self.local_versions.as_ref() else {
+            return Ok(());
+        };
+        let writes = local
+            .values()
+            .filter(|history| history.last().is_some_and(|v| !v.is_deleted()))
+            .count();
+        if writes > 0 && self.holds_hot_rows() {
+            let versions = self.parent_store.versions.read();
+            let reuse = local.iter().all(|(id, history)| {
+                history.last().is_none_or(|v| v.is_deleted())
+                    || versions
+                        .get(id)
+                        .is_some_and(|head| head.arena_idx.is_some())
+            });
+            if reuse {
+                self.arena_reservation = Some(self.parent_store.arena.reserve_existing());
+                return Ok(());
+            }
+        }
+        self.arena_reservation = Some(self.parent_store.arena.reserve(writes)?);
+        Ok(())
+    }
+
     /// Commit local changes to parent store
     ///
     /// Performance: This method drains local_versions to take ownership of
     /// RowVersion values, avoiding expensive clones. The transaction is
     /// consumed after commit anyway, so this is safe.
     pub fn commit(&mut self) -> Result<(), Error> {
+        let externally_prepared = self.arena_reservation.is_some();
+        self.reserve_commit_capacity()?;
+        let result = self.commit_prepared();
+        if !externally_prepared {
+            self.arena_reservation.take();
+        }
+        result
+    }
+
+    fn commit_prepared(&mut self) -> Result<(), Error> {
         // OCC validation: detect concurrent write conflicts.
         // Rows removed by seal (missing from hot B-tree) are not conflicts —
         // they were moved to cold segments, not modified by another transaction.
@@ -6233,12 +6495,17 @@ impl TransactionVersionStore {
         self.update_indexes_on_commit()?;
 
         // Commit local versions to parent store
-        if let Some(local_versions) = self.local_versions.as_mut() {
+        if let (Some(local_versions), Some(reservation)) = (
+            self.local_versions.as_mut(),
+            self.arena_reservation.as_mut(),
+        ) {
+            let before = local_versions.allocation_bytes();
             if local_versions.len() == 1 {
                 // Single-row fast path: avoid Vec allocation
                 if let Some((row_id, mut versions)) = local_versions.drain().next() {
                     if let Some(version) = versions.pop() {
-                        self.parent_store.add_version_single(row_id, version);
+                        self.parent_store
+                            .install_versions(reservation, [(row_id, version)]);
                     }
                 }
             } else {
@@ -6251,14 +6518,16 @@ impl TransactionVersionStore {
                 // Sort by row_id to ensure deterministic locking order
                 batch.sort_by_key(|(row_id, _)| *row_id);
 
-                self.parent_store.add_versions_batch(batch);
+                self.parent_store.install_versions(reservation, batch);
             }
+            account_map_capacity(before, local_versions);
         }
 
         // Release ALL claims from write_set (includes both local and external claims).
         // Must drain the entire write_set — external claims from track_external_claim()
         // have no corresponding local_versions entry.
         if let Some(write_set) = self.write_set.as_mut() {
+            let before = write_set.allocation_bytes();
             if write_set.len() == 1 {
                 // Single-claim fast path: avoid Vec allocation
                 if let Some((row_id, _)) = write_set.drain().next() {
@@ -6271,8 +6540,10 @@ impl TransactionVersionStore {
                 self.parent_store
                     .release_row_claims_batch(&row_ids, self.txn_id);
             }
+            account_map_capacity(before, write_set);
         }
 
+        self.release_versions(self.version_bytes);
         Ok(())
     }
 
@@ -6577,11 +6848,14 @@ impl TransactionVersionStore {
             if add_batches[idx].is_empty() && remove_batches[idx].is_empty() {
                 continue;
             }
-            undo.push(IndexUndo {
-                index: Arc::clone(index),
-                added: std::mem::take(&mut add_batches[idx]),
-                removed: std::mem::take(&mut remove_batches[idx]),
-            });
+            undo.push(
+                IndexUndo {
+                    index: Arc::clone(index),
+                    added: std::mem::take(&mut add_batches[idx]),
+                    removed: std::mem::take(&mut remove_batches[idx]),
+                },
+                &self.parent_store.memory,
+            );
         }
 
         Ok(())
@@ -6734,11 +7008,14 @@ impl TransactionVersionStore {
                 })
                 .collect();
             let entry = vec![(row_id, values)];
-            undo.push(IndexUndo {
-                index: Arc::clone(index),
-                added: if is_add { entry.clone() } else { Vec::new() },
-                removed: if is_add { Vec::new() } else { entry },
-            });
+            undo.push(
+                IndexUndo {
+                    index: Arc::clone(index),
+                    added: if is_add { entry.clone() } else { Vec::new() },
+                    removed: if is_add { Vec::new() } else { entry },
+                },
+                &self.parent_store.memory,
+            );
         }
 
         Ok(())
@@ -6801,15 +7078,30 @@ impl TransactionVersionStore {
     /// `pending` contains sorted row IDs after the cold rollback.
     pub(crate) fn rollback_to_timestamp_with_pending(&mut self, timestamp: i64, pending: &[i64]) {
         debug_assert!(pending.windows(2).all(|pair| pair[0] < pair[1]));
+        let mut removed_bytes = 0;
         if let Some(local_versions) = self.local_versions.as_mut() {
+            let before = local_versions.allocation_bytes();
             local_versions.retain(|_, versions| {
-                versions.retain(|v| v.create_time <= timestamp);
+                versions.retain(|v| {
+                    let keep = v.create_time <= timestamp;
+                    if !keep {
+                        removed_bytes += v.data.heap_bytes();
+                    }
+                    keep
+                });
+                if versions.is_empty() && versions.spilled() {
+                    removed_bytes +=
+                        (versions.capacity() * std::mem::size_of::<RowVersion>()) as u128;
+                }
                 !versions.is_empty()
             });
+            account_map_capacity(before, local_versions);
         }
         let Some(write_set) = self.write_set.as_mut() else {
+            self.release_versions(removed_bytes);
             return;
         };
+        let before = write_set.allocation_bytes();
         let mut released: Vec<i64> = write_set
             .keys()
             .filter(|&row_id| {
@@ -6821,13 +7113,20 @@ impl TransactionVersionStore {
             })
             .collect();
         for &row_id in &released {
-            write_set.remove(row_id);
+            if let Some(entry) = write_set.remove(row_id) {
+                removed_bytes += entry
+                    .read_version
+                    .as_ref()
+                    .map_or(0, |v| v.data.heap_bytes());
+            }
         }
+        account_map_capacity(before, write_set);
         if !released.is_empty() {
             released.sort_unstable();
             self.parent_store
                 .release_row_claims_batch(&released, self.txn_id);
         }
+        self.release_versions(removed_bytes);
     }
 
     /// Track a claim made directly on the parent VersionStore (not through put()).
@@ -6836,6 +7135,7 @@ impl TransactionVersionStore {
     /// leak because commit() only releases claims found in write_set.
     pub fn track_external_claim(&mut self, row_id: i64) {
         let write_set = self.ensure_write_set();
+        let before = write_set.allocation_bytes();
         // Only add if not already tracked (idempotent).
         // Use empty read_version since this is a cold-only claim — the actual
         // row data lives in cold storage, not in the hot version store.
@@ -6846,6 +7146,7 @@ impl TransactionVersionStore {
                 read_version_seq: 0,
             });
         }
+        account_map_capacity(before, write_set);
     }
 
     /// Release all row claims held by this transaction
@@ -6881,6 +7182,7 @@ impl Drop for TransactionVersionStore {
         if let Some(map) = self.write_set.take() {
             return_write_set_map(map);
         }
+        self.release_versions(self.version_bytes);
     }
 }
 
@@ -6939,6 +7241,238 @@ mod tests {
     /// A visibility checker that does not force snapshot isolation, so the
     /// arena-backed grouped aggregation path is reachable.
     struct ReadCommittedChecker;
+
+    #[test]
+    fn version_payload_charges_follow_history_and_each_captured_root() {
+        let mut store = VersionStore::with_visibility_checker(
+            "payload_history",
+            test_schema(),
+            Arc::new(TestVisibilityChecker::new()),
+        );
+        store.set_max_version_history(2);
+        let add = |txn_id| {
+            store
+                .add_version(
+                    1,
+                    RowVersion::new_with_timestamp(
+                        txn_id,
+                        Row::from(vec![Value::Integer(txn_id)]),
+                        0,
+                    ),
+                )
+                .unwrap();
+        };
+        add(1);
+        let node_bytes = store.versions.read().node_bytes();
+        let link_bytes =
+            2 * std::mem::size_of::<usize>() + std::mem::size_of::<VersionChainEntry>();
+        let first = store.capture_versions();
+        add(2);
+        assert_eq!(store.memory.usage().version_tree, node_bytes + link_bytes);
+        let second = store.capture_versions();
+        add(3);
+        assert_eq!(store.memory.usage().version_tree, node_bytes);
+        assert_eq!(
+            store.memory.usage().pinned_version_tree,
+            node_bytes * 2 + link_bytes
+        );
+        assert_eq!(store.version_payload_footprint(), (32, 96, 0));
+        assert_eq!(first.get(1).unwrap().version.data[0], Value::Integer(1));
+        assert_eq!(second.get(1).unwrap().version.data[0], Value::Integer(2));
+        drop(first);
+        let copy = store.capture_versions();
+        assert_eq!(store.version_payload_footprint(), (32, 96, 0));
+        drop(second);
+        assert_eq!(store.version_payload_footprint(), (32, 32, 0));
+        assert_eq!(store.memory.usage().pinned_version_tree, node_bytes);
+        drop(copy);
+        add(4);
+        assert_eq!(store.version_payload_footprint(), (64, 0, 0));
+        assert_eq!(store.memory.usage().version_tree, node_bytes + link_bytes);
+        assert_eq!(
+            store.cleanup_old_previous_versions_with_retention(std::time::Duration::ZERO),
+            1
+        );
+        assert_eq!(store.version_payload_footprint(), (32, 0, 0));
+        assert_eq!(store.memory.usage().version_tree, node_bytes);
+    }
+
+    #[test]
+    fn captured_payload_account_outlives_the_version_store() {
+        let registry = crate::storage::mvcc::memory::HotMemoryRegistry::default();
+        let store = VersionStore::new("captured_payload_owner", test_schema());
+        registry.register(store.memory_account());
+        store
+            .add_version(1, RowVersion::new(1, Row::from(vec![Value::Integer(7)])))
+            .unwrap();
+        let tree_bytes = store.versions.read().node_bytes();
+        assert!(tree_bytes > 0);
+        assert_eq!(registry.total().version_tree, tree_bytes);
+        let snapshot = store.capture_versions();
+        drop(store);
+        let usage = registry.total();
+        assert_eq!(usage.version_payloads, 0);
+        assert_eq!(usage.pinned_version_payloads, 32);
+        assert_eq!(usage.version_tree, 0);
+        assert_eq!(usage.pinned_version_tree, tree_bytes);
+        assert_eq!(usage.arena_payloads, 0);
+        assert_eq!(usage.arena_capacity, 0);
+        assert_eq!(snapshot.get(1).unwrap().version.data[0], Value::Integer(7));
+        drop(snapshot);
+        assert_eq!(registry.total().pinned_version_payloads, 0);
+        assert_eq!(registry.total().pinned_version_tree, 0);
+    }
+
+    #[test]
+    fn owned_payload_bound_resets_after_cow_and_history_removal() {
+        let mut store = VersionStore::new("owned_payloads", test_schema());
+        store.set_max_version_history(2);
+        let mut wide = Row::with_capacity(64);
+        wide.push(Value::Integer(1));
+        store
+            .add_version(1, RowVersion::new_deleted_with_timestamp(1, wide, 0))
+            .unwrap();
+        let snapshot = store.capture_versions();
+        store
+            .add_version(1, RowVersion::new(2, Row::from(vec![Value::Integer(2)])))
+            .unwrap();
+        assert_eq!(store.version_payload_footprint(), (1056, 1024, 0));
+        assert_eq!(
+            store
+                .versions
+                .read()
+                .get(1)
+                .unwrap()
+                .prev
+                .as_ref()
+                .unwrap()
+                .version
+                .data
+                .owned_capacity(),
+            Some(1),
+            "the canonical clone shrinks while its recorded capacity bound stays conservative"
+        );
+        store
+            .add_version(1, RowVersion::new(3, Row::from(vec![Value::Integer(3)])))
+            .unwrap();
+        assert_eq!(store.version_payload_footprint(), (32, 1024, 0));
+        assert_eq!(store.versions.read().payloads.owned_capacity, 0);
+        let mut small = Row::with_capacity(4);
+        small.push(Value::Integer(4));
+        store
+            .add_version(2, RowVersion::new_deleted_with_timestamp(4, small, 0))
+            .unwrap();
+        assert_eq!(store.version_payload_footprint(), (96, 1024, 0));
+        assert_eq!(store.cleanup_deleted_rows(std::time::Duration::ZERO), 1);
+        assert_eq!(store.version_payload_footprint(), (32, 1024, 0));
+        drop(snapshot);
+        assert_eq!(store.version_payload_footprint(), (32, 0, 0));
+    }
+
+    #[test]
+    fn reinsert_keeps_replaced_arena_payload_charged_until_drop() {
+        let _guard = crate::test_failpoints::FailpointGuard::new();
+        let mut store = VersionStore::new("reinsert_payload_owner", test_schema());
+        store.set_max_version_history(1);
+        store
+            .add_version(1, RowVersion::new(1, Row::from(vec![Value::Integer(7)])))
+            .unwrap();
+        store
+            .add_version(
+                1,
+                RowVersion::new_deleted(2, Row::from(vec![Value::Integer(8)])),
+            )
+            .unwrap();
+        assert_eq!(store.version_payload_footprint(), (16, 0, 0));
+        let account = Arc::clone(store.memory_account());
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_drop = Arc::clone(&observed);
+        crate::test_failpoints::before_hot_owner_drop(move || {
+            let usage = account.usage();
+            assert_eq!(usage.version_payloads, 16);
+            assert_eq!(usage.arena_payloads, 32);
+            assert_eq!(
+                usage.retired_arena_payloads, 32,
+                "the replaced arena payload is still retained"
+            );
+            observed_drop.store(true, Ordering::Relaxed);
+        });
+        store
+            .add_version(1, RowVersion::new(3, Row::from(vec![Value::Integer(9)])))
+            .unwrap();
+        assert!(observed.load(Ordering::Relaxed));
+        assert_eq!(store.version_payload_footprint(), (32, 0, 0));
+    }
+
+    #[test]
+    fn different_deleted_payload_and_truncate_keep_each_owner_charged() {
+        let mut store = VersionStore::new("deleted_payloads", test_schema());
+        store.set_max_version_history(1);
+        let row = Row::from(vec![Value::text("a heap payload retained by the arena")]);
+        let arena_bytes = (row.heap_bytes() + 16) as usize;
+        store.add_version(1, RowVersion::new(1, row)).unwrap();
+        let mut deleted = Row::with_capacity(128);
+        deleted.push(Value::Integer(2));
+        store
+            .add_version(1, RowVersion::new_deleted(2, deleted))
+            .unwrap();
+        assert_eq!(store.version_payload_footprint(), (2048, 0, 0));
+        assert_eq!(store.hot_bytes(), arena_bytes);
+        let tree_bytes = store.versions.read().node_bytes();
+        assert!(tree_bytes > 0);
+        let snapshot = store.capture_versions();
+        let reservation = store.arena.reserve(1).unwrap();
+        assert!(store.truncate_all().is_err());
+        assert_eq!(store.version_payload_footprint(), (2048, 2048, 0));
+        assert_eq!(store.memory.usage().version_tree, tree_bytes);
+        assert_eq!(store.memory.usage().pinned_version_tree, tree_bytes);
+        assert_eq!(store.hot_bytes(), arena_bytes);
+        drop(reservation);
+        let retired = store.truncate_all().unwrap();
+        assert_eq!(store.hot_bytes(), 0);
+        assert_eq!(store.version_payload_footprint(), (0, 4096, arena_bytes));
+        assert_eq!(store.memory.usage().version_tree, 0);
+        assert_eq!(store.memory.usage().pinned_version_tree, tree_bytes * 2);
+        drop(retired);
+        assert_eq!(store.arena.capacity_bytes(), 0);
+        assert_eq!(store.version_payload_footprint(), (0, 2048, 0));
+        assert_eq!(store.memory.usage().pinned_version_tree, tree_bytes);
+        drop(snapshot);
+        assert_eq!(store.version_payload_footprint(), (0, 0, 0));
+        assert_eq!(store.memory.usage().pinned_version_tree, 0);
+    }
+
+    #[test]
+    fn seal_payload_charges_keep_skipped_rows_and_retirement_owners() {
+        let store = VersionStore::with_visibility_checker(
+            "seal_payloads",
+            test_schema(),
+            Arc::new(TestVisibilityChecker::new()),
+        );
+        for id in 1..=3 {
+            store
+                .add_version(id, RowVersion::new(1, Row::from(vec![Value::Integer(id)])))
+                .unwrap();
+        }
+        let snapshot = ExtractionSnapshot {
+            inner: store.capture_versions(),
+        };
+        store
+            .add_version(2, RowVersion::new(2, Row::from(vec![Value::Integer(20)])))
+            .unwrap();
+        store.try_claim_row(3, 99).unwrap();
+        let mut retired = store.prepare_arena_retirement(3);
+        let (removed, _, skipped) = store.remove_sealed_rows(&[1, 2, 3], &snapshot, &mut retired);
+        assert_eq!(removed, 1);
+        assert_eq!(skipped, vec![2, 3]);
+        assert_eq!(store.hot_bytes(), 64);
+        assert_eq!(store.version_payload_footprint(), (96, 96, 32));
+        drop(snapshot);
+        assert_eq!(store.version_payload_footprint(), (96, 0, 32));
+        drop(retired);
+        assert_eq!(store.version_payload_footprint(), (96, 0, 0));
+        store.release_row_claim(3, 99);
+    }
 
     impl VisibilityChecker for ReadCommittedChecker {
         fn is_visible(&self, version_txn_id: i64, viewing_txn_id: i64) -> bool {
@@ -7061,7 +7595,7 @@ mod tests {
         let row = Row::from(vec![Value::from(42)]);
         let version = RowVersion::new(1, row);
 
-        store.add_version(100, version);
+        store.add_version(100, version).unwrap();
 
         // Transaction 2 should see version from transaction 1
         let visible = store.get_visible_version(100, 2);
@@ -7078,7 +7612,7 @@ mod tests {
         // Add version from transaction 5
         let row = Row::from(vec![Value::from(42)]);
         let version = RowVersion::new(5, row);
-        store.add_version(100, version);
+        store.add_version(100, version).unwrap();
 
         // Transaction 3 should NOT see version from transaction 5
         let visible = store.get_visible_version(100, 3);
@@ -7102,11 +7636,11 @@ mod tests {
         // Add version from transaction 1
         let row = Row::from(vec![Value::from(42)]);
         let version = RowVersion::new(1, row.clone());
-        store.add_version(100, version);
+        store.add_version(100, version).unwrap();
 
         // Delete in transaction 2
         let deleted_version = RowVersion::new_deleted(2, row);
-        store.add_version(100, deleted_version);
+        store.add_version(100, deleted_version).unwrap();
 
         // Transaction 1 should still see the row (delete not visible)
         let visible = store.get_visible_version(100, 1);
@@ -7122,9 +7656,13 @@ mod tests {
         let store = VersionStore::new("test_table".to_string(), test_schema());
 
         let row = Row::from(vec![Value::from(1)]);
-        store.add_version(100, RowVersion::new(1, row.clone()));
-        store.add_version(200, RowVersion::new(1, row.clone()));
-        store.add_version(300, RowVersion::new(1, row));
+        store
+            .add_version(100, RowVersion::new(1, row.clone()))
+            .unwrap();
+        store
+            .add_version(200, RowVersion::new(1, row.clone()))
+            .unwrap();
+        store.add_version(300, RowVersion::new(1, row)).unwrap();
 
         let row_ids = store.get_all_row_ids();
         assert_eq!(row_ids.len(), 3);
@@ -7143,7 +7681,7 @@ mod tests {
 
         // Operations should be no-ops when closed
         let row = Row::from(vec![Value::from(1)]);
-        store.add_version(100, RowVersion::new(1, row));
+        store.add_version(100, RowVersion::new(1, row)).unwrap();
         assert_eq!(store.row_count(), 0);
     }
 
@@ -7166,6 +7704,238 @@ mod tests {
         assert!(tvs.has_locally_seen(100));
         let got = tvs.get(100);
         assert!(got.is_some());
+    }
+
+    fn retained_transaction_versions(store: &TransactionVersionStore) -> u128 {
+        let local: u128 = store
+            .local_versions
+            .iter()
+            .flat_map(|m| m.values())
+            .map(|history| {
+                let payloads: u128 = history.iter().map(|v| v.data.heap_bytes()).sum();
+                payloads
+                    + if history.spilled() {
+                        (history.capacity() * std::mem::size_of::<RowVersion>()) as u128
+                    } else {
+                        0
+                    }
+            })
+            .sum();
+        let originals: u128 = store
+            .write_set
+            .iter()
+            .flat_map(|m| m.values())
+            .filter_map(|entry| entry.read_version.as_ref())
+            .map(|v| v.data.heap_bytes())
+            .sum();
+        local + originals
+    }
+
+    #[test]
+    fn transaction_version_charges_cover_each_put_path() {
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "transaction_versions",
+            test_schema(),
+            Arc::new(TestVisibilityChecker::new()),
+        ));
+        for id in 1..=5 {
+            store
+                .add_version(id, RowVersion::new(1, Row::from(vec![Value::Integer(id)])))
+                .unwrap();
+        }
+        let row = || Row::from(vec![Value::text("a retained transaction payload")]);
+        let original = |id| store.get_visible_version(id, 10).unwrap();
+        let mut local = TransactionVersionStore::new(Arc::clone(&store), 10);
+        local.put(1, row(), false).unwrap();
+        local
+            .put_with_original(2, row(), original(2), false)
+            .unwrap();
+        local
+            .put_batch_with_originals(vec![(3, row(), original(3)), (3, row(), original(3))])
+            .unwrap();
+        let mut wide = Row::with_capacity(64);
+        wide.push(Value::Integer(4));
+        local
+            .put_batch_deleted(RowVec::from_vec(vec![(4, wide), (4, row())]))
+            .unwrap();
+        local
+            .put_batch_deleted_with_originals(vec![
+                (5, row(), original(5)),
+                (5, row(), original(5)),
+            ])
+            .unwrap();
+        let bytes = retained_transaction_versions(&local);
+        assert!(bytes > 64 * std::mem::size_of::<Value>() as u128);
+        assert_eq!(local.version_bytes, bytes);
+        assert_eq!(store.memory.usage().transaction_versions as u128, bytes);
+        local.rollback();
+        assert_eq!(store.memory.usage().transaction_versions as u128, bytes);
+        drop(local);
+        assert_eq!(store.memory.usage().transaction_versions, 0);
+    }
+
+    #[test]
+    fn transaction_version_charges_keep_failed_claim_original() {
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "failed_claim_versions",
+            test_schema(),
+            Arc::new(TestVisibilityChecker::new()),
+        ));
+        store
+            .add_version(1, RowVersion::new(1, Row::from(vec![Value::Integer(7)])))
+            .unwrap();
+        store.try_claim_row(1, 2).unwrap();
+        let mut local = TransactionVersionStore::new(Arc::clone(&store), 3);
+        assert!(local
+            .put(1, Row::from(vec![Value::Integer(8)]), false)
+            .is_err());
+        assert!(!local.has_local_changes());
+        assert_eq!(store.memory.usage().transaction_versions, 32);
+        assert_eq!(retained_transaction_versions(&local), 32);
+        local.rollback_to_timestamp(i64::MIN);
+        assert_eq!(store.memory.usage().transaction_versions, 0);
+        store.release_row_claim(1, 2);
+    }
+
+    #[test]
+    fn transaction_version_charges_keep_spill_capacity_after_savepoint() {
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "savepoint_versions",
+            test_schema(),
+            Arc::new(TestVisibilityChecker::new()),
+        ));
+        let mut local = TransactionVersionStore::new(Arc::clone(&store), 1);
+        local
+            .put(1, Row::from(vec![Value::Integer(0)]), false)
+            .unwrap();
+        let timestamp = local.get_latest_local(1).unwrap().create_time;
+        for value in 1..9 {
+            local
+                .put(1, Row::from(vec![Value::Integer(value)]), false)
+                .unwrap();
+        }
+        let capacity = local
+            .local_versions
+            .as_ref()
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .capacity();
+        local.rollback_to_timestamp(timestamp);
+        let history = local.local_versions.as_ref().unwrap().get(1).unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(history.spilled());
+        assert_eq!(history.capacity(), capacity);
+        assert_eq!(local.version_bytes, retained_transaction_versions(&local));
+        assert_eq!(
+            store.memory.usage().transaction_versions,
+            32 + capacity * std::mem::size_of::<RowVersion>()
+        );
+        local.rollback_to_timestamp(i64::MIN);
+        assert_eq!(store.memory.usage().transaction_versions, 0);
+    }
+
+    #[test]
+    fn transaction_version_charges_follow_commit_success_and_failure() {
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "commit_versions",
+            test_schema(),
+            Arc::new(TestVisibilityChecker::new()),
+        ));
+        let mut first = TransactionVersionStore::new(Arc::clone(&store), 1);
+        first
+            .put(1, Row::from(vec![Value::Integer(7)]), false)
+            .unwrap();
+        let mut second = TransactionVersionStore::new(Arc::clone(&store), 2);
+        second
+            .put(1, Row::from(vec![Value::Integer(8)]), false)
+            .unwrap();
+        assert_eq!(store.memory.usage().transaction_versions, 64);
+        first.commit().unwrap();
+        assert_eq!(store.memory.usage().transaction_versions, 32);
+        assert!(second.commit().is_err());
+        assert_eq!(store.memory.usage().transaction_versions, 32);
+        assert_eq!(retained_transaction_versions(&second), 32);
+        drop(second);
+        assert_eq!(store.memory.usage().transaction_versions, 0);
+        assert_eq!(store.memory.usage().version_payloads, 32);
+    }
+
+    #[test]
+    fn index_undo_charges_survive_transaction_and_table_owners() {
+        for row_count in [1, 2] {
+            let registry = crate::storage::mvcc::memory::HotMemoryRegistry::default();
+            let schema = crate::core::SchemaBuilder::new("undo_memory")
+                .column("id", DataType::Integer, false, true)
+                .column("key", DataType::Text, true, false)
+                .build();
+            let mut store = VersionStore::with_visibility_checker(
+                "undo_memory",
+                schema,
+                Arc::new(TestVisibilityChecker::new()),
+            );
+            store.set_max_version_history(1);
+            let store = Arc::new(store);
+            registry.register(store.memory_account());
+            store.add_index(
+                "key".to_string(),
+                Arc::new(crate::storage::index::HashIndex::new(
+                    "key".to_string(),
+                    "undo_memory".to_string(),
+                    vec!["key".to_string()],
+                    vec![1],
+                    vec![DataType::Text],
+                    false,
+                    0,
+                )),
+            );
+            let mut first = TransactionVersionStore::new(Arc::clone(&store), 1);
+            for id in 1..=row_count {
+                first
+                    .put(
+                        id,
+                        Row::from(vec![
+                            Value::Integer(id),
+                            Value::text("an old heap key retained for index undo"),
+                        ]),
+                        false,
+                    )
+                    .unwrap();
+            }
+            first.commit().unwrap();
+            drop(first);
+            assert_eq!(registry.total().transaction_undo, 0);
+            let mut second = TransactionVersionStore::new(Arc::clone(&store), 2);
+            for id in 1..=row_count {
+                second
+                    .put(
+                        id,
+                        Row::from(vec![Value::Integer(id), Value::text("new")]),
+                        false,
+                    )
+                    .unwrap();
+            }
+            second.commit().unwrap();
+            assert_eq!(registry.total().transaction_versions, 0);
+            let undo = std::mem::take(&mut *second.index_undo.lock());
+            let removed_keys = undo
+                .entries
+                .iter()
+                .flat_map(|entry| &entry.removed)
+                .flat_map(|(_, values)| values)
+                .map(|value| value.heap_bytes() as u128)
+                .sum::<u128>();
+            assert!(removed_keys > 0);
+            let bytes = undo.entries.capacity() as u128 * std::mem::size_of::<IndexUndo>() as u128
+                + undo.entries.iter().map(IndexUndo::heap_bytes).sum::<u128>();
+            assert!(bytes > removed_keys);
+            assert_eq!(registry.total().transaction_undo as u128, bytes);
+            drop(second);
+            drop(store);
+            assert_eq!(registry.total().transaction_undo as u128, bytes);
+            drop(undo);
+            assert_eq!(registry.total().transaction_undo, 0);
+        }
     }
 
     #[test]
@@ -7239,7 +8009,7 @@ mod tests {
         for txn_id in 1..=5 {
             let row = Row::from(vec![Value::from(txn_id)]);
             let version = RowVersion::new(txn_id, row);
-            store.add_version(row_id, version);
+            store.add_version(row_id, version).unwrap();
         }
 
         // After 5 versions with limit 3:
@@ -7275,7 +8045,7 @@ mod tests {
         for txn_id in 1..=20 {
             let row = Row::from(vec![Value::from(txn_id)]);
             let version = RowVersion::new(txn_id, row);
-            store.add_version(row_id, version);
+            store.add_version(row_id, version).unwrap();
         }
 
         // Verify chain is bounded (between 2 and limit+1)
@@ -7312,7 +8082,7 @@ mod tests {
         for txn_id in 1..=15 {
             let row = Row::from(vec![Value::from(txn_id)]);
             let version = RowVersion::new(txn_id, row);
-            store.add_version(row_id, version);
+            store.add_version(row_id, version).unwrap();
         }
 
         // Count chain length - should be 15 (unlimited)
@@ -7344,7 +8114,7 @@ mod tests {
         for txn_id in 1..=3 {
             let row = Row::from(vec![Value::from(txn_id)]);
             let version = RowVersion::new(txn_id, row);
-            store.add_version(row_id, version);
+            store.add_version(row_id, version).unwrap();
         }
 
         // Now add more via batch - each will trigger drop when exceeding limit
@@ -7355,7 +8125,8 @@ mod tests {
             })
             .collect();
 
-        store.add_versions_batch(batch);
+        let mut reservation = store.arena.reserve_existing();
+        store.install_versions(&mut reservation, batch);
 
         // Verify chain is bounded (at most limit+1)
         // Chain can be as short as 1 right after pruning (when new_depth > limit)
@@ -7484,7 +8255,7 @@ mod tests {
         // Add a row
         let row = Row::from(vec![Value::from(42)]);
         let version = RowVersion::new(1, row);
-        store.add_version(100, version);
+        store.add_version(100, version).unwrap();
 
         // Row exists
         assert!(store.quick_check_row_existence(100));
@@ -7501,7 +8272,7 @@ mod tests {
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i * 10)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         // Batch query
@@ -7521,7 +8292,7 @@ mod tests {
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         let count = store.count_visible_versions_batch(&[1, 2, 3, 99, 100], 2);
@@ -7540,7 +8311,7 @@ mod tests {
         for i in 1..=10 {
             let row = Row::from(vec![Value::from(i)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         assert_eq!(store.count_visible_rows(2), 10);
@@ -7555,10 +8326,10 @@ mod tests {
         // Add a row
         let row = Row::from(vec![Value::from(42)]);
         let version = RowVersion::new(1, row);
-        store.add_version(100, version);
+        store.add_version(100, version).unwrap();
 
         // Mark it deleted
-        store.mark_deleted(100, 2);
+        store.mark_deleted(100, 2).unwrap();
 
         // Transaction 1 should still see it
         assert!(store.get_visible_version(100, 1).is_some());
@@ -7567,7 +8338,7 @@ mod tests {
         assert!(store.get_visible_version(100, 3).is_none());
 
         // Mark non-existent row as deleted (no-op)
-        store.mark_deleted(999, 2);
+        store.mark_deleted(999, 2).unwrap();
     }
 
     #[test]
@@ -7580,7 +8351,7 @@ mod tests {
         for i in 1..=20 {
             let row = Row::from(vec![Value::from(i)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         // Get with limit (txn_id, limit, offset)
@@ -7601,12 +8372,12 @@ mod tests {
         // Add version from transaction 5
         let row = Row::from(vec![Value::from(100)]);
         let version = RowVersion::new(5, row);
-        store.add_version(1, version);
+        store.add_version(1, version).unwrap();
 
         // Add updated version from transaction 10
         let row2 = Row::from(vec![Value::from(200)]);
         let version2 = RowVersion::new(10, row2);
-        store.add_version(1, version2);
+        store.add_version(1, version2).unwrap();
 
         // AS OF transaction 7 should see the first version
         let result = store.get_visible_version_as_of_transaction(1, 7);
@@ -7638,12 +8409,12 @@ mod tests {
         // Add version with specific timestamp
         let row = Row::from(vec![Value::from(100)]);
         let version = RowVersion::new_with_timestamp(1, row, 1000);
-        store.add_version(1, version);
+        store.add_version(1, version).unwrap();
 
         // Add version with later timestamp
         let row2 = Row::from(vec![Value::from(200)]);
         let version2 = RowVersion::new_with_timestamp(2, row2, 2000);
-        store.add_version(1, version2);
+        store.add_version(1, version2).unwrap();
 
         // AS OF timestamp 1500 should see first version
         let result = store.get_visible_version_as_of_timestamp(1, 1500);
@@ -7670,7 +8441,7 @@ mod tests {
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i * 10)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         let (sum, count) = store.sum_column(2, 0);
@@ -7689,7 +8460,7 @@ mod tests {
         for (i, v) in values.iter().enumerate() {
             let row = Row::from(vec![Value::from(*v)]);
             let version = RowVersion::new(1, row);
-            store.add_version((i + 1) as i64, version);
+            store.add_version((i + 1) as i64, version).unwrap();
         }
 
         let (sum, count) = store.sum_column(2, 0);
@@ -7707,7 +8478,7 @@ mod tests {
         for i in [30, 10, 50, 20, 40] {
             let row = Row::from(vec![Value::from(i)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         let min = store.min_column(2, 0);
@@ -7738,7 +8509,7 @@ mod tests {
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i * 10)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         // Compute multiple aggregates at once
@@ -7806,6 +8577,39 @@ mod tests {
     }
 
     #[test]
+    fn claim_capacity_follows_growth_shrink_and_store_destruction() {
+        let store = VersionStore::new("claims", test_schema());
+        let account = Arc::clone(store.memory_account());
+        let check = || {
+            assert_eq!(
+                account.usage().row_claims,
+                store.uncommitted_writes.read().allocation_bytes()
+            );
+        };
+        check();
+        let initial = account.usage().row_claims;
+        for id in 0..1024 {
+            store.try_claim_row(id, 1).unwrap();
+        }
+        check();
+        assert!(account.usage().row_claims > initial);
+        assert!(store.try_claim_row(0, 2).is_err());
+        store.release_row_claim(0, 2);
+        check();
+        store.release_row_claim(0, 1);
+        check();
+        store.release_row_claims_batch(&(1..1024).collect::<Vec<_>>(), 1);
+        check();
+        let empty_capacity = account.usage().row_claims;
+        assert!(empty_capacity >= initial);
+        drop(store.truncate_all().unwrap());
+        check();
+        assert_eq!(account.usage().row_claims, empty_capacity);
+        drop(store);
+        assert_eq!(account.usage().row_claims, 0);
+    }
+
+    #[test]
     fn test_version_store_index_operations() {
         use crate::core::types::DataType;
         use crate::storage::index::HashIndex;
@@ -7863,7 +8667,7 @@ mod tests {
         // Apply a recovered version
         let row = Row::from(vec![Value::from(42)]);
         let version = RowVersion::new(1, row);
-        store.apply_recovered_version(100, version);
+        store.apply_recovered_version(100, version).unwrap();
 
         assert_eq!(store.row_count(), 1);
         assert!(store.quick_check_row_existence(100));
@@ -7896,7 +8700,7 @@ mod tests {
         // Verify it works with the new checker
         let row = Row::from(vec![Value::from(42)]);
         let version = RowVersion::new(1, row);
-        store.add_version(100, version);
+        store.add_version(100, version).unwrap();
 
         let visible = store.get_visible_version(100, 2);
         assert!(visible.is_some());
@@ -7914,7 +8718,7 @@ mod tests {
         // Add a row first
         let row = Row::from(vec![Value::from(42)]);
         let version = RowVersion::new(1, row);
-        store.add_version(100, version);
+        store.add_version(100, version).unwrap();
 
         // Start a new transaction and update
         let mut tvs = TransactionVersionStore::new(Arc::clone(&store), 2);
@@ -7950,7 +8754,7 @@ mod tests {
         // Add a row first
         let row = Row::from(vec![Value::from(42)]);
         let version = RowVersion::new(1, row);
-        store.add_version(100, version);
+        store.add_version(100, version).unwrap();
 
         // Start a new transaction and delete
         let mut tvs = TransactionVersionStore::new(Arc::clone(&store), 2);
@@ -7981,7 +8785,7 @@ mod tests {
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i * 10)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         let rows = store.get_all_visible_rows(2);
@@ -8010,7 +8814,7 @@ mod tests {
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         let row_ids = store.get_all_visible_row_ids(2);
@@ -8029,7 +8833,7 @@ mod tests {
         for i in [5, 3, 1, 4, 2] {
             let row = Row::from(vec![Value::from(i * 10)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         // Get rows in ascending PK order
@@ -8078,7 +8882,7 @@ mod tests {
         for i in 1..=10 {
             let row = Row::from(vec![Value::from(i)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         assert_eq!(store.count_visible(2), 10);
@@ -8098,7 +8902,7 @@ mod tests {
         for i in 1..=10 {
             let row = Row::from(vec![Value::from(i)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         // Delete all rows in transaction 2
@@ -8106,7 +8910,7 @@ mod tests {
             let row = Row::from(vec![Value::from(i)]);
             let mut version = RowVersion::new(1, row);
             version.deleted_at_txn_id = 2;
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         // Cleanup with 0 retention (immediate)
@@ -8132,11 +8936,11 @@ mod tests {
         // Add and delete a row
         let row = Row::from(vec![Value::from(1)]);
         let version = RowVersion::new(1, row.clone());
-        store.add_version(1, version);
+        store.add_version(1, version).unwrap();
 
         let mut deleted_version = RowVersion::new(1, row);
         deleted_version.deleted_at_txn_id = 2;
-        store.add_version(1, deleted_version);
+        store.add_version(1, deleted_version).unwrap();
 
         // Cleanup with very long retention - should not clean
         let cleaned = store.cleanup_deleted_rows(std::time::Duration::from_secs(3600));
@@ -8160,7 +8964,7 @@ mod tests {
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i)]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         // Delete rows 1, 3, 5
@@ -8168,7 +8972,7 @@ mod tests {
             let row = Row::from(vec![Value::from(i)]);
             let mut version = RowVersion::new(1, row);
             version.deleted_at_txn_id = 2;
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         // Cleanup
@@ -8192,11 +8996,11 @@ mod tests {
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i), Value::text(format!("data_{}", i))]);
             let version = RowVersion::new(1, row);
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         // Record initial arena length
-        let initial_arena_len = store.arena.len();
+        let initial_arena_len = store.arena.slot_count();
         assert_eq!(initial_arena_len, 5);
 
         // Delete all rows
@@ -8204,26 +9008,16 @@ mod tests {
             let row = Row::from(vec![Value::from(i), Value::text(format!("data_{}", i))]);
             let mut version = RowVersion::new(1, row);
             version.deleted_at_txn_id = 2;
-            store.add_version(i, version);
+            store.add_version(i, version).unwrap();
         }
 
         // Cleanup
         let cleaned = store.cleanup_deleted_rows(std::time::Duration::from_secs(0));
         assert_eq!(cleaned, 5);
 
-        // Arena slots should be cleared (data replaced with empty)
-        // The slots remain but data is released
         let guard = store.arena.read_guard();
-        for i in 0..5 {
-            // Cleared slots have row_id = 0
-            assert_eq!(guard.meta()[i].row_id, 0, "Slot {} should be cleared", i);
-            // Data should be empty
-            assert!(
-                guard.data()[i].is_empty(),
-                "Slot {} data should be empty",
-                i
-            );
-        }
+        assert!(guard.is_empty());
+        assert_eq!(guard.rows().count(), 0);
     }
 
     #[test]
@@ -8238,13 +9032,13 @@ mod tests {
         // Tx 1: insert row_id=100
         let row = Row::from(vec![Value::from(42)]);
         let version = RowVersion::new(1, row);
-        store.add_version(100, version);
+        store.add_version(100, version).unwrap();
 
         // Tx 2: delete row_id=100
         let row = Row::from(vec![Value::from(42)]);
         let mut deleted = RowVersion::new(1, row);
         deleted.deleted_at_txn_id = 2;
-        store.add_version(100, deleted);
+        store.add_version(100, deleted).unwrap();
 
         // Simulate the cleanup's first pass: snapshot and identify row for deletion
         assert!(store.versions.read().get(100).unwrap().version.is_deleted());
@@ -8252,7 +9046,7 @@ mod tests {
         // Now, BEFORE cleanup's removal pass, tx 3 re-inserts a live version at row_id=100
         let row = Row::from(vec![Value::from(99)]);
         let live_version = RowVersion::new(3, row);
-        store.add_version(100, live_version);
+        store.add_version(100, live_version).unwrap();
 
         // The row should now be live (not deleted)
         assert!(!store.versions.read().get(100).unwrap().version.is_deleted());
@@ -8284,19 +9078,19 @@ mod tests {
         // Insert and delete rows 1..=4
         for i in 1..=4 {
             let row = Row::from(vec![Value::from(i)]);
-            store.add_version(i, RowVersion::new(1, row));
+            store.add_version(i, RowVersion::new(1, row)).unwrap();
         }
         for i in 1..=4 {
             let row = Row::from(vec![Value::from(i)]);
             let mut del = RowVersion::new(1, row);
             del.deleted_at_txn_id = 2;
-            store.add_version(i, del);
+            store.add_version(i, del).unwrap();
         }
 
         // Re-insert rows 2 and 4 with new values (simulating concurrent commit)
         for &i in &[2, 4] {
             let row = Row::from(vec![Value::from(i * 100)]);
-            store.add_version(i, RowVersion::new(3, row));
+            store.add_version(i, RowVersion::new(3, row)).unwrap();
         }
 
         // Cleanup should only remove rows 1 and 3 (still deleted)
@@ -8328,14 +9122,16 @@ mod tests {
 
         // Tx 1: insert row_id=1 with value=100, row_id=2 with value=200
         let row1 = Row::from(vec![Value::from(100)]);
-        store.add_version(1, RowVersion::new(1, row1));
+        store.add_version(1, RowVersion::new(1, row1)).unwrap();
         let row2 = Row::from(vec![Value::from(200)]);
-        store.add_version(2, RowVersion::new(1, row2));
+        store.add_version(2, RowVersion::new(1, row2)).unwrap();
 
         // Tx 3: update row_id=1 with new value=999
         // This creates a version chain: HEAD(txn=3, val=999) -> prev(txn=1, val=100)
         let updated_row = Row::from(vec![Value::from(999)]);
-        store.add_version(1, RowVersion::new(3, updated_row));
+        store
+            .add_version(1, RowVersion::new(3, updated_row))
+            .unwrap();
 
         // Viewer txn_id=2: sees txn<=2, so sees txn=1 but NOT txn=3
         // Expected: row_id=1 should have value=100, row_id=2 should have value=200
@@ -8363,43 +9159,6 @@ mod tests {
             Some(&Value::from(100)),
             "Descending: row_id=1 should have original value 100, not updated 999"
         );
-    }
-
-    #[test]
-    fn test_pack_arena_idx_no_overflow() {
-        // Verify that NonZeroU64 handles all valid indices correctly without overflow
-
-        // Case 1: Small index
-        let small = 100usize;
-        let packed = pack_arena_idx(small);
-        assert!(packed.is_some());
-        assert_eq!(unpack_arena_idx(packed), Some(small));
-
-        // Case 2: Max u32 value (previously caused issues with NonZeroU32)
-        let max_u32 = u32::MAX as usize;
-        let packed_u32 = pack_arena_idx(max_u32);
-        assert!(packed_u32.is_some());
-        assert_eq!(unpack_arena_idx(packed_u32), Some(max_u32));
-
-        // Case 3: Beyond u32::MAX (previously caused corruption with NonZeroU32)
-        let beyond_u32 = u32::MAX as usize + 1;
-        let packed_beyond = pack_arena_idx(beyond_u32);
-        assert!(packed_beyond.is_some());
-        assert_eq!(unpack_arena_idx(packed_beyond), Some(beyond_u32)); // Now correct!
-
-        // Case 4: Large index (5 billion - would have corrupted with u32)
-        let large = 5_000_000_000usize;
-        let packed_large = pack_arena_idx(large);
-        assert!(packed_large.is_some());
-        assert_eq!(unpack_arena_idx(packed_large), Some(large)); // Now correct!
-
-        // Case 5: Zero index
-        let zero = 0usize;
-        let packed_zero = pack_arena_idx(zero);
-        assert!(packed_zero.is_some());
-        assert_eq!(unpack_arena_idx(packed_zero), Some(zero));
-
-        assert_eq!(unpack_arena_idx(None), None);
     }
 
     #[test]
@@ -8557,7 +9316,7 @@ mod tests {
         // Setup: 10 committed rows
         for i in 1..=10 {
             let row = Row::from(vec![Value::from(i)]);
-            store.add_version(i, RowVersion::new(1, row));
+            store.add_version(i, RowVersion::new(1, row)).unwrap();
         }
         assert_eq!(store.committed_row_count.load(Ordering::Relaxed), 10);
 
@@ -8584,7 +9343,7 @@ mod tests {
         // Release the claim, then truncate should succeed
         store.release_row_claim(5, 99);
         let count = store.truncate_all().expect("truncate should succeed now");
-        assert_eq!(count, 10);
+        assert_eq!(count.rows_affected, 10);
         assert!(store.versions.read().is_empty());
         assert!(store.uncommitted_writes.read().is_empty());
 
@@ -8592,7 +9351,7 @@ mod tests {
         // Insert fresh data for next round
         for i in 1..=5 {
             let row = Row::from(vec![Value::from(i)]);
-            store.add_version(i, RowVersion::new(1, row));
+            store.add_version(i, RowVersion::new(1, row)).unwrap();
         }
         // Force committed_row_count to reflect the 5 rows
         store.committed_row_count.store(5, Ordering::Relaxed);

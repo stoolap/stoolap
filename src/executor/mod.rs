@@ -355,7 +355,9 @@ impl Executor {
         }
 
         // Try compiled fast paths based on statement type
-        match cached.statement.as_ref() {
+        let scope = crate::storage::mvcc::read_memory::current_scope().unwrap_or_default();
+        let _active = scope.enter();
+        let result = match cached.statement.as_ref() {
             Statement::Select(stmt) => {
                 self.try_fast_pk_lookup_with_params(stmt, params, &cached.compiled)
             }
@@ -366,7 +368,8 @@ impl Executor {
                 self.try_fast_pk_delete_with_params(stmt, params, &cached.compiled)
             }
             _ => None,
-        }
+        };
+        result.map(|result| result.map(|result| result::retain_read_scope(result, scope)))
     }
 
     /// Execute a SQL query with named parameters
@@ -398,6 +401,14 @@ impl Executor {
     /// If found, it uses the cached AST. Otherwise, it parses the query
     /// and caches the result for future use.
     fn execute_cached(&self, sql: &str, ctx: &ExecutionContext) -> Result<Box<dyn QueryResult>> {
+        result::with_read_scope(|| self.execute_cached_scoped(sql, ctx))
+    }
+
+    fn execute_cached_scoped(
+        &self,
+        sql: &str,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
         // Try to get from cache
         if let Some(cached) = self.query_cache.get(sql) {
             // Validate parameter count if query has parameters
@@ -597,7 +608,9 @@ impl Executor {
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        self.execute_statement_inner(statement, ctx, self.active_txn_id(), None)
+        result::with_read_scope(|| {
+            self.execute_statement_inner(statement, ctx, self.active_txn_id(), None)
+        })
     }
 
     /// Execute a single statement with pre-captured transaction state.
@@ -749,6 +762,14 @@ impl Executor {
     /// here on every execution, avoiding normalize + hash + RwLock read
     /// per call.
     pub fn execute_with_cached_plan(
+        &self,
+        plan: &CachedPlanRef,
+        ctx: &ExecutionContext,
+    ) -> Result<Box<dyn QueryResult>> {
+        result::with_read_scope(|| self.execute_cached_plan_scoped(plan, ctx))
+    }
+
+    fn execute_cached_plan_scoped(
         &self,
         plan: &CachedPlanRef,
         ctx: &ExecutionContext,

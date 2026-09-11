@@ -255,6 +255,7 @@ impl Executor {
                 let col = &schema.columns[i];
                 // Use pre-computed default value if available, otherwise use NULL
                 if let Some(ref default_val) = col.default_value {
+                    crate::storage::mvcc::read_memory::charge_value_export(default_val);
                     row.push(default_val.clone());
                 } else {
                     row.push(Value::null(col.data_type));

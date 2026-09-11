@@ -189,6 +189,20 @@ impl Value {
     // Type accessors
     // =========================================================================
 
+    /// Requested heap bytes, counting shared text and extensions per owner.
+    #[inline]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        match self {
+            Value::Text(text) if text.is_heap() => {
+                2 * std::mem::size_of::<usize>()
+                    + std::mem::size_of::<String>()
+                    + text.heap_capacity()
+            }
+            Value::Extension(bytes) => 2 * std::mem::size_of::<usize>() + bytes.len(),
+            _ => 0,
+        }
+    }
+
     /// Returns the data type of this value
     pub fn data_type(&self) -> DataType {
         match self {

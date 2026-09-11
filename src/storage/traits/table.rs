@@ -20,7 +20,7 @@ use std::fmt;
 
 use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, Value};
 use crate::storage::expression::Expression;
-use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
+use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult, TruncateResult};
 use crate::storage::traits::{Index, QueryResult, Scanner};
 
 /// Describes the access method that will be used for a table scan
@@ -423,8 +423,8 @@ pub trait Table: Send + Sync {
     /// Truncates the table, removing all rows efficiently.
     /// Unlike DELETE, this drops storage directly instead of creating delete versions.
     /// Default implementation falls back to delete(None).
-    fn truncate(&mut self) -> Result<i32> {
-        self.delete(None)
+    fn truncate(&mut self) -> Result<TruncateResult> {
+        self.delete(None).map(TruncateResult::from)
     }
 
     /// Scans the table and returns a scanner over matching rows

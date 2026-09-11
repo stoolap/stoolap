@@ -16,7 +16,7 @@
 //! Flags and hooks are enabled by unit tests or the `test-failpoints` feature.
 //! Normal builds without that feature compile out the failpoints and their calls.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, MutexGuard};
 
@@ -45,6 +45,52 @@ static FAILPOINT_LOCK: Mutex<()> = Mutex::new(());
 
 thread_local! {
     static VERSION_ROOT_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static COMMIT_PREPARED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static HOT_OWNER_DROP_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static ARENA_GROWTH_REMAINING: Cell<Option<usize>> = const { Cell::new(None) };
+}
+
+/// Run once on this thread after all commit capacity is prepared, before publication.
+pub fn after_commit_preparation(hook: impl FnOnce() + 'static) {
+    COMMIT_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn commit_capacity_prepared() {
+    let hook = COMMIT_PREPARED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread before retained hot storage begins destruction.
+pub fn before_hot_owner_drop(hook: impl FnOnce() + 'static) {
+    HOT_OWNER_DROP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn hot_owner_dropping() {
+    let hook = HOT_OWNER_DROP_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Fail one arena growth after this many successful growth preparations on this thread.
+pub fn fail_arena_growth_after(successes: usize) {
+    ARENA_GROWTH_REMAINING.with(|remaining| remaining.set(Some(successes)));
+}
+
+pub(crate) fn arena_growth_fails() -> bool {
+    ARENA_GROWTH_REMAINING.with(|remaining| match remaining.get() {
+        Some(0) => {
+            remaining.set(None);
+            true
+        }
+        Some(count) => {
+            remaining.set(Some(count - 1));
+            false
+        }
+        None => false,
+    })
 }
 
 /// Run once on this thread immediately after its next version root is copied.
@@ -69,6 +115,9 @@ pub fn reset_all() {
     SNAPSHOT_RENAME_FAIL.store(false, Release);
     CHECKPOINT_WRITE_FAIL.store(false, Release);
     VERSION_ROOT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    COMMIT_PREPARED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    HOT_OWNER_DROP_HOOK.with(|slot| *slot.borrow_mut() = None);
+    ARENA_GROWTH_REMAINING.with(|remaining| remaining.set(None));
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.

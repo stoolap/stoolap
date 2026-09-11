@@ -100,6 +100,7 @@ use crate::parser::ast::{Expression, InfixOperator};
 
 use super::expression::ExpressionEval;
 use super::utils::{expressions_equivalent, extract_and_conditions, extract_column_name};
+use crate::storage::mvcc::read_memory::SharedPayloadCharge;
 
 /// Maximum number of cached query results per table+column combination.
 ///
@@ -185,6 +186,7 @@ pub struct CachedResult {
     pub last_accessed: Instant,
     /// Access count
     pub access_count: u64,
+    payload: std::sync::Arc<SharedPayloadCharge>,
 }
 
 impl CachedResult {
@@ -195,16 +197,7 @@ impl CachedResult {
         rows: Vec<Row>,
         predicate: Option<Expression>,
     ) -> Self {
-        let now = Instant::now();
-        Self {
-            fingerprint,
-            column_names,
-            rows: CompactArc::new(rows), // Wrap in CompactArc for zero-copy sharing
-            predicate,
-            cached_at: now,
-            last_accessed: now,
-            access_count: 1,
-        }
+        Self::new_with_arc(fingerprint, column_names, CompactArc::new(rows), predicate)
     }
 
     /// Create a new cached result with pre-wrapped Arc (avoids clone)
@@ -218,6 +211,7 @@ impl CachedResult {
         predicate: Option<Expression>,
     ) -> Self {
         let now = Instant::now();
+        let payload = SharedPayloadCharge::new(rows.iter().map(Row::heap_bytes).sum());
         Self {
             fingerprint,
             column_names,
@@ -226,6 +220,7 @@ impl CachedResult {
             cached_at: now,
             last_accessed: now,
             access_count: 1,
+            payload,
         }
     }
 
@@ -433,7 +428,12 @@ impl SemanticCache {
                     SubsumptionResult::Identical => {
                         let rows = entry.rows.clone();
                         let hash = entry.fingerprint.predicate_structure_hash;
-                        found = Some((idx, hash, CacheLookupResult::ExactHit(rows)));
+                        found = Some((
+                            idx,
+                            hash,
+                            CacheLookupResult::ExactHit(rows),
+                            std::sync::Arc::clone(&entry.payload),
+                        ));
                         break;
                     }
                     SubsumptionResult::Subsumed { filter } => {
@@ -448,6 +448,7 @@ impl SemanticCache {
                                 filter,
                                 columns,
                             },
+                            std::sync::Arc::clone(&entry.payload),
                         ));
                         break;
                     }
@@ -461,7 +462,8 @@ impl SemanticCache {
         }; // Read lock released here
 
         match hit_info {
-            Some((idx, expected_hash, result)) => {
+            Some((idx, expected_hash, result, payload)) => {
+                payload.import();
                 // Update access time with write lock
                 // TOCTOU safety: verify the entry's fingerprint hash matches
                 // If entry was evicted/replaced, skip update (benign miss)

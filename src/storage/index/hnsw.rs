@@ -23,10 +23,13 @@
 
 use parking_lot::RwLock;
 use std::collections::BinaryHeap;
+use std::sync::Arc;
 
 use crate::common::{I64Map, I64Set};
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
+use crate::storage::index::memory::{hash_table_bytes, IndexMemory, IndexMemoryOwner};
+use crate::storage::mvcc::memory::RetainedBytes;
 use crate::storage::traits::index_trait::Index;
 
 // ─────────────────────────────────────────────────────────────
@@ -143,6 +146,12 @@ struct SearchScratch {
 }
 
 impl SearchScratch {
+    fn requested_bytes(&self) -> u128 {
+        (self.visited.capacity() * std::mem::size_of::<u64>()) as u128
+            + (self.candidates.capacity() * std::mem::size_of::<MinEntry>()) as u128
+            + (self.result.capacity() * std::mem::size_of::<MaxEntry>()) as u128
+    }
+
     fn new() -> Self {
         Self {
             visited: Vec::new(),
@@ -167,50 +176,66 @@ impl SearchScratch {
     }
 }
 
-/// Reusable scratch buffers for query-time search_layer calls.
-/// Uses bitset for visited tracking (1 bit/node) — 32x smaller than FxHashSet,
-/// keeps working set in L1 cache for dramatically fewer cache misses.
-/// Thread-local storage avoids per-call heap allocation after the first invocation.
-struct QueryScratch {
-    /// Bitset for visited nodes: bit N = node N has been visited this call
-    visited: Vec<u64>,
-    candidates: BinaryHeap<MinEntry>,
-    result: BinaryHeap<MaxEntry>,
+static SEARCH_SCRATCH_BYTES: RetainedBytes = RetainedBytes::new();
+
+pub(crate) fn search_scratch_bytes() -> usize {
+    SEARCH_SCRATCH_BYTES.get()
 }
 
-impl QueryScratch {
+#[derive(Default)]
+struct ScratchCharge(u128);
+
+impl Drop for ScratchCharge {
+    fn drop(&mut self) {
+        SEARCH_SCRATCH_BYTES.remove(self.0);
+    }
+}
+
+struct ThreadScratch {
+    buffers: SearchScratch,
+    charge: ScratchCharge,
+}
+
+impl ThreadScratch {
     fn new() -> Self {
         Self {
-            visited: Vec::new(),
-            candidates: BinaryHeap::new(),
-            result: BinaryHeap::new(),
+            buffers: SearchScratch::new(),
+            charge: ScratchCharge::default(),
         }
     }
 
-    #[inline]
-    fn reset(&mut self, node_count: usize) {
-        let words = (node_count + 63) >> 6;
-        if self.visited.len() < words {
-            self.visited.resize(words, 0);
-        } else {
-            self.visited[..words].fill(0);
-        }
-        self.candidates.clear();
-        self.result.clear();
+    fn sync_charge(&mut self) {
+        let bytes = self.buffers.requested_bytes();
+        SEARCH_SCRATCH_BYTES.resize(self.charge.0, bytes);
+        self.charge.0 = bytes;
+    }
+}
+
+impl std::ops::Deref for ThreadScratch {
+    type Target = SearchScratch;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffers
+    }
+}
+
+impl std::ops::DerefMut for ThreadScratch {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.buffers
     }
 }
 
 thread_local! {
-    static QUERY_SCRATCH: std::cell::RefCell<QueryScratch> =
-        std::cell::RefCell::new(QueryScratch::new());
+    static QUERY_SCRATCH: std::cell::RefCell<ThreadScratch> =
+        std::cell::RefCell::new(ThreadScratch::new());
 }
 
 // Bitset-based scratch for parallel build (zero-overhead visited tracking).
 // Uses Vec<u64> bitset (1 bit/node) — 32x smaller than generation array, fits L1 cache.
 #[cfg(feature = "parallel")]
 thread_local! {
-    static BUILD_SCRATCH: std::cell::RefCell<SearchScratch> =
-        std::cell::RefCell::new(SearchScratch::new());
+    static BUILD_SCRATCH: std::cell::RefCell<ThreadScratch> =
+        std::cell::RefCell::new(ThreadScratch::new());
 }
 
 struct HnswInner {
@@ -241,6 +266,9 @@ struct HnswInner {
     /// Maps ahash(raw_vec_bytes) → list of live row_ids with that hash.
     /// `None` when UNIQUE is not enabled; built via `build_unique_map()`.
     unique_map: Option<ahash::AHashMap<u64, Vec<i64>>>,
+    neighbor_bytes: u128,
+    unique_row_bytes: u128,
+    unique_hash_high_water: usize,
 }
 
 impl HnswInner {
@@ -257,7 +285,33 @@ impl HnswInner {
             scratch: SearchScratch::new(),
             deleted_bits: Vec::new(),
             unique_map: None,
+            neighbor_bytes: 0,
+            unique_row_bytes: 0,
+            unique_hash_high_water: 0,
         }
+    }
+
+    fn requested_bytes(&self) -> u128 {
+        (self.nodes.capacity() * std::mem::size_of::<HnswNode>()) as u128
+            + self.vectors.capacity() as u128
+            + (self.node_to_row_id.capacity() * std::mem::size_of::<i64>()) as u128
+            + self.row_id_to_node.allocation_bytes() as u128
+            + (self.deleted_bits.capacity() * std::mem::size_of::<u64>()) as u128
+            + self.scratch.requested_bytes()
+            + self.neighbor_bytes
+            + self.unique_row_bytes
+    }
+
+    fn estimated_bytes(&self) -> u128 {
+        hash_table_bytes::<u64, Vec<i64>>(self.unique_hash_high_water)
+    }
+
+    fn replace_neighbors(&mut self, node: u32, layer: usize, neighbors: Vec<(u32, f32)>) {
+        let previous = &mut self.nodes[node as usize].neighbors[layer];
+        self.neighbor_bytes = self.neighbor_bytes
+            - (previous.capacity() * std::mem::size_of::<(u32, f32)>()) as u128
+            + (neighbors.capacity() * std::mem::size_of::<(u32, f32)>()) as u128;
+        *previous = neighbors;
     }
 
     /// Hash raw vector bytes for the unique_map.
@@ -273,6 +327,7 @@ impl HnswInner {
     fn build_unique_map(&mut self) {
         let mut map: ahash::AHashMap<u64, Vec<i64>> =
             ahash::AHashMap::with_capacity(self.nodes.len());
+        let mut row_bytes = 0;
         for (node_idx, &row_id) in self.node_to_row_id.iter().enumerate() {
             if self.is_deleted(node_idx as u32) {
                 continue;
@@ -280,9 +335,14 @@ impl HnswInner {
             let offset = node_idx * self.dims_bytes;
             if let Some(vec_bytes) = self.vectors.get(offset..offset + self.dims_bytes) {
                 let hash = Self::hash_vec_bytes(vec_bytes);
-                map.entry(hash).or_default().push(row_id);
+                let rows = map.entry(hash).or_default();
+                let before = rows.capacity();
+                rows.push(row_id);
+                row_bytes += ((rows.capacity() - before) * std::mem::size_of::<i64>()) as u128;
             }
         }
+        self.unique_row_bytes = row_bytes;
+        self.unique_hash_high_water = map.capacity();
         self.unique_map = Some(map);
     }
 
@@ -293,7 +353,12 @@ impl HnswInner {
             let row_id = self.node_to_row_id[node_id as usize];
             let offset = node_id as usize * self.dims_bytes;
             let hash = Self::hash_vec_bytes(&self.vectors[offset..offset + self.dims_bytes]);
-            map.entry(hash).or_default().push(row_id);
+            let rows = map.entry(hash).or_default();
+            let before = rows.capacity();
+            rows.push(row_id);
+            self.unique_row_bytes +=
+                ((rows.capacity() - before) * std::mem::size_of::<i64>()) as u128;
+            self.unique_hash_high_water = self.unique_hash_high_water.max(map.capacity());
         }
     }
 
@@ -307,6 +372,8 @@ impl HnswInner {
             if let Some(row_ids) = map.get_mut(&hash) {
                 row_ids.retain(|&r| r != row_id);
                 if row_ids.is_empty() {
+                    self.unique_row_bytes -=
+                        (row_ids.capacity() * std::mem::size_of::<i64>()) as u128;
                     map.remove(&hash);
                 }
             }
@@ -550,6 +617,7 @@ impl HnswInner {
                 }
             }
 
+            scratch.sync_charge();
             scratch.result.drain().collect()
         })
     }
@@ -847,7 +915,11 @@ impl HnswInner {
 
         // Room available — just push.
         if cur_len < max_conn {
-            self.nodes[target as usize].neighbors[layer].push((new_nb, new_dist));
+            let neighbors = &mut self.nodes[target as usize].neighbors[layer];
+            let before = neighbors.capacity();
+            neighbors.push((new_nb, new_dist));
+            self.neighbor_bytes +=
+                ((neighbors.capacity() - before) * std::mem::size_of::<(u32, f32)>()) as u128;
             return;
         }
 
@@ -910,7 +982,11 @@ impl HnswInner {
 
         let cur_len = neighbors.len();
         if cur_len < max_conn {
-            self.nodes[target as usize].neighbors[layer].push((new_nb, new_dist));
+            let neighbors = &mut self.nodes[target as usize].neighbors[layer];
+            let before = neighbors.capacity();
+            neighbors.push((new_nb, new_dist));
+            self.neighbor_bytes +=
+                ((neighbors.capacity() - before) * std::mem::size_of::<(u32, f32)>()) as u128;
             return;
         }
 
@@ -946,7 +1022,7 @@ impl HnswInner {
         });
 
         let pruned = self.select_neighbors(candidates, max_conn);
-        self.nodes[target as usize].neighbors[layer] = pruned;
+        self.replace_neighbors(target, layer, pruned);
     }
 
     /// Insert a vector into the graph
@@ -1000,7 +1076,7 @@ impl HnswInner {
                         }
                         entry_points.clear();
                         entry_points.extend(neighbors.iter().map(|&(n, _)| n));
-                        self.nodes[existing_node as usize].neighbors[l] = neighbors;
+                        self.replace_neighbors(existing_node, l, neighbors);
                     }
                 }
                 return;
@@ -1015,9 +1091,10 @@ impl HnswInner {
         self.vectors.extend_from_slice(vector_bytes);
 
         // Create node
-        self.nodes.push(HnswNode {
-            neighbors: vec![Vec::new(); level + 1],
-        });
+        let neighbors = vec![Vec::new(); level + 1];
+        self.neighbor_bytes +=
+            (neighbors.capacity() * std::mem::size_of::<Vec<(u32, f32)>>()) as u128;
+        self.nodes.push(HnswNode { neighbors });
         self.push_node_alive();
 
         // Store mappings
@@ -1075,7 +1152,7 @@ impl HnswInner {
             // Update entry points for next layer, then store neighbors
             entry_points.clear();
             entry_points.extend(neighbors.iter().map(|&(n, _)| n));
-            self.nodes[node_id as usize].neighbors[l] = neighbors;
+            self.replace_neighbors(node_id, l, neighbors);
         }
 
         // Update entry point if new node has higher level
@@ -1249,9 +1326,10 @@ impl HnswInner {
             let level = random_level(ml);
 
             self.vectors.extend_from_slice(vec_bytes);
-            self.nodes.push(HnswNode {
-                neighbors: vec![Vec::new(); level + 1],
-            });
+            let neighbors = vec![Vec::new(); level + 1];
+            self.neighbor_bytes +=
+                (neighbors.capacity() * std::mem::size_of::<Vec<(u32, f32)>>()) as u128;
+            self.nodes.push(HnswNode { neighbors });
             self.push_node_alive();
             self.node_to_row_id.push(row_id);
             self.row_id_to_node.insert(row_id, node_id);
@@ -1351,7 +1429,7 @@ impl HnswInner {
                     }
                     entry_points.clear();
                     entry_points.extend(neighbors.iter().map(|&(n, _)| n));
-                    self.nodes[node_id as usize].neighbors[l] = neighbors;
+                    self.replace_neighbors(node_id, l, neighbors);
                 }
 
                 // Update entry point if this node has higher level
@@ -1408,7 +1486,7 @@ impl HnswInner {
                 }
                 self.update_connection(nb, node_id, dist, 0, m0, false);
             }
-            self.nodes[node_id as usize].neighbors[0] = neighbors;
+            self.replace_neighbors(node_id, 0, neighbors);
         }
     }
 
@@ -1603,8 +1681,12 @@ impl HnswInner {
         // Validate all neighbor IDs are within bounds — corrupt IDs would cause
         // out-of-bounds reads in unsafe pointer arithmetic during search traversal
         let node_count = nodes.len() as u32;
+        let mut neighbor_bytes = 0;
         for (i, node) in nodes.iter().enumerate() {
+            neighbor_bytes +=
+                (node.neighbors.capacity() * std::mem::size_of::<Vec<(u32, f32)>>()) as u128;
             for (l, layer) in node.neighbors.iter().enumerate() {
+                neighbor_bytes += (layer.capacity() * std::mem::size_of::<(u32, f32)>()) as u128;
                 for &(nid, _) in layer {
                     if nid >= node_count {
                         return Err(format!(
@@ -1638,6 +1720,9 @@ impl HnswInner {
             scratch: SearchScratch::new(),
             deleted_bits,
             unique_map: None,
+            neighbor_bytes,
+            unique_row_bytes: 0,
+            unique_hash_high_water: 0,
         };
 
         // Version 1 didn't store distances — recompute them
@@ -2477,6 +2562,7 @@ fn search_layer_shared(
             }
         }
 
+        scratch.sync_charge();
         scratch.result.drain().collect()
     })
 }
@@ -2560,9 +2646,65 @@ pub struct HnswIndex {
     ml: f64,
     metric: HnswDistanceMetric,
     is_unique: bool,
+    memory: IndexMemoryOwner,
+}
+
+struct HnswWrite<'a> {
+    inner: parking_lot::RwLockWriteGuard<'a, HnswInner>,
+    account: &'a IndexMemory,
+    requested: u128,
+    estimated: u128,
+}
+
+impl std::ops::Deref for HnswWrite<'_> {
+    type Target = HnswInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl std::ops::DerefMut for HnswWrite<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Drop for HnswWrite<'_> {
+    fn drop(&mut self) {
+        self.account
+            .resize(self.requested, self.inner.requested_bytes());
+        self.account
+            .resize_estimate(self.estimated, self.inner.estimated_bytes());
+    }
 }
 
 impl HnswIndex {
+    fn write(&self) -> HnswWrite<'_> {
+        let inner = self.inner.write();
+        let requested = inner.requested_bytes();
+        let estimated = inner.estimated_bytes();
+        HnswWrite {
+            inner,
+            account: &self.memory.account,
+            requested,
+            estimated,
+        }
+    }
+
+    fn metadata_bytes(&self) -> u128 {
+        self.name.capacity() as u128
+            + self.table_name.capacity() as u128
+            + (self.column_ids.capacity() * std::mem::size_of::<i32>()) as u128
+            + (self.column_names.capacity() * std::mem::size_of::<String>()) as u128
+            + self
+                .column_names
+                .iter()
+                .map(|name| name.capacity() as u128)
+                .sum::<u128>()
+            + (self.data_types.capacity() * std::mem::size_of::<DataType>()) as u128
+    }
+
     /// Create a new HNSW index
     ///
     /// # Arguments
@@ -2587,11 +2729,38 @@ impl HnswIndex {
         ef_search: usize,
         metric: HnswDistanceMetric,
     ) -> Self {
+        Self::from_inner(
+            name,
+            table_name,
+            column_name,
+            column_id,
+            HnswInner::new(dims, metric),
+            m,
+            ef_construction,
+            ef_search,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_inner(
+        name: String,
+        table_name: String,
+        column_name: String,
+        column_id: i32,
+        inner: HnswInner,
+        m: usize,
+        ef_construction: usize,
+        ef_search: usize,
+    ) -> Self {
         // m must be >= 2: ln(1)=0 → ml=inf → random_level overflows
         let m = if m < 2 { 2 } else { m };
         let ml = 1.0 / (m as f64).ln();
-        Self {
-            inner: RwLock::new(HnswInner::new(dims, metric)),
+        let dims = inner.dims_bytes / 4;
+        let metric = inner.metric;
+        let memory =
+            IndexMemoryOwner::new::<Self>(inner.requested_bytes(), inner.estimated_bytes());
+        let index = Self {
+            inner: RwLock::new(inner),
             name,
             table_name,
             column_ids: vec![column_id],
@@ -2605,17 +2774,23 @@ impl HnswIndex {
             ml,
             metric,
             is_unique: false,
-        }
+            memory,
+        };
+        index.memory.account.resize(0, index.metadata_bytes());
+        index
     }
 
     /// Set the uniqueness constraint for this HNSW index.
     /// When enabling uniqueness, builds the O(1) byte-hash lookup map.
     pub fn set_unique(&mut self, unique: bool) {
         self.is_unique = unique;
+        let mut inner = self.write();
         if unique {
-            self.inner.write().build_unique_map();
+            inner.build_unique_map();
         } else {
-            self.inner.write().unique_map = None;
+            inner.unique_map = None;
+            inner.unique_row_bytes = 0;
+            inner.unique_hash_high_water = 0;
         }
     }
 
@@ -2805,24 +2980,17 @@ impl HnswIndex {
                         ),
                     ));
                 }
-                let metric = inner.metric;
-                let ml = 1.0 / (m as f64).ln();
-                Ok(Some(Self {
-                    inner: RwLock::new(inner),
+                let index = Self::from_inner(
                     name,
                     table_name,
-                    column_ids: vec![column_id],
-                    column_names: vec![column_name],
-                    data_types: vec![DataType::Vector],
-                    dims,
+                    column_name,
+                    column_id,
+                    inner,
                     m,
-                    m0: m * 2,
                     ef_construction,
                     ef_search,
-                    ml,
-                    metric,
-                    is_unique: false,
-                }))
+                );
+                Ok(Some(index))
             }
             Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e)),
         }
@@ -2842,6 +3010,10 @@ impl HnswIndex {
 }
 
 impl Index for HnswIndex {
+    fn memory_account(&self) -> Option<&Arc<IndexMemory>> {
+        Some(&self.memory.account)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -2862,7 +3034,7 @@ impl Index for HnswIndex {
             Some(b) if b.len() == self.dims * 4 => b,
             _ => return Ok(()), // Skip non-vector or wrong dimension
         };
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         // Enforce uniqueness using exact byte equality (metric-independent).
         if self.is_unique
             && Self::find_exact_duplicate_in_inner(&inner, vec_bytes, row_id, None).is_some()
@@ -2885,7 +3057,7 @@ impl Index for HnswIndex {
     }
 
     fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let dims_bytes = inner.dims_bytes;
         let expected_vec_len = self.dims * 4;
 
@@ -2939,7 +3111,7 @@ impl Index for HnswIndex {
     }
 
     fn remove(&self, _values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         if let Some(&node_id) = inner.row_id_to_node.get(row_id) {
             inner.unique_map_remove(node_id);
             inner.set_deleted(node_id);
@@ -2948,7 +3120,7 @@ impl Index for HnswIndex {
     }
 
     fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         for row_id in entries.keys() {
             if let Some(&node_id) = inner.row_id_to_node.get(row_id) {
                 inner.unique_map_remove(node_id);
@@ -2959,7 +3131,7 @@ impl Index for HnswIndex {
     }
 
     fn add_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let dims_bytes = inner.dims_bytes;
         let expected_vec_len = self.dims * 4;
 
@@ -3013,7 +3185,7 @@ impl Index for HnswIndex {
     }
 
     fn remove_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         for &(row_id, _) in entries {
             if let Some(&node_id) = inner.row_id_to_node.get(row_id) {
                 inner.unique_map_remove(node_id);
@@ -3094,7 +3266,7 @@ impl Index for HnswIndex {
     }
 
     fn clear(&self) -> Result<()> {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         *inner = HnswInner::new(self.dims, self.metric);
         if self.is_unique {
             inner.unique_map = Some(ahash::AHashMap::new());
@@ -3103,7 +3275,7 @@ impl Index for HnswIndex {
     }
 
     fn cleanup(&self) -> Result<()> {
-        let mut inner = self.inner.write();
+        let mut inner = self.write();
         let total = inner.nodes.len();
         if total == 0 {
             return Ok(());
@@ -3205,6 +3377,213 @@ mod tests {
             Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => &data[1..],
             _ => panic!("not a vector value"),
         }
+    }
+
+    fn memory_index() -> HnswIndex {
+        HnswIndex::new(
+            "idx_vector".into(),
+            "items".into(),
+            "embedding".into(),
+            0,
+            3,
+            4,
+            16,
+            16,
+            HnswDistanceMetric::L2,
+        )
+    }
+
+    fn assert_graph_allocations(inner: &HnswInner) -> u128 {
+        let neighbors: u128 = inner
+            .nodes
+            .iter()
+            .map(|node| {
+                (node.neighbors.capacity() * std::mem::size_of::<Vec<(u32, f32)>>()) as u128
+                    + node
+                        .neighbors
+                        .iter()
+                        .map(|layer| (layer.capacity() * std::mem::size_of::<(u32, f32)>()) as u128)
+                        .sum::<u128>()
+            })
+            .sum();
+        let unique_rows = inner.unique_map.as_ref().map_or(0, |map| {
+            map.values()
+                .map(|rows| (rows.capacity() * std::mem::size_of::<i64>()) as u128)
+                .sum::<u128>()
+        });
+        assert_eq!(inner.neighbor_bytes, neighbors);
+        assert_eq!(inner.unique_row_bytes, unique_rows);
+        if let Some(map) = &inner.unique_map {
+            assert!(inner.unique_hash_high_water >= map.capacity());
+        } else {
+            assert_eq!(inner.unique_hash_high_water, 0);
+        }
+        let expected = neighbors
+            + unique_rows
+            + (inner.nodes.capacity() * std::mem::size_of::<HnswNode>()) as u128
+            + inner.vectors.capacity() as u128
+            + (inner.node_to_row_id.capacity() * std::mem::size_of::<i64>()) as u128
+            + inner.row_id_to_node.allocation_bytes() as u128
+            + (inner.deleted_bits.capacity() * std::mem::size_of::<u64>()) as u128
+            + (inner.scratch.visited.capacity() * std::mem::size_of::<u64>()) as u128
+            + (inner.scratch.candidates.capacity() * std::mem::size_of::<MinEntry>()) as u128
+            + (inner.scratch.result.capacity() * std::mem::size_of::<MaxEntry>()) as u128;
+        assert_eq!(inner.requested_bytes(), expected);
+        expected
+    }
+
+    fn assert_index_allocations(index: &HnswIndex) {
+        let inner = index.inner.read();
+        let expected = crate::storage::mvcc::memory::arc_allocation_bytes::<HnswIndex>() as u128
+            + assert_graph_allocations(&inner)
+            + index.metadata_bytes();
+        assert_eq!(index.memory.account.requested_bytes() as u128, expected);
+        assert_eq!(
+            index.memory.account.estimated_bytes() as u128,
+            inner.estimated_bytes()
+        );
+    }
+
+    #[test]
+    fn hnsw_accounting_retains_deleted_graph_and_releases_unique_buckets() {
+        let mut index = memory_index();
+        assert_index_allocations(&index);
+        for id in 0..32 {
+            index
+                .add(&[Value::vector(vec![id as f32, 0.0, 0.0])], id, 0)
+                .unwrap();
+            assert_index_allocations(&index);
+        }
+        let before_delete = index.memory.account.requested_bytes();
+        index.remove(&[], 0, 0).unwrap();
+        assert_eq!(index.memory.account.requested_bytes(), before_delete);
+        assert_index_allocations(&index);
+        index
+            .add(&[Value::vector(vec![0.5, 1.0, 0.0])], 0, 0)
+            .unwrap();
+        assert_index_allocations(&index);
+        assert_eq!(index.node_count(), 32);
+        index.set_unique(true);
+        assert_index_allocations(&index);
+        let entries: Vec<_> = (0..16).map(|id| (id, &[][..])).collect();
+        index.remove_batch_slice(&entries).unwrap();
+        assert_index_allocations(&index);
+        index.cleanup().unwrap();
+        assert_eq!(index.node_count(), 16);
+        assert_index_allocations(&index);
+        index.set_unique(false);
+        assert_index_allocations(&index);
+        assert_eq!(index.memory.account.estimated_bytes(), 0);
+        index.clear().unwrap();
+        let vector = [Value::vector(vec![1.0, 2.0, 3.0])];
+        index
+            .add_batch_slice(&[(1, &vector), (2, &vector)])
+            .unwrap();
+        index.set_unique(true);
+        let bucket_bytes = index.inner.read().unique_row_bytes;
+        index.remove(&[], 1, 0).unwrap();
+        assert_eq!(index.inner.read().unique_row_bytes, bucket_bytes);
+        assert_index_allocations(&index);
+        index.remove(&[], 2, 0).unwrap();
+        assert_eq!(index.inner.read().unique_row_bytes, 0);
+        assert!(index.memory.account.estimated_bytes() > 0);
+        assert_index_allocations(&index);
+        index.clear().unwrap();
+        assert_index_allocations(&index);
+        let account = Arc::clone(index.memory_account().unwrap());
+        index.close().unwrap();
+        assert!(account.requested_bytes() > 0);
+        drop(index);
+        assert_eq!(account.requested_bytes(), 0);
+        assert_eq!(account.estimated_bytes(), 0);
+    }
+
+    #[test]
+    fn hnsw_accounting_restores_loaded_graph_and_retains_thread_scratch() {
+        let index = memory_index();
+        let rows: Vec<_> = (0..16)
+            .map(|id| (id, vec![Value::vector(vec![id as f32, 0.0, 0.0])]))
+            .collect();
+        let entries: Vec<_> = rows
+            .iter()
+            .map(|(id, values)| (*id, values.as_slice()))
+            .collect();
+        index.add_batch_slice(&entries).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("graph.bin");
+        index.save_graph(&path).unwrap();
+        let loaded = HnswIndex::load_graph(
+            &path,
+            "loaded".into(),
+            "items".into(),
+            "embedding".into(),
+            0,
+            3,
+            4,
+            16,
+            16,
+        )
+        .unwrap()
+        .unwrap();
+        assert_index_allocations(&loaded);
+        assert_eq!(loaded.node_count(), 16);
+        std::thread::spawn(move || {
+            let query = [0.0f32; 3]
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>();
+            assert!(!loaded.search_nearest(&query, 4, 16).is_empty());
+            QUERY_SCRATCH.with(|cell| {
+                let scratch = cell.borrow();
+                assert!(scratch.charge.0 > 0);
+                assert_eq!(scratch.charge.0, scratch.buffers.requested_bytes());
+            });
+            drop(loaded);
+            QUERY_SCRATCH.with(|cell| {
+                let scratch = cell.borrow();
+                assert_eq!(scratch.charge.0, scratch.buffers.requested_bytes());
+                assert!(search_scratch_bytes() as u128 >= scratch.charge.0);
+            });
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn hnsw_accounting_covers_parallel_neighbor_replacement() {
+        let index = memory_index();
+        let vectors: Vec<_> = (0..32)
+            .map(|id| {
+                [id as f32, 0.0, 1.0]
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let entries: Vec<_> = vectors
+            .iter()
+            .enumerate()
+            .map(|(id, bytes)| (bytes.as_slice(), id as i64))
+            .collect();
+        {
+            let mut inner = index.write();
+            inner.insert_batch_inner(&entries, index.m, index.m0, index.ef_construction, index.ml);
+        }
+        assert_index_allocations(&index);
+        index.remove(&[], 0, 0).unwrap();
+        {
+            let mut inner = index.write();
+            inner.insert_batch_inner(
+                &entries[..1],
+                index.m,
+                index.m0,
+                index.ef_construction,
+                index.ml,
+            );
+        }
+        assert_index_allocations(&index);
+        assert_eq!(index.node_count(), 32);
     }
 
     #[test]

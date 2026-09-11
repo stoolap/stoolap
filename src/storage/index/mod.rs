@@ -27,6 +27,7 @@ pub mod bitmap;
 pub mod btree;
 pub mod hash;
 pub mod hnsw;
+mod memory;
 pub mod multi_column;
 pub mod pk;
 
@@ -59,5 +60,6 @@ pub use hash::HashIndex;
 pub use hnsw::{
     default_ef_construction, default_ef_search, default_m_for_dims, HnswDistanceMetric, HnswIndex,
 };
+pub use memory::IndexMemory;
 pub use multi_column::{CompositeKey, MultiColumnIndex};
 pub use pk::PkIndex;

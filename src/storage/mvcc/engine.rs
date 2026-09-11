@@ -42,6 +42,10 @@ fn to_lowercase_cow(s: &str) -> Cow<'_, str> {
 }
 
 use super::file_lock::FileLock;
+use super::memory::{
+    arc_allocation_bytes, hash_table_bytes, name_bytes, smallvec_bytes, HotMemoryRegistry,
+    HotMetadataCharge, NamedMap,
+};
 
 use crate::core::{DataType, Error, ForeignKeyConstraint, IsolationLevel, Result, Schema, Value};
 use crate::storage::config::Config;
@@ -58,10 +62,97 @@ use crate::storage::traits::{Engine, Index, Table, Transaction};
 /// Type alias for a single table entry in the transaction version store
 type TxnTableEntry = (SmartString, Arc<RwLock<TransactionVersionStore>>);
 
-/// Type alias for the transaction version store map
-/// Structured as txn_id -> [(table_name, store)] for efficient lookup per transaction
-/// Uses SmallVec<[T; 2]> since most transactions access 1-2 tables, avoiding heap allocation
-type TxnVersionStoreMap = I64Map<SmallVec<[TxnTableEntry; 2]>>;
+struct TxnVersionStoreMap {
+    entries: I64Map<SmallVec<[TxnTableEntry; 2]>>,
+    nested_bytes: u128,
+    charge: HotMetadataCharge,
+}
+
+impl TxnVersionStoreMap {
+    fn new() -> Self {
+        let entries = I64Map::new();
+        let bytes = (arc_allocation_bytes::<RwLock<Self>>() + entries.allocation_bytes()) as u128;
+        Self {
+            entries,
+            nested_bytes: 0,
+            charge: HotMetadataCharge::new(bytes),
+        }
+    }
+
+    fn table_bytes(tables: &SmallVec<[TxnTableEntry; 2]>) -> u128 {
+        let buffer = if tables.spilled() {
+            tables.capacity() * std::mem::size_of::<TxnTableEntry>()
+        } else {
+            0
+        };
+        buffer as u128
+            + tables
+                .iter()
+                .map(|(name, _)| name_bytes(name))
+                .sum::<u128>()
+    }
+
+    fn update_charge(&mut self) {
+        self.charge.resize(
+            (arc_allocation_bytes::<RwLock<Self>>() + self.entries.allocation_bytes()) as u128
+                + self.nested_bytes,
+        );
+    }
+
+    fn get_or_insert(
+        &mut self,
+        txn_id: i64,
+        name: &str,
+        parent: &Arc<VersionStore>,
+    ) -> Arc<RwLock<TransactionVersionStore>> {
+        let tables = self.entries.entry(txn_id).or_default();
+        if let Some((_, store)) = tables.iter().find(|(stored, _)| stored.as_str() == name) {
+            return Arc::clone(store);
+        }
+        let before = if tables.spilled() {
+            tables.capacity()
+        } else {
+            0
+        };
+        let store = Arc::new(RwLock::new(TransactionVersionStore::new(
+            Arc::clone(parent),
+            txn_id,
+        )));
+        let name = SmartString::from(name);
+        self.nested_bytes += name_bytes(&name);
+        tables.push((name, Arc::clone(&store)));
+        let after = if tables.spilled() {
+            tables.capacity()
+        } else {
+            0
+        };
+        self.nested_bytes += ((after - before) * std::mem::size_of::<TxnTableEntry>()) as u128;
+        self.update_charge();
+        store
+    }
+
+    fn remove(&mut self, txn_id: i64) {
+        if let Some(tables) = self.entries.remove(txn_id) {
+            self.nested_bytes -= Self::table_bytes(&tables);
+            drop(tables);
+        }
+        self.update_charge();
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.nested_bytes = 0;
+        self.update_charge();
+    }
+}
+
+impl std::ops::Deref for TxnVersionStoreMap {
+    type Target = I64Map<SmallVec<[TxnTableEntry; 2]>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
 
 /// Helper to get registry as the visibility checker type expected by VersionStore.
 /// In production: returns concrete Arc<TransactionRegistry> (zero-cost, inlined).
@@ -84,7 +175,7 @@ fn registry_as_visibility_checker(
 /// Updates both the schemas map and each affected VersionStore's schema.
 /// Caller must hold schemas as write-locked and version_stores as read-locked.
 fn strip_fk_references(
-    schemas: &mut FxHashMap<String, CompactArc<Schema>>,
+    schemas: &mut NamedMap<CompactArc<Schema>>,
     version_stores: &FxHashMap<String, Arc<VersionStore>>,
     parent_table_lower: &str,
 ) {
@@ -102,25 +193,24 @@ fn strip_fk_references(
     for child_name in &children_to_update {
         if let Some(old_schema_arc) = schemas.get(child_name) {
             let old_schema: &Schema = old_schema_arc;
-            let mut new_fks: Vec<ForeignKeyConstraint> = old_schema
+            let new_fks: Vec<ForeignKeyConstraint> = old_schema
                 .foreign_keys
                 .iter()
                 .filter(|fk| fk.referenced_table != parent_table_lower)
                 .cloned()
                 .collect();
             if new_fks.len() < old_schema.foreign_keys.len() {
-                let mut new_schema = Schema::with_timestamps_and_foreign_keys(
+                let new_schema = Schema::with_timestamps_and_foreign_keys(
                     old_schema.table_name.clone(),
                     old_schema.columns.clone(),
-                    Vec::new(),
+                    new_fks,
                     old_schema.created_at,
                     old_schema.updated_at,
                 );
-                std::mem::swap(&mut new_schema.foreign_keys, &mut new_fks);
                 let new_arc = CompactArc::new(new_schema);
 
                 if let Some(vs) = version_stores.get(child_name.as_str()) {
-                    *vs.schema_mut() = new_arc.clone();
+                    vs.replace_schema(new_arc.clone());
                 }
 
                 schemas.insert(child_name.clone(), new_arc);
@@ -327,7 +417,7 @@ fn read_snapshot_lsn(snapshot_dir: &std::path::Path) -> u64 {
 }
 
 /// View definition storing the query that defines the view
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct ViewDefinition {
     /// View name (lowercase for case-insensitive lookup)
     pub name: String,
@@ -335,16 +425,42 @@ pub struct ViewDefinition {
     pub original_name: String,
     /// The SQL query string that defines the view
     pub query: String,
+    memory: HotMetadataCharge,
+}
+
+impl Clone for ViewDefinition {
+    fn clone(&self) -> Self {
+        let mut copy = Self {
+            name: self.name.clone(),
+            original_name: self.original_name.clone(),
+            query: self.query.clone(),
+            memory: HotMetadataCharge::default(),
+        };
+        copy.refresh_memory();
+        copy
+    }
 }
 
 impl ViewDefinition {
     /// Create a new view definition
     pub fn new(name: &str, query: String) -> Self {
-        Self {
+        let mut view = Self {
             name: name.to_lowercase(),
             original_name: name.to_string(),
             query,
-        }
+            memory: HotMetadataCharge::default(),
+        };
+        view.refresh_memory();
+        view
+    }
+
+    fn refresh_memory(&mut self) {
+        self.memory.resize(
+            (arc_allocation_bytes::<Self>()
+                + self.name.capacity()
+                + self.original_name.capacity()
+                + self.query.capacity()) as u128,
+        );
     }
 
     /// Serialize view definition to binary format for WAL
@@ -403,7 +519,95 @@ impl ViewDefinition {
 
 /// Cached reverse FK mapping: (schema_epoch, parent_table → Arc<Vec<(child_table, constraint)>>)
 /// Arc-wrapped so lookups are a ref-count bump (no Vec clone on every FK check).
-type FkReverseCache = (u64, StringMap<Arc<Vec<(String, ForeignKeyConstraint)>>>);
+type FkReverseCache = (u64, StringMap<Arc<ReferencingFks>>, HotMetadataCharge);
+
+/// Shared reverse foreign-key definitions and their retained metadata.
+pub struct ReferencingFks {
+    entries: Vec<(String, ForeignKeyConstraint)>,
+    _memory: HotMetadataCharge,
+}
+
+impl ReferencingFks {
+    fn new(entries: Vec<(String, ForeignKeyConstraint)>) -> Self {
+        let bytes = arc_allocation_bytes::<Self>() as u128
+            + (entries.capacity() * std::mem::size_of::<(String, ForeignKeyConstraint)>()) as u128
+            + entries
+                .iter()
+                .map(|(name, fk)| {
+                    (name.capacity()
+                        + fk.column_name.capacity()
+                        + fk.referenced_table.capacity()
+                        + fk.referenced_column.capacity()) as u128
+                })
+                .sum::<u128>();
+        Self {
+            entries,
+            _memory: HotMetadataCharge::new(bytes),
+        }
+    }
+}
+
+impl std::ops::Deref for ReferencingFks {
+    type Target = [(String, ForeignKeyConstraint)];
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+struct EngineConfig {
+    value: Config,
+    _memory: HotMetadataCharge,
+}
+
+impl EngineConfig {
+    fn new(value: Config) -> Self {
+        let bytes = value.path.as_ref().map_or(0, String::capacity);
+        Self {
+            value,
+            _memory: HotMetadataCharge::new(bytes as u128),
+        }
+    }
+}
+
+impl std::ops::Deref for EngineConfig {
+    type Target = Config;
+
+    fn deref(&self) -> &Config {
+        &self.value
+    }
+}
+
+#[derive(Default)]
+struct SnapshotTimestamps {
+    entries: NamedMap<String>,
+    value_bytes: u128,
+    memory: HotMetadataCharge,
+}
+
+impl SnapshotTimestamps {
+    fn insert(&mut self, name: String, timestamp: String) {
+        self.value_bytes += timestamp.capacity() as u128;
+        if let Some(previous) = self.entries.insert(name, timestamp) {
+            self.value_bytes -= previous.capacity() as u128;
+        }
+        self.memory.resize(self.value_bytes);
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.value_bytes = 0;
+        self.memory.resize(0);
+    }
+}
+
+impl std::ops::Deref for SnapshotTimestamps {
+    type Target = NamedMap<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
 
 /// `hot_max_rows` / `hot_max_bytes` mirrored from the config so the commit
 /// path reads them without the config lock, the seal request a commit
@@ -441,6 +645,22 @@ pub struct MemoryStat {
     pub chain_entries: usize,
     pub volume_bytes: usize,
     pub admission_waits: u64,
+    pub version_payload_bytes: usize,
+    pub pinned_version_payload_bytes: usize,
+    pub retired_arena_payload_bytes: usize,
+    pub version_tree_bytes: usize,
+    pub pinned_version_tree_bytes: usize,
+    pub transaction_version_bytes: usize,
+    pub transaction_undo_bytes: usize,
+    pub transaction_map_bytes: usize,
+    pub index_requested_bytes: usize,
+    pub index_estimated_bytes: usize,
+    pub index_scratch_bytes: usize,
+    pub row_claim_bytes: usize,
+    pub row_pool_bytes: usize,
+    pub exported_payload_bytes: usize,
+    pub transaction_registry_bytes: usize,
+    pub hot_metadata_bytes: usize,
 }
 
 /// MVCC Storage Engine
@@ -450,12 +670,13 @@ pub struct MVCCEngine {
     /// Database path (empty for in-memory)
     path: String,
     /// Configuration
-    config: RwLock<Config>,
+    config: RwLock<EngineConfig>,
     /// Table schemas (Arc-wrapped for safe sharing with transactions)
     /// Each schema is also Arc-wrapped to avoid cloning on lookup (critical for PK fast path)
-    schemas: Arc<RwLock<FxHashMap<String, CompactArc<Schema>>>>,
+    schemas: Arc<RwLock<NamedMap<CompactArc<Schema>>>>,
     /// Version stores for each table (Arc-wrapped for safe sharing with transactions)
-    version_stores: Arc<RwLock<FxHashMap<String, Arc<VersionStore>>>>,
+    version_stores: Arc<RwLock<NamedMap<Arc<VersionStore>>>>,
+    hot_memory: Arc<HotMemoryRegistry>,
     /// Transaction registry
     registry: Arc<TransactionRegistry>,
     /// Whether the engine is open
@@ -464,7 +685,7 @@ pub struct MVCCEngine {
     /// (Arc-wrapped for safe sharing with transactions)
     txn_version_stores: Arc<RwLock<TxnVersionStoreMap>>,
     /// View definitions (Arc for cheap cloning on lookup)
-    views: RwLock<FxHashMap<String, Arc<ViewDefinition>>>,
+    views: RwLock<NamedMap<Arc<ViewDefinition>>>,
     /// Persistence manager for WAL and snapshot operations (Arc-wrapped for safe sharing)
     persistence: Arc<Option<PersistenceManager>>,
     /// Flag to indicate we're loading from disk to avoid triggering redundant WAL writes
@@ -486,7 +707,7 @@ pub struct MVCCEngine {
     fk_reverse_cache: RwLock<FkReverseCache>,
     /// Snapshot timestamps loaded per table — used to pair HNSW graph files with their
     /// matching data snapshots during WAL replay.
-    snapshot_timestamps: RwLock<FxHashMap<String, String>>,
+    snapshot_timestamps: RwLock<SnapshotTimestamps>,
     /// Per-table segment managers (owns segments, delete vectors, manifest).
     /// Key: lowercase table name. Replaces frozen_volumes + volume_tombstones.
     segment_managers:
@@ -512,6 +733,7 @@ pub struct MVCCEngine {
     /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
     #[cfg(not(target_arch = "wasm32"))]
     eviction_epoch: AtomicU64,
+    metadata: HotMetadataCharge,
 }
 
 /// RAII guard that clears an AtomicBool on drop. Used to release the
@@ -578,27 +800,32 @@ impl MVCCEngine {
             None
         };
 
-        Self {
+        let mut engine = Self {
             path: if path.is_empty() {
                 "memory://".to_string()
             } else {
                 path
             },
-            config: RwLock::new(config),
-            schemas: Arc::new(RwLock::new(FxHashMap::default())),
-            version_stores: Arc::new(RwLock::new(FxHashMap::default())),
+            config: RwLock::new(EngineConfig::new(config)),
+            schemas: Arc::new(RwLock::new(NamedMap::default())),
+            version_stores: Arc::new(RwLock::new(NamedMap::default())),
+            hot_memory: Arc::new(HotMemoryRegistry::default()),
             registry: Arc::new(TransactionRegistry::new()),
             open: AtomicBool::new(false),
-            txn_version_stores: Arc::new(RwLock::new(I64Map::new())),
-            views: RwLock::new(FxHashMap::default()),
+            txn_version_stores: Arc::new(RwLock::new(TxnVersionStoreMap::new())),
+            views: RwLock::new(NamedMap::default()),
             persistence: Arc::new(persistence),
             loading_from_disk: Arc::new(AtomicBool::new(false)),
             file_lock: Mutex::new(None),
             schema_epoch: AtomicU64::new(0),
             stats_epoch: AtomicU64::new(0),
             cleanup_handle: Mutex::new(None),
-            fk_reverse_cache: RwLock::new((u64::MAX, StringMap::default())),
-            snapshot_timestamps: RwLock::new(FxHashMap::default()),
+            fk_reverse_cache: RwLock::new((
+                u64::MAX,
+                StringMap::default(),
+                HotMetadataCharge::default(),
+            )),
+            snapshot_timestamps: RwLock::new(SnapshotTimestamps::default()),
             segment_managers: Arc::new(RwLock::new(FxHashMap::default())),
             force_seal_all: AtomicBool::new(false),
             hot_limits,
@@ -607,7 +834,15 @@ impl MVCCEngine {
             compaction_running: Arc::new(AtomicBool::new(false)),
             #[cfg(not(target_arch = "wasm32"))]
             eviction_epoch: AtomicU64::new(0),
-        }
+            metadata: HotMetadataCharge::default(),
+        };
+        engine.metadata.resize(
+            (arc_allocation_bytes::<Self>()
+                + engine.path.capacity()
+                + EngineOperations::shared_metadata_bytes()
+                + arc_allocation_bytes::<AtomicBool>()) as u128,
+        );
+        engine
     }
 
     /// Creates a new in-memory MVCC engine
@@ -1093,19 +1328,29 @@ impl MVCCEngine {
             schema.clone(),
             registry_as_visibility_checker(&self.registry),
         ));
+        self.hot_memory.register(version_store.memory_account());
 
         // Register virtual PkIndex for INTEGER PRIMARY KEY
         register_pk_index(&schema, &version_store);
 
+        let mut load_error = None;
         // Load all rows from the snapshot
         reader.for_each(|row_id, mut version| {
             // Snapshot versions have txn_id = -1, we need to use the recovery txn_id
             version.txn_id = super::RECOVERY_TRANSACTION_ID;
 
             // Apply to version store
-            version_store.apply_recovered_version(row_id, version);
-            true
+            match version_store.apply_recovered_version(row_id, version) {
+                Ok(()) => true,
+                Err(error) => {
+                    load_error = Some(error);
+                    false
+                }
+            }
         })?;
+        if let Some(error) = load_error {
+            return Err(error);
+        }
 
         // Store the schema and version store
         {
@@ -1154,6 +1399,7 @@ impl MVCCEngine {
                 schema.clone(),
                 registry_as_visibility_checker(&self.registry),
             ));
+            self.hot_memory.register(version_store.memory_account());
             register_pk_index(&schema, &version_store);
 
             // Store schema and version store
@@ -1195,6 +1441,7 @@ impl MVCCEngine {
             schema.clone(),
             registry_as_visibility_checker(&self.registry),
         ));
+        self.hot_memory.register(version_store.memory_account());
         register_pk_index(&schema, &version_store);
 
         // Build a frozen volume from the snapshot rows
@@ -1590,7 +1837,7 @@ impl MVCCEngine {
             if !needs_update {
                 continue;
             }
-            let schema = CompactArc::make_mut(&mut *schema_guard);
+            let schema = &mut *schema_guard;
             for col in &mut schema.columns {
                 if col.default_value.is_none() {
                     if let Some(ref expr) = col.default_expr {
@@ -1629,6 +1876,7 @@ impl MVCCEngine {
                         schema.clone(),
                         registry_as_visibility_checker(&self.registry),
                     ));
+                    self.hot_memory.register(version_store.memory_account());
 
                     // Register virtual PkIndex for INTEGER PRIMARY KEY
                     register_pk_index(&schema, &version_store);
@@ -1776,14 +2024,14 @@ impl MVCCEngine {
                             // in the cumulative skip set at scan time). No tombstone
                             // needed here — the hot version IS the dedup mechanism.
                             if let Ok(store) = self.get_version_store(&table_name) {
-                                store.apply_recovered_version(entry.row_id, row_version);
+                                store.apply_recovered_version(entry.row_id, row_version)?;
                             }
                         }
                         // else: sealed INSERT, volume has authoritative data → skip
                     } else {
                         // Row not in any volume: standard hot insert
                         if let Ok(store) = self.get_version_store(&table_name) {
-                            store.apply_recovered_version(entry.row_id, row_version);
+                            store.apply_recovered_version(entry.row_id, row_version)?;
                         }
                     }
                 }
@@ -1794,7 +2042,7 @@ impl MVCCEngine {
                 let mgr = self.get_or_create_segment_manager(&table_name);
                 let in_volume = mgr.is_row_id_in_volume(entry.row_id)?;
                 if let Ok(store) = self.get_version_store(&table_name) {
-                    store.mark_deleted(entry.row_id, entry.txn_id);
+                    store.mark_deleted(entry.row_id, entry.txn_id)?;
                 }
                 // If the deleted row_id lives in a cold segment, add a tombstone
                 // so it is excluded from scans and point lookups.
@@ -2262,7 +2510,7 @@ impl MVCCEngine {
         self.hot_limits
             .max_bytes
             .store(config.persistence.hot_max_bytes, Ordering::Relaxed);
-        *self.config.write().unwrap() = config;
+        *self.config.write().unwrap() = EngineConfig::new(config);
         Ok(())
     }
 
@@ -2290,6 +2538,7 @@ impl MVCCEngine {
         };
         for (name, store) in stores {
             let (arena_slots, arena_capacity_bytes) = store.arena_footprint();
+            let usage = store.memory_account().usage();
             let stat = MemoryStat {
                 hot_rows: store.committed_row_count(),
                 hot_bytes: store.hot_bytes(),
@@ -2299,15 +2548,48 @@ impl MVCCEngine {
                 volume_bytes: volume_bytes.remove(&name).unwrap_or(0),
                 table_name: name,
                 admission_waits: 0,
+                version_payload_bytes: usage.version_payloads,
+                pinned_version_payload_bytes: usage.pinned_version_payloads,
+                retired_arena_payload_bytes: usage.retired_arena_payloads,
+                version_tree_bytes: usage.version_tree,
+                pinned_version_tree_bytes: usage.pinned_version_tree,
+                transaction_version_bytes: usage.transaction_versions,
+                transaction_undo_bytes: usage.transaction_undo,
+                transaction_map_bytes: 0,
+                index_requested_bytes: usage.index_requested,
+                index_estimated_bytes: usage.index_estimated,
+                index_scratch_bytes: 0,
+                row_claim_bytes: usage.row_claims,
+                row_pool_bytes: 0,
+                exported_payload_bytes: 0,
+                transaction_registry_bytes: 0,
+                hot_metadata_bytes: 0,
             };
             total.hot_rows += stat.hot_rows;
-            total.hot_bytes += stat.hot_bytes;
             total.arena_slots += stat.arena_slots;
-            total.arena_capacity_bytes += stat.arena_capacity_bytes;
             total.chain_entries += stat.chain_entries;
             total.volume_bytes += stat.volume_bytes;
             result.push(stat);
         }
+        let retained = self.hot_memory.total();
+        total.hot_bytes = retained.arena_payloads;
+        total.arena_capacity_bytes = retained.arena_capacity;
+        total.version_payload_bytes = retained.version_payloads;
+        total.pinned_version_payload_bytes = retained.pinned_version_payloads;
+        total.retired_arena_payload_bytes = retained.retired_arena_payloads;
+        total.version_tree_bytes = retained.version_tree;
+        total.pinned_version_tree_bytes = retained.pinned_version_tree;
+        total.transaction_version_bytes = retained.transaction_versions;
+        total.transaction_undo_bytes = retained.transaction_undo;
+        total.transaction_map_bytes = crate::storage::mvcc::version_store::transaction_map_bytes();
+        total.index_requested_bytes = retained.index_requested;
+        total.index_estimated_bytes = retained.index_estimated;
+        total.index_scratch_bytes = crate::storage::index::hnsw::search_scratch_bytes();
+        total.row_claim_bytes = retained.row_claims;
+        total.row_pool_bytes = crate::core::row_vec::row_pool_bytes();
+        total.exported_payload_bytes = super::read_memory::exported_payload_bytes();
+        total.transaction_registry_bytes = super::registry::registry_bytes();
+        total.hot_metadata_bytes = super::memory::hot_metadata_bytes();
         total.volume_bytes += volume_bytes.values().sum::<usize>();
         result.push(total);
         result
@@ -2698,12 +2980,9 @@ impl MVCCEngine {
     /// Uses a cached reverse mapping that is rebuilt only when schema_epoch changes.
     /// Returns Arc-wrapped Vec for zero-copy sharing (ref-count bump only).
     /// Zero cost for databases without FK constraints.
-    pub fn find_referencing_fks(
-        &self,
-        parent_table: &str,
-    ) -> Arc<Vec<(String, ForeignKeyConstraint)>> {
-        static EMPTY: std::sync::LazyLock<Arc<Vec<(String, ForeignKeyConstraint)>>> =
-            std::sync::LazyLock::new(|| Arc::new(Vec::new()));
+    pub fn find_referencing_fks(&self, parent_table: &str) -> Arc<ReferencingFks> {
+        static EMPTY: std::sync::LazyLock<Arc<ReferencingFks>> =
+            std::sync::LazyLock::new(|| Arc::new(ReferencingFks::new(Vec::new())));
 
         let current_epoch = self.schema_epoch.load(Ordering::Acquire);
 
@@ -2741,9 +3020,16 @@ impl MVCCEngine {
             }
         }
         // Wrap each Vec in Arc before storing in cache
-        let arc_map: StringMap<Arc<Vec<(String, ForeignKeyConstraint)>>> =
-            map.into_iter().map(|(k, v)| (k, Arc::new(v))).collect();
-        *cache = (current_epoch, arc_map);
+        let arc_map: StringMap<Arc<ReferencingFks>> = map
+            .into_iter()
+            .map(|(k, v)| (k, Arc::new(ReferencingFks::new(v))))
+            .collect();
+        let bytes = hash_table_bytes::<String, Arc<ReferencingFks>>(arc_map.capacity())
+            + arc_map
+                .keys()
+                .map(|name| name.capacity() as u128)
+                .sum::<u128>();
+        *cache = (current_epoch, arc_map, HotMetadataCharge::new(bytes));
 
         cache
             .1
@@ -2753,7 +3039,8 @@ impl MVCCEngine {
     }
 
     /// Creates a new table
-    pub fn create_table(&self, schema: Schema) -> Result<Schema> {
+    pub fn create_table(&self, mut schema: Schema) -> Result<Schema> {
+        schema.refresh_memory_charge();
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -2769,6 +3056,7 @@ impl MVCCEngine {
             schema.clone(),
             registry_as_visibility_checker(&self.registry),
         ));
+        self.hot_memory.register(version_store.memory_account());
 
         // Register virtual PkIndex for INTEGER PRIMARY KEY
         register_pk_index(&schema, &version_store);
@@ -2908,7 +3196,7 @@ impl MVCCEngine {
             let stores = self.version_stores.read().unwrap();
             if let Some(store) = stores.get(&table_name_lower) {
                 let mut vs_schema_guard = store.schema_mut();
-                let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                let vs_schema = &mut *vs_schema_guard;
                 let col = crate::core::SchemaColumn::new(
                     vs_schema.columns.len(),
                     column_name,
@@ -2973,7 +3261,7 @@ impl MVCCEngine {
             let stores = self.version_stores.read().unwrap();
             if let Some(store) = stores.get(&table_name_lower) {
                 let mut vs_schema_guard = store.schema_mut();
-                let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                let vs_schema = &mut *vs_schema_guard;
                 let mut col = crate::core::SchemaColumn::new(
                     vs_schema.columns.len(),
                     column_name,
@@ -3475,7 +3763,7 @@ impl MVCCEngine {
             let stores = self.version_stores.read().unwrap();
             if let Some(store) = stores.get(&table_name_lower) {
                 let mut vs_schema_guard = store.schema_mut();
-                CompactArc::make_mut(&mut *vs_schema_guard).remove_column(column_name)?;
+                vs_schema_guard.remove_column(column_name)?;
             }
         }
 
@@ -3531,7 +3819,7 @@ impl MVCCEngine {
             let stores = self.version_stores.read().unwrap();
             if let Some(store) = stores.get(&table_name_lower) {
                 let mut vs_schema_guard = store.schema_mut();
-                CompactArc::make_mut(&mut *vs_schema_guard).rename_column(old_name, new_name)?;
+                vs_schema_guard.rename_column(old_name, new_name)?;
             }
         }
 
@@ -3622,11 +3910,7 @@ impl MVCCEngine {
             let stores = self.version_stores.read().unwrap();
             if let Some(store) = stores.get(&table_name_lower) {
                 let mut vs_schema_guard = store.schema_mut();
-                CompactArc::make_mut(&mut *vs_schema_guard).modify_column(
-                    column_name,
-                    Some(data_type),
-                    Some(nullable),
-                )?;
+                vs_schema_guard.modify_column(column_name, Some(data_type), Some(nullable))?;
             }
         }
 
@@ -3682,7 +3966,7 @@ impl MVCCEngine {
             let stores = self.version_stores.read().unwrap();
             if let Some(store) = stores.get(&table_name_lower) {
                 let mut vs_schema_guard = store.schema_mut();
-                let vs_schema = CompactArc::make_mut(&mut *vs_schema_guard);
+                let vs_schema = &mut *vs_schema_guard;
                 vs_schema.modify_column(column_name, Some(data_type), Some(nullable))?;
                 // Set vector_dimensions on the modified column
                 if let Some(idx) = vs_schema.get_column_index(column_name) {
@@ -3731,8 +4015,7 @@ impl MVCCEngine {
             }
             if let Some(mut schema_arc) = schemas.remove(&old_name_lower) {
                 let schema = CompactArc::make_mut(&mut schema_arc);
-                schema.table_name = new_name.to_string();
-                schema.table_name_lower = new_name_lower.clone();
+                schema.rename_table(new_name);
                 schemas.insert(new_name_lower.clone(), schema_arc);
             }
         }
@@ -3744,9 +4027,7 @@ impl MVCCEngine {
                 // Update the schema's table name within the store
                 {
                     let mut vs_schema_guard = store.schema_mut();
-                    let schema = CompactArc::make_mut(&mut *vs_schema_guard);
-                    schema.table_name = new_name.to_string();
-                    schema.table_name_lower = new_name_lower.clone();
+                    vs_schema_guard.rename_table(new_name);
                 }
                 stores.insert(new_name_lower.clone(), store);
             }
@@ -3783,9 +4064,7 @@ impl MVCCEngine {
                         if let Some(store) = stores.remove(&new_name_lower) {
                             {
                                 let mut vs_schema_guard = store.schema_mut();
-                                let schema = CompactArc::make_mut(&mut *vs_schema_guard);
-                                schema.table_name = old_name.to_string();
-                                schema.table_name_lower = old_name_lower.clone();
+                                vs_schema_guard.rename_table(old_name);
                             }
                             stores.insert(old_name_lower.clone(), store);
                         }
@@ -3794,8 +4073,7 @@ impl MVCCEngine {
                         let mut schemas = self.schemas.write().unwrap();
                         if let Some(mut schema_arc) = schemas.remove(&new_name_lower) {
                             let schema = CompactArc::make_mut(&mut schema_arc);
-                            schema.table_name = old_name.to_string();
-                            schema.table_name_lower = old_name_lower.clone();
+                            schema.rename_table(old_name);
                             schemas.insert(old_name_lower, schema_arc);
                         }
                         drop(schemas);
@@ -3851,7 +4129,12 @@ impl MVCCEngine {
 
     /// Creates an engine operations wrapper for a transaction
     fn create_engine_operations(&self) -> Arc<dyn TransactionEngineOperations> {
-        Arc::new(EngineOperations::new(self))
+        let mut operations = EngineOperations::new(self);
+        operations.metadata.resize(
+            (arc_allocation_bytes::<EngineOperations>() + EngineOperations::shared_metadata_bytes())
+                as u128,
+        );
+        Arc::new(operations)
     }
 
     /// Undo one failed statement without changing its transaction or savepoints.
@@ -4930,7 +5213,11 @@ impl MVCCEngine {
         self.snapshot_timestamps.write().unwrap().clear();
         {
             let mut fk_cache = self.fk_reverse_cache.write().unwrap();
-            *fk_cache = (u64::MAX, crate::common::StringMap::default());
+            *fk_cache = (
+                u64::MAX,
+                crate::common::StringMap::default(),
+                HotMetadataCharge::default(),
+            );
         }
 
         // === Load snapshot data ===
@@ -5849,6 +6136,8 @@ impl MVCCEngine {
     /// Threshold: 100K rows (first seal) or 10K rows (subsequent seals).
     /// Output is split into target_volume_rows-sized volumes.
     fn seal_hot_buffers(&self) -> Result<()> {
+        let read_scope = Arc::new(super::read_memory::ReadScope::default());
+        let _active_scope = read_scope.enter();
         const SEAL_ROW_THRESHOLD: usize = 100_000;
         const SEAL_INCREMENTAL_THRESHOLD: usize = 10_000;
         let hot_max_rows = self.hot_limits.max_rows.load(Ordering::Relaxed);
@@ -6036,6 +6325,7 @@ impl MVCCEngine {
             }
             let mgr = self.get_or_create_segment_manager(&table_name);
 
+            let mut arena_retirement = store.prepare_arena_retirement(all_rows.len());
             // Seal critical section under exclusive fence: register cold
             // segments + remove hot rows + remove hot index entries.
             // DML operations hold the shared fence, so they cannot race
@@ -6065,12 +6355,16 @@ impl MVCCEngine {
                 let mut all_skipped_inner: Vec<i64> = Vec::new();
                 let all_row_ids: Vec<i64> = all_rows.iter().map(|(id, _)| *id).collect();
                 for batch in all_row_ids.chunks(REMOVE_BATCH_SIZE) {
-                    let (removed, cleanup, skipped) =
-                        store.remove_sealed_rows(batch, &extraction_snapshot);
+                    let (removed, cleanup, skipped) = store.remove_sealed_rows(
+                        batch,
+                        &extraction_snapshot,
+                        &mut arena_retirement,
+                    );
                     store.subtract_committed_row_count(removed);
                     index_cleanups.push(cleanup);
                     all_skipped_inner.extend(skipped);
                 }
+                store.finish_arena_retirement(&mut arena_retirement);
 
                 if !all_skipped_inner.is_empty() {
                     let seal_seq = self.registry.get_current_sequence() as u64;
@@ -6687,10 +6981,16 @@ impl MVCCEngine {
             return 0;
         }
 
-        let stores = self.version_stores.read().unwrap();
+        let stores: Vec<_> = self
+            .version_stores
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
         let mut total_removed = 0;
 
-        for store in stores.values() {
+        for store in stores {
             total_removed += store.cleanup_deleted_rows(max_age);
         }
 
@@ -6742,26 +7042,28 @@ impl MVCCEngine {
 
         let txn_cleaned = self.cleanup_old_transactions(retention);
 
-        let stores = self.version_stores.read().unwrap();
+        let stores: Vec<_> = {
+            let stores = self
+                .version_stores
+                .read()
+                .map_err(|_| Error::internal("version store lock poisoned"))?;
+            if let Some(name) = table_name {
+                vec![stores
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| Error::TableNotFound(name.to_string()))?]
+            } else {
+                stores.values().cloned().collect()
+            }
+        };
 
         let mut rows_cleaned = 0;
         let mut versions_cleaned = 0;
 
-        if let Some(name) = table_name {
-            if let Some(store) = stores.get(name) {
-                rows_cleaned += store.cleanup_deleted_rows(retention);
-                versions_cleaned += store.cleanup_old_previous_versions_with_retention(retention);
-            } else {
-                return Err(crate::core::Error::TableNotFound(name.to_string()));
-            }
-        } else {
-            for store in stores.values() {
-                rows_cleaned += store.cleanup_deleted_rows(retention);
-                versions_cleaned += store.cleanup_old_previous_versions_with_retention(retention);
-            }
+        for store in stores {
+            rows_cleaned += store.cleanup_deleted_rows(retention);
+            versions_cleaned += store.cleanup_old_previous_versions_with_retention(retention);
         }
-
-        drop(stores);
 
         Ok((rows_cleaned, versions_cleaned, txn_cleaned))
     }
@@ -6840,9 +7142,10 @@ impl Drop for CleanupHandle {
 /// from transactions without raw pointers.
 struct EngineOperations {
     /// Shared reference to schemas (each schema is Arc-wrapped to avoid cloning on lookup)
-    schemas: Arc<RwLock<FxHashMap<String, CompactArc<Schema>>>>,
+    schemas: Arc<RwLock<NamedMap<CompactArc<Schema>>>>,
     /// Shared reference to version stores
-    version_stores: Arc<RwLock<FxHashMap<String, Arc<VersionStore>>>>,
+    version_stores: Arc<RwLock<NamedMap<Arc<VersionStore>>>>,
+    hot_memory: Arc<HotMemoryRegistry>,
     /// Shared reference to registry
     registry: Arc<TransactionRegistry>,
     /// Shared reference to transaction version stores cache
@@ -6858,15 +7161,27 @@ struct EngineOperations {
     seal_fence: Arc<parking_lot::RwLock<()>>,
     /// Hot size limits shared with the engine
     hot_limits: Arc<HotLimits>,
+    metadata: HotMetadataCharge,
 }
 
 // EngineOperations is Send + Sync because all fields are Arc-wrapped thread-safe types
 
 impl EngineOperations {
+    fn shared_metadata_bytes() -> usize {
+        arc_allocation_bytes::<AtomicBool>()
+            + arc_allocation_bytes::<parking_lot::RwLock<()>>()
+            + arc_allocation_bytes::<HotLimits>()
+            + arc_allocation_bytes::<Option<PersistenceManager>>()
+            + arc_allocation_bytes::<
+                RwLock<FxHashMap<String, Arc<crate::storage::volume::manifest::SegmentManager>>>,
+            >()
+    }
+
     fn new(engine: &MVCCEngine) -> Self {
         Self {
             schemas: Arc::clone(&engine.schemas),
             version_stores: Arc::clone(&engine.version_stores),
+            hot_memory: Arc::clone(&engine.hot_memory),
             registry: Arc::clone(&engine.registry),
             txn_version_stores: Arc::clone(&engine.txn_version_stores),
             persistence: Arc::clone(&engine.persistence),
@@ -6874,14 +7189,15 @@ impl EngineOperations {
             segment_managers: Arc::clone(&engine.segment_managers),
             seal_fence: Arc::clone(&engine.seal_fence),
             hot_limits: Arc::clone(&engine.hot_limits),
+            metadata: HotMetadataCharge::default(),
         }
     }
 
-    fn schemas(&self) -> &RwLock<FxHashMap<String, CompactArc<Schema>>> {
+    fn schemas(&self) -> &RwLock<NamedMap<CompactArc<Schema>>> {
         &self.schemas
     }
 
-    fn version_stores(&self) -> &RwLock<FxHashMap<String, Arc<VersionStore>>> {
+    fn version_stores(&self) -> &RwLock<NamedMap<Arc<VersionStore>>> {
         &self.version_stores
     }
 
@@ -7145,23 +7461,7 @@ impl TransactionEngineOperations for EngineOperations {
             } else {
                 // Upgrade to write lock and re-check (another thread may have inserted)
                 let mut cache = self.txn_version_stores().write().unwrap();
-                let txn_tables = cache.entry(txn_id).or_default();
-                if let Some((_, cached)) = txn_tables
-                    .iter()
-                    .find(|(name, _)| name == &*table_name_lower)
-                {
-                    Arc::clone(cached)
-                } else {
-                    let new_store = Arc::new(RwLock::new(TransactionVersionStore::new(
-                        Arc::clone(&version_store),
-                        txn_id,
-                    )));
-                    txn_tables.push((
-                        table_name_lower.clone().into_owned().into(),
-                        Arc::clone(&new_store),
-                    ));
-                    new_store
-                }
+                cache.get_or_insert(txn_id, &table_name_lower, &version_store)
             }
         };
 
@@ -7183,25 +7483,26 @@ impl TransactionEngineOperations for EngineOperations {
             let mgrs = self.segment_managers.read().unwrap();
             match mgrs.get(&*table_name_lower) {
                 Some(mgr) if mgr.has_segments() => Arc::clone(mgr),
-                _ => return Ok(Box::new(table)),
+                _ => return Ok(table.into_boxed()),
             }
         };
         if self.registry.get_isolation_level(txn_id) == crate::IsolationLevel::SnapshotIsolation {
             let begin_seq = self.registry.get_transaction_begin_sequence(txn_id) as u64;
             return Ok(Box::new(
                 crate::storage::volume::table::SegmentedTable::with_snapshot_seq(
-                    Box::new(table),
+                    table.into_boxed(),
                     mgr,
                     begin_seq,
                 ),
             ));
         }
         Ok(Box::new(
-            crate::storage::volume::table::SegmentedTable::new(Box::new(table), mgr),
+            crate::storage::volume::table::SegmentedTable::new(table.into_boxed(), mgr),
         ))
     }
 
-    fn create_table(&self, name: &str, schema: Schema) -> Result<Box<dyn Table>> {
+    fn create_table(&self, name: &str, mut schema: Schema) -> Result<Box<dyn Table>> {
+        schema.refresh_memory_charge();
         let table_name = name.to_lowercase();
 
         // Create version store for this table (before acquiring locks)
@@ -7210,6 +7511,7 @@ impl TransactionEngineOperations for EngineOperations {
             schema.clone(),
             registry_as_visibility_checker(&self.registry),
         ));
+        self.hot_memory.register(version_store.memory_account());
 
         // Register PkIndex if table has a primary key
         register_pk_index(&schema, &version_store);
@@ -7233,7 +7535,7 @@ impl TransactionEngineOperations for EngineOperations {
         // Create MVCC table
         let table = MVCCTable::new(0, version_store, txn_versions);
 
-        Ok(Box::new(table))
+        Ok(table.into_boxed())
     }
 
     fn drop_table(&self, name: &str) -> Result<()> {
@@ -7305,8 +7607,7 @@ impl TransactionEngineOperations for EngineOperations {
             }
             if let Some(mut schema_arc) = schemas.remove(&old_name_lower) {
                 let schema = CompactArc::make_mut(&mut schema_arc);
-                schema.table_name = new_name.to_string();
-                schema.table_name_lower = new_name_lower.clone();
+                schema.rename_table(new_name);
                 schemas.insert(new_name_lower.clone(), schema_arc);
             }
         }
@@ -7317,9 +7618,7 @@ impl TransactionEngineOperations for EngineOperations {
             if let Some(store) = stores.remove(&old_name_lower) {
                 {
                     let mut vs_schema_guard = store.schema_mut();
-                    let schema = CompactArc::make_mut(&mut *vs_schema_guard);
-                    schema.table_name = new_name.to_string();
-                    schema.table_name_lower = new_name_lower.clone();
+                    vs_schema_guard.rename_table(new_name);
                 }
                 stores.insert(new_name_lower.clone(), store);
             }
@@ -7348,8 +7647,7 @@ impl TransactionEngineOperations for EngineOperations {
                             let mut schemas = self.schemas().write().unwrap();
                             if let Some(mut schema_arc) = schemas.remove(&new_name_lower) {
                                 let schema = CompactArc::make_mut(&mut schema_arc);
-                                schema.table_name = old_name.to_string();
-                                schema.table_name_lower = old_name_lower.clone();
+                                schema.rename_table(old_name);
                                 schemas.insert(old_name_lower.clone(), schema_arc);
                             }
                         }
@@ -7358,9 +7656,7 @@ impl TransactionEngineOperations for EngineOperations {
                             if let Some(store) = stores.remove(&new_name_lower) {
                                 {
                                     let mut vs_schema_guard = store.schema_mut();
-                                    let schema = CompactArc::make_mut(&mut *vs_schema_guard);
-                                    schema.table_name = old_name.to_string();
-                                    schema.table_name_lower = old_name_lower.clone();
+                                    vs_schema_guard.rename_table(old_name);
                                 }
                                 stores.insert(old_name_lower.clone(), store);
                             }
@@ -7390,51 +7686,6 @@ impl TransactionEngineOperations for EngineOperations {
         }
 
         Ok(())
-    }
-
-    fn commit_table(&self, txn_id: i64, table: &dyn Table) -> Result<()> {
-        // Skip WAL writes during recovery replay
-        if self.should_skip_wal() {
-            return Ok(());
-        }
-
-        // Record DML operations to WAL before the table commits
-        if let Some(ref pm) = self.persistence() {
-            if pm.is_enabled() {
-                let table_name = table.name();
-                let pending = table.get_pending_versions();
-
-                for (row_id, row_data, is_deleted, version_txn_id) in pending {
-                    // Create a RowVersion for serialization
-                    let version = RowVersion {
-                        txn_id: version_txn_id,
-                        deleted_at_txn_id: if is_deleted { version_txn_id } else { 0 },
-                        data: row_data,
-                        create_time: 0, // Not needed for persistence
-                    };
-
-                    // Determine operation type
-                    let op = if is_deleted {
-                        WALOperationType::Delete
-                    } else {
-                        // Check if this is an update vs insert by looking at global store
-                        // For simplicity, we record everything as Insert
-                        // (at replay time, the version store handles deduplication)
-                        WALOperationType::Insert
-                    };
-
-                    pm.record_dml_operation(txn_id, table_name, row_id, op, &version)?;
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn rollback_table(&self, _txn_id: i64, table: &dyn Table) {
-        // The Table trait now has a rollback method.
-        // This callback is for any engine-level rollback actions.
-        let _ = table;
     }
 
     fn record_commit(&self, txn_id: i64) -> Result<()> {
@@ -7492,8 +7743,13 @@ impl TransactionEngineOperations for EngineOperations {
         }
 
         // Phase 2: No hot changes found. Now collect table names for cold check.
+        let _touched_memory;
         let touched_tables: smallvec::SmallVec<[crate::common::SmartString; 4]> =
             txn_tables.iter().map(|(name, _)| name.clone()).collect();
+        _touched_memory = HotMetadataCharge::new(
+            smallvec_bytes(&touched_tables) as u128
+                + touched_tables.iter().map(name_bytes).sum::<u128>(),
+        );
         drop(cache);
 
         // Check cold-side pending tombstones only for tables this txn touched.
@@ -7510,42 +7766,43 @@ impl TransactionEngineOperations for EngineOperations {
         false
     }
 
-    fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>) {
+    fn prepare_commit(&self, txn_id: i64) -> Result<super::version_store::PreparedCommit> {
+        let prepared = {
+            let cache = self
+                .txn_version_stores()
+                .read()
+                .map_err(|_| Error::internal("transaction store lock poisoned"))?;
+            let stores = self
+                .version_stores()
+                .read()
+                .map_err(|_| Error::internal("version store lock poisoned"))?;
+            let tables = cache
+                .get(txn_id)
+                .into_iter()
+                .flat_map(|tables| {
+                    tables
+                        .iter()
+                        .map(|(name, store)| super::version_store::PreparedTable {
+                            name: name.clone(),
+                            txn_store: Arc::clone(store),
+                            version_store: stores.get(name.as_str()).cloned(),
+                        })
+                })
+                .collect();
+            super::version_store::PreparedCommit::new(tables)
+        };
+        prepared.reserve()
+    }
+
+    fn commit_all_tables(
+        &self,
+        txn_id: i64,
+        prepared: &super::version_store::PreparedCommit,
+    ) -> (bool, Option<crate::core::Error>) {
         // Get the commit_seq for this transaction. start_commit() was called before us,
         // so the commit_seq is in the registry. Used for versioned tombstones: snapshot
         // isolation transactions only see tombstones with commit_seq <= their begin_seq.
         let commit_seq = self.registry.get_committing_sequence(txn_id) as u64;
-
-        // Collect table data under the read lock, then drop the lock before WAL I/O.
-        // This prevents blocking concurrent get_table_for_transaction (which needs
-        // a write lock on txn_version_stores) during potentially slow WAL writes.
-        let tables_to_commit: Vec<(
-            crate::common::SmartString,
-            Arc<RwLock<TransactionVersionStore>>,
-            Arc<VersionStore>,
-        )>;
-        {
-            let cache = self.txn_version_stores().read().unwrap();
-            tables_to_commit = if let Some(txn_tables) = cache.get(txn_id) {
-                let stores = self.version_stores().read().unwrap();
-                txn_tables
-                    .iter()
-                    .filter(|(_, txn_store)| {
-                        let store = txn_store.read().unwrap();
-                        store.has_local_changes()
-                    })
-                    .filter_map(|(table_name, txn_store)| {
-                        stores
-                            .get(table_name.as_str())
-                            .cloned()
-                            .map(|vs| (table_name.clone(), Arc::clone(txn_store), vs))
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            // cache (read lock) and stores (read lock) dropped here
-        }
 
         let mut commit_error: Option<crate::core::Error> = None;
         let mut any_committed = false;
@@ -7572,7 +7829,12 @@ impl TransactionEngineOperations for EngineOperations {
         };
 
         // WAL I/O and table commits happen here with NO lock on txn_version_stores
-        for (table_name, txn_store, version_store) in &tables_to_commit {
+        for prepared_table in &prepared.tables {
+            let Some(version_store) = &prepared_table.version_store else {
+                continue;
+            };
+            let table_name = &prepared_table.name;
+            let txn_store = &prepared_table.txn_store;
             // Record cold tombstone DELETEs to WAL FIRST.
             // These must come before hot INSERTs so that on replay,
             // the tombstone marks the cold row as superseded BEFORE
@@ -7685,8 +7947,6 @@ impl TransactionEngineOperations for EngineOperations {
         cache.remove(txn_id);
         drop(cache);
 
-        drop(tables_to_commit);
-
         // Commit or rollback pending tombstones on all segment managers.
         // For tables with hot changes, tombstone WAL entries were already
         // recorded in the per-table loop above. For cold-only changes
@@ -7750,32 +8010,47 @@ impl TransactionEngineOperations for EngineOperations {
         (any_committed, commit_error)
     }
 
-    fn begin_publish(&self, txn_id: i64) -> super::version_store::PublishHold {
+    fn begin_publish(
+        &self,
+        _txn_id: i64,
+        prepared: &super::version_store::PreparedCommit,
+    ) -> Result<super::version_store::PublishHold> {
         let mut hold = super::version_store::PublishHold::default();
-        let cache = self.txn_version_stores().read().unwrap();
-        if let Some(txn_tables) = cache.get(txn_id) {
-            let stores = self.version_stores().read().unwrap();
-            for (table_name, txn_store) in txn_tables.iter() {
-                if !txn_store.read().unwrap().has_local_changes() {
-                    continue;
-                }
-                if let Some(version_store) = stores.get(table_name.as_str()) {
-                    hold.add(version_store, Arc::clone(txn_store));
+        let stores = self
+            .version_stores()
+            .read()
+            .map_err(|_| Error::internal("version store lock poisoned"))?;
+        for table in &prepared.tables {
+            if let Some(version_store) = &table.version_store {
+                if !stores
+                    .get(table.name.as_str())
+                    .is_some_and(|live| Arc::ptr_eq(live, version_store))
+                {
+                    return Err(Error::TransactionAborted);
                 }
             }
         }
-        hold
+        for table in &prepared.tables {
+            if let Some(version_store) = &table.version_store {
+                hold.add(version_store, Arc::clone(&table.txn_store));
+            }
+        }
+        Ok(hold)
     }
 
     fn rollback_all_tables(&self, txn_id: i64) {
         // Collect touched table names BEFORE removing the cache entry,
         // so we only rollback tombstones on tables this txn actually used
         // instead of iterating every segment manager (O(tables) → O(touched)).
+        let _touched_memory;
         let mut cache = self.txn_version_stores().write().unwrap();
         let touched: smallvec::SmallVec<[crate::common::SmartString; 4]> = cache
             .get(txn_id)
             .map(|tables| tables.iter().map(|(name, _)| name.clone()).collect())
             .unwrap_or_default();
+        _touched_memory = HotMetadataCharge::new(
+            smallvec_bytes(&touched) as u128 + touched.iter().map(name_bytes).sum::<u128>(),
+        );
         cache.remove(txn_id);
         drop(cache);
 
@@ -7793,6 +8068,7 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn rollback_dml_after(&self, txn_id: i64, timestamp: i64) {
+        let _touched_memory;
         let cache = self.txn_version_stores().read().unwrap();
         let touched: smallvec::SmallVec<
             [(
@@ -7808,6 +8084,13 @@ impl TransactionEngineOperations for EngineOperations {
                     .collect()
             })
             .unwrap_or_default();
+        _touched_memory = HotMetadataCharge::new(
+            smallvec_bytes(&touched) as u128
+                + touched
+                    .iter()
+                    .map(|(name, _)| name_bytes(name))
+                    .sum::<u128>(),
+        );
         drop(cache);
 
         for (name, txn_store) in &touched {
@@ -7859,17 +8142,22 @@ impl TransactionEngineOperations for EngineOperations {
         }
         // A table whose existing rows this transaction claimed is left out:
         // the seal skips claimed rows, so the wait could not end
+        let _stores_memory;
         let stores: Vec<Arc<VersionStore>> = {
             let cache = self.txn_version_stores().read().unwrap();
             let Some(txn_tables) = cache.get(txn_id) else {
                 return;
             };
             let stores = self.version_stores().read().unwrap();
-            txn_tables
+            let retained: Vec<_> = txn_tables
                 .iter()
                 .filter(|(_, txn_store)| txn_store.read().is_ok_and(|s| !s.holds_hot_rows()))
                 .filter_map(|(table_name, _)| stores.get(table_name.as_str()).cloned())
-                .collect()
+                .collect();
+            _stores_memory = HotMetadataCharge::new(
+                (retained.capacity() * std::mem::size_of::<Arc<VersionStore>>()) as u128,
+            );
+            retained
         };
         let over = || stores.iter().any(|store| store.hot_bytes() >= limit);
         if !over() {
@@ -7898,6 +8186,105 @@ impl TransactionEngineOperations for EngineOperations {
 mod tests {
     use super::*;
     use crate::core::{DataType, IndexType, Row, SchemaBuilder, Value};
+
+    #[test]
+    fn catalog_children_remain_charged_after_replacement_and_drop() {
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+        let parent_name = "parent".repeat(256);
+        let child_name = "child".repeat(256);
+        let column_name = "key".repeat(256);
+        let parent = SchemaBuilder::new(&parent_name)
+            .add_primary_key(&column_name, DataType::Integer)
+            .build();
+        drop(engine.create_table(parent).unwrap());
+        let child = SchemaBuilder::new(&child_name)
+            .add_primary_key(&column_name, DataType::Integer)
+            .add_foreign_key(ForeignKeyConstraint {
+                column_index: 0,
+                column_name: column_name.clone(),
+                referenced_table: parent_name.clone(),
+                referenced_column: column_name.clone(),
+                on_delete: crate::core::ForeignKeyAction::NoAction,
+                on_update: crate::core::ForeignKeyAction::NoAction,
+            })
+            .build();
+        drop(engine.create_table(child).unwrap());
+        let references = engine.find_referencing_fks(&parent_name);
+        let fk_bytes = references._memory.bytes();
+        assert!(fk_bytes >= (child_name.len() + parent_name.len() + 2 * column_name.len()) as u128);
+        engine.drop_table_internal(&child_name).unwrap();
+        assert!(engine.find_referencing_fks(&parent_name).is_empty());
+        assert_eq!(references._memory.bytes(), fk_bytes);
+
+        let query = format!("SELECT 1 /* {} */", "view".repeat(2048));
+        engine
+            .create_view("retained_view", query.clone(), false)
+            .unwrap();
+        let view = engine.get_view_lowercase("retained_view").unwrap().unwrap();
+        let copy = (*view).clone();
+        engine.drop_view("retained_view", false).unwrap();
+        assert!(view.memory.bytes() >= query.len() as u128);
+        assert!(copy.memory.bytes() >= query.len() as u128);
+        assert_eq!(view.query, query);
+        engine.close_engine().unwrap();
+        drop(engine);
+        assert_eq!(references._memory.bytes(), fk_bytes);
+        assert!(view.memory.bytes() >= query.len() as u128);
+    }
+
+    #[test]
+    fn transaction_cache_charges_outer_growth_spills_and_stored_names() {
+        let parent = Arc::new(VersionStore::new("items", Schema::new("items", Vec::new())));
+        let mut cache = TxnVersionStoreMap::new();
+        let initial = cache.charge.bytes();
+        for txn_id in 0..64 {
+            for table in 0..8 {
+                let name = format!("table_with_a_heap_allocated_name_{table}");
+                cache.get_or_insert(txn_id, &name, &parent);
+            }
+        }
+        let names = cache
+            .values()
+            .flat_map(|tables| tables.iter())
+            .map(|(name, _)| name_bytes(name))
+            .sum::<u128>();
+        let buffers = cache
+            .values()
+            .map(|tables| tables.capacity() * std::mem::size_of::<TxnTableEntry>())
+            .sum::<usize>() as u128;
+        assert!(names > 0);
+        assert!(buffers > 0);
+        assert_eq!(cache.nested_bytes, names + buffers);
+        assert_eq!(
+            cache.charge.bytes(),
+            (arc_allocation_bytes::<RwLock<TxnVersionStoreMap>>() + cache.allocation_bytes())
+                as u128
+                + names
+                + buffers,
+        );
+        let before = cache.charge.bytes();
+        cache.get_or_insert(0, "table_with_a_heap_allocated_name_0", &parent);
+        assert_eq!(cache.charge.bytes(), before);
+        for txn_id in 0..64 {
+            cache.remove(txn_id);
+        }
+        assert_eq!(cache.nested_bytes, 0);
+        let empty = cache.charge.bytes();
+        assert!(
+            empty >= initial,
+            "deletion can retain more than the initial capacity"
+        );
+        assert!(empty < before);
+        assert_eq!(
+            empty,
+            (arc_allocation_bytes::<RwLock<TxnVersionStoreMap>>() + cache.allocation_bytes())
+                as u128,
+        );
+        cache.get_or_insert(1, "another_heap_allocated_table_name", &parent);
+        cache.clear();
+        assert_eq!(cache.charge.bytes(), empty);
+    }
 
     #[test]
     fn test_engine_creation() {

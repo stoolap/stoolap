@@ -1579,12 +1579,12 @@ impl SegmentManager {
                     &renames,
                 )
             } else {
-                super::writer::ColumnMapping {
-                    sources: (0..volume.columns.len())
+                super::writer::ColumnMapping::new(
+                    (0..volume.columns.len())
                         .map(super::writer::ColSource::Volume)
                         .collect(),
-                    is_identity: true,
-                }
+                    true,
+                )
             };
             let cold = ColdSegment {
                 volume,
@@ -1629,12 +1629,12 @@ impl SegmentManager {
 
         if let Some(schema_version) = seg_schema_version {
             let cold = ColdSegment {
-                mapping: super::writer::ColumnMapping {
-                    sources: (0..volume.columns.len())
+                mapping: super::writer::ColumnMapping::new(
+                    (0..volume.columns.len())
                         .map(super::writer::ColSource::Volume)
                         .collect(),
-                    is_identity: true,
-                },
+                    true,
+                ),
                 volume,
                 schema_version,
                 visible: None,
@@ -2241,10 +2241,7 @@ impl SegmentManager {
         if let Some(cold) = segs.get(&seg_id) {
             cold.mapping.clone()
         } else {
-            super::writer::ColumnMapping {
-                sources: Vec::new(),
-                is_identity: true,
-            }
+            super::writer::ColumnMapping::new(Vec::new(), true)
         }
     }
 
@@ -2453,12 +2450,12 @@ impl SegmentManager {
             manifest.segments.insert(insert_pos, new_meta);
 
             let cold = ColdSegment {
-                mapping: super::writer::ColumnMapping {
-                    sources: (0..new_volume.columns.len())
+                mapping: super::writer::ColumnMapping::new(
+                    (0..new_volume.columns.len())
                         .map(super::writer::ColSource::Volume)
                         .collect(),
-                    is_identity: true,
-                },
+                    true,
+                ),
                 volume: new_volume,
                 schema_version: seg_schema_version,
                 visible: None,
@@ -2523,12 +2520,12 @@ impl SegmentManager {
                 manifest.segments.insert(insert_pos + i, meta);
 
                 let cold = ColdSegment {
-                    mapping: super::writer::ColumnMapping {
-                        sources: (0..vol.columns.len())
+                    mapping: super::writer::ColumnMapping::new(
+                        (0..vol.columns.len())
                             .map(super::writer::ColSource::Volume)
                             .collect(),
-                        is_identity: true,
-                    },
+                        true,
+                    ),
                     volume: vol,
                     schema_version: seg_schema_version,
                     visible: None,

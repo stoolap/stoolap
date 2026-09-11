@@ -196,6 +196,10 @@ impl<V: Clone> NodePtr<V> {
         ptr
     }
 
+    fn allocation_bytes(&self) -> usize {
+        2 * mem::size_of::<usize>() + self.ptr.len()
+    }
+
     fn make_mut(&mut self) -> &mut Self {
         // Check if this node is shared using our own drop_count.
         // If drop_count > 1, we need to deep clone to maintain COW semantics.
@@ -934,6 +938,7 @@ pub struct CowBTree<V: Clone> {
     max_key: i64,
     /// Number of elements in the tree
     len: usize,
+    node_bytes: usize,
 }
 
 impl<V: Clone> Default for CowBTree<V> {
@@ -950,6 +955,7 @@ impl<V: Clone> Clone for CowBTree<V> {
             root: self.root.clone(),
             max_key: self.max_key,
             len: self.len,
+            node_bytes: self.node_bytes,
         }
     }
 }
@@ -965,6 +971,7 @@ impl<V: Clone> CowBTree<V> {
             root: None,
             max_key: 0,
             len: 0,
+            node_bytes: 0,
         }
     }
 
@@ -973,9 +980,23 @@ impl<V: Clone> CowBTree<V> {
         self.len
     }
 
+    /// Requested node allocations reachable from this root, excluding value-owned heaps.
+    pub(crate) fn node_bytes(&self) -> usize {
+        self.node_bytes
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.root.is_none()
+    }
+
+    #[inline]
+    pub(crate) fn shares_root(&self, other: &Self) -> bool {
+        match (&self.root, &other.root) {
+            (Some(a), Some(b)) => CompactArc::ptr_eq(&a.ptr, &b.ptr),
+            (None, None) => true,
+            _ => false,
+        }
     }
 
     /// Get a value by key. Lock-free, O(log n).
@@ -1036,6 +1057,7 @@ impl<V: Clone> CowBTree<V> {
         if self.root.is_none() {
             let mut node = NodePtr::new_leaf();
             node.push_leaf(key, value);
+            self.node_bytes = node.allocation_bytes();
             self.root = Some(node);
             self.max_key = key;
             self.len = 1;
@@ -1045,7 +1067,7 @@ impl<V: Clone> CowBTree<V> {
         // Fast path for sequential inserts: if key > max key, append to rightmost leaf
         if self.is_key_greater_than_max(key) {
             let root = self.root.as_mut().unwrap();
-            let result = Self::insert_rightmost(root, key, value);
+            let result = Self::insert_rightmost(root, key, value, &mut self.node_bytes);
             self.max_key = key;
 
             return match result {
@@ -1058,6 +1080,7 @@ impl<V: Clone> CowBTree<V> {
                 InsertResult::Split(median, right) => {
                     let old_root = self.root.take().unwrap();
                     let mut new_root = NodePtr::new_internal();
+                    self.node_bytes += new_root.allocation_bytes();
 
                     // SAFETY: new_root is a freshly created internal node with len=0.
                     // We write old_root to children[0]. Internal nodes have len+1 children,
@@ -1081,7 +1104,7 @@ impl<V: Clone> CowBTree<V> {
         }
 
         let root = self.root.as_mut().unwrap();
-        let result = Self::insert_recursive(root, key, value);
+        let result = Self::insert_recursive(root, key, value, &mut self.node_bytes);
 
         if key > self.max_key {
             self.max_key = key;
@@ -1097,6 +1120,7 @@ impl<V: Clone> CowBTree<V> {
             InsertResult::Split(median, right) => {
                 let old_root = self.root.take().unwrap();
                 let mut new_root = NodePtr::new_internal();
+                self.node_bytes += new_root.allocation_bytes();
                 // SAFETY: new_root is a freshly created internal node with len=0.
                 // We write old_root to children[0]. Internal nodes have len+1 children,
                 // so with len=0 we have space for 1 child at index 0. old_root is moved
@@ -1124,8 +1148,13 @@ impl<V: Clone> CowBTree<V> {
     }
 
     /// Fast path: insert into rightmost leaf (for sequential inserts)
-    fn insert_rightmost(node: &mut NodePtr<V>, key: i64, value: V) -> InsertResult<V> {
-        let (res, _) = Self::insert_rightmost_return_ptr(node, key, value);
+    fn insert_rightmost(
+        node: &mut NodePtr<V>,
+        key: i64,
+        value: V,
+        node_bytes: &mut usize,
+    ) -> InsertResult<V> {
+        let (res, _) = Self::insert_rightmost_return_ptr(node, key, value, node_bytes);
         res
     }
 
@@ -1133,6 +1162,7 @@ impl<V: Clone> CowBTree<V> {
         node: &mut NodePtr<V>,
         key: i64,
         value: V,
+        node_bytes: &mut usize,
     ) -> (InsertResult<V>, *mut V) {
         let node = node.make_mut();
 
@@ -1152,6 +1182,7 @@ impl<V: Clone> CowBTree<V> {
                 if node.len() > MAX_KEYS {
                     // Use rightmost split: keeps MAX_KEYS in left, moves 1 to right
                     let (median, right) = node.split_leaf_rightmost();
+                    *node_bytes += right.allocation_bytes();
                     // After rightmost split, the inserted value is at right[0]
                     let v_ptr_new =
                         right.ptr.data_ptr_mut().add(NodePtr::<V>::values_offset()) as *mut V;
@@ -1163,7 +1194,7 @@ impl<V: Clone> CowBTree<V> {
         } else {
             let last_idx = node.len();
             let child = node.child_mut(last_idx);
-            let (result, ptr) = Self::insert_rightmost_return_ptr(child, key, value);
+            let (result, ptr) = Self::insert_rightmost_return_ptr(child, key, value, node_bytes);
 
             match result {
                 InsertResult::Done(old) => (InsertResult::Done(old), ptr),
@@ -1173,6 +1204,7 @@ impl<V: Clone> CowBTree<V> {
                     if node.len() > MAX_KEYS {
                         // Use rightmost split for internal nodes too
                         let (m, r) = node.split_internal_rightmost();
+                        *node_bytes += r.allocation_bytes();
                         (InsertResult::Split(m, r), ptr)
                     } else {
                         (InsertResult::Done(None), ptr)
@@ -1182,7 +1214,12 @@ impl<V: Clone> CowBTree<V> {
         }
     }
 
-    fn insert_recursive(node: &mut NodePtr<V>, key: i64, value: V) -> InsertResult<V> {
+    fn insert_recursive(
+        node: &mut NodePtr<V>,
+        key: i64,
+        value: V,
+        node_bytes: &mut usize,
+    ) -> InsertResult<V> {
         let node = node.make_mut();
 
         if node.is_leaf() {
@@ -1209,6 +1246,7 @@ impl<V: Clone> CowBTree<V> {
                         } else {
                             node.split_leaf()
                         };
+                        *node_bytes += right.allocation_bytes();
                         InsertResult::Split(median, right)
                     } else {
                         InsertResult::Done(None)
@@ -1221,7 +1259,7 @@ impl<V: Clone> CowBTree<V> {
                 Err(i) => i,
             };
 
-            let result = Self::insert_recursive(node.child_mut(i), key, value);
+            let result = Self::insert_recursive(node.child_mut(i), key, value, node_bytes);
 
             match result {
                 InsertResult::Done(old) => InsertResult::Done(old),
@@ -1235,6 +1273,7 @@ impl<V: Clone> CowBTree<V> {
                         } else {
                             node.split_internal()
                         };
+                        *node_bytes += r.allocation_bytes();
                         InsertResult::Split(m, r)
                     } else {
                         InsertResult::Done(None)
@@ -1247,7 +1286,7 @@ impl<V: Clone> CowBTree<V> {
     /// Remove a key. Returns the value if it existed.
     pub fn remove(&mut self, key: i64) -> Option<V> {
         let root = self.root.as_mut()?;
-        let result = Self::remove_recursive(root, key);
+        let result = Self::remove_recursive(root, key, &mut self.node_bytes);
 
         if result.is_some() {
             self.len -= 1;
@@ -1255,6 +1294,7 @@ impl<V: Clone> CowBTree<V> {
             if self.len == 0 {
                 self.root = None;
                 self.max_key = 0;
+                self.node_bytes = 0;
             } else if self.max_key == key {
                 self.refresh_max_key();
             }
@@ -1263,10 +1303,12 @@ impl<V: Clone> CowBTree<V> {
                 let root = root.make_mut();
                 if !root.is_leaf() && root.len() == 0 {
                     let child_node = root.child_mut(0).clone();
+                    self.node_bytes -= root.allocation_bytes();
                     self.root = Some(child_node);
                 } else if root.is_leaf() && root.len() == 0 {
                     self.root = None;
                     self.max_key = 0;
+                    self.node_bytes = 0;
                 }
             }
         }
@@ -1313,6 +1355,7 @@ impl<V: Clone> CowBTree<V> {
         path: &NodePath,
         depth: usize,
         leaf_idx: usize,
+        node_bytes: &mut usize,
     ) -> (InsertResult<V>, *mut V) {
         let node = node_ptr.make_mut();
 
@@ -1323,6 +1366,7 @@ impl<V: Clone> CowBTree<V> {
 
             if node.len() > MAX_KEYS {
                 let (median, right_node) = node.split_leaf();
+                *node_bytes += right_node.allocation_bytes();
                 // Must match split_leaf's mid calculation: self.len() / 2
                 // Before split, len was MAX_KEYS + 1, so mid = (MAX_KEYS + 1) / 2 = MAX_KEYS.div_ceil(2)
                 let mid = MAX_KEYS.div_ceil(2);
@@ -1365,8 +1409,15 @@ impl<V: Clone> CowBTree<V> {
         } else {
             let i = path.get(depth);
 
-            let (result, ptr) =
-                Self::insert_with_path(node.child_mut(i), key, value, path, depth + 1, leaf_idx);
+            let (result, ptr) = Self::insert_with_path(
+                node.child_mut(i),
+                key,
+                value,
+                path,
+                depth + 1,
+                leaf_idx,
+                node_bytes,
+            );
 
             match result {
                 InsertResult::Done(old) => (InsertResult::Done(old), ptr),
@@ -1380,6 +1431,7 @@ impl<V: Clone> CowBTree<V> {
                         } else {
                             node.split_internal()
                         };
+                        *node_bytes += r.allocation_bytes();
                         (InsertResult::Split(m, r), ptr)
                     } else {
                         (InsertResult::Done(None), ptr)
@@ -1404,7 +1456,7 @@ impl<V: Clone> CowBTree<V> {
         }
     }
 
-    fn remove_recursive(node: &mut NodePtr<V>, key: i64) -> Option<V> {
+    fn remove_recursive(node: &mut NodePtr<V>, key: i64, node_bytes: &mut usize) -> Option<V> {
         let node = node.make_mut();
 
         if node.is_leaf() {
@@ -1419,7 +1471,7 @@ impl<V: Clone> CowBTree<V> {
             };
 
             if node.child(i).len() <= MIN_KEYS {
-                Self::ensure_child_can_lose_key(node, i);
+                Self::ensure_child_can_lose_key(node, i, node_bytes);
             }
 
             let new_i = match node.search(key) {
@@ -1428,11 +1480,11 @@ impl<V: Clone> CowBTree<V> {
             };
 
             let i = new_i.min(node.len()); // Children len is len+1. Max index len.
-            Self::remove_recursive(node.child_mut(i), key)
+            Self::remove_recursive(node.child_mut(i), key, node_bytes)
         }
     }
 
-    fn ensure_child_can_lose_key(node: &mut NodePtr<V>, i: usize) {
+    fn ensure_child_can_lose_key(node: &mut NodePtr<V>, i: usize, node_bytes: &mut usize) {
         let can_borrow_left = i > 0 && node.child(i - 1).len() > MIN_KEYS;
         let can_borrow_right = i < node.len() && node.child(i + 1).len() > MIN_KEYS;
 
@@ -1441,9 +1493,13 @@ impl<V: Clone> CowBTree<V> {
         } else if can_borrow_right {
             node.borrow_from_right(i);
         } else if i > 0 {
+            let removed_bytes = node.child(i).allocation_bytes();
             node.merge_with_left(i);
+            *node_bytes -= removed_bytes;
         } else if i < node.len() {
+            let removed_bytes = node.child(i + 1).allocation_bytes();
             node.merge_with_right(i);
+            *node_bytes -= removed_bytes;
         }
     }
 
@@ -1521,6 +1577,7 @@ impl<V: Clone> CowBTree<V> {
         self.root = None;
         self.max_key = 0;
         self.len = 0;
+        self.node_bytes = 0;
     }
 
     /// Returns the cached maximum key, or None if the tree is empty.
@@ -1535,7 +1592,8 @@ impl<V: Clone> CowBTree<V> {
 
     fn insert_rightmost_entry(&mut self, key: i64, value: V) -> *mut V {
         let root = self.root.as_mut().unwrap();
-        let (result, ptr) = Self::insert_rightmost_return_ptr(root, key, value);
+        let (result, ptr) =
+            Self::insert_rightmost_return_ptr(root, key, value, &mut self.node_bytes);
         self.max_key = key;
 
         match result {
@@ -1547,6 +1605,7 @@ impl<V: Clone> CowBTree<V> {
             InsertResult::Split(median, right) => {
                 let old_root = self.root.take().unwrap();
                 let mut new_root = NodePtr::new_internal();
+                self.node_bytes += new_root.allocation_bytes();
                 // SAFETY: new_root is a freshly created internal node with len=0.
                 // We write old_root to children[0]. Internal nodes have len+1 children,
                 // so with len=0 we have space for 1 child at index 0. old_root is moved
@@ -1616,7 +1675,8 @@ impl<V: Clone> CowBTree<V> {
         }
 
         let root = self.root.as_mut().unwrap();
-        let (result, ptr) = Self::insert_with_path(root, key, value, path, 0, leaf_idx);
+        let (result, ptr) =
+            Self::insert_with_path(root, key, value, path, 0, leaf_idx, &mut self.node_bytes);
 
         if key > self.max_key {
             self.max_key = key;
@@ -1631,6 +1691,7 @@ impl<V: Clone> CowBTree<V> {
             InsertResult::Split(median, right) => {
                 let old_root = self.root.take().unwrap();
                 let mut new_root = NodePtr::new_internal();
+                self.node_bytes += new_root.allocation_bytes();
                 // SAFETY: new_root is a freshly created internal node with len=0.
                 // We write old_root to children[0]. Internal nodes have len+1 children,
                 // so with len=0 we have space for 1 child at index 0. old_root is moved
@@ -2410,7 +2471,101 @@ mod tests {
 
     #[test]
     fn test_memory_size() {
-        assert!(std::mem::size_of::<CowBTree<i64>>() <= 24);
+        assert!(std::mem::size_of::<CowBTree<i64>>() <= 32);
+    }
+
+    fn assert_node_bytes<V: Clone>(tree: &CowBTree<V>) {
+        fn walk<V: Clone>(node: &NodePtr<V>) -> usize {
+            2 * mem::size_of::<usize>()
+                + node.ptr.len()
+                + if node.is_leaf() {
+                    0
+                } else {
+                    node.children().iter().map(walk).sum()
+                }
+        }
+        assert_eq!(tree.node_bytes(), tree.root.as_ref().map_or(0, walk));
+    }
+
+    #[test]
+    fn node_bytes_follow_insert_paths_and_retained_roots() {
+        for use_entry in [false, true] {
+            for sequential in [false, true] {
+                let mut tree = CowBTree::new();
+                let mut snapshots = Vec::new();
+                for i in 0..20_003 {
+                    let key = if sequential { i } else { i * 7919 % 20_003 };
+                    if use_entry {
+                        tree.entry(key).or_insert(key);
+                    } else {
+                        tree.insert(key, key);
+                    }
+                    if i % 128 == 0 {
+                        assert_node_bytes(&tree);
+                    }
+                    if i % 4096 == 0 {
+                        snapshots.push(tree.clone());
+                    }
+                }
+                let allocated = tree.node_bytes();
+                tree.insert(10, -10);
+                *tree.entry(11).or_insert(0) = -11;
+                *tree.get_mut(12).unwrap() = -12;
+                assert_eq!(tree.node_bytes(), allocated);
+                assert_node_bytes(&tree);
+
+                for i in 0..20_003 {
+                    tree.remove(i * 7919 % 20_003);
+                    if i % 128 == 0 {
+                        assert_node_bytes(&tree);
+                    }
+                }
+                assert_eq!(tree.node_bytes(), 0);
+                for snapshot in &snapshots {
+                    assert_node_bytes(snapshot);
+                }
+                tree.insert(1, 1);
+                assert_node_bytes(&tree);
+                tree.clear();
+                assert_eq!(tree.node_bytes(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn node_bytes_follow_local_end_splits() {
+        let mut tree = CowBTree::new();
+        for key in 0..MAX_KEYS as i64 {
+            tree.insert(key, key);
+        }
+        for key in (i64::MAX - 20_000..=i64::MAX).rev() {
+            tree.insert(key, key);
+            if key % 128 == 0 {
+                assert_node_bytes(&tree);
+            }
+        }
+        assert_node_bytes(&tree);
+    }
+
+    #[test]
+    fn node_bytes_follow_merge_on_missing_remove() {
+        let mut tree = CowBTree::new();
+        for key in 0..=MAX_KEYS as i64 {
+            tree.insert(key, key);
+        }
+        for key in 0..(MAX_KEYS - MIN_KEYS) as i64 {
+            tree.remove(key);
+        }
+        let snapshot = tree.clone();
+        let before = tree.node_bytes();
+        assert_eq!(tree.remove(-1), None);
+        assert!(tree.node_bytes() < before);
+        assert_eq!(tree.root.as_ref().unwrap().len(), 0);
+        assert_node_bytes(&tree);
+        assert_node_bytes(&snapshot);
+        tree.remove(MAX_KEYS as i64);
+        assert!(tree.root.as_ref().unwrap().is_leaf());
+        assert_node_bytes(&tree);
     }
 
     #[test]

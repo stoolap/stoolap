@@ -75,14 +75,14 @@ pub enum PkValueSource {
 pub struct CompiledPkLookup {
     /// Table name (already lowercased)
     pub table_name: SmartString,
-    /// Cached schema
-    pub schema: CompactArc<Schema>,
     /// Pre-computed column names for result (CompactArc<Vec<String>> for zero-copy O(1) clone on execution)
     pub column_names: CompactArc<Vec<String>>,
     /// How to extract the PK value
     pub pk_value_source: PkValueSource,
     /// Schema epoch at compilation time (for fast cache invalidation)
     pub cached_epoch: u64,
+    /// Owns schema metadata until the shared column names are released.
+    pub schema: CompactArc<Schema>,
 }
 
 /// Pre-compiled update column assignment

@@ -44,13 +44,17 @@
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 use ahash::AHashMap;
-use roaring::RoaringTreemap;
+use roaring::{RoaringBitmap, RoaringTreemap};
 
 use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
+use crate::storage::index::memory::{
+    btree_node_bytes, hash_table_bytes, value_bytes, IndexMemory, IndexMemoryOwner, IndexValueMap,
+};
 use crate::storage::traits::Index;
 
 /// Warning threshold for cardinality
@@ -85,18 +89,170 @@ pub struct BitmapIndex {
     is_unique: bool,
     closed: AtomicBool,
 
-    /// One bitmap per distinct value
-    /// Maps CompactArc<Value> -> RoaringTreemap of row IDs (supports full u64 range)
-    /// Uses CompactArc<Value> keys for memory efficiency (8 bytes per key)
-    /// AHash for HashDoS resistance (user-controlled indexed values)
-    bitmaps: RwLock<AHashMap<CompactArc<Value>, RoaringTreemap>>,
+    /// One bitmap per distinct value, using AHash for user-controlled keys.
+    bitmaps: RwLock<BitmapStorage>,
 
     /// Reverse mapping: row_id -> CompactArc<Value> for efficient removal
     /// Uses I64Map for fast O(1) lookups and CompactArc<Value> (8 bytes per entry)
-    row_to_value: RwLock<I64Map<CompactArc<Value>>>,
+    row_to_value: RwLock<IndexValueMap>,
 
     /// Track cardinality for warnings
     distinct_count: AtomicUsize,
+    memory: IndexMemoryOwner,
+}
+
+struct BitmapRows {
+    rows: RoaringTreemap,
+    containers: usize,
+    submaps: usize,
+    peak_containers: usize,
+    present_row: u64,
+    payload_bound: u64,
+}
+
+impl Default for BitmapRows {
+    fn default() -> Self {
+        Self {
+            rows: RoaringTreemap::new(),
+            containers: 0,
+            submaps: 0,
+            peak_containers: 0,
+            present_row: u64::MAX,
+            payload_bound: 0,
+        }
+    }
+}
+
+impl BitmapRows {
+    fn occupancy(&self, row_id: u64) -> (bool, bool) {
+        if self.present_row >> 16 == row_id >> 16 {
+            return (true, true);
+        }
+        let mut rows = self.rows.iter();
+        rows.advance_to(row_id & !0xffff);
+        let next = rows.next();
+        if next.is_some_and(|found| found >> 16 == row_id >> 16) {
+            return (true, true);
+        }
+        if self.present_row >> 32 == row_id >> 32
+            || next.is_some_and(|found| found >> 32 == row_id >> 32)
+        {
+            return (false, true);
+        }
+        let mut rows = self.rows.iter();
+        rows.advance_to(row_id & !0xffff_ffff);
+        (
+            false,
+            rows.next().is_some_and(|found| found >> 32 == row_id >> 32),
+        )
+    }
+
+    fn insert(&mut self, row_id: u64) {
+        debug_assert!(row_id <= i64::MAX as u64);
+        let (container_exists, submap_exists) = self.occupancy(row_id);
+        if self.rows.insert(row_id) {
+            if container_exists {
+                self.payload_bound += 4;
+            } else {
+                self.containers += 1;
+                self.peak_containers = self.peak_containers.max(self.containers);
+                self.submaps += usize::from(!submap_exists);
+                self.payload_bound += 8;
+            }
+            self.payload_bound = self.payload_bound.min(8192 * self.containers as u64);
+        }
+        self.present_row = row_id;
+    }
+
+    fn remove(&mut self, row_id: u64) {
+        if !self.rows.remove(row_id) {
+            return;
+        }
+        if self.present_row == row_id {
+            self.present_row = u64::MAX;
+        }
+        let (container_exists, submap_exists) = self.occupancy(row_id);
+        if !container_exists {
+            self.containers -= 1;
+            self.submaps -= usize::from(!submap_exists);
+            self.payload_bound -= 8;
+            self.payload_bound = self.payload_bound.min(8192 * self.containers as u64);
+        }
+    }
+
+    fn estimated_bytes(&self) -> u128 {
+        if self.containers == 0 {
+            return 0;
+        }
+        // Roaring point mutations retain container-directory capacity on deletion.
+        let directory =
+            64 * self.submaps as u128 * (2 * self.peak_containers.min(65536)).max(4) as u128;
+        self.payload_bound as u128
+            + directory
+            + btree_node_bytes::<u32, RoaringBitmap>(self.submaps)
+    }
+}
+
+impl std::ops::Deref for BitmapRows {
+    type Target = RoaringTreemap;
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
+}
+
+#[derive(Default)]
+struct BitmapStorage {
+    map: AHashMap<CompactArc<Value>, BitmapRows>,
+    key_bytes: u128,
+    bitmap_bytes: u128,
+    capacity_high_water: usize,
+}
+
+impl BitmapStorage {
+    fn estimated_bytes(&self) -> u128 {
+        self.bitmap_bytes
+            + hash_table_bytes::<CompactArc<Value>, BitmapRows>(self.capacity_high_water)
+    }
+
+    fn add(&mut self, value: &CompactArc<Value>, row_id: u64) -> bool {
+        let mut new_key = false;
+        let bitmap = self.map.entry(CompactArc::clone(value)).or_insert_with(|| {
+            new_key = true;
+            self.key_bytes += value_bytes(value);
+            BitmapRows::default()
+        });
+        let before = bitmap.estimated_bytes();
+        bitmap.insert(row_id);
+        self.bitmap_bytes = self.bitmap_bytes - before + bitmap.estimated_bytes();
+        self.capacity_high_water = self.capacity_high_water.max(self.map.capacity());
+        new_key
+    }
+
+    fn remove(&mut self, value: &CompactArc<Value>, row_id: u64) -> bool {
+        let Some(bitmap) = self.map.get_mut(value) else {
+            return false;
+        };
+        let before = bitmap.estimated_bytes();
+        bitmap.remove(row_id);
+        self.bitmap_bytes = self.bitmap_bytes - before + bitmap.estimated_bytes();
+        if bitmap.is_empty() {
+            if let Some((stored, _)) = self.map.remove_entry(value) {
+                self.key_bytes -= value_bytes(&stored);
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl std::ops::Deref for BitmapStorage {
+    type Target = AHashMap<CompactArc<Value>, BitmapRows>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
 }
 
 impl std::fmt::Debug for BitmapIndex {
@@ -131,6 +287,21 @@ impl BitmapIndex {
         is_unique: bool,
         expected_rows: usize,
     ) -> Self {
+        let map = if expected_rows > 0 {
+            I64Map::with_capacity(expected_rows)
+        } else {
+            I64Map::new()
+        };
+        let requested = name.capacity() as u128
+            + table_name.capacity() as u128
+            + (column_names.capacity() * std::mem::size_of::<String>()) as u128
+            + column_names
+                .iter()
+                .map(|name| name.capacity() as u128)
+                .sum::<u128>()
+            + (column_ids.capacity() * std::mem::size_of::<i32>()) as u128
+            + (data_types.capacity() * std::mem::size_of::<DataType>()) as u128
+            + map.allocation_bytes() as u128;
         Self {
             name,
             table_name,
@@ -139,14 +310,32 @@ impl BitmapIndex {
             data_types,
             is_unique,
             closed: AtomicBool::new(false),
-            bitmaps: RwLock::new(AHashMap::default()),
-            row_to_value: RwLock::new(if expected_rows > 0 {
-                I64Map::with_capacity(expected_rows)
-            } else {
-                I64Map::new()
+            bitmaps: RwLock::new(BitmapStorage::default()),
+            row_to_value: RwLock::new(IndexValueMap {
+                map,
+                payload_bytes: 0,
             }),
             distinct_count: AtomicUsize::new(0),
+            memory: IndexMemoryOwner::new::<Self>(requested, 0),
         }
+    }
+
+    fn mutate(
+        &self,
+        mutation: impl FnOnce(&mut BitmapStorage, &mut IndexValueMap) -> Result<()>,
+    ) -> Result<()> {
+        let mut bitmaps = self.bitmaps.write();
+        let mut reverse = self.row_to_value.write();
+        let before = bitmaps.key_bytes + reverse.requested_bytes();
+        let estimated_before = bitmaps.estimated_bytes();
+        let result = mutation(&mut bitmaps, &mut reverse);
+        self.memory
+            .account
+            .resize(before, bitmaps.key_bytes + reverse.requested_bytes());
+        self.memory
+            .account
+            .resize_estimate(estimated_before, bitmaps.estimated_bytes());
+        result
     }
 
     /// Get the current cardinality (number of distinct values)
@@ -164,7 +353,7 @@ impl BitmapIndex {
         // Intern value to get Arc for lookup
         let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
         let bitmaps = self.bitmaps.read();
-        bitmaps.get(&arc_key).cloned()
+        bitmaps.get(&arc_key).map(|bitmap| bitmap.rows.clone())
     }
 
     /// Perform AND operation on multiple values (for multi-predicate queries)
@@ -177,8 +366,8 @@ impl BitmapIndex {
             let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
             if let Some(bitmap) = bitmaps.get(&arc_key) {
                 result = Some(match result {
-                    Some(r) => r & bitmap,
-                    None => bitmap.clone(),
+                    Some(r) => r & &bitmap.rows,
+                    None => bitmap.rows.clone(),
                 });
             } else {
                 // Value not found - result is empty
@@ -198,7 +387,7 @@ impl BitmapIndex {
         for value in values {
             let arc_key = self.value_to_arc_key(std::slice::from_ref(value));
             if let Some(bitmap) = bitmaps.get(&arc_key) {
-                result |= bitmap;
+                result |= &bitmap.rows;
             }
         }
 
@@ -215,12 +404,12 @@ impl BitmapIndex {
         // Get all row IDs (union of all bitmaps)
         let mut all_rows = RoaringTreemap::new();
         for bitmap in bitmaps.values() {
-            all_rows |= bitmap;
+            all_rows |= &bitmap.rows;
         }
 
         // Subtract the matching bitmap
         if let Some(bitmap) = bitmaps.get(&arc_key) {
-            all_rows - bitmap
+            all_rows - &bitmap.rows
         } else {
             all_rows
         }
@@ -255,8 +444,8 @@ impl BitmapIndex {
         values: &[Value],
         row_id: i64,
         row_id_u64: u64,
-        mut bitmaps: parking_lot::RwLockWriteGuard<'_, AHashMap<CompactArc<Value>, RoaringTreemap>>,
-        mut row_to_value: parking_lot::RwLockWriteGuard<'_, I64Map<CompactArc<Value>>>,
+        bitmaps: &mut BitmapStorage,
+        row_to_value: &mut IndexValueMap,
     ) -> Result<()> {
         // Create composite key for multi-column lookup
         let arc_key = self.value_to_arc_key(values);
@@ -286,21 +475,15 @@ impl BitmapIndex {
 
         // Check if row already exists with a different value
         if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
-            if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
-                if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
-                    old_bitmap.remove(row_id_u64);
-                    if old_bitmap.is_empty() {
-                        bitmaps.remove(&old_arc_key);
-                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
-                    }
-                }
+            if !CompactArc::ptr_eq(&old_arc_key, &arc_key)
+                && bitmaps.remove(&old_arc_key, row_id_u64)
+            {
+                self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
             }
         }
 
         // Add to bitmap
-        let is_new_value = !bitmaps.contains_key(&arc_key);
-        let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
-        bitmap.insert(row_id_u64);
+        let is_new_value = bitmaps.add(&arc_key, row_id_u64);
 
         // Update reverse mapping
         row_to_value.insert(row_id, arc_key);
@@ -314,6 +497,10 @@ impl BitmapIndex {
 }
 
 impl Index for BitmapIndex {
+    fn memory_account(&self) -> Option<&Arc<IndexMemory>> {
+        Some(&self.memory.account)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -349,77 +536,73 @@ impl Index for BitmapIndex {
             )));
         }
 
-        // Acquire write locks
-        let mut bitmaps = self.bitmaps.write();
-        let mut row_to_value = self.row_to_value.write();
-
-        // Build lookup key (for single-column, just the first value)
-        let lookup_value = if values.len() == 1 {
-            &values[0]
-        } else {
-            // For multi-column, we need to create a composite key for lookup
-            // This is less common but supported
-            return self.add_multi_column_slow(values, row_id, row_id_u64, bitmaps, row_to_value);
-        };
-
-        // Check uniqueness constraint (using Borrow trait for &Value lookup)
-        if self.is_unique && !lookup_value.is_null() {
-            if let Some(bitmap) = bitmaps.get(lookup_value) {
-                // Check if there's already a row with this value (excluding current row)
-                let existing_count = if bitmap.contains(row_id_u64) {
-                    bitmap.len() - 1
-                } else {
-                    bitmap.len()
-                };
-                if existing_count > 0 {
-                    return Err(Error::unique_constraint(
-                        &self.name,
-                        self.column_names.join(", "),
-                        format!("{:?}", lookup_value),
-                    ));
-                }
-            }
-        }
-
-        // Try to reuse existing Arc if value already exists (O(1) clone)
-        // Only create new Arc if this is a new unique value
-        let (arc_key, is_new_value) =
-            if let Some((existing_arc, _)) = bitmaps.get_key_value(lookup_value) {
-                // Value exists - reuse the existing Arc (O(1) atomic refcount bump)
-                (CompactArc::clone(existing_arc), false)
+        self.mutate(|bitmaps, row_to_value| {
+            // Build lookup key (for single-column, just the first value)
+            let lookup_value = if values.len() == 1 {
+                &values[0]
             } else {
-                // New unique value - create Arc once
-                (CompactArc::new(lookup_value.clone()), true)
+                // For multi-column, we need to create a composite key for lookup
+                // This is less common but supported
+                return self.add_multi_column_slow(
+                    values,
+                    row_id,
+                    row_id_u64,
+                    bitmaps,
+                    row_to_value,
+                );
             };
 
-        // Check if row already exists with a different value (for updates)
-        if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
-            // Compare Arc pointers - if same Arc, same value
-            if !CompactArc::ptr_eq(&old_arc_key, &arc_key) {
-                // Remove from old bitmap
-                if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
-                    old_bitmap.remove(row_id_u64);
-                    if old_bitmap.is_empty() {
-                        bitmaps.remove(&old_arc_key);
-                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
+            // Check uniqueness constraint (using Borrow trait for &Value lookup)
+            if self.is_unique && !lookup_value.is_null() {
+                if let Some(bitmap) = bitmaps.get(lookup_value) {
+                    // Check if there's already a row with this value (excluding current row)
+                    let existing_count = if bitmap.contains(row_id_u64) {
+                        bitmap.len() - 1
+                    } else {
+                        bitmap.len()
+                    };
+                    if existing_count > 0 {
+                        return Err(Error::unique_constraint(
+                            &self.name,
+                            self.column_names.join(", "),
+                            format!("{:?}", lookup_value),
+                        ));
                     }
                 }
             }
-        }
 
-        // Add to bitmap
-        let bitmap = bitmaps.entry(CompactArc::clone(&arc_key)).or_default();
-        bitmap.insert(row_id_u64);
+            // Try to reuse existing Arc if value already exists (O(1) clone)
+            // Only create new Arc if this is a new unique value
+            let arc_key = if let Some((existing_arc, _)) = bitmaps.get_key_value(lookup_value) {
+                // Value exists - reuse the existing Arc (O(1) atomic refcount bump)
+                CompactArc::clone(existing_arc)
+            } else {
+                // New unique value - create Arc once
+                CompactArc::new(lookup_value.clone())
+            };
 
-        // Update reverse mapping with Arc reference
-        row_to_value.insert(row_id, arc_key);
+            // Check if row already exists with a different value (for updates)
+            if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
+                if !CompactArc::ptr_eq(&old_arc_key, &arc_key)
+                    && bitmaps.remove(&old_arc_key, row_id_u64)
+                {
+                    self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
+                }
+            }
 
-        // Update cardinality if this is a new distinct value
-        if is_new_value {
-            self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
-        }
+            // Add to bitmap
+            let is_new_value = bitmaps.add(&arc_key, row_id_u64);
 
-        Ok(())
+            // Update reverse mapping with Arc reference
+            row_to_value.insert(row_id, arc_key);
+
+            // Update cardinality if this is a new distinct value
+            if is_new_value {
+                self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
+            }
+
+            Ok(())
+        })
     }
 
     fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
@@ -446,22 +629,15 @@ impl Index for BitmapIndex {
         // Intern value to get Arc key for lookup
         let arc_key = self.value_to_arc_key(values);
 
-        let mut bitmaps = self.bitmaps.write();
-        let mut row_to_value = self.row_to_value.write();
-
-        // Remove from bitmap
-        if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
-            bitmap.remove(row_id_u64);
-            if bitmap.is_empty() {
-                bitmaps.remove(&arc_key);
+        self.mutate(|bitmaps, row_to_value| {
+            if bitmaps.remove(&arc_key, row_id_u64) {
                 self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
             }
-        }
 
-        // Remove from reverse mapping
-        row_to_value.remove(row_id);
+            row_to_value.remove(row_id);
 
-        Ok(())
+            Ok(())
+        })
     }
 
     fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
@@ -483,113 +659,104 @@ impl Index for BitmapIndex {
 
         let num_cols = self.column_ids.len();
 
-        // Acquire write locks ONCE for entire batch
-        let mut bitmaps = self.bitmaps.write();
-        let mut row_to_value = self.row_to_value.write();
+        self.mutate(|bitmaps, row_to_value| {
+            // Reserve capacity
+            row_to_value.map.reserve(entries.len());
 
-        // Reserve capacity
-        row_to_value.reserve(entries.len());
+            // PRE-CHECK PHASE: Validate all unique constraints BEFORE modifying anything
+            // This prevents partial batch execution on failure
+            if self.is_unique {
+                // Track keys seen in this batch for intra-batch duplicate detection
+                let mut batch_keys: AHashMap<CompactArc<Value>, i64> =
+                    AHashMap::with_capacity(entries.len());
 
-        // PRE-CHECK PHASE: Validate all unique constraints BEFORE modifying anything
-        // This prevents partial batch execution on failure
-        if self.is_unique {
-            // Track keys seen in this batch for intra-batch duplicate detection
-            let mut batch_keys: AHashMap<CompactArc<Value>, i64> =
-                AHashMap::with_capacity(entries.len());
-
-            for &(row_id, values) in entries {
-                if row_id < 0 || values.len() != num_cols {
-                    continue;
-                }
-
-                // NULL values don't violate uniqueness
-                if values.iter().any(|v| v.is_null()) {
-                    continue;
-                }
-
-                let row_id_u64 = row_id as u64;
-                let arc_key = self.value_to_arc_key(values);
-
-                // Check intra-batch duplicates
-                if let Some(&existing_row_id) = batch_keys.get(&arc_key) {
-                    if existing_row_id != row_id {
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            self.column_names.join(", "),
-                            format!("{:?}", values),
-                        ));
+                for &(row_id, values) in entries {
+                    if row_id < 0 || values.len() != num_cols {
+                        continue;
                     }
-                }
 
-                // Check against existing index
-                if let Some(bitmap) = bitmaps.get(&arc_key) {
-                    let existing_count = if bitmap.contains(row_id_u64) {
-                        bitmap.len() - 1
-                    } else {
-                        bitmap.len()
-                    };
-                    if existing_count > 0 {
-                        return Err(Error::unique_constraint(
-                            &self.name,
-                            self.column_names.join(", "),
-                            format!("{:?}", values),
-                        ));
+                    // NULL values don't violate uniqueness
+                    if values.iter().any(|v| v.is_null()) {
+                        continue;
                     }
-                }
 
-                batch_keys.insert(arc_key, row_id);
-            }
-        }
+                    let row_id_u64 = row_id as u64;
+                    let arc_key = self.value_to_arc_key(values);
 
-        // MODIFICATION PHASE: All constraints checked, now safe to modify
-        for &(row_id, values) in entries {
-            if row_id < 0 {
-                continue; // Skip invalid row IDs
-            }
-            let row_id_u64 = row_id as u64;
-
-            if values.len() != num_cols {
-                continue;
-            }
-
-            let arc_key = self.value_to_arc_key(values);
-
-            // Try to reuse existing Arc
-            let (final_arc_key, is_new_value) =
-                if let Some((existing_arc, _)) = bitmaps.get_key_value(&arc_key) {
-                    (CompactArc::clone(existing_arc), false)
-                } else {
-                    (arc_key, true)
-                };
-
-            // Handle update case - remove from old bitmap
-            if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
-                if !CompactArc::ptr_eq(&old_arc_key, &final_arc_key) {
-                    if let Some(old_bitmap) = bitmaps.get_mut(&old_arc_key) {
-                        old_bitmap.remove(row_id_u64);
-                        if old_bitmap.is_empty() {
-                            bitmaps.remove(&old_arc_key);
-                            self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
+                    // Check intra-batch duplicates
+                    if let Some(&existing_row_id) = batch_keys.get(&arc_key) {
+                        if existing_row_id != row_id {
+                            return Err(Error::unique_constraint(
+                                &self.name,
+                                self.column_names.join(", "),
+                                format!("{:?}", values),
+                            ));
                         }
                     }
+
+                    // Check against existing index
+                    if let Some(bitmap) = bitmaps.get(&arc_key) {
+                        let existing_count = if bitmap.contains(row_id_u64) {
+                            bitmap.len() - 1
+                        } else {
+                            bitmap.len()
+                        };
+                        if existing_count > 0 {
+                            return Err(Error::unique_constraint(
+                                &self.name,
+                                self.column_names.join(", "),
+                                format!("{:?}", values),
+                            ));
+                        }
+                    }
+
+                    batch_keys.insert(arc_key, row_id);
                 }
             }
 
-            // Add to bitmap
-            let bitmap = bitmaps
-                .entry(CompactArc::clone(&final_arc_key))
-                .or_default();
-            bitmap.insert(row_id_u64);
+            // MODIFICATION PHASE: All constraints checked, now safe to modify
+            for &(row_id, values) in entries {
+                if row_id < 0 {
+                    continue; // Skip invalid row IDs
+                }
+                let row_id_u64 = row_id as u64;
 
-            // Update reverse mapping
-            row_to_value.insert(row_id, final_arc_key);
+                if values.len() != num_cols {
+                    continue;
+                }
 
-            if is_new_value {
-                self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
+                let arc_key = self.value_to_arc_key(values);
+
+                // Try to reuse existing Arc
+                let final_arc_key = if let Some((existing_arc, _)) = bitmaps.get_key_value(&arc_key)
+                {
+                    CompactArc::clone(existing_arc)
+                } else {
+                    arc_key
+                };
+
+                // Handle update case - remove from old bitmap
+                if let Some(old_arc_key) = row_to_value.get(row_id).cloned() {
+                    if !CompactArc::ptr_eq(&old_arc_key, &final_arc_key)
+                        && bitmaps.remove(&old_arc_key, row_id_u64)
+                    {
+                        self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
+                    }
+                }
+
+                // Add to bitmap
+                let is_new_value = bitmaps.add(&final_arc_key, row_id_u64);
+
+                // Update reverse mapping
+                row_to_value.insert(row_id, final_arc_key);
+
+                if is_new_value {
+                    self.distinct_count.fetch_add(1, AtomicOrdering::Relaxed);
+                }
             }
-        }
 
-        Ok(())
+            Ok(())
+        })
     }
 
     /// Optimized batch remove with single lock acquisition
@@ -602,55 +769,44 @@ impl Index for BitmapIndex {
             return Err(Error::IndexClosed);
         }
 
-        // Acquire write locks ONCE for entire batch
-        let mut bitmaps = self.bitmaps.write();
-        let mut row_to_value = self.row_to_value.write();
+        self.mutate(|bitmaps, row_to_value| {
+            for &(row_id, values) in entries {
+                if row_id < 0 {
+                    continue;
+                }
+                let row_id_u64 = row_id as u64;
 
-        for &(row_id, values) in entries {
-            if row_id < 0 {
-                continue;
-            }
-            let row_id_u64 = row_id as u64;
+                let arc_key = self.value_to_arc_key(values);
 
-            let arc_key = self.value_to_arc_key(values);
-
-            // Remove from bitmap
-            if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
-                bitmap.remove(row_id_u64);
-                if bitmap.is_empty() {
-                    bitmaps.remove(&arc_key);
+                if bitmaps.remove(&arc_key, row_id_u64) {
                     self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
                 }
+
+                // Remove from reverse mapping
+                row_to_value.remove(row_id);
             }
 
-            // Remove from reverse mapping
-            row_to_value.remove(row_id);
-        }
-
-        Ok(())
+            Ok(())
+        })
     }
 
     fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
         if self.closed.load(AtomicOrdering::Acquire) {
             return Some(Err(Error::IndexClosed));
         }
-        let mut bitmaps = self.bitmaps.write();
-        let mut row_to_value = self.row_to_value.write();
-        for &row_id in row_ids {
-            if row_id < 0 {
-                continue;
-            }
-            if let Some(arc_key) = row_to_value.remove(row_id) {
-                if let Some(bitmap) = bitmaps.get_mut(&arc_key) {
-                    bitmap.remove(row_id as u64);
-                    if bitmap.is_empty() {
-                        bitmaps.remove(&arc_key);
+        Some(self.mutate(|bitmaps, row_to_value| {
+            for &row_id in row_ids {
+                if row_id < 0 {
+                    continue;
+                }
+                if let Some(arc_key) = row_to_value.remove(row_id) {
+                    if bitmaps.remove(&arc_key, row_id as u64) {
                         self.distinct_count.fetch_sub(1, AtomicOrdering::Relaxed);
                     }
                 }
             }
-        }
-        Some(Ok(()))
+            Ok(())
+        }))
     }
 
     fn column_ids(&self) -> &[i32] {
@@ -790,7 +946,7 @@ impl Index for BitmapIndex {
         let bitmaps = self.bitmaps.read();
         let mut all_rows = RoaringTreemap::new();
         for bitmap in bitmaps.values() {
-            all_rows |= bitmap;
+            all_rows |= &bitmap.rows;
         }
         let _ = expr;
         let collected: Vec<i64> = all_rows.iter().map(|id| id as i64).collect();
@@ -799,15 +955,24 @@ impl Index for BitmapIndex {
 
     fn get_all_values(&self) -> Vec<Value> {
         let bitmaps = self.bitmaps.read();
+        let mut exports = crate::storage::mvcc::read_memory::ExportBatch::new();
         // Dereference CompactArc<Value> to clone inner Value
-        bitmaps.keys().map(|arc| (**arc).clone()).collect()
+        bitmaps
+            .keys()
+            .map(|arc| exports.capture_value(arc))
+            .collect()
     }
 
     fn clear(&self) -> Result<()> {
-        self.bitmaps.write().clear();
-        self.row_to_value.write().clear();
-        self.distinct_count.store(0, AtomicOrdering::Relaxed);
-        Ok(())
+        self.mutate(|bitmaps, reverse| {
+            bitmaps.map.clear();
+            bitmaps.key_bytes = 0;
+            bitmaps.bitmap_bytes = 0;
+            reverse.map.clear();
+            reverse.payload_bytes = 0;
+            self.distinct_count.store(0, AtomicOrdering::Relaxed);
+            Ok(())
+        })
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -823,6 +988,191 @@ impl Index for BitmapIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_bitmap_bound(bitmap: &BitmapRows) {
+        let mut containers = 0;
+        let mut submaps = 0;
+        let mut payload = 0;
+        for (_, rows) in bitmap.rows.bitmaps() {
+            let stats = rows.statistics();
+            containers += stats.n_containers as usize;
+            submaps += 1;
+            assert_eq!(stats.n_run_containers, 0);
+            // Roaring 0.11.3 reports array capacity in u32 units and bitsets in bits.
+            payload += stats.n_bytes_array_containers / 2 + stats.n_bytes_bitset_containers / 8;
+        }
+        assert_eq!(bitmap.containers, containers);
+        assert_eq!(bitmap.submaps, submaps);
+        assert!(bitmap.peak_containers >= containers);
+        assert!(
+            bitmap.payload_bound >= payload,
+            "payload {payload} exceeds {}",
+            bitmap.payload_bound
+        );
+        assert!(bitmap.payload_bound <= 8192 * containers as u64);
+        assert!(bitmap.present_row == u64::MAX || bitmap.rows.contains(bitmap.present_row));
+    }
+
+    #[test]
+    fn bitmap_accounting_tracks_sparse_containers_and_submap_lifetimes() {
+        let mut bitmap = BitmapRows::default();
+        let ids = [
+            0,
+            1 << 16,
+            5 << 16,
+            1 << 32,
+            (1 << 32) + (7 << 16),
+            i64::MAX as u64,
+        ];
+        for id in ids {
+            bitmap.insert(id);
+            assert_bitmap_bound(&bitmap);
+            let before = bitmap.payload_bound;
+            bitmap.insert(id);
+            assert_eq!(bitmap.payload_bound, before);
+        }
+        assert_eq!(bitmap.payload_bound, 8 * ids.len() as u64);
+        for id in [ids[4], ids[2], ids[1], ids[3], ids[5], ids[0]] {
+            bitmap.remove(id);
+            assert_bitmap_bound(&bitmap);
+        }
+        assert_eq!(bitmap.estimated_bytes(), 0);
+
+        for id in 0..1024 {
+            bitmap.insert(id << 16);
+        }
+        assert_bitmap_bound(&bitmap);
+        assert_eq!(bitmap.payload_bound, 8192);
+        let peak = bitmap.peak_containers;
+        for id in 1..1024 {
+            bitmap.remove(id << 16);
+        }
+        assert_bitmap_bound(&bitmap);
+        assert_eq!(bitmap.peak_containers, peak);
+        assert!(bitmap.estimated_bytes() >= 64 * 2 * peak as u128);
+    }
+
+    #[test]
+    fn bitmap_accounting_bounds_dense_conversion_and_retained_array_churn() {
+        let mut bitmap = BitmapRows::default();
+        for id in 0..5000 {
+            bitmap.insert(id);
+            if id % 64 == 0 || (4095..=4097).contains(&id) {
+                assert_bitmap_bound(&bitmap);
+            }
+        }
+        assert_bitmap_bound(&bitmap);
+        for id in 1..5000 {
+            bitmap.remove(id);
+            if id % 64 == 0 || (902..=905).contains(&id) {
+                assert_bitmap_bound(&bitmap);
+            }
+        }
+        assert_bitmap_bound(&bitmap);
+        assert_eq!(bitmap.payload_bound, 8192);
+        bitmap.remove(0);
+        assert_bitmap_bound(&bitmap);
+        assert_eq!(bitmap.payload_bound, 0);
+
+        bitmap.insert(0);
+        for _ in 0..3000 {
+            bitmap.insert(1);
+            bitmap.remove(1);
+        }
+        assert_bitmap_bound(&bitmap);
+        assert_eq!(bitmap.payload_bound, 8192);
+    }
+
+    fn memory_index(unique: bool, columns: usize) -> BitmapIndex {
+        BitmapIndex::new(
+            "idx_label".into(),
+            "items".into(),
+            (0..columns).map(|id| format!("column_{id}")).collect(),
+            (0..columns as i32).collect(),
+            vec![DataType::Text; columns],
+            unique,
+            0,
+        )
+    }
+
+    fn assert_requested_allocations(index: &BitmapIndex) {
+        let bitmaps = index.bitmaps.read();
+        let reverse = index.row_to_value.read();
+        let payload = |value: &CompactArc<Value>| {
+            (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Value>()) as u128
+                + value.heap_bytes() as u128
+        };
+        let keys: u128 = bitmaps.keys().map(payload).sum();
+        let reverse_keys: u128 = reverse.values().map(payload).sum();
+        assert_eq!(bitmaps.key_bytes, keys);
+        assert_eq!(reverse.payload_bytes, reverse_keys);
+        let expected = crate::storage::mvcc::memory::arc_allocation_bytes::<BitmapIndex>() as u128
+            + keys
+            + reverse_keys
+            + reverse.map.allocation_bytes() as u128
+            + index.name.capacity() as u128
+            + index.table_name.capacity() as u128
+            + (index.column_names.capacity() * std::mem::size_of::<String>()) as u128
+            + index
+                .column_names
+                .iter()
+                .map(|name| name.capacity() as u128)
+                .sum::<u128>()
+            + (index.column_ids.capacity() * std::mem::size_of::<i32>()) as u128
+            + (index.data_types.capacity() * std::mem::size_of::<DataType>()) as u128;
+        assert_eq!(index.memory.account.requested_bytes() as u128, expected);
+        for bitmap in bitmaps.values() {
+            assert_bitmap_bound(bitmap);
+        }
+        assert_eq!(
+            index.memory.account.estimated_bytes() as u128,
+            bitmaps.estimated_bytes()
+        );
+    }
+
+    #[test]
+    fn bitmap_accounting_covers_failed_reserve_and_scalar_replacement() {
+        let index = memory_index(true, 1);
+        assert_requested_allocations(&index);
+        let initial = index.memory.account.requested_bytes();
+        let key = [Value::text("the same long key in a rejected batch")];
+        let entries: Vec<_> = (0..1024).map(|id| (id, &key[..])).collect();
+        assert!(index.add_batch_slice(&entries).is_err());
+        assert!(index.memory.account.requested_bytes() > initial);
+        assert_requested_allocations(&index);
+        assert_eq!(index.memory.account.estimated_bytes(), 0);
+
+        for columns in [1, 2] {
+            let index = memory_index(false, columns);
+            let key =
+                vec![Value::text("a retained key shared by bitmap and reverse owners"); columns];
+            let next = vec![Value::text("a replacement key"); columns];
+            index.add(&key, 1, 0).unwrap();
+            index.add(&key, 2, 0).unwrap();
+            assert_requested_allocations(&index);
+            index.add(&next, 1, 0).unwrap();
+            assert_requested_allocations(&index);
+            index.remove(&key, 2, 0).unwrap();
+            assert_requested_allocations(&index);
+            index.remove_batch_ids(&[1]).unwrap().unwrap();
+            assert_requested_allocations(&index);
+            assert_eq!(index.cardinality(), 0);
+            assert!(index.memory.account.estimated_bytes() > 0);
+            let entries = [(3, key.as_slice()), (4, key.as_slice())];
+            index.add_batch_slice(&entries).unwrap();
+            assert_requested_allocations(&index);
+            index.remove_batch_slice(&entries[..1]).unwrap();
+            assert_requested_allocations(&index);
+            index.remove_batch_slice(&entries[1..]).unwrap();
+            assert_requested_allocations(&index);
+            index.clear().unwrap();
+            assert_requested_allocations(&index);
+            let account = Arc::clone(index.memory_account().unwrap());
+            drop(index);
+            assert_eq!(account.requested_bytes(), 0);
+            assert_eq!(account.estimated_bytes(), 0);
+        }
+    }
 
     #[test]
     fn test_bitmap_index_basic() {
