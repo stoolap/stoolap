@@ -11,7 +11,7 @@ github:
   repository_url: https://github.com/stoolap/stoolap
 
 # Latest release shown in the homepage hero badge
-stoolap_version: v0.4.0
+stoolap_version: v0.4.1
 
 # Google Analytics
 google_analytics: 
