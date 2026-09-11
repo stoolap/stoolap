@@ -1553,3 +1553,89 @@ fn test_predicate_between_with_outer_ref() {
         "BETWEEN predicate with outer ref should return results"
     );
 }
+
+fn assert_semi_join_outer_reference(name: &str, predicate: &str, expected: &[i64]) {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    db.execute(
+        "CREATE TABLE outer_t (id INTEGER PRIMARY KEY, val INTEGER, pattern TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "CREATE TABLE inner_t (id INTEGER PRIMARY KEY, outer_id INTEGER, v INTEGER, label TEXT)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE TABLE third_t (n INTEGER)", ()).unwrap();
+    db.execute("INSERT INTO outer_t VALUES (1, 5, 'a%'), (2, 30, 'b%')", ())
+        .unwrap();
+    db.execute(
+        "INSERT INTO inner_t VALUES (1, 1, 5, 'a_b'), (2, 2, 7, 'baa')",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO third_t VALUES (10), (20)", ())
+        .unwrap();
+    let ids: Vec<i64> = db
+        .query(
+            &format!("SELECT o.id FROM outer_t o WHERE {predicate} ORDER BY o.id"),
+            (),
+        )
+        .unwrap()
+        .map(|row| row.unwrap().get(0).unwrap())
+        .collect();
+    assert_eq!(ids, expected);
+}
+
+#[test]
+fn test_semi_join_outer_reference_in_like_pattern() {
+    assert_semi_join_outer_reference(
+        "test_semi_join_outer_reference_in_like_pattern",
+        "EXISTS (SELECT 1 FROM inner_t i WHERE i.outer_id = o.id AND i.label LIKE o.pattern)",
+        &[1, 2],
+    );
+}
+
+#[test]
+fn test_semi_join_rejects_outer_reference_in_like_escape() {
+    use stoolap::executor::Executor;
+    use stoolap::parser::ast::{Expression, Statement};
+
+    let statements = stoolap::parser::parse_sql(
+        "SELECT o.id FROM outer_t o WHERE EXISTS (SELECT 1 FROM inner_t i WHERE i.outer_id = o.id AND i.label LIKE 'a!_b' ESCAPE o.escape_char)",
+    ).unwrap();
+    let Statement::Select(select) = &statements[0] else {
+        panic!("expected SELECT");
+    };
+    let Some(Expression::Exists(exists)) = select.where_clause.as_deref() else {
+        panic!("expected EXISTS predicate");
+    };
+    assert!(Executor::try_extract_semi_join_info(exists, false, &["o".into()]).is_none());
+}
+
+#[test]
+fn test_semi_join_outer_reference_in_list_value() {
+    assert_semi_join_outer_reference(
+        "test_semi_join_outer_reference_in_list_value",
+        "EXISTS (SELECT 1 FROM inner_t i WHERE i.outer_id = o.id AND i.v IN (o.val, -1))",
+        &[1],
+    );
+}
+
+#[test]
+fn test_semi_join_outer_reference_in_any_left_operand() {
+    assert_semi_join_outer_reference(
+        "test_semi_join_outer_reference_in_any_left_operand",
+        "EXISTS (SELECT 1 FROM inner_t i WHERE i.outer_id = o.id AND o.val > ANY (SELECT n FROM third_t))",
+        &[2],
+    );
+}
+
+#[test]
+fn test_semi_join_outer_reference_in_nested_projection() {
+    assert_semi_join_outer_reference(
+        "test_semi_join_outer_reference_in_nested_projection",
+        "EXISTS (SELECT 1 FROM inner_t i WHERE i.outer_id = o.id AND (SELECT o.val FROM third_t LIMIT 1) > 10)",
+        &[2],
+    );
+}

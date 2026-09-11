@@ -3600,7 +3600,9 @@ impl Executor {
     /// of them defines
     fn nested_reads_outer_columns(nested: &SelectStatement, subquery_tables: &[String]) -> bool {
         let mut tables = subquery_tables.to_vec();
-        tables.extend(Self::collect_subquery_table_columns(nested));
+        if let Some(from) = &nested.table_expr {
+            Self::collect_table_names_from_source(from, &mut tables);
+        }
         nested
             .where_clause
             .as_deref()
@@ -3883,7 +3885,7 @@ impl Executor {
         // Example: WHERE o.customer_id = c.id AND c.country = 'USA'
         // The "c.country = 'USA'" references outer table and can't be pushed to inner query.
         if let Some(ref rem) = remaining {
-            if Self::expression_references_outer_tables(rem.as_ref(), outer_tables, &inner_tables) {
+            if Self::references_outer_columns(rem.as_ref(), &inner_tables) {
                 return None;
             }
         }
@@ -4023,131 +4025,6 @@ impl Executor {
                 Some(id.value.to_string())
             }
             _ => None,
-        }
-    }
-
-    /// Check if an expression references any outer tables.
-    /// Used to determine if a predicate can be pushed to the inner query in semi-join optimization.
-    fn expression_references_outer_tables(
-        expr: &Expression,
-        outer_tables: &[String],
-        inner_tables: &[String],
-    ) -> bool {
-        match expr {
-            Expression::QualifiedIdentifier(qid) => {
-                // Use pre-computed value_lower to avoid allocation
-                let table = &qid.qualifier.value_lower;
-                // One pass over the inner table answers every outer row, so
-                // any name the inner table does not own has to be read per
-                // row, whether it belongs to the query above or one further
-                let _ = outer_tables;
-                !inner_tables.iter().any(|t| t.eq_ignore_ascii_case(table))
-            }
-            Expression::Infix(infix) => {
-                Self::expression_references_outer_tables(&infix.left, outer_tables, inner_tables)
-                    || Self::expression_references_outer_tables(
-                        &infix.right,
-                        outer_tables,
-                        inner_tables,
-                    )
-            }
-            Expression::Prefix(prefix) => {
-                Self::expression_references_outer_tables(&prefix.right, outer_tables, inner_tables)
-            }
-            Expression::FunctionCall(func) => func.arguments.iter().any(|arg| {
-                Self::expression_references_outer_tables(arg, outer_tables, inner_tables)
-            }),
-            Expression::In(in_expr) => {
-                Self::expression_references_outer_tables(&in_expr.left, outer_tables, inner_tables)
-                    || Self::expression_references_outer_tables(
-                        &in_expr.right,
-                        outer_tables,
-                        inner_tables,
-                    )
-            }
-            Expression::Between(between) => {
-                Self::expression_references_outer_tables(&between.expr, outer_tables, inner_tables)
-                    || Self::expression_references_outer_tables(
-                        &between.lower,
-                        outer_tables,
-                        inner_tables,
-                    )
-                    || Self::expression_references_outer_tables(
-                        &between.upper,
-                        outer_tables,
-                        inner_tables,
-                    )
-            }
-            Expression::Case(case) => {
-                case.value.as_ref().is_some_and(|op| {
-                    Self::expression_references_outer_tables(
-                        op.as_ref(),
-                        outer_tables,
-                        inner_tables,
-                    )
-                }) || case.when_clauses.iter().any(|wc| {
-                    Self::expression_references_outer_tables(
-                        &wc.condition,
-                        outer_tables,
-                        inner_tables,
-                    ) || Self::expression_references_outer_tables(
-                        &wc.then_result,
-                        outer_tables,
-                        inner_tables,
-                    )
-                }) || case.else_value.as_ref().is_some_and(|el| {
-                    Self::expression_references_outer_tables(
-                        el.as_ref(),
-                        outer_tables,
-                        inner_tables,
-                    )
-                })
-            }
-            // For subqueries, check if their WHERE clause references outer tables.
-            // A nested EXISTS that only references its own scope and the immediate
-            // parent (inner_tables) is safe for semi-join. But if it references
-            // grandparent scope (outer_tables), semi-join cannot handle it.
-            Expression::Exists(exists) => {
-                Self::subquery_references_outer_tables(&exists.subquery, outer_tables, inner_tables)
-            }
-            Expression::ScalarSubquery(sq) => {
-                Self::subquery_references_outer_tables(&sq.subquery, outer_tables, inner_tables)
-            }
-            Expression::AllAny(aa) => {
-                Self::subquery_references_outer_tables(&aa.subquery, outer_tables, inner_tables)
-            }
-            // Literals and other expressions don't reference tables
-            _ => false,
-        }
-    }
-
-    /// Check if a subquery's WHERE clause references any of the outer tables.
-    /// This is used to determine if a nested EXISTS/ScalarSubquery can be safely
-    /// handled by the semi-join optimization (which only provides inner table context).
-    fn subquery_references_outer_tables(
-        subquery: &SelectStatement,
-        outer_tables: &[String],
-        inner_tables: &[String],
-    ) -> bool {
-        if let Some(ref where_clause) = subquery.where_clause {
-            // Collect the subquery's own tables to extend inner_tables
-            let mut sub_tables: Vec<String> = inner_tables.to_vec();
-            Self::collect_table_names_from_source_if_present(&subquery.table_expr, &mut sub_tables);
-            // Check if the WHERE references outer tables (grandparent scope)
-            if Self::expression_references_outer_tables(where_clause, outer_tables, &sub_tables) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Collect table names from an optional table expression.
-    fn collect_table_names_from_source_if_present(
-        table_expr: &Option<Box<Expression>>,
-        tables: &mut Vec<String>,
-    ) {
-        if let Some(ref expr) = table_expr {
-            Self::collect_table_names_from_source(expr.as_ref(), tables);
         }
     }
 
@@ -4781,17 +4658,15 @@ impl Executor {
         &self,
         expr: &Expression,
         ctx: &ExecutionContext,
-        outer_tables: &[String],
+        _outer_tables: &[String],
     ) -> Result<Option<Expression>> {
         match expr {
             Expression::In(in_expr) => {
                 // Check if right side is a scalar subquery
                 if let Expression::ScalarSubquery(subquery) = in_expr.right.as_ref() {
-                    if let Some(info) = Self::try_extract_in_semi_join_info(
-                        in_expr,
-                        &subquery.subquery,
-                        outer_tables,
-                    ) {
+                    if let Some(info) =
+                        Self::try_extract_in_semi_join_info(in_expr, &subquery.subquery)
+                    {
                         // Execute subquery once and build hash set
                         let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
                         return Ok(Some(Self::transform_exists_to_in_list(&info, hash_set)));
@@ -4802,9 +4677,10 @@ impl Executor {
 
             Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("AND") => {
                 // Try to optimize IN in either branch of AND
-                let left_opt = self.try_optimize_in_to_semi_join(&infix.left, ctx, outer_tables)?;
+                let left_opt =
+                    self.try_optimize_in_to_semi_join(&infix.left, ctx, _outer_tables)?;
                 let right_opt =
-                    self.try_optimize_in_to_semi_join(&infix.right, ctx, outer_tables)?;
+                    self.try_optimize_in_to_semi_join(&infix.right, ctx, _outer_tables)?;
 
                 match (left_opt, right_opt) {
                     (Some(new_left), Some(new_right)) => {
@@ -4836,9 +4712,10 @@ impl Executor {
 
             Expression::Infix(infix) if infix.operator.eq_ignore_ascii_case("OR") => {
                 // Try to optimize IN in either branch of OR
-                let left_opt = self.try_optimize_in_to_semi_join(&infix.left, ctx, outer_tables)?;
+                let left_opt =
+                    self.try_optimize_in_to_semi_join(&infix.left, ctx, _outer_tables)?;
                 let right_opt =
-                    self.try_optimize_in_to_semi_join(&infix.right, ctx, outer_tables)?;
+                    self.try_optimize_in_to_semi_join(&infix.right, ctx, _outer_tables)?;
 
                 match (left_opt, right_opt) {
                     (Some(new_left), Some(new_right)) => {
@@ -4883,7 +4760,6 @@ impl Executor {
     fn try_extract_in_semi_join_info(
         in_expr: &InExpression,
         subquery: &SelectStatement,
-        outer_tables: &[String],
     ) -> Option<SemiJoinInfo> {
         // 1. Extract outer column from left side of IN
         let (outer_column, outer_table): (String, Option<String>) = match in_expr.left.as_ref() {
@@ -4930,7 +4806,7 @@ impl Executor {
 
         // 5. Check if WHERE clause references outer tables
         if let Some(ref where_clause) = subquery.where_clause {
-            if Self::expression_references_outer_tables(where_clause, outer_tables, &inner_tables) {
+            if Self::references_outer_columns(where_clause, &inner_tables) {
                 return None; // Correlated WHERE, can't optimize
             }
         }
