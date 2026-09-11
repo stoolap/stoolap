@@ -1,0 +1,12 @@
+# Configuration for `cargo audit` and the Security Audit workflow.
+# Every ignored advisory needs a reason and a date, and is revisited when
+# the dependency that pulls it in moves.
+
+[advisories]
+ignore = [
+    # rkyv 0.7 is pulled in only by the optional `duckdb` feature (rust_decimal
+    # -> rkyv), used for the comparison benchmarks. It is not part of the
+    # library or CLI build. The fix is rkyv 0.8, which rust_decimal has not
+    # moved to yet. Reviewed 2026-09-11.
+    "RUSTSEC-2026-0235",
+]
