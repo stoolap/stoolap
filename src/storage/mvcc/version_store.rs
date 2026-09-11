@@ -2466,6 +2466,14 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema); // Release lock early
+        let fully_compiled = compiled_filter.is_fully_compiled();
+        let matches_row = |row: &Row| {
+            if fully_compiled {
+                compiled_filter.matches_arc_slice(row.as_slice())
+            } else {
+                compiled_filter.matches(row)
+            }
+        };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -2481,7 +2489,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if (head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id))
-                    && compiled_filter.matches(&chain.version.data)
+                    && matches_row(&chain.version.data)
                 {
                     let mut version_copy = chain.version.clone();
                     version_copy.create_time = current_seq;
@@ -2498,7 +2506,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if (deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id))
-                        && compiled_filter.matches(&e.version.data)
+                        && matches_row(&e.version.data)
                     {
                         let mut version_copy = e.version.clone();
                         version_copy.create_time = current_seq;
@@ -3093,6 +3101,14 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema); // Release lock early
+        let fully_compiled = compiled_filter.is_fully_compiled();
+        let matches_row = |row: &Row| {
+            if fully_compiled {
+                compiled_filter.matches_arc_slice(row.as_slice())
+            } else {
+                compiled_filter.matches(row)
+            }
+        };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -3112,7 +3128,7 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    if compiled_filter.matches(&e.version.data) {
+                    if matches_row(&e.version.data) {
                         result.push((row_id, e.version.data.clone()));
                     }
                     break;
@@ -3149,6 +3165,14 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema);
+        let fully_compiled = compiled_filter.is_fully_compiled();
+        let matches_row = |row: &Row| {
+            if fully_compiled {
+                compiled_filter.matches_arc_slice(row.as_slice())
+            } else {
+                compiled_filter.matches(row)
+            }
+        };
 
         let versions = self.snapshot_versions();
 
@@ -3164,9 +3188,7 @@ impl VersionStore {
                         break;
                     }
 
-                    if compiled_filter.matches(&e.version.data)
-                        && !callback(row_id, e.version.data.clone())
-                    {
+                    if matches_row(&e.version.data) && !callback(row_id, e.version.data.clone()) {
                         return;
                     }
                     break;
@@ -3207,6 +3229,14 @@ impl VersionStore {
         let schema = self.schema.read();
         let compiled_filter = CompiledFilter::compile(filter, &schema);
         drop(schema);
+        let fully_compiled = compiled_filter.is_fully_compiled();
+        let matches_row = |row: &Row| {
+            if fully_compiled {
+                compiled_filter.matches_arc_slice(row.as_slice())
+            } else {
+                compiled_filter.matches(row)
+            }
+        };
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
@@ -3229,7 +3259,7 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    if compiled_filter.matches(&e.version.data) {
+                    if matches_row(&e.version.data) {
                         if skipped < offset {
                             skipped += 1;
                         } else {
