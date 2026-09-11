@@ -2407,7 +2407,7 @@ impl Table for SegmentedTable {
                 (None, None) => std::cmp::Ordering::Equal,
                 (None, Some(_)) => std::cmp::Ordering::Less,
                 (Some(_), None) => std::cmp::Ordering::Greater,
-                (Some(va), Some(vb)) => va.compare(vb).unwrap_or(std::cmp::Ordering::Equal),
+                (Some(va), Some(vb)) => va.compare_nulls_last(vb),
             };
             if ascending {
                 cmp

@@ -452,6 +452,30 @@ impl Value {
         Ok(s1.cmp(&s2))
     }
 
+    /// Compare storage sort keys with NULLs last in ascending order.
+    #[inline]
+    pub(crate) fn compare_nulls_last(&self, other: &Value) -> Ordering {
+        match self.compare(other) {
+            Ok(order) => order,
+            Err(error) => self.nulls_last_on_error(error),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn nulls_last_on_error(&self, error: Error) -> Ordering {
+        match error {
+            Error::NullComparison => {
+                if self.is_null() {
+                    Ordering::Greater
+                } else {
+                    Ordering::Less
+                }
+            }
+            _ => Ordering::Equal,
+        }
+    }
+
     /// Compare values of the same type
     fn compare_same_type(&self, other: &Value) -> Result<Ordering> {
         match (self, other) {

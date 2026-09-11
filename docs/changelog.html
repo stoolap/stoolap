@@ -21,6 +21,7 @@ description: Release history and version notes for Stoolap
       </header>
       <div class="changelog-body">
         <p>Fixed captured-version scans reading a newer row payload after a concurrent UPDATE reused its arena slot. These scans now read the payload retained by the visible version, preserving snapshot values, filter results, ordering, and aggregates.</p>
+        <p>Fixed sorted LIMIT scans through the storage API treating NULL keys as equal to non-NULL keys. These scans now place NULLs last in ascending order and first in descending order, matching SQL's default NULL ordering.</p>
       </div>
     </article>
     <div id="changelogContent">
