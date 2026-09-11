@@ -268,7 +268,7 @@ impl Program {
                 | Op::CaseCompare => -1,
 
                 // Pop 3, push 1 (-2)
-                Op::Between | Op::NotBetween => -2,
+                Op::Between | Op::NotBetween | Op::LikeDynamicEscapeExpr(_) => -2,
                 // Pop the value and its items, push 1
                 Op::InList(count) => -i32::try_from(*count).unwrap_or(i32::MAX),
 

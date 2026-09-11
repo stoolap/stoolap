@@ -265,6 +265,41 @@ impl ExprVM {
 
     /// Execute a program and return the result
     #[inline]
+    /// Match a runtime pattern, caching the compiled form per (pattern, case, escape).
+    fn like_dynamic_escape(
+        &mut self,
+        text_val: &Value,
+        pattern_val: &Value,
+        ci: bool,
+        esc: Option<char>,
+    ) -> Value {
+        match (text_val, pattern_val) {
+            (Value::Text(text), Value::Text(pat)) => {
+                let need_compile = match &self.cached_like {
+                    Some((cached_pat, cached_ci, cached_esc, _)) => {
+                        cached_pat.as_str() != pat.as_str()
+                            || *cached_ci != ci
+                            || *cached_esc != esc
+                    }
+                    None => true,
+                };
+                if need_compile {
+                    // !% becomes \% so CompiledPattern treats the wildcard as literal
+                    let processed = match esc {
+                        Some(esc) => process_like_escape_runtime(pat, esc),
+                        None => pat.to_string(),
+                    };
+                    let compiled = CompiledPattern::compile(&processed, ci);
+                    self.cached_like = Some((pat.clone(), ci, esc, compiled));
+                }
+                let (_, _, _, ref compiled) = self.cached_like.as_ref().unwrap();
+                Value::Boolean(compiled.matches(text, ci))
+            }
+            (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
+            _ => Value::Boolean(false),
+        }
+    }
+
     pub fn execute(&mut self, program: &Program, ctx: &ExecuteContext) -> Result<Value> {
         // Ensure stack has enough capacity
         if self.stack.capacity() < program.max_stack_depth() {
@@ -1164,30 +1199,34 @@ impl ExprVM {
                 Op::LikeDynamicEscape(case_insensitive, escape_char) => {
                     let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
                     let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
-                    let result = match (&text_val, &pattern_val) {
-                        (Value::Text(text), Value::Text(pat)) => {
-                            let ci = *case_insensitive;
-                            let esc = *escape_char;
-                            let need_compile = match &self.cached_like {
-                                Some((cached_pat, cached_ci, cached_esc, _)) => {
-                                    cached_pat.as_str() != pat.as_str()
-                                        || *cached_ci != ci
-                                        || *cached_esc != Some(esc)
-                                }
-                                None => true,
-                            };
-                            if need_compile {
-                                // Pre-process the escape character in the pattern at runtime,
-                                // converting e.g. !% -> \% so CompiledPattern treats it as literal
-                                let processed = process_like_escape_runtime(pat, esc);
-                                let compiled = CompiledPattern::compile(&processed, ci);
-                                self.cached_like = Some((pat.clone(), ci, Some(esc), compiled));
-                            }
-                            let (_, _, _, ref compiled) = self.cached_like.as_ref().unwrap();
-                            Value::Boolean(compiled.matches(text, ci))
+                    let escape = Some(*escape_char);
+                    let result = self.like_dynamic_escape(
+                        &text_val,
+                        &pattern_val,
+                        *case_insensitive,
+                        escape,
+                    );
+                    self.stack.push(result);
+                    pc += 1;
+                }
+
+                Op::LikeDynamicEscapeExpr(case_insensitive) => {
+                    let escape_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let pattern_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let text_val = self.stack.pop().unwrap_or_else(Value::null_unknown);
+                    let result = match &escape_val {
+                        Value::Text(escape) => self.like_dynamic_escape(
+                            &text_val,
+                            &pattern_val,
+                            *case_insensitive,
+                            escape.chars().next(),
+                        ),
+                        Value::Null(_) => Value::Null(DataType::Boolean),
+                        _ => {
+                            return Err(crate::core::Error::invalid_argument(
+                                "ESCAPE must be a single-character string",
+                            ))
                         }
-                        (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
-                        _ => Value::Boolean(false),
                     };
                     self.stack.push(result);
                     pc += 1;

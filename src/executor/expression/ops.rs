@@ -547,6 +547,10 @@ pub enum Op {
     /// Stack: [text, pattern_text] -> [bool]
     LikeDynamicEscape(bool, char), // case_insensitive, escape_char
 
+    /// Dynamic LIKE with ESCAPE: both pattern and escape are on the stack
+    /// Stack: [text, pattern_text, escape_text] -> [bool]
+    LikeDynamicEscapeExpr(bool), // case_insensitive
+
     /// Dynamic GLOB: pattern is on the stack
     /// Stack: [text, pattern_text] -> [bool]
     GlobDynamic,
@@ -928,6 +932,9 @@ impl std::fmt::Debug for Op {
                     "LikeDynamicEscape(case_insensitive={}, escape='{}')",
                     ci, esc
                 )
+            }
+            Op::LikeDynamicEscapeExpr(ci) => {
+                write!(f, "LikeDynamicEscapeExpr(case_insensitive={})", ci)
             }
             Op::GlobDynamic => write!(f, "GlobDynamic"),
             Op::RegexpDynamic => write!(f, "RegexpDynamic"),
