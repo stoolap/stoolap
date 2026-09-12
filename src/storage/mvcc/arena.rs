@@ -644,11 +644,15 @@ impl RowArena {
         let mut bytes = 0;
         for &slot in slots {
             if let Some(chunk) = inner.chunk_mut(slot.chunk()) {
-                if let Some(data) = chunk.data[slot.offset()].take() {
-                    bytes += row_bytes(&data);
-                    retired.payloads[retired.payload_count] = Some(data);
+                let offset = slot.offset();
+                if let Some(data) = &chunk.data[offset] {
+                    let payload_bytes = row_bytes(data);
+                    let destination = &mut retired.payloads[retired.payload_count];
+                    let data = chunk.data[offset].take();
+                    chunk.meta[offset] = ArenaRowMeta::default();
+                    *destination = data;
+                    bytes += payload_bytes;
                     retired.payload_count += 1;
-                    chunk.meta[slot.offset()] = ArenaRowMeta::default();
                     chunk.occupied -= 1;
                     cleared += 1;
                     if inner.active.as_ref().is_some_and(|c| c.id == slot.chunk()) {
@@ -788,6 +792,54 @@ pub struct ArenaReadGuard<'a> {
     inner: parking_lot::RwLockReadGuard<'a, ArenaInner>,
 }
 
+pub(crate) struct ArenaChunkSlices<'a> {
+    meta: &'a [ArenaRowMeta],
+    data: &'a [Option<CompactArc<[Value]>>],
+}
+
+pub(crate) struct ArenaLiveRow<'a> {
+    meta: &'a ArenaRowMeta,
+    data: &'a Option<CompactArc<[Value]>>,
+}
+
+impl<'a> ArenaLiveRow<'a> {
+    #[inline]
+    pub fn metadata(&self) -> &'a ArenaRowMeta {
+        self.meta
+    }
+
+    #[inline]
+    pub fn payload(&self) -> &'a CompactArc<[Value]> {
+        debug_assert!(self.data.is_some());
+        // SAFETY: The read guard pins paired slices; every live metadata slot owns a payload.
+        unsafe { self.data.as_ref().unwrap_unchecked() }
+    }
+}
+
+impl ArenaChunkSlices<'_> {
+    #[inline]
+    pub fn slot_count(&self) -> usize {
+        self.meta.len().min(self.data.len())
+    }
+
+    #[inline]
+    pub fn metadata(&self) -> &[ArenaRowMeta] {
+        self.meta
+    }
+
+    #[inline]
+    pub fn live_row(&self, offset: usize) -> Option<ArenaLiveRow<'_>> {
+        let meta = self.meta.get(offset)?;
+        if meta.txn_id == 0 {
+            return None;
+        }
+        Some(ArenaLiveRow {
+            meta,
+            data: &self.data[offset],
+        })
+    }
+}
+
 impl ArenaReadGuard<'_> {
     #[cfg(test)]
     fn get(&self, slot: ArenaSlot, row_id: i64) -> Option<(&ArenaRowMeta, &CompactArc<[Value]>)> {
@@ -814,16 +866,14 @@ impl ArenaReadGuard<'_> {
         self.inner.frozen.get(i.checked_sub(1)?)?.probe(row_id)
     }
 
-    pub fn rows(&self) -> impl Iterator<Item = (&ArenaRowMeta, &CompactArc<[Value]>)> {
+    pub(crate) fn chunks(&self) -> impl Iterator<Item = ArenaChunkSlices<'_>> {
         self.inner
             .frozen
             .iter()
             .chain(&self.inner.active)
-            .flat_map(|chunk| {
-                chunk.meta[..chunk.len]
-                    .iter()
-                    .zip(&chunk.data[..chunk.len])
-                    .filter_map(|(meta, data)| data.as_ref().map(|data| (meta, data)))
+            .map(|chunk| ArenaChunkSlices {
+                meta: &chunk.meta[..chunk.len],
+                data: &chunk.data[..chunk.len],
             })
     }
 
@@ -861,6 +911,53 @@ mod tests {
         let slot = ArenaSlot::new(CHUNK_ID_LIMIT - 1, ARENA_CHUNK_ROWS - 1);
         assert_eq!(slot.chunk(), CHUNK_ID_LIMIT - 1);
         assert_eq!(slot.offset(), ARENA_CHUNK_ROWS - 1);
+    }
+
+    #[test]
+    fn retirement_capacity_panic_keeps_published_payload_installed() {
+        let arena = RowArena::with_capacity(0);
+        let slot = insert(&arena, 7);
+        let mut retired = ArenaRetirement::default();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            arena.clear_batch(&[slot], &mut retired);
+        }));
+        assert!(panic.is_err());
+        let guard = arena.read_guard();
+        assert_eq!(
+            guard.get(slot, 7).map(|(_, row)| &row[0]),
+            Some(&Value::Integer(7))
+        );
+    }
+
+    #[test]
+    fn chunk_payload_checks_reserved_cleared_and_out_of_range_slots() {
+        let arena = RowArena::with_capacity(0);
+        let first = insert(&arena, 7);
+        let _reservation = arena.reserve(1).unwrap();
+        let last = insert(&arena, 9);
+        {
+            let guard = arena.read_guard();
+            let chunk = guard.chunks().next().unwrap();
+            assert_eq!(
+                chunk.live_row(first.offset()).map(|row| &row.payload()[0]),
+                Some(&Value::Integer(7))
+            );
+            assert!(chunk.live_row(1).is_none());
+            assert_eq!(
+                chunk.live_row(last.offset()).map(|row| &row.payload()[0]),
+                Some(&Value::Integer(9))
+            );
+            assert!(chunk.live_row(usize::MAX).is_none());
+        }
+        let mut retired = arena.prepare_clear(1);
+        arena.clear_batch(&[first], &mut retired);
+        let guard = arena.read_guard();
+        let chunk = guard.chunks().next().unwrap();
+        assert!(chunk.live_row(first.offset()).is_none());
+        assert_eq!(
+            chunk.live_row(last.offset()).map(|row| &row.payload()[0]),
+            Some(&Value::Integer(9))
+        );
     }
 
     #[test]

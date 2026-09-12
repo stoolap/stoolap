@@ -39,7 +39,9 @@ use crate::common::{new_i64_map, new_i64_map_with_capacity, CompactArc, CowBTree
 use crate::core::types::DataType;
 use crate::core::{Error, Row, RowVec, Schema, Value};
 use crate::storage::expression::CompiledFilter;
-use crate::storage::mvcc::arena::{ArenaReservation, ArenaRetirement, ArenaSlot, RowArena};
+use crate::storage::mvcc::arena::{
+    ArenaChunkSlices, ArenaReservation, ArenaRetirement, ArenaSlot, RowArena,
+};
 use crate::storage::mvcc::get_fast_timestamp;
 use crate::storage::mvcc::memory::{
     arc_allocation_bytes, name_bytes, smallvec_bytes, HotMetadataCharge, HotObjectCharge, NamedMap,
@@ -1907,12 +1909,14 @@ impl VersionStore {
                 if !arena_guard.is_empty() {
                     let mut visible_row_ids =
                         Vec::with_capacity(self.committed_row_count.load(Ordering::Relaxed));
-                    for (meta, _) in arena_guard.rows() {
-                        if meta.txn_id != 0
-                            && meta.deleted_at_txn_id == 0
-                            && checker.is_visible(meta.txn_id, txn_id)
-                        {
-                            visible_row_ids.push(meta.row_id);
+                    for chunk in arena_guard.chunks() {
+                        for meta in chunk.metadata() {
+                            if meta.txn_id != 0
+                                && meta.deleted_at_txn_id == 0
+                                && checker.is_visible(meta.txn_id, txn_id)
+                            {
+                                visible_row_ids.push(meta.row_id);
+                            }
                         }
                     }
                     return visible_row_ids;
@@ -1978,12 +1982,14 @@ impl VersionStore {
                 let arena_guard = self.arena.read_guard();
                 if !arena_guard.is_empty() {
                     let mut count = 0usize;
-                    for (meta, _) in arena_guard.rows() {
-                        if meta.txn_id != 0
-                            && meta.deleted_at_txn_id == 0
-                            && checker.is_visible(meta.txn_id, txn_id)
-                        {
-                            count += 1;
+                    for chunk in arena_guard.chunks() {
+                        for meta in chunk.metadata() {
+                            if meta.txn_id != 0
+                                && meta.deleted_at_txn_id == 0
+                                && checker.is_visible(meta.txn_id, txn_id)
+                            {
+                                count += 1;
+                            }
                         }
                     }
                     return count;
@@ -3396,6 +3402,50 @@ impl VersionStore {
             }
         }
 
+        // Keep chunk traversal state out of the per-row register set.
+        #[inline(never)]
+        fn sum_chunk(
+            chunk: ArenaChunkSlices<'_>,
+            #[cfg(not(test))] checker: &TransactionRegistry,
+            #[cfg(test)] checker: &dyn VisibilityChecker,
+            txn_id: i64,
+            col_idx: usize,
+            visibility: &mut (i64, bool),
+            totals: &mut (i128, f64, usize),
+        ) {
+            let (mut last_txn_id, mut last_visible) = *visibility;
+            let (mut int_sum, mut float_sum, mut count) = *totals;
+            let slot_count = chunk.slot_count();
+            let mut offset = 0;
+            while offset < slot_count {
+                let row = chunk.live_row(offset);
+                offset += 1;
+                let Some(row) = row else {
+                    continue;
+                };
+                let meta = row.metadata();
+                if meta.deleted_at_txn_id != 0 {
+                    continue;
+                }
+                let version_txn_id = meta.txn_id;
+                let is_vis = if version_txn_id == last_txn_id {
+                    last_visible
+                } else {
+                    let vis = checker.is_visible(version_txn_id, txn_id);
+                    last_txn_id = version_txn_id;
+                    last_visible = vis;
+                    vis
+                };
+                if is_vis {
+                    if let Some(val) = row.payload().get(col_idx) {
+                        accumulate_sum(&mut int_sum, &mut float_sum, &mut count, val);
+                    }
+                }
+            }
+            *visibility = (last_txn_id, last_visible);
+            *totals = (int_sum, float_sum, count);
+        }
+
         // FAST PATH: If uncommitted_writes is empty, scan arena directly (single pass).
         // SAFETY: Arena heads are used only under ReadCommitted isolation.
         //
@@ -3409,33 +3459,19 @@ impl VersionStore {
                 && !arena_guard.is_empty()
                 && !checker.needs_snapshot_isolation(txn_id)
             {
-                // OPTIMIZATION: Cache visibility result for repeated txn_ids
-                // When rows are inserted in batches, consecutive rows often have the same txn_id.
-                // Caching avoids repeated thread-local access overhead (~27ms per 100K rows).
-                let mut last_txn_id: i64 = 0;
-                let mut last_visible: bool = false;
-
-                for (meta, payload) in arena_guard.rows() {
-                    if meta.txn_id != 0 && meta.deleted_at_txn_id == 0 {
-                        // Check visibility with cache
-                        let version_txn_id = meta.txn_id;
-                        let is_vis = if version_txn_id == last_txn_id {
-                            last_visible
-                        } else {
-                            let vis = checker.is_visible(version_txn_id, txn_id);
-                            last_txn_id = version_txn_id;
-                            last_visible = vis;
-                            vis
-                        };
-
-                        if is_vis {
-                            if let Some(val) = payload.get(col_idx) {
-                                accumulate_sum(&mut int_sum, &mut float_sum, &mut count, val);
-                            }
-                        }
-                    }
+                let mut visibility = (0, false);
+                let mut totals = (int_sum, float_sum, count);
+                for chunk in arena_guard.chunks() {
+                    sum_chunk(
+                        chunk,
+                        checker.as_ref(),
+                        txn_id,
+                        col_idx,
+                        &mut visibility,
+                        &mut totals,
+                    );
                 }
-                return (int_sum as f64 + float_sum, count);
+                return (totals.0 as f64 + totals.1, totals.2);
             }
             // arena_guard dropped here — no need to hold it for slow path
         }
@@ -3520,21 +3556,27 @@ impl VersionStore {
                 let mut last_txn_id: i64 = 0;
                 let mut last_visible: bool = false;
 
-                for (meta, payload) in arena_guard.rows() {
-                    if meta.txn_id != 0 && meta.deleted_at_txn_id == 0 {
-                        let version_txn_id = meta.txn_id;
-                        let is_vis = if version_txn_id == last_txn_id {
-                            last_visible
-                        } else {
-                            let vis = checker.is_visible(version_txn_id, txn_id);
-                            last_txn_id = version_txn_id;
-                            last_visible = vis;
-                            vis
+                for chunk in arena_guard.chunks() {
+                    for offset in 0..chunk.metadata().len() {
+                        let Some(row) = chunk.live_row(offset) else {
+                            continue;
                         };
+                        let meta = row.metadata();
+                        if meta.deleted_at_txn_id == 0 {
+                            let version_txn_id = meta.txn_id;
+                            let is_vis = if version_txn_id == last_txn_id {
+                                last_visible
+                            } else {
+                                let vis = checker.is_visible(version_txn_id, txn_id);
+                                last_txn_id = version_txn_id;
+                                last_visible = vis;
+                                vis
+                            };
 
-                        if is_vis {
-                            if let Some(val) = payload.get(col_idx) {
-                                update_min(&mut min_val, val);
+                            if is_vis {
+                                if let Some(val) = row.payload().get(col_idx) {
+                                    update_min(&mut min_val, val);
+                                }
                             }
                         }
                     }
@@ -3629,21 +3671,27 @@ impl VersionStore {
                 let mut last_txn_id: i64 = 0;
                 let mut last_visible: bool = false;
 
-                for (meta, payload) in arena_guard.rows() {
-                    if meta.txn_id != 0 && meta.deleted_at_txn_id == 0 {
-                        let version_txn_id = meta.txn_id;
-                        let is_vis = if version_txn_id == last_txn_id {
-                            last_visible
-                        } else {
-                            let vis = checker.is_visible(version_txn_id, txn_id);
-                            last_txn_id = version_txn_id;
-                            last_visible = vis;
-                            vis
+                for chunk in arena_guard.chunks() {
+                    for offset in 0..chunk.metadata().len() {
+                        let Some(row) = chunk.live_row(offset) else {
+                            continue;
                         };
+                        let meta = row.metadata();
+                        if meta.deleted_at_txn_id == 0 {
+                            let version_txn_id = meta.txn_id;
+                            let is_vis = if version_txn_id == last_txn_id {
+                                last_visible
+                            } else {
+                                let vis = checker.is_visible(version_txn_id, txn_id);
+                                last_txn_id = version_txn_id;
+                                last_visible = vis;
+                                vis
+                            };
 
-                        if is_vis {
-                            if let Some(val) = payload.get(col_idx) {
-                                update_max(&mut max_val, val);
+                            if is_vis {
+                                if let Some(val) = row.payload().get(col_idx) {
+                                    update_max(&mut max_val, val);
+                                }
                             }
                         }
                     }
@@ -3817,12 +3865,15 @@ impl VersionStore {
         if uncommitted_empty && !checker.needs_snapshot_isolation(txn_id) {
             let arena_guard = self.arena.read_guard();
             if !arena_guard.is_empty() {
-                for (meta, arc_row) in arena_guard.rows() {
-                    if meta.txn_id != 0
-                        && meta.deleted_at_txn_id == 0
-                        && checker.is_visible(meta.txn_id, txn_id)
-                    {
-                        accumulate_from!(arc_row, results, aggregates);
+                for chunk in arena_guard.chunks() {
+                    for offset in 0..chunk.metadata().len() {
+                        let Some(row) = chunk.live_row(offset) else {
+                            continue;
+                        };
+                        let meta = row.metadata();
+                        if meta.deleted_at_txn_id == 0 && checker.is_visible(meta.txn_id, txn_id) {
+                            accumulate_from!(row.payload(), results, aggregates);
+                        }
                     }
                 }
 
@@ -5573,69 +5624,27 @@ impl VersionStore {
             // Only used for String/other types that can't be mapped to i64
             let mut other_groups: GroupKeyMap<u32> = GroupKeyMap::default();
 
-            for (meta, row_data) in arena_guard.rows() {
-                // Visibility check (standard pattern: check creation, then deletion)
-                if meta.txn_id == 0 || !checker.is_visible(meta.txn_id, txn_id) {
-                    continue;
-                }
-                if meta.deleted_at_txn_id != 0 && checker.is_visible(meta.deleted_at_txn_id, txn_id)
-                {
-                    continue;
-                }
-
-                let row_slice = row_data.as_ref();
-                let val = if col_idx < row_slice.len() {
-                    &row_slice[col_idx]
-                } else {
-                    // NULL - track separately without GroupKey allocation
-                    let ordinal = match null_group {
-                        Some(ordinal) => ordinal,
-                        None => {
-                            *null_group.insert(new_group(&mut accums, &mut group_count, n_aggs))
-                        }
+            for chunk in arena_guard.chunks() {
+                for offset in 0..chunk.metadata().len() {
+                    let Some(row) = chunk.live_row(offset) else {
+                        continue;
                     };
-                    let base = ordinal as usize * n_aggs;
-                    update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
-                    continue;
-                };
+                    let meta = row.metadata();
+                    // Visibility check (standard pattern: check creation, then deletion)
+                    if !checker.is_visible(meta.txn_id, txn_id) {
+                        continue;
+                    }
+                    if meta.deleted_at_txn_id != 0
+                        && checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                    {
+                        continue;
+                    }
 
-                // Try to extract i64 key for primitive types.
-                // Only route to int_groups when the type matches key_type.
-                // Mixed-type columns route mismatched types to other_groups
-                // to avoid reconstructing Float bits as Integer or vice versa.
-                let i64_key = match val {
-                    Value::Integer(i) => {
-                        if key_type == 255 {
-                            key_type = 0;
-                        }
-                        if key_type == 0 {
-                            Some(*i)
-                        } else {
-                            None // Type mismatch → other_groups
-                        }
-                    }
-                    Value::Float(f) => {
-                        if key_type == 255 {
-                            key_type = 1;
-                        }
-                        if key_type == 1 {
-                            Some(key_from_f64(*f))
-                        } else {
-                            None // Type mismatch → other_groups
-                        }
-                    }
-                    Value::Boolean(b) => {
-                        if key_type == 255 {
-                            key_type = 2;
-                        }
-                        if key_type == 2 {
-                            Some(if *b { 1 } else { 0 })
-                        } else {
-                            None // Type mismatch → other_groups
-                        }
-                    }
-                    Value::Null(_) => {
-                        // NULL value in the column - track separately
+                    let row_slice = row.payload().as_ref();
+                    let val = if col_idx < row_slice.len() {
+                        &row_slice[col_idx]
+                    } else {
+                        // NULL - track separately without GroupKey allocation
                         let ordinal = match null_group {
                             Some(ordinal) => ordinal,
                             None => {
@@ -5645,27 +5654,80 @@ impl VersionStore {
                         let base = ordinal as usize * n_aggs;
                         update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
                         continue;
-                    }
-                    _ => None,
-                };
+                    };
 
-                let ordinal = if let Some(key) = i64_key {
-                    match int_groups.entry(key) {
-                        Entry::Occupied(existing) => *existing.into_mut(),
-                        Entry::Vacant(slot) => {
-                            *slot.insert(new_group(&mut accums, &mut group_count, n_aggs))
+                    // Try to extract i64 key for primitive types.
+                    // Only route to int_groups when the type matches key_type.
+                    // Mixed-type columns route mismatched types to other_groups
+                    // to avoid reconstructing Float bits as Integer or vice versa.
+                    let i64_key = match val {
+                        Value::Integer(i) => {
+                            if key_type == 255 {
+                                key_type = 0;
+                            }
+                            if key_type == 0 {
+                                Some(*i)
+                            } else {
+                                None // Type mismatch → other_groups
+                            }
                         }
-                    }
-                } else {
-                    match other_groups.entry(GroupKey::Single(CompactArc::new(val.clone()))) {
-                        std::collections::hash_map::Entry::Occupied(existing) => *existing.get(),
-                        std::collections::hash_map::Entry::Vacant(slot) => {
-                            *slot.insert(new_group(&mut accums, &mut group_count, n_aggs))
+                        Value::Float(f) => {
+                            if key_type == 255 {
+                                key_type = 1;
+                            }
+                            if key_type == 1 {
+                                Some(key_from_f64(*f))
+                            } else {
+                                None // Type mismatch → other_groups
+                            }
                         }
-                    }
-                };
-                let base = ordinal as usize * n_aggs;
-                update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
+                        Value::Boolean(b) => {
+                            if key_type == 255 {
+                                key_type = 2;
+                            }
+                            if key_type == 2 {
+                                Some(if *b { 1 } else { 0 })
+                            } else {
+                                None // Type mismatch → other_groups
+                            }
+                        }
+                        Value::Null(_) => {
+                            // NULL value in the column - track separately
+                            let ordinal = match null_group {
+                                Some(ordinal) => ordinal,
+                                None => *null_group.insert(new_group(
+                                    &mut accums,
+                                    &mut group_count,
+                                    n_aggs,
+                                )),
+                            };
+                            let base = ordinal as usize * n_aggs;
+                            update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
+                            continue;
+                        }
+                        _ => None,
+                    };
+
+                    let ordinal = if let Some(key) = i64_key {
+                        match int_groups.entry(key) {
+                            Entry::Occupied(existing) => *existing.into_mut(),
+                            Entry::Vacant(slot) => {
+                                *slot.insert(new_group(&mut accums, &mut group_count, n_aggs))
+                            }
+                        }
+                    } else {
+                        match other_groups.entry(GroupKey::Single(CompactArc::new(val.clone()))) {
+                            std::collections::hash_map::Entry::Occupied(existing) => {
+                                *existing.get()
+                            }
+                            std::collections::hash_map::Entry::Vacant(slot) => {
+                                *slot.insert(new_group(&mut accums, &mut group_count, n_aggs))
+                            }
+                        }
+                    };
+                    let base = ordinal as usize * n_aggs;
+                    update_accums(&mut accums[base..base + n_aggs], aggregates, row_slice);
+                }
             }
 
             // Convert to results
@@ -5744,33 +5806,39 @@ impl VersionStore {
         // SLOW PATH: Multi-column GROUP BY (currently not used from try_storage_aggregation)
         let mut groups: GroupKeyMap<Vec<Accum>> = GroupKeyMap::default();
 
-        for (meta, row_data) in arena_guard.rows() {
-            // Visibility check (standard pattern: check creation, then deletion)
-            if meta.txn_id == 0 || !checker.is_visible(meta.txn_id, txn_id) {
-                continue;
+        for chunk in arena_guard.chunks() {
+            for offset in 0..chunk.metadata().len() {
+                let Some(row) = chunk.live_row(offset) else {
+                    continue;
+                };
+                let meta = row.metadata();
+                // Visibility check (standard pattern: check creation, then deletion)
+                if !checker.is_visible(meta.txn_id, txn_id) {
+                    continue;
+                }
+                if meta.deleted_at_txn_id != 0 && checker.is_visible(meta.deleted_at_txn_id, txn_id)
+                {
+                    continue;
+                }
+
+                let row_slice = row.payload().as_ref();
+                let key_values: Vec<CompactArc<Value>> = group_by_indices
+                    .iter()
+                    .map(|&col_idx| {
+                        if col_idx < row_slice.len() {
+                            CompactArc::new(row_slice[col_idx].clone())
+                        } else {
+                            CompactArc::new(Value::Null(DataType::Null))
+                        }
+                    })
+                    .collect();
+                let group_key = GroupKey::Multi(key_values);
+
+                let accums = groups
+                    .entry(group_key)
+                    .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
+                update_accums(accums, aggregates, row_slice);
             }
-            if meta.deleted_at_txn_id != 0 && checker.is_visible(meta.deleted_at_txn_id, txn_id) {
-                continue;
-            }
-
-            let row_slice = row_data.as_ref();
-
-            let key_values: Vec<CompactArc<Value>> = group_by_indices
-                .iter()
-                .map(|&col_idx| {
-                    if col_idx < row_slice.len() {
-                        CompactArc::new(row_slice[col_idx].clone())
-                    } else {
-                        CompactArc::new(Value::Null(DataType::Null))
-                    }
-                })
-                .collect();
-            let group_key = GroupKey::Multi(key_values);
-
-            let accums = groups
-                .entry(group_key)
-                .or_insert_with(|| vec![Accum::default(); aggregates.len()]);
-            update_accums(accums, aggregates, row_slice);
         }
 
         // Convert to results
@@ -9017,7 +9085,13 @@ mod tests {
 
         let guard = store.arena.read_guard();
         assert!(guard.is_empty());
-        assert_eq!(guard.rows().count(), 0);
+        assert_eq!(
+            guard
+                .chunks()
+                .map(|chunk| chunk.metadata().len())
+                .sum::<usize>(),
+            0
+        );
     }
 
     #[test]
