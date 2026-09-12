@@ -2519,7 +2519,7 @@ mod tests {
     fn materialized_result_keeps_export_owner_without_a_wrapper() {
         let row = Row::from_values(vec![Value::text("retained heap value".repeat(100))]);
         let ((), scope) = ReadScopeGuard::with_lazy(|| {
-            crate::storage::mvcc::read_memory::charge_export(&row);
+            crate::storage::mvcc::read_memory::charge_bytes_export(row.heap_bytes());
         });
         let scope = scope.unwrap();
         let identity = Arc::downgrade(&scope);
@@ -2546,7 +2546,7 @@ mod tests {
     fn materialized_scanner_projection_retains_owner_without_wrappers() {
         let row = Row::from_values(vec![Value::text("retained heap value".repeat(100))]);
         let ((), scope) = ReadScopeGuard::with_lazy(|| {
-            crate::storage::mvcc::read_memory::charge_export(&row);
+            crate::storage::mvcc::read_memory::charge_bytes_export(row.heap_bytes());
         });
         let scope = scope.unwrap();
         let identity = Arc::downgrade(&scope);
@@ -2611,7 +2611,7 @@ mod tests {
             if !self.inner.next() {
                 return false;
             }
-            crate::storage::mvcc::read_memory::charge_export(self.inner.row());
+            crate::storage::mvcc::read_memory::charge_bytes_export(self.inner.row().heap_bytes());
             true
         }
         fn scan(&self, dest: &mut [Value]) -> Result<()> {

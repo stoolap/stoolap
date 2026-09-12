@@ -60,17 +60,6 @@ pub(crate) fn current_scope() -> Option<Arc<ReadScope>> {
     })
 }
 
-pub(crate) fn charge_export(row: &Row) {
-    ACTIVE_SCOPE.with(|scope| {
-        if let ActiveScope::Active(owner) = &mut *scope.borrow_mut() {
-            let bytes = row.heap_bytes();
-            if bytes != 0 {
-                owner.get_or_insert_with(new_scope).add(bytes);
-            }
-        }
-    });
-}
-
 pub(crate) fn charge_value_export(value: &Value) {
     charge_bytes_export(value.heap_bytes() as u128);
 }
@@ -346,6 +335,8 @@ pub(crate) struct ExportBatch {
     scope: Option<Arc<ReadScope>>,
     enabled: bool,
     bytes: u128,
+    row_bound: u128,
+    rows: usize,
 }
 
 impl ExportBatch {
@@ -354,32 +345,35 @@ impl ExportBatch {
             scope: None,
             enabled: ACTIVE_SCOPE.with(|scope| matches!(*scope.borrow(), ActiveScope::Active(_))),
             bytes: 0,
+            row_bound: 0,
+            rows: 0,
         }
     }
 
-    pub fn record(&mut self, row: &Row) {
-        if self.enabled {
-            self.record_bytes(row.heap_bytes());
-        }
+    pub fn for_rows(row_bound: u128) -> Self {
+        let mut batch = Self::new();
+        batch.row_bound = row_bound;
+        batch
     }
 
-    pub fn record_rows(
-        &mut self,
-        rows: &[(i64, Row)],
-        inline_row_bytes: Option<std::num::NonZeroUsize>,
-    ) {
-        if self.enabled {
-            let bytes = match inline_row_bytes {
-                Some(bytes) => rows.len() as u128 * bytes.get() as u128,
-                None => rows.iter().map(|(_, row)| row.heap_bytes()).sum(),
-            };
-            self.record_bytes(bytes);
-        }
+    pub fn include_row_bound(&mut self, bound: u128) {
+        self.row_bound = self.row_bound.max(bound);
     }
 
+    #[inline]
     pub fn capture(&mut self, row: &Row) -> Row {
-        self.record(row);
+        self.record_rows(1);
         row.clone()
+    }
+
+    #[inline]
+    pub fn record_rows(&mut self, count: usize) {
+        if self.enabled && self.row_bound != 0 && count != 0 {
+            if self.scope.is_none() {
+                self.bind_scope();
+            }
+            self.rows += count;
+        }
     }
 
     pub fn record_value(&mut self, value: &Value) {
@@ -411,13 +405,19 @@ impl ExportBatch {
         self.record_value(value);
         value.clone()
     }
+
+    pub fn publish(&mut self) {
+        if let Some(scope) = &self.scope {
+            let bytes = std::mem::take(&mut self.bytes)
+                + std::mem::take(&mut self.rows) as u128 * self.row_bound;
+            scope.add(bytes);
+        }
+    }
 }
 
 impl Drop for ExportBatch {
     fn drop(&mut self) {
-        if let Some(scope) = &self.scope {
-            scope.add(self.bytes);
-        }
+        self.publish();
     }
 }
 
@@ -489,6 +489,32 @@ impl Clone for PayloadCharge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_exports_count_rows_and_keep_value_charges() {
+        let (_, scope) = ReadScopeGuard::with_lazy(|| {
+            ExportBatch::for_rows(512).record_rows(0);
+        });
+        assert!(scope.is_none());
+        let value = Value::text("retained export child".repeat(8));
+        let row = Row::from(vec![Value::Integer(1), value.clone()]).into_shared();
+        let bound = row.heap_bytes() + 256;
+        let scope = Arc::new(ReadScope::default());
+        let _active = scope.enter();
+        let panic = std::panic::catch_unwind(|| {
+            let mut batch = ExportBatch::for_rows(bound);
+            let captured = batch.capture(&row);
+            assert_eq!(captured, row);
+            batch.record_rows(1);
+            batch.record_value(&value);
+            panic!("publish the partial batch during unwind");
+        });
+        assert!(panic.is_err());
+        assert_eq!(
+            scope.exported_bytes(),
+            2 * bound + value.heap_bytes() as u128
+        );
+    }
 
     #[test]
     fn deferred_exports_stay_lazy_and_follow_their_owner_across_threads() {
@@ -662,13 +688,12 @@ mod tests {
             let _outer = outer.enter();
             {
                 let _inner = inner.enter();
-                let mut batch = ExportBatch::new();
-                batch.record(&row);
-                batch.record(&row);
+                let mut batch = ExportBatch::for_rows(row.heap_bytes());
+                batch.record_rows(2);
                 assert_eq!(inner.bytes.get(), 0);
             }
             assert_eq!(inner.bytes.get_wide(), row.heap_bytes() * 2);
-            charge_export(&row);
+            charge_bytes_export(row.heap_bytes());
             assert_eq!(outer.bytes.get_wide(), row.heap_bytes());
         }
         assert!(current_scope().is_none());

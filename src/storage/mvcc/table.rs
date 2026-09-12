@@ -1617,7 +1617,7 @@ impl MVCCTable {
     #[inline]
     fn collect_visible_rows(&self, filter: Option<&dyn Expression>) -> RowVec {
         let txn_versions = self.txn_versions.read().unwrap();
-        let mut exports = super::read_memory::ExportBatch::new();
+        let mut exports = txn_versions.export_batch();
         let schema = &self.cached_schema;
 
         // Check if we have local versions (uncommitted changes in this transaction)
@@ -1733,7 +1733,7 @@ impl MVCCTable {
             if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
                 // Direct O(1) lookup by primary key
                 let txn_versions = self.txn_versions.read().unwrap();
-                let mut exports = super::read_memory::ExportBatch::new();
+                let mut exports = txn_versions.export_batch();
                 // Check local versions first via get_local_version (preserves
                 // delete signal). txn_versions.get() swallows deletes as None,
                 // which would cause a fallback to the committed store and miss
@@ -1813,7 +1813,7 @@ impl MVCCTable {
                 .collect();
         }
 
-        let mut exports = super::read_memory::ExportBatch::new();
+        let mut exports = txn_versions.export_batch();
         // Has local versions - use batch fetch then merge with early termination
         // Uses thread-local cached Vec for zero-allocation reuse
         let global_rows = self.version_store.get_all_visible_rows_cached(self.txn_id);
@@ -1895,7 +1895,7 @@ impl MVCCTable {
             if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
                 // Direct O(1) lookup by primary key
                 let txn_versions = self.txn_versions.read().unwrap();
-                let mut exports = super::read_memory::ExportBatch::new();
+                let mut exports = txn_versions.export_batch();
                 // Check local versions first via get_local_version (preserves
                 // delete signal). txn_versions.get() swallows deletes as None,
                 // which would cause a fallback to the committed store and miss
@@ -2005,7 +2005,7 @@ impl Table for MVCCTable {
         rows: &mut RowVec,
     ) -> Result<()> {
         let txn_versions = self.txn_versions.read().unwrap();
-        let mut exports = super::read_memory::ExportBatch::new();
+        let mut exports = txn_versions.export_batch();
         let schema = &self.cached_schema;
 
         // Don't pre-allocate based on row_ids.len() — for volume-backed tables,
@@ -2141,7 +2141,7 @@ impl Table for MVCCTable {
                 // missing uncommitted deletes in the current transaction.
                 let row_with_original = {
                     let txn_versions = self.txn_versions.read().unwrap();
-                    let mut exports = super::read_memory::ExportBatch::new();
+                    let mut exports = txn_versions.export_batch();
                     if let Some(local) = txn_versions.get_local_version(pk_id) {
                         if local.is_deleted() {
                             None // Locally deleted — can't update
@@ -2202,7 +2202,7 @@ impl Table for MVCCTable {
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
-                    let mut exports = super::read_memory::ExportBatch::new();
+                    let mut exports = txn_versions.export_batch();
                     for row_id in pk_range_ids {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
@@ -2257,7 +2257,7 @@ impl Table for MVCCTable {
 
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
-                    let mut exports = super::read_memory::ExportBatch::new();
+                    let mut exports = txn_versions.export_batch();
                     for &row_id in &filtered_row_ids {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
@@ -2383,7 +2383,7 @@ impl Table for MVCCTable {
         // - Rows locally inserted (not in global store): add to update set
         let local_rows_to_update: RowVec = {
             let txn_versions = self.txn_versions.read().unwrap();
-            let mut exports = super::read_memory::ExportBatch::new();
+            let mut exports = txn_versions.export_batch();
             if txn_versions.has_local_changes() {
                 // Fix up global rows that have local modifications
                 rows_with_originals.retain_mut(|(row_id, row, _orig)| {
@@ -2497,7 +2497,7 @@ impl Table for MVCCTable {
 
         {
             let txn_versions = self.txn_versions.read().unwrap();
-            let mut exports = super::read_memory::ExportBatch::new();
+            let mut exports = txn_versions.export_batch();
             for &row_id in row_ids {
                 if let Some(local) = txn_versions.get_local_version(row_id) {
                     if !local.is_deleted() {
@@ -2556,7 +2556,7 @@ impl Table for MVCCTable {
 
         {
             let txn_versions = self.txn_versions.read().unwrap();
-            let mut exports = super::read_memory::ExportBatch::new();
+            let mut exports = txn_versions.export_batch();
             for &row_id in row_ids {
                 if let Some(local) = txn_versions.get_local_version(row_id) {
                     if !local.is_deleted() {
@@ -2707,7 +2707,7 @@ impl Table for MVCCTable {
                 // missing uncommitted deletes in the current transaction.
                 let row_with_original = {
                     let txn_versions = self.txn_versions.read().unwrap();
-                    let mut exports = super::read_memory::ExportBatch::new();
+                    let mut exports = txn_versions.export_batch();
                     if let Some(local) = txn_versions.get_local_version(pk_id) {
                         if local.is_deleted() {
                             None // Already locally deleted — don't double-count
@@ -2758,7 +2758,7 @@ impl Table for MVCCTable {
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
-                    let mut exports = super::read_memory::ExportBatch::new();
+                    let mut exports = txn_versions.export_batch();
                     for row_id in pk_range_ids {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
@@ -2806,7 +2806,7 @@ impl Table for MVCCTable {
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
-                    let mut exports = super::read_memory::ExportBatch::new();
+                    let mut exports = txn_versions.export_batch();
                     for row_id in filtered_row_ids {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
@@ -2862,7 +2862,7 @@ impl Table for MVCCTable {
             // Use get_local_version to distinguish "no local version" from "locally deleted"
             let local_version = {
                 let txn_versions = self.txn_versions.read().unwrap();
-                let mut exports = super::read_memory::ExportBatch::new();
+                let mut exports = txn_versions.export_batch();
                 txn_versions
                     .get_local_version(row_id)
                     .map(|v| (v.is_deleted(), exports.capture(&v.data)))
@@ -2966,7 +2966,7 @@ impl Table for MVCCTable {
                 // missing uncommitted deletes in the current transaction.
                 let row = {
                     let txn_versions = self.txn_versions.read().unwrap();
-                    let mut exports = super::read_memory::ExportBatch::new();
+                    let mut exports = txn_versions.export_batch();
                     if let Some(local) = txn_versions.get_local_version(pk_lookup) {
                         if local.is_deleted() {
                             None // Locally deleted in this transaction
@@ -3177,7 +3177,7 @@ impl Table for MVCCTable {
 
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
         let txn_versions = self.txn_versions.read().unwrap();
-        let mut exports = super::read_memory::ExportBatch::new();
+        let mut exports = txn_versions.export_batch();
         txn_versions
             .iter_local()
             .map(|(row_id, version)| {
