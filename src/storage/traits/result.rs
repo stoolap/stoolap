@@ -19,6 +19,8 @@ use rustc_hash::FxHashMap;
 
 use crate::common::CompactArc;
 use crate::core::{Result, Row, Value};
+use crate::storage::mvcc::ReadScope;
+use std::sync::Arc;
 
 /// QueryResult represents the result of a SQL query
 ///
@@ -121,6 +123,20 @@ pub trait QueryResult: Send {
         None
     }
 
+    /// Whether all storage payloads are already captured and iteration performs no storage reads.
+    fn is_materialized(&self) -> bool {
+        false
+    }
+
+    /// Binds deferred exports before iteration. True means no ambient scope is needed.
+    fn bind_read_scope(&mut self, _scope: Option<&Arc<ReadScope>>) -> bool {
+        self.is_materialized()
+    }
+
+    /// Takes retained storage ownership if the result can hold it directly.
+    /// The default leaves ownership with the caller's result wrapper.
+    fn retain_read_scope(&mut self, _scope: &mut Option<Arc<ReadScope>>) {}
+
     /// Returns a pending error from the last `next()` call, if any.
     ///
     /// When `next()` returns false due to a runtime error (e.g. invalid REGEXP
@@ -201,6 +217,10 @@ impl MemoryResult {
 }
 
 impl QueryResult for MemoryResult {
+    fn is_materialized(&self) -> bool {
+        true
+    }
+
     fn columns(&self) -> &[String] {
         &self.columns
     }

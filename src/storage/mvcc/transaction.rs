@@ -21,6 +21,7 @@ use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use crate::core::{Error, IsolationLevel, Result, Schema, SchemaColumn};
+use crate::storage::mvcc::memory::HotMetadataCharge;
 use crate::storage::mvcc::{get_fast_timestamp, TransactionRegistry};
 use crate::storage::traits::{QueryResult, Table, Transaction};
 use crate::storage::Expression;
@@ -63,16 +64,12 @@ pub struct MvccTransaction {
     id: i64,
     /// Transaction state
     state: TransactionState,
-    /// Tables accessed in this transaction
-    tables: FxHashMap<String, Box<dyn Table>>,
     /// Transaction-specific isolation level (if different from engine default)
     isolation_level: Option<IsolationLevel>,
     /// Reference to the transaction registry
     registry: Arc<TransactionRegistry>,
     /// Begin sequence number (for snapshot isolation)
     begin_seq: i64,
-    /// Fast path cache for single table operations
-    last_table_name: Option<String>,
     /// Engine reference for table operations (will be set by Engine)
     engine_operations: Option<Arc<dyn TransactionEngineOperations>>,
     /// Savepoints in creation order; the same name may appear more than once
@@ -81,6 +78,7 @@ pub struct MvccTransaction {
     created_tables: Vec<String>,
     /// Tables dropped in this transaction (for rollback - stores name and schema)
     dropped_tables: Vec<(String, Schema)>,
+    metadata: HotMetadataCharge,
 }
 
 /// Operations that require engine access
@@ -103,12 +101,6 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// Rename a table
     fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()>;
 
-    /// Commit table changes
-    fn commit_table(&self, txn_id: i64, table: &dyn Table) -> Result<()>;
-
-    /// Rollback table changes
-    fn rollback_table(&self, txn_id: i64, table: &dyn Table);
-
     /// Record commit in WAL
     fn record_commit(&self, txn_id: i64) -> Result<()>;
 
@@ -128,7 +120,16 @@ pub trait TransactionEngineOperations: Send + Sync {
     ///
     /// Callers MUST complete_commit if any_committed is true, even on error,
     /// to avoid orphaning already-committed rows.
-    fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>);
+    fn commit_all_tables(
+        &self,
+        txn_id: i64,
+        prepared: &super::version_store::PreparedCommit,
+    ) -> (bool, Option<crate::core::Error>);
+
+    /// Prepare hot capacity for all tables before publishing the first table.
+    fn prepare_commit(&self, _txn_id: i64) -> Result<super::version_store::PreparedCommit> {
+        Ok(super::version_store::PreparedCommit::default())
+    }
 
     /// Rollback all tables for a transaction at once
     /// This cleans up the transaction's entries in txn_version_stores
@@ -136,9 +137,12 @@ pub trait TransactionEngineOperations: Send + Sync {
 
     /// Marks every table the transaction writes as publishing, from before
     /// its index updates until the transaction is visible or undone
-    fn begin_publish(&self, txn_id: i64) -> super::version_store::PublishHold {
-        let _ = txn_id;
-        super::version_store::PublishHold::default()
+    fn begin_publish(
+        &self,
+        _txn_id: i64,
+        _prepared: &super::version_store::PreparedCommit,
+    ) -> Result<super::version_store::PublishHold> {
+        Ok(super::version_store::PublishHold::default())
     }
 
     /// Waits while a table the transaction writes holds more hot bytes than
@@ -155,12 +159,6 @@ pub trait TransactionEngineOperations: Send + Sync {
 
     /// Discard later DML across all touched tables, including cold claims.
     fn rollback_dml_after(&self, txn_id: i64, timestamp: i64);
-
-    /// Defer table cleanup to background thread (avoids synchronous deallocation)
-    /// Default implementation drops synchronously
-    fn defer_table_cleanup(&self, _tables: Vec<Box<dyn Table>>) {
-        // Default: just drop synchronously (tables dropped when _tables goes out of scope)
-    }
 
     /// Acquire the seal fence shared lock. Commits hold this to signal they
     /// are in-flight. The checkpoint micro-seal acquires the exclusive lock,
@@ -217,15 +215,14 @@ impl MvccTransaction {
         Self {
             id,
             state: TransactionState::Active,
-            tables: FxHashMap::default(),
             isolation_level: None,
             registry,
             begin_seq,
-            last_table_name: None,
             engine_operations: None,
             savepoints: Vec::new(),
             created_tables: Vec::new(),
             dropped_tables: Vec::new(),
+            metadata: HotMetadataCharge::new(std::mem::size_of::<Self>() as u128),
         }
     }
 
@@ -267,18 +264,37 @@ impl MvccTransaction {
 
     /// Clean up transaction resources
     fn cleanup(&mut self) {
-        // Clear fast path cache
-        self.last_table_name = None;
-
-        // Clear tables
-        self.tables.clear();
-
         // Clear DDL tracking
         self.created_tables.clear();
         self.dropped_tables.clear();
+        self.refresh_metadata();
 
         // Remove transaction isolation level from registry
         self.registry.remove_transaction_isolation_level(self.id);
+    }
+
+    fn refresh_metadata(&mut self) {
+        let bytes = std::mem::size_of::<Self>() as u128
+            + (self.savepoints.capacity() * std::mem::size_of::<(String, SavepointState)>())
+                as u128
+            + (self.created_tables.capacity() * std::mem::size_of::<String>()) as u128
+            + (self.dropped_tables.capacity() * std::mem::size_of::<(String, Schema)>()) as u128
+            + self
+                .savepoints
+                .iter()
+                .map(|(name, _)| name.capacity() as u128)
+                .sum::<u128>()
+            + self
+                .created_tables
+                .iter()
+                .map(|name| name.capacity() as u128)
+                .sum::<u128>()
+            + self
+                .dropped_tables
+                .iter()
+                .map(|(name, _)| name.capacity() as u128)
+                .sum::<u128>();
+        self.metadata.resize(bytes);
     }
 
     /// Roll back DDL operations (CREATE TABLE / DROP TABLE) in reverse order.
@@ -338,6 +354,7 @@ impl MvccTransaction {
                 ddl_state,
             },
         ));
+        self.refresh_metadata();
         Ok(())
     }
 
@@ -357,6 +374,7 @@ impl MvccTransaction {
         self.check_active()?;
         let position = self.savepoint_position(name)?;
         self.savepoints.truncate(position);
+        self.refresh_metadata();
         Ok(())
     }
 
@@ -403,6 +421,7 @@ impl MvccTransaction {
         }
 
         self.savepoints.truncate(position + 1);
+        self.refresh_metadata();
 
         Ok(())
     }
@@ -432,9 +451,6 @@ impl Transaction for MvccTransaction {
     fn commit(&mut self) -> Result<()> {
         self.check_active()?;
 
-        // Update state to committing
-        self.state = TransactionState::Committing;
-
         // Check if read-only: no DDL changes and no DML changes
         // Use has_pending_dml_changes() to avoid allocating Vec<Box<dyn Table>>
         let has_dml_changes = self
@@ -447,9 +463,20 @@ impl Transaction for MvccTransaction {
 
         // Two-phase commit protocol
         if !is_read_only {
-            if let Some(ops) = &self.engine_operations {
+            let prepared = if let Some(ops) = &self.engine_operations {
                 ops.wait_for_hot_admission(self.id);
-            }
+                match ops.prepare_commit(self.id) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.rollback()?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                super::version_store::PreparedCommit::default()
+            };
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::commit_capacity_prepared();
             // Acquire seal fence shared lock. This signals to the checkpoint
             // micro-seal that a commit is in-flight. The micro-seal waits for
             // all in-flight commits to finish before draining hot rows.
@@ -459,19 +486,27 @@ impl Transaction for MvccTransaction {
                 .as_ref()
                 .and_then(|ops| ops.acquire_seal_fence());
 
-            // Phase 1: Start commit - mark transaction as "committing"
-            self.registry.start_commit(self.id);
             // Held until the transaction is visible or undone: readers that
             // trust an index's order stand down while it publishes
-            let publish = self
-                .engine_operations
-                .as_ref()
-                .map(|ops| ops.begin_publish(self.id));
+            let publish = if let Some(ops) = &self.engine_operations {
+                match ops.begin_publish(self.id, &prepared) {
+                    Ok(publish) => Some(publish),
+                    Err(error) => {
+                        drop(_seal_guard);
+                        self.rollback()?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            self.state = TransactionState::Committing;
+            self.registry.start_commit(self.id);
 
             // Phase 2: Commit all tables - apply local changes to global store
             // This now includes WAL recording internally (before each table commit)
             if let Some(ops) = &self.engine_operations {
-                let (any_committed, error) = ops.commit_all_tables(self.id);
+                let (any_committed, error) = ops.commit_all_tables(self.id, &prepared);
                 if let Some(e) = error {
                     if any_committed {
                         // Partial commit: some tables already committed.
@@ -550,16 +585,7 @@ impl Transaction for MvccTransaction {
             self.rollback_ddl(ops.as_ref());
         }
 
-        // Rollback all tables - discard local changes
-        for table in self.tables.values_mut() {
-            table.rollback();
-        }
-
-        // Notify engine of rollback (per-table callbacks)
         if let Some(ops) = &self.engine_operations {
-            for table in self.tables.values() {
-                ops.rollback_table(self.id, table.as_ref());
-            }
             // Clean up txn_version_stores entry to prevent memory leak
             ops.rollback_all_tables(self.id);
         }
@@ -618,6 +644,7 @@ impl Transaction for MvccTransaction {
 
         // Track for rollback - store the table name
         self.created_tables.push(name.to_lowercase());
+        self.refresh_metadata();
 
         Ok(table)
     }
@@ -645,20 +672,11 @@ impl Transaction for MvccTransaction {
 
         // Save schema for potential rollback (note: data cannot be recovered)
         self.dropped_tables.push((name.to_lowercase(), schema));
+        self.refresh_metadata();
 
         // Now drop the table
         let ops = self.get_engine_ops()?;
         ops.drop_table(name)?;
-
-        // Remove from cache
-        self.tables.remove(name);
-
-        // Clear fast path cache if needed
-        if let Some(last_name) = &self.last_table_name {
-            if last_name == name {
-                self.last_table_name = None;
-            }
-        }
 
         Ok(())
     }
@@ -666,11 +684,6 @@ impl Transaction for MvccTransaction {
     fn get_table(&self, name: &str) -> Result<Box<dyn Table>> {
         self.check_active()?;
 
-        // Note: Cached tables would require Clone on Table trait, which isn't object-safe.
-        // For now, always get from engine (engine will handle caching internally).
-        // The tables HashMap is used for tracking which tables were accessed for commit/rollback.
-
-        // Get from engine
         let ops = self.get_engine_ops()?;
         ops.get_table_for_transaction(self.id, name)
     }
@@ -686,21 +699,7 @@ impl Transaction for MvccTransaction {
         self.check_active()?;
 
         let ops = self.get_engine_ops()?;
-        ops.rename_table(old_name, new_name)?;
-
-        // Update cache if needed
-        if let Some(table) = self.tables.remove(old_name) {
-            self.tables.insert(new_name.to_string(), table);
-        }
-
-        // Update fast path cache
-        if let Some(last_name) = &self.last_table_name {
-            if last_name == old_name {
-                self.last_table_name = Some(new_name.to_string());
-            }
-        }
-
-        Ok(())
+        ops.rename_table(old_name, new_name)
     }
 
     fn create_table_index(
@@ -858,6 +857,28 @@ impl Drop for MvccTransaction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn savepoint_metadata_retains_empty_capacity_and_survives_cleanup() {
+        let registry = Arc::new(TransactionRegistry::new());
+        let (txn_id, begin_seq) = registry.begin_transaction();
+        let mut txn = MvccTransaction::new(txn_id, begin_seq, registry);
+        let name = "savepoint_with_a_long_name".repeat(100);
+        txn.create_savepoint(&name).unwrap();
+        let with_name = txn.metadata.bytes();
+        assert!(with_name >= (std::mem::size_of::<MvccTransaction>() + name.len()) as u128);
+        txn.release_savepoint(&name).unwrap();
+        let empty_capacity = txn.metadata.bytes();
+        assert!(empty_capacity > std::mem::size_of::<MvccTransaction>() as u128);
+        assert_eq!(with_name - empty_capacity, name.len() as u128);
+        txn.create_savepoint(&name).unwrap();
+        txn.rollback().unwrap();
+        assert_eq!(
+            txn.metadata.bytes(),
+            with_name,
+            "cleanup retains savepoints and their names"
+        );
+    }
 
     #[test]
     fn test_transaction_creation() {

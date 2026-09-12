@@ -29,10 +29,12 @@
 
 use parking_lot::RwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use crate::common::{I64Map, I64Set};
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
+use crate::storage::index::memory::{IndexMemory, IndexMemoryOwner};
 use crate::storage::Index;
 
 /// Row IDs in `[0, BITSET_MAX_BITS)` use the fast bitset path (~156 KB max).
@@ -80,9 +82,9 @@ impl PkIndexInner {
 
     /// Insert `id`. Returns `true` if newly inserted (was absent).
     #[inline]
-    fn insert(&mut self, id: i64) -> bool {
+    fn insert(&mut self, id: i64, memory: &IndexMemory) -> bool {
         if let Some((word_idx, mask)) = to_word_bit(id) {
-            ensure_capacity(&mut self.words, word_idx);
+            ensure_capacity(&mut self.words, word_idx, memory);
             if (self.words[word_idx] & mask) == 0 {
                 self.words[word_idx] |= mask;
                 self.count += 1;
@@ -90,17 +92,18 @@ impl PkIndexInner {
             } else {
                 false
             }
-        } else if self.overflow.insert(id) {
-            self.count += 1;
-            true
         } else {
-            false
+            let before = self.overflow.capacity();
+            let inserted = self.overflow.insert(id);
+            memory.resize(before as u128 * 8, self.overflow.capacity() as u128 * 8);
+            self.count += usize::from(inserted);
+            inserted
         }
     }
 
     /// Remove `id`. Returns `true` if it was present and removed.
     #[inline]
-    fn remove(&mut self, id: i64) -> bool {
+    fn remove(&mut self, id: i64, memory: &IndexMemory) -> bool {
         if let Some((word_idx, mask)) = to_word_bit(id) {
             if word_idx < self.words.len() && (self.words[word_idx] & mask) != 0 {
                 self.words[word_idx] &= !mask;
@@ -109,11 +112,12 @@ impl PkIndexInner {
             } else {
                 false
             }
-        } else if self.overflow.remove(id) {
-            self.count -= 1;
-            true
         } else {
-            false
+            let before = self.overflow.capacity();
+            let removed = self.overflow.remove(id);
+            memory.resize(before as u128 * 8, self.overflow.capacity() as u128 * 8);
+            self.count -= usize::from(removed);
+            removed
         }
     }
 
@@ -124,9 +128,11 @@ impl PkIndexInner {
     }
 
     /// Reset everything.
-    fn clear(&mut self) {
+    fn clear(&mut self, memory: &IndexMemory) {
         self.words.clear();
+        let before = self.overflow.capacity();
         self.overflow = I64Set::new();
+        memory.resize(before as u128 * 8, self.overflow.capacity() as u128 * 8);
         self.count = 0;
     }
 }
@@ -149,9 +155,11 @@ fn to_word_bit(row_id: i64) -> Option<(usize, u64)> {
 
 /// Grow `words` so that `word_idx` is valid.
 #[inline]
-fn ensure_capacity(words: &mut Vec<u64>, word_idx: usize) {
+fn ensure_capacity(words: &mut Vec<u64>, word_idx: usize, memory: &IndexMemory) {
     if word_idx >= words.len() {
+        let before = words.capacity();
         words.resize(word_idx + 1, 0);
+        memory.resize(before as u128 * 8, words.capacity() as u128 * 8);
     }
 }
 
@@ -290,17 +298,24 @@ pub struct PkIndex {
     column_name: String,
     data: RwLock<PkIndexInner>,
     closed: AtomicBool,
+    memory: IndexMemoryOwner,
 }
 
 impl PkIndex {
     pub fn new(name: String, table_name: String, column_id: i32, column_name: String) -> Self {
+        let data = PkIndexInner::new();
+        let bytes = name.capacity()
+            + table_name.capacity()
+            + column_name.capacity()
+            + data.overflow.capacity() * 8;
         Self {
             name,
             table_name,
             column_id,
             column_name,
-            data: RwLock::new(PkIndexInner::new()),
+            data: RwLock::new(data),
             closed: AtomicBool::new(false),
+            memory: IndexMemoryOwner::new::<Self>(bytes as u128, 0),
         }
     }
 
@@ -340,6 +355,10 @@ impl PkIndex {
 // ---------------------------------------------------------------------------
 
 impl Index for PkIndex {
+    fn memory_account(&self) -> Option<&Arc<IndexMemory>> {
+        Some(&self.memory.account)
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -355,14 +374,14 @@ impl Index for PkIndex {
     fn add(&self, values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         let _ = values;
         let mut inner = self.data.write();
-        inner.insert(row_id);
+        inner.insert(row_id, &self.memory.account);
         Ok(())
     }
 
     fn add_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
         let mut inner = self.data.write();
         for (row_id, _) in entries.iter() {
-            inner.insert(row_id);
+            inner.insert(row_id, &self.memory.account);
         }
         Ok(())
     }
@@ -370,21 +389,21 @@ impl Index for PkIndex {
     fn add_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
         let mut inner = self.data.write();
         for &(row_id, _) in entries {
-            inner.insert(row_id);
+            inner.insert(row_id, &self.memory.account);
         }
         Ok(())
     }
 
     fn remove(&self, _values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
         let mut inner = self.data.write();
-        inner.remove(row_id);
+        inner.remove(row_id, &self.memory.account);
         Ok(())
     }
 
     fn remove_batch(&self, entries: &I64Map<Vec<Value>>) -> Result<()> {
         let mut inner = self.data.write();
         for (row_id, _) in entries.iter() {
-            inner.remove(row_id);
+            inner.remove(row_id, &self.memory.account);
         }
         Ok(())
     }
@@ -392,7 +411,7 @@ impl Index for PkIndex {
     fn remove_batch_slice(&self, entries: &[(i64, &[Value])]) -> Result<()> {
         let mut inner = self.data.write();
         for &(row_id, _) in entries {
-            inner.remove(row_id);
+            inner.remove(row_id, &self.memory.account);
         }
         Ok(())
     }
@@ -400,7 +419,7 @@ impl Index for PkIndex {
     fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
         let mut inner = self.data.write();
         for &row_id in row_ids {
-            inner.remove(row_id);
+            inner.remove(row_id, &self.memory.account);
         }
         Some(Ok(()))
     }
@@ -927,7 +946,7 @@ impl Index for PkIndex {
 
     fn clear(&self) -> Result<()> {
         let mut inner = self.data.write();
-        inner.clear();
+        inner.clear(&self.memory.account);
         Ok(())
     }
 
@@ -960,6 +979,95 @@ mod tests {
 
     fn count(idx: &PkIndex) -> usize {
         idx.data.read().count
+    }
+
+    #[test]
+    fn retained_capacity_follows_growth_shrink_clear_and_index_owners() {
+        let mut idx = make_idx();
+        let account = Arc::clone(idx.memory_account().unwrap());
+        let initial = account.requested_bytes();
+        let initial_overflow = idx.data.read().overflow.capacity() * 8;
+        assert_eq!(
+            initial,
+            crate::storage::mvcc::memory::arc_allocation_bytes::<PkIndex>()
+                + idx.name.capacity()
+                + idx.table_name.capacity()
+                + idx.column_name.capacity()
+                + initial_overflow
+        );
+        let assert_capacity = |idx: &PkIndex| {
+            let inner = idx.data.read();
+            assert_eq!(
+                account.requested_bytes(),
+                initial - initial_overflow
+                    + inner.words.capacity() * 8
+                    + inner.overflow.capacity() * 8
+            );
+        };
+        idx.add(&[], 4096, 0).unwrap();
+        idx.add(&[], i64::MIN, 0).unwrap();
+        let entries: Vec<_> = (1..=2048).map(|id| (-id, &[][..])).collect();
+        idx.add_batch_slice(&entries).unwrap();
+        assert_capacity(&idx);
+        let grown = account.requested_bytes();
+        idx.remove_batch_slice(&entries[..1024]).unwrap();
+        idx.remove_batch_ids(&(1025..=2048).map(|id| -id).collect::<Vec<_>>())
+            .unwrap()
+            .unwrap();
+        assert!(account.requested_bytes() < grown);
+        assert_capacity(&idx);
+        idx.remove(&[], i64::MIN, 0).unwrap();
+        let mut batch = I64Map::new();
+        batch.insert(-10, vec![]);
+        batch.insert(8192, vec![]);
+        idx.add_batch(&batch).unwrap();
+        assert_capacity(&idx);
+        idx.remove_batch(&batch).unwrap();
+        assert_capacity(&idx);
+        idx.clear().unwrap();
+        assert_capacity(&idx);
+        assert!(
+            account.requested_bytes() > initial,
+            "clear retains bitset capacity"
+        );
+        idx.close().unwrap();
+        assert_capacity(&idx);
+        drop(idx);
+        assert_eq!(account.requested_bytes(), 0);
+    }
+
+    #[test]
+    fn attached_index_charge_survives_table_and_index_removal() {
+        use crate::storage::mvcc::memory::{HotMemoryRegistry, TableMemory};
+        use crate::storage::mvcc::version_store::VersionStore;
+
+        let registry = HotMemoryRegistry::default();
+        let table = Arc::new(TableMemory::default());
+        registry.register(&table);
+        let idx = make_idx();
+        idx.add(&[], 4096, 0).unwrap();
+        let account = Arc::clone(idx.memory_account().unwrap());
+        account.register(&table);
+        account.register(&table);
+        let retained = account.requested_bytes();
+        assert_eq!(registry.total().index_requested, retained);
+        drop(table);
+        assert_eq!(registry.total().index_requested, retained);
+        drop(idx);
+        assert_eq!(registry.total().index_requested, 0);
+        drop(account);
+
+        let store = VersionStore::new("index_owner", crate::core::Schema::default());
+        registry.register(store.memory_account());
+        let idx = Arc::new(make_idx());
+        store.add_index("pk".to_string(), idx.clone());
+        let retained = registry.total().index_requested;
+        assert!(retained > 0);
+        drop(store.remove_index("pk"));
+        drop(store);
+        assert_eq!(registry.total().index_requested, retained);
+        drop(idx);
+        assert_eq!(registry.total().index_requested, 0);
     }
 
     #[test]

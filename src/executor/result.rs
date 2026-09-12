@@ -17,12 +17,138 @@
 //! This module provides result types for SQL query execution.
 
 use crate::common::CompactArc;
-use crate::core::{Result, Row, RowVec, Value};
+use crate::core::{Result, Row, RowVec, Schema, Value};
 use crate::parser::ast::Expression;
 use crate::storage::traits::QueryResult;
 use rustc_hash::{FxHashMap, FxHasher};
 
 use super::expression::RowFilter;
+use crate::storage::mvcc::memory::HotMetadataCharge;
+use crate::storage::mvcc::read_memory::{
+    DeferredExports, ReadScope, ReadScopeGuard, ResultReadScope,
+};
+use std::cell::RefCell;
+use std::sync::Arc;
+
+pub(super) fn with_read_scope(
+    execute: impl FnOnce() -> Result<Box<dyn QueryResult>>,
+) -> Result<Box<dyn QueryResult>> {
+    let (inner, scope) = ReadScopeGuard::with_lazy(execute);
+    Ok(retain_read_scope(inner?, scope))
+}
+
+pub(super) fn retain_read_scope(
+    mut inner: Box<dyn QueryResult>,
+    mut scope: Option<Arc<ReadScope>>,
+) -> Box<dyn QueryResult> {
+    let bound = inner.bind_read_scope(scope.as_ref());
+    if scope.is_some() && bound {
+        inner.retain_read_scope(&mut scope);
+    }
+    if inner.columns().is_empty() || (scope.is_none() && bound) {
+        return inner;
+    }
+    Box::new(ScopedResult {
+        inner,
+        scope: RefCell::new(scope),
+        activate: !bound,
+    })
+}
+
+struct ScopedResult {
+    inner: Box<dyn QueryResult>,
+    scope: RefCell<Option<Arc<ReadScope>>>,
+    activate: bool,
+}
+
+impl QueryResult for ScopedResult {
+    fn bind_read_scope(&mut self, _scope: Option<&Arc<ReadScope>>) -> bool {
+        !self.activate
+    }
+
+    fn columns(&self) -> &[String] {
+        self.inner.columns()
+    }
+
+    fn columns_arc(&self) -> Option<CompactArc<Vec<String>>> {
+        self.inner.columns_arc()
+    }
+
+    fn next(&mut self) -> bool {
+        let _active = self
+            .activate
+            .then(|| ReadScopeGuard::for_result(&self.scope));
+        self.inner.next()
+    }
+
+    fn scan(&self, dest: &mut [Value]) -> Result<()> {
+        let _active = self
+            .activate
+            .then(|| ReadScopeGuard::for_result(&self.scope));
+        self.inner.scan(dest)
+    }
+
+    fn row(&self) -> &Row {
+        self.inner.row()
+    }
+
+    fn take_row(&mut self) -> Row {
+        let _active = self
+            .activate
+            .then(|| ReadScopeGuard::for_result(&self.scope));
+        self.inner.take_row()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        let _active = self
+            .activate
+            .then(|| ReadScopeGuard::for_result(&self.scope));
+        self.inner.close()
+    }
+
+    fn rows_affected(&self) -> i64 {
+        self.inner.rows_affected()
+    }
+
+    fn last_insert_id(&self) -> i64 {
+        self.inner.last_insert_id()
+    }
+
+    fn try_into_arc_rows(&mut self) -> Option<CompactArc<Vec<Row>>> {
+        let _active = self
+            .activate
+            .then(|| ReadScopeGuard::for_result(&self.scope));
+        self.inner.try_into_arc_rows()
+    }
+
+    fn estimated_count(&self) -> Option<usize> {
+        self.inner.estimated_count()
+    }
+
+    fn exact_len(&self) -> Option<usize> {
+        self.inner.exact_len()
+    }
+
+    fn last_error(&mut self) -> Option<crate::core::Error> {
+        self.inner.last_error()
+    }
+
+    fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
+        let Self {
+            inner,
+            scope,
+            activate,
+        } = *self;
+        let active = activate.then(|| ReadScopeGuard::for_result(&scope));
+        let inner = inner.with_aliases(aliases);
+        drop(active);
+        Box::new(Self {
+            inner,
+            scope,
+            activate,
+        })
+    }
+}
 
 /// Execution result for DML operations (INSERT, UPDATE, DELETE)
 ///
@@ -167,26 +293,20 @@ pub struct ExecutorResult {
     affected: i64,
     /// Last insert ID (0 for SELECT)
     insert_id: i64,
+    _column_memory: HotMetadataCharge,
+    _read_scope: ResultReadScope,
 }
 
 impl ExecutorResult {
     /// Create a new memory result with columns and pooled rows
     pub fn new(columns: Vec<String>, rows: RowVec) -> Self {
-        let len = rows.len();
-        Self {
-            columns: CompactArc::new(columns),
-            rows: RowStorage::Owned(rows),
-            len,
-            current_index: None,
-            closed: false,
-            affected: 0,
-            insert_id: 0,
-        }
+        Self::with_arc_columns(CompactArc::new(columns), rows)
     }
 
     /// Create a new memory result with Arc columns (zero-copy)
     pub fn with_arc_columns(columns: CompactArc<Vec<String>>, rows: RowVec) -> Self {
         let len = rows.len();
+        let column_memory = HotMetadataCharge::new(Schema::column_names_bytes(&columns));
         Self {
             columns,
             rows: RowStorage::Owned(rows),
@@ -195,22 +315,15 @@ impl ExecutorResult {
             closed: false,
             affected: 0,
             insert_id: 0,
+            _column_memory: column_memory,
+            _read_scope: ResultReadScope::default(),
         }
     }
 
     /// Create a new memory result with shared rows from cache (zero-copy for rows)
     /// This avoids cloning the entire Vec<Row> when reading from semantic cache
     pub fn with_shared_rows(columns: Vec<String>, rows: CompactArc<Vec<Row>>) -> Self {
-        let len = rows.len();
-        Self {
-            columns: CompactArc::new(columns),
-            rows: RowStorage::Shared(rows),
-            len,
-            current_index: None,
-            closed: false,
-            affected: 0,
-            insert_id: 0,
-        }
+        Self::with_arc_columns_shared_rows(CompactArc::new(columns), rows)
     }
 
     /// Create a new memory result with Arc columns and shared rows (zero-copy for both)
@@ -219,6 +332,7 @@ impl ExecutorResult {
         rows: CompactArc<Vec<Row>>,
     ) -> Self {
         let len = rows.len();
+        let column_memory = HotMetadataCharge::new(Schema::column_names_bytes(&columns));
         Self {
             columns,
             rows: RowStorage::Shared(rows),
@@ -227,22 +341,15 @@ impl ExecutorResult {
             closed: false,
             affected: 0,
             insert_id: 0,
+            _column_memory: column_memory,
+            _read_scope: ResultReadScope::default(),
         }
     }
 
     /// Create a new memory result with both Arc columns and Arc rows (fully zero-copy)
     /// This is the most efficient constructor for cached/shared results
     pub fn with_arc_all(columns: CompactArc<Vec<String>>, rows: CompactArc<Vec<Row>>) -> Self {
-        let len = rows.len();
-        Self {
-            columns,
-            rows: RowStorage::Shared(rows),
-            len,
-            current_index: None,
-            closed: false,
-            affected: 0,
-            insert_id: 0,
-        }
+        Self::with_arc_columns_shared_rows(columns, rows)
     }
 
     /// Create an empty memory result
@@ -325,6 +432,14 @@ impl ExecutorResult {
 }
 
 impl QueryResult for ExecutorResult {
+    fn is_materialized(&self) -> bool {
+        true
+    }
+
+    fn retain_read_scope(&mut self, scope: &mut Option<Arc<ReadScope>>) {
+        self._read_scope.retain(scope);
+    }
+
     fn columns(&self) -> &[String] {
         &self.columns
     }
@@ -429,6 +544,8 @@ impl QueryResult for ExecutorResult {
                 }
             }
         }
+        self._column_memory
+            .resize(Schema::column_names_bytes(&self.columns));
         self
     }
 }
@@ -438,8 +555,6 @@ impl QueryResult for ExecutorResult {
 /// This struct owns a pre-compiled RowFilter, avoiding per-row compilation.
 /// The filter is compiled once during construction and reused for every row.
 pub struct FilteredResult {
-    /// Underlying result
-    inner: Box<dyn QueryResult>,
     /// Pre-compiled row filter (thread-safe, reusable)
     filter: RowFilter,
     /// Current row (cached after filter passes)
@@ -448,6 +563,8 @@ pub struct FilteredResult {
     columns: Vec<String>,
     /// Pending error from filter evaluation (e.g. invalid REGEXP pattern)
     pending_error: Option<crate::core::Error>,
+    /// Underlying result, retained beyond the filtered row.
+    inner: Box<dyn QueryResult>,
 }
 
 // SAFETY: FilteredResult is Send because all fields are Send:
@@ -508,6 +625,10 @@ impl FilteredResult {
 }
 
 impl QueryResult for FilteredResult {
+    fn bind_read_scope(&mut self, scope: Option<&Arc<ReadScope>>) -> bool {
+        self.inner.bind_read_scope(scope)
+    }
+
     fn columns(&self) -> &[String] {
         &self.columns
     }
@@ -608,8 +729,6 @@ enum CompiledProjection {
 /// This struct pre-compiles all expressions during construction, providing
 /// efficient per-row evaluation through the Expression VM.
 pub struct ExprMappedResult {
-    /// Underlying result
-    inner: Box<dyn QueryResult>,
     /// Pre-compiled projections (one per output column)
     projections: Vec<CompiledProjection>,
     /// VM instance for expression execution (reused)
@@ -620,6 +739,9 @@ pub struct ExprMappedResult {
     output_columns: Vec<String>,
     /// Pre-computed lowercase source columns (avoids per-row to_lowercase())
     source_columns_lower: Vec<String>,
+    /// Underlying result, retained beyond the projected row.
+    inner: Box<dyn QueryResult>,
+    exports: DeferredExports,
 }
 
 // SAFETY: ExprMappedResult is Send because all fields are Send:
@@ -676,6 +798,7 @@ impl ExprMappedResult {
             current_row: Row::with_capacity(capacity),
             output_columns,
             source_columns_lower,
+            exports: DeferredExports::default(),
         })
     }
 
@@ -690,6 +813,11 @@ impl ExprMappedResult {
 }
 
 impl QueryResult for ExprMappedResult {
+    fn bind_read_scope(&mut self, scope: Option<&Arc<ReadScope>>) -> bool {
+        self.exports.bind(scope);
+        self.inner.bind_read_scope(scope)
+    }
+
     fn columns(&self) -> &[String] {
         &self.output_columns
     }
@@ -732,8 +860,9 @@ impl QueryResult for ExprMappedResult {
                         let ctx = ExecuteContext::new(source_row);
                         let value = self
                             .vm
-                            .execute_cow(program, &ctx)
+                            .evaluate_cow(program, &ctx)
                             .unwrap_or(Value::null_unknown());
+                        self.exports.add(value.heap_bytes() as u128);
                         self.current_row.push_inline(value);
                     }
                 }
@@ -831,6 +960,10 @@ impl LimitedResult {
 }
 
 impl QueryResult for LimitedResult {
+    fn bind_read_scope(&mut self, scope: Option<&Arc<ReadScope>>) -> bool {
+        self.inner.bind_read_scope(scope)
+    }
+
     fn exact_len(&self) -> Option<usize> {
         if self.offset_applied || self.returned_count > 0 {
             return None;
@@ -1107,6 +1240,10 @@ impl OrderedResult {
 }
 
 impl QueryResult for OrderedResult {
+    fn is_materialized(&self) -> bool {
+        true
+    }
+
     fn columns(&self) -> &[String] {
         self.inner.columns()
     }
@@ -1266,6 +1403,10 @@ impl TopNResult {
 }
 
 impl QueryResult for TopNResult {
+    fn is_materialized(&self) -> bool {
+        true
+    }
+
     fn columns(&self) -> &[String] {
         self.inner.columns()
     }
@@ -1310,8 +1451,6 @@ impl QueryResult for TopNResult {
 /// - Lower latency to first row
 /// - Streaming output
 pub struct DistinctResult {
-    /// Underlying result source
-    inner: Box<dyn QueryResult>,
     /// Columns from inner result
     columns: Vec<String>,
     /// Number of columns to consider for distinctness
@@ -1324,6 +1463,8 @@ pub struct DistinctResult {
     current_row: Row,
     /// Whether we have a valid current row
     has_current: bool,
+    /// Underlying result, retained beyond the row and distinct keys.
+    inner: Box<dyn QueryResult>,
 }
 
 impl DistinctResult {
@@ -1364,6 +1505,10 @@ impl DistinctResult {
 }
 
 impl QueryResult for DistinctResult {
+    fn bind_read_scope(&mut self, scope: Option<&Arc<ReadScope>>) -> bool {
+        self.inner.bind_read_scope(scope)
+    }
+
     fn columns(&self) -> &[String] {
         &self.columns
     }
@@ -1457,7 +1602,6 @@ impl QueryResult for DistinctResult {
 /// Memory usage is O(groups) where groups is the number of unique key
 /// combinations, not total rows.
 pub struct DistinctOnResult {
-    inner: Box<dyn QueryResult>,
     columns: Vec<String>,
     /// Column indices that form the DISTINCT ON key
     key_indices: Vec<usize>,
@@ -1465,6 +1609,7 @@ pub struct DistinctOnResult {
     seen: FxHashMap<u64, Vec<Vec<Value>>>,
     current_row: Row,
     has_current: bool,
+    inner: Box<dyn QueryResult>,
 }
 
 impl DistinctOnResult {
@@ -1515,6 +1660,10 @@ impl DistinctOnResult {
 }
 
 impl QueryResult for DistinctOnResult {
+    fn bind_read_scope(&mut self, scope: Option<&Arc<ReadScope>>) -> bool {
+        self.inner.bind_read_scope(scope)
+    }
+
     fn columns(&self) -> &[String] {
         &self.columns
     }
@@ -1620,6 +1769,10 @@ impl AliasedResult {
 }
 
 impl QueryResult for AliasedResult {
+    fn bind_read_scope(&mut self, scope: Option<&Arc<ReadScope>>) -> bool {
+        self.inner.bind_read_scope(scope)
+    }
+
     fn columns(&self) -> &[String] {
         &self.aliased_columns
     }
@@ -1667,13 +1820,13 @@ impl QueryResult for AliasedResult {
 /// This result type projects rows to only include the first N columns,
 /// removing any extra columns that were added for sorting purposes.
 pub struct ProjectedResult {
-    inner: Box<dyn QueryResult>,
     /// Number of columns to keep
     keep_columns: usize,
     /// Cached projected columns
     projected_columns: Vec<String>,
     /// Cached projected row
     current_row: Row,
+    inner: Box<dyn QueryResult>,
 }
 
 impl ProjectedResult {
@@ -1693,6 +1846,10 @@ impl ProjectedResult {
 }
 
 impl QueryResult for ProjectedResult {
+    fn bind_read_scope(&mut self, scope: Option<&Arc<ReadScope>>) -> bool {
+        self.inner.bind_read_scope(scope)
+    }
+
     fn columns(&self) -> &[String] {
         &self.projected_columns
     }
@@ -1766,14 +1923,16 @@ impl QueryResult for ProjectedResult {
 /// This allows scanners to be used with the streaming filter/limit wrappers
 /// without materializing all rows upfront.
 pub struct ScannerResult {
-    /// The underlying scanner
-    scanner: Box<dyn crate::storage::traits::Scanner>,
     /// Column names (shared with the schema cache, not cloned per statement)
     columns: CompactArc<Vec<String>>,
     /// Current row (cloned from scanner since scanner.row() returns a reference)
     current_row: Row,
     /// Whether we have a valid current row
     has_current: bool,
+    /// The underlying scanner, retained beyond the current row.
+    scanner: Box<dyn crate::storage::traits::Scanner>,
+    _column_memory: HotMetadataCharge,
+    _read_scope: ResultReadScope,
 }
 
 impl ScannerResult {
@@ -1782,16 +1941,31 @@ impl ScannerResult {
         scanner: Box<dyn crate::storage::traits::Scanner>,
         columns: CompactArc<Vec<String>>,
     ) -> Self {
+        let column_memory = HotMetadataCharge::new(Schema::column_names_bytes(&columns));
         Self {
             scanner,
             columns,
             current_row: Row::new(),
             has_current: false,
+            _column_memory: column_memory,
+            _read_scope: ResultReadScope::default(),
         }
     }
 }
 
 impl QueryResult for ScannerResult {
+    fn bind_read_scope(&mut self, scope: Option<&Arc<ReadScope>>) -> bool {
+        self.scanner.bind_read_scope(scope)
+    }
+
+    fn is_materialized(&self) -> bool {
+        self.scanner.is_materialized()
+    }
+
+    fn retain_read_scope(&mut self, scope: &mut Option<Arc<ReadScope>>) {
+        self._read_scope.retain(scope);
+    }
+
     fn columns(&self) -> &[String] {
         &self.columns
     }
@@ -1877,14 +2051,15 @@ pub type StreamingFilterResult = FilteredResult;
 /// This allows streaming projection without materializing all rows into a Vec.
 /// Uses simple column index-based projection for performance.
 pub struct StreamingProjectionResult {
-    /// Underlying result
-    inner: Box<dyn QueryResult>,
     /// Column indices to project (from source to output)
     column_indices: Vec<usize>,
     /// Output column names
     output_columns: Vec<String>,
     /// Current projected row
     current_row: Row,
+    /// Underlying result, dropped after the projected row.
+    inner: Box<dyn QueryResult>,
+    _read_scope: ResultReadScope,
 }
 
 impl StreamingProjectionResult {
@@ -1902,15 +2077,28 @@ impl StreamingProjectionResult {
         // Pre-allocate Inline storage - no Arc overhead for intermediate results
         let capacity = column_indices.len();
         Self {
-            inner,
             column_indices,
             output_columns,
             current_row: Row::with_capacity(capacity),
+            inner,
+            _read_scope: ResultReadScope::default(),
         }
     }
 }
 
 impl QueryResult for StreamingProjectionResult {
+    fn bind_read_scope(&mut self, scope: Option<&Arc<ReadScope>>) -> bool {
+        self.inner.bind_read_scope(scope)
+    }
+
+    fn is_materialized(&self) -> bool {
+        self.inner.is_materialized()
+    }
+
+    fn retain_read_scope(&mut self, scope: &mut Option<Arc<ReadScope>>) {
+        self._read_scope.retain(scope);
+    }
+
     fn columns(&self) -> &[String] {
         &self.output_columns
     }
@@ -2004,6 +2192,7 @@ pub struct ColumnarResult {
     current_row: Row,
     /// Whether the result is closed
     closed: bool,
+    _column_memory: HotMetadataCharge,
 }
 
 impl ColumnarResult {
@@ -2039,6 +2228,7 @@ impl ColumnarResult {
 
         // Pre-allocate the row buffer with capacity for all columns
         let num_cols = columns.len();
+        let column_memory = HotMetadataCharge::new(Schema::column_names_bytes(&columns));
 
         Self {
             columns: CompactArc::new(columns),
@@ -2047,6 +2237,7 @@ impl ColumnarResult {
             current_index: None,
             current_row: Row::with_capacity(num_cols),
             closed: false,
+            _column_memory: column_memory,
         }
     }
 
@@ -2054,6 +2245,7 @@ impl ColumnarResult {
     pub fn with_arc_columns(columns: CompactArc<Vec<String>>, data: Vec<Vec<Value>>) -> Self {
         let num_rows = data.first().map(|c| c.len()).unwrap_or(0);
         let num_cols = columns.len();
+        let column_memory = HotMetadataCharge::new(Schema::column_names_bytes(&columns));
 
         Self {
             columns,
@@ -2062,6 +2254,7 @@ impl ColumnarResult {
             current_index: None,
             current_row: Row::with_capacity(num_cols),
             closed: false,
+            _column_memory: column_memory,
         }
     }
 
@@ -2079,6 +2272,10 @@ impl ColumnarResult {
 }
 
 impl QueryResult for ColumnarResult {
+    fn is_materialized(&self) -> bool {
+        true
+    }
+
     fn columns(&self) -> &[String] {
         &self.columns
     }
@@ -2171,6 +2368,347 @@ impl QueryResult for ColumnarResult {
 mod tests {
     use super::*;
     use crate::core::row_vec::RowVec;
+    use crate::storage::mvcc::read_memory::current_scope;
+
+    fn cold_result(default: Option<Value>) -> Box<dyn QueryResult> {
+        use crate::core::{DataType, SchemaBuilder};
+        use crate::storage::volume::scanner::{MergingScanner, VolumeScanner};
+        use crate::storage::volume::writer::{ColSource, ColumnMapping, VolumeBuilder};
+
+        let schema = SchemaBuilder::new("bound_cold")
+            .add_primary_key("id", DataType::Integer)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        for id in 1..=2 {
+            builder.add_row(id, &Row::from_values(vec![Value::Integer(id)]));
+        }
+        let projection = usize::from(default.is_some());
+        let name = if default.is_some() { "label" } else { "id" };
+        let mut scanner =
+            VolumeScanner::new(Arc::new(builder.finish()), vec![projection], None).unwrap();
+        if let Some(default) = default {
+            scanner.set_column_mapping(ColumnMapping::new(
+                vec![ColSource::Volume(0), ColSource::Default(default)],
+                false,
+            ));
+        }
+        Box::new(ScannerResult::new(
+            Box::new(MergingScanner::new(vec![Box::new(scanner)])),
+            CompactArc::new(vec![name.into()]),
+        ))
+    }
+
+    #[test]
+    fn bound_cold_scanners_iterate_without_scope_wrappers() {
+        let inner = Box::new(LimitedResult::new(
+            Box::new(StreamingProjectionResult::new(
+                cold_result(None),
+                vec![0],
+                vec!["projected".into()],
+            )),
+            Some(2),
+            0,
+        ));
+        let address = std::ptr::from_ref(inner.as_ref()).cast::<()>();
+        let mut result = with_read_scope(|| Ok(inner)).unwrap();
+        assert_eq!(std::ptr::from_ref(result.as_ref()).cast::<()>(), address);
+        for id in 1..=2 {
+            assert!(result.next());
+            assert_eq!(result.row()[0], Value::Integer(id));
+            assert!(current_scope().is_none());
+        }
+        assert!(!result.next());
+    }
+
+    #[test]
+    fn bound_default_exports_survive_parent_materialization() {
+        let value = Value::text("deferred mapped default ".repeat(128));
+        let bytes = value.heap_bytes() as u128;
+        let (rows, scope) = ReadScopeGuard::with_lazy(|| {
+            let result = with_read_scope(|| Ok(cold_result(Some(value.clone())))).unwrap();
+            assert!(current_scope().is_none());
+            crate::executor::Executor::materialize_result_arc(result).unwrap()
+        });
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], value);
+        assert_eq!(scope.unwrap().exported_bytes(), 2 * bytes);
+    }
+
+    #[test]
+    fn bound_default_exports_remain_owned_after_close_and_aliasing() {
+        let value = Value::text("deferred mapped default ".repeat(128));
+        let scope = Arc::new(ReadScope::default());
+        let identity = Arc::downgrade(&scope);
+        let mut result = retain_read_scope(cold_result(Some(value.clone())), Some(scope));
+        assert!(result.next());
+        assert_eq!(
+            identity.upgrade().unwrap().exported_bytes(),
+            value.heap_bytes() as u128
+        );
+        assert!(current_scope().is_none());
+        let mut result = result.with_aliases(FxHashMap::from_iter([(
+            "retained_label".into(),
+            "label".into(),
+        )]));
+        result.close().unwrap();
+        assert_eq!(result.row()[0], value);
+        assert!(identity.upgrade().is_some());
+        drop(result);
+        assert!(identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn bound_expression_exports_materialize_lazily_and_move_with_the_result() {
+        use crate::parser::ast::Identifier;
+        use crate::parser::token::{Token, TokenType};
+
+        let value = Value::text("deferred expression value ".repeat(128));
+        let expression = Expression::Identifier(Identifier::new(
+            Token::new(TokenType::Identifier, "label", Default::default()),
+            "label",
+        ));
+        let mut result = ExprMappedResult::new(
+            Box::new(ExecutorResult::new(
+                vec!["label".into()],
+                make_rows(vec![Row::from_values(vec![value.clone()])]),
+            )),
+            vec![expression],
+            vec!["projected".into()],
+        )
+        .unwrap();
+        assert!(result.bind_read_scope(None));
+        assert!(result.exports.scope().is_none());
+        let result = std::thread::spawn(move || {
+            assert!(result.next());
+            assert!(current_scope().is_none());
+            assert_eq!(
+                result.exports.scope().unwrap().exported_bytes(),
+                value.heap_bytes() as u128
+            );
+            result
+        })
+        .join()
+        .unwrap();
+        let identity = Arc::downgrade(result.exports.scope().unwrap());
+        drop(result);
+        assert!(identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn scalar_result_without_exports_needs_no_scope_or_wrapper() {
+        let inner = Box::new(ExecutorResult::new(
+            vec!["count".into()],
+            make_rows(vec![Row::from_values(vec![Value::Integer(10)])]),
+        ));
+        let address = std::ptr::from_ref(inner.as_ref()).cast::<()>();
+        let mut result = with_read_scope(|| {
+            assert!(
+                current_scope().is_none(),
+                "statement scope must start unmaterialized"
+            );
+            Ok(inner)
+        })
+        .unwrap();
+        assert_eq!(std::ptr::from_ref(result.as_ref()).cast::<()>(), address);
+        assert!(current_scope().is_none());
+        assert!(result.next());
+        assert_eq!(result.row().get(0), Some(&Value::Integer(10)));
+    }
+
+    #[test]
+    fn materialized_result_keeps_export_owner_without_a_wrapper() {
+        let row = Row::from_values(vec![Value::text("retained heap value".repeat(100))]);
+        let ((), scope) = ReadScopeGuard::with_lazy(|| {
+            crate::storage::mvcc::read_memory::charge_bytes_export(row.heap_bytes());
+        });
+        let scope = scope.unwrap();
+        let identity = Arc::downgrade(&scope);
+        let inner = Box::new(ExecutorResult::new(
+            vec!["label".into()],
+            make_rows(vec![row]),
+        ));
+        let address = std::ptr::from_ref(inner.as_ref()).cast::<()>();
+        let result = retain_read_scope(inner, Some(Arc::clone(&scope)));
+        let result = retain_read_scope(result, Some(scope));
+        assert_eq!(std::ptr::from_ref(result.as_ref()).cast::<()>(), address);
+        let mut result =
+            result.with_aliases(FxHashMap::from_iter([("name".into(), "label".into())]));
+        result.close().unwrap();
+        assert!(identity.upgrade().unwrap().exported_bytes() >= 1800);
+        let rows = result.try_into_arc_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(identity.upgrade().is_some());
+        drop(result);
+        assert!(identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn materialized_scanner_projection_retains_owner_without_wrappers() {
+        let row = Row::from_values(vec![Value::text("retained heap value".repeat(100))]);
+        let ((), scope) = ReadScopeGuard::with_lazy(|| {
+            crate::storage::mvcc::read_memory::charge_bytes_export(row.heap_bytes());
+        });
+        let scope = scope.unwrap();
+        let identity = Arc::downgrade(&scope);
+        let schema = CompactArc::new(
+            crate::core::SchemaBuilder::new("projection")
+                .column("label", crate::core::DataType::Text, false, false)
+                .build(),
+        );
+        let scanner =
+            crate::storage::mvcc::MVCCScanner::from_rows(make_rows(vec![row]), schema, vec![0]);
+        let inner = Box::new(ScannerResult::new(
+            Box::new(scanner),
+            CompactArc::new(vec!["label".into()]),
+        ));
+        let address = std::ptr::from_ref(inner.as_ref()).cast::<()>();
+        let inner = retain_read_scope(inner, Some(Arc::clone(&scope)));
+        assert_eq!(std::ptr::from_ref(inner.as_ref()).cast::<()>(), address);
+        let result = Box::new(StreamingProjectionResult::new(
+            inner,
+            vec![0],
+            vec!["projected".into()],
+        ));
+        let address = std::ptr::from_ref(result.as_ref()).cast::<()>();
+        let mut result = retain_read_scope(result, Some(scope));
+        assert_eq!(std::ptr::from_ref(result.as_ref()).cast::<()>(), address);
+        assert!(result.next());
+        result.close().unwrap();
+        assert!(identity.upgrade().unwrap().exported_bytes() >= 1800);
+        assert_eq!(
+            result.row().get(0),
+            Some(&Value::text("retained heap value".repeat(100)))
+        );
+        drop(result);
+        assert!(identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn materialized_result_keeps_distinct_nested_owners() {
+        let first = Arc::new(ReadScope::default());
+        let second = Arc::new(ReadScope::default());
+        let first_identity = Arc::downgrade(&first);
+        let second_identity = Arc::downgrade(&second);
+        let inner = Box::new(ExecutorResult::new(vec!["label".into()], RowVec::new()));
+        let result = retain_read_scope(inner, Some(first));
+        let result = retain_read_scope(result, Some(second));
+        assert!(first_identity.upgrade().is_some());
+        assert!(second_identity.upgrade().is_some());
+        drop(result);
+        assert!(first_identity.upgrade().is_none());
+        assert!(second_identity.upgrade().is_none());
+    }
+
+    struct DeferredExport {
+        inner: ExecutorResult,
+    }
+
+    impl QueryResult for DeferredExport {
+        fn columns(&self) -> &[String] {
+            self.inner.columns()
+        }
+        fn next(&mut self) -> bool {
+            if !self.inner.next() {
+                return false;
+            }
+            crate::storage::mvcc::read_memory::charge_bytes_export(self.inner.row().heap_bytes());
+            true
+        }
+        fn scan(&self, dest: &mut [Value]) -> Result<()> {
+            self.inner.scan(dest)
+        }
+        fn row(&self) -> &Row {
+            self.inner.row()
+        }
+        fn try_into_arc_rows(&mut self) -> Option<CompactArc<Vec<Row>>> {
+            while self.next() {}
+            self.inner.try_into_arc_rows()
+        }
+        fn with_aliases(
+            self: Box<Self>,
+            _aliases: FxHashMap<String, String>,
+        ) -> Box<dyn QueryResult> {
+            self
+        }
+    }
+
+    fn deferred_export() -> Box<dyn QueryResult> {
+        Box::new(DeferredExport {
+            inner: ExecutorResult::new(
+                vec!["label".into()],
+                make_rows(vec![Row::from_values(vec![Value::text(
+                    "retained heap value".repeat(100),
+                )])]),
+            ),
+        })
+    }
+
+    #[test]
+    fn deferred_result_first_export_survives_thread_transfer() {
+        let result = ScopedResult {
+            inner: deferred_export(),
+            scope: RefCell::new(None),
+            activate: true,
+        };
+        let result = std::thread::spawn(move || {
+            let mut result = result;
+            assert!(result.next());
+            assert!(current_scope().is_none());
+            assert!(result.scope.borrow().as_ref().unwrap().exported_bytes() >= 1800);
+            result
+        })
+        .join()
+        .unwrap();
+        let identity = Arc::downgrade(result.scope.borrow().as_ref().unwrap());
+        drop(result);
+        assert!(identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn nested_deferred_extraction_stays_owned_by_parent() {
+        let _active = ReadScopeGuard::lazy();
+        let mut result = with_read_scope(|| Ok(deferred_export())).unwrap();
+        assert!(current_scope().is_none());
+        let rows = result.try_into_arc_rows().unwrap();
+        drop(result);
+        assert_eq!(rows.len(), 1);
+        assert!(current_scope().unwrap().exported_bytes() >= 1800);
+    }
+
+    #[test]
+    fn result_names_stay_charged_after_schema_release() {
+        let name = "retained_column_name".repeat(512);
+        let schema = Schema::new(
+            "result_names",
+            vec![crate::core::SchemaColumn::nullable(
+                0,
+                &name,
+                crate::core::DataType::Text,
+            )],
+        );
+        let columns = schema.column_names_arc();
+        let mut owned = ExecutorResult::with_arc_columns(columns.clone(), RowVec::new());
+        let shared = ExecutorResult::with_arc_all(columns.clone(), CompactArc::new(Vec::new()));
+        let scanner = ScannerResult::new(
+            Box::new(crate::storage::mvcc::EmptyScanner::new()),
+            columns.clone(),
+        );
+        let columnar = ColumnarResult::with_arc_columns(columns.clone(), vec![Vec::new()]);
+        drop(columns);
+        drop(schema);
+        owned.close().unwrap();
+        for bytes in [
+            owned._column_memory.bytes(),
+            shared._column_memory.bytes(),
+            scanner._column_memory.bytes(),
+            columnar._column_memory.bytes(),
+        ] {
+            assert!(bytes >= name.len() as u128);
+        }
+        let alias = name.repeat(2);
+        let aliased = Box::new(owned).with_aliases(FxHashMap::from_iter([(alias.clone(), name)]));
+        assert_eq!(aliased.columns()[0], alias);
+    }
 
     /// Helper to create RowVec from Vec<Row> for tests
     fn make_rows(rows: Vec<Row>) -> RowVec {

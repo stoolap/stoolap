@@ -24,7 +24,83 @@
 //! - Smart eviction: keeps larger buffers which are more versatile
 
 use crate::core::Row;
+use crate::storage::mvcc::memory::RetainedBytes;
 use std::cell::RefCell;
+
+static ROW_POOL_BYTES: RetainedBytes = RetainedBytes::new();
+
+pub(crate) fn row_pool_bytes() -> usize {
+    ROW_POOL_BYTES.get()
+}
+
+struct PoolCharge(u128);
+
+impl PoolCharge {
+    fn resize(&mut self, bytes: u128) {
+        ROW_POOL_BYTES.resize(self.0, bytes);
+        self.0 = bytes;
+    }
+}
+
+impl Drop for PoolCharge {
+    fn drop(&mut self) {
+        ROW_POOL_BYTES.remove(self.0);
+    }
+}
+
+struct CachedPool<T> {
+    buffers: Vec<Vec<T>>,
+    charge: PoolCharge,
+}
+
+impl<T> CachedPool<T> {
+    const fn new() -> Self {
+        Self {
+            buffers: Vec::new(),
+            charge: PoolCharge(0),
+        }
+    }
+
+    fn pop(&mut self) -> Option<Vec<T>> {
+        let buffer = self.buffers.pop()?;
+        self.charge
+            .resize(self.charge.0 - (buffer.capacity() * std::mem::size_of::<T>()) as u128);
+        Some(buffer)
+    }
+
+    fn remove(&mut self, index: usize) -> Vec<T> {
+        let buffer = self.buffers.remove(index);
+        self.charge
+            .resize(self.charge.0 - (buffer.capacity() * std::mem::size_of::<T>()) as u128);
+        buffer
+    }
+
+    fn insert(&mut self, index: usize, buffer: Vec<T>) {
+        debug_assert!(buffer.is_empty());
+        let bytes = (buffer.capacity() * std::mem::size_of::<T>()) as u128;
+        let before = self.buffers.capacity();
+        self.buffers.insert(index, buffer);
+        self.charge.resize(
+            self.charge.0
+                + bytes
+                + ((self.buffers.capacity() - before) * std::mem::size_of::<Vec<T>>()) as u128,
+        );
+    }
+
+    fn clear(&mut self) {
+        self.buffers.clear();
+        self.charge
+            .resize((self.buffers.capacity() * std::mem::size_of::<Vec<T>>()) as u128);
+    }
+}
+
+impl<T> std::ops::Deref for CachedPool<T> {
+    type Target = Vec<Vec<T>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.buffers
+    }
+}
 
 /// Maximum buffers to keep in the thread-local pool.
 /// 16 slots handles most concurrent usage patterns including complex queries
@@ -38,7 +114,7 @@ const MAX_CACHED_CAPACITY: usize = 64_000;
 
 // Thread-local pool for row vectors - kept sorted by capacity (ascending)
 thread_local! {
-    static ROW_VEC_POOL: RefCell<Vec<Vec<(i64, Row)>>> = const { RefCell::new(Vec::new()) };
+    static ROW_VEC_POOL: RefCell<CachedPool<(i64, Row)>> = const { RefCell::new(CachedPool::new()) };
 }
 
 /// Clear the thread-local RowVec pool, releasing all cached buffers.
@@ -649,7 +725,7 @@ const ROW_ID_POOL_SIZE: usize = 16;
 
 // Thread-local pool for row ID vectors - kept sorted by capacity (ascending)
 thread_local! {
-    static ROW_ID_VEC_POOL: RefCell<Vec<Vec<i64>>> = const { RefCell::new(Vec::new()) };
+    static ROW_ID_VEC_POOL: RefCell<CachedPool<i64>> = const { RefCell::new(CachedPool::new()) };
 }
 
 /// Clear the thread-local RowIdVec pool, releasing all cached buffers.
@@ -938,6 +1014,41 @@ impl FromIterator<i64> for RowIdVec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_pool_capacity<T>(pool: &CachedPool<T>) {
+        let expected = (pool.buffers.capacity() * std::mem::size_of::<Vec<T>>()) as u128
+            + pool
+                .buffers
+                .iter()
+                .map(|buffer| (buffer.capacity() * std::mem::size_of::<T>()) as u128)
+                .sum::<u128>();
+        assert_eq!(pool.charge.0, expected);
+    }
+
+    #[test]
+    fn pooled_capacity_follows_checkout_replacement_and_clear() {
+        fn check<T>() {
+            let mut pool = CachedPool::<T>::new();
+            assert_pool_capacity(&pool);
+            for capacity in [16, 32, 64, 128, 256] {
+                pool.insert(pool.len(), Vec::with_capacity(capacity));
+                assert_pool_capacity(&pool);
+            }
+            let removed = pool.remove(1);
+            assert_pool_capacity(&pool);
+            let last = pool.pop().unwrap();
+            assert_pool_capacity(&pool);
+            pool.insert(0, removed);
+            pool.insert(pool.len(), last);
+            assert_pool_capacity(&pool);
+            pool.clear();
+            assert!(pool.is_empty());
+            assert!(pool.charge.0 > 0);
+            assert_pool_capacity(&pool);
+        }
+        check::<(i64, Row)>();
+        check::<i64>();
+    }
     use crate::core::Value;
 
     #[test]

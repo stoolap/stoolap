@@ -222,9 +222,9 @@ impl ResultRow {
 ///     .collect();
 /// ```
 pub struct Rows {
-    result: Box<dyn QueryResult>,
     /// Shared column names (Arc to avoid cloning per row)
     columns: CompactArc<Vec<String>>,
+    result: Box<dyn QueryResult>,
     closed: bool,
     /// Pending error from a filter runtime failure (e.g., invalid REGEXP)
     pending_error: Option<crate::core::Error>,

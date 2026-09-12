@@ -236,18 +236,17 @@ impl Expression for FunctionExpr {
             let mut arg_values = buf_cell.borrow_mut();
             arg_values.clear();
 
-            // Evaluate all arguments into the buffer
-            for (i, arg) in self.arguments.iter().enumerate() {
-                let value =
-                    self.evaluate_arg(arg, self.arg_indices.get(i).copied().flatten(), row)?;
-                arg_values.push(value);
-            }
-
-            // Call the function
-            let result = self.function.evaluate(&arg_values)?;
-
-            // Compare with target value
-            Ok(self.compare(&result, &self.compare_value))
+            let evaluated = (|| {
+                for (i, arg) in self.arguments.iter().enumerate() {
+                    let value =
+                        self.evaluate_arg(arg, self.arg_indices.get(i).copied().flatten(), row)?;
+                    arg_values.push(value);
+                }
+                let result = self.function.evaluate(&arg_values)?;
+                Ok(self.compare(&result, &self.compare_value))
+            })();
+            arg_values.clear();
+            evaluated
         })
     }
 
@@ -494,6 +493,38 @@ mod tests {
             Value::Integer(30),
         ]);
         assert!(expr.evaluate(&row).unwrap());
+        ARG_BUFFER.with(|buffer| assert!(buffer.borrow().is_empty()));
+    }
+
+    #[test]
+    fn function_argument_buffer_releases_values_after_errors() {
+        let mut missing = FunctionExpr::eq(
+            Arc::new(UpperFunction),
+            vec![
+                FunctionArg::Literal(Value::text("a retained heap argument before failure")),
+                FunctionArg::Column("missing".into()),
+            ],
+            Value::null_unknown(),
+        );
+        missing.prepare_for_schema(&test_schema());
+        assert!(matches!(
+            missing.evaluate(&Row::new()),
+            Err(crate::core::Error::ColumnNotFound(_))
+        ));
+        ARG_BUFFER.with(|buffer| assert!(buffer.borrow().is_empty()));
+
+        let invalid = FunctionExpr::eq(
+            Arc::new(crate::functions::AbsFunction),
+            vec![FunctionArg::Literal(Value::text(
+                "a nonnumeric retained heap argument",
+            ))],
+            Value::Integer(0),
+        );
+        assert!(matches!(
+            invalid.evaluate(&Row::new()),
+            Err(crate::core::Error::InvalidArgument(_))
+        ));
+        ARG_BUFFER.with(|buffer| assert!(buffer.borrow().is_empty()));
     }
 
     #[test]

@@ -30,6 +30,12 @@ use crate::storage::expression::Expression;
 /// - **Bitmap**: For low-cardinality columns (< 5% unique values)
 /// - **BTree**: For range queries and ordered access
 pub trait Index: Send + Sync {
+    /// Retained-memory accounting for built-in indexes.
+    /// None means the implementation does not report its allocations.
+    fn memory_account(&self) -> Option<&std::sync::Arc<crate::storage::index::IndexMemory>> {
+        None
+    }
+
     /// Returns the name of the index
     fn name(&self) -> &str;
 

@@ -22,6 +22,7 @@ use std::sync::{Arc, OnceLock};
 use chrono::{DateTime, Utc};
 
 use crate::common::{CompactArc, StringMap};
+use crate::storage::mvcc::memory::{arc_allocation_bytes, hash_table_bytes, HotMetadataCharge};
 
 use super::error::{Error, Result};
 use super::types::{DataType, ForeignKeyAction};
@@ -242,6 +243,8 @@ pub struct Schema {
 
     /// Cached lowercase column names (computed lazily on first access)
     column_names_lower_cache: OnceLock<CompactArc<Vec<String>>>,
+
+    memory: HotMetadataCharge,
 }
 
 impl Clone for Schema {
@@ -285,7 +288,9 @@ impl Clone for Schema {
             column_index_map_cache,
             pk_indices_cache,
             column_names_lower_cache,
+            memory: HotMetadataCharge::default(),
         }
+        .with_memory_charge()
     }
 }
 
@@ -367,7 +372,9 @@ impl Schema {
             column_index_map_cache,
             pk_indices_cache,
             column_names_lower_cache,
+            memory: HotMetadataCharge::default(),
         }
+        .with_memory_charge()
     }
 
     /// Create a new schema with explicit timestamps
@@ -447,7 +454,71 @@ impl Schema {
             column_index_map_cache,
             pk_indices_cache,
             column_names_lower_cache,
+            memory: HotMetadataCharge::default(),
         }
+        .with_memory_charge()
+    }
+
+    fn with_memory_charge(mut self) -> Self {
+        self.refresh_memory_charge();
+        self
+    }
+
+    pub(crate) fn refresh_memory_charge(&mut self) {
+        let bytes = self.retained_bytes();
+        self.memory.resize(bytes);
+    }
+
+    fn retained_bytes(&self) -> u128 {
+        let mut bytes = arc_allocation_bytes::<Self>() as u128
+            + self.table_name.capacity() as u128
+            + self.table_name_lower.capacity() as u128
+            + (self.columns.capacity() * std::mem::size_of::<SchemaColumn>()) as u128
+            + (self.foreign_keys.capacity() * std::mem::size_of::<ForeignKeyConstraint>()) as u128;
+        for column in &self.columns {
+            bytes += column.name.capacity() as u128
+                + column.name_lower.capacity() as u128
+                + column.default_expr.as_ref().map_or(0, String::capacity) as u128
+                + column.check_expr.as_ref().map_or(0, String::capacity) as u128
+                + column
+                    .default_value
+                    .as_ref()
+                    .map_or(0, super::Value::heap_bytes) as u128;
+        }
+        for fk in &self.foreign_keys {
+            bytes += fk.column_name.capacity() as u128
+                + fk.referenced_table.capacity() as u128
+                + fk.referenced_column.capacity() as u128;
+        }
+        for names in [&self.column_names_cache, &self.column_names_lower_cache] {
+            if let Some(names) = names.get() {
+                bytes += Self::column_names_bytes(names);
+            }
+        }
+        if let Some(indices) = self.pk_indices_cache.get() {
+            bytes += arc_allocation_bytes::<Vec<usize>>() as u128
+                + (indices.capacity() * std::mem::size_of::<usize>()) as u128;
+        }
+        if let Some(map) = self.column_index_map_cache.get() {
+            bytes += hash_table_bytes::<String, usize>(map.capacity())
+                + map.keys().map(|name| name.capacity() as u128).sum::<u128>();
+        }
+        bytes
+    }
+
+    pub(crate) fn column_names_bytes(names: &Vec<String>) -> u128 {
+        arc_allocation_bytes::<Vec<String>>() as u128
+            + (names.capacity() * std::mem::size_of::<String>()) as u128
+            + names
+                .iter()
+                .map(|name| name.capacity() as u128)
+                .sum::<u128>()
+    }
+
+    pub(crate) fn rename_table(&mut self, name: &str) {
+        self.table_name = name.to_string();
+        self.table_name_lower = name.to_lowercase();
+        self.refresh_memory_charge();
     }
 
     /// Get the number of columns
@@ -646,6 +717,7 @@ impl Schema {
         let _ = self.column_names_lower_cache.set(CompactArc::new(
             self.columns.iter().map(|c| c.name_lower.clone()).collect(),
         ));
+        self.refresh_memory_charge();
     }
 
     /// Add a column to the schema
@@ -853,6 +925,74 @@ impl SchemaBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_adoption_charges_schema_capacity_reserved_by_the_caller() {
+        use crate::storage::Engine;
+
+        let mut engine = crate::storage::mvcc::MVCCEngine::in_memory();
+        engine.open().unwrap();
+        for transactional in [false, true] {
+            let name = if transactional {
+                "transaction_adoption"
+            } else {
+                "engine_adoption"
+            };
+            let mut schema = Schema::new(
+                name,
+                vec![SchemaColumn::primary_key(0, "id", DataType::Integer)],
+            );
+            schema.columns.reserve(1024);
+            let capacity_bytes =
+                (schema.columns.capacity() * std::mem::size_of::<SchemaColumn>()) as u128;
+            if transactional {
+                let mut txn = engine.begin_transaction().unwrap();
+                drop(txn.create_table(name, schema).unwrap());
+                txn.commit().unwrap();
+            } else {
+                drop(engine.create_table(schema).unwrap());
+            }
+            let installed = engine.get_table_schema(name).unwrap();
+            assert!(installed.memory.bytes() >= capacity_bytes);
+        }
+        engine.close().unwrap();
+    }
+
+    #[test]
+    fn schema_metadata_retains_capacity_and_tracks_guarded_mutation() {
+        let mut columns = Vec::with_capacity(128);
+        columns.push(SchemaColumn::primary_key(0, "id", DataType::Integer));
+        columns.push(SchemaColumn::nullable(1, "payload", DataType::Text));
+        let mut schema = Schema::new("schema_metadata", columns);
+        let removed = schema.remove_column("id").unwrap();
+        drop(removed);
+        assert!(schema.memory.bytes() >= (128 * std::mem::size_of::<SchemaColumn>()) as u128);
+
+        let store = crate::storage::mvcc::VersionStore::new("schema_metadata", schema);
+        let old = store.schema();
+        let old_bytes = old.memory.bytes();
+        {
+            let mut schema = store.schema_mut();
+            schema.table_name = "retained_schema_name".repeat(256);
+            schema.columns[0].default_value =
+                Some(super::super::Value::text("default".repeat(8192)));
+            schema.foreign_keys.push(ForeignKeyConstraint {
+                column_index: 0,
+                column_name: "child".repeat(512),
+                referenced_table: "parent".repeat(512),
+                referenced_column: "key".repeat(512),
+                on_delete: ForeignKeyAction::NoAction,
+                on_update: ForeignKeyAction::NoAction,
+            });
+        }
+        let current = store.schema();
+        assert!(current.memory.bytes() > old_bytes + 8_000);
+        assert_eq!(old.memory.bytes(), old_bytes);
+        assert_eq!(old.table_name, "schema_metadata");
+        drop(store);
+        assert!(current.memory.bytes() > old_bytes + 8_000);
+        assert_eq!(old.memory.bytes(), old_bytes);
+    }
 
     fn create_test_schema() -> Schema {
         SchemaBuilder::new("users")

@@ -24,6 +24,7 @@ use rustc_hash::FxHashSet;
 use super::ops::Op;
 use crate::common::CompactArc;
 use crate::core::Value;
+use crate::storage::mvcc::read_memory::PayloadCharge;
 
 /// Constant value stored in the program
 #[derive(Debug, Clone)]
@@ -65,6 +66,7 @@ pub struct Program {
     /// Source expression string (for debugging)
     #[cfg(debug_assertions)]
     source: Option<String>,
+    _payload: PayloadCharge,
 }
 
 impl Program {
@@ -89,6 +91,7 @@ impl Program {
         });
 
         let cow_supported = Self::compute_cow_supported(&ops);
+        let payload = Self::payload_charge(&ops);
 
         Self {
             ops,
@@ -99,6 +102,7 @@ impl Program {
             cow_supported,
             #[cfg(debug_assertions)]
             source: None,
+            _payload: payload,
         }
     }
 
@@ -120,6 +124,7 @@ impl Program {
         });
 
         let cow_supported = Self::compute_cow_supported(&ops);
+        let payload = Self::payload_charge(&ops);
 
         Self {
             ops,
@@ -130,7 +135,36 @@ impl Program {
             cow_supported,
             #[cfg(debug_assertions)]
             source: None,
+            _payload: payload,
         }
+    }
+
+    fn payload_charge(ops: &[Op]) -> PayloadCharge {
+        let bytes = ops
+            .iter()
+            .map(|op| match op {
+                Op::LoadConst(value)
+                | Op::EqColumnConst(_, value)
+                | Op::NeColumnConst(_, value)
+                | Op::LtColumnConst(_, value)
+                | Op::LeColumnConst(_, value)
+                | Op::GtColumnConst(_, value)
+                | Op::GeColumnConst(_, value) => value.heap_bytes() as u128,
+                Op::BetweenColumnConst(_, low, high) => {
+                    low.heap_bytes() as u128 + high.heap_bytes() as u128
+                }
+                Op::InSet(values, _) | Op::NotInSet(values, _) | Op::InSetColumn(_, values, _) => {
+                    values.iter().map(|v| v.heap_bytes() as u128).sum()
+                }
+                Op::InTupleSet { values, .. } => values
+                    .iter()
+                    .flatten()
+                    .map(|v| v.heap_bytes() as u128)
+                    .sum(),
+                _ => 0,
+            })
+            .sum();
+        PayloadCharge::unshared(bytes)
     }
 
     /// Create an empty program that returns NULL
@@ -371,6 +405,7 @@ impl Program {
     /// This is called automatically when creating a program via `new()`.
     pub fn optimize(mut self) -> Self {
         self.ops = Self::peephole_optimize(self.ops);
+        self._payload = Self::payload_charge(&self.ops);
         // Recalculate metadata after optimization
         self.max_stack_depth = Self::compute_stack_depth(&self.ops);
         self.cow_supported = Self::compute_cow_supported(&self.ops);
@@ -701,6 +736,38 @@ mod tests {
         assert!(!prog.needs_outer_context());
         assert!(!prog.needs_second_row());
         assert!(!prog.has_subqueries());
+    }
+
+    #[test]
+    fn program_charges_shared_children_after_optimization_and_clone() {
+        let value = Value::text("a long constant with retained heap storage");
+        let bytes = value.heap_bytes() as u128;
+        let program = Program::new(vec![
+            Op::LoadColumn(0),
+            Op::LoadConst(value.clone()),
+            Op::Eq,
+            Op::Return,
+        ]);
+        assert_eq!(program._payload.bytes(), bytes);
+        let copy = program.clone().optimize();
+        drop(program);
+        assert_eq!(copy._payload.bytes(), bytes);
+
+        let set: CompactArc<crate::core::ValueSet> =
+            CompactArc::new([value.clone()].into_iter().collect());
+        let tuples = std::sync::Arc::new(vec![vec![value]]);
+        let program = Program::new_unoptimized(vec![
+            Op::InSet(set.clone(), false),
+            Op::NotInSet(set.clone(), false),
+            Op::InSetColumn(0, set, false),
+            Op::InTupleSet {
+                tuple_size: 1,
+                values: tuples,
+                negated: false,
+            },
+        ]);
+        assert_eq!(program._payload.bytes(), bytes * 4);
+        assert_eq!(program.clone()._payload.bytes(), bytes * 4);
     }
 
     #[test]

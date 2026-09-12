@@ -30,6 +30,7 @@ use super::ops::{CompareOp, CompiledPattern, Op};
 use super::program::Program;
 use crate::common::{CompactArc, SmartString};
 use crate::core::{DataType, Result, Row, Value, NULL_VALUE};
+use crate::storage::mvcc::read_memory::{charge_value_export, PayloadCharge};
 
 /// Stack value that can be borrowed (from row/constants) or owned (from operations)
 type StackValue<'a> = Cow<'a, Value>;
@@ -227,15 +228,30 @@ pub struct ExprVM {
 
     /// Cache for dynamic LIKE patterns (avoids recompilation per row)
     /// Stores (pattern_string, case_insensitive, escape_char, compiled_pattern)
-    cached_like: Option<(SmartString, bool, Option<char>, CompiledPattern)>,
+    cached_like: Option<(
+        SmartString,
+        bool,
+        Option<char>,
+        CompiledPattern,
+        PayloadCharge,
+    )>,
 
     /// Cache for dynamic GLOB patterns (separate from LIKE to avoid cross-contamination)
     /// Stores (pattern_string, compiled_pattern)
-    cached_glob: Option<(SmartString, CompiledPattern)>,
+    cached_glob: Option<(SmartString, CompiledPattern, PayloadCharge)>,
 
     /// Cache for dynamic REGEXP patterns (avoids recompilation per row)
     /// Stores (pattern_string, compiled_regex)
-    cached_regexp: Option<(SmartString, regex::Regex)>,
+    cached_regexp: Option<(SmartString, regex::Regex, PayloadCharge)>,
+}
+
+struct VmEvaluation<'a>(&'a mut ExprVM);
+
+impl Drop for VmEvaluation<'_> {
+    fn drop(&mut self) {
+        self.0.stack.clear();
+        self.0.args_buffer.clear();
+    }
 }
 
 impl ExprVM {
@@ -276,7 +292,7 @@ impl ExprVM {
         match (text_val, pattern_val) {
             (Value::Text(text), Value::Text(pat)) => {
                 let need_compile = match &self.cached_like {
-                    Some((cached_pat, cached_ci, cached_esc, _)) => {
+                    Some((cached_pat, cached_ci, cached_esc, _, _)) => {
                         cached_pat.as_str() != pat.as_str()
                             || *cached_ci != ci
                             || *cached_esc != esc
@@ -290,9 +306,15 @@ impl ExprVM {
                         None => pat.to_string(),
                     };
                     let compiled = CompiledPattern::compile(&processed, ci);
-                    self.cached_like = Some((pat.clone(), ci, esc, compiled));
+                    self.cached_like = Some((
+                        pat.clone(),
+                        ci,
+                        esc,
+                        compiled,
+                        PayloadCharge::unshared(pattern_val.heap_bytes() as u128),
+                    ));
                 }
-                let (_, _, _, ref compiled) = self.cached_like.as_ref().unwrap();
+                let (_, _, _, ref compiled, _) = self.cached_like.as_ref().unwrap();
                 Value::Boolean(compiled.matches(text, ci))
             }
             (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
@@ -301,6 +323,15 @@ impl ExprVM {
     }
 
     pub fn execute(&mut self, program: &Program, ctx: &ExecuteContext) -> Result<Value> {
+        let evaluation = VmEvaluation(self);
+        let result = evaluation.0.execute_owned_inner(program, ctx);
+        if let Ok(value) = &result {
+            charge_value_export(value);
+        }
+        result
+    }
+
+    fn execute_owned_inner(&mut self, program: &Program, ctx: &ExecuteContext) -> Result<Value> {
         // Ensure stack has enough capacity
         if self.stack.capacity() < program.max_stack_depth() {
             self.stack
@@ -1175,7 +1206,7 @@ impl ExprVM {
                             // Cache compiled pattern: parameters are constant per query,
                             // so recompiling every row is wasteful
                             let need_compile = match &self.cached_like {
-                                Some((cached_pat, cached_ci, cached_esc, _)) => {
+                                Some((cached_pat, cached_ci, cached_esc, _, _)) => {
                                     cached_pat.as_str() != pat.as_str()
                                         || *cached_ci != ci
                                         || cached_esc.is_some()
@@ -1184,9 +1215,15 @@ impl ExprVM {
                             };
                             if need_compile {
                                 let compiled = CompiledPattern::compile(pat, ci);
-                                self.cached_like = Some((pat.clone(), ci, None, compiled));
+                                self.cached_like = Some((
+                                    pat.clone(),
+                                    ci,
+                                    None,
+                                    compiled,
+                                    PayloadCharge::unshared(pattern_val.heap_bytes() as u128),
+                                ));
                             }
-                            let (_, _, _, ref compiled) = self.cached_like.as_ref().unwrap();
+                            let (_, _, _, ref compiled, _) = self.cached_like.as_ref().unwrap();
                             Value::Boolean(compiled.matches(text, ci))
                         }
                         (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
@@ -1238,14 +1275,18 @@ impl ExprVM {
                     let result = match (&text_val, &pattern_val) {
                         (Value::Text(text), Value::Text(pat)) => {
                             let need_compile = match &self.cached_glob {
-                                Some((cached_pat, _)) => cached_pat.as_str() != pat.as_str(),
+                                Some((cached_pat, _, _)) => cached_pat.as_str() != pat.as_str(),
                                 None => true,
                             };
                             if need_compile {
                                 let compiled = CompiledPattern::compile_glob(pat);
-                                self.cached_glob = Some((pat.clone(), compiled));
+                                self.cached_glob = Some((
+                                    pat.clone(),
+                                    compiled,
+                                    PayloadCharge::unshared(pattern_val.heap_bytes() as u128),
+                                ));
                             }
-                            let (_, ref compiled) = self.cached_glob.as_ref().unwrap();
+                            let (_, ref compiled, _) = self.cached_glob.as_ref().unwrap();
                             Value::Boolean(compiled.matches(text, false))
                         }
                         (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
@@ -1261,13 +1302,19 @@ impl ExprVM {
                     let result = match (&text_val, &pattern_val) {
                         (Value::Text(text), Value::Text(pat)) => {
                             let need_compile = match &self.cached_regexp {
-                                Some((cached_pat, _)) => cached_pat.as_str() != pat.as_str(),
+                                Some((cached_pat, _, _)) => cached_pat.as_str() != pat.as_str(),
                                 None => true,
                             };
                             if need_compile {
                                 match regex::Regex::new(pat) {
                                     Ok(re) => {
-                                        self.cached_regexp = Some((pat.clone(), re));
+                                        self.cached_regexp = Some((
+                                            pat.clone(),
+                                            re,
+                                            PayloadCharge::unshared(
+                                                pattern_val.heap_bytes() as u128
+                                            ),
+                                        ));
                                     }
                                     Err(e) => {
                                         self.cached_regexp = None;
@@ -1280,7 +1327,7 @@ impl ExprVM {
                                     }
                                 }
                             }
-                            let (_, ref re) = self.cached_regexp.as_ref().unwrap();
+                            let (_, ref re, _) = self.cached_regexp.as_ref().unwrap();
                             Value::Boolean(re.is_match(text))
                         }
                         (Value::Null(_), _) | (_, Value::Null(_)) => Value::Null(DataType::Boolean),
@@ -2094,13 +2141,33 @@ impl ExprVM {
         program: &'a Program,
         ctx: &'a ExecuteContext<'a>,
     ) -> Result<Value> {
+        let result = self.evaluate_cow(program, ctx);
+        if let Ok(value) = &result {
+            charge_value_export(value);
+        }
+        result
+    }
+
+    pub(crate) fn evaluate_cow<'a>(
+        &mut self,
+        program: &'a Program,
+        ctx: &'a ExecuteContext<'a>,
+    ) -> Result<Value> {
+        let evaluation = VmEvaluation(self);
         // A program with any op this loop does not handle goes straight
         // to the owned VM, instead of bailing mid-program and paying the
         // already-executed prefix twice
         if !program.cow_supported() {
-            return self.execute(program, ctx);
+            return evaluation.0.execute_owned_inner(program, ctx);
         }
+        evaluation.0.execute_cow_inner(program, ctx)
+    }
 
+    fn execute_cow_inner<'a>(
+        &mut self,
+        program: &'a Program,
+        ctx: &'a ExecuteContext<'a>,
+    ) -> Result<Value> {
         // Local stack with borrowed values - lifetime tied to this execution
         let mut stack: SmallVec<[StackValue<'a>; STACK_INLINE_CAPACITY]> = SmallVec::new();
 
@@ -2756,7 +2823,7 @@ impl ExprVM {
 
                 // For any unhandled operation, fall back to the regular execute
                 _ => {
-                    return self.execute(program, ctx);
+                    return self.execute_owned_inner(program, ctx);
                 }
             }
         }
@@ -4019,6 +4086,81 @@ mod tests {
     fn test_vm_new() {
         let vm = ExprVM::new();
         assert_eq!(vm.stack.len(), 0);
+    }
+
+    #[test]
+    fn vm_releases_transient_values_after_success_and_error() {
+        let functions = crate::functions::FunctionRegistry::new();
+        let row = Row::from_values(vec![Value::text(
+            "a long non-numeric argument retained by the VM",
+        )]);
+        let ctx = ExecuteContext::new(&row);
+        for cow in [false, true] {
+            let mut vm = ExprVM::new();
+            for succeeds in [true, false] {
+                let mut ops = vec![
+                    Op::LoadColumn(0),
+                    Op::LoadColumn(0),
+                    Op::CallScalar {
+                        func: functions.get_scalar("LENGTH").unwrap().into(),
+                        arg_count: 1,
+                    },
+                ];
+                if !succeeds {
+                    ops.extend([
+                        Op::LoadColumn(0),
+                        Op::LoadConst(Value::text("[")),
+                        Op::RegexpDynamic,
+                    ]);
+                }
+                ops.push(Op::Return);
+                let program = Program::new_unoptimized(ops);
+                let result = if cow {
+                    vm.execute_cow(&program, &ctx)
+                } else {
+                    vm.execute(&program, &ctx)
+                };
+                assert_eq!(result.is_ok(), succeeds);
+                assert!(vm.stack.is_empty(), "stack retained argument values");
+                assert!(vm.args_buffer.is_empty(), "argument buffer retained values");
+            }
+        }
+    }
+
+    #[test]
+    fn vm_pattern_caches_retain_and_replace_their_payload_charges() {
+        let value = Value::text("a retained dynamic pattern longer than inline storage");
+        let bytes = value.heap_bytes() as u128;
+        let row = Row::from_values(vec![value.clone(), value]);
+        let ctx = ExecuteContext::new(&row);
+        let mut vm = ExprVM::new();
+        for op in [Op::LikeDynamic(false), Op::GlobDynamic, Op::RegexpDynamic] {
+            let program = Program::new_unoptimized(vec![
+                Op::LoadColumn(0),
+                Op::LoadColumn(1),
+                op,
+                Op::Return,
+            ]);
+            assert_eq!(vm.execute(&program, &ctx).unwrap(), Value::Boolean(true));
+        }
+        drop(row);
+        assert_eq!(vm.cached_like.as_ref().unwrap().4.bytes(), bytes);
+        assert_eq!(vm.cached_glob.as_ref().unwrap().2.bytes(), bytes);
+        assert_eq!(vm.cached_regexp.as_ref().unwrap().2.bytes(), bytes);
+        let row = Row::from_values(vec![Value::text("x"), Value::text("[")]);
+        let ctx = ExecuteContext::new(&row);
+        let invalid = Program::new_unoptimized(vec![
+            Op::LoadColumn(0),
+            Op::LoadColumn(1),
+            Op::RegexpDynamic,
+            Op::Return,
+        ]);
+        assert!(vm.execute(&invalid, &ctx).is_err());
+        assert!(vm.cached_regexp.is_none());
+        assert!(vm.stack.is_empty());
+        assert!(vm.args_buffer.is_empty());
+        let _ = vm.like_dynamic_escape(&Value::text("x"), &Value::text("x"), false, Some('!'));
+        assert_eq!(vm.cached_like.as_ref().unwrap().4.bytes(), 0);
     }
 
     #[test]

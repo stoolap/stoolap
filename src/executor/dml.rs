@@ -3286,7 +3286,7 @@ impl Executor {
         // WAL is recorded AFTER success to prevent phantom records on failure.
         // If a crash occurs between truncate and WAL write, recovery restores
         // the pre-truncate state from the snapshot — the user simply retries.
-        let rows_affected = table.truncate()?;
+        let rows_affected = table.truncate()?.rows_affected;
 
         // Record TRUNCATE to WAL for persistence (only after successful truncate)
         self.engine.record_truncate_table(table_name)?;

@@ -27,6 +27,7 @@ use crate::core::{
 use crate::storage::expression::logical::OrExpr;
 use crate::storage::expression::Expression;
 use crate::storage::index::{BTreeIndex, BitmapIndex, HashIndex, HnswIndex, MultiColumnIndex};
+use crate::storage::mvcc::memory::HotObjectCharge;
 use crate::storage::mvcc::scanner::MVCCScanner;
 use crate::storage::mvcc::{TransactionVersionStore, VersionStore};
 use crate::storage::traits::{Index, QueryResult, ScanPlan, Scanner, Table};
@@ -42,6 +43,7 @@ pub struct MVCCTable {
     txn_versions: Arc<RwLock<TransactionVersionStore>>,
     /// Cached schema for returning references (Arc clone from version_store - O(1) instead of cloning)
     cached_schema: CompactArc<Schema>,
+    _object: Option<HotObjectCharge<Self>>,
 }
 
 /// Where a WHERE conjunction sits on a multi-column index: equalities on the
@@ -87,6 +89,7 @@ impl MVCCTable {
             version_store,
             txn_versions: Arc::new(RwLock::new(txn_versions)),
             cached_schema,
+            _object: None,
         }
     }
 
@@ -104,7 +107,13 @@ impl MVCCTable {
             version_store,
             txn_versions,
             cached_schema,
+            _object: None,
         }
+    }
+
+    pub(crate) fn into_boxed(mut self) -> Box<Self> {
+        self._object = Some(HotObjectCharge::new());
+        Box::new(self)
     }
 
     /// Returns the transaction ID
@@ -182,6 +191,7 @@ impl MVCCTable {
                 let col = &schema.columns[i];
                 // Use pre-computed default value if available, otherwise use NULL
                 if let Some(ref default_val) = col.default_value {
+                    super::read_memory::charge_value_export(default_val);
                     row.push(default_val.clone());
                 } else {
                     row.push(Value::null(col.data_type));
@@ -1607,6 +1617,7 @@ impl MVCCTable {
     #[inline]
     fn collect_visible_rows(&self, filter: Option<&dyn Expression>) -> RowVec {
         let txn_versions = self.txn_versions.read().unwrap();
+        let mut exports = txn_versions.export_batch();
         let schema = &self.cached_schema;
 
         // Check if we have local versions (uncommitted changes in this transaction)
@@ -1684,7 +1695,7 @@ impl MVCCTable {
                 continue;
             }
             // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-            let row = self.normalize_row_to_schema(version.data.clone(), schema);
+            let row = self.normalize_row_to_schema(exports.capture(&version.data), schema);
             if let Some(expr) = filter {
                 if !expr.evaluate_fast(&row) {
                     continue;
@@ -1722,6 +1733,7 @@ impl MVCCTable {
             if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
                 // Direct O(1) lookup by primary key
                 let txn_versions = self.txn_versions.read().unwrap();
+                let mut exports = txn_versions.export_batch();
                 // Check local versions first via get_local_version (preserves
                 // delete signal). txn_versions.get() swallows deletes as None,
                 // which would cause a fallback to the committed store and miss
@@ -1730,7 +1742,7 @@ impl MVCCTable {
                     if local.is_deleted() {
                         None // Locally deleted in this transaction
                     } else {
-                        Some((pk_id, local.data.clone()))
+                        Some((pk_id, exports.capture(&local.data)))
                     }
                 } else if let Some(version) =
                     self.version_store.get_visible_version(pk_id, self.txn_id)
@@ -1801,6 +1813,7 @@ impl MVCCTable {
                 .collect();
         }
 
+        let mut exports = txn_versions.export_batch();
         // Has local versions - use batch fetch then merge with early termination
         // Uses thread-local cached Vec for zero-allocation reuse
         let global_rows = self.version_store.get_all_visible_rows_cached(self.txn_id);
@@ -1846,7 +1859,7 @@ impl MVCCTable {
             if version.is_deleted() {
                 continue;
             }
-            let row = self.normalize_row_to_schema(version.data.clone(), schema);
+            let row = self.normalize_row_to_schema(exports.capture(&version.data), schema);
             if let Some(expr) = filter {
                 if !expr.evaluate_fast(&row) {
                     continue;
@@ -1882,6 +1895,7 @@ impl MVCCTable {
             if let Some(pk_id) = self.try_pk_lookup(expr, schema) {
                 // Direct O(1) lookup by primary key
                 let txn_versions = self.txn_versions.read().unwrap();
+                let mut exports = txn_versions.export_batch();
                 // Check local versions first via get_local_version (preserves
                 // delete signal). txn_versions.get() swallows deletes as None,
                 // which would cause a fallback to the committed store and miss
@@ -1890,7 +1904,7 @@ impl MVCCTable {
                     if local.is_deleted() {
                         None // Locally deleted in this transaction
                     } else {
-                        Some((pk_id, local.data.clone()))
+                        Some((pk_id, exports.capture(&local.data)))
                     }
                 } else if let Some(version) =
                     self.version_store.get_visible_version(pk_id, self.txn_id)
@@ -1991,6 +2005,7 @@ impl Table for MVCCTable {
         rows: &mut RowVec,
     ) -> Result<()> {
         let txn_versions = self.txn_versions.read().unwrap();
+        let mut exports = txn_versions.export_batch();
         let schema = &self.cached_schema;
 
         // Don't pre-allocate based on row_ids.len() — for volume-backed tables,
@@ -2004,7 +2019,7 @@ impl Table for MVCCTable {
             if let Some(version) = txn_versions.get_local_version(row_id) {
                 if !version.is_deleted() {
                     // Normalize row to match current schema (handles ALTER TABLE ADD/DROP COLUMN)
-                    let row = self.normalize_row_to_schema(version.data.clone(), schema);
+                    let row = self.normalize_row_to_schema(exports.capture(&version.data), schema);
                     if filter.evaluate_fast(&row) {
                         rows.push((row_id, row));
                     }
@@ -2072,7 +2087,7 @@ impl Table for MVCCTable {
         );
         {
             let mut schema_guard = self.version_store.schema_mut();
-            CompactArc::make_mut(&mut *schema_guard).add_column(column.clone())?;
+            schema_guard.add_column(column.clone())?;
         }
         CompactArc::make_mut(&mut self.cached_schema).add_column(column)?;
         Ok(())
@@ -2082,7 +2097,7 @@ impl Table for MVCCTable {
         // Remove column from both version store and cached schema
         {
             let mut schema_guard = self.version_store.schema_mut();
-            CompactArc::make_mut(&mut *schema_guard).remove_column(name)?;
+            schema_guard.remove_column(name)?;
         }
         CompactArc::make_mut(&mut self.cached_schema).remove_column(name)?;
         Ok(())
@@ -2126,12 +2141,13 @@ impl Table for MVCCTable {
                 // missing uncommitted deletes in the current transaction.
                 let row_with_original = {
                     let txn_versions = self.txn_versions.read().unwrap();
+                    let mut exports = txn_versions.export_batch();
                     if let Some(local) = txn_versions.get_local_version(pk_id) {
                         if local.is_deleted() {
                             None // Locally deleted — can't update
                         } else {
                             // Local version - no need to track original (already in write-set)
-                            Some((local.data.clone(), None))
+                            Some((exports.capture(&local.data), None))
                         }
                     } else if let Some(version) =
                         self.version_store.get_visible_version(pk_id, self.txn_id)
@@ -2186,10 +2202,12 @@ impl Table for MVCCTable {
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
+                    let mut exports = txn_versions.export_batch();
                     for row_id in pk_range_ids {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
-                                let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                                let row = self
+                                    .normalize_row_to_schema(exports.capture(&local.data), schema);
                                 let (updated_row, changed) = setter(row)?;
                                 if changed {
                                     local_rows.push((row_id, updated_row));
@@ -2239,10 +2257,12 @@ impl Table for MVCCTable {
 
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
+                    let mut exports = txn_versions.export_batch();
                     for &row_id in &filtered_row_ids {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
-                                let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                                let row = self
+                                    .normalize_row_to_schema(exports.capture(&local.data), schema);
                                 // Re-apply filter
                                 if expr.evaluate(&row).unwrap_or(false) {
                                     local_rows_to_update.push((row_id, row));
@@ -2363,6 +2383,7 @@ impl Table for MVCCTable {
         // - Rows locally inserted (not in global store): add to update set
         let local_rows_to_update: RowVec = {
             let txn_versions = self.txn_versions.read().unwrap();
+            let mut exports = txn_versions.export_batch();
             if txn_versions.has_local_changes() {
                 // Fix up global rows that have local modifications
                 rows_with_originals.retain_mut(|(row_id, row, _orig)| {
@@ -2372,7 +2393,8 @@ impl Table for MVCCTable {
                             return false;
                         }
                         // Locally modified — use local data instead of stale global data
-                        *row = self.normalize_row_to_schema(local_version.data.clone(), schema);
+                        *row = self
+                            .normalize_row_to_schema(exports.capture(&local_version.data), schema);
                         // Re-check filter against local data
                         if let Some(expr) = where_expr {
                             if !expr.evaluate(row).unwrap_or(false) {
@@ -2395,7 +2417,7 @@ impl Table for MVCCTable {
                     if version.is_deleted() {
                         return None;
                     }
-                    let row = self.normalize_row_to_schema(version.data.clone(), schema);
+                    let row = self.normalize_row_to_schema(exports.capture(&version.data), schema);
                     if let Some(expr) = where_expr {
                         if !expr.evaluate(&row).unwrap_or(false) {
                             return None;
@@ -2475,10 +2497,12 @@ impl Table for MVCCTable {
 
         {
             let txn_versions = self.txn_versions.read().unwrap();
+            let mut exports = txn_versions.export_batch();
             for &row_id in row_ids {
                 if let Some(local) = txn_versions.get_local_version(row_id) {
                     if !local.is_deleted() {
-                        let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                        let row =
+                            self.normalize_row_to_schema(exports.capture(&local.data), schema);
                         let (updated_row, changed) = setter(row)?;
                         if changed {
                             local_rows.push((row_id, updated_row));
@@ -2532,10 +2556,12 @@ impl Table for MVCCTable {
 
         {
             let txn_versions = self.txn_versions.read().unwrap();
+            let mut exports = txn_versions.export_batch();
             for &row_id in row_ids {
                 if let Some(local) = txn_versions.get_local_version(row_id) {
                     if !local.is_deleted() {
-                        let row = self.normalize_row_to_schema(local.data.clone(), schema);
+                        let row =
+                            self.normalize_row_to_schema(exports.capture(&local.data), schema);
                         local_deletes.push((row_id, row));
                     }
                     // Already locally deleted — skip, don't fall through
@@ -2681,12 +2707,13 @@ impl Table for MVCCTable {
                 // missing uncommitted deletes in the current transaction.
                 let row_with_original = {
                     let txn_versions = self.txn_versions.read().unwrap();
+                    let mut exports = txn_versions.export_batch();
                     if let Some(local) = txn_versions.get_local_version(pk_id) {
                         if local.is_deleted() {
                             None // Already locally deleted — don't double-count
                         } else {
                             // Local version - no need to track original (already in write-set)
-                            Some((local.data.clone(), None))
+                            Some((exports.capture(&local.data), None))
                         }
                     } else if let Some(version) =
                         self.version_store.get_visible_version(pk_id, self.txn_id)
@@ -2731,10 +2758,11 @@ impl Table for MVCCTable {
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(pk_range_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
+                    let mut exports = txn_versions.export_batch();
                     for row_id in pk_range_ids {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
-                                local_rows.push((row_id, local.data.clone()));
+                                local_rows.push((row_id, exports.capture(&local.data)));
                             }
                             // Already locally deleted — skip, don't fall through
                         } else {
@@ -2778,10 +2806,11 @@ impl Table for MVCCTable {
                 let mut remaining_row_ids: Vec<i64> = Vec::with_capacity(filtered_row_ids.len());
                 {
                     let txn_versions = self.txn_versions.read().unwrap();
+                    let mut exports = txn_versions.export_batch();
                     for row_id in filtered_row_ids {
                         if let Some(local) = txn_versions.get_local_version(row_id) {
                             if !local.is_deleted() {
-                                let row = local.data.clone();
+                                let row = exports.capture(&local.data);
                                 // Re-apply filter (index may be partial match)
                                 if expr.evaluate(&row).unwrap_or(false) {
                                     rows_to_delete.push((row_id, row));
@@ -2833,9 +2862,10 @@ impl Table for MVCCTable {
             // Use get_local_version to distinguish "no local version" from "locally deleted"
             let local_version = {
                 let txn_versions = self.txn_versions.read().unwrap();
+                let mut exports = txn_versions.export_batch();
                 txn_versions
                     .get_local_version(row_id)
-                    .map(|v| (v.is_deleted(), v.data.clone()))
+                    .map(|v| (v.is_deleted(), exports.capture(&v.data)))
             };
 
             if let Some((is_deleted, row)) = local_version {
@@ -2912,7 +2942,7 @@ impl Table for MVCCTable {
         Ok(delete_count)
     }
 
-    fn truncate(&mut self) -> Result<i32> {
+    fn truncate(&mut self) -> Result<super::version_store::TruncateResult> {
         // Fast path: drop all storage directly, bypassing per-row MVCC versioning.
         // This is O(1) instead of O(N) for delete-all.
         // Fails if other transactions have uncommitted writes on this table.
@@ -2936,11 +2966,12 @@ impl Table for MVCCTable {
                 // missing uncommitted deletes in the current transaction.
                 let row = {
                     let txn_versions = self.txn_versions.read().unwrap();
+                    let mut exports = txn_versions.export_batch();
                     if let Some(local) = txn_versions.get_local_version(pk_lookup) {
                         if local.is_deleted() {
                             None // Locally deleted in this transaction
                         } else {
-                            Some(local.data.clone())
+                            Some(exports.capture(&local.data))
                         }
                     } else if let Some(version) = self
                         .version_store
@@ -3146,12 +3177,13 @@ impl Table for MVCCTable {
 
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
         let txn_versions = self.txn_versions.read().unwrap();
+        let mut exports = txn_versions.export_batch();
         txn_versions
             .iter_local()
             .map(|(row_id, version)| {
                 (
                     row_id,
-                    version.data.clone(),
+                    exports.capture(&version.data),
                     version.is_deleted(),
                     version.txn_id,
                 )
@@ -4162,7 +4194,7 @@ impl Table for MVCCTable {
         // Rename column in both version store and cached schema
         {
             let mut schema_guard = self.version_store.schema_mut();
-            CompactArc::make_mut(&mut *schema_guard).rename_column(old_name, new_name)?;
+            schema_guard.rename_column(old_name, new_name)?;
         }
         CompactArc::make_mut(&mut self.cached_schema).rename_column(old_name, new_name)?;
         Ok(())
@@ -4172,11 +4204,7 @@ impl Table for MVCCTable {
         // Modify column in both version store and cached schema
         {
             let mut schema_guard = self.version_store.schema_mut();
-            CompactArc::make_mut(&mut *schema_guard).modify_column(
-                name,
-                Some(column_type),
-                Some(nullable),
-            )?;
+            schema_guard.modify_column(name, Some(column_type), Some(nullable))?;
         }
         CompactArc::make_mut(&mut self.cached_schema).modify_column(
             name,

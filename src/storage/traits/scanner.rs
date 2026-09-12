@@ -37,6 +37,19 @@ use crate::core::{Result, Row};
 /// scanner.close()?;
 /// ```
 pub trait Scanner: Send {
+    /// Whether all payloads are captured and iteration needs no further export accounting.
+    fn is_materialized(&self) -> bool {
+        false
+    }
+
+    /// Binds deferred exports before iteration. True means no ambient scope is needed.
+    fn bind_read_scope(
+        &mut self,
+        _scope: Option<&std::sync::Arc<crate::storage::mvcc::ReadScope>>,
+    ) -> bool {
+        self.is_materialized()
+    }
+
     /// Advances the scanner to the next row
     ///
     /// Returns `true` if there is another row available, `false` otherwise.
@@ -123,6 +136,10 @@ impl Default for EmptyScanner {
 }
 
 impl Scanner for EmptyScanner {
+    fn is_materialized(&self) -> bool {
+        true
+    }
+
     fn next(&mut self) -> bool {
         false
     }
@@ -177,6 +194,10 @@ impl VecScanner {
 }
 
 impl Scanner for VecScanner {
+    fn is_materialized(&self) -> bool {
+        true
+    }
+
     fn next(&mut self) -> bool {
         if self.closed || self.error.is_some() {
             return false;

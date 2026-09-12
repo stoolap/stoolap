@@ -12,739 +12,1255 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Arena-based row storage for O(1) clone reads
-//!
-//! This module provides Arc-based storage for row data,
-//! enabling O(1) row cloning on read (just CompactArc::clone).
-//!
-//! Key insight: Store row data as CompactArc<[Value]> for O(1) clone on read.
-//! Single clone on insert, zero clone on read.
-//!
-//! # Lock Design
-//!
-//! Uses a single RwLock for both data and metadata to:
-//! - Ensure consistent lock ordering (eliminates deadlock risk)
-//! - Reduce lock acquisition overhead (one lock vs two)
-//! - Guarantee atomic insert operations
+//! Chunked row payloads with stable addresses and prepared write capacity.
 
 use parking_lot::{Mutex, RwLock};
+use smallvec::SmallVec;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use crate::common::CompactArc;
-use crate::core::{Row, Value};
+use crate::core::{Error, Result, Value};
+use crate::storage::mvcc::memory::{HotObjectCharge, TableMemory};
 
-/// Bytes a row holds: the values in place plus what text and extension
-/// values keep on the heap
-pub fn row_bytes(values: &[Value]) -> usize {
-    let mut bytes = 16 + std::mem::size_of_val(values);
-    for value in values {
-        match value {
-            Value::Text(s) if s.is_heap() => bytes += 40 + s.heap_capacity(),
-            Value::Extension(bytes_ref) => bytes += 16 + bytes_ref.len(),
-            _ => {}
-        }
-    }
-    bytes
+pub const ARENA_CHUNK_ROWS: usize = 1 << 18;
+const CHUNK_BITS: u32 = 18;
+const CHUNK_ID_LIMIT: u64 = (1 << (64 - CHUNK_BITS)) - 1;
+
+/// Bytes requested by a payload, conservatively counting shared children again.
+pub fn row_bytes(values: &[Value]) -> u128 {
+    (2 * std::mem::size_of::<usize>() + std::mem::size_of_val(values)) as u128
+        + values
+            .iter()
+            .map(|value| value.heap_bytes() as u128)
+            .sum::<u128>()
 }
 
-/// Metadata for a row stored in the arena
-///
-/// Note: create_time is NOT stored here to save 8 bytes per row.
-/// It's available via RowVersion in the version chain when needed.
-#[derive(Clone, Copy, Debug)]
+struct ArenaBuffer<T> {
+    values: Vec<T>,
+    // Fields drop in order: the allocation is freed before its charge.
+    _charge: ArenaBufferCharge,
+}
+
+#[derive(Default)]
+struct ArenaBufferCharge {
+    account: Option<Arc<TableMemory>>,
+    bytes: usize,
+}
+
+impl Drop for ArenaBufferCharge {
+    fn drop(&mut self) {
+        if let Some(account) = &self.account {
+            account.arena_capacity.remove(self.bytes as u128);
+        }
+    }
+}
+
+struct RetiredPayloadCharge<'a> {
+    account: &'a TableMemory,
+    bytes: u128,
+}
+
+impl<'a> RetiredPayloadCharge<'a> {
+    fn new(account: &'a TableMemory, bytes: u128) -> Self {
+        *account.retired_arena_payloads.lock() += bytes;
+        Self { account, bytes }
+    }
+}
+
+impl Drop for RetiredPayloadCharge<'_> {
+    fn drop(&mut self) {
+        *self.account.retired_arena_payloads.lock() -= self.bytes;
+    }
+}
+
+impl<T> Default for ArenaBuffer<T> {
+    fn default() -> Self {
+        Self {
+            values: Vec::new(),
+            _charge: ArenaBufferCharge::default(),
+        }
+    }
+}
+
+impl<T> ArenaBuffer<T> {
+    fn new(values: Vec<T>, account: &Arc<TableMemory>) -> Self {
+        let bytes = values.capacity() * std::mem::size_of::<T>();
+        let owner = (bytes != 0).then(|| {
+            account.arena_capacity.add(bytes as u128);
+            Arc::clone(account)
+        });
+        Self {
+            values,
+            _charge: ArenaBufferCharge {
+                account: owner,
+                bytes,
+            },
+        }
+    }
+
+    fn try_with_capacity(capacity: usize, account: &Arc<TableMemory>) -> Result<Self> {
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(capacity)
+            .map_err(allocation_error)?;
+        Ok(Self::new(values, account))
+    }
+}
+
+impl<T> std::ops::Deref for ArenaBuffer<T> {
+    type Target = Vec<T>;
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl<T> std::ops::DerefMut for ArenaBuffer<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.values
+    }
+}
+
+impl<'a, T> IntoIterator for &'a ArenaBuffer<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a mut ArenaBuffer<T> {
+    type Item = &'a mut T;
+    type IntoIter = std::slice::IterMut<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.values.iter_mut()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct ArenaSlot(NonZeroU64);
+
+impl ArenaSlot {
+    fn new(chunk: u64, offset: usize) -> Self {
+        debug_assert!(chunk < CHUNK_ID_LIMIT && offset < ARENA_CHUNK_ROWS);
+        Self(NonZeroU64::new((chunk << CHUNK_BITS) + offset as u64 + 1).unwrap_or(NonZeroU64::MIN))
+    }
+
+    fn chunk(self) -> u64 {
+        (self.0.get() - 1) >> CHUNK_BITS
+    }
+
+    fn offset(self) -> usize {
+        ((self.0.get() - 1) & (ARENA_CHUNK_ROWS as u64 - 1)) as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ArenaRowMeta {
-    /// Row ID
     pub row_id: i64,
-    /// Transaction ID that created this row
     pub txn_id: i64,
-    /// Transaction ID that deleted this row (0 if not deleted)
     pub deleted_at_txn_id: i64,
 }
 
-impl ArenaRowMeta {
-    /// Check if this row is deleted
-    #[inline]
-    pub fn is_deleted(&self) -> bool {
-        self.deleted_at_txn_id != 0
+#[derive(Default)]
+struct Chunk {
+    id: u64,
+    data: ArenaBuffer<Option<CompactArc<[Value]>>>,
+    meta: ArenaBuffer<ArenaRowMeta>,
+    len: usize,
+    occupied: usize,
+    reserved: usize,
+    base_row_id: Option<i64>,
+}
+
+impl Chunk {
+    fn prepare(id: u64, capacity: usize, account: &Arc<TableMemory>) -> Result<Self> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if crate::test_failpoints::arena_growth_fails() {
+            return Err(Error::internal("injected hot arena growth failure"));
+        }
+        let mut data = ArenaBuffer::try_with_capacity(capacity, account)?;
+        data.resize_with(capacity, || None);
+        let mut meta = ArenaBuffer::try_with_capacity(capacity, account)?;
+        meta.resize(capacity, ArenaRowMeta::default());
+        Ok(Self {
+            id,
+            data,
+            meta,
+            len: 0,
+            occupied: 0,
+            reserved: 0,
+            base_row_id: None,
+        })
+    }
+
+    fn get(&self, offset: usize, row_id: i64) -> Option<(&ArenaRowMeta, &CompactArc<[Value]>)> {
+        let meta = self.meta.get(offset)?;
+        if meta.txn_id == 0 || meta.row_id != row_id {
+            return None;
+        }
+        Some((meta, self.data.get(offset)?.as_ref()?))
+    }
+
+    fn probe(&self, row_id: i64) -> Option<(&ArenaRowMeta, &CompactArc<[Value]>)> {
+        let offset = row_id.checked_sub(self.base_row_id?)?;
+        self.get(usize::try_from(offset).ok()?, row_id)
     }
 }
 
-/// Inner arena data protected by single lock
-///
-/// NOTE: This struct is on the hot read path. Keep it minimal.
-/// The free_list is stored separately in RowArena to avoid bloating this struct.
-pub struct ArenaInner {
-    /// Arc storage per row (for O(1) clone on read)
-    /// Stores CompactArc<[Value]> for efficient row sharing
-    pub data: Vec<CompactArc<[Value]>>,
-    /// Row metadata
-    pub meta: Vec<ArenaRowMeta>,
+fn allocation_error(error: impl std::fmt::Display) -> Error {
+    Error::internal(format!("cannot reserve hot arena capacity: {error}"))
 }
 
-/// Arena-based storage for row data
-///
-/// Row data is stored as CompactArc<[Value]> for O(1) clone on read.
-/// Single clone on insert, zero clone on read.
-///
-/// Uses single RwLock for atomicity and deadlock prevention.
-/// Free list is stored separately to avoid bloating the hot read path.
-pub struct RowArena {
-    /// Combined data and metadata under single lock
-    inner: RwLock<ArenaInner>,
-    /// Free list of cleared slot indices for reuse (separate lock, write-path only)
-    /// This prevents unbounded arena growth during insert/delete cycles
-    free_list: Mutex<Vec<usize>>,
-    /// Bytes of the rows in live slots, kept exact by every mutation
-    bytes: AtomicUsize,
+struct ArenaInner {
+    active: Option<Chunk>,
+    frozen: ArenaBuffer<Chunk>,
+    free: ArenaBuffer<u32>,
+    free_len: usize,
+    next_chunk_id: u64,
+    reserved: usize,
+    ordered_bases: bool,
+    payload_bytes: u128,
+    row_bound: u128,
 }
 
-impl RowArena {
-    /// Create a new arena.
-    ///
-    /// Nothing is reserved up front. Reserving 10,000 slots cost every table
-    /// 320 KB before it held a row (80 KB of pointers plus 240 KB of metadata),
-    /// which a schema with many small tables pays over and over, and it bought
-    /// very little: growing a Vec by doubling copies about 2n elements in total
-    /// whatever it starts from, so a 10,000 slot head start only saves copying
-    /// the first 10,000, and the expensive doublings at the end happen either
-    /// way. A caller that knows the size should use [`RowArena::with_capacity`].
-    pub fn new() -> Self {
-        Self {
-            inner: RwLock::new(ArenaInner {
-                data: Vec::new(),
-                meta: Vec::new(),
-            }),
-            free_list: Mutex::new(Vec::new()),
-            bytes: AtomicUsize::new(0),
-        }
-    }
-
-    /// Create a new arena with pre-allocated capacity
-    pub fn with_capacity(row_capacity: usize) -> Self {
-        Self {
-            inner: RwLock::new(ArenaInner {
-                data: Vec::with_capacity(row_capacity),
-                meta: Vec::with_capacity(row_capacity),
-            }),
-            free_list: Mutex::new(Vec::new()),
-            bytes: AtomicUsize::new(0),
-        }
-    }
-
-    /// Insert a row into the arena
-    ///
-    /// Returns the index of the row metadata.
-    /// Reuses cleared slots from the free list to prevent unbounded growth.
-    #[inline]
-    pub fn insert(&self, row_id: i64, txn_id: i64, values: &[Value]) -> usize {
-        // Check free list first (separate lock, doesn't affect read path)
-        let reuse_idx = self.free_list.lock().pop();
-
-        let mut inner = self.inner.write();
-
-        // Convert values to CompactArc<[Value]>
-        let arc_data: CompactArc<[Value]> = CompactArc::from(values.to_vec());
-        self.bytes.fetch_add(row_bytes(values), Ordering::Relaxed);
-
-        let meta = ArenaRowMeta {
-            row_id,
-            txn_id,
-            deleted_at_txn_id: 0,
-        };
-
-        // Reuse a slot from the free list if available
-        if let Some(idx) = reuse_idx {
-            inner.data[idx] = arc_data;
-            inner.meta[idx] = meta;
-            idx
-        } else {
-            inner.data.push(arc_data);
-            let idx = inner.meta.len();
-            inner.meta.push(meta);
-            idx
-        }
-    }
-
-    /// Insert a row from a Row struct
-    /// Handles all storage types: Shared Arc is cloned O(1), Owned values create new Arc.
-    /// Reuses cleared slots from the free list to prevent unbounded growth.
-    #[inline]
-    pub fn insert_row(&self, row_id: i64, txn_id: i64, row: &Row) -> usize {
-        // Check free list first (separate lock, doesn't affect read path)
-        let reuse_idx = self.free_list.lock().pop();
-
-        let mut inner = self.inner.write();
-
-        // Store Arc for O(1) clone on read
-        // If row is Shared, clone the Arc (O(1))
-        // If row is Owned, create new Arc from values
-        let arc_data = match row.as_arc() {
-            Some(arc) => CompactArc::clone(arc),
-            None => {
-                // Owned storage: create new Arc from values
-                let values: Vec<Value> = row.iter().cloned().collect();
-                CompactArc::from(values)
-            }
-        };
-        self.bytes
-            .fetch_add(row_bytes(&arc_data), Ordering::Relaxed);
-
-        let meta = ArenaRowMeta {
-            row_id,
-            txn_id,
-            deleted_at_txn_id: 0,
-        };
-
-        // Reuse a slot from the free list if available
-        if let Some(idx) = reuse_idx {
-            inner.data[idx] = arc_data;
-            inner.meta[idx] = meta;
-            idx
-        } else {
-            inner.data.push(arc_data);
-            let idx = inner.meta.len();
-            inner.meta.push(meta);
-            idx
-        }
-    }
-
-    /// Insert a row and return both the index AND the Arc
-    /// This allows the caller to reuse the Arc for O(1) clones
-    /// Handles all storage types: Shared Arc is cloned O(1), Owned values create new Arc.
-    /// Reuses cleared slots from the free list to prevent unbounded growth.
-    #[inline]
-    pub fn insert_row_get_arc(
-        &self,
-        row_id: i64,
-        txn_id: i64,
-        row: &Row,
-    ) -> (usize, CompactArc<[Value]>) {
-        // Check free list first (separate lock, doesn't affect read path)
-        let reuse_idx = self.free_list.lock().pop();
-
-        let mut inner = self.inner.write();
-
-        // Create Arc once, clone for storage and return
-        let arc_data = match row.as_arc() {
-            Some(arc) => CompactArc::clone(arc),
-            None => {
-                // Owned storage: create new Arc from values
-                let values: Vec<Value> = row.iter().cloned().collect();
-                CompactArc::from(values)
-            }
-        };
-        self.bytes
-            .fetch_add(row_bytes(&arc_data), Ordering::Relaxed);
-
-        let meta = ArenaRowMeta {
-            row_id,
-            txn_id,
-            deleted_at_txn_id: 0,
-        };
-
-        // Reuse a slot from the free list if available
-        let idx = if let Some(idx) = reuse_idx {
-            inner.data[idx] = CompactArc::clone(&arc_data);
-            inner.meta[idx] = meta;
-            idx
-        } else {
-            inner.data.push(CompactArc::clone(&arc_data));
-            let idx = inner.meta.len();
-            inner.meta.push(meta);
-            idx
-        };
-        (idx, arc_data)
-    }
-
-    /// Insert an already-created Arc directly - avoids copy when caller has Arc
-    /// Returns the index where it was stored
-    /// Reuses cleared slots from the free list to prevent unbounded growth.
-    #[inline]
-    pub fn insert_arc(&self, row_id: i64, txn_id: i64, arc_data: CompactArc<[Value]>) -> usize {
-        // Check free list first (separate lock, doesn't affect read path)
-        let reuse_idx = self.free_list.lock().pop();
-
-        let mut inner = self.inner.write();
-        self.bytes
-            .fetch_add(row_bytes(&arc_data), Ordering::Relaxed);
-
-        let meta = ArenaRowMeta {
-            row_id,
-            txn_id,
-            deleted_at_txn_id: 0,
-        };
-
-        // Reuse a slot from the free list if available
-        if let Some(idx) = reuse_idx {
-            inner.data[idx] = arc_data;
-            inner.meta[idx] = meta;
-            idx
-        } else {
-            inner.data.push(arc_data);
-            let idx = inner.meta.len();
-            inner.meta.push(meta);
-            idx
-        }
-    }
-
-    /// Mark a row as deleted
-    #[inline]
-    pub fn mark_deleted(&self, row_idx: usize, deleted_at_txn_id: i64) {
-        let mut inner = self.inner.write();
-        if row_idx < inner.meta.len() {
-            inner.meta[row_idx].deleted_at_txn_id = deleted_at_txn_id;
-        }
-    }
-
-    /// Clear a slot in the arena to release memory
-    ///
-    /// This replaces the data with an empty Arc and marks the metadata as cleared
-    /// (row_id = 0). The slot index is added to the free list for reuse.
-    /// This is used during cleanup of deleted rows.
-    #[inline]
-    pub fn clear_at(&self, arena_idx: usize) -> bool {
-        let cleared = {
-            let mut inner = self.inner.write();
-            if arena_idx < inner.meta.len() {
-                self.bytes
-                    .fetch_sub(row_bytes(&inner.data[arena_idx]), Ordering::Relaxed);
-                // Replace data with empty Arc to release memory
-                inner.data[arena_idx] = CompactArc::from(Vec::<Value>::new());
-                // Mark metadata as cleared (txn_id = 0 is the cleared sentinel;
-                // row_id = 0 is a valid user PK, but txn_id is always > 0 for real rows)
-                inner.meta[arena_idx] = ArenaRowMeta {
-                    row_id: 0,
-                    txn_id: 0,
-                    deleted_at_txn_id: 0,
-                };
-                true
-            } else {
-                false
-            }
-        };
-
-        if cleared {
-            // Add to free list for reuse (separate lock)
-            self.free_list.lock().push(arena_idx);
-        }
-        cleared
-    }
-
-    /// Clear multiple slots in the arena efficiently (single lock acquisition)
-    ///
-    /// Returns the number of slots actually cleared.
-    /// Cleared indices are added to the free list for reuse.
-    #[inline]
-    pub fn clear_batch(&self, arena_indices: &[usize]) -> usize {
-        let mut cleared_indices = Vec::with_capacity(arena_indices.len());
-
-        {
-            let mut inner = self.inner.write();
-            let empty_data: CompactArc<[Value]> = CompactArc::from(Vec::<Value>::new());
-            let cleared_meta = ArenaRowMeta {
-                row_id: 0,
-                txn_id: 0,
-                deleted_at_txn_id: 0,
+impl ArenaInner {
+    fn refresh_probe_order(&mut self) {
+        let mut end = None;
+        self.ordered_bases = self.frozen.iter().all(|chunk| {
+            let Some(base) = chunk.base_row_id else {
+                return false;
             };
+            let Some(next) = base.checked_add(chunk.len as i64) else {
+                return false;
+            };
+            let ordered = end.is_none_or(|previous| previous <= base);
+            end = Some(next);
+            ordered
+        });
+    }
 
-            let mut freed = 0usize;
-            for &arena_idx in arena_indices {
-                if arena_idx < inner.meta.len() {
-                    freed += row_bytes(&inner.data[arena_idx]);
-                    inner.data[arena_idx] = CompactArc::clone(&empty_data);
-                    inner.meta[arena_idx] = cleared_meta;
-                    cleared_indices.push(arena_idx);
+    #[cfg(test)]
+    fn chunk(&self, id: u64) -> Option<&Chunk> {
+        if let Some(active) = &self.active {
+            if active.id == id {
+                return Some(active);
+            }
+        }
+        self.frozen
+            .binary_search_by_key(&id, |c| c.id)
+            .ok()
+            .map(|i| &self.frozen[i])
+    }
+
+    fn chunk_mut(&mut self, id: u64) -> Option<&mut Chunk> {
+        if self.active.as_ref().is_some_and(|c| c.id == id) {
+            return self.active.as_mut();
+        }
+        self.frozen
+            .binary_search_by_key(&id, |c| c.id)
+            .ok()
+            .map(|i| &mut self.frozen[i])
+    }
+
+    fn retire_empty(&mut self, id: u64) -> Option<Chunk> {
+        if let Some(active) = &self.active {
+            if active.id == id {
+                if active.occupied == 0 && active.reserved == 0 {
+                    self.free_len = 0;
+                    return self.active.take();
                 }
+                return None;
             }
-            self.bytes.fetch_sub(freed, Ordering::Relaxed);
         }
-
-        // Add to free list for reuse (separate lock, after releasing inner lock)
-        let count = cleared_indices.len();
-        if count > 0 {
-            let mut free_list = self.free_list.lock();
-            free_list.reserve(count);
-            free_list.extend(cleared_indices);
-        }
-        count
-    }
-
-    /// Update data at an existing arena index (for slot reuse during UPDATEs)
-    ///
-    /// This replaces both data and metadata at the given index, avoiding
-    /// unbounded arena growth during update-heavy workloads.
-    /// Returns true if the update was successful, false if index out of bounds.
-    #[inline]
-    pub fn update_at(
-        &self,
-        arena_idx: usize,
-        row_id: i64,
-        txn_id: i64,
-        arc_data: CompactArc<[Value]>,
-    ) -> bool {
-        let mut inner = self.inner.write();
-        if arena_idx < inner.meta.len() {
-            let old = row_bytes(&inner.data[arena_idx]);
-            self.bytes
-                .fetch_add(row_bytes(&arc_data), Ordering::Relaxed);
-            self.bytes.fetch_sub(old, Ordering::Relaxed);
-            inner.data[arena_idx] = arc_data;
-            inner.meta[arena_idx] = ArenaRowMeta {
-                row_id,
-                txn_id,
-                deleted_at_txn_id: 0,
-            };
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Drop all data and release the memory.
-    /// This releases all memory immediately (O(1) memory release)
-    /// unlike clear_batch which only clears slots but retains Vec capacity.
-    pub fn clear_all(&self) {
-        let mut inner = self.inner.write();
-        inner.data = Vec::new();
-        inner.meta = Vec::new();
-        self.free_list.lock().clear();
-        self.bytes.store(0, Ordering::Relaxed);
-    }
-
-    /// Get the number of rows (including deleted)
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.inner.read().meta.len()
-    }
-
-    /// Bytes of the rows in live slots
-    #[inline]
-    pub fn bytes(&self) -> usize {
-        self.bytes.load(Ordering::Relaxed)
-    }
-
-    /// Bytes the slot vectors reserve, used or not
-    pub fn capacity_bytes(&self) -> usize {
-        let inner = self.inner.read();
-        inner.data.capacity() * std::mem::size_of::<CompactArc<[Value]>>()
-            + inner.meta.capacity() * std::mem::size_of::<ArenaRowMeta>()
-    }
-
-    /// Check if the arena is empty
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.inner.read().meta.is_empty()
-    }
-
-    /// Get read guard for arena data
-    ///
-    /// Returns a guard that provides access to both metadata and data slices.
-    /// Single lock acquisition for both.
-    #[inline]
-    pub fn read_guard(&self) -> ArenaReadGuard<'_> {
-        ArenaReadGuard {
-            inner: self.inner.read(),
-        }
-    }
-
-    /// Get Arc for a row by arena index - O(1) clone
-    #[inline]
-    pub fn get_arc(&self, arena_idx: usize) -> Option<CompactArc<[Value]>> {
-        let inner = self.inner.read();
-        inner.data.get(arena_idx).cloned()
-    }
-
-    /// Get both metadata and Arc for a row by arena index - O(1) with single lock
-    ///
-    /// This is optimized for the visibility fast path where we need to check
-    /// txn_id and deleted_at_txn_id before returning the data.
-    #[inline]
-    pub fn get_meta_and_arc(
-        &self,
-        arena_idx: usize,
-    ) -> Option<(ArenaRowMeta, CompactArc<[Value]>)> {
-        let inner = self.inner.read();
-        if arena_idx < inner.meta.len() {
-            let meta = inner.meta[arena_idx];
-            let arc = CompactArc::clone(&inner.data[arena_idx]);
-            Some((meta, arc))
+        let i = self.frozen.binary_search_by_key(&id, |c| c.id).ok()?;
+        if self.frozen[i].occupied == 0 && self.frozen[i].reserved == 0 {
+            let retired = self.frozen.remove(i);
+            self.refresh_probe_order();
+            Some(retired)
         } else {
             None
         }
     }
 }
 
-impl Default for RowArena {
-    fn default() -> Self {
-        Self::new()
+struct ArenaState {
+    inner: RwLock<ArenaInner>,
+    growth: Mutex<()>,
+    reuse_holds: AtomicUsize,
+    account: Arc<TableMemory>,
+    initial_capacity: usize,
+    _object: HotObjectCharge<Self>,
+}
+
+impl Drop for ArenaState {
+    fn drop(&mut self) {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::hot_owner_dropping();
+        let inner = self.inner.get_mut();
+        drop(inner.active.take());
+        drop(std::mem::take(&mut inner.frozen));
+        drop(std::mem::take(&mut inner.free));
+        self.account.arena_payloads.store(0, Ordering::Release);
     }
 }
 
-/// Read guard for arena providing access to both data and metadata
+pub struct RowArena {
+    state: Arc<ArenaState>,
+}
+
+/// Exclusive slots remain valid across freeze until consumed or released.
+pub struct ArenaReservation {
+    state: Arc<ArenaState>,
+    slots: SmallVec<[Option<ArenaSlot>; 1]>,
+    cursor: usize,
+    reuse_heads: bool,
+}
+
+/// Owns detached buffers until the caller has released its publication guards.
+#[derive(Default)]
+pub struct ArenaRetirement {
+    chunks: ArenaBuffer<Chunk>,
+    directory: ArenaBuffer<Chunk>,
+    active: Option<Chunk>,
+    payloads: ArenaBuffer<Option<CompactArc<[Value]>>>,
+    payload_count: usize,
+    free: ArenaBuffer<u32>,
+    account: Option<Arc<TableMemory>>,
+    payload_bytes: u128,
+}
+
+impl ArenaRetirement {
+    fn retain_payloads(&mut self, account: &Arc<TableMemory>, bytes: u128) {
+        if let Some(owner) = &self.account {
+            debug_assert!(Arc::ptr_eq(owner, account));
+        } else {
+            self.account = Some(Arc::clone(account));
+        }
+        *account.retired_arena_payloads.lock() += bytes;
+        self.payload_bytes += bytes;
+    }
+}
+
+impl Drop for ArenaRetirement {
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.chunks));
+        drop(std::mem::take(&mut self.directory));
+        self.active.take();
+        drop(std::mem::take(&mut self.payloads));
+        drop(std::mem::take(&mut self.free));
+        if let Some(account) = &self.account {
+            *account.retired_arena_payloads.lock() -= self.payload_bytes;
+        }
+    }
+}
+
+impl RowArena {
+    pub fn with_capacity(expected_rows: usize) -> Self {
+        Self::with_account(expected_rows, Arc::new(TableMemory::default()))
+    }
+
+    pub(crate) fn with_account(expected_rows: usize, account: Arc<TableMemory>) -> Self {
+        Self {
+            state: Arc::new(ArenaState {
+                inner: RwLock::new(ArenaInner {
+                    active: None,
+                    frozen: ArenaBuffer::default(),
+                    free: ArenaBuffer::default(),
+                    free_len: 0,
+                    next_chunk_id: 0,
+                    reserved: 0,
+                    ordered_bases: true,
+                    payload_bytes: 0,
+                    row_bound: 0,
+                }),
+                growth: Mutex::new(()),
+                reuse_holds: AtomicUsize::new(0),
+                account,
+                initial_capacity: expected_rows.clamp(4, ARENA_CHUNK_ROWS),
+                _object: HotObjectCharge::new(),
+            }),
+        }
+    }
+
+    pub fn reserve(&self, count: usize) -> Result<ArenaReservation> {
+        let mut reservation = ArenaReservation {
+            state: Arc::clone(&self.state),
+            slots: SmallVec::new(),
+            cursor: 0,
+            reuse_heads: false,
+        };
+        reservation
+            .slots
+            .try_reserve(count)
+            .map_err(allocation_error)?;
+        if reservation.slots.spilled() {
+            self.state.account.arena_capacity.add(
+                (reservation.slots.capacity() * std::mem::size_of::<Option<ArenaSlot>>()) as u128,
+            );
+        }
+        reservation.slots.resize(count, None);
+        let mut filled = 0;
+        while filled < count {
+            let mut inner = self.state.inner.write();
+            while filled < count {
+                let free_len = inner.free_len;
+                let offset = if free_len > 0 {
+                    inner.free_len -= 1;
+                    inner.free[free_len - 1] as usize
+                } else if let Some(active) = &mut inner.active {
+                    if active.len == active.data.len() {
+                        break;
+                    }
+                    let offset = active.len;
+                    active.len += 1;
+                    offset
+                } else {
+                    break;
+                };
+                if let Some(active) = &mut inner.active {
+                    active.reserved += 1;
+                    reservation.slots[filled] = Some(ArenaSlot::new(active.id, offset));
+                    filled += 1;
+                    inner.reserved += 1;
+                }
+            }
+            drop(inner);
+            if filled < count {
+                self.grow(count - filled)?;
+            }
+        }
+        Ok(reservation)
+    }
+
+    /// The caller holds versions.read until the existing-head reservation is installed.
+    pub fn reserve_existing(&self) -> ArenaReservation {
+        self.state.reuse_holds.fetch_add(1, Ordering::Relaxed);
+        ArenaReservation {
+            state: Arc::clone(&self.state),
+            slots: SmallVec::new(),
+            cursor: 0,
+            reuse_heads: true,
+        }
+    }
+
+    /// Removal checks this under versions.write, paired with reserve_existing.
+    pub fn has_reserved_heads(&self) -> bool {
+        self.state.reuse_holds.load(Ordering::Relaxed) != 0
+    }
+
+    fn grow(&self, remaining: usize) -> Result<()> {
+        let _growth = self.state.growth.lock();
+        let (id, capacity, directory_capacity) = {
+            let inner = self.state.inner.read();
+            if inner.free_len > 0 || inner.active.as_ref().is_some_and(|c| c.len < c.data.len()) {
+                return Ok(());
+            }
+            if let Some(active) = &inner.active {
+                if active.data.len() < ARENA_CHUNK_ROWS {
+                    (
+                        active.id,
+                        (active
+                            .data
+                            .len()
+                            .saturating_add(remaining)
+                            .max(active.data.len() * 2))
+                        .min(ARENA_CHUNK_ROWS),
+                        inner.frozen.len() + 1,
+                    )
+                } else {
+                    (
+                        inner.next_chunk_id,
+                        remaining.clamp(self.state.initial_capacity, ARENA_CHUNK_ROWS),
+                        inner.frozen.len() + 2,
+                    )
+                }
+            } else {
+                (
+                    inner.next_chunk_id,
+                    remaining.clamp(self.state.initial_capacity, ARENA_CHUNK_ROWS),
+                    inner.frozen.len() + 1,
+                )
+            }
+        };
+        if id >= CHUNK_ID_LIMIT {
+            return Err(Error::internal("hot arena chunk address space exhausted"));
+        }
+        let mut prepared = Chunk::prepare(id, capacity, &self.state.account)?;
+        let mut free = ArenaBuffer::try_with_capacity(capacity, &self.state.account)?;
+        free.resize(capacity, 0);
+        let mut directory =
+            ArenaBuffer::try_with_capacity(directory_capacity, &self.state.account)?;
+        directory.resize_with(directory_capacity, Chunk::default);
+        directory.clear();
+        let mut inner = self.state.inner.write();
+        if inner
+            .active
+            .as_ref()
+            .is_some_and(|c| c.id != id && c.data.len() < ARENA_CHUNK_ROWS)
+            || (inner.active.is_none() && inner.next_chunk_id != id)
+        {
+            return Ok(());
+        }
+        if let Some(active) = &mut inner.active {
+            if active.id == id {
+                prepared.len = active.len;
+                prepared.occupied = active.occupied;
+                prepared.reserved = active.reserved;
+                prepared.base_row_id = active.base_row_id;
+                for (dst, src) in prepared.data.iter_mut().zip(&mut active.data) {
+                    *dst = src.take();
+                }
+                prepared.meta[..active.len].copy_from_slice(&active.meta[..active.len]);
+                std::mem::swap(active, &mut prepared);
+            } else {
+                directory.append(&mut inner.frozen);
+                if let Some(old) = inner.active.take() {
+                    directory.push(old);
+                }
+                std::mem::swap(&mut inner.frozen, &mut directory);
+                inner.refresh_probe_order();
+                inner.active = Some(prepared);
+                inner.next_chunk_id += 1;
+                // Free offsets belong to the old chunk, so rotation starts empty.
+                inner.free_len = 0;
+                std::mem::swap(&mut inner.free, &mut free);
+                drop(inner);
+                return Ok(());
+            }
+        } else {
+            inner.active = Some(prepared);
+            inner.next_chunk_id += 1;
+            std::mem::swap(&mut inner.free, &mut free);
+            drop(inner);
+            return Ok(());
+        }
+        free[..inner.free_len].copy_from_slice(&inner.free[..inner.free_len]);
+        std::mem::swap(&mut inner.free, &mut free);
+        drop(inner);
+        Ok(())
+    }
+
+    /// VersionStore retains the canonical nondeleted payload until this returns.
+    pub(crate) fn install(
+        &self,
+        reservation: &mut ArenaReservation,
+        existing: Option<ArenaSlot>,
+        row_id: i64,
+        txn_id: i64,
+        data: CompactArc<[Value]>,
+    ) -> (ArenaSlot, u128) {
+        debug_assert!(Arc::ptr_eq(&self.state, &reservation.state));
+        let reserved = if reservation.reuse_heads {
+            None
+        } else {
+            let reserved = reservation.slots[reservation.cursor];
+            if existing.is_none() {
+                reservation.slots[reservation.cursor] = None;
+            }
+            reservation.cursor += 1;
+            reserved
+        };
+        let slot = existing
+            .or(reserved)
+            .unwrap_or_else(|| unreachable!("write capacity was reserved before publication"));
+        let bytes = row_bytes(&data);
+        let mut inner = self.state.inner.write();
+        let chunk = inner
+            .chunk_mut(slot.chunk())
+            .unwrap_or_else(|| unreachable!("published head or reservation owns its chunk"));
+        let offset = slot.offset();
+        let was_deleted = chunk.meta[offset].deleted_at_txn_id != 0;
+        let mut old_charge = None;
+        let old = chunk.data[offset].replace(data);
+        if old.is_none() {
+            chunk.occupied += 1;
+        }
+        chunk.meta[offset] = ArenaRowMeta {
+            row_id,
+            txn_id,
+            deleted_at_txn_id: 0,
+        };
+        let new_base = chunk.base_row_id.is_none();
+        if new_base {
+            chunk.base_row_id = row_id.checked_sub(offset as i64);
+        }
+        if Some(slot) == reserved {
+            chunk.reserved -= 1;
+            inner.reserved -= 1;
+        }
+        if new_base {
+            inner.refresh_probe_order();
+        }
+        inner.payload_bytes += bytes;
+        inner.row_bound = inner.row_bound.max(bytes);
+        if let Some(old) = &old {
+            let old_bytes = row_bytes(old);
+            if was_deleted {
+                old_charge = Some(RetiredPayloadCharge::new(&self.state.account, old_bytes));
+            }
+            inner.payload_bytes -= old_bytes;
+        }
+        self.state.account.arena_payloads.store(
+            inner.payload_bytes.min(usize::MAX as u128) as usize,
+            Ordering::Release,
+        );
+        drop(inner);
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if old_charge.is_some() {
+            crate::test_failpoints::hot_owner_dropping();
+        }
+        drop(old);
+        drop(old_charge);
+        (slot, bytes)
+    }
+
+    pub fn mark_deleted(&self, slot: ArenaSlot, txn_id: i64) {
+        let mut inner = self.state.inner.write();
+        if let Some(chunk) = inner.chunk_mut(slot.chunk()) {
+            chunk.meta[slot.offset()].deleted_at_txn_id = txn_id;
+        }
+    }
+
+    pub fn prepare_clear(&self, rows: usize) -> ArenaRetirement {
+        let chunks = rows.min(self.state.inner.read().frozen.len() + 1);
+        let mut retirement = ArenaRetirement {
+            payloads: ArenaBuffer::new((0..rows).map(|_| None).collect(), &self.state.account),
+            chunks: ArenaBuffer::new(Vec::with_capacity(chunks), &self.state.account),
+            directory: ArenaBuffer::default(),
+            active: None,
+            payload_count: 0,
+            free: ArenaBuffer::default(),
+            account: None,
+            payload_bytes: 0,
+        };
+        retirement.chunks.resize_with(chunks, Chunk::default);
+        retirement.chunks.clear();
+        retirement
+    }
+
+    pub fn clear_batch(&self, slots: &[ArenaSlot], retired: &mut ArenaRetirement) -> usize {
+        let mut inner = self.state.inner.write();
+        let mut cleared = 0;
+        let mut bytes = 0;
+        for &slot in slots {
+            if let Some(chunk) = inner.chunk_mut(slot.chunk()) {
+                let offset = slot.offset();
+                if let Some(data) = &chunk.data[offset] {
+                    let payload_bytes = row_bytes(data);
+                    let destination = &mut retired.payloads[retired.payload_count];
+                    let data = chunk.data[offset].take();
+                    chunk.meta[offset] = ArenaRowMeta::default();
+                    *destination = data;
+                    bytes += payload_bytes;
+                    retired.payload_count += 1;
+                    chunk.occupied -= 1;
+                    cleared += 1;
+                    if inner.active.as_ref().is_some_and(|c| c.id == slot.chunk()) {
+                        let n = inner.free_len;
+                        inner.free[n] = slot.offset() as u32;
+                        inner.free_len += 1;
+                    }
+                    if let Some(chunk) = inner.retire_empty(slot.chunk()) {
+                        debug_assert!(retired.chunks.len() < retired.chunks.capacity());
+                        retired.chunks.push(chunk);
+                        if inner.active.is_none() && !inner.free.is_empty() {
+                            debug_assert!(retired.free.is_empty());
+                            retired.free = std::mem::take(&mut inner.free);
+                        }
+                    }
+                }
+            }
+        }
+        retired.retain_payloads(&self.state.account, bytes);
+        inner.payload_bytes -= bytes;
+        if inner.payload_bytes == 0 {
+            inner.row_bound = 0;
+        }
+        self.state.account.arena_payloads.store(
+            inner.payload_bytes.min(usize::MAX as u128) as usize,
+            Ordering::Release,
+        );
+        drop(inner);
+        cleared
+    }
+
+    pub fn finish_clear(&self, retired: &mut ArenaRetirement) {
+        let mut inner = self.state.inner.write();
+        if inner.frozen.is_empty() && inner.frozen.capacity() != 0 {
+            debug_assert_eq!(retired.directory.capacity(), 0);
+            retired.directory = std::mem::take(&mut inner.frozen);
+        }
+    }
+
+    pub fn clear_all(&self) -> Result<ArenaRetirement> {
+        let mut inner = self.state.inner.write();
+        if inner.reserved != 0 || self.has_reserved_heads() {
+            return Err(Error::TableHasActiveTransactions);
+        }
+        let active = inner.active.take();
+        let frozen = std::mem::take(&mut inner.frozen);
+        let free = std::mem::take(&mut inner.free);
+        inner.free_len = 0;
+        let payload_bytes = std::mem::take(&mut inner.payload_bytes);
+        inner.row_bound = 0;
+        let mut retired = ArenaRetirement {
+            active,
+            chunks: frozen,
+            free,
+            directory: ArenaBuffer::default(),
+            payloads: ArenaBuffer::default(),
+            payload_count: 0,
+            account: None,
+            payload_bytes: 0,
+        };
+        retired.retain_payloads(&self.state.account, payload_bytes);
+        self.state
+            .account
+            .arena_payloads
+            .store(0, Ordering::Release);
+        drop(inner);
+        Ok(retired)
+    }
+
+    pub fn slot_count(&self) -> usize {
+        let inner = self.state.inner.read();
+        inner
+            .active
+            .iter()
+            .chain(&inner.frozen)
+            .map(|c| c.len)
+            .sum()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.state.account.arena_payloads.load(Ordering::Acquire)
+    }
+
+    pub fn capacity_bytes(&self) -> usize {
+        self.state.account.arena_capacity.get()
+    }
+
+    pub fn read_guard(&self) -> ArenaReadGuard<'_> {
+        ArenaReadGuard {
+            inner: self.state.inner.read(),
+        }
+    }
+}
+
+impl Drop for ArenaReservation {
+    fn drop(&mut self) {
+        if self.reuse_heads {
+            self.state.reuse_holds.fetch_sub(1, Ordering::Relaxed);
+        }
+        let mut slots = self.slots.iter().flatten().copied().peekable();
+        while let Some(first) = slots.peek().copied() {
+            let mut inner = self.state.inner.write();
+            for _ in 0..1024 {
+                let Some(slot) = slots.next_if(|slot| slot.chunk() == first.chunk()) else {
+                    break;
+                };
+                if let Some(chunk) = inner.chunk_mut(slot.chunk()) {
+                    debug_assert!(chunk.reserved > 0);
+                    chunk.reserved -= 1;
+                    inner.reserved -= 1;
+                    if inner.active.as_ref().is_some_and(|c| c.id == slot.chunk()) {
+                        let n = inner.free_len;
+                        inner.free[n] = slot.offset() as u32;
+                        inner.free_len += 1;
+                    }
+                }
+            }
+            let retired = inner.retire_empty(first.chunk());
+            let free = if inner.active.is_none() {
+                std::mem::take(&mut inner.free)
+            } else {
+                ArenaBuffer::default()
+            };
+            let directory = if inner.frozen.is_empty() {
+                std::mem::take(&mut inner.frozen)
+            } else {
+                ArenaBuffer::default()
+            };
+            drop(inner);
+            drop((retired, free, directory));
+        }
+        if self.slots.spilled() {
+            let bytes = self.slots.capacity() * std::mem::size_of::<Option<ArenaSlot>>();
+            drop(std::mem::take(&mut self.slots));
+            self.state.account.arena_capacity.remove(bytes as u128);
+        }
+    }
+}
+
 pub struct ArenaReadGuard<'a> {
     inner: parking_lot::RwLockReadGuard<'a, ArenaInner>,
 }
 
-impl<'a> ArenaReadGuard<'a> {
-    /// Get data slice
+pub(crate) struct ArenaChunkSlices<'a> {
+    meta: &'a [ArenaRowMeta],
+    data: &'a [Option<CompactArc<[Value]>>],
+}
+
+pub(crate) struct ArenaLiveRow<'a> {
+    meta: &'a ArenaRowMeta,
+    data: &'a Option<CompactArc<[Value]>>,
+}
+
+impl<'a> ArenaLiveRow<'a> {
     #[inline]
-    pub fn data(&self) -> &[CompactArc<[Value]>] {
-        &self.inner.data
+    pub fn metadata(&self) -> &'a ArenaRowMeta {
+        self.meta
     }
 
-    /// Get metadata slice
     #[inline]
-    pub fn meta(&self) -> &[ArenaRowMeta] {
-        &self.inner.meta
+    pub fn payload(&self) -> &'a CompactArc<[Value]> {
+        match self.data.as_ref() {
+            Some(data) => data,
+            None => panic!("live arena slot has no payload"),
+        }
+    }
+}
+
+impl ArenaChunkSlices<'_> {
+    #[inline]
+    pub fn slot_count(&self) -> usize {
+        self.meta.len().min(self.data.len())
     }
 
-    /// Get length
     #[inline]
-    pub fn len(&self) -> usize {
-        self.inner.meta.len()
+    pub fn metadata(&self) -> &[ArenaRowMeta] {
+        self.meta
     }
 
-    /// Check if empty
     #[inline]
+    pub fn live_row(&self, offset: usize) -> Option<ArenaLiveRow<'_>> {
+        let meta = self.meta.get(offset)?;
+        if meta.txn_id == 0 {
+            return None;
+        }
+        Some(ArenaLiveRow {
+            meta,
+            data: &self.data[offset],
+        })
+    }
+}
+
+impl ArenaReadGuard<'_> {
+    pub(crate) fn row_bound(&self) -> u128 {
+        self.inner.row_bound
+    }
+
+    #[cfg(test)]
+    fn get(&self, slot: ArenaSlot, row_id: i64) -> Option<(&ArenaRowMeta, &CompactArc<[Value]>)> {
+        self.inner.chunk(slot.chunk())?.get(slot.offset(), row_id)
+    }
+
+    #[inline]
+    pub fn probe(&self, row_id: i64) -> Option<(&ArenaRowMeta, &CompactArc<[Value]>)> {
+        if let Some(hit) = self.inner.active.as_ref().and_then(|c| c.probe(row_id)) {
+            return Some(hit);
+        }
+        self.probe_frozen(row_id)
+    }
+
+    #[inline(never)]
+    fn probe_frozen(&self, row_id: i64) -> Option<(&ArenaRowMeta, &CompactArc<[Value]>)> {
+        if !self.inner.ordered_bases {
+            return None;
+        }
+        let i = self
+            .inner
+            .frozen
+            .partition_point(|chunk| chunk.base_row_id.is_some_and(|base| base <= row_id));
+        self.inner.frozen.get(i.checked_sub(1)?)?.probe(row_id)
+    }
+
+    pub(crate) fn chunks(&self) -> impl Iterator<Item = ArenaChunkSlices<'_>> {
+        self.inner
+            .frozen
+            .iter()
+            .chain(&self.inner.active)
+            .map(|chunk| ArenaChunkSlices {
+                meta: &chunk.meta[..chunk.len],
+                data: &chunk.data[..chunk.len],
+            })
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.inner.meta.is_empty()
+        self.inner
+            .active
+            .iter()
+            .chain(&self.inner.frozen)
+            .all(|c| c.occupied == 0)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::Value;
 
-    #[test]
-    fn bytes_follow_inserts_updates_and_clears() {
-        let arena = RowArena::new();
-        assert_eq!(arena.bytes(), 0);
-        let short = vec![Value::Integer(1), Value::text("inline")];
-        let long = vec![
-            Value::Integer(1),
-            Value::text("a text value that lives on the heap"),
-        ];
-        let mut spacious = String::with_capacity(4096);
-        spacious.push_str("a text value that lives on the heap");
-        let spacious = vec![
-            Value::Integer(1),
-            Value::Text(crate::common::SmartString::from_string(spacious)),
-        ];
-        assert!(
-            row_bytes(&spacious) >= row_bytes(&long) + 4096 - 64,
-            "a String's spare capacity is memory the row owns"
-        );
-        let idx = arena.insert(1, 1, &short);
-        assert_eq!(arena.bytes(), row_bytes(&short));
-        assert!(row_bytes(&long) > row_bytes(&short));
-        arena.update_at(idx, 1, 2, CompactArc::from(long.clone()));
-        assert_eq!(arena.bytes(), row_bytes(&long));
-        let other = arena.insert(2, 2, &short);
-        assert_eq!(arena.bytes(), row_bytes(&long) + row_bytes(&short));
-        arena.clear_batch(&[idx]);
-        assert_eq!(arena.bytes(), row_bytes(&short));
-        assert!(arena.clear_at(other));
-        assert_eq!(arena.bytes(), 0);
-        let reused = arena.insert(3, 3, &long);
-        assert_eq!(arena.bytes(), row_bytes(&long));
-        arena.clear_all();
-        assert_eq!(arena.bytes(), 0);
-        assert!(reused < 2);
+    fn insert(arena: &RowArena, id: i64) -> ArenaSlot {
+        let mut reservation = arena.reserve(1).unwrap();
+        arena
+            .install(
+                &mut reservation,
+                None,
+                id,
+                1,
+                CompactArc::from(vec![Value::Integer(id)]),
+            )
+            .0
     }
 
     #[test]
-    fn test_arena_insert_and_iterate() {
-        let arena = RowArena::new();
+    fn address_and_slot_layouts_stay_compact() {
+        assert_eq!(std::mem::size_of::<Option<ArenaSlot>>(), 8);
+        assert_eq!(std::mem::size_of::<Option<CompactArc<[Value]>>>(), 8);
+        assert_eq!(std::mem::size_of::<ArenaRowMeta>(), 24);
+        let slot = ArenaSlot::new(CHUNK_ID_LIMIT - 1, ARENA_CHUNK_ROWS - 1);
+        assert_eq!(slot.chunk(), CHUNK_ID_LIMIT - 1);
+        assert_eq!(slot.offset(), ARENA_CHUNK_ROWS - 1);
+    }
 
-        // Insert some rows
-        arena.insert(
-            1,
-            100,
-            &[Value::Integer(1), Value::text("Alice"), Value::Float(100.0)],
-        );
-        arena.insert(
-            2,
-            100,
-            &[Value::Integer(2), Value::text("Bob"), Value::Float(200.0)],
-        );
-        arena.insert(
-            3,
-            100,
-            &[Value::Integer(3), Value::text("Carol"), Value::Float(300.0)],
-        );
-
-        assert_eq!(arena.len(), 3);
-
-        // Iterate using read_guard
+    #[test]
+    fn retirement_capacity_panic_keeps_published_payload_installed() {
+        let arena = RowArena::with_capacity(0);
+        let slot = insert(&arena, 7);
+        let mut retired = ArenaRetirement::default();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            arena.clear_batch(&[slot], &mut retired);
+        }));
+        assert!(panic.is_err());
         let guard = arena.read_guard();
-        let mut count = 0;
-        let mut sum = 0.0f64;
-
-        for (idx, _meta) in guard.meta().iter().enumerate() {
-            count += 1;
-            if let Some(Value::Float(v)) = guard.data()[idx].get(2) {
-                sum += v;
-            }
-        }
-
-        assert_eq!(count, 3);
-        assert_eq!(sum, 600.0);
-    }
-
-    #[test]
-    fn test_arena_arc_clone() {
-        let arena = RowArena::new();
-
-        arena.insert(1, 100, &[Value::Integer(42), Value::text("test")]);
-
-        let guard = arena.read_guard();
-        assert_eq!(guard.len(), 1);
-
-        // Get row as Arc - O(1) clone
-        let row_arc = CompactArc::clone(&guard.data()[0]);
-        assert_eq!(row_arc.len(), 2);
-
-        if let Value::Integer(v) = &row_arc[0] {
-            assert_eq!(*v, 42);
-        } else {
-            panic!("Expected Integer");
-        }
-    }
-
-    #[test]
-    fn test_arena_deletion() {
-        let arena = RowArena::new();
-
-        let idx = arena.insert(1, 100, &[Value::Integer(1), Value::text("test")]);
-
-        // Mark as deleted
-        arena.mark_deleted(idx, 101);
-
-        let guard = arena.read_guard();
-        assert!(guard.meta()[0].is_deleted());
-        assert_eq!(guard.meta()[0].deleted_at_txn_id, 101);
-    }
-
-    #[test]
-    fn test_arena_get_column_value() {
-        let arena = RowArena::new();
-
-        arena.insert(
-            1,
-            100,
-            &[Value::Integer(42), Value::text("hello"), Value::Float(3.15)],
+        assert_eq!(
+            guard.get(slot, 7).map(|(_, row)| &row[0]),
+            Some(&Value::Integer(7))
         );
-
-        let guard = arena.read_guard();
-
-        // Get column 0
-        let val = guard.data()[0].first().cloned();
-        assert_eq!(val, Some(Value::Integer(42)));
-
-        // Get column 1
-        let val = guard.data()[0].get(1).cloned();
-        assert_eq!(val, Some(Value::text("hello")));
-
-        // Get column 2
-        let val = guard.data()[0].get(2).cloned();
-        assert_eq!(val, Some(Value::Float(3.15)));
-
-        // Out of bounds column - returns None
-        let val: Option<Value> = guard.data()[0].get(3).cloned();
-        assert_eq!(val, None);
     }
 
     #[test]
-    fn test_arena_read_guard() {
-        let arena = RowArena::new();
-
-        arena.insert(1, 100, &[Value::Integer(1), Value::text("a")]);
-        arena.insert(2, 100, &[Value::Integer(2), Value::text("b")]);
-
-        let guard = arena.read_guard();
-        assert_eq!(guard.len(), 2);
-        assert_eq!(guard.meta()[0].row_id, 1);
-        assert_eq!(guard.meta()[1].row_id, 2);
-    }
-
-    #[test]
-    fn test_arena_free_list_reuse() {
-        let arena = RowArena::new();
-
-        // Insert 5 rows
-        for i in 1..=5 {
-            arena.insert(
-                i,
-                100,
-                &[Value::Integer(i), Value::text(format!("row{}", i))],
+    fn chunk_payload_checks_reserved_cleared_and_out_of_range_slots() {
+        let arena = RowArena::with_capacity(0);
+        let first = insert(&arena, 7);
+        let _reservation = arena.reserve(1).unwrap();
+        let last = insert(&arena, 9);
+        {
+            let guard = arena.read_guard();
+            let chunk = guard.chunks().next().unwrap();
+            assert_eq!(
+                chunk.live_row(first.offset()).map(|row| &row.payload()[0]),
+                Some(&Value::Integer(7))
             );
+            assert!(chunk.live_row(1).is_none());
+            assert_eq!(
+                chunk.live_row(last.offset()).map(|row| &row.payload()[0]),
+                Some(&Value::Integer(9))
+            );
+            assert!(chunk.live_row(usize::MAX).is_none());
         }
-        assert_eq!(arena.len(), 5);
-
-        // Clear slots 1 and 3 (0-indexed)
-        arena.clear_at(1);
-        arena.clear_at(3);
-
-        // Arena len is still 5 (slots are cleared but not removed)
-        assert_eq!(arena.len(), 5);
-
-        // Verify cleared slots have row_id = 0
-        {
-            let guard = arena.read_guard();
-            assert_eq!(guard.meta()[1].row_id, 0);
-            assert_eq!(guard.meta()[3].row_id, 0);
-        }
-
-        // Insert new rows - should reuse cleared slots (3 then 1, LIFO order)
-        let idx1 = arena.insert(10, 200, &[Value::Integer(10), Value::text("new1")]);
-        let idx2 = arena.insert(11, 200, &[Value::Integer(11), Value::text("new2")]);
-
-        // Slots should be reused, not appended
-        assert_eq!(arena.len(), 5); // Still 5, slots were reused
-
-        // Verify indices are the cleared slots (LIFO: 3 was pushed last, so popped first)
-        assert_eq!(idx1, 3);
-        assert_eq!(idx2, 1);
-
-        // Verify the new data is in the reused slots
-        {
-            let guard = arena.read_guard();
-            assert_eq!(guard.meta()[3].row_id, 10);
-            assert_eq!(guard.meta()[1].row_id, 11);
-        }
-
-        // Insert one more - should append since free list is empty
-        let idx3 = arena.insert(12, 200, &[Value::Integer(12), Value::text("new3")]);
-        assert_eq!(idx3, 5); // New slot at end
-        assert_eq!(arena.len(), 6);
+        let mut retired = arena.prepare_clear(1);
+        arena.clear_batch(&[first], &mut retired);
+        let guard = arena.read_guard();
+        let chunk = guard.chunks().next().unwrap();
+        assert!(chunk.live_row(first.offset()).is_none());
+        assert_eq!(
+            chunk.live_row(last.offset()).map(|row| &row.payload()[0]),
+            Some(&Value::Integer(9))
+        );
     }
 
     #[test]
-    fn test_arena_clear_batch_free_list() {
-        let arena = RowArena::new();
+    fn retained_account_outlives_arena_and_prepared_reservations() {
+        let _guard = crate::test_failpoints::FailpointGuard::new();
+        let registry = Arc::new(crate::storage::mvcc::memory::HotMemoryRegistry::default());
+        let arena = RowArena::with_capacity(0);
+        registry.register(&arena.state.account);
+        insert(&arena, 1);
+        let reservation = arena.reserve(2).unwrap();
+        let capacity = arena.capacity_bytes();
+        let reservation_bytes =
+            reservation.slots.capacity() * std::mem::size_of::<Option<ArenaSlot>>();
+        let weak = Arc::downgrade(&arena.state);
+        drop(arena);
+        assert_eq!(registry.total().arena_capacity, capacity);
+        let observer = Arc::clone(&registry);
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed_drop = Arc::clone(&observed);
+        crate::test_failpoints::before_hot_owner_drop(move || {
+            assert!(weak.upgrade().is_none());
+            let usage = observer.total();
+            assert_eq!(usage.arena_payloads, 32);
+            assert_eq!(usage.arena_capacity, capacity - reservation_bytes);
+            observed_drop.store(true, Ordering::Relaxed);
+        });
+        drop(reservation);
+        assert!(observed.load(Ordering::Relaxed));
+        let usage = registry.total();
+        assert_eq!(usage.arena_payloads, 0);
+        assert_eq!(usage.arena_capacity, 0);
+    }
 
-        // Insert 10 rows
-        for i in 0..10 {
-            arena.insert(i, 100, &[Value::Integer(i)]);
+    #[test]
+    fn detached_buffers_outlive_the_arena_without_releasing_their_charge() {
+        let registry = crate::storage::mvcc::memory::HotMemoryRegistry::default();
+        let arena = RowArena::with_capacity(0);
+        registry.register(&arena.state.account);
+        insert(&arena, 1);
+        let retired = arena.clear_all().unwrap();
+        let capacity = arena.capacity_bytes();
+        drop(arena);
+        let usage = registry.total();
+        assert_eq!(usage.arena_payloads, 0);
+        assert_eq!(usage.retired_arena_payloads, 32);
+        assert_eq!(usage.arena_capacity, capacity);
+        drop(retired);
+        let usage = registry.total();
+        assert_eq!(usage.retired_arena_payloads, 0);
+        assert_eq!(usage.arena_capacity, 0);
+    }
+
+    #[test]
+    fn empty_chunks_release_capacity_without_reusing_identity() {
+        let arena = RowArena::with_capacity(0);
+        let old = insert(&arena, 100);
+        let before = arena.capacity_bytes();
+        let mut retirement = arena.prepare_clear(1);
+        assert_eq!(arena.clear_batch(&[old], &mut retirement), 1);
+        assert!(arena.capacity_bytes() >= before);
+        drop(retirement);
+        assert!(arena.capacity_bytes() < before);
+        let next = insert(&arena, -10);
+        assert!(next.chunk() > old.chunk());
+        assert!(arena.read_guard().get(old, 100).is_none());
+        assert!(arena.read_guard().get(next, -10).is_some());
+    }
+
+    #[test]
+    fn reservation_survives_freeze_and_prevents_truncate() {
+        let arena = RowArena::with_capacity(0);
+        let mut first = arena.reserve(ARENA_CHUNK_ROWS).unwrap();
+        let later = insert(&arena, 900_000);
+        assert!(matches!(
+            arena.clear_all(),
+            Err(Error::TableHasActiveTransactions)
+        ));
+        let (slot, _) = arena.install(
+            &mut first,
+            None,
+            0,
+            1,
+            CompactArc::from(vec![Value::Integer(7)]),
+        );
+        assert!(slot.chunk() < later.chunk());
+        drop(first);
+        assert!(arena.read_guard().get(slot, 0).is_some());
+        arena.clear_all().unwrap();
+        assert!(insert(&arena, 1).chunk() > later.chunk());
+    }
+
+    #[test]
+    fn exhausted_addresses_fail_before_installing_rows() {
+        let arena = RowArena::with_capacity(0);
+        arena.state.inner.write().next_chunk_id = CHUNK_ID_LIMIT;
+        assert!(arena.reserve(2).is_err());
+        assert!(arena.read_guard().is_empty());
+        assert_eq!(arena.state.inner.read().reserved, 0);
+        assert_eq!(arena.capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn middle_chunk_removal_preserves_neighbors_and_releases_the_directory() {
+        let arena = RowArena::with_capacity(0);
+        let mut slots = Vec::new();
+        let mut reservations = Vec::new();
+        for id in [0, ARENA_CHUNK_ROWS as i64, 2 * ARENA_CHUNK_ROWS as i64] {
+            let mut reserved = arena.reserve(ARENA_CHUNK_ROWS).unwrap();
+            let (slot, _) = arena.install(
+                &mut reserved,
+                None,
+                id,
+                1,
+                CompactArc::from(vec![Value::Integer(id)]),
+            );
+            slots.push(slot);
+            reservations.push(reserved);
         }
-        assert_eq!(arena.len(), 10);
+        drop(reservations);
+        let before = arena.capacity_bytes();
+        let mut retired = arena.prepare_clear(3);
+        assert_eq!(arena.clear_batch(&[slots[1]], &mut retired), 1);
+        assert!(arena
+            .read_guard()
+            .get(slots[1], ARENA_CHUNK_ROWS as i64)
+            .is_none());
+        assert!(arena.read_guard().get(slots[0], 0).is_some());
+        assert!(arena
+            .read_guard()
+            .get(slots[2], 2 * ARENA_CHUNK_ROWS as i64)
+            .is_some());
+        drop(retired);
+        assert!(arena.capacity_bytes() < before);
+        let mut retired = arena.prepare_clear(2);
+        assert_eq!(arena.clear_batch(&[slots[0], slots[2]], &mut retired), 2);
+        arena.finish_clear(&mut retired);
+        drop(retired);
+        assert_eq!(arena.capacity_bytes(), 0);
+        assert!(insert(&arena, 50).chunk() > slots[2].chunk());
+    }
 
-        // Clear slots 2, 4, 6, 8 in batch
-        let cleared = arena.clear_batch(&[2, 4, 6, 8]);
-        assert_eq!(cleared, 4);
-        assert_eq!(arena.len(), 10); // Still 10, slots cleared but not removed
+    #[test]
+    fn existing_head_reservation_does_not_grow_a_full_chunk() {
+        let arena = RowArena::with_capacity(0);
+        let mut reserved = arena.reserve(ARENA_CHUNK_ROWS).unwrap();
+        let (slot, _) = arena.install(
+            &mut reserved,
+            None,
+            5,
+            1,
+            CompactArc::from(vec![Value::Integer(5)]),
+        );
+        let capacity = arena.capacity_bytes();
+        let next_id = arena.state.inner.read().next_chunk_id;
+        let mut update = arena.reserve_existing();
+        assert!(arena.has_reserved_heads());
+        assert!(matches!(
+            arena.clear_all(),
+            Err(Error::TableHasActiveTransactions)
+        ));
+        arena.install(
+            &mut update,
+            Some(slot),
+            5,
+            2,
+            CompactArc::from(vec![Value::Integer(9)]),
+        );
+        drop(update);
+        assert!(!arena.has_reserved_heads());
+        assert_eq!(arena.capacity_bytes(), capacity);
+        assert_eq!(arena.state.inner.read().next_chunk_id, next_id);
+    }
 
-        // Insert 4 new rows - should reuse all 4 cleared slots
-        let mut new_indices = Vec::new();
-        for i in 100..104 {
-            new_indices.push(arena.insert(i, 200, &[Value::Integer(i)]));
-        }
+    #[test]
+    fn payload_bytes_include_spare_text_capacity() {
+        let mut text = String::with_capacity(4096);
+        text.push_str("a text value that lives on the heap");
+        let values = [Value::Text(crate::common::SmartString::from_string(text))];
+        assert!(row_bytes(&values) >= 16 + 16 + 40 + 4096);
+    }
 
-        // Should still be 10 (all slots reused)
-        assert_eq!(arena.len(), 10);
+    #[test]
+    fn shared_payload_amplification_survives_replacement_and_retirement() {
+        let value = Value::Extension(CompactArc::from(vec![0u8; 65_536]));
+        let data: CompactArc<[Value]> = CompactArc::from(vec![value; 65_536]);
+        let expected = (2 * std::mem::size_of::<usize>() + std::mem::size_of_val(data.as_ref()))
+            as u128
+            + 65_536 * (2 * std::mem::size_of::<usize>() as u128 + 65_536);
+        assert!(expected > u32::MAX as u128);
+        let arena = RowArena::with_capacity(0);
+        let mut reservation = arena.reserve(1).unwrap();
+        let (slot, charge) = arena.install(&mut reservation, None, 1, 1, CompactArc::clone(&data));
+        assert_eq!(charge, expected);
+        assert_eq!(arena.state.inner.read().payload_bytes, expected);
+        drop(reservation);
+        let current = (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Value>()) as u128;
+        let mut update = arena.reserve_existing();
+        arena.install(
+            &mut update,
+            Some(slot),
+            1,
+            2,
+            CompactArc::from(vec![Value::Integer(2)]),
+        );
+        assert_eq!(arena.state.inner.read().payload_bytes, current);
+        arena.install(&mut update, Some(slot), 1, 3, data);
+        assert_eq!(arena.state.inner.read().payload_bytes, expected);
+        drop(update);
+        let mut retired = arena.prepare_clear(1);
+        arena.clear_batch(&[slot], &mut retired);
+        assert_eq!(arena.bytes(), 0);
+        assert_eq!(*arena.state.account.retired_arena_payloads.lock(), expected);
+        let replacement = insert(&arena, 2);
+        assert_eq!(arena.state.inner.read().payload_bytes, current);
+        drop(retired);
+        assert_eq!(*arena.state.account.retired_arena_payloads.lock(), 0);
+        assert!(arena.read_guard().get(replacement, 2).is_some());
+        let retired = arena.clear_all().unwrap();
+        assert_eq!(*arena.state.account.retired_arena_payloads.lock(), current);
+        drop(retired);
+        assert_eq!(*arena.state.account.retired_arena_payloads.lock(), 0);
+    }
 
-        // Verify all new indices are from cleared slots (8, 6, 4, 2 in LIFO order)
-        assert!(new_indices.iter().all(|&idx| [2, 4, 6, 8].contains(&idx)));
+    #[test]
+    fn preparation_between_removal_batches_keeps_both_directories_owned() {
+        let arena = RowArena::with_capacity(0);
+        let mut first = arena.reserve(ARENA_CHUNK_ROWS).unwrap();
+        let (a, _) = arena.install(
+            &mut first,
+            None,
+            1,
+            1,
+            CompactArc::from(vec![Value::Integer(1)]),
+        );
+        let mut second = arena.reserve(ARENA_CHUNK_ROWS).unwrap();
+        let (b, _) = arena.install(
+            &mut second,
+            None,
+            2,
+            1,
+            CompactArc::from(vec![Value::Integer(2)]),
+        );
+        drop(first);
+        let mut retired = arena.prepare_clear(2);
+        assert_eq!(arena.clear_batch(&[a], &mut retired), 1);
+        let third = arena.reserve(1).unwrap();
+        drop(second);
+        assert_eq!(arena.clear_batch(&[b], &mut retired), 1);
+        arena.finish_clear(&mut retired);
+        assert!(retired.directory.capacity() > 0);
+        assert_eq!(arena.state.inner.read().frozen.capacity(), 0);
+        drop(third);
+        drop(retired);
+        assert_eq!(arena.capacity_bytes(), 0);
+    }
+
+    #[test]
+    fn update_reuses_the_payload_slot_and_releases_its_reservation() {
+        let arena = RowArena::with_capacity(0);
+        let slot = insert(&arena, 10);
+        let data = CompactArc::from(vec![
+            Value::Integer(10),
+            Value::text("a retained heap text payload"),
+        ]);
+        let expected = row_bytes(&data);
+        let mut reservation = arena.reserve(1).unwrap();
+        assert_eq!(
+            arena.install(&mut reservation, Some(slot), 10, 2, data),
+            (slot, expected)
+        );
+        drop(reservation);
+        assert_eq!(arena.bytes() as u128, expected);
+        assert_eq!(arena.read_guard().row_bound(), expected);
+        let mut reservation = arena.reserve(1).unwrap();
+        arena.install(
+            &mut reservation,
+            Some(slot),
+            10,
+            3,
+            CompactArc::from(vec![Value::Integer(10)]),
+        );
+        assert!(arena.clear_all().is_err());
+        assert_eq!(arena.read_guard().row_bound(), expected);
+        drop(reservation);
+        let mut retirement = arena.prepare_clear(2);
+        assert_eq!(arena.clear_batch(&[slot, slot], &mut retirement), 1);
+        assert_eq!(arena.bytes(), 0);
+        assert_eq!(arena.read_guard().row_bound(), 0);
+        insert(&arena, 11);
+        assert!(arena.read_guard().row_bound() < expected);
+        drop(arena.clear_all().unwrap());
+        assert_eq!(arena.read_guard().row_bound(), 0);
     }
 }

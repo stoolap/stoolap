@@ -968,10 +968,7 @@ fn assert_row_materializer_failure(which: usize) {
     use stoolap::storage::volume::writer::{ColSource, ColumnMapping};
     let mut volume = two_column_volume();
     volume.columns = malformed_columns();
-    let mapping = ColumnMapping {
-        sources: vec![ColSource::Volume(0), ColSource::Volume(1)],
-        is_identity: true,
-    };
+    let mapping = ColumnMapping::new(vec![ColSource::Volume(0), ColSource::Volume(1)], true);
     assert_io_failure(
         || match which {
             0 => volume.get_row(0),
@@ -1022,10 +1019,10 @@ fn projections_leave_unrequested_corrupt_columns_untouched() {
     use stoolap::storage::volume::writer::{ColSource, ColumnMapping};
     let mut volume = two_column_volume();
     volume.columns = malformed_columns();
-    let mapping = ColumnMapping {
-        sources: vec![ColSource::Volume(0), ColSource::Default(Value::Integer(9))],
-        is_identity: false,
-    };
+    let mapping = ColumnMapping::new(
+        vec![ColSource::Volume(0), ColSource::Default(Value::Integer(9))],
+        false,
+    );
     for row in [
         volume.get_row_projected(0, &[0]).unwrap(),
         volume.get_row_needed(0, &[true, false]).unwrap(),
@@ -1408,7 +1405,6 @@ fn hot_maintenance_engine(path: &std::path::Path) -> stoolap::storage::mvcc::MVC
 #[test]
 fn seal_prebuild_schema_mismatch_removes_output_and_keeps_hot_rows() {
     use std::sync::Arc;
-    use stoolap::common::CompactArc;
     use stoolap::core::SchemaBuilder;
     use stoolap::storage::index::HashIndex;
     use stoolap::storage::traits::Engine;
@@ -1416,13 +1412,11 @@ fn seal_prebuild_schema_mismatch_removes_output_and_keeps_hot_rows() {
     let engine = hot_maintenance_engine(dir.path());
     let store = engine.get_version_store("group_access").unwrap();
     let original_schema = store.schema();
-    *store.schema_mut() = CompactArc::new(
-        SchemaBuilder::new("group_access")
-            .column("a", DataType::Integer, false, true)
-            .column("b", DataType::Integer, false, false)
-            .column("extra", DataType::Integer, false, false)
-            .build(),
-    );
+    *store.schema_mut() = SchemaBuilder::new("group_access")
+        .column("a", DataType::Integer, false, true)
+        .column("b", DataType::Integer, false, false)
+        .column("extra", DataType::Integer, false, false)
+        .build();
     store.add_index(
         "extra_unique".into(),
         Arc::new(HashIndex::new(
@@ -1446,7 +1440,7 @@ fn seal_prebuild_schema_mismatch_removes_output_and_keeps_hot_rows() {
     let table_dir = dir.path().join("volumes/group_access");
     assert!(volume_files(&table_dir).is_empty());
     store.remove_index("extra_unique");
-    *store.schema_mut() = original_schema;
+    *store.schema_mut() = (*original_schema).clone();
     engine.force_checkpoint_cycle().unwrap();
     assert_eq!(store.committed_row_count(), 0);
     assert_eq!(volume_files(&table_dir).len(), 1);
