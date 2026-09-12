@@ -32,7 +32,7 @@ pub static GLOBAL_EVICTION_EPOCH: std::sync::atomic::AtomicU64 =
 
 use crate::common::SmartString;
 use crate::core::{DataType, Row, Schema, Value};
-use crate::storage::mvcc::read_memory::{charge_bytes_export, PayloadCharge};
+use crate::storage::mvcc::read_memory::{DeferredExports, PayloadCharge};
 
 use super::column::{ColumnData, ZoneMap, ROW_GROUP_SIZE};
 use super::format::{
@@ -1776,6 +1776,7 @@ pub struct ColumnMapping {
     /// use get_row()/get_row_projected() directly.
     pub is_identity: bool,
     _payload: PayloadCharge,
+    pub(crate) exports: DeferredExports,
 }
 
 impl ColumnMapping {
@@ -1791,6 +1792,7 @@ impl ColumnMapping {
             sources,
             is_identity,
             _payload: PayloadCharge::unshared(bytes),
+            exports: DeferredExports::default(),
         }
     }
 }
@@ -1881,7 +1883,7 @@ impl FrozenVolume {
                 }
             });
         }
-        charge_bytes_export(exported);
+        mapping.exports.add(exported);
         Ok(Row::from_values(values))
     }
 
@@ -1904,7 +1906,7 @@ impl FrozenVolume {
                 }
             });
         }
-        charge_bytes_export(exported);
+        mapping.exports.add(exported);
         Ok(Row::from_values(values))
     }
 
@@ -1953,7 +1955,7 @@ impl FrozenVolume {
                 }
             });
         }
-        charge_bytes_export(exported);
+        mapping.exports.add(exported);
         Ok(Row::from_values(values))
     }
 

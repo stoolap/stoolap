@@ -128,6 +128,11 @@ pub trait QueryResult: Send {
         false
     }
 
+    /// Binds deferred exports before iteration. True means no ambient scope is needed.
+    fn bind_read_scope(&mut self, _scope: Option<&Arc<ReadScope>>) -> bool {
+        self.is_materialized()
+    }
+
     /// Takes retained storage ownership if the result can hold it directly.
     /// The default leaves ownership with the caller's result wrapper.
     fn retain_read_scope(&mut self, _scope: &mut Option<Arc<ReadScope>>) {}

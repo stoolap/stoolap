@@ -168,6 +168,49 @@ impl Drop for ResultReadScope {
     }
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct DeferredExports {
+    bound: bool,
+    owner: std::sync::OnceLock<Arc<ReadScope>>,
+}
+
+impl DeferredExports {
+    #[cfg(test)]
+    pub fn scope(&self) -> Option<&Arc<ReadScope>> {
+        self.owner.get()
+    }
+
+    pub fn bind(&mut self, scope: Option<&Arc<ReadScope>>) {
+        self.bound = true;
+        if let Some(scope) = scope {
+            self.owner.get_or_init(|| Arc::clone(scope));
+        }
+    }
+
+    pub fn add(&self, bytes: u128) {
+        if bytes == 0 {
+            return;
+        }
+        if !self.bound {
+            charge_bytes_export(bytes);
+            return;
+        }
+        let scope = self.owner.get_or_init(|| {
+            ACTIVE_SCOPE.with(|active| match &mut *active.borrow_mut() {
+                ActiveScope::Active(scope) => Arc::clone(scope.get_or_insert_with(new_scope)),
+                ActiveScope::Inactive => new_scope(),
+            })
+        });
+        scope.add(bytes);
+    }
+}
+
+impl Drop for DeferredExports {
+    fn drop(&mut self) {
+        drop(ResultReadScope(self.owner.take()));
+    }
+}
+
 pub(crate) struct ReadScopeGuard<'a> {
     previous: Option<ActiveScope>,
     retain: Option<&'a RefCell<Option<Arc<ReadScope>>>>,
@@ -446,6 +489,39 @@ impl Clone for PayloadCharge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deferred_exports_stay_lazy_and_follow_their_owner_across_threads() {
+        let mut first = DeferredExports::default();
+        first.bind(None);
+        first.add(0);
+        assert!(first.scope().is_none());
+        first.add(512);
+        let first_identity = Arc::downgrade(first.scope().unwrap());
+        let mut second = DeferredExports::default();
+        second.bind(None);
+        second.add(1024);
+        assert!(!Arc::ptr_eq(
+            first.scope().unwrap(),
+            second.scope().unwrap()
+        ));
+        let first = std::thread::spawn(move || {
+            let unrelated = Arc::new(ReadScope::default());
+            let _active = unrelated.enter();
+            first.add(256);
+            assert_eq!(unrelated.exported_bytes(), 0);
+            assert_eq!(first.scope().unwrap().exported_bytes(), 768);
+            first
+        })
+        .join()
+        .unwrap();
+        second.add(128);
+        assert_eq!(second.scope().unwrap().exported_bytes(), 1152);
+        assert!(current_scope().is_none());
+        drop(first);
+        assert!(first_identity.upgrade().is_none());
+        assert_eq!(second.scope().unwrap().exported_bytes(), 1152);
+    }
 
     #[test]
     fn recycled_scope_clears_exports_and_imports_before_reuse() {

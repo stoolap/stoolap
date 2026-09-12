@@ -238,7 +238,9 @@ Composite cleanup vectors and their old key pins, including the values collected
 
 SQL readers charge exported rows and shared value children before releasing their protecting storage guard or captured root. Export ownership is created on the first nonzero export; statements that export no payload allocate no retained-payload scope. A statement retains its cumulative export charge until its result and nested result owners are destroyed, including after UPDATE, TRUNCATE or DROP TABLE. Closing a result does not necessarily destroy its buffers. Repeated reads and projections can overcount shared children. Result-buffer and analytic-operator capacities are outside this subtotal.
 
-Each thread can retain one empty scope for reuse after a materialized result releases its last owner. Recycling clears exported payload charges and import storage; the idle scope object stays counted in `hot_metadata_bytes` until reuse or thread destruction.
+Deferred readers retain their export owner with the schema-default mapping or expression result. The owner is created lazily on the first nonzero export and follows the result across threads. Interleaved results keep separate owners unless they share a containing SQL statement. Closing a reader preserves its charge while its values remain accessible.
+
+Each thread can retain one empty scope for reuse after a materialized or deferred result releases its last owner. Recycling clears exported payload charges and import storage; the idle scope object stays counted in `hot_metadata_bytes` until reuse or thread destruction.
 
 For primary-key-ordered reads, a captured version tree containing no heap value children charges the returned row count times its row-buffer high-water bound. This includes retained history and can overcount after row widths shrink. The bound resets when the tree becomes empty. Trees with heap value children charge the returned rows and children individually.
 
