@@ -355,20 +355,20 @@ impl Executor {
         }
 
         // Try compiled fast paths based on statement type
-        let scope = crate::storage::mvcc::read_memory::current_scope().unwrap_or_default();
-        let _active = scope.enter();
-        let result = match cached.statement.as_ref() {
-            Statement::Select(stmt) => {
-                self.try_fast_pk_lookup_with_params(stmt, params, &cached.compiled)
+        let (result, scope) = crate::storage::mvcc::read_memory::ReadScopeGuard::with_lazy(|| {
+            match cached.statement.as_ref() {
+                Statement::Select(stmt) => {
+                    self.try_fast_pk_lookup_with_params(stmt, params, &cached.compiled)
+                }
+                Statement::Update(stmt) => {
+                    self.try_fast_pk_update_with_params(stmt, params, &cached.compiled)
+                }
+                Statement::Delete(stmt) => {
+                    self.try_fast_pk_delete_with_params(stmt, params, &cached.compiled)
+                }
+                _ => None,
             }
-            Statement::Update(stmt) => {
-                self.try_fast_pk_update_with_params(stmt, params, &cached.compiled)
-            }
-            Statement::Delete(stmt) => {
-                self.try_fast_pk_delete_with_params(stmt, params, &cached.compiled)
-            }
-            _ => None,
-        };
+        });
         result.map(|result| result.map(|result| result::retain_read_scope(result, scope)))
     }
 

@@ -1085,13 +1085,10 @@ impl SegmentedTable {
         let per_volume_rows: Vec<Option<RowVec>> =
             if pruned_volumes.len() >= 4 && _total_cold_rows >= 100_000 {
                 use rayon::prelude::*;
-                let read_scope = crate::storage::mvcc::read_memory::current_scope();
+                let read_scope = crate::storage::mvcc::read_memory::ParallelReadScope::new();
                 pruned_volumes
                     .par_iter()
-                    .map(|v| {
-                        let _scope = read_scope.as_ref().map(|scope| scope.enter());
-                        process_volume(v)
-                    })
+                    .map(|v| read_scope.run(|| process_volume(v)))
                     .collect::<Result<_>>()?
             } else {
                 pruned_volumes
@@ -6303,13 +6300,10 @@ impl Table for SegmentedTable {
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;
-                let read_scope = crate::storage::mvcc::read_memory::current_scope();
+                let read_scope = crate::storage::mvcc::read_memory::ParallelReadScope::new();
                 let vol_group_maps: Vec<Option<VolumeGroups>> = volumes
                     .par_iter()
-                    .map(|volume| {
-                        let _scope = read_scope.as_ref().map(|scope| scope.enter());
-                        process_volume(volume)
-                    })
+                    .map(|volume| read_scope.run(|| process_volume(volume)))
                     .collect::<Result<_>>()?;
                 if bail.load(std::sync::atomic::Ordering::Relaxed) {
                     return Ok(None);

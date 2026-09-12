@@ -65,6 +65,7 @@ pub use persistence::{
     serialize_value_into, IndexMetadata, PersistenceManager, PersistenceMeta,
     DEFAULT_CHECKPOINT_INTERVAL, DEFAULT_KEEP_SNAPSHOTS,
 };
+pub use read_memory::ReadScope;
 pub use registry::{TransactionRegistry, INVALID_TRANSACTION_ID, RECOVERY_TRANSACTION_ID};
 pub use scanner::{EmptyScanner, MVCCScanner, RangeScanner, SingleRowScanner};
 pub use snapshot::{DiskVersionStore, SnapshotReader, SnapshotWriter};

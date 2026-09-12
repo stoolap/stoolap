@@ -45,13 +45,13 @@ impl IndexValueMap {
     pub fn insert(&mut self, row_id: i64, value: CompactArc<Value>) {
         self.payload_bytes += value_bytes(&value);
         if let Some(previous) = self.map.insert(row_id, value) {
-            self.payload_bytes -= value_bytes(&previous);
+            self.payload_bytes = self.payload_bytes.saturating_sub(value_bytes(&previous));
         }
     }
 
     pub fn remove(&mut self, row_id: i64) -> Option<CompactArc<Value>> {
         let value = self.map.remove(row_id)?;
-        self.payload_bytes -= value_bytes(&value);
+        self.payload_bytes = self.payload_bytes.saturating_sub(value_bytes(&value));
         Some(value)
     }
 

@@ -677,6 +677,7 @@ pub struct MVCCEngine {
     /// Version stores for each table (Arc-wrapped for safe sharing with transactions)
     version_stores: Arc<RwLock<NamedMap<Arc<VersionStore>>>>,
     hot_memory: Arc<HotMemoryRegistry>,
+    operations: std::sync::OnceLock<Arc<EngineOperations>>,
     /// Transaction registry
     registry: Arc<TransactionRegistry>,
     /// Whether the engine is open
@@ -810,6 +811,7 @@ impl MVCCEngine {
             schemas: Arc::new(RwLock::new(NamedMap::default())),
             version_stores: Arc::new(RwLock::new(NamedMap::default())),
             hot_memory: Arc::new(HotMemoryRegistry::default()),
+            operations: std::sync::OnceLock::new(),
             registry: Arc::new(TransactionRegistry::new()),
             open: AtomicBool::new(false),
             txn_version_stores: Arc::new(RwLock::new(TxnVersionStoreMap::new())),
@@ -2973,7 +2975,8 @@ impl MVCCEngine {
         txn_id: i64,
         table_name: &str,
     ) -> Result<Box<dyn crate::storage::traits::Table>> {
-        EngineOperations::new(self).get_table_for_transaction(txn_id, table_name)
+        self.engine_operations()
+            .get_table_for_transaction(txn_id, table_name)
     }
 
     /// Find all FK constraints in other tables that reference the given parent table.
@@ -4127,19 +4130,22 @@ impl MVCCEngine {
         Ok(())
     }
 
-    /// Creates an engine operations wrapper for a transaction
-    fn create_engine_operations(&self) -> Arc<dyn TransactionEngineOperations> {
-        let mut operations = EngineOperations::new(self);
-        operations.metadata.resize(
-            (arc_allocation_bytes::<EngineOperations>() + EngineOperations::shared_metadata_bytes())
-                as u128,
-        );
-        Arc::new(operations)
+    /// Shares the engine's immutable handles with transactions.
+    fn engine_operations(&self) -> &Arc<EngineOperations> {
+        self.operations.get_or_init(|| {
+            let mut operations = EngineOperations::new(self);
+            operations.metadata.resize(
+                (arc_allocation_bytes::<EngineOperations>()
+                    + EngineOperations::shared_metadata_bytes()) as u128,
+            );
+            Arc::new(operations)
+        })
     }
 
     /// Undo one failed statement without changing its transaction or savepoints.
     pub(crate) fn rollback_dml_after(&self, txn_id: i64, timestamp: i64) {
-        EngineOperations::new(self).rollback_dml_after(txn_id, timestamp);
+        self.engine_operations()
+            .rollback_dml_after(txn_id, timestamp);
     }
 
     // --- View Management Methods ---
@@ -6136,8 +6142,7 @@ impl MVCCEngine {
     /// Threshold: 100K rows (first seal) or 10K rows (subsequent seals).
     /// Output is split into target_volume_rows-sized volumes.
     fn seal_hot_buffers(&self) -> Result<()> {
-        let read_scope = Arc::new(super::read_memory::ReadScope::default());
-        let _active_scope = read_scope.enter();
+        let _active_scope = super::read_memory::ReadScopeGuard::fresh();
         const SEAL_ROW_THRESHOLD: usize = 100_000;
         const SEAL_INCREMENTAL_THRESHOLD: usize = 10_000;
         let hot_max_rows = self.hot_limits.max_rows.load(Ordering::Relaxed);
@@ -6461,8 +6466,7 @@ impl Engine for MVCCEngine {
         }
 
         // Set engine operations
-        let engine_ops = self.create_engine_operations();
-        txn.set_engine_operations(engine_ops);
+        txn.set_engine_operations(self.engine_operations().clone());
 
         Ok(Box::new(txn))
     }
@@ -8302,6 +8306,23 @@ mod tests {
 
         engine.close_engine().unwrap();
         assert!(!engine.is_open());
+    }
+
+    #[test]
+    fn engine_operations_share_charge_and_outlive_engine() {
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+        let shared = Arc::downgrade(engine.engine_operations());
+        let first = engine.begin_transaction().unwrap();
+        let second = engine.begin_transaction().unwrap();
+        assert_eq!(shared.strong_count(), 3);
+        drop(engine);
+        assert_eq!(shared.strong_count(), 2);
+        assert!(shared.upgrade().unwrap().metadata.bytes() > 0);
+        drop(first);
+        assert_eq!(shared.strong_count(), 1);
+        drop(second);
+        assert!(shared.upgrade().is_none());
     }
 
     #[test]

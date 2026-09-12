@@ -128,7 +128,7 @@ impl<V> NamedMap<V> {
 
     pub fn remove(&mut self, name: &str) -> Option<V> {
         let (key, value) = self.entries.remove_entry(name)?;
-        self.key_bytes -= key.capacity() as u128;
+        self.key_bytes = self.key_bytes.saturating_sub(key.capacity() as u128);
         drop(key);
         self.refresh_memory();
         Some(value)
@@ -345,14 +345,14 @@ impl TableMemory {
 pub(crate) struct RetainedBytes {
     // usize::MAX permanently routes this account through the widened counter.
     bytes: AtomicUsize,
-    wide: Mutex<u128>,
+    wide: std::sync::OnceLock<Box<Mutex<u128>>>,
 }
 
 impl RetainedBytes {
     pub const fn new() -> Self {
         Self {
             bytes: AtomicUsize::new(0),
-            wide: Mutex::new(0),
+            wide: std::sync::OnceLock::new(),
         }
     }
 
@@ -364,6 +364,10 @@ impl RetainedBytes {
         }
     }
 
+    fn wide(&self) -> &Mutex<u128> {
+        self.wide.get_or_init(|| Box::new(Mutex::new(0)))
+    }
+
     pub fn add(&self, bytes: u128) {
         if bytes == 0 {
             return;
@@ -371,7 +375,7 @@ impl RetainedBytes {
         let mut current = self.bytes.load(Ordering::Acquire);
         loop {
             if current == usize::MAX {
-                *self.wide.lock() += bytes;
+                *self.wide().lock() += bytes;
                 return;
             }
             let total = current as u128 + bytes;
@@ -386,7 +390,7 @@ impl RetainedBytes {
                     Err(observed) => current = observed,
                 }
             } else {
-                let mut wide = self.wide.lock();
+                let mut wide = self.wide().lock();
                 match self.bytes.compare_exchange(
                     current,
                     usize::MAX,
@@ -410,13 +414,13 @@ impl RetainedBytes {
         let mut current = self.bytes.load(Ordering::Acquire);
         loop {
             if current == usize::MAX {
-                *self.wide.lock() -= bytes;
+                let mut wide = self.wide().lock();
+                *wide = wide.saturating_sub(bytes);
                 return;
             }
-            debug_assert!(bytes <= current as u128);
             match self.bytes.compare_exchange_weak(
                 current,
-                current - bytes as usize,
+                (current as u128).saturating_sub(bytes) as usize,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
@@ -428,14 +432,14 @@ impl RetainedBytes {
 
     pub fn get(&self) -> usize {
         match self.bytes.load(Ordering::Acquire) {
-            usize::MAX => (*self.wide.lock()).min(usize::MAX as u128) as usize,
+            usize::MAX => (*self.wide().lock()).min(usize::MAX as u128) as usize,
             bytes => bytes,
         }
     }
 
     pub fn get_wide(&self) -> u128 {
         match self.bytes.load(Ordering::Acquire) {
-            usize::MAX => *self.wide.lock(),
+            usize::MAX => *self.wide().lock(),
             bytes => bytes as u128,
         }
     }
@@ -556,11 +560,13 @@ mod tests {
     #[test]
     fn transaction_counter_preserves_excess_through_release() {
         let memory = RetainedBytes::default();
+        assert!(memory.wide.get().is_none());
         memory.add(48);
         memory.add(32);
         assert_eq!(memory.get(), 80);
         memory.remove(80);
         assert_eq!(memory.bytes.load(Ordering::Relaxed), 0);
+        assert!(memory.wide.get().is_none());
 
         memory.add(usize::MAX as u128 - 8);
         memory.add(64);
@@ -573,6 +579,19 @@ mod tests {
         assert_eq!(memory.bytes.load(Ordering::Relaxed), usize::MAX);
         memory.remove(48);
         assert_eq!(memory.get(), 0);
+    }
+
+    #[test]
+    fn counter_release_saturates_before_narrowing() {
+        let memory = RetainedBytes::default();
+        memory.add(48);
+        memory.remove(usize::MAX as u128 + 32);
+        assert_eq!(memory.get(), 0);
+        memory.add(usize::MAX as u128 + 32);
+        memory.remove(usize::MAX as u128 + 48);
+        assert_eq!(memory.get_wide(), 0);
+        memory.add(64);
+        assert_eq!(memory.get_wide(), 64);
     }
 
     #[test]

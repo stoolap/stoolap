@@ -23,7 +23,21 @@ use parking_lot::Mutex;
 static EXPORTED_PAYLOAD_BYTES: RetainedBytes = RetainedBytes::new();
 
 thread_local! {
-    static ACTIVE_SCOPE: RefCell<Option<Arc<ReadScope>>> = const { RefCell::new(None) };
+    static ACTIVE_SCOPE: RefCell<ActiveScope> = const { RefCell::new(ActiveScope::Inactive) };
+}
+
+enum ActiveScope {
+    Inactive,
+    Active(Option<Arc<ReadScope>>),
+}
+
+impl ActiveScope {
+    fn activate(&mut self) -> Option<Self> {
+        match self {
+            Self::Inactive => Some(std::mem::replace(self, Self::Active(None))),
+            Self::Active(_) => None,
+        }
+    }
 }
 
 pub(crate) fn exported_payload_bytes() -> usize {
@@ -31,13 +45,19 @@ pub(crate) fn exported_payload_bytes() -> usize {
 }
 
 pub(crate) fn current_scope() -> Option<Arc<ReadScope>> {
-    ACTIVE_SCOPE.with(|scope| scope.borrow().clone())
+    ACTIVE_SCOPE.with(|scope| match &*scope.borrow() {
+        ActiveScope::Active(owner) => owner.clone(),
+        ActiveScope::Inactive => None,
+    })
 }
 
 pub(crate) fn charge_export(row: &Row) {
     ACTIVE_SCOPE.with(|scope| {
-        if let Some(scope) = scope.borrow().as_ref() {
-            scope.add(row.heap_bytes());
+        if let ActiveScope::Active(owner) = &mut *scope.borrow_mut() {
+            let bytes = row.heap_bytes();
+            if bytes != 0 {
+                owner.get_or_insert_with(Default::default).add(bytes);
+            }
         }
     });
 }
@@ -51,14 +71,15 @@ pub(crate) fn charge_bytes_export(bytes: u128) {
         return;
     }
     ACTIVE_SCOPE.with(|scope| {
-        if let Some(scope) = scope.borrow().as_ref() {
-            scope.add(bytes);
+        if let ActiveScope::Active(owner) = &mut *scope.borrow_mut() {
+            owner.get_or_insert_with(Default::default).add(bytes);
         }
     });
 }
 
+/// Retained storage payload ownership managed by the executor.
 #[derive(Default)]
-pub(crate) struct ReadScope {
+pub struct ReadScope {
     bytes: RetainedBytes,
     imports: Mutex<ChargedSmallVec<[ChargedWeak<SharedPayloadCharge>; 2]>>,
     last_import: AtomicPtr<SharedPayloadCharge>,
@@ -76,9 +97,14 @@ impl ReadScope {
         self.bytes.add(bytes);
     }
 
-    pub fn enter(self: &Arc<Self>) -> ReadScopeGuard {
-        let previous = ACTIVE_SCOPE.with(|scope| scope.replace(Some(Arc::clone(self))));
-        ReadScopeGuard { previous }
+    pub(crate) fn enter(self: &Arc<Self>) -> ReadScopeGuard<'static> {
+        let previous =
+            ACTIVE_SCOPE.with(|scope| scope.replace(ActiveScope::Active(Some(Arc::clone(self)))));
+        ReadScopeGuard {
+            previous: Some(previous),
+            retain: None,
+            state: None,
+        }
     }
 
     fn import(&self, source: &Arc<SharedPayloadCharge>) {
@@ -101,32 +127,155 @@ impl Drop for ReadScope {
     }
 }
 
-pub(crate) struct ReadScopeGuard {
-    previous: Option<Arc<ReadScope>>,
+pub(crate) struct ReadScopeGuard<'a> {
+    previous: Option<ActiveScope>,
+    retain: Option<&'a RefCell<Option<Arc<ReadScope>>>>,
+    state: Option<&'a RefCell<ActiveScope>>,
 }
 
-impl Drop for ReadScopeGuard {
+impl ReadScopeGuard<'static> {
+    pub fn lazy() -> Self {
+        let previous = ACTIVE_SCOPE.with(|scope| scope.borrow_mut().activate());
+        Self {
+            previous,
+            retain: None,
+            state: None,
+        }
+    }
+
+    pub fn with_lazy<T>(execute: impl FnOnce() -> T) -> (T, Option<Arc<ReadScope>>) {
+        ACTIVE_SCOPE.with(|state| {
+            let _active = ReadScopeGuard {
+                previous: state.borrow_mut().activate(),
+                retain: None,
+                state: Some(state),
+            };
+            let result = execute();
+            let owner = match &*state.borrow() {
+                ActiveScope::Active(owner) => owner.clone(),
+                ActiveScope::Inactive => None,
+            };
+            (result, owner)
+        })
+    }
+
+    pub fn fresh() -> Self {
+        let previous = ACTIVE_SCOPE.with(|scope| scope.replace(ActiveScope::Active(None)));
+        Self {
+            previous: Some(previous),
+            retain: None,
+            state: None,
+        }
+    }
+}
+
+impl<'a> ReadScopeGuard<'a> {
+    pub fn for_result(owner: &'a RefCell<Option<Arc<ReadScope>>>) -> Self {
+        let mut active = match owner.borrow().as_ref() {
+            Some(scope) => scope.enter(),
+            None => ReadScopeGuard::lazy(),
+        };
+        Self {
+            previous: active.previous.take(),
+            retain: Some(owner),
+            state: None,
+        }
+    }
+}
+
+impl Drop for ReadScopeGuard<'_> {
     fn drop(&mut self) {
-        ACTIVE_SCOPE.with(|scope| scope.replace(self.previous.take()));
+        if let Some(owner) = self.retain {
+            if owner.borrow().is_none() {
+                *owner.borrow_mut() = current_scope();
+            }
+        }
+        if let Some(previous) = self.previous.take() {
+            match self.state {
+                Some(state) => {
+                    state.replace(previous);
+                }
+                None => {
+                    ACTIVE_SCOPE.with(|scope| scope.replace(previous));
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "parallel")]
+pub(crate) struct ParallelReadScope {
+    enabled: bool,
+    shared: Option<Arc<ReadScope>>,
+    owner: Mutex<Option<Arc<ReadScope>>>,
+}
+
+#[cfg(feature = "parallel")]
+impl ParallelReadScope {
+    pub fn new() -> Self {
+        Self {
+            enabled: ACTIVE_SCOPE.with(|scope| matches!(*scope.borrow(), ActiveScope::Active(_))),
+            shared: current_scope(),
+            owner: Mutex::new(None),
+        }
+    }
+
+    pub fn run<T>(&self, read: impl FnOnce() -> T) -> T {
+        if !self.enabled {
+            return read();
+        }
+        if let Some(scope) = &self.shared {
+            let _active = scope.enter();
+            return read();
+        }
+        let _active = ReadScopeGuard::fresh();
+        let result = read();
+        if let Some(scope) = current_scope() {
+            let mut owner = self.owner.lock();
+            match owner.as_ref() {
+                Some(owner) => owner.add(scope.bytes.get_wide()),
+                None => *owner = Some(scope),
+            }
+        }
+        result
+    }
+}
+
+#[cfg(feature = "parallel")]
+impl Drop for ParallelReadScope {
+    fn drop(&mut self) {
+        let Some(scope) = self.owner.get_mut().take() else {
+            return;
+        };
+        ACTIVE_SCOPE.with(|state| {
+            if let ActiveScope::Active(owner) = &mut *state.borrow_mut() {
+                match owner.as_ref() {
+                    Some(owner) => owner.add(scope.bytes.get_wide()),
+                    None => *owner = Some(scope),
+                }
+            }
+        });
     }
 }
 
 pub(crate) struct ExportBatch {
     scope: Option<Arc<ReadScope>>,
+    enabled: bool,
     bytes: u128,
 }
 
 impl ExportBatch {
     pub fn new() -> Self {
         Self {
-            scope: current_scope(),
+            scope: None,
+            enabled: ACTIVE_SCOPE.with(|scope| matches!(*scope.borrow(), ActiveScope::Active(_))),
             bytes: 0,
         }
     }
 
     pub fn record(&mut self, row: &Row) {
-        if self.scope.is_some() {
-            self.bytes += row.heap_bytes();
+        if self.enabled {
+            self.record_bytes(row.heap_bytes());
         }
     }
 
@@ -136,9 +285,30 @@ impl ExportBatch {
     }
 
     pub fn record_value(&mut self, value: &Value) {
-        if self.scope.is_some() {
-            self.bytes += value.heap_bytes() as u128;
+        if self.enabled {
+            self.record_bytes(value.heap_bytes() as u128);
         }
+    }
+
+    #[inline]
+    fn record_bytes(&mut self, bytes: u128) {
+        if bytes == 0 {
+            return;
+        }
+        if self.scope.is_none() {
+            self.bind_scope();
+        }
+        self.bytes += bytes;
+    }
+
+    #[cold]
+    fn bind_scope(&mut self) {
+        self.scope = ACTIVE_SCOPE.with(|scope| match &mut *scope.borrow_mut() {
+            ActiveScope::Active(owner) => {
+                Some(Arc::clone(owner.get_or_insert_with(Default::default)))
+            }
+            ActiveScope::Inactive => None,
+        });
     }
 
     pub fn capture_value(&mut self, value: &Value) -> Value {
@@ -197,9 +367,12 @@ impl SharedPayloadCharge {
     }
 
     pub fn import(self: &Arc<Self>) {
+        if self.payload.bytes == 0 {
+            return;
+        }
         ACTIVE_SCOPE.with(|scope| {
-            if let Some(scope) = scope.borrow().as_ref() {
-                scope.import(self);
+            if let ActiveScope::Active(owner) = &mut *scope.borrow_mut() {
+                owner.get_or_insert_with(Default::default).import(self);
             }
         });
     }
@@ -220,6 +393,83 @@ impl Clone for PayloadCharge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lazy_scope_materializes_only_for_nonzero_exports() {
+        let _active = ReadScopeGuard::lazy();
+        {
+            let _nested = ReadScopeGuard::lazy();
+            charge_bytes_export(0);
+            charge_value_export(&Value::Integer(7));
+            SharedPayloadCharge::new(0).import();
+            let mut batch = ExportBatch::new();
+            batch.record_value(&Value::Integer(7));
+        }
+        assert!(current_scope().is_none());
+        let source = SharedPayloadCharge::new(512);
+        source.import();
+        let scope = current_scope().unwrap();
+        assert_eq!(scope.exported_bytes(), 512);
+        source.import();
+        assert_eq!(scope.exported_bytes(), 512);
+        let _nested = ReadScopeGuard::lazy();
+        charge_bytes_export(64);
+        assert!(Arc::ptr_eq(&scope, &current_scope().unwrap()));
+        assert_eq!(scope.exported_bytes(), 576);
+    }
+
+    #[test]
+    fn lazy_result_owner_retains_first_export_on_unwind() {
+        let owner = RefCell::new(None);
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _active = ReadScopeGuard::for_result(&owner);
+            charge_bytes_export(512);
+            panic!("leave result iteration");
+        }));
+        assert!(outcome.is_err());
+        assert!(current_scope().is_none());
+        assert_eq!(owner.borrow().as_ref().unwrap().exported_bytes(), 512);
+        let _active = ReadScopeGuard::for_result(&owner);
+        charge_bytes_export(64);
+        assert_eq!(owner.borrow().as_ref().unwrap().exported_bytes(), 576);
+    }
+
+    #[cfg(feature = "parallel")]
+    #[test]
+    fn lazy_workers_transfer_exports_to_unmaterialized_parent() {
+        let _active = ReadScopeGuard::lazy();
+        {
+            let workers = ParallelReadScope::new();
+            workers.run(|| charge_value_export(&Value::Integer(7)));
+            assert!(workers.owner.lock().is_none());
+        }
+        assert!(current_scope().is_none());
+        {
+            let workers = ParallelReadScope::new();
+            std::thread::scope(|threads| {
+                for _ in 0..4 {
+                    let workers = &workers;
+                    threads.spawn(move || workers.run(|| charge_bytes_export(512)));
+                }
+            });
+            assert!(current_scope().is_none());
+            assert_eq!(
+                workers.owner.lock().as_ref().unwrap().exported_bytes(),
+                2048
+            );
+        }
+        assert_eq!(current_scope().unwrap().exported_bytes(), 2048);
+        let parent = current_scope().unwrap();
+        {
+            let workers = ParallelReadScope::new();
+            workers.run(|| {
+                assert!(Arc::ptr_eq(&parent, &current_scope().unwrap()));
+                charge_bytes_export(64);
+            });
+            assert!(workers.owner.lock().is_none());
+        }
+        assert_eq!(parent.exported_bytes(), 2112);
+    }
 
     #[test]
     fn scope_restores_nested_activation_and_batches_exports() {

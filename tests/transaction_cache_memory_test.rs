@@ -38,6 +38,7 @@ fn table_handles_keep_transaction_store_objects_charged_after_rollback() {
             .unwrap()
             .hot_metadata_bytes
     };
+    db.engine().begin_transaction().unwrap().rollback().unwrap();
     let baseline = bytes();
     let mut transaction = db.engine().begin_transaction().unwrap();
     let tables: Vec<_> = (0..8)

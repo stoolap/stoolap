@@ -24,31 +24,36 @@ use rustc_hash::{FxHashMap, FxHasher};
 
 use super::expression::RowFilter;
 use crate::storage::mvcc::memory::HotMetadataCharge;
-use crate::storage::mvcc::read_memory::{current_scope, ReadScope};
+use crate::storage::mvcc::read_memory::{ReadScope, ReadScopeGuard};
+use std::cell::RefCell;
 use std::sync::Arc;
 
 pub(super) fn with_read_scope(
     execute: impl FnOnce() -> Result<Box<dyn QueryResult>>,
 ) -> Result<Box<dyn QueryResult>> {
-    let scope = current_scope().unwrap_or_default();
-    let _active = scope.enter();
-    let inner = execute()?;
-    Ok(retain_read_scope(inner, scope))
+    let (inner, scope) = ReadScopeGuard::with_lazy(execute);
+    Ok(retain_read_scope(inner?, scope))
 }
 
 pub(super) fn retain_read_scope(
-    inner: Box<dyn QueryResult>,
-    scope: Arc<ReadScope>,
+    mut inner: Box<dyn QueryResult>,
+    mut scope: Option<Arc<ReadScope>>,
 ) -> Box<dyn QueryResult> {
-    if inner.columns().is_empty() {
+    if scope.is_some() && inner.is_materialized() {
+        inner.retain_read_scope(&mut scope);
+    }
+    if inner.columns().is_empty() || (scope.is_none() && inner.is_materialized()) {
         return inner;
     }
-    Box::new(ScopedResult { inner, scope })
+    Box::new(ScopedResult {
+        inner,
+        scope: RefCell::new(scope),
+    })
 }
 
 struct ScopedResult {
     inner: Box<dyn QueryResult>,
-    scope: Arc<ReadScope>,
+    scope: RefCell<Option<Arc<ReadScope>>>,
 }
 
 impl QueryResult for ScopedResult {
@@ -61,12 +66,14 @@ impl QueryResult for ScopedResult {
     }
 
     fn next(&mut self) -> bool {
-        let _active = self.scope.enter();
+        let _active =
+            (!self.inner.is_materialized()).then(|| ReadScopeGuard::for_result(&self.scope));
         self.inner.next()
     }
 
     fn scan(&self, dest: &mut [Value]) -> Result<()> {
-        let _active = self.scope.enter();
+        let _active =
+            (!self.inner.is_materialized()).then(|| ReadScopeGuard::for_result(&self.scope));
         self.inner.scan(dest)
     }
 
@@ -75,12 +82,14 @@ impl QueryResult for ScopedResult {
     }
 
     fn take_row(&mut self) -> Row {
-        let _active = self.scope.enter();
+        let _active =
+            (!self.inner.is_materialized()).then(|| ReadScopeGuard::for_result(&self.scope));
         self.inner.take_row()
     }
 
     fn close(&mut self) -> Result<()> {
-        let _active = self.scope.enter();
+        let _active =
+            (!self.inner.is_materialized()).then(|| ReadScopeGuard::for_result(&self.scope));
         self.inner.close()
     }
 
@@ -93,7 +102,8 @@ impl QueryResult for ScopedResult {
     }
 
     fn try_into_arc_rows(&mut self) -> Option<CompactArc<Vec<Row>>> {
-        let _active = self.scope.enter();
+        let _active =
+            (!self.inner.is_materialized()).then(|| ReadScopeGuard::for_result(&self.scope));
         self.inner.try_into_arc_rows()
     }
 
@@ -111,11 +121,10 @@ impl QueryResult for ScopedResult {
 
     fn with_aliases(self: Box<Self>, aliases: FxHashMap<String, String>) -> Box<dyn QueryResult> {
         let Self { inner, scope } = *self;
-        let _active = scope.enter();
-        Box::new(Self {
-            inner: inner.with_aliases(aliases),
-            scope,
-        })
+        let active = (!inner.is_materialized()).then(|| ReadScopeGuard::for_result(&scope));
+        let inner = inner.with_aliases(aliases);
+        drop(active);
+        Box::new(Self { inner, scope })
     }
 }
 
@@ -263,6 +272,7 @@ pub struct ExecutorResult {
     /// Last insert ID (0 for SELECT)
     insert_id: i64,
     _column_memory: HotMetadataCharge,
+    _read_scope: Option<Arc<ReadScope>>,
 }
 
 impl ExecutorResult {
@@ -284,6 +294,7 @@ impl ExecutorResult {
             affected: 0,
             insert_id: 0,
             _column_memory: column_memory,
+            _read_scope: None,
         }
     }
 
@@ -309,6 +320,7 @@ impl ExecutorResult {
             affected: 0,
             insert_id: 0,
             _column_memory: column_memory,
+            _read_scope: None,
         }
     }
 
@@ -398,6 +410,20 @@ impl ExecutorResult {
 }
 
 impl QueryResult for ExecutorResult {
+    fn is_materialized(&self) -> bool {
+        true
+    }
+
+    fn retain_read_scope(&mut self, scope: &mut Option<Arc<ReadScope>>) {
+        match (&self._read_scope, scope.as_ref()) {
+            (None, _) => self._read_scope = scope.take(),
+            (Some(retained), Some(incoming)) if Arc::ptr_eq(retained, incoming) => {
+                scope.take();
+            }
+            _ => {}
+        }
+    }
+
     fn columns(&self) -> &[String] {
         &self.columns
     }
@@ -2254,6 +2280,146 @@ impl QueryResult for ColumnarResult {
 mod tests {
     use super::*;
     use crate::core::row_vec::RowVec;
+    use crate::storage::mvcc::read_memory::current_scope;
+
+    #[test]
+    fn scalar_result_without_exports_needs_no_scope_or_wrapper() {
+        let inner = Box::new(ExecutorResult::new(
+            vec!["count".into()],
+            make_rows(vec![Row::from_values(vec![Value::Integer(10)])]),
+        ));
+        let address = std::ptr::from_ref(inner.as_ref()).cast::<()>();
+        let mut result = with_read_scope(|| {
+            assert!(
+                current_scope().is_none(),
+                "statement scope must start unmaterialized"
+            );
+            Ok(inner)
+        })
+        .unwrap();
+        assert_eq!(std::ptr::from_ref(result.as_ref()).cast::<()>(), address);
+        assert!(current_scope().is_none());
+        assert!(result.next());
+        assert_eq!(result.row().get(0), Some(&Value::Integer(10)));
+    }
+
+    #[test]
+    fn materialized_result_keeps_export_owner_without_a_wrapper() {
+        let row = Row::from_values(vec![Value::text("retained heap value".repeat(100))]);
+        let ((), scope) = ReadScopeGuard::with_lazy(|| {
+            crate::storage::mvcc::read_memory::charge_export(&row);
+        });
+        let scope = scope.unwrap();
+        let identity = Arc::downgrade(&scope);
+        let inner = Box::new(ExecutorResult::new(
+            vec!["label".into()],
+            make_rows(vec![row]),
+        ));
+        let address = std::ptr::from_ref(inner.as_ref()).cast::<()>();
+        let result = retain_read_scope(inner, Some(Arc::clone(&scope)));
+        let result = retain_read_scope(result, Some(scope));
+        assert_eq!(std::ptr::from_ref(result.as_ref()).cast::<()>(), address);
+        let mut result =
+            result.with_aliases(FxHashMap::from_iter([("name".into(), "label".into())]));
+        result.close().unwrap();
+        assert!(identity.upgrade().unwrap().exported_bytes() >= 1800);
+        let rows = result.try_into_arc_rows().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(identity.upgrade().is_some());
+        drop(result);
+        assert!(identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn materialized_result_keeps_distinct_nested_owners() {
+        let first = Arc::new(ReadScope::default());
+        let second = Arc::new(ReadScope::default());
+        let first_identity = Arc::downgrade(&first);
+        let second_identity = Arc::downgrade(&second);
+        let inner = Box::new(ExecutorResult::new(vec!["label".into()], RowVec::new()));
+        let result = retain_read_scope(inner, Some(first));
+        let result = retain_read_scope(result, Some(second));
+        assert!(first_identity.upgrade().is_some());
+        assert!(second_identity.upgrade().is_some());
+        drop(result);
+        assert!(first_identity.upgrade().is_none());
+        assert!(second_identity.upgrade().is_none());
+    }
+
+    struct DeferredExport {
+        inner: ExecutorResult,
+    }
+
+    impl QueryResult for DeferredExport {
+        fn columns(&self) -> &[String] {
+            self.inner.columns()
+        }
+        fn next(&mut self) -> bool {
+            if !self.inner.next() {
+                return false;
+            }
+            crate::storage::mvcc::read_memory::charge_export(self.inner.row());
+            true
+        }
+        fn scan(&self, dest: &mut [Value]) -> Result<()> {
+            self.inner.scan(dest)
+        }
+        fn row(&self) -> &Row {
+            self.inner.row()
+        }
+        fn try_into_arc_rows(&mut self) -> Option<CompactArc<Vec<Row>>> {
+            while self.next() {}
+            self.inner.try_into_arc_rows()
+        }
+        fn with_aliases(
+            self: Box<Self>,
+            _aliases: FxHashMap<String, String>,
+        ) -> Box<dyn QueryResult> {
+            self
+        }
+    }
+
+    fn deferred_export() -> Box<dyn QueryResult> {
+        Box::new(DeferredExport {
+            inner: ExecutorResult::new(
+                vec!["label".into()],
+                make_rows(vec![Row::from_values(vec![Value::text(
+                    "retained heap value".repeat(100),
+                )])]),
+            ),
+        })
+    }
+
+    #[test]
+    fn deferred_result_first_export_survives_thread_transfer() {
+        let result = ScopedResult {
+            inner: deferred_export(),
+            scope: RefCell::new(None),
+        };
+        let result = std::thread::spawn(move || {
+            let mut result = result;
+            assert!(result.next());
+            assert!(current_scope().is_none());
+            assert!(result.scope.borrow().as_ref().unwrap().exported_bytes() >= 1800);
+            result
+        })
+        .join()
+        .unwrap();
+        let identity = Arc::downgrade(result.scope.borrow().as_ref().unwrap());
+        drop(result);
+        assert!(identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn nested_deferred_extraction_stays_owned_by_parent() {
+        let _active = ReadScopeGuard::lazy();
+        let mut result = with_read_scope(|| Ok(deferred_export())).unwrap();
+        assert!(current_scope().is_none());
+        let rows = result.try_into_arc_rows().unwrap();
+        drop(result);
+        assert_eq!(rows.len(), 1);
+        assert!(current_scope().unwrap().exported_bytes() >= 1800);
+    }
 
     #[test]
     fn result_names_stay_charged_after_schema_release() {

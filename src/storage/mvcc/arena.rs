@@ -522,8 +522,8 @@ impl RowArena {
                 inner.refresh_probe_order();
                 inner.active = Some(prepared);
                 inner.next_chunk_id += 1;
+                // Free offsets belong to the old chunk, so rotation starts empty.
                 inner.free_len = 0;
-                free[..inner.free_len].copy_from_slice(&inner.free[..inner.free_len]);
                 std::mem::swap(&mut inner.free, &mut free);
                 drop(inner);
                 return Ok(());
@@ -810,9 +810,10 @@ impl<'a> ArenaLiveRow<'a> {
 
     #[inline]
     pub fn payload(&self) -> &'a CompactArc<[Value]> {
-        debug_assert!(self.data.is_some());
-        // SAFETY: The read guard pins paired slices; every live metadata slot owns a payload.
-        unsafe { self.data.as_ref().unwrap_unchecked() }
+        match self.data.as_ref() {
+            Some(data) => data,
+            None => panic!("live arena slot has no payload"),
+        }
     }
 }
 
