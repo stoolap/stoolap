@@ -574,15 +574,18 @@ impl Row {
         }
     }
 
-    /// Requested heap bytes, including unused owned capacity and shared children.
-    pub(crate) fn heap_bytes(&self) -> u128 {
-        let storage = match &self.storage {
+    pub(crate) fn storage_bytes(&self) -> usize {
+        match &self.storage {
             RowStorage::Shared(arc) => {
                 2 * std::mem::size_of::<usize>() + std::mem::size_of_val(arc.as_ref())
             }
             RowStorage::Owned(values) => values.capacity() * std::mem::size_of::<Value>(),
-        };
-        storage as u128
+        }
+    }
+
+    /// Requested heap bytes, including unused owned capacity and shared children.
+    pub(crate) fn heap_bytes(&self) -> u128 {
+        self.storage_bytes() as u128
             + self
                 .as_slice()
                 .iter()

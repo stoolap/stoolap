@@ -37,6 +37,11 @@ use crate::core::{Result, Row};
 /// scanner.close()?;
 /// ```
 pub trait Scanner: Send {
+    /// Whether all payloads are captured and iteration needs no further export accounting.
+    fn is_materialized(&self) -> bool {
+        false
+    }
+
     /// Advances the scanner to the next row
     ///
     /// Returns `true` if there is another row available, `false` otherwise.

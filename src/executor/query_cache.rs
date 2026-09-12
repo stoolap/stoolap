@@ -46,6 +46,7 @@ use rustc_hash::FxHashMap;
 use crate::common::CompactArc;
 use crate::core::Schema;
 use crate::parser::ast::Statement;
+use crate::storage::mvcc::memory::HotMetadataCharge;
 
 use super::query_classification::QueryClassification;
 
@@ -229,14 +230,44 @@ pub struct CompiledCountDistinct {
 
 /// Pre-compiled state for COUNT(*) queries
 /// Caches table info to avoid re-parsing on every execution
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CompiledCountStar {
     /// Table name (already lowercased)
     pub table_name: SmartString,
-    /// Result column name (e.g., "COUNT(*)")
-    pub result_column_name: String,
+    /// Shared result column names (e.g., "COUNT(*)")
+    pub result_columns: CompactArc<Vec<String>>,
     /// Schema epoch at compilation time (for fast cache invalidation)
     pub cached_epoch: u64,
+    _column_memory: Box<HotMetadataCharge>,
+}
+
+impl CompiledCountStar {
+    pub fn new(
+        table_name: SmartString,
+        result_columns: CompactArc<Vec<String>>,
+        cached_epoch: u64,
+    ) -> Self {
+        let column_memory = Box::new(HotMetadataCharge::new(
+            Schema::column_names_bytes(&result_columns)
+                + std::mem::size_of::<HotMetadataCharge>() as u128,
+        ));
+        Self {
+            table_name,
+            result_columns,
+            cached_epoch,
+            _column_memory: column_memory,
+        }
+    }
+}
+
+impl Clone for CompiledCountStar {
+    fn clone(&self) -> Self {
+        Self::new(
+            self.table_name.clone(),
+            self.result_columns.clone(),
+            self.cached_epoch,
+        )
+    }
 }
 
 /// Pre-compiled execution state for fast paths

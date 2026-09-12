@@ -156,6 +156,10 @@ impl MVCCScanner {
 }
 
 impl Scanner for MVCCScanner {
+    fn is_materialized(&self) -> bool {
+        true
+    }
+
     fn next(&mut self) -> bool {
         if self.closed || self.error.is_some() {
             return false;

@@ -24,7 +24,7 @@ use rustc_hash::{FxHashMap, FxHasher};
 
 use super::expression::RowFilter;
 use crate::storage::mvcc::memory::HotMetadataCharge;
-use crate::storage::mvcc::read_memory::{ReadScope, ReadScopeGuard};
+use crate::storage::mvcc::read_memory::{ReadScope, ReadScopeGuard, ResultReadScope};
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -272,7 +272,7 @@ pub struct ExecutorResult {
     /// Last insert ID (0 for SELECT)
     insert_id: i64,
     _column_memory: HotMetadataCharge,
-    _read_scope: Option<Arc<ReadScope>>,
+    _read_scope: ResultReadScope,
 }
 
 impl ExecutorResult {
@@ -294,7 +294,7 @@ impl ExecutorResult {
             affected: 0,
             insert_id: 0,
             _column_memory: column_memory,
-            _read_scope: None,
+            _read_scope: ResultReadScope::default(),
         }
     }
 
@@ -320,7 +320,7 @@ impl ExecutorResult {
             affected: 0,
             insert_id: 0,
             _column_memory: column_memory,
-            _read_scope: None,
+            _read_scope: ResultReadScope::default(),
         }
     }
 
@@ -415,13 +415,7 @@ impl QueryResult for ExecutorResult {
     }
 
     fn retain_read_scope(&mut self, scope: &mut Option<Arc<ReadScope>>) {
-        match (&self._read_scope, scope.as_ref()) {
-            (None, _) => self._read_scope = scope.take(),
-            (Some(retained), Some(incoming)) if Arc::ptr_eq(retained, incoming) => {
-                scope.take();
-            }
-            _ => {}
-        }
+        self._read_scope.retain(scope);
     }
 
     fn columns(&self) -> &[String] {
@@ -1876,6 +1870,7 @@ pub struct ScannerResult {
     /// Whether we have a valid current row
     has_current: bool,
     _column_memory: HotMetadataCharge,
+    _read_scope: ResultReadScope,
 }
 
 impl ScannerResult {
@@ -1891,11 +1886,20 @@ impl ScannerResult {
             current_row: Row::new(),
             has_current: false,
             _column_memory: column_memory,
+            _read_scope: ResultReadScope::default(),
         }
     }
 }
 
 impl QueryResult for ScannerResult {
+    fn is_materialized(&self) -> bool {
+        self.scanner.is_materialized()
+    }
+
+    fn retain_read_scope(&mut self, scope: &mut Option<Arc<ReadScope>>) {
+        self._read_scope.retain(scope);
+    }
+
     fn columns(&self) -> &[String] {
         &self.columns
     }
@@ -1981,14 +1985,15 @@ pub type StreamingFilterResult = FilteredResult;
 /// This allows streaming projection without materializing all rows into a Vec.
 /// Uses simple column index-based projection for performance.
 pub struct StreamingProjectionResult {
-    /// Underlying result
-    inner: Box<dyn QueryResult>,
     /// Column indices to project (from source to output)
     column_indices: Vec<usize>,
     /// Output column names
     output_columns: Vec<String>,
     /// Current projected row
     current_row: Row,
+    /// Underlying result, dropped after the projected row.
+    inner: Box<dyn QueryResult>,
+    _read_scope: ResultReadScope,
 }
 
 impl StreamingProjectionResult {
@@ -2006,15 +2011,24 @@ impl StreamingProjectionResult {
         // Pre-allocate Inline storage - no Arc overhead for intermediate results
         let capacity = column_indices.len();
         Self {
-            inner,
             column_indices,
             output_columns,
             current_row: Row::with_capacity(capacity),
+            inner,
+            _read_scope: ResultReadScope::default(),
         }
     }
 }
 
 impl QueryResult for StreamingProjectionResult {
+    fn is_materialized(&self) -> bool {
+        self.inner.is_materialized()
+    }
+
+    fn retain_read_scope(&mut self, scope: &mut Option<Arc<ReadScope>>) {
+        self._read_scope.retain(scope);
+    }
+
     fn columns(&self) -> &[String] {
         &self.output_columns
     }
@@ -2326,6 +2340,47 @@ mod tests {
         let rows = result.try_into_arc_rows().unwrap();
         assert_eq!(rows.len(), 1);
         assert!(identity.upgrade().is_some());
+        drop(result);
+        assert!(identity.upgrade().is_none());
+    }
+
+    #[test]
+    fn materialized_scanner_projection_retains_owner_without_wrappers() {
+        let row = Row::from_values(vec![Value::text("retained heap value".repeat(100))]);
+        let ((), scope) = ReadScopeGuard::with_lazy(|| {
+            crate::storage::mvcc::read_memory::charge_export(&row);
+        });
+        let scope = scope.unwrap();
+        let identity = Arc::downgrade(&scope);
+        let schema = CompactArc::new(
+            crate::core::SchemaBuilder::new("projection")
+                .column("label", crate::core::DataType::Text, false, false)
+                .build(),
+        );
+        let scanner =
+            crate::storage::mvcc::MVCCScanner::from_rows(make_rows(vec![row]), schema, vec![0]);
+        let inner = Box::new(ScannerResult::new(
+            Box::new(scanner),
+            CompactArc::new(vec!["label".into()]),
+        ));
+        let address = std::ptr::from_ref(inner.as_ref()).cast::<()>();
+        let inner = retain_read_scope(inner, Some(Arc::clone(&scope)));
+        assert_eq!(std::ptr::from_ref(inner.as_ref()).cast::<()>(), address);
+        let result = Box::new(StreamingProjectionResult::new(
+            inner,
+            vec![0],
+            vec!["projected".into()],
+        ));
+        let address = std::ptr::from_ref(result.as_ref()).cast::<()>();
+        let mut result = retain_read_scope(result, Some(scope));
+        assert_eq!(std::ptr::from_ref(result.as_ref()).cast::<()>(), address);
+        assert!(result.next());
+        result.close().unwrap();
+        assert!(identity.upgrade().unwrap().exported_bytes() >= 1800);
+        assert_eq!(
+            result.row().get(0),
+            Some(&Value::text("retained heap value".repeat(100)))
+        );
         drop(result);
         assert!(identity.upgrade().is_none());
     }

@@ -24,6 +24,15 @@ static EXPORTED_PAYLOAD_BYTES: RetainedBytes = RetainedBytes::new();
 
 thread_local! {
     static ACTIVE_SCOPE: RefCell<ActiveScope> = const { RefCell::new(ActiveScope::Inactive) };
+    static RECYCLED_SCOPE: RefCell<Option<Arc<ReadScope>>> = const { RefCell::new(None) };
+}
+
+fn new_scope() -> Arc<ReadScope> {
+    RECYCLED_SCOPE
+        .try_with(|scope| scope.take())
+        .ok()
+        .flatten()
+        .unwrap_or_default()
 }
 
 enum ActiveScope {
@@ -56,7 +65,7 @@ pub(crate) fn charge_export(row: &Row) {
         if let ActiveScope::Active(owner) = &mut *scope.borrow_mut() {
             let bytes = row.heap_bytes();
             if bytes != 0 {
-                owner.get_or_insert_with(Default::default).add(bytes);
+                owner.get_or_insert_with(new_scope).add(bytes);
             }
         }
     });
@@ -72,7 +81,7 @@ pub(crate) fn charge_bytes_export(bytes: u128) {
     }
     ACTIVE_SCOPE.with(|scope| {
         if let ActiveScope::Active(owner) = &mut *scope.borrow_mut() {
-            owner.get_or_insert_with(Default::default).add(bytes);
+            owner.get_or_insert_with(new_scope).add(bytes);
         }
     });
 }
@@ -124,6 +133,38 @@ impl ReadScope {
 impl Drop for ReadScope {
     fn drop(&mut self) {
         EXPORTED_PAYLOAD_BYTES.remove(self.bytes.get_wide());
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ResultReadScope(Option<Arc<ReadScope>>);
+
+impl ResultReadScope {
+    pub fn retain(&mut self, scope: &mut Option<Arc<ReadScope>>) {
+        match (&self.0, scope.as_ref()) {
+            (None, _) => self.0 = scope.take(),
+            (Some(retained), Some(incoming)) if Arc::ptr_eq(retained, incoming) => {
+                scope.take();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Drop for ResultReadScope {
+    fn drop(&mut self) {
+        let Some(mut scope) = self.0.take() else {
+            return;
+        };
+        let Some(owner) = Arc::get_mut(&mut scope) else {
+            return;
+        };
+        EXPORTED_PAYLOAD_BYTES.remove(owner.bytes.get_wide());
+        owner.bytes = RetainedBytes::new();
+        *owner.imports.get_mut() = ChargedSmallVec::default();
+        *owner.last_import.get_mut() = std::ptr::null_mut();
+        // One idle scope stays charged until reuse or thread destruction.
+        let _ = RECYCLED_SCOPE.try_with(|spare| spare.replace(Some(scope)));
     }
 }
 
@@ -279,6 +320,20 @@ impl ExportBatch {
         }
     }
 
+    pub fn record_rows(
+        &mut self,
+        rows: &[(i64, Row)],
+        inline_row_bytes: Option<std::num::NonZeroUsize>,
+    ) {
+        if self.enabled {
+            let bytes = match inline_row_bytes {
+                Some(bytes) => rows.len() as u128 * bytes.get() as u128,
+                None => rows.iter().map(|(_, row)| row.heap_bytes()).sum(),
+            };
+            self.record_bytes(bytes);
+        }
+    }
+
     pub fn capture(&mut self, row: &Row) -> Row {
         self.record(row);
         row.clone()
@@ -304,9 +359,7 @@ impl ExportBatch {
     #[cold]
     fn bind_scope(&mut self) {
         self.scope = ACTIVE_SCOPE.with(|scope| match &mut *scope.borrow_mut() {
-            ActiveScope::Active(owner) => {
-                Some(Arc::clone(owner.get_or_insert_with(Default::default)))
-            }
+            ActiveScope::Active(owner) => Some(Arc::clone(owner.get_or_insert_with(new_scope))),
             ActiveScope::Inactive => None,
         });
     }
@@ -372,7 +425,7 @@ impl SharedPayloadCharge {
         }
         ACTIVE_SCOPE.with(|scope| {
             if let ActiveScope::Active(owner) = &mut *scope.borrow_mut() {
-                owner.get_or_insert_with(Default::default).import(self);
+                owner.get_or_insert_with(new_scope).import(self);
             }
         });
     }
@@ -393,6 +446,56 @@ impl Clone for PayloadCharge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recycled_scope_clears_exports_and_imports_before_reuse() {
+        RECYCLED_SCOPE.with(|scope| scope.take());
+        let sources = [
+            SharedPayloadCharge::new(512),
+            SharedPayloadCharge::new(128),
+            SharedPayloadCharge::new(256),
+        ];
+        let scope = new_scope();
+        let pointer = Arc::as_ptr(&scope);
+        for source in &sources {
+            scope.import(source);
+            assert_eq!(Arc::weak_count(source), 1);
+        }
+        assert!(scope.imports.lock().spilled());
+        scope.add(64);
+        assert_eq!(scope.exported_bytes(), 960);
+        drop(ResultReadScope(Some(scope)));
+        for source in &sources {
+            assert_eq!(Arc::weak_count(source), 0);
+        }
+        RECYCLED_SCOPE.with(|spare| {
+            let spare = spare.borrow();
+            let scope = spare.as_ref().unwrap();
+            assert_eq!(scope.exported_bytes(), 0);
+            assert!(scope.imports.lock().is_empty());
+            assert!(!scope.imports.lock().spilled());
+            assert!(scope.last_import.load(Ordering::Relaxed).is_null());
+        });
+        let reused = new_scope();
+        assert_eq!(Arc::as_ptr(&reused), pointer);
+        reused.import(&sources[0]);
+        assert_eq!(reused.exported_bytes(), 512);
+        assert_eq!(Arc::weak_count(&sources[0]), 1);
+    }
+
+    #[test]
+    fn shared_scope_is_not_reset_or_recycled() {
+        RECYCLED_SCOPE.with(|scope| scope.take());
+        let scope = new_scope();
+        scope.add(512);
+        drop(ResultReadScope(Some(Arc::clone(&scope))));
+        assert_eq!(scope.exported_bytes(), 512);
+        RECYCLED_SCOPE.with(|spare| assert!(spare.borrow().is_none()));
+        let weak = Arc::downgrade(&scope);
+        drop(ResultReadScope(Some(scope)));
+        assert!(weak.upgrade().is_none());
+        RECYCLED_SCOPE.with(|spare| assert!(spare.borrow().is_none()));
+    }
 
     #[test]
     fn lazy_scope_materializes_only_for_nonzero_exports() {

@@ -7183,8 +7183,8 @@ impl Executor {
         let mut rows = RowVec::with_capacity(1);
         rows.push((0, row));
 
-        Ok(Box::new(ExecutorResult::new(
-            vec![cs.result_column_name.clone()],
+        Ok(Box::new(ExecutorResult::with_arc_columns(
+            cs.result_columns.clone(),
             rows,
         )))
     }
@@ -7398,13 +7398,13 @@ impl Executor {
         };
 
         // Cache the compiled state
-        let compiled_cs = CompiledCountStar {
-            table_name: SmartString::new(&table_name),
-            result_column_name: result_column_name.clone(),
-            cached_epoch: self.engine.schema_epoch(),
-        };
+        let result_columns = CompactArc::new(vec![result_column_name]);
+        let compiled_cs = CompiledCountStar::new(
+            SmartString::new(&table_name),
+            result_columns.clone(),
+            self.engine.schema_epoch(),
+        );
         *compiled_guard = CompiledExecution::CountStar(compiled_cs);
-        drop(compiled_guard);
 
         // Build result
         let mut result_values = CompactVec::with_capacity(1);
@@ -7413,10 +7413,9 @@ impl Executor {
         let mut rows = RowVec::with_capacity(1);
         rows.push((0, row));
 
-        Some(Ok(Box::new(ExecutorResult::new(
-            vec![result_column_name],
-            rows,
-        ))))
+        let result = ExecutorResult::with_arc_columns(result_columns, rows);
+        drop(compiled_guard);
+        Some(Ok(Box::new(result)))
     }
 }
 
@@ -7448,6 +7447,24 @@ mod tests {
         executor
             .execute("INSERT INTO sales VALUES (4, 'clothing', 75)")
             .unwrap();
+    }
+
+    #[test]
+    fn count_star_reuses_names_across_cached_results() {
+        let executor = create_test_executor();
+        setup_test_data(&executor);
+        for sql in [
+            "SELECT COUNT(*) FROM sales",
+            "SELECT COUNT(1) AS retained_count_alias FROM sales",
+        ] {
+            let mut first = executor.execute(sql).unwrap();
+            let mut cached = executor.execute(sql).unwrap();
+            assert_eq!(first.columns().as_ptr(), cached.columns().as_ptr());
+            assert!(first.next());
+            assert!(cached.next());
+            assert_eq!(first.row()[0], Value::Integer(4));
+            assert_eq!(cached.row()[0], Value::Integer(4));
+        }
     }
 
     #[test]
