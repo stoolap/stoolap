@@ -53,7 +53,7 @@ use crate::common::{CompactArc, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::index::memory::{
-    btree_node_bytes, hash_table_bytes, value_bytes, IndexMemory, IndexMemoryOwner, IndexValueMap,
+    btree_node_bytes, hash_table_bytes, IndexMemory, IndexMemoryOwner,
 };
 use crate::storage::traits::Index;
 
@@ -94,7 +94,7 @@ pub struct BitmapIndex {
 
     /// Reverse mapping: row_id -> CompactArc<Value> for efficient removal
     /// Uses I64Map for fast O(1) lookups and CompactArc<Value> (8 bytes per entry)
-    row_to_value: RwLock<IndexValueMap>,
+    row_to_value: RwLock<I64Map<CompactArc<Value>>>,
 
     /// Track cardinality for warnings
     distinct_count: AtomicUsize,
@@ -204,7 +204,6 @@ impl std::ops::Deref for BitmapRows {
 #[derive(Default)]
 struct BitmapStorage {
     map: AHashMap<CompactArc<Value>, BitmapRows>,
-    key_bytes: u128,
     bitmap_bytes: u128,
     capacity_high_water: usize,
 }
@@ -219,7 +218,6 @@ impl BitmapStorage {
         let mut new_key = false;
         let bitmap = self.map.entry(CompactArc::clone(value)).or_insert_with(|| {
             new_key = true;
-            self.key_bytes += value_bytes(value);
             BitmapRows::default()
         });
         let before = bitmap.estimated_bytes();
@@ -237,9 +235,7 @@ impl BitmapStorage {
         bitmap.remove(row_id);
         self.bitmap_bytes = self.bitmap_bytes - before + bitmap.estimated_bytes();
         if bitmap.is_empty() {
-            if let Some((stored, _)) = self.map.remove_entry(value) {
-                self.key_bytes -= value_bytes(&stored);
-            }
+            self.map.remove(value);
             true
         } else {
             false
@@ -311,10 +307,7 @@ impl BitmapIndex {
             is_unique,
             closed: AtomicBool::new(false),
             bitmaps: RwLock::new(BitmapStorage::default()),
-            row_to_value: RwLock::new(IndexValueMap {
-                map,
-                payload_bytes: 0,
-            }),
+            row_to_value: RwLock::new(map),
             distinct_count: AtomicUsize::new(0),
             memory: IndexMemoryOwner::new::<Self>(requested, 0),
         }
@@ -322,16 +315,16 @@ impl BitmapIndex {
 
     fn mutate(
         &self,
-        mutation: impl FnOnce(&mut BitmapStorage, &mut IndexValueMap) -> Result<()>,
+        mutation: impl FnOnce(&mut BitmapStorage, &mut I64Map<CompactArc<Value>>) -> Result<()>,
     ) -> Result<()> {
         let mut bitmaps = self.bitmaps.write();
         let mut reverse = self.row_to_value.write();
-        let before = bitmaps.key_bytes + reverse.requested_bytes();
+        let before = reverse.allocation_bytes() as u128;
         let estimated_before = bitmaps.estimated_bytes();
         let result = mutation(&mut bitmaps, &mut reverse);
         self.memory
             .account
-            .resize(before, bitmaps.key_bytes + reverse.requested_bytes());
+            .resize(before, reverse.allocation_bytes() as u128);
         self.memory
             .account
             .resize_estimate(estimated_before, bitmaps.estimated_bytes());
@@ -445,7 +438,7 @@ impl BitmapIndex {
         row_id: i64,
         row_id_u64: u64,
         bitmaps: &mut BitmapStorage,
-        row_to_value: &mut IndexValueMap,
+        row_to_value: &mut I64Map<CompactArc<Value>>,
     ) -> Result<()> {
         // Create composite key for multi-column lookup
         let arc_key = self.value_to_arc_key(values);
@@ -661,7 +654,7 @@ impl Index for BitmapIndex {
 
         self.mutate(|bitmaps, row_to_value| {
             // Reserve capacity
-            row_to_value.map.reserve(entries.len());
+            row_to_value.reserve(entries.len());
 
             // PRE-CHECK PHASE: Validate all unique constraints BEFORE modifying anything
             // This prevents partial batch execution on failure
@@ -955,21 +948,15 @@ impl Index for BitmapIndex {
 
     fn get_all_values(&self) -> Vec<Value> {
         let bitmaps = self.bitmaps.read();
-        let mut exports = crate::storage::mvcc::read_memory::ExportBatch::new();
         // Dereference CompactArc<Value> to clone inner Value
-        bitmaps
-            .keys()
-            .map(|arc| exports.capture_value(arc))
-            .collect()
+        bitmaps.keys().map(|arc| (**arc).clone()).collect()
     }
 
     fn clear(&self) -> Result<()> {
         self.mutate(|bitmaps, reverse| {
             bitmaps.map.clear();
-            bitmaps.key_bytes = 0;
             bitmaps.bitmap_bytes = 0;
-            reverse.map.clear();
-            reverse.payload_bytes = 0;
+            reverse.clear();
             self.distinct_count.store(0, AtomicOrdering::Relaxed);
             Ok(())
         })
@@ -1098,18 +1085,8 @@ mod tests {
     fn assert_requested_allocations(index: &BitmapIndex) {
         let bitmaps = index.bitmaps.read();
         let reverse = index.row_to_value.read();
-        let payload = |value: &CompactArc<Value>| {
-            (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Value>()) as u128
-                + value.heap_bytes() as u128
-        };
-        let keys: u128 = bitmaps.keys().map(payload).sum();
-        let reverse_keys: u128 = reverse.values().map(payload).sum();
-        assert_eq!(bitmaps.key_bytes, keys);
-        assert_eq!(reverse.payload_bytes, reverse_keys);
         let expected = crate::storage::mvcc::memory::arc_allocation_bytes::<BitmapIndex>() as u128
-            + keys
-            + reverse_keys
-            + reverse.map.allocation_bytes() as u128
+            + reverse.allocation_bytes() as u128
             + index.name.capacity() as u128
             + index.table_name.capacity() as u128
             + (index.column_names.capacity() * std::mem::size_of::<String>()) as u128

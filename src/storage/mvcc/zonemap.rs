@@ -275,13 +275,7 @@ impl TableZoneMap {
         for (name, column) in &self.columns {
             bytes += name.capacity() as u128
                 + column.column_name.capacity() as u128
-                + (column.segments.capacity() * std::mem::size_of::<ZoneMapEntry>()) as u128
-                + column.global_min.as_ref().map_or(0, Value::heap_bytes) as u128
-                + column.global_max.as_ref().map_or(0, Value::heap_bytes) as u128;
-            for segment in &column.segments {
-                bytes += segment.min_value.as_ref().map_or(0, Value::heap_bytes) as u128
-                    + segment.max_value.as_ref().map_or(0, Value::heap_bytes) as u128;
-            }
+                + (column.segments.capacity() * std::mem::size_of::<ZoneMapEntry>()) as u128;
         }
         self.memory.resize(bytes);
     }
@@ -410,7 +404,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn installed_zone_maps_retain_capacity_and_stale_payloads_after_replacement() {
+    fn installed_zone_maps_retain_capacity_after_replacement() {
         let store = crate::storage::mvcc::VersionStore::new(
             "zone_owner",
             crate::core::Schema::new("zone_owner", Vec::new()),
@@ -428,12 +422,16 @@ mod tests {
         store.set_zone_maps(map);
         let old = store.get_zone_maps().unwrap();
         let charged = old.memory.bytes();
-        assert!(charged >= capacity as u128 + 4 * value.heap_bytes() as u128);
+        assert!(charged >= capacity as u128);
         store.mark_zone_maps_stale();
         assert!(old.is_stale());
         assert_eq!(old.memory.bytes(), charged);
         let copy = (*old).clone();
-        assert!(copy.memory.bytes() >= 4 * value.heap_bytes() as u128);
+        assert!(
+            copy.memory.bytes()
+                >= (copy.columns["payload"].segments.capacity()
+                    * std::mem::size_of::<ZoneMapEntry>()) as u128
+        );
         store.set_zone_maps(TableZoneMap::new(1));
         drop(store);
         assert_eq!(old.memory.bytes(), charged);

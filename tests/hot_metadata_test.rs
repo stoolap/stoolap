@@ -19,7 +19,7 @@ use stoolap::storage::index::IndexMemory;
 use stoolap::storage::mvcc::MVCCEngine;
 
 #[test]
-fn metadata_charges_survive_strong_owners_until_weak_backing_is_released() {
+fn metadata_charges_follow_strong_owners() {
     let observer = MVCCEngine::in_memory();
     let bytes = || observer.memory_stats().last().unwrap().hot_metadata_bytes;
     let baseline = bytes();
@@ -44,20 +44,11 @@ fn metadata_charges_survive_strong_owners_until_weak_backing_is_released() {
     let object_bytes = strong - weak;
     assert!(object_bytes >= std::mem::size_of::<IndexMemory>());
     drop(target.memory_stats());
-    assert_eq!(
-        weak - bytes(),
-        object_bytes,
-        "the engine Weak keeps the same allocation envelope charged"
-    );
+    assert_eq!(bytes(), weak);
 
     target.drop_table_internal("metadata_owners").unwrap();
     drop(store);
-    let weak_table = bytes();
     drop(target.memory_stats());
-    assert!(
-        bytes() < weak_table,
-        "the dead table account releases its Weak backing on registry pruning"
-    );
     drop(target);
     assert_eq!(bytes(), baseline);
 }

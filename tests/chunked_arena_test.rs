@@ -18,8 +18,8 @@ use stoolap::storage::Engine;
 use stoolap::{test_failpoints, Database};
 
 #[test]
-fn memory_stats_include_retained_version_payloads() {
-    let db = Database::open("memory://memory_stats_include_retained_version_payloads").unwrap();
+fn memory_stats_include_arena_and_tree_capacity() {
+    let db = Database::open("memory://memory_stats_include_arena_and_tree_capacity").unwrap();
     db.execute(
         "CREATE TABLE items (id INTEGER PRIMARY KEY, value INTEGER)",
         (),
@@ -38,21 +38,15 @@ fn memory_stats_include_retained_version_payloads() {
         .find(|row| row.get::<String>(0).unwrap() == "items")
         .unwrap();
     assert_eq!(table.get::<i64>(2).unwrap(), 48);
-    assert_eq!(table.get::<i64>(8).unwrap(), 96);
-    assert_eq!(table.get::<i64>(9).unwrap(), 0);
+    assert_eq!(table.get::<i64>(8).unwrap(), 0);
+    assert!(table.get::<i64>(9).unwrap() > 0);
     assert_eq!(table.get::<i64>(10).unwrap(), 0);
-    assert!(table.get::<i64>(11).unwrap() > 0);
-    assert_eq!(table.get::<i64>(12).unwrap(), 0);
-    assert_eq!(table.get::<i64>(13).unwrap(), 0);
-    assert!(table.get::<i64>(16).unwrap() > 0);
+    assert!(table.get::<i64>(13).unwrap() > 0);
     db.execute("TRUNCATE TABLE items", ()).unwrap();
     let stats = db.engine().memory_stats();
     let table = stats.iter().find(|row| row.table_name == "items").unwrap();
-    assert_eq!(table.version_payload_bytes, 0);
-    assert_eq!(table.pinned_version_payload_bytes, 0);
     assert_eq!(table.retired_arena_payload_bytes, 0);
     assert_eq!(table.version_tree_bytes, 0);
-    assert_eq!(table.pinned_version_tree_bytes, 0);
 }
 
 #[test]
@@ -73,14 +67,14 @@ fn memory_stats_keep_transaction_history_until_release() {
             .unwrap()
             .transaction_version_bytes
     };
-    assert_eq!(bytes(), 48);
+    assert_eq!(bytes(), 0);
     db.execute("SAVEPOINT first_write", ()).unwrap();
     db.execute("UPDATE items SET value = 20 WHERE id = 1", ())
         .unwrap();
     let with_history = bytes();
-    assert!(with_history > 96);
+    assert!(with_history > 0);
     db.execute("ROLLBACK TO SAVEPOINT first_write", ()).unwrap();
-    assert_eq!(bytes(), with_history - 48);
+    assert_eq!(bytes(), with_history);
     db.execute("COMMIT", ()).unwrap();
     assert_eq!(bytes(), 0);
 }
@@ -109,11 +103,9 @@ fn memory_totals_retain_dropped_table_until_payload_destruction() {
         .1;
     let stats = db.engine().memory_stats();
     let current = stats.iter().find(|row| row.table_name == "items").unwrap();
-    assert_eq!(current.version_payload_bytes, 32);
     let tree_bytes = current.version_tree_bytes;
     assert!(tree_bytes > 0);
     let total = stats.last().unwrap();
-    assert_eq!(total.version_payload_bytes, 80);
     assert_eq!(total.version_tree_bytes, tree_bytes * 2);
     assert_eq!(total.arena_capacity_bytes, old_capacity + current_capacity);
     let weak = std::sync::Arc::downgrade(&old);
@@ -127,10 +119,6 @@ fn memory_totals_retain_dropped_table_until_payload_destruction() {
         );
         let stats = reader.engine().memory_stats();
         let total = stats.last().unwrap();
-        assert_eq!(
-            total.version_payload_bytes, 80,
-            "payloads remain charged during destruction"
-        );
         assert_eq!(total.version_tree_bytes, tree_bytes * 2);
         assert_eq!(total.hot_bytes, 80);
         assert_eq!(total.arena_capacity_bytes, old_capacity + current_capacity);
@@ -140,7 +128,6 @@ fn memory_totals_retain_dropped_table_until_payload_destruction() {
     assert!(observed.load(std::sync::atomic::Ordering::Relaxed));
     let stats = db.engine().memory_stats();
     let total = stats.last().unwrap();
-    assert_eq!(total.version_payload_bytes, 32);
     assert_eq!(total.version_tree_bytes, tree_bytes);
     assert_eq!(total.hot_bytes, 32);
     assert_eq!(total.arena_capacity_bytes, current_capacity);

@@ -156,10 +156,6 @@ impl MVCCScanner {
 }
 
 impl Scanner for MVCCScanner {
-    fn is_materialized(&self) -> bool {
-        true
-    }
-
     fn next(&mut self) -> bool {
         if self.closed || self.error.is_some() {
             return false;
@@ -306,10 +302,6 @@ impl RangeScanner {
 }
 
 impl Scanner for RangeScanner {
-    fn is_materialized(&self) -> bool {
-        true
-    }
-
     fn next(&mut self) -> bool {
         if self.error.is_some() {
             return false;
@@ -370,10 +362,6 @@ impl Default for EmptyScanner {
 }
 
 impl Scanner for EmptyScanner {
-    fn is_materialized(&self) -> bool {
-        true
-    }
-
     fn next(&mut self) -> bool {
         false
     }
@@ -415,10 +403,6 @@ impl SingleRowScanner {
 }
 
 impl Scanner for SingleRowScanner {
-    fn is_materialized(&self) -> bool {
-        true
-    }
-
     fn next(&mut self) -> bool {
         if self.done {
             false

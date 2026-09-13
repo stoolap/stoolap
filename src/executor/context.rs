@@ -35,9 +35,8 @@ const SEMI_JOIN_CACHE_SIZE: usize = 256;
 
 use crate::api::params::ParamVec;
 use crate::common::{CompactArc, StringMap};
-use crate::core::{Result, Row, Schema, Value, ValueMap, ValueSet};
+use crate::core::{Result, Row, Value, ValueMap, ValueSet};
 use crate::storage::mvcc::memory::{hash_table_bytes, HotMetadataCharge};
-use crate::storage::mvcc::read_memory::{charge_bytes_export, SharedPayloadCharge};
 
 // Static defaults for ExecutionContext to avoid allocations for empty values.
 // These are shared across all contexts and only require Arc refcount bump on clone.
@@ -58,11 +57,7 @@ static EMPTY_SESSION_VARS: LazyLock<Arc<AHashMap<String, Value>>> =
 use smallvec::SmallVec;
 
 /// Cached scalar subquery entry: (tables_referenced for invalidation, result value)
-type ScalarSubqueryCacheEntry = (
-    SmallVec<[CompactArc<str>; 2]>,
-    Value,
-    Arc<SharedPayloadCharge>,
-);
+type ScalarSubqueryCacheEntry = (SmallVec<[CompactArc<str>; 2]>, Value);
 
 thread_local! {
     static SCALAR_SUBQUERY_CACHE: RefCell<LruCache<String, ScalarSubqueryCacheEntry>> =
@@ -90,7 +85,7 @@ pub fn invalidate_scalar_subquery_cache_for_table(table_name: &str) {
         // Collect keys to remove (LruCache doesn't have retain)
         let keys_to_remove: Vec<String> = c
             .iter()
-            .filter(|(_, (tables, _, _))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
+            .filter(|(_, (tables, _))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
             .map(|(k, _)| k.clone())
             .collect();
         for key in keys_to_remove {
@@ -101,19 +96,13 @@ pub fn invalidate_scalar_subquery_cache_for_table(table_name: &str) {
 
 /// Get a cached scalar subquery result by SQL string key.
 pub fn get_cached_scalar_subquery(key: &str) -> Option<Value> {
-    SCALAR_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().get(key).map(|(_, value, payload)| {
-            payload.import();
-            value.clone()
-        })
-    })
+    SCALAR_SUBQUERY_CACHE.with(|cache| cache.borrow_mut().get(key).map(|(_, v)| v.clone()))
 }
 
 /// Cache a scalar subquery result with the tables it references.
 pub fn cache_scalar_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>, value: Value) {
-    let payload = SharedPayloadCharge::new(value.heap_bytes() as u128);
     SCALAR_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().put(key, (tables, value, payload));
+        cache.borrow_mut().put(key, (tables, value));
     });
 }
 
@@ -129,7 +118,6 @@ type InSubqueryCacheEntry = (
     SmallVec<[CompactArc<str>; 2]>,
     Vec<Value>,
     Option<CompactArc<crate::core::ValueSet>>,
-    Arc<SharedPayloadCharge>,
 );
 
 thread_local! {
@@ -158,9 +146,7 @@ pub fn invalidate_in_subquery_cache_for_table(table_name: &str) {
         // Collect keys to remove (LruCache doesn't have retain)
         let keys_to_remove: Vec<String> = c
             .iter()
-            .filter(|(_, (tables, _, _, _))| {
-                tables.iter().any(|t| t.eq_ignore_ascii_case(table_name))
-            })
+            .filter(|(_, (tables, _, _))| tables.iter().any(|t| t.eq_ignore_ascii_case(table_name)))
             .map(|(k, _)| k.clone())
             .collect();
         for key in keys_to_remove {
@@ -171,12 +157,7 @@ pub fn invalidate_in_subquery_cache_for_table(table_name: &str) {
 
 /// Get a cached IN subquery result by SQL string key.
 pub fn get_cached_in_subquery(key: &str) -> Option<Vec<Value>> {
-    IN_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().get(key).map(|(_, values, _, payload)| {
-            payload.import();
-            values.clone()
-        })
-    })
+    IN_SUBQUERY_CACHE.with(|cache| cache.borrow_mut().get(key).map(|(_, v, _)| v.clone()))
 }
 
 /// Get a cached IN subquery result as a shared hash set, building and
@@ -186,7 +167,6 @@ pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<crate::core::V
     IN_SUBQUERY_CACHE.with(|cache| {
         let mut c = cache.borrow_mut();
         let entry = c.get_mut(key)?;
-        entry.3.import();
         if entry.2.is_none() {
             entry.2 = Some(CompactArc::new(entry.1.iter().cloned().collect()));
         }
@@ -196,10 +176,8 @@ pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<crate::core::V
 
 /// Cache an IN subquery result with the tables it references.
 pub fn cache_in_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>, values: Vec<Value>) {
-    // The lazily built set can retain a second copy of each value's children.
-    let payload = SharedPayloadCharge::new(values.iter().map(|v| 2 * v.heap_bytes() as u128).sum());
     IN_SUBQUERY_CACHE.with(|cache| {
-        cache.borrow_mut().put(key, (tables, values, None, payload));
+        cache.borrow_mut().put(key, (tables, values, None));
     });
 }
 
@@ -245,11 +223,7 @@ use ahash::AHashMap;
 use std::hash::{Hash, Hasher};
 
 /// Cached semi-join entry: (table_name for invalidation, hash_set values)
-type SemiJoinCacheEntry = (
-    CompactArc<str>,
-    CompactArc<ValueSet>,
-    Arc<SharedPayloadCharge>,
-);
+type SemiJoinCacheEntry = (CompactArc<str>, CompactArc<ValueSet>);
 
 /// Compute a cache key hash from table, column, and predicate hash without allocation.
 #[inline]
@@ -287,7 +261,7 @@ pub fn invalidate_semi_join_cache_for_table(table_name: &str) {
         // Collect keys to remove (LruCache doesn't have retain)
         let keys_to_remove: Vec<u64> = c
             .iter()
-            .filter(|(_, (key_table, _, _))| key_table.eq_ignore_ascii_case(table_name))
+            .filter(|(_, (key_table, _))| key_table.eq_ignore_ascii_case(table_name))
             .map(|(k, _)| *k)
             .collect();
         for key in keys_to_remove {
@@ -303,21 +277,17 @@ pub fn get_cached_semi_join(key_hash: u64) -> Option<CompactArc<ValueSet>> {
         cache
             .borrow_mut()
             .get(&key_hash)
-            .map(|(_, values, payload)| {
-                payload.import();
-                CompactArc::clone(values)
-            })
+            .map(|(_, v)| CompactArc::clone(v))
     })
 }
 
 /// Cache a semi-join hash set result (CompactArc version for zero-copy).
 #[inline]
 pub fn cache_semi_join_arc(key_hash: u64, table: &str, values: CompactArc<ValueSet>) {
-    let payload = SharedPayloadCharge::new(values.iter().map(|v| v.heap_bytes() as u128).sum());
     SEMI_JOIN_CACHE.with(|cache| {
         cache
             .borrow_mut()
-            .put(key_hash, (CompactArc::from(table), values, payload));
+            .put(key_hash, (CompactArc::from(table), values));
     });
 }
 
@@ -444,8 +414,8 @@ impl ExistsSchemaCache {
         let bytes = hash_table_bytes::<String, CompactArc<Vec<String>>>(self.entries.capacity())
             + self
                 .entries
-                .iter()
-                .map(|(key, names)| key.capacity() as u128 + Schema::column_names_bytes(names))
+                .keys()
+                .map(|key| key.capacity() as u128)
                 .sum::<u128>();
         self.memory.resize(bytes);
     }
@@ -479,7 +449,6 @@ pub fn get_cached_exists_schema(key: &str) -> Option<CompactArc<Vec<String>>> {
 
 /// Cache table column names (takes Arc for zero-copy sharing).
 pub fn cache_exists_schema(key: String, columns: CompactArc<Vec<String>>) {
-    charge_bytes_export(Schema::column_names_bytes(&columns));
     EXISTS_SCHEMA_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
         cache.entries.insert(key, columns);
@@ -517,10 +486,8 @@ pub fn cache_exists_pred_key(subquery_ptr: usize, pred_key: String) {
 // Cache for batch aggregate subquery results (e.g., COUNT(*) GROUP BY user_id).
 // Thread-local to avoid synchronization overhead.
 // The key is a stable identifier for the subquery, the value is a map from group key to aggregate value.
-type BatchAggregateCacheEntry = (CompactArc<ValueMap<Value>>, Arc<SharedPayloadCharge>);
-
 thread_local! {
-    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<String, BatchAggregateCacheEntry>> = RefCell::new(FxHashMap::default());
+    static BATCH_AGGREGATE_CACHE: RefCell<FxHashMap<String, CompactArc<ValueMap<Value>>>> = RefCell::new(FxHashMap::default());
 }
 
 /// Clear the batch aggregate cache. Should be called at the start of each top-level query.
@@ -534,26 +501,13 @@ pub fn clear_batch_aggregate_cache() {
 
 /// Get a cached batch aggregate result map by subquery identifier.
 pub fn get_cached_batch_aggregate(key: &str) -> Option<CompactArc<ValueMap<Value>>> {
-    BATCH_AGGREGATE_CACHE.with(|cache| {
-        cache.borrow().get(key).map(|(values, payload)| {
-            payload.import();
-            CompactArc::clone(values)
-        })
-    })
+    BATCH_AGGREGATE_CACHE.with(|cache| cache.borrow().get(key).cloned())
 }
 
 /// Cache a batch aggregate result map.
 pub fn cache_batch_aggregate(key: String, values: ValueMap<Value>) {
-    let payload = SharedPayloadCharge::new(
-        values
-            .iter()
-            .map(|(k, v)| k.heap_bytes() as u128 + v.heap_bytes() as u128)
-            .sum(),
-    );
     BATCH_AGGREGATE_CACHE.with(|cache| {
-        cache
-            .borrow_mut()
-            .insert(key, (CompactArc::new(values), payload));
+        cache.borrow_mut().insert(key, CompactArc::new(values));
     });
 }
 
@@ -1500,36 +1454,6 @@ impl Default for ExecutionContextBuilder {
 mod tests {
     use super::*;
     use rustc_hash::FxHashMap;
-
-    #[test]
-    fn exists_names_keep_capacity_and_exports_after_cache_clear() {
-        clear_exists_schema_cache();
-        let scope = Arc::new(crate::storage::mvcc::read_memory::ReadScope::default());
-        let _active = scope.enter();
-        let name = "retained_exists_column".repeat(256);
-        let schema = Schema::new(
-            "exists_names",
-            vec![crate::core::SchemaColumn::nullable(
-                0,
-                &name,
-                crate::core::DataType::Text,
-            )],
-        );
-        cache_exists_schema("exists_names".to_string(), schema.column_names_arc());
-        let names = get_cached_exists_schema("exists_names").unwrap();
-        drop(schema);
-        EXISTS_SCHEMA_CACHE
-            .with(|cache| assert!(cache.borrow().memory.bytes() >= name.len() as u128));
-        clear_exists_schema_cache();
-        assert_eq!(names[0], name);
-        assert!(scope.exported_bytes() >= name.len() as u128);
-        EXISTS_SCHEMA_CACHE.with(|cache| {
-            let mut cache = cache.borrow_mut();
-            assert!(cache.memory.bytes() > 0, "clear retains the map allocation");
-            cache.shrink_to_fit();
-            assert_eq!(cache.memory.bytes(), 0);
-        });
-    }
 
     #[test]
     fn test_context_new() {

@@ -1215,13 +1215,6 @@ impl VolumeScanner {
 }
 
 impl Scanner for VolumeScanner {
-    fn bind_read_scope(&mut self, scope: Option<&Arc<crate::storage::mvcc::ReadScope>>) -> bool {
-        if let Some(mapping) = &mut self.column_mapping {
-            mapping.exports.bind(scope);
-        }
-        true
-    }
-
     fn next(&mut self) -> bool {
         match self.next_row() {
             Ok(has_row) => has_row,
@@ -1293,14 +1286,6 @@ impl MergingScanner {
 }
 
 impl Scanner for MergingScanner {
-    fn bind_read_scope(&mut self, scope: Option<&Arc<crate::storage::mvcc::ReadScope>>) -> bool {
-        let mut bound = true;
-        for source in &mut self.sources {
-            bound &= source.bind_read_scope(scope);
-        }
-        bound
-    }
-
     fn next(&mut self) -> bool {
         while self.current_source < self.sources.len() {
             if self.sources[self.current_source].next() {
@@ -1394,10 +1379,6 @@ impl RowVecScanner {
 }
 
 impl Scanner for RowVecScanner {
-    fn is_materialized(&self) -> bool {
-        true
-    }
-
     fn next(&mut self) -> bool {
         if self.index < self.rows.len() {
             self.index += 1;

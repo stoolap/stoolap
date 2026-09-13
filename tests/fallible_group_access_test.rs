@@ -968,7 +968,10 @@ fn assert_row_materializer_failure(which: usize) {
     use stoolap::storage::volume::writer::{ColSource, ColumnMapping};
     let mut volume = two_column_volume();
     volume.columns = malformed_columns();
-    let mapping = ColumnMapping::new(vec![ColSource::Volume(0), ColSource::Volume(1)], true);
+    let mapping = ColumnMapping {
+        sources: vec![ColSource::Volume(0), ColSource::Volume(1)],
+        is_identity: true,
+    };
     assert_io_failure(
         || match which {
             0 => volume.get_row(0),
@@ -1019,10 +1022,10 @@ fn projections_leave_unrequested_corrupt_columns_untouched() {
     use stoolap::storage::volume::writer::{ColSource, ColumnMapping};
     let mut volume = two_column_volume();
     volume.columns = malformed_columns();
-    let mapping = ColumnMapping::new(
-        vec![ColSource::Volume(0), ColSource::Default(Value::Integer(9))],
-        false,
-    );
+    let mapping = ColumnMapping {
+        sources: vec![ColSource::Volume(0), ColSource::Default(Value::Integer(9))],
+        is_identity: false,
+    };
     for row in [
         volume.get_row_projected(0, &[0]).unwrap(),
         volume.get_row_needed(0, &[true, false]).unwrap(),

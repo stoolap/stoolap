@@ -9819,11 +9819,8 @@ impl Executor {
                     "chain_entries".to_string(),
                     "volume_bytes".to_string(),
                     "admission_waits".to_string(),
-                    "version_payload_bytes".to_string(),
-                    "pinned_version_payload_bytes".to_string(),
                     "retired_arena_payload_bytes".to_string(),
                     "version_tree_bytes".to_string(),
-                    "pinned_version_tree_bytes".to_string(),
                     "transaction_version_bytes".to_string(),
                     "transaction_undo_bytes".to_string(),
                     "transaction_map_bytes".to_string(),
@@ -9832,7 +9829,6 @@ impl Executor {
                     "index_scratch_bytes".to_string(),
                     "row_claim_bytes".to_string(),
                     "row_pool_bytes".to_string(),
-                    "exported_payload_bytes".to_string(),
                     "transaction_registry_bytes".to_string(),
                     "hot_metadata_bytes".to_string(),
                 ];
@@ -9852,18 +9848,9 @@ impl Executor {
                             Value::Integer(stat.volume_bytes as i64),
                             Value::Integer(stat.admission_waits as i64),
                             Value::Integer(
-                                stat.version_payload_bytes.min(i64::MAX as usize) as i64,
-                            ),
-                            Value::Integer(
-                                stat.pinned_version_payload_bytes.min(i64::MAX as usize) as i64,
-                            ),
-                            Value::Integer(
                                 stat.retired_arena_payload_bytes.min(i64::MAX as usize) as i64,
                             ),
                             Value::Integer(stat.version_tree_bytes.min(i64::MAX as usize) as i64),
-                            Value::Integer(
-                                stat.pinned_version_tree_bytes.min(i64::MAX as usize) as i64,
-                            ),
                             Value::Integer(
                                 stat.transaction_version_bytes.min(i64::MAX as usize) as i64,
                             ),
@@ -9884,7 +9871,6 @@ impl Executor {
                             ),
                             Value::Integer(stat.row_claim_bytes.min(i64::MAX as usize) as i64),
                             Value::Integer(stat.row_pool_bytes.min(i64::MAX as usize) as i64),
-                            Value::Integer(stat.exported_payload_bytes.min(i64::MAX as usize) as i64),
                             Value::Integer(
                                 stat.transaction_registry_bytes.min(i64::MAX as usize) as i64,
                             ),
@@ -11495,7 +11481,6 @@ impl Executor {
 
                 // Build result row - only clone group_value when we need to keep it
                 let mut values = Vec::with_capacity(1 + num_aggs);
-                crate::storage::mvcc::read_memory::charge_value_export(group_value);
                 values.push(group_value.clone());
                 for (i, agg) in simple_aggs.iter().enumerate() {
                     let value = match agg {

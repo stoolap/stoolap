@@ -47,7 +47,6 @@ use crate::storage::mvcc::memory::{
     arc_allocation_bytes, name_bytes, smallvec_bytes, HotMetadataCharge, HotObjectCharge, NamedMap,
     RetainedBytes, TableMemory,
 };
-use crate::storage::mvcc::read_memory::{charge_bytes_export, charge_value_export, ExportBatch};
 #[cfg(not(test))]
 use crate::storage::mvcc::registry::TransactionRegistry;
 use crate::storage::Index;
@@ -202,82 +201,15 @@ struct VersionChainEntry {
     arena_idx: Option<ArenaSlot>,
 }
 
-impl VersionChainEntry {
-    fn payloads(&self) -> VersionPayloads {
-        let mut payloads = VersionPayloads::default();
-        payloads.add_row(&self.version.data);
-        let mut current = self.prev.as_deref();
-        while let Some(entry) = current {
-            payloads.add_row(&entry.version.data);
-            current = entry.prev.as_deref();
-        }
-        payloads
-    }
-}
-
-#[derive(Clone, Copy, Default)]
-struct VersionPayloads {
-    shared_and_children: u128,
-    // Complete row-payload high-water bound, reset when no versions remain.
-    row_bound: u128,
-    versions: usize,
-    owned_rows: usize,
-    // COW clones may shrink vectors. This maximum bounds every remaining owner.
-    owned_capacity: usize,
-}
-
-impl VersionPayloads {
-    fn add_row(&mut self, row: &Row) {
-        self.versions += 1;
-        let mut bytes = row.heap_bytes();
-        let shared_storage =
-            2 * std::mem::size_of::<usize>() + row.len() * std::mem::size_of::<Value>();
-        self.row_bound = self
-            .row_bound
-            .max(bytes + shared_storage.saturating_sub(row.storage_bytes()) as u128);
-        if let Some(capacity) = row.owned_capacity() {
-            bytes -= (capacity * std::mem::size_of::<Value>()) as u128;
-            self.owned_rows += 1;
-            self.owned_capacity = self.owned_capacity.max(capacity);
-        }
-        self.shared_and_children += bytes;
-    }
-
-    fn add_shared(&mut self, bytes: u128) {
-        self.shared_and_children += bytes;
-        self.versions += 1;
-        self.row_bound = self.row_bound.max(bytes);
-    }
-
-    fn remove(&mut self, removed: Self) {
-        self.shared_and_children -= removed.shared_and_children;
-        self.versions -= removed.versions;
-        self.owned_rows -= removed.owned_rows;
-        if self.versions == 0 {
-            self.row_bound = 0;
-        }
-        if self.owned_rows == 0 {
-            self.owned_capacity = 0;
-        }
-    }
-
-    fn bytes(&self) -> u128 {
-        self.shared_and_children
-            + self.owned_rows as u128
-                * self.owned_capacity as u128
-                * std::mem::size_of::<Value>() as u128
-    }
-}
-
 #[derive(Default)]
 struct VersionTree {
     entries: CowBTree<VersionChainEntry>,
-    payloads: VersionPayloads,
+    version_count: usize,
 }
 
 impl VersionTree {
     fn tree_bytes(&self) -> u128 {
-        let links = self.payloads.versions - self.entries.len();
+        let links = self.version_count - self.entries.len();
         self.entries.node_bytes() as u128
             + links as u128
                 * (2 * std::mem::size_of::<usize>() + std::mem::size_of::<VersionChainEntry>())
@@ -285,10 +217,6 @@ impl VersionTree {
     }
 
     fn publish_memory(&self, account: &TableMemory) {
-        account.version_payloads.store(
-            self.payloads.bytes().min(usize::MAX as u128) as usize,
-            Ordering::Release,
-        );
         account.version_tree.store(
             self.tree_bytes().min(usize::MAX as u128) as usize,
             Ordering::Release,
@@ -532,54 +460,7 @@ pub trait VisibilityChecker: Send + Sync {
 /// Opaque snapshot of the version store at extraction time.
 /// Used by `remove_sealed_rows` to detect concurrent commits.
 pub struct ExtractionSnapshot {
-    inner: VersionSnapshot,
-}
-
-struct VersionSnapshot {
     inner: crate::common::CowBTree<VersionChainEntry>,
-    // Fields drop in order: release the tree before its charge.
-    _charge: VersionSnapshotCharge,
-}
-
-impl std::ops::Deref for VersionSnapshot {
-    type Target = crate::common::CowBTree<VersionChainEntry>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-struct VersionSnapshotCharge {
-    account: Arc<TableMemory>,
-    row_bound: u128,
-    bytes: u128,
-    tree_bytes: u128,
-}
-
-impl VersionSnapshotCharge {
-    fn new(account: &Arc<TableMemory>, versions: &VersionTree) -> Self {
-        let bytes = versions.payloads.bytes();
-        let tree_bytes = versions.tree_bytes();
-        {
-            let mut pinned = account.pinned_versions.lock();
-            pinned.payloads += bytes;
-            pinned.tree += tree_bytes;
-        }
-        Self {
-            account: Arc::clone(account),
-            row_bound: versions.payloads.row_bound,
-            bytes,
-            tree_bytes,
-        }
-    }
-}
-
-impl Drop for VersionSnapshotCharge {
-    fn drop(&mut self) {
-        let mut pinned = self.account.pinned_versions.lock();
-        pinned.payloads -= self.bytes;
-        pinned.tree -= self.tree_bytes;
-    }
 }
 
 /// Token holding pre-removal snapshot data needed for deferred index cleanup.
@@ -593,7 +474,7 @@ pub struct SealedIndexCleanup {
 /// Truncated storage is released when this result leaves the caller's fence.
 pub struct TruncateResult {
     pub rows_affected: i32,
-    _versions: Option<VersionSnapshot>,
+    _versions: Option<crate::common::CowBTree<VersionChainEntry>>,
     _arena: ArenaRetirement,
 }
 
@@ -645,11 +526,7 @@ pub(crate) struct PreparedTable {
 
 impl PreparedCommit {
     pub(crate) fn new(tables: SmallVec<[PreparedTable; 4]>) -> Self {
-        let bytes = smallvec_bytes(&tables) as u128
-            + tables
-                .iter()
-                .map(|table| name_bytes(&table.name))
-                .sum::<u128>();
+        let bytes = smallvec_bytes(&tables) as u128;
         Self {
             tables,
             _metadata: HotMetadataCharge::new(bytes),
@@ -741,10 +618,6 @@ impl IndexUndo {
                         .iter()
                         .map(|(_, values)| {
                             values.capacity() as u128 * std::mem::size_of::<Value>() as u128
-                                + values
-                                    .iter()
-                                    .map(|value| value.heap_bytes() as u128)
-                                    .sum::<u128>()
                         })
                         .sum::<u128>()
             })
@@ -1047,16 +920,12 @@ impl VersionStore {
     }
 
     #[inline]
-    fn capture_versions(&self) -> VersionSnapshot {
-        let versions = self.versions.read();
-        VersionSnapshot {
-            inner: versions.entries.clone(),
-            _charge: VersionSnapshotCharge::new(&self.memory, &versions),
-        }
+    fn capture_versions(&self) -> crate::common::CowBTree<VersionChainEntry> {
+        self.versions.read().entries.clone()
     }
 
     #[inline]
-    fn snapshot_versions(&self) -> VersionSnapshot {
+    fn snapshot_versions(&self) -> crate::common::CowBTree<VersionChainEntry> {
         let versions = self.capture_versions();
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::version_root_captured();
@@ -1147,8 +1016,11 @@ impl VersionStore {
             None => self.arena.reserve(usize::from(!version.is_deleted()))?,
         };
         let mut versions = self.versions.write();
-        let VersionTree { entries, payloads } = &mut *versions;
-        let delta = self.install_version(entries, &mut reservation, payloads, row_id, version);
+        let VersionTree {
+            entries,
+            version_count,
+        } = &mut *versions;
+        let delta = self.install_version(entries, &mut reservation, version_count, row_id, version);
         versions.publish_memory(&self.memory);
         if delta != 0 {
             self.committed_row_count
@@ -1161,7 +1033,7 @@ impl VersionStore {
         &self,
         versions: &mut crate::common::CowBTree<VersionChainEntry>,
         reservation: &mut ArenaReservation,
-        payloads: &mut VersionPayloads,
+        version_count: &mut usize,
         row_id: i64,
         version: RowVersion,
     ) -> isize {
@@ -1204,7 +1076,7 @@ impl VersionStore {
                     // Convert Row to Arc once (takes ownership, no copy if already Arc)
                     let arc_data = std::mem::take(&mut new_version.data).into_arc();
 
-                    let (idx, bytes) = self.arena.install(
+                    let (idx, _) = self.arena.install(
                         reservation,
                         existing_arena_idx,
                         row_id,
@@ -1215,19 +1087,17 @@ impl VersionStore {
                     // Reuse the Arc for the version's data - enables O(1) clone on read
                     new_version.data = Row::from_arc(arc_data);
 
-                    payloads.add_shared(bytes);
                     Some(idx)
                 } else {
                     // Deleted version - mark arena as deleted for visibility
                     if let Some(old_arena_idx) = existing_arena_idx {
                         self.arena.mark_deleted(old_arena_idx, new_version.txn_id);
                     }
-                    payloads.add_row(&new_version.data);
                     existing_arena_idx
                 };
 
                 if can_reuse_arena {
-                    payloads.remove(existing.payloads());
+                    *version_count -= existing_depth;
                 }
 
                 // Build version chain entry
@@ -1266,7 +1136,7 @@ impl VersionStore {
                     // Convert Row to Arc once (takes ownership, no copy if already Arc)
                     let arc_data = std::mem::take(&mut v.data).into_arc();
                     // Insert Arc into arena (just Arc::clone, no data copy)
-                    let (idx, bytes) = self.arena.install(
+                    let (idx, _) = self.arena.install(
                         reservation,
                         None,
                         row_id,
@@ -1275,10 +1145,8 @@ impl VersionStore {
                     );
                     // Create version with Arc-backed data for O(1) clone
                     v.data = Row::from_arc(arc_data);
-                    payloads.add_shared(bytes);
                     (Some(idx), v)
                 } else {
-                    payloads.add_row(&version.data);
                     (None, version)
                 };
 
@@ -1292,6 +1160,7 @@ impl VersionStore {
                 vacant.insert(new_entry);
             }
         }
+        *version_count += 1;
         delta
     }
 
@@ -1302,9 +1171,12 @@ impl VersionStore {
     ) {
         let mut versions = self.versions.write();
         let mut delta = 0;
-        let VersionTree { entries, payloads } = &mut *versions;
+        let VersionTree {
+            entries,
+            version_count,
+        } = &mut *versions;
         for (row_id, version) in batch {
-            delta += self.install_version(entries, reservation, payloads, row_id, version);
+            delta += self.install_version(entries, reservation, version_count, row_id, version);
         }
         versions.publish_memory(&self.memory);
         if delta != 0 {
@@ -1341,7 +1213,6 @@ impl VersionStore {
                         return None;
                     }
                     let data = Row::from_arc(CompactArc::clone(payload));
-                    charge_bytes_export(arena_guard.row_bound());
                     return Some(RowVersion {
                         txn_id: meta.txn_id,
                         deleted_at_txn_id: meta.deleted_at_txn_id,
@@ -1370,7 +1241,6 @@ impl VersionStore {
                 return None;
             }
             let row = chain.version.data.clone();
-            charge_bytes_export(versions.payloads.row_bound);
             return Some(RowVersion {
                 txn_id: head_txn_id,
                 deleted_at_txn_id: head_deleted_at,
@@ -1390,7 +1260,6 @@ impl VersionStore {
                 if deleted_at_txn_id != 0 && checker.is_visible(deleted_at_txn_id, txn_id) {
                     return None;
                 }
-                charge_bytes_export(versions.payloads.row_bound);
                 return Some(e.version.clone());
             }
             current = e.prev.as_ref().map(|b| b.as_ref());
@@ -1474,8 +1343,6 @@ impl VersionStore {
         // Lock ordering: versions first, then arena (matches commit path)
         let versions = self.versions.read();
         let arena_guard = self.arena.read_guard();
-        let mut exports =
-            ExportBatch::for_rows(versions.payloads.row_bound.max(arena_guard.row_bound()));
 
         // Fast path: if both arena and version tree are empty, no rows can match.
         // This avoids iterating millions of phantom row_ids from volume-populated indexes.
@@ -1529,7 +1396,6 @@ impl VersionStore {
                 }
             }
         }
-        exports.record_rows(results.len());
         results
     }
 
@@ -1555,7 +1421,6 @@ impl VersionStore {
         };
 
         let versions = self.capture_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
         let mut payloads: [Option<CompactArc<[Value]>>; 128] = std::array::from_fn(|_| None);
         let mut remaining = row_ids;
         let mut batch_size = 1;
@@ -1565,9 +1430,6 @@ impl VersionStore {
                 let current = self.versions.read();
                 let live = versions.shares_root(&current).then_some(current);
                 let arena = live.as_ref().map(|_| self.arena.read_guard());
-                if let Some(arena) = &arena {
-                    exports.include_row_bound(arena.row_bound());
-                }
                 let mut last_visible_txn = 0;
                 for (&row_id, slot) in remaining[..count].iter().zip(&mut payloads[..count]) {
                     if let Some((meta, payload)) = arena.as_ref().and_then(|a| a.probe(row_id)) {
@@ -1596,14 +1458,6 @@ impl VersionStore {
                         current = entry.prev.as_deref();
                     }
                 }
-                // Arena-only payloads must stay charged after the seal gap's read guard drops.
-                exports.record_rows(
-                    payloads[..count]
-                        .iter()
-                        .filter(|slot| slot.is_some())
-                        .count(),
-                );
-                exports.publish();
             }
             for (&row_id, slot) in remaining[..count].iter().zip(&mut payloads[..count]) {
                 if let Some(payload) = slot.take() {
@@ -1771,7 +1625,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         for &row_id in row_ids {
             if let Some(chain) = versions.get(row_id) {
@@ -1784,7 +1637,7 @@ impl VersionStore {
                     if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
                         let mut version_copy = chain.version.clone();
                         version_copy.create_time = current_seq;
-                        results.push((row_id, exports.capture(&chain.version.data), version_copy));
+                        results.push((row_id, chain.version.data.clone(), version_copy));
                     }
                     continue;
                 }
@@ -1804,7 +1657,7 @@ impl VersionStore {
                             // Store the current sequence in create_time for later retrieval
                             // (This is a bit of a hack, but avoids changing the struct)
                             version_copy.create_time = current_seq;
-                            results.push((row_id, exports.capture(&e.version.data), version_copy));
+                            results.push((row_id, e.version.data.clone(), version_copy));
                         }
                         break;
                     }
@@ -1847,7 +1700,6 @@ impl VersionStore {
                 if e.version.deleted_at_txn_id != 0 && e.version.deleted_at_txn_id <= as_of_txn_id {
                     return None;
                 }
-                charge_bytes_export(versions.payloads.row_bound);
                 return Some(e.version.clone());
             }
             current = e.prev.as_ref().map(|b| b.as_ref());
@@ -1880,7 +1732,6 @@ impl VersionStore {
                 if e.version.deleted_at_txn_id != 0 {
                     return None;
                 }
-                charge_bytes_export(versions.payloads.row_bound);
                 return Some(e.version.clone());
             }
             current = e.prev.as_ref().map(|b| b.as_ref());
@@ -2079,17 +1930,6 @@ impl VersionStore {
         self.arena.bytes()
     }
 
-    /// Canonical, pinned-root and retired-arena payload bounds, with shared overcount.
-    #[cfg(test)]
-    pub(crate) fn version_payload_footprint(&self) -> (usize, usize, usize) {
-        let usage = self.memory.usage();
-        (
-            usage.version_payloads,
-            usage.pinned_version_payloads,
-            usage.retired_arena_payloads,
-        )
-    }
-
     pub(crate) fn memory_account(&self) -> &Arc<TableMemory> {
         &self.memory
     }
@@ -2111,7 +1951,7 @@ impl VersionStore {
     /// Previous versions kept alive by the version chains
     pub fn chain_entries(&self) -> usize {
         let versions = self.versions.read();
-        versions.payloads.versions - versions.len()
+        versions.version_count - versions.len()
     }
 
     /// Check if a row_id exists in the committed version store (B-tree).
@@ -2215,16 +2055,12 @@ impl VersionStore {
             let mut versions = self.versions.write();
             let arena = self.arena.clear_all()?;
             let count = self.committed_row_count.swap(0, Ordering::SeqCst) as i32;
-            let charge = VersionSnapshotCharge::new(&self.memory, &versions);
             let entries = std::mem::take(&mut versions.entries);
-            versions.payloads = VersionPayloads::default();
+            versions.version_count = 0;
             versions.publish_memory(&self.memory);
             result = TruncateResult {
                 rows_affected: count,
-                _versions: Some(VersionSnapshot {
-                    inner: entries,
-                    _charge: charge,
-                }),
+                _versions: Some(entries),
                 _arena: arena,
             };
         }
@@ -2302,7 +2138,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         let mut results = RowVec::with_capacity(versions.len());
 
@@ -2314,7 +2149,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    results.push((row_id, exports.capture(&chain.version.data)));
+                    results.push((row_id, chain.version.data.clone()));
                 }
                 continue;
             }
@@ -2327,7 +2162,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        results.push((row_id, exports.capture(&e.version.data)));
+                        results.push((row_id, e.version.data.clone()));
                     }
                     break;
                 }
@@ -2352,7 +2187,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         let mut result = RowVec::with_capacity(versions.len());
 
@@ -2364,7 +2198,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, exports.capture(&chain.version.data)));
+                    result.push((row_id, chain.version.data.clone()));
                 }
                 continue;
             }
@@ -2377,7 +2211,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, exports.capture(&e.version.data)));
+                        result.push((row_id, e.version.data.clone()));
                     }
                     break;
                 }
@@ -2405,7 +2239,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
         let mut result = RowVec::new();
 
         // Ensure capacity
@@ -2444,7 +2277,6 @@ impl VersionStore {
             }
         }
 
-        exports.record_rows(result.len());
         result
     }
 
@@ -2472,7 +2304,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len());
 
@@ -2486,7 +2317,7 @@ impl VersionStore {
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
                     let mut version_copy = chain.version.clone();
                     version_copy.create_time = current_seq;
-                    result.push((row_id, exports.capture(&chain.version.data), version_copy));
+                    result.push((row_id, chain.version.data.clone(), version_copy));
                 }
                 continue;
             }
@@ -2501,7 +2332,7 @@ impl VersionStore {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
                         let mut version_copy = e.version.clone();
                         version_copy.create_time = current_seq;
-                        result.push((row_id, exports.capture(&e.version.data), version_copy));
+                        result.push((row_id, e.version.data.clone(), version_copy));
                     }
                     break;
                 }
@@ -2551,7 +2382,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         // Single-pass: read, filter, and collect in one loop
         let mut result: Vec<(i64, Row, RowVersion)> = Vec::with_capacity(versions.len() / 4);
@@ -2568,7 +2398,7 @@ impl VersionStore {
                 {
                     let mut version_copy = chain.version.clone();
                     version_copy.create_time = current_seq;
-                    result.push((row_id, exports.capture(&chain.version.data), version_copy));
+                    result.push((row_id, chain.version.data.clone(), version_copy));
                 }
                 continue;
             }
@@ -2585,7 +2415,7 @@ impl VersionStore {
                     {
                         let mut version_copy = e.version.clone();
                         version_copy.create_time = current_seq;
-                        result.push((row_id, exports.capture(&e.version.data), version_copy));
+                        result.push((row_id, e.version.data.clone(), version_copy));
                     }
                     break;
                 }
@@ -2612,7 +2442,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         let mut result = RowVec::with_capacity(versions.len());
 
@@ -2624,7 +2453,7 @@ impl VersionStore {
             if checker.is_visible(head_txn_id, txn_id) {
                 // HEAD is visible - check if deleted
                 if head_deleted_at == 0 || !checker.is_visible(head_deleted_at, txn_id) {
-                    result.push((row_id, exports.capture(&chain.version.data)));
+                    result.push((row_id, chain.version.data.clone()));
                 }
                 continue;
             }
@@ -2637,7 +2466,7 @@ impl VersionStore {
 
                 if checker.is_visible(version_txn_id, txn_id) {
                     if deleted_at_txn_id == 0 || !checker.is_visible(deleted_at_txn_id, txn_id) {
-                        result.push((row_id, exports.capture(&e.version.data)));
+                        result.push((row_id, e.version.data.clone()));
                     }
                     break;
                 }
@@ -2671,7 +2500,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         // Collect with early termination
         // A user-supplied limit can be i64::MAX; only pre-allocate what
@@ -2719,7 +2547,7 @@ impl VersionStore {
                 if skipped < offset {
                     skipped += 1;
                 } else {
-                    result.push((row_id, exports.capture(&entry.version.data)));
+                    result.push((row_id, entry.version.data.clone()));
                     if result.len() >= limit {
                         break; // Early termination!
                     }
@@ -2818,7 +2646,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         // Use range for efficient cursor-based iteration
         let mut result = RowVec::with_capacity(batch_size);
@@ -2869,7 +2696,7 @@ impl VersionStore {
                     has_more = true;
                     break; // Early termination - found one more than needed
                 }
-                result.push((row_id, exports.capture(&entry.version.data)));
+                result.push((row_id, entry.version.data.clone()));
             }
         }
 
@@ -2909,7 +2736,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         // Use range for efficient cursor-based iteration
         buffer.reserve(batch_size);
@@ -2960,7 +2786,7 @@ impl VersionStore {
                     has_more = true;
                     break; // Early termination - found one more than needed
                 }
-                buffer.push((row_id, exports.capture(&entry.version.data)));
+                buffer.push((row_id, entry.version.data.clone()));
             }
         }
 
@@ -2999,7 +2825,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         // Collect with offset/limit
         // Cap capacity to avoid overflow when limit is usize::MAX
@@ -3057,7 +2882,6 @@ impl VersionStore {
             }
         }
 
-        exports.record_rows(result.len());
         Some(result)
     }
 
@@ -3094,10 +2918,9 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         // Helper to find visible version and get row data
-        let mut find_visible_row = |chain: &VersionChainEntry| -> Option<Row> {
+        let find_visible_row = |chain: &VersionChainEntry| -> Option<Row> {
             let mut current: Option<&VersionChainEntry> = Some(chain);
             while let Some(e) = current {
                 let version_txn_id = e.version.txn_id;
@@ -3108,7 +2931,7 @@ impl VersionStore {
                         break; // Row is deleted
                     }
 
-                    return Some(exports.capture(&e.version.data));
+                    return Some(e.version.data.clone());
                 }
                 current = e.prev.as_ref().map(|b| b.as_ref());
             }
@@ -3194,7 +3017,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         // Single-pass: read, filter, and collect in one loop
         let mut result = RowVec::with_capacity(versions.len() / 4);
@@ -3220,7 +3042,6 @@ impl VersionStore {
             }
         }
 
-        exports.record_rows(result.len());
         result
     }
 
@@ -3259,7 +3080,6 @@ impl VersionStore {
         };
 
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         for (&row_id, chain) in versions.iter() {
             let mut current: Option<&VersionChainEntry> = Some(chain);
@@ -3273,9 +3093,7 @@ impl VersionStore {
                         break;
                     }
 
-                    if matches_row(&e.version.data)
-                        && !callback(row_id, exports.capture(&e.version.data))
-                    {
+                    if matches_row(&e.version.data) && !callback(row_id, e.version.data.clone()) {
                         return;
                     }
                     break;
@@ -3327,7 +3145,6 @@ impl VersionStore {
 
         // Clone CowBTree to release read lock early, allowing concurrent commits
         let versions = self.snapshot_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
 
         // Collect with offset/limit and early termination
         // A user-supplied limit can be i64::MAX; only pre-allocate what
@@ -3351,7 +3168,7 @@ impl VersionStore {
                         if skipped < offset {
                             skipped += 1;
                         } else {
-                            result.push((row_id, exports.capture(&e.version.data)));
+                            result.push((row_id, e.version.data.clone()));
                             if result.len() >= limit {
                                 return result; // Early termination!
                             }
@@ -3607,9 +3424,6 @@ impl VersionStore {
                         }
                     }
                 }
-                if let Some(value) = &min_val {
-                    charge_value_export(value);
-                }
                 return min_val;
             }
             // arena_guard dropped here — no need to hold it for slow path
@@ -3651,9 +3465,6 @@ impl VersionStore {
             }
         }
 
-        if let Some(value) = &min_val {
-            charge_value_export(value);
-        }
         min_val
     }
 
@@ -3722,9 +3533,6 @@ impl VersionStore {
                         }
                     }
                 }
-                if let Some(value) = &max_val {
-                    charge_value_export(value);
-                }
                 return max_val;
             }
             // arena_guard dropped here — no need to hold it for slow path
@@ -3766,9 +3574,6 @@ impl VersionStore {
             }
         }
 
-        if let Some(value) = &max_val {
-            charge_value_export(value);
-        }
         max_val
     }
 
@@ -3910,18 +3715,8 @@ impl VersionStore {
                         AggregateAccumulator::Sum(is, fs, c) => {
                             AggregateResult::Sum(is as f64 + fs, c)
                         }
-                        AggregateAccumulator::Min(v) => {
-                            if let Some(value) = &v {
-                                charge_value_export(value);
-                            }
-                            AggregateResult::Min(v)
-                        }
-                        AggregateAccumulator::Max(v) => {
-                            if let Some(value) = &v {
-                                charge_value_export(value);
-                            }
-                            AggregateResult::Max(v)
-                        }
+                        AggregateAccumulator::Min(v) => AggregateResult::Min(v),
+                        AggregateAccumulator::Max(v) => AggregateResult::Max(v),
                         AggregateAccumulator::Avg(is, fs, c) => {
                             AggregateResult::Avg(is as f64 + fs, c)
                         }
@@ -3954,18 +3749,8 @@ impl VersionStore {
             .map(|acc| match acc {
                 AggregateAccumulator::Count(c) => AggregateResult::Count(c),
                 AggregateAccumulator::Sum(is, fs, c) => AggregateResult::Sum(is as f64 + fs, c),
-                AggregateAccumulator::Min(v) => {
-                    if let Some(value) = &v {
-                        charge_value_export(value);
-                    }
-                    AggregateResult::Min(v)
-                }
-                AggregateAccumulator::Max(v) => {
-                    if let Some(value) = &v {
-                        charge_value_export(value);
-                    }
-                    AggregateResult::Max(v)
-                }
+                AggregateAccumulator::Min(v) => AggregateResult::Min(v),
+                AggregateAccumulator::Max(v) => AggregateResult::Max(v),
                 AggregateAccumulator::Avg(is, fs, c) => AggregateResult::Avg(is as f64 + fs, c),
             })
             .collect()
@@ -4924,9 +4709,9 @@ impl VersionStore {
                     if let Some(idx) = entry.arena_idx {
                         arena_indices_to_clear.push(idx);
                     }
-                    let removed_payloads = entry.payloads();
+                    let removed_versions = count_chain_depth(entry);
                     versions.remove(row_id);
-                    versions.payloads.remove(removed_payloads);
+                    versions.version_count -= removed_versions;
                     removed_ids.push(row_id);
                 }
             }
@@ -5062,9 +4847,9 @@ impl VersionStore {
                         if let Some(idx) = entry.arena_idx {
                             actual_arena_indices.push(idx);
                         }
-                        let removed_payloads = entry.payloads();
+                        let removed_versions = count_chain_depth(entry);
                         versions.remove(row_id);
-                        versions.payloads.remove(removed_payloads);
+                        versions.version_count -= removed_versions;
                         actually_deleted.push(row_id);
                     }
                 }
@@ -5266,10 +5051,6 @@ impl VersionStore {
             if keep_count < prev_versions.len() {
                 let to_remove = prev_versions.len() - keep_count;
                 cleaned += to_remove as i32;
-                let mut removed_payloads = VersionPayloads::default();
-                for entry in &prev_versions[keep_count..] {
-                    removed_payloads.add_row(&entry.version.data);
-                }
 
                 // Clone the LIVE entry (not stale snapshot) and modify
                 let mut modified_entry = chain_entry.clone();
@@ -5292,7 +5073,7 @@ impl VersionStore {
                 }
 
                 versions.insert(row_id, modified_entry);
-                versions.payloads.remove(removed_payloads);
+                versions.version_count -= to_remove;
             }
         }
         versions.publish_memory(&self.memory);
@@ -5344,7 +5125,6 @@ impl VersionStore {
 
         // Iterate all versions
         let versions = self.capture_versions();
-        let mut exports = ExportBatch::for_rows(versions._charge.row_bound);
         for (&row_id, chain_entry) in versions.iter() {
             // Walk the version chain to find the visible version
             let mut current: Option<&VersionChainEntry> = Some(chain_entry);
@@ -5377,7 +5157,6 @@ impl VersionStore {
                     }
 
                     // Found visible, non-deleted version
-                    exports.record_rows(1);
                     if !callback(row_id, &e.version) {
                         return; // Callback wants to stop
                     }
@@ -5504,7 +5283,6 @@ impl VersionStore {
 
         // Pre-acquire arena lock ONCE
         let arena_guard = self.arena.read_guard();
-        let mut exports = ExportBatch::new();
 
         // Helper to update accumulators
         #[inline(always)]
@@ -5583,7 +5361,6 @@ impl VersionStore {
         fn compute_aggregate_values(
             aggregates: &[(AggregateOp, usize)],
             accums: &[Accum],
-            exports: &mut ExportBatch,
         ) -> Vec<Value> {
             aggregates
                 .iter()
@@ -5609,12 +5386,12 @@ impl VersionStore {
                     AggregateOp::Min => accum
                         .min
                         .as_ref()
-                        .map(|v| exports.capture_value(v))
+                        .cloned()
                         .unwrap_or(Value::Null(DataType::Null)),
                     AggregateOp::Max => accum
                         .max
                         .as_ref()
-                        .map(|v| exports.capture_value(v))
+                        .cloned()
                         .unwrap_or(Value::Null(DataType::Null)),
                 })
                 .collect()
@@ -5783,11 +5560,7 @@ impl VersionStore {
                 group_values.push(group_value);
                 results.push(GroupedAggregateResult {
                     group_values,
-                    aggregate_values: compute_aggregate_values(
-                        aggregates,
-                        slice_of(ordinal),
-                        &mut exports,
-                    ),
+                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal)),
                 });
             }
 
@@ -5797,11 +5570,7 @@ impl VersionStore {
                 group_values.push(Value::Null(DataType::Null));
                 results.push(GroupedAggregateResult {
                     group_values,
-                    aggregate_values: compute_aggregate_values(
-                        aggregates,
-                        slice_of(ordinal),
-                        &mut exports,
-                    ),
+                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal)),
                 });
             }
 
@@ -5811,18 +5580,12 @@ impl VersionStore {
             for (group_key, ordinal) in other_groups {
                 let mut group_values = Vec::with_capacity(row_width);
                 match group_key {
-                    GroupKey::Single(v) => group_values.push(exports.capture_value(&v)),
-                    GroupKey::Multi(vs) => {
-                        group_values.extend(vs.iter().map(|v| exports.capture_value(v)))
-                    }
+                    GroupKey::Single(v) => group_values.push((*v).clone()),
+                    GroupKey::Multi(vs) => group_values.extend(vs.iter().map(|v| (**v).clone())),
                 }
                 results.push(GroupedAggregateResult {
                     group_values,
-                    aggregate_values: compute_aggregate_values(
-                        aggregates,
-                        slice_of(ordinal),
-                        &mut exports,
-                    ),
+                    aggregate_values: compute_aggregate_values(aggregates, slice_of(ordinal)),
                 });
             }
 
@@ -5872,12 +5635,12 @@ impl VersionStore {
 
         for (group_key, accums) in groups {
             let group_values = match group_key {
-                GroupKey::Single(v) => vec![exports.capture_value(&v)],
-                GroupKey::Multi(vs) => vs.iter().map(|v| exports.capture_value(v)).collect(),
+                GroupKey::Single(v) => vec![(*v).clone()],
+                GroupKey::Multi(vs) => vs.iter().map(|v| (**v).clone()).collect(),
             };
             results.push(GroupedAggregateResult {
                 group_values,
-                aggregate_values: compute_aggregate_values(aggregates, &accums, &mut exports),
+                aggregate_values: compute_aggregate_values(aggregates, &accums),
             });
         }
 
@@ -5890,7 +5653,6 @@ impl Drop for VersionStore {
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::hot_owner_dropping();
         drop(std::mem::take(&mut self.versions.get_mut().entries));
-        self.memory.version_payloads.store(0, Ordering::Release);
         self.memory.version_tree.store(0, Ordering::Release);
     }
 }
@@ -5933,7 +5695,6 @@ pub struct TransactionVersionStore {
     index_undo: Mutex<IndexUndoLog>,
     arena_reservation: Option<ArenaReservation>,
     version_bytes: u128,
-    row_bound: u128,
     _object_charge: HotObjectCharge<std::sync::RwLock<TransactionVersionStore>>,
 }
 
@@ -5953,7 +5714,6 @@ impl TransactionVersionStore {
             index_undo: Mutex::new(IndexUndoLog::default()),
             arena_reservation: None,
             version_bytes: 0,
-            row_bound: 0,
             _object_charge: HotObjectCharge::new(),
         }
     }
@@ -6018,17 +5778,9 @@ impl TransactionVersionStore {
     fn release_versions(&mut self, bytes: u128) {
         self.version_bytes -= bytes;
         self.parent_store.memory.transaction_versions.remove(bytes);
-        if !self.has_local_changes() {
-            self.row_bound = 0;
-        }
     }
 
-    pub(crate) fn export_batch(&self) -> ExportBatch {
-        ExportBatch::for_rows(self.row_bound)
-    }
-
-    fn push_local_version(versions: &mut VersionList, version: RowVersion) -> (u128, u128) {
-        let bytes = version.data.heap_bytes();
+    fn push_local_version(versions: &mut VersionList, version: RowVersion) -> u128 {
         let before = if versions.spilled() {
             versions.capacity()
         } else {
@@ -6040,33 +5792,24 @@ impl TransactionVersionStore {
         } else {
             0
         };
-        (
-            bytes + ((after - before) * std::mem::size_of::<RowVersion>()) as u128,
-            bytes,
-        )
+        ((after - before) * std::mem::size_of::<RowVersion>()) as u128
     }
 
     fn append_local_version(&mut self, row_id: i64, version: RowVersion) {
         let map = self.ensure_local_versions();
         let before = map.allocation_bytes();
         let versions = map.entry(row_id).or_default();
-        let (bytes, row_bytes) = Self::push_local_version(versions, version);
+        let bytes = Self::push_local_version(versions, version);
         account_map_capacity(before, map);
-        self.row_bound = self.row_bound.max(row_bytes);
         self.charge_versions(bytes);
     }
 
     fn record_read_version(&mut self, row_id: i64, entry: WriteSetEntry) {
-        let bytes = entry
-            .read_version
-            .as_ref()
-            .map_or(0, |v| v.data.heap_bytes());
         let map = self.ensure_write_set();
         let before = map.allocation_bytes();
         let previous = map.insert(row_id, entry);
         account_map_capacity(before, map);
         debug_assert!(previous.is_none());
-        self.charge_versions(bytes);
     }
 
     /// Put adds or updates a row in the transaction's local store
@@ -6225,8 +5968,7 @@ impl TransactionVersionStore {
             // Check if already in local versions (already processed in this transaction)
             if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
                 // Append new version to history
-                let (bytes, row_bytes) = Self::push_local_version(versions, rv);
-                self.row_bound = self.row_bound.max(row_bytes);
+                let bytes = Self::push_local_version(versions, rv);
                 self.charge_versions(bytes);
                 continue;
             }
@@ -6345,8 +6087,7 @@ impl TransactionVersionStore {
 
             // Check if already in local versions (already processed in this transaction)
             if let Some(versions) = self.ensure_local_versions().get_mut(row_id) {
-                let (bytes, row_bytes) = Self::push_local_version(versions, rv);
-                self.row_bound = self.row_bound.max(row_bytes);
+                let bytes = Self::push_local_version(versions, rv);
                 self.charge_versions(bytes);
                 continue;
             }
@@ -6464,7 +6205,6 @@ impl TransactionVersionStore {
                     if local_version.is_deleted() {
                         return None;
                     }
-                    charge_bytes_export(self.row_bound);
                     return Some(local_version.data.clone());
                 }
             }
@@ -7191,13 +6931,7 @@ impl TransactionVersionStore {
         if let Some(local_versions) = self.local_versions.as_mut() {
             let before = local_versions.allocation_bytes();
             local_versions.retain(|_, versions| {
-                versions.retain(|v| {
-                    let keep = v.create_time <= timestamp;
-                    if !keep {
-                        removed_bytes += v.data.heap_bytes();
-                    }
-                    keep
-                });
+                versions.retain(|v| v.create_time <= timestamp);
                 if versions.is_empty() && versions.spilled() {
                     removed_bytes +=
                         (versions.capacity() * std::mem::size_of::<RowVersion>()) as u128;
@@ -7222,12 +6956,7 @@ impl TransactionVersionStore {
             })
             .collect();
         for &row_id in &released {
-            if let Some(entry) = write_set.remove(row_id) {
-                removed_bytes += entry
-                    .read_version
-                    .as_ref()
-                    .map_or(0, |v| v.data.heap_bytes());
-            }
+            write_set.remove(row_id);
         }
         account_map_capacity(before, write_set);
         if !released.is_empty() {
@@ -7352,7 +7081,7 @@ mod tests {
     struct ReadCommittedChecker;
 
     #[test]
-    fn version_payload_charges_follow_history_and_each_captured_root() {
+    fn version_tree_capacity_follows_canonical_history() {
         let mut store = VersionStore::with_visibility_checker(
             "payload_history",
             test_schema(),
@@ -7381,33 +7110,21 @@ mod tests {
         let second = store.capture_versions();
         add(3);
         assert_eq!(store.memory.usage().version_tree, node_bytes);
-        assert_eq!(
-            store.memory.usage().pinned_version_tree,
-            node_bytes * 2 + link_bytes
-        );
-        assert_eq!(store.version_payload_footprint(), (32, 96, 0));
         assert_eq!(first.get(1).unwrap().version.data[0], Value::Integer(1));
         assert_eq!(second.get(1).unwrap().version.data[0], Value::Integer(2));
         drop(first);
-        let copy = store.capture_versions();
-        assert_eq!(store.version_payload_footprint(), (32, 96, 0));
         drop(second);
-        assert_eq!(store.version_payload_footprint(), (32, 32, 0));
-        assert_eq!(store.memory.usage().pinned_version_tree, node_bytes);
-        drop(copy);
         add(4);
-        assert_eq!(store.version_payload_footprint(), (64, 0, 0));
         assert_eq!(store.memory.usage().version_tree, node_bytes + link_bytes);
         assert_eq!(
             store.cleanup_old_previous_versions_with_retention(std::time::Duration::ZERO),
             1
         );
-        assert_eq!(store.version_payload_footprint(), (32, 0, 0));
         assert_eq!(store.memory.usage().version_tree, node_bytes);
     }
 
     #[test]
-    fn captured_payload_account_outlives_the_version_store() {
+    fn captured_payload_outlives_the_version_store() {
         let registry = crate::storage::mvcc::memory::HotMemoryRegistry::default();
         let store = VersionStore::new("captured_payload_owner", test_schema());
         registry.register(store.memory_account());
@@ -7420,281 +7137,10 @@ mod tests {
         let snapshot = store.capture_versions();
         drop(store);
         let usage = registry.total();
-        assert_eq!(usage.version_payloads, 0);
-        assert_eq!(usage.pinned_version_payloads, 32);
         assert_eq!(usage.version_tree, 0);
-        assert_eq!(usage.pinned_version_tree, tree_bytes);
         assert_eq!(usage.arena_payloads, 0);
         assert_eq!(usage.arena_capacity, 0);
         assert_eq!(snapshot.get(1).unwrap().version.data[0], Value::Integer(7));
-        drop(snapshot);
-        assert_eq!(registry.total().pinned_version_payloads, 0);
-        assert_eq!(registry.total().pinned_version_tree, 0);
-    }
-
-    #[test]
-    fn export_bound_covers_owned_conversion_without_recounting_columns() {
-        for capacity in [2, 256] {
-            let mut row = Row::with_capacity(capacity);
-            row.push(Value::Integer(1));
-            row.push(Value::text("owned export child".repeat(64)));
-            let original_bytes = row.heap_bytes();
-            let mut payloads = VersionPayloads::default();
-            payloads.add_row(&row);
-            let shared = row.clone().into_shared();
-            assert_eq!(payloads.row_bound, original_bytes.max(shared.heap_bytes()));
-        }
-    }
-
-    #[test]
-    fn cached_scan_exports_keep_the_captured_heap_bound_after_store_removal() {
-        let store = VersionStore::with_visibility_checker(
-            "cached_scan_export_bound",
-            test_schema(),
-            Arc::new(TestVisibilityChecker::new()),
-        );
-        for id in 1..=2 {
-            let text = Value::text("retained scan child".repeat(id as usize * 64));
-            store
-                .add_version(
-                    id,
-                    RowVersion::new(1, Row::from(vec![Value::Integer(id), text])),
-                )
-                .unwrap();
-        }
-        let bound = store.versions.read().payloads.row_bound;
-        let (rows, scope) = super::super::read_memory::ReadScopeGuard::with_lazy(|| {
-            store.get_all_visible_rows_cached(1)
-        });
-        assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|(_, row)| row.is_shared()));
-        let (points, point_scope) = super::super::read_memory::ReadScopeGuard::with_lazy(|| {
-            [
-                store.get_visible_version(1, 1).unwrap().data,
-                store
-                    .get_visible_version_as_of_transaction(1, 1)
-                    .unwrap()
-                    .data,
-                store
-                    .get_visible_version_as_of_timestamp(1, i64::MAX)
-                    .unwrap()
-                    .data,
-            ]
-        });
-        let (batch, batch_scope) = super::super::read_memory::ReadScopeGuard::with_lazy(|| {
-            store.get_visible_versions_batch(&[1, 2, 3], 1)
-        });
-        drop(store.truncate_all().unwrap());
-        drop(store);
-        let scope = scope.unwrap();
-        assert_eq!(scope.exported_bytes(), 2 * bound);
-        assert!(scope.exported_bytes() >= rows.iter().map(|(_, row)| row.heap_bytes()).sum());
-        assert_eq!(batch.len(), 2);
-        assert_eq!(batch_scope.unwrap().exported_bytes(), 2 * bound);
-        let point_bytes = point_scope.unwrap().exported_bytes();
-        assert_eq!(point_bytes, 3 * bound);
-        assert!(point_bytes >= points.iter().map(Row::heap_bytes).sum());
-    }
-
-    #[test]
-    fn callback_exports_publish_before_callbacks_and_do_not_charge_twice() {
-        let store = VersionStore::with_visibility_checker(
-            "callback_export_bound",
-            test_schema(),
-            Arc::new(TestVisibilityChecker::new()),
-        );
-        for id in 1..=3 {
-            store
-                .add_version(id, RowVersion::new(1, Row::from(vec![Value::Integer(id)])))
-                .unwrap();
-        }
-        let bound = store.arena.read_guard().row_bound();
-        let scope = Arc::new(super::super::read_memory::ReadScope::default());
-        let mut rows = Vec::new();
-        {
-            let _active = scope.enter();
-            store.for_each_visible(&[1, 2, 3], 1, |id, row| {
-                let captured = if id == 1 { 1 } else { 3 };
-                assert_eq!(scope.exported_bytes(), captured * bound);
-                rows.push(row);
-                id == 1
-            });
-        }
-        assert_eq!(rows.len(), 2);
-        assert_eq!(scope.exported_bytes(), 3 * bound);
-        drop(store);
-        assert!(scope.exported_bytes() >= rows.iter().map(Row::heap_bytes).sum());
-    }
-
-    #[test]
-    fn export_bound_covers_heap_history_and_captured_roots() {
-        #[cfg(target_pointer_width = "64")]
-        {
-            assert_eq!(std::mem::size_of::<VersionPayloads>(), 64);
-            assert_eq!(std::mem::size_of::<VersionSnapshotCharge>(), 64);
-        }
-        let mut store = VersionStore::with_visibility_checker(
-            "export_bound_history",
-            test_schema(),
-            Arc::new(TestVisibilityChecker::new()),
-        );
-        store.set_max_version_history(2);
-        store
-            .add_version(1, RowVersion::new(1, Row::from(vec![Value::Integer(1)])))
-            .unwrap();
-        let inline_root = store.capture_versions();
-        store
-            .add_version(
-                2,
-                RowVersion::new(
-                    1,
-                    Row::from(vec![
-                        Value::Integer(2),
-                        Value::text("heap value".repeat(64)),
-                    ]),
-                ),
-            )
-            .unwrap();
-        let heap_root = store.capture_versions();
-        let bound = heap_root.get(2).unwrap().version.data.heap_bytes();
-        assert!(inline_root._charge.row_bound < bound);
-        assert_eq!(heap_root._charge.row_bound, bound);
-        store
-            .add_version(2, RowVersion::new(2, Row::from(vec![Value::Integer(2)])))
-            .unwrap();
-        assert_eq!(store.versions.read().payloads.row_bound, bound);
-        for (txn_id, ascending, offset) in [(1, true, 1), (1, false, 0), (2, false, 0)] {
-            let (rows, scope) = super::super::read_memory::ReadScopeGuard::with_lazy(|| {
-                store
-                    .collect_rows_pk_ordered(txn_id, ascending, 1, offset)
-                    .unwrap()
-            });
-            assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].0, 2);
-            assert_eq!(scope.unwrap().exported_bytes(), bound);
-            assert!(bound >= rows[0].1.heap_bytes());
-        }
-        store
-            .add_version(2, RowVersion::new(3, Row::from(vec![Value::Integer(3)])))
-            .unwrap();
-        assert_eq!(store.capture_versions()._charge.row_bound, bound);
-        assert_eq!(heap_root._charge.row_bound, bound);
-        let (rows, scope) = super::super::read_memory::ReadScopeGuard::with_lazy(|| {
-            store.collect_rows_pk_ordered(3, true, 2, 0).unwrap()
-        });
-        assert_eq!(rows.len(), 2);
-        assert_eq!(scope.unwrap().exported_bytes(), 2 * bound);
-    }
-
-    #[test]
-    fn inline_export_bound_covers_shrinking_and_skipped_rows() {
-        let mut store = VersionStore::with_visibility_checker(
-            "inline_export_bound",
-            test_schema(),
-            Arc::new(TestVisibilityChecker::new()),
-        );
-        store.set_max_version_history(1);
-        store
-            .add_version(1, RowVersion::new(1, Row::from(vec![Value::Integer(1)])))
-            .unwrap();
-        store
-            .add_version(2, RowVersion::new(1, Row::from(vec![Value::Integer(2); 8])))
-            .unwrap();
-        let bound = 2 * std::mem::size_of::<usize>() + 8 * std::mem::size_of::<Value>();
-        let captured = store.capture_versions();
-        store
-            .add_version(2, RowVersion::new(2, Row::from(vec![Value::Integer(2)])))
-            .unwrap();
-        let (rows, scope) = super::super::read_memory::ReadScopeGuard::with_lazy(|| {
-            store.collect_rows_pk_ordered(2, true, 1, 0).unwrap()
-        });
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].0, 1);
-        assert_eq!(scope.unwrap().exported_bytes(), bound as u128);
-        assert!(rows[0].1.heap_bytes() < bound as u128);
-        assert_eq!(captured._charge.row_bound, bound as u128);
-        let retired = store.truncate_all().unwrap();
-        assert_eq!(store.versions.read().payloads.row_bound, 0);
-        assert_eq!(
-            retired._versions.as_ref().unwrap()._charge.row_bound,
-            bound as u128
-        );
-    }
-
-    #[test]
-    fn export_bound_tracks_owned_deletes_and_truncate() {
-        let store = VersionStore::new("owned_export_bound", test_schema());
-        let mut row = Row::with_capacity(256);
-        row.push(Value::Integer(1));
-        row.push(Value::text("owned heap value".repeat(64)));
-        let bound = row.heap_bytes();
-        store
-            .add_version(1, RowVersion::new_deleted_with_timestamp(1, row, 0))
-            .unwrap();
-        assert_eq!(store.versions.read().payloads.row_bound, bound);
-        assert_eq!(store.cleanup_deleted_rows(std::time::Duration::ZERO), 1);
-        assert_eq!(store.versions.read().payloads.row_bound, 0);
-        store
-            .add_version(
-                2,
-                RowVersion::new(
-                    2,
-                    Row::from(vec![
-                        Value::Integer(2),
-                        Value::text("heap value".repeat(64)),
-                    ]),
-                ),
-            )
-            .unwrap();
-        let retired = store.truncate_all().unwrap();
-        assert!(retired._versions.as_ref().unwrap()._charge.row_bound > 0);
-        assert_eq!(store.versions.read().payloads.row_bound, 0);
-    }
-
-    #[test]
-    fn owned_payload_bound_resets_after_cow_and_history_removal() {
-        let mut store = VersionStore::new("owned_payloads", test_schema());
-        store.set_max_version_history(2);
-        let mut wide = Row::with_capacity(64);
-        wide.push(Value::Integer(1));
-        store
-            .add_version(1, RowVersion::new_deleted_with_timestamp(1, wide, 0))
-            .unwrap();
-        let snapshot = store.capture_versions();
-        store
-            .add_version(1, RowVersion::new(2, Row::from(vec![Value::Integer(2)])))
-            .unwrap();
-        assert_eq!(store.version_payload_footprint(), (1056, 1024, 0));
-        assert_eq!(
-            store
-                .versions
-                .read()
-                .get(1)
-                .unwrap()
-                .prev
-                .as_ref()
-                .unwrap()
-                .version
-                .data
-                .owned_capacity(),
-            Some(1),
-            "the canonical clone shrinks while its recorded capacity bound stays conservative"
-        );
-        store
-            .add_version(1, RowVersion::new(3, Row::from(vec![Value::Integer(3)])))
-            .unwrap();
-        assert_eq!(store.version_payload_footprint(), (32, 1024, 0));
-        assert_eq!(store.versions.read().payloads.owned_capacity, 0);
-        let mut small = Row::with_capacity(4);
-        small.push(Value::Integer(4));
-        store
-            .add_version(2, RowVersion::new_deleted_with_timestamp(4, small, 0))
-            .unwrap();
-        assert_eq!(store.version_payload_footprint(), (96, 1024, 0));
-        assert_eq!(store.cleanup_deleted_rows(std::time::Duration::ZERO), 1);
-        assert_eq!(store.version_payload_footprint(), (32, 1024, 0));
-        drop(snapshot);
-        assert_eq!(store.version_payload_footprint(), (32, 0, 0));
     }
 
     #[test]
@@ -7711,13 +7157,11 @@ mod tests {
                 RowVersion::new_deleted(2, Row::from(vec![Value::Integer(8)])),
             )
             .unwrap();
-        assert_eq!(store.version_payload_footprint(), (16, 0, 0));
         let account = Arc::clone(store.memory_account());
         let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed_drop = Arc::clone(&observed);
         crate::test_failpoints::before_hot_owner_drop(move || {
             let usage = account.usage();
-            assert_eq!(usage.version_payloads, 16);
             assert_eq!(usage.arena_payloads, 32);
             assert_eq!(
                 usage.retired_arena_payloads, 32,
@@ -7729,45 +7173,40 @@ mod tests {
             .add_version(1, RowVersion::new(3, Row::from(vec![Value::Integer(9)])))
             .unwrap();
         assert!(observed.load(Ordering::Relaxed));
-        assert_eq!(store.version_payload_footprint(), (32, 0, 0));
+        assert_eq!(store.memory.usage().retired_arena_payloads, 0);
     }
 
     #[test]
-    fn different_deleted_payload_and_truncate_keep_each_owner_charged() {
+    fn truncate_retains_arena_charge_after_different_deleted_payload() {
         let mut store = VersionStore::new("deleted_payloads", test_schema());
         store.set_max_version_history(1);
-        let row = Row::from(vec![Value::text("a heap payload retained by the arena")]);
-        let arena_bytes = (row.heap_bytes() + 16) as usize;
+        let value = Value::text("a heap payload retained by the arena");
+        let arena_bytes =
+            2 * std::mem::size_of::<usize>() + std::mem::size_of::<Value>() + value.heap_bytes();
+        let row = Row::from(vec![value]);
         store.add_version(1, RowVersion::new(1, row)).unwrap();
         let mut deleted = Row::with_capacity(128);
         deleted.push(Value::Integer(2));
         store
             .add_version(1, RowVersion::new_deleted(2, deleted))
             .unwrap();
-        assert_eq!(store.version_payload_footprint(), (2048, 0, 0));
         assert_eq!(store.hot_bytes(), arena_bytes);
         let tree_bytes = store.versions.read().node_bytes();
         assert!(tree_bytes > 0);
         let snapshot = store.capture_versions();
         let reservation = store.arena.reserve(1).unwrap();
         assert!(store.truncate_all().is_err());
-        assert_eq!(store.version_payload_footprint(), (2048, 2048, 0));
         assert_eq!(store.memory.usage().version_tree, tree_bytes);
-        assert_eq!(store.memory.usage().pinned_version_tree, tree_bytes);
         assert_eq!(store.hot_bytes(), arena_bytes);
         drop(reservation);
         let retired = store.truncate_all().unwrap();
         assert_eq!(store.hot_bytes(), 0);
-        assert_eq!(store.version_payload_footprint(), (0, 4096, arena_bytes));
+        assert_eq!(store.memory.usage().retired_arena_payloads, arena_bytes);
         assert_eq!(store.memory.usage().version_tree, 0);
-        assert_eq!(store.memory.usage().pinned_version_tree, tree_bytes * 2);
         drop(retired);
         assert_eq!(store.arena.capacity_bytes(), 0);
-        assert_eq!(store.version_payload_footprint(), (0, 2048, 0));
-        assert_eq!(store.memory.usage().pinned_version_tree, tree_bytes);
+        assert_eq!(store.memory.usage().retired_arena_payloads, 0);
         drop(snapshot);
-        assert_eq!(store.version_payload_footprint(), (0, 0, 0));
-        assert_eq!(store.memory.usage().pinned_version_tree, 0);
     }
 
     #[test]
@@ -7794,11 +7233,11 @@ mod tests {
         assert_eq!(removed, 1);
         assert_eq!(skipped, vec![2, 3]);
         assert_eq!(store.hot_bytes(), 64);
-        assert_eq!(store.version_payload_footprint(), (96, 96, 32));
+        assert_eq!(store.memory.usage().retired_arena_payloads, 32);
         drop(snapshot);
-        assert_eq!(store.version_payload_footprint(), (96, 0, 32));
+        assert_eq!(store.memory.usage().retired_arena_payloads, 32);
         drop(retired);
-        assert_eq!(store.version_payload_footprint(), (96, 0, 0));
+        assert_eq!(store.memory.usage().retired_arena_payloads, 0);
         store.release_row_claim(3, 99);
     }
 
@@ -8035,79 +7474,18 @@ mod tests {
     }
 
     fn retained_transaction_versions(store: &TransactionVersionStore) -> u128 {
-        let local: u128 = store
+        store
             .local_versions
             .iter()
             .flat_map(|m| m.values())
             .map(|history| {
-                let payloads: u128 = history.iter().map(|v| v.data.heap_bytes()).sum();
-                payloads
-                    + if history.spilled() {
-                        (history.capacity() * std::mem::size_of::<RowVersion>()) as u128
-                    } else {
-                        0
-                    }
+                if history.spilled() {
+                    (history.capacity() * std::mem::size_of::<RowVersion>()) as u128
+                } else {
+                    0
+                }
             })
-            .sum();
-        let originals: u128 = store
-            .write_set
-            .iter()
-            .flat_map(|m| m.values())
-            .filter_map(|entry| entry.read_version.as_ref())
-            .map(|v| v.data.heap_bytes())
-            .sum();
-        local + originals
-    }
-
-    #[test]
-    fn local_export_bound_covers_batch_updates_and_resets_after_rollback() {
-        let store = Arc::new(VersionStore::with_visibility_checker(
-            "local_export_bound",
-            test_schema(),
-            Arc::new(TestVisibilityChecker::new()),
-        ));
-        store
-            .add_version(1, RowVersion::new(1, Row::from(vec![Value::Integer(1)])))
-            .unwrap();
-        let original = store.get_visible_version(1, 10).unwrap();
-        let row = |width| {
-            Row::from(vec![
-                Value::Integer(1),
-                Value::text("local export child".repeat(width)),
-            ])
-        };
-        let mut local = TransactionVersionStore::new(Arc::clone(&store), 10);
-        local.put(1, row(32), false).unwrap();
-        let first_timestamp = local.get_latest_local(1).unwrap().create_time;
-        let first = local.row_bound;
-        local
-            .put_batch_with_originals(vec![(1, row(64), original.clone())])
-            .unwrap();
-        assert!(local.row_bound > first);
-        let second = local.row_bound;
-        local
-            .put_batch_deleted_with_originals(vec![(1, row(128), original)])
-            .unwrap();
-        assert!(local.row_bound > second);
-        let bound = local.row_bound;
-        let (_, scope) = super::super::read_memory::ReadScopeGuard::with_lazy(|| {
-            let mut exports = local.export_batch();
-            exports.capture(&local.get_latest_local(1).unwrap().data)
-        });
-        local.rollback_to_timestamp(first_timestamp);
-        assert_eq!(local.get_latest_local(1).unwrap().data, row(32));
-        assert_eq!(local.row_bound, bound);
-        let (point, point_scope) =
-            super::super::read_memory::ReadScopeGuard::with_lazy(|| local.get(1).unwrap());
-        local.rollback_to_timestamp(i64::MIN);
-        assert_eq!(local.row_bound, 0);
-        assert_eq!(scope.unwrap().exported_bytes(), bound);
-        assert_eq!(point_scope.unwrap().exported_bytes(), bound);
-        assert!(bound >= point.heap_bytes());
-        local.put(1, row(16), false).unwrap();
-        assert!(local.row_bound < first);
-        local.commit().unwrap();
-        assert_eq!(local.row_bound, 0);
+            .sum()
     }
 
     #[test]
@@ -8144,7 +7522,7 @@ mod tests {
             ])
             .unwrap();
         let bytes = retained_transaction_versions(&local);
-        assert!(bytes > 64 * std::mem::size_of::<Value>() as u128);
+        assert!(bytes > 0);
         assert_eq!(local.version_bytes, bytes);
         assert_eq!(store.memory.usage().transaction_versions as u128, bytes);
         local.rollback();
@@ -8154,7 +7532,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_version_charges_keep_failed_claim_original() {
+    fn failed_claim_does_not_allocate_local_history() {
         let store = Arc::new(VersionStore::with_visibility_checker(
             "failed_claim_versions",
             test_schema(),
@@ -8169,8 +7547,8 @@ mod tests {
             .put(1, Row::from(vec![Value::Integer(8)]), false)
             .is_err());
         assert!(!local.has_local_changes());
-        assert_eq!(store.memory.usage().transaction_versions, 32);
-        assert_eq!(retained_transaction_versions(&local), 32);
+        assert_eq!(store.memory.usage().transaction_versions, 0);
+        assert_eq!(retained_transaction_versions(&local), 0);
         local.rollback_to_timestamp(i64::MIN);
         assert_eq!(store.memory.usage().transaction_versions, 0);
         store.release_row_claim(1, 2);
@@ -8208,7 +7586,7 @@ mod tests {
         assert_eq!(local.version_bytes, retained_transaction_versions(&local));
         assert_eq!(
             store.memory.usage().transaction_versions,
-            32 + capacity * std::mem::size_of::<RowVersion>()
+            capacity * std::mem::size_of::<RowVersion>()
         );
         local.rollback_to_timestamp(i64::MIN);
         assert_eq!(store.memory.usage().transaction_versions, 0);
@@ -8229,15 +7607,33 @@ mod tests {
         second
             .put(1, Row::from(vec![Value::Integer(8)]), false)
             .unwrap();
-        assert_eq!(store.memory.usage().transaction_versions, 64);
+        for _ in 0..8 {
+            first
+                .put(1, Row::from(vec![Value::Integer(7)]), false)
+                .unwrap();
+            second
+                .put(1, Row::from(vec![Value::Integer(8)]), false)
+                .unwrap();
+        }
+        let second_capacity = retained_transaction_versions(&second);
+        assert!(second_capacity > 0);
+        assert_eq!(
+            store.memory.usage().transaction_versions as u128,
+            retained_transaction_versions(&first) + second_capacity
+        );
         first.commit().unwrap();
-        assert_eq!(store.memory.usage().transaction_versions, 32);
+        assert_eq!(
+            store.memory.usage().transaction_versions as u128,
+            second_capacity
+        );
         assert!(second.commit().is_err());
-        assert_eq!(store.memory.usage().transaction_versions, 32);
-        assert_eq!(retained_transaction_versions(&second), 32);
+        assert_eq!(
+            store.memory.usage().transaction_versions as u128,
+            second_capacity
+        );
+        assert_eq!(retained_transaction_versions(&second), second_capacity);
         drop(second);
         assert_eq!(store.memory.usage().transaction_versions, 0);
-        assert_eq!(store.memory.usage().version_payloads, 32);
     }
 
     #[test]
@@ -8297,17 +7693,9 @@ mod tests {
             second.commit().unwrap();
             assert_eq!(registry.total().transaction_versions, 0);
             let undo = std::mem::take(&mut *second.index_undo.lock());
-            let removed_keys = undo
-                .entries
-                .iter()
-                .flat_map(|entry| &entry.removed)
-                .flat_map(|(_, values)| values)
-                .map(|value| value.heap_bytes() as u128)
-                .sum::<u128>();
-            assert!(removed_keys > 0);
             let bytes = undo.entries.capacity() as u128 * std::mem::size_of::<IndexUndo>() as u128
                 + undo.entries.iter().map(IndexUndo::heap_bytes).sum::<u128>();
-            assert!(bytes > removed_keys);
+            assert!(bytes > 0);
             assert_eq!(registry.total().transaction_undo as u128, bytes);
             drop(second);
             drop(store);

@@ -185,30 +185,8 @@ impl<T> Drop for HotObjectCharge<T> {
     }
 }
 
-pub(crate) struct ChargedWeak<T> {
-    weak: Weak<T>,
-    _memory: HotObjectCharge<T>,
-}
-
-impl<T> ChargedWeak<T> {
-    pub fn new(owner: &Arc<T>) -> Self {
-        Self {
-            weak: Arc::downgrade(owner),
-            _memory: HotObjectCharge::new(),
-        }
-    }
-}
-
-impl<T> std::ops::Deref for ChargedWeak<T> {
-    type Target = Weak<T>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.weak
-    }
-}
-
 struct WeakAccounts<T> {
-    entries: Vec<ChargedWeak<T>>,
+    entries: Vec<Weak<T>>,
     memory: HotMetadataCharge,
 }
 
@@ -224,9 +202,9 @@ impl<T> Default for WeakAccounts<T> {
 impl<T> WeakAccounts<T> {
     fn register(&mut self, owner: &Arc<T>) {
         self.entries.retain(|account| account.strong_count() != 0);
-        self.entries.push(ChargedWeak::new(owner));
+        self.entries.push(Arc::downgrade(owner));
         self.memory
-            .resize((self.entries.capacity() * std::mem::size_of::<ChargedWeak<T>>()) as u128);
+            .resize((self.entries.capacity() * std::mem::size_of::<Weak<T>>()) as u128);
     }
 }
 
@@ -261,9 +239,7 @@ impl<A: smallvec::Array> std::ops::Deref for ChargedSmallVec<A> {
 
 #[derive(Default)]
 pub(crate) struct TableMemory {
-    pub version_payloads: AtomicUsize,
     pub version_tree: AtomicUsize,
-    pub pinned_versions: Mutex<PinnedVersionMemory>,
     pub arena_payloads: AtomicUsize,
     pub retired_arena_payloads: Mutex<u128>,
     pub arena_capacity: RetainedBytes,
@@ -275,17 +251,8 @@ pub(crate) struct TableMemory {
 }
 
 #[derive(Default)]
-pub(crate) struct PinnedVersionMemory {
-    pub payloads: u128,
-    pub tree: u128,
-}
-
-#[derive(Default)]
 pub(crate) struct TableMemoryUsage {
-    pub version_payloads: usize,
-    pub pinned_version_payloads: usize,
     pub version_tree: usize,
-    pub pinned_version_tree: usize,
     pub arena_payloads: usize,
     pub retired_arena_payloads: usize,
     pub arena_capacity: usize,
@@ -302,15 +269,7 @@ impl TableMemory {
     }
 
     pub fn usage(&self) -> TableMemoryUsage {
-        let version_payloads = self.version_payloads.load(Ordering::Acquire);
         let version_tree = self.version_tree.load(Ordering::Acquire);
-        let (pinned_version_payloads, pinned_version_tree) = {
-            let pinned = self.pinned_versions.lock();
-            (
-                pinned.payloads.min(usize::MAX as u128) as usize,
-                pinned.tree.min(usize::MAX as u128) as usize,
-            )
-        };
         let arena_payloads = self.arena_payloads.load(Ordering::Acquire);
         let retired_arena_payloads =
             (*self.retired_arena_payloads.lock()).min(usize::MAX as u128) as usize;
@@ -325,10 +284,7 @@ impl TableMemory {
             true
         });
         TableMemoryUsage {
-            version_payloads,
-            pinned_version_payloads,
             version_tree,
-            pinned_version_tree,
             arena_payloads,
             retired_arena_payloads,
             arena_capacity: self.arena_capacity.get(),
@@ -436,13 +392,6 @@ impl RetainedBytes {
             bytes => bytes,
         }
     }
-
-    pub fn get_wide(&self) -> u128 {
-        match self.bytes.load(Ordering::Acquire) {
-            usize::MAX => *self.wide().lock(),
-            bytes => bytes as u128,
-        }
-    }
 }
 
 #[derive(Default)]
@@ -463,16 +412,7 @@ impl HotMemoryRegistry {
                 return false;
             };
             let usage = account.usage();
-            total.version_payloads = total
-                .version_payloads
-                .saturating_add(usage.version_payloads);
-            total.pinned_version_payloads = total
-                .pinned_version_payloads
-                .saturating_add(usage.pinned_version_payloads);
             total.version_tree = total.version_tree.saturating_add(usage.version_tree);
-            total.pinned_version_tree = total
-                .pinned_version_tree
-                .saturating_add(usage.pinned_version_tree);
             total.arena_payloads = total.arena_payloads.saturating_add(usage.arena_payloads);
             total.retired_arena_payloads = total
                 .retired_arena_payloads
@@ -589,9 +529,9 @@ mod tests {
         assert_eq!(memory.get(), 0);
         memory.add(usize::MAX as u128 + 32);
         memory.remove(usize::MAX as u128 + 48);
-        assert_eq!(memory.get_wide(), 0);
+        assert_eq!(memory.get(), 0);
         memory.add(64);
-        assert_eq!(memory.get_wide(), 64);
+        assert_eq!(memory.get(), 64);
     }
 
     #[test]

@@ -479,25 +479,12 @@ impl Schema {
             bytes += column.name.capacity() as u128
                 + column.name_lower.capacity() as u128
                 + column.default_expr.as_ref().map_or(0, String::capacity) as u128
-                + column.check_expr.as_ref().map_or(0, String::capacity) as u128
-                + column
-                    .default_value
-                    .as_ref()
-                    .map_or(0, super::Value::heap_bytes) as u128;
+                + column.check_expr.as_ref().map_or(0, String::capacity) as u128;
         }
         for fk in &self.foreign_keys {
             bytes += fk.column_name.capacity() as u128
                 + fk.referenced_table.capacity() as u128
                 + fk.referenced_column.capacity() as u128;
-        }
-        for names in [&self.column_names_cache, &self.column_names_lower_cache] {
-            if let Some(names) = names.get() {
-                bytes += Self::column_names_bytes(names);
-            }
-        }
-        if let Some(indices) = self.pk_indices_cache.get() {
-            bytes += arc_allocation_bytes::<Vec<usize>>() as u128
-                + (indices.capacity() * std::mem::size_of::<usize>()) as u128;
         }
         if let Some(map) = self.column_index_map_cache.get() {
             bytes += hash_table_bytes::<String, usize>(map.capacity())
@@ -974,8 +961,7 @@ mod tests {
         {
             let mut schema = store.schema_mut();
             schema.table_name = "retained_schema_name".repeat(256);
-            schema.columns[0].default_value =
-                Some(super::super::Value::text("default".repeat(8192)));
+            schema.columns[0].default_expr = Some("default".repeat(8192));
             schema.foreign_keys.push(ForeignKeyConstraint {
                 column_index: 0,
                 column_name: "child".repeat(512),

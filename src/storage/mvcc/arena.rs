@@ -223,7 +223,6 @@ struct ArenaInner {
     reserved: usize,
     ordered_bases: bool,
     payload_bytes: u128,
-    row_bound: u128,
 }
 
 impl ArenaInner {
@@ -374,7 +373,6 @@ impl RowArena {
                     reserved: 0,
                     ordered_bases: true,
                     payload_bytes: 0,
-                    row_bound: 0,
                 }),
                 growth: Mutex::new(()),
                 reuse_holds: AtomicUsize::new(0),
@@ -595,7 +593,6 @@ impl RowArena {
             inner.refresh_probe_order();
         }
         inner.payload_bytes += bytes;
-        inner.row_bound = inner.row_bound.max(bytes);
         if let Some(old) = &old {
             let old_bytes = row_bytes(old);
             if was_deleted {
@@ -676,9 +673,6 @@ impl RowArena {
         }
         retired.retain_payloads(&self.state.account, bytes);
         inner.payload_bytes -= bytes;
-        if inner.payload_bytes == 0 {
-            inner.row_bound = 0;
-        }
         self.state.account.arena_payloads.store(
             inner.payload_bytes.min(usize::MAX as u128) as usize,
             Ordering::Release,
@@ -705,7 +699,6 @@ impl RowArena {
         let free = std::mem::take(&mut inner.free);
         inner.free_len = 0;
         let payload_bytes = std::mem::take(&mut inner.payload_bytes);
-        inner.row_bound = 0;
         let mut retired = ArenaRetirement {
             active,
             chunks: frozen,
@@ -849,10 +842,6 @@ impl ArenaChunkSlices<'_> {
 }
 
 impl ArenaReadGuard<'_> {
-    pub(crate) fn row_bound(&self) -> u128 {
-        self.inner.row_bound
-    }
-
     #[cfg(test)]
     fn get(&self, slot: ArenaSlot, row_id: i64) -> Option<(&ArenaRowMeta, &CompactArc<[Value]>)> {
         self.inner.chunk(slot.chunk())?.get(slot.offset(), row_id)
@@ -1242,7 +1231,6 @@ mod tests {
         );
         drop(reservation);
         assert_eq!(arena.bytes() as u128, expected);
-        assert_eq!(arena.read_guard().row_bound(), expected);
         let mut reservation = arena.reserve(1).unwrap();
         arena.install(
             &mut reservation,
@@ -1252,15 +1240,12 @@ mod tests {
             CompactArc::from(vec![Value::Integer(10)]),
         );
         assert!(arena.clear_all().is_err());
-        assert_eq!(arena.read_guard().row_bound(), expected);
         drop(reservation);
         let mut retirement = arena.prepare_clear(2);
         assert_eq!(arena.clear_batch(&[slot, slot], &mut retirement), 1);
         assert_eq!(arena.bytes(), 0);
-        assert_eq!(arena.read_guard().row_bound(), 0);
         insert(&arena, 11);
-        assert!(arena.read_guard().row_bound() < expected);
         drop(arena.clear_all().unwrap());
-        assert_eq!(arena.read_guard().row_bound(), 0);
+        assert_eq!(arena.bytes(), 0);
     }
 }

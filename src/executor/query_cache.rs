@@ -238,7 +238,7 @@ pub struct CompiledCountStar {
     pub result_columns: CompactArc<Vec<String>>,
     /// Schema epoch at compilation time (for fast cache invalidation)
     pub cached_epoch: u64,
-    _column_memory: Box<HotMetadataCharge>,
+    _column_memory: Option<Box<HotMetadataCharge>>,
 }
 
 impl CompiledCountStar {
@@ -255,18 +255,19 @@ impl CompiledCountStar {
             table_name,
             result_columns,
             cached_epoch,
-            _column_memory: column_memory,
+            _column_memory: Some(column_memory),
         }
     }
 }
 
 impl Clone for CompiledCountStar {
     fn clone(&self) -> Self {
-        Self::new(
-            self.table_name.clone(),
-            self.result_columns.clone(),
-            self.cached_epoch,
-        )
+        Self {
+            table_name: self.table_name.clone(),
+            result_columns: self.result_columns.clone(),
+            cached_epoch: self.cached_epoch,
+            _column_memory: None,
+        }
     }
 }
 

@@ -645,11 +645,8 @@ pub struct MemoryStat {
     pub chain_entries: usize,
     pub volume_bytes: usize,
     pub admission_waits: u64,
-    pub version_payload_bytes: usize,
-    pub pinned_version_payload_bytes: usize,
     pub retired_arena_payload_bytes: usize,
     pub version_tree_bytes: usize,
-    pub pinned_version_tree_bytes: usize,
     pub transaction_version_bytes: usize,
     pub transaction_undo_bytes: usize,
     pub transaction_map_bytes: usize,
@@ -658,7 +655,6 @@ pub struct MemoryStat {
     pub index_scratch_bytes: usize,
     pub row_claim_bytes: usize,
     pub row_pool_bytes: usize,
-    pub exported_payload_bytes: usize,
     pub transaction_registry_bytes: usize,
     pub hot_metadata_bytes: usize,
 }
@@ -2550,11 +2546,8 @@ impl MVCCEngine {
                 volume_bytes: volume_bytes.remove(&name).unwrap_or(0),
                 table_name: name,
                 admission_waits: 0,
-                version_payload_bytes: usage.version_payloads,
-                pinned_version_payload_bytes: usage.pinned_version_payloads,
                 retired_arena_payload_bytes: usage.retired_arena_payloads,
                 version_tree_bytes: usage.version_tree,
-                pinned_version_tree_bytes: usage.pinned_version_tree,
                 transaction_version_bytes: usage.transaction_versions,
                 transaction_undo_bytes: usage.transaction_undo,
                 transaction_map_bytes: 0,
@@ -2563,7 +2556,6 @@ impl MVCCEngine {
                 index_scratch_bytes: 0,
                 row_claim_bytes: usage.row_claims,
                 row_pool_bytes: 0,
-                exported_payload_bytes: 0,
                 transaction_registry_bytes: 0,
                 hot_metadata_bytes: 0,
             };
@@ -2576,11 +2568,8 @@ impl MVCCEngine {
         let retained = self.hot_memory.total();
         total.hot_bytes = retained.arena_payloads;
         total.arena_capacity_bytes = retained.arena_capacity;
-        total.version_payload_bytes = retained.version_payloads;
-        total.pinned_version_payload_bytes = retained.pinned_version_payloads;
         total.retired_arena_payload_bytes = retained.retired_arena_payloads;
         total.version_tree_bytes = retained.version_tree;
-        total.pinned_version_tree_bytes = retained.pinned_version_tree;
         total.transaction_version_bytes = retained.transaction_versions;
         total.transaction_undo_bytes = retained.transaction_undo;
         total.transaction_map_bytes = crate::storage::mvcc::version_store::transaction_map_bytes();
@@ -2589,7 +2578,6 @@ impl MVCCEngine {
         total.index_scratch_bytes = crate::storage::index::hnsw::search_scratch_bytes();
         total.row_claim_bytes = retained.row_claims;
         total.row_pool_bytes = crate::core::row_vec::row_pool_bytes();
-        total.exported_payload_bytes = super::read_memory::exported_payload_bytes();
         total.transaction_registry_bytes = super::registry::registry_bytes();
         total.hot_metadata_bytes = super::memory::hot_metadata_bytes();
         total.volume_bytes += volume_bytes.values().sum::<usize>();
@@ -6142,7 +6130,6 @@ impl MVCCEngine {
     /// Threshold: 100K rows (first seal) or 10K rows (subsequent seals).
     /// Output is split into target_volume_rows-sized volumes.
     fn seal_hot_buffers(&self) -> Result<()> {
-        let _active_scope = super::read_memory::ReadScopeGuard::fresh();
         const SEAL_ROW_THRESHOLD: usize = 100_000;
         const SEAL_INCREMENTAL_THRESHOLD: usize = 10_000;
         let hot_max_rows = self.hot_limits.max_rows.load(Ordering::Relaxed);
@@ -7750,10 +7737,7 @@ impl TransactionEngineOperations for EngineOperations {
         let _touched_memory;
         let touched_tables: smallvec::SmallVec<[crate::common::SmartString; 4]> =
             txn_tables.iter().map(|(name, _)| name.clone()).collect();
-        _touched_memory = HotMetadataCharge::new(
-            smallvec_bytes(&touched_tables) as u128
-                + touched_tables.iter().map(name_bytes).sum::<u128>(),
-        );
+        _touched_memory = HotMetadataCharge::new(smallvec_bytes(&touched_tables) as u128);
         drop(cache);
 
         // Check cold-side pending tombstones only for tables this txn touched.
@@ -8052,9 +8036,7 @@ impl TransactionEngineOperations for EngineOperations {
             .get(txn_id)
             .map(|tables| tables.iter().map(|(name, _)| name.clone()).collect())
             .unwrap_or_default();
-        _touched_memory = HotMetadataCharge::new(
-            smallvec_bytes(&touched) as u128 + touched.iter().map(name_bytes).sum::<u128>(),
-        );
+        _touched_memory = HotMetadataCharge::new(smallvec_bytes(&touched) as u128);
         cache.remove(txn_id);
         drop(cache);
 
@@ -8088,13 +8070,7 @@ impl TransactionEngineOperations for EngineOperations {
                     .collect()
             })
             .unwrap_or_default();
-        _touched_memory = HotMetadataCharge::new(
-            smallvec_bytes(&touched) as u128
-                + touched
-                    .iter()
-                    .map(|(name, _)| name_bytes(name))
-                    .sum::<u128>(),
-        );
+        _touched_memory = HotMetadataCharge::new(smallvec_bytes(&touched) as u128);
         drop(cache);
 
         for (name, txn_store) in &touched {

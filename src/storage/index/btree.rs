@@ -42,9 +42,7 @@ use rayon::prelude::*;
 use crate::common::{CompactArc, CompactVec, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
-use crate::storage::index::memory::{
-    btree_node_bytes, value_bytes, IndexMemory, IndexMemoryOwner, IndexValueMap,
-};
+use crate::storage::index::memory::{btree_node_bytes, IndexMemory, IndexMemoryOwner};
 use crate::storage::traits::Index;
 
 /// Threshold for parallel filtering (number of unique values)
@@ -104,7 +102,7 @@ pub struct BTreeIndex {
 
     /// Row ID to value mapping (for removal operations)
     /// Uses I64Map for fast O(1) lookups with CompactArc<Value> (8 bytes per entry)
-    row_to_value: RwLock<IndexValueMap>,
+    row_to_value: RwLock<I64Map<CompactArc<Value>>>,
 
     /// Cached minimum value (excluding NULLs)
     cached_min: RwLock<Option<CompactArc<Value>>>,
@@ -139,7 +137,6 @@ impl BTreeStorage {
         let rows = match self.map.entry(CompactArc::clone(value)) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::btree_map::Entry::Vacant(entry) => {
-                self.nested_bytes += value_bytes(entry.key());
                 self.has_nodes = true;
                 entry.insert(RowIdSet::new())
             }
@@ -152,9 +149,8 @@ impl BTreeStorage {
     }
 
     fn remove_key(&mut self, value: &CompactArc<Value>) {
-        if let Some((stored, rows)) = self.map.remove_entry(value) {
-            self.nested_bytes -=
-                value_bytes(&stored) + (rows.capacity() * std::mem::size_of::<i64>()) as u128;
+        if let Some((_, rows)) = self.map.remove_entry(value) {
+            self.nested_bytes -= (rows.capacity() * std::mem::size_of::<i64>()) as u128;
         }
     }
 
@@ -242,10 +238,7 @@ impl BTreeIndex {
             unique,
             closed: AtomicBool::new(false),
             sorted_values: RwLock::new(BTreeStorage::default()),
-            row_to_value: RwLock::new(IndexValueMap {
-                map,
-                payload_bytes: 0,
-            }),
+            row_to_value: RwLock::new(map),
             cached_min: RwLock::new(None),
             cached_max: RwLock::new(None),
             cache_valid: AtomicBool::new(true),
@@ -256,16 +249,17 @@ impl BTreeIndex {
 
     fn mutate(
         &self,
-        mutation: impl FnOnce(&mut BTreeStorage, &mut IndexValueMap) -> Result<bool>,
+        mutation: impl FnOnce(&mut BTreeStorage, &mut I64Map<CompactArc<Value>>) -> Result<bool>,
     ) -> Result<()> {
         let mut sorted = self.sorted_values.write();
         let mut reverse = self.row_to_value.write();
-        let before = sorted.nested_bytes + reverse.requested_bytes();
+        let before = sorted.nested_bytes + reverse.allocation_bytes() as u128;
         let estimated_before = sorted.estimated_bytes();
         let result = mutation(&mut sorted, &mut reverse);
-        self.memory
-            .account
-            .resize(before, sorted.nested_bytes + reverse.requested_bytes());
+        self.memory.account.resize(
+            before,
+            sorted.nested_bytes + reverse.allocation_bytes() as u128,
+        );
         self.memory
             .account
             .resize_estimate(estimated_before, sorted.estimated_bytes());
@@ -332,11 +326,7 @@ impl BTreeIndex {
     /// Gets all values (sorted by BTreeMap ordering)
     pub fn get_all_values(&self) -> Vec<Value> {
         let sorted_values = self.sorted_values.read();
-        let mut exports = crate::storage::mvcc::read_memory::ExportBatch::new();
-        sorted_values
-            .keys()
-            .map(|arc| exports.capture_value(arc))
-            .collect()
+        sorted_values.keys().map(|arc| (**arc).clone()).collect()
     }
 
     /// Gets all row IDs for a specific value
@@ -397,12 +387,8 @@ impl BTreeIndex {
         {
             let mut cached_min = self.cached_min.write();
             let mut cached_max = self.cached_max.write();
-            let before = cached_min.as_ref().map_or(0, value_bytes)
-                + cached_max.as_ref().map_or(0, value_bytes);
-            let after = min.as_ref().map_or(0, value_bytes) + max.as_ref().map_or(0, value_bytes);
             *cached_min = min;
             *cached_max = max;
-            self.memory.account.resize(before, after);
         }
 
         // Mark cache as valid — still under sorted_values read lock, so no
@@ -632,7 +618,7 @@ impl Index for BTreeIndex {
         self.check_closed()?;
 
         self.mutate(|sorted_values, row_to_value| {
-            row_to_value.map.reserve(entries.len());
+            row_to_value.reserve(entries.len());
 
             // For unique indexes: pre-check all entries before modifying
             if self.unique {
@@ -1047,10 +1033,7 @@ impl Index for BTreeIndex {
 
         // Return cached min (clone the inner Value from Arc)
         let cached_min = self.cached_min.read();
-        cached_min.as_ref().map(|arc| {
-            crate::storage::mvcc::read_memory::charge_value_export(arc);
-            (**arc).clone()
-        })
+        cached_min.as_ref().map(|arc| (**arc).clone())
     }
 
     /// Returns the maximum value in the index
@@ -1067,10 +1050,7 @@ impl Index for BTreeIndex {
 
         // Return cached max (clone the inner Value from Arc)
         let cached_max = self.cached_max.read();
-        cached_max.as_ref().map(|arc| {
-            crate::storage::mvcc::read_memory::charge_value_export(arc);
-            (**arc).clone()
-        })
+        cached_max.as_ref().map(|arc| (**arc).clone())
     }
 
     fn get_all_values(&self) -> Vec<Value> {
@@ -1192,16 +1172,13 @@ impl Index for BTreeIndex {
             sorted.map.clear();
             sorted.nested_bytes = 0;
             sorted.has_nodes = false;
-            reverse.map.clear();
-            reverse.payload_bytes = 0;
+            reverse.clear();
             Ok(false)
         })?;
 
         for cache in [&self.cached_min, &self.cached_max] {
             let mut cache = cache.write();
-            let before = cache.as_ref().map_or(0, value_bytes);
             *cache = None;
-            self.memory.account.resize(before, 0);
         }
 
         Ok(())
@@ -1354,27 +1331,15 @@ mod tests {
     fn assert_requested_allocations(index: &BTreeIndex) {
         let sorted = index.sorted_values.read();
         let reverse = index.row_to_value.read();
-        let payload = |value: &CompactArc<Value>| {
-            (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Value>()) as u128
-                + value.heap_bytes() as u128
-        };
         let nested: u128 = sorted
             .map
-            .iter()
-            .map(|(key, rows)| {
-                payload(key) + (rows.capacity() * std::mem::size_of::<i64>()) as u128
-            })
+            .values()
+            .map(|rows| (rows.capacity() * std::mem::size_of::<i64>()) as u128)
             .sum();
-        let reverse_payload: u128 = reverse.map.values().map(payload).sum();
         assert_eq!(sorted.nested_bytes, nested);
-        assert_eq!(reverse.payload_bytes, reverse_payload);
-        let cached = index.cached_min.read().as_ref().map_or(0, payload)
-            + index.cached_max.read().as_ref().map_or(0, payload);
         let expected = crate::storage::mvcc::memory::arc_allocation_bytes::<BTreeIndex>() as u128
             + nested
-            + reverse_payload
-            + cached
-            + reverse.map.allocation_bytes() as u128
+            + reverse.allocation_bytes() as u128
             + index.name.capacity() as u128
             + index.table_name.capacity() as u128
             + index.column_name.capacity() as u128;
@@ -1382,7 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn btree_accounting_retains_deleted_cache_keys_until_refresh_or_clear() {
+    fn btree_capacity_accounting_survives_cache_refresh_and_clear() {
         for refresh in [false, true] {
             let index = memory_index(false);
             let initial = index.memory.account.requested_bytes();
@@ -1394,7 +1359,7 @@ mod tests {
             assert_requested_allocations(&index);
             index.remove(&[], 1, 0).unwrap();
             assert_requested_allocations(&index);
-            assert!(index.memory.account.requested_bytes() > initial);
+            assert_eq!(index.memory.account.requested_bytes(), initial);
             assert!(
                 index.memory.account.estimated_bytes() > 0,
                 "the empty tree can retain its root"

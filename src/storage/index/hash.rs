@@ -65,7 +65,7 @@ use rustc_hash::FxHashMap;
 use crate::common::{CompactArc, CompactVec, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::{ComparisonExpr, Expression, InListExpr};
-use crate::storage::index::memory::{hash_table_bytes, value_bytes, IndexMemory, IndexMemoryOwner};
+use crate::storage::index::memory::{hash_table_bytes, IndexMemory, IndexMemoryOwner};
 use crate::storage::traits::Index;
 
 /// Fixed seeds for deterministic hashing across add/find operations
@@ -140,7 +140,8 @@ impl HashStorage {
     fn group_bytes(values: &Vec<CompactArc<Value>>, rows: &CompactVec<i64>) -> u128 {
         (values.capacity() * std::mem::size_of::<CompactArc<Value>>()) as u128
             + (rows.capacity() * std::mem::size_of::<i64>()) as u128
-            + values.iter().map(value_bytes).sum::<u128>()
+            + (values.len() * (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Value>()))
+                as u128
     }
 
     fn prune_empty(groups: &mut HashGroups) -> u128 {
@@ -808,13 +809,12 @@ impl Index for HashIndex {
             return Vec::new();
         }
         let hash_to_values = self.hash_to_values.read();
-        let mut exports = crate::storage::mvcc::read_memory::ExportBatch::new();
         let mut result = Vec::with_capacity(hash_to_values.len());
         for entries in hash_to_values.values() {
             for (values, _row_ids) in entries {
                 // For single-column index, return the value directly
                 if values.len() == 1 {
-                    result.push(exports.capture_value(&values[0]));
+                    result.push((*values[0]).clone());
                 }
             }
         }
@@ -892,11 +892,9 @@ mod tests {
             for (values, row_ids) in groups {
                 nested += (values.capacity() * std::mem::size_of::<CompactArc<Value>>()) as u128;
                 nested += (row_ids.capacity() * std::mem::size_of::<i64>()) as u128;
-                for value in values {
-                    nested += (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Value>())
-                        as u128
-                        + value.heap_bytes() as u128;
-                }
+                nested += (values.len()
+                    * (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Value>()))
+                    as u128;
             }
         }
         assert_eq!(storage.nested_bytes, nested);

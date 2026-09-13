@@ -46,9 +46,9 @@ use crate::common::{CompactArc, CompactVec, I64Map};
 use crate::core::{DataType, Error, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 use crate::storage::index::memory::{
-    btree_node_bytes, hash_table_bytes, value_bytes, IndexMemory, IndexMemoryOwner,
+    btree_node_bytes, hash_table_bytes, IndexMemory, IndexMemoryOwner,
 };
-use crate::storage::mvcc::read_memory::PayloadCharge;
+use crate::storage::mvcc::memory::HotMetadataCharge;
 use crate::storage::traits::Index;
 
 // ============================================================================
@@ -63,11 +63,6 @@ pub struct CompositeKey(pub Vec<Value>);
 impl CompositeKey {
     fn heap_bytes(&self) -> u128 {
         (self.0.capacity() * std::mem::size_of::<Value>()) as u128
-            + self
-                .0
-                .iter()
-                .map(|value| value.heap_bytes() as u128)
-                .sum::<u128>()
     }
 }
 
@@ -314,7 +309,6 @@ struct CompositeReverse {
 impl CompositeReverse {
     fn key_bytes(values: &Vec<CompactArc<Value>>) -> u128 {
         (values.capacity() * std::mem::size_of::<CompactArc<Value>>()) as u128
-            + values.iter().map(value_bytes).sum::<u128>()
     }
 
     fn requested_bytes(&self) -> u128 {
@@ -368,20 +362,16 @@ impl WalkOrders {
         };
         let before = 1 + order.len() / 5;
         if insert {
-            let value = value.clone();
-            let bytes = value.heap_bytes() as u128;
-            if order.insert((value, row_id)) {
-                self.nested_bytes += bytes;
-            }
-        } else if let Some((stored, _)) = order.take(&(value.clone(), row_id)) {
-            self.nested_bytes -= stored.heap_bytes() as u128;
+            order.insert((value.clone(), row_id));
+        } else {
+            order.remove(&(value.clone(), row_id));
         }
         self.node_units = self.node_units - before as u128 + (1 + order.len() / 5) as u128;
     }
 
-    fn insert(&mut self, key: CompositeKey, order: BTreeSet<(Value, i64)>, value_bytes: u128) {
+    fn insert(&mut self, key: CompositeKey, order: BTreeSet<(Value, i64)>) {
         debug_assert!(!self.map.contains_key(&key));
-        self.nested_bytes += key.heap_bytes() + value_bytes;
+        self.nested_bytes += key.heap_bytes();
         self.node_units += (1 + order.len() / 5) as u128;
         self.map.insert(key, order);
         self.capacity_high_water = self.capacity_high_water.max(self.map.capacity());
@@ -770,7 +760,7 @@ impl Index for MultiColumnIndex {
         let key = CompositeKey(values.to_vec());
 
         // Track old key if this is an update (for BTree/prefix cleanup after releasing locks)
-        let mut cleanup_charge = PayloadCharge::unshared(0);
+        let mut cleanup_charge = HotMetadataCharge::default();
         let mut old_key_for_cleanup: Option<Vec<CompactArc<Value>>> = None;
 
         let Some(btree_needs_update) = self.mutate_main(|value_to_rows, row_to_key| {
@@ -785,7 +775,7 @@ impl Index for MultiColumnIndex {
 
                 // Different key - save for BTree/prefix cleanup AFTER releasing locks
                 let old_key = existing_arc_values.clone();
-                cleanup_charge.add(CompositeReverse::key_bytes(&old_key));
+                cleanup_charge.resize(CompositeReverse::key_bytes(&old_key));
                 old_key_for_cleanup = Some(old_key);
 
                 // Create CompositeKey from existing Arc values for removal
@@ -969,7 +959,7 @@ impl Index for MultiColumnIndex {
             }
         }
 
-        let mut cleanup_charge = PayloadCharge::unshared(0);
+        let mut cleanup_charge = HotMetadataCharge::default();
         let mut updates_to_old_key: Vec<(i64, Vec<CompactArc<Value>>)> = Vec::new();
         let btree_needs_update = self.mutate_main(|value_to_rows, row_to_key| {
             // Reserve capacity to reduce reallocations
@@ -1059,7 +1049,7 @@ impl Index for MultiColumnIndex {
                 row_to_key.insert(row_id, arc_values);
             }
 
-            cleanup_charge.add(
+            cleanup_charge.resize(
                 cleanup_bytes
                     + (updates_to_old_key.capacity()
                         * std::mem::size_of::<(i64, Vec<CompactArc<Value>>)>())
@@ -1201,31 +1191,23 @@ impl Index for MultiColumnIndex {
     }
 
     fn remove_batch_ids(&self, row_ids: &[i64]) -> Option<Result<()>> {
-        let mut cleanup_charge = PayloadCharge::unshared(0);
+        let mut cleanup_charge = HotMetadataCharge::default();
+        let mut cleanup_bytes = 0u128;
         // The keys come from the row map; the batch path then removes them
         let owned: Vec<(i64, Vec<Value>)> = {
             let row_to_key = self.row_to_key.read();
-            let mut cleanup_bytes = 0u128;
             let owned: Vec<_> = row_ids
                 .iter()
                 .filter_map(|&row_id| {
                     row_to_key.get(row_id).map(|key| {
-                        let values: Vec<_> = key
-                            .iter()
-                            .map(|v| {
-                                cleanup_bytes += v.heap_bytes() as u128;
-                                (**v).clone()
-                            })
-                            .collect();
+                        let values: Vec<_> = key.iter().map(|v| (**v).clone()).collect();
                         cleanup_bytes += (values.capacity() * std::mem::size_of::<Value>()) as u128;
                         (row_id, values)
                     })
                 })
                 .collect();
-            cleanup_charge.add(
-                cleanup_bytes
-                    + (owned.capacity() * std::mem::size_of::<(i64, Vec<Value>)>()) as u128,
-            );
+            cleanup_bytes += (owned.capacity() * std::mem::size_of::<(i64, Vec<Value>)>()) as u128;
+            cleanup_charge.resize(cleanup_bytes);
             owned
         };
         if owned.is_empty() {
@@ -1235,7 +1217,8 @@ impl Index for MultiColumnIndex {
             .iter()
             .map(|(row_id, values)| (*row_id, values.as_slice()))
             .collect();
-        cleanup_charge.add((borrowed.capacity() * std::mem::size_of::<(i64, &[Value])>()) as u128);
+        cleanup_bytes += (borrowed.capacity() * std::mem::size_of::<(i64, &[Value])>()) as u128;
+        cleanup_charge.resize(cleanup_bytes);
         Some(self.remove_batch_slice(&borrowed))
     }
 
@@ -1431,17 +1414,15 @@ impl Index for MultiColumnIndex {
                     let ids = self.get_row_ids_equal(prefix);
                     let row_to_key = self.row_to_key.read();
                     let mut entries: Vec<(Value, i64)> = Vec::with_capacity(ids.len());
-                    let mut value_bytes = 0;
                     for row_id in ids.iter() {
                         if let Some(key) = row_to_key.get(*row_id) {
                             if let Some(value) = key.get(walked) {
-                                value_bytes += value.heap_bytes() as u128;
                                 entries.push(((**value).clone(), *row_id));
                             }
                         }
                     }
                     entries.sort_unstable();
-                    orders.insert(group.clone(), entries.into_iter().collect(), value_bytes);
+                    orders.insert(group.clone(), entries.into_iter().collect());
                     self.memory.account.resize(before, orders.nested_bytes);
                     self.memory
                         .account
@@ -1583,14 +1564,8 @@ mod tests {
     }
 
     fn assert_requested_allocations(index: &MultiColumnIndex) {
-        let key_bytes = |key: &CompositeKey| {
-            (key.0.capacity() * std::mem::size_of::<Value>()) as u128
-                + key
-                    .0
-                    .iter()
-                    .map(|value| value.heap_bytes() as u128)
-                    .sum::<u128>()
-        };
+        let key_bytes =
+            |key: &CompositeKey| (key.0.capacity() * std::mem::size_of::<Value>()) as u128;
         let entry_bytes = |(key, rows): (&CompositeKey, &CompactVec<i64>)| {
             key_bytes(key) + (rows.capacity() * std::mem::size_of::<i64>()) as u128
         };
@@ -1602,28 +1577,9 @@ mod tests {
         let tree_bytes = tree.iter().map(entry_bytes).sum::<u128>();
         let reverse_bytes = reverse
             .values()
-            .map(|values| {
-                (values.capacity() * std::mem::size_of::<CompactArc<Value>>()) as u128
-                    + values
-                        .iter()
-                        .map(|value| {
-                            (2 * std::mem::size_of::<usize>() + std::mem::size_of::<Value>())
-                                as u128
-                                + value.heap_bytes() as u128
-                        })
-                        .sum::<u128>()
-            })
+            .map(|values| (values.capacity() * std::mem::size_of::<CompactArc<Value>>()) as u128)
             .sum::<u128>();
-        let order_bytes = orders
-            .iter()
-            .map(|(key, rows)| {
-                key_bytes(key)
-                    + rows
-                        .iter()
-                        .map(|(value, _)| value.heap_bytes() as u128)
-                        .sum::<u128>()
-            })
-            .sum::<u128>();
+        let order_bytes = orders.keys().map(key_bytes).sum::<u128>();
         assert_eq!(main.nested_bytes, main_bytes);
         assert_eq!(tree.nested_bytes, tree_bytes);
         assert_eq!(reverse.payload_bytes, reverse_bytes);
@@ -1752,29 +1708,6 @@ mod tests {
         assert_eq!(orders.nested_bytes, 0);
         assert_eq!(orders.node_units, 0);
         assert!(orders.capacity_high_water > 0);
-    }
-
-    #[test]
-    fn composite_removal_debits_the_stored_walk_value() {
-        let index = memory_index(false);
-        let mut large = String::with_capacity(4096);
-        large.push_str("equal text with different retained capacity");
-        let original = [Value::Integer(1), Value::Text(large.into())];
-        let replacement = [
-            Value::Integer(1),
-            Value::text("equal text with different retained capacity"),
-        ];
-        assert!(original[1].heap_bytes() > replacement[1].heap_bytes());
-        index.add(&original, 1, 0).unwrap();
-        assert!(index.walk_prefix_ordered(&original[..1], None, None, true, &mut |_, _| true));
-        index.add_batch_slice(&[(1, &replacement)]).unwrap();
-        assert_requested_allocations(&index);
-        index.remove(&replacement, 1, 0).unwrap();
-        assert_requested_allocations(&index);
-        assert_eq!(
-            index.walk_orders.read().nested_bytes,
-            CompositeKey(original[..1].to_vec()).heap_bytes()
-        );
     }
 
     #[test]

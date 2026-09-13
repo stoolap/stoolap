@@ -255,11 +255,7 @@ impl SegmentedTable {
         if col_idx < schema.columns.len() {
             let col = &schema.columns[col_idx];
             col.default_value
-                .as_ref()
-                .map(|value| {
-                    crate::storage::mvcc::read_memory::charge_value_export(value);
-                    value.clone()
-                })
+                .clone()
                 .unwrap_or_else(|| Value::null(col.data_type))
         } else {
             Value::Null(crate::core::DataType::Null)
@@ -1085,10 +1081,9 @@ impl SegmentedTable {
         let per_volume_rows: Vec<Option<RowVec>> =
             if pruned_volumes.len() >= 4 && _total_cold_rows >= 100_000 {
                 use rayon::prelude::*;
-                let read_scope = crate::storage::mvcc::read_memory::ParallelReadScope::new();
                 pruned_volumes
                     .par_iter()
-                    .map(|v| read_scope.run(|| process_volume(v)))
+                    .map(|v| process_volume(v))
                     .collect::<Result<_>>()?
             } else {
                 pruned_volumes
@@ -6271,7 +6266,6 @@ impl Table for SegmentedTable {
                             accumulate_columnar(&mut la, &phys_aggs, i);
                         }
                         if visible > 0 {
-                            crate::storage::mvcc::read_memory::charge_value_export(default_val);
                             let key = default_val.clone();
                             local_groups
                                 .entry(key.clone())
@@ -6300,10 +6294,9 @@ impl Table for SegmentedTable {
             #[cfg(feature = "parallel")]
             {
                 use rayon::prelude::*;
-                let read_scope = crate::storage::mvcc::read_memory::ParallelReadScope::new();
                 let vol_group_maps: Vec<Option<VolumeGroups>> = volumes
                     .par_iter()
-                    .map(|volume| read_scope.run(|| process_volume(volume)))
+                    .map(&process_volume)
                     .collect::<Result<_>>()?;
                 if bail.load(std::sync::atomic::Ordering::Relaxed) {
                     return Ok(None);
@@ -6598,71 +6591,6 @@ mod tests {
             .column("id", DataType::Integer, false, true)
             .column("value", DataType::Float, false, false)
             .build()
-    }
-
-    #[cfg(feature = "parallel")]
-    fn table_with_parallel_mapped_defaults() -> (SegmentedTable, u128) {
-        let physical = SchemaBuilder::new("test")
-            .add_primary_key("id", DataType::Integer)
-            .build();
-        let mut schema = physical.clone();
-        let default = Value::text("a retained default for parallel scans");
-        let bytes = default.heap_bytes() as u128;
-        let mut column = crate::core::SchemaColumn::nullable(1, "label", DataType::Text);
-        column.default_value = Some(default);
-        schema.add_column(column).unwrap();
-        let mgr = Arc::new(SegmentManager::new("test", None));
-        let mut row = Row::from_values(vec![Value::Integer(0)]);
-        for segment in 0..4 {
-            let first = segment * 25_000 + 1;
-            let mut builder = VolumeBuilder::with_capacity(&physical, 25_000);
-            for id in first..first + 25_000 {
-                row.set(0, Value::Integer(id)).unwrap();
-                builder.add_row(id, &row);
-            }
-            mgr.register_segment(
-                segment as u64 + 1,
-                Arc::new(builder.finish()),
-                SegmentMeta {
-                    segment_id: segment as u64 + 1,
-                    file_path: PathBuf::from("parallel.vol"),
-                    row_count: 25_000,
-                    min_row_id: first,
-                    max_row_id: first + 24_999,
-                    schema_version: 0,
-                    creation_lsn: 0,
-                    seal_seq: 0,
-                },
-                Some(&schema),
-            );
-        }
-        let hot = MockHotTable::new(schema, Vec::new());
-        (SegmentedTable::new(Box::new(hot), mgr), bytes)
-    }
-
-    #[test]
-    #[cfg(feature = "parallel")]
-    fn parallel_mapped_rows_keep_the_statement_export_scope() {
-        let (table, bytes) = table_with_parallel_mapped_defaults();
-        let scope = Arc::new(crate::storage::mvcc::read_memory::ReadScope::default());
-        let _active = scope.enter();
-        let rows = table.collect_all_rows(None).unwrap();
-        assert_eq!(rows.len(), 100_000);
-        assert!(scope.exported_bytes() >= 100_000 * bytes);
-    }
-
-    #[test]
-    #[cfg(feature = "parallel")]
-    fn parallel_default_groups_keep_the_statement_export_scope() {
-        let (table, bytes) = table_with_parallel_mapped_defaults();
-        let scope = Arc::new(crate::storage::mvcc::read_memory::ReadScope::default());
-        let _active = scope.enter();
-        let groups = table
-            .compute_grouped_aggregates(&[1], &[(AggregateOp::Count, 0)])
-            .unwrap()
-            .unwrap();
-        assert_eq!(groups.len(), 1);
-        assert!(scope.exported_bytes() >= 4 * bytes);
     }
 
     #[test]
