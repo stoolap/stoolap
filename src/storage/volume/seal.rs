@@ -117,13 +117,16 @@ pub fn seal_and_persist_multi(
 
     let mut results = Vec::new();
     for chunk in rows.chunks(chunk_size) {
-        let mut volume = seal_rows(schema, chunk)?;
-        let volume_id = io::next_volume_id();
-        match io::write_volume_to_disk_opts(volume_dir, table_name, volume_id, &volume, compress) {
-            Ok((path, store)) => {
-                volume.columns.attach_compressed_store(store);
-                results.push((Arc::new(volume), path, volume_id));
-            }
+        let sealed = seal_rows(schema, chunk).and_then(|mut volume| {
+            let volume_id = io::next_volume_id();
+            let (path, store) = io::write_volume_to_disk_opts(
+                volume_dir, table_name, volume_id, &volume, compress,
+            )?;
+            volume.columns.attach_compressed_store(store);
+            Ok((Arc::new(volume), path, volume_id))
+        });
+        match sealed {
+            Ok(entry) => results.push(entry),
             Err(e) => {
                 // Clean up already-written files before propagating the error.
                 for (_, path, _) in &results {
