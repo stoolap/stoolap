@@ -25,7 +25,7 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>) {
         .build();
     let mut builder = VolumeBuilder::new(&schema);
     builder.add_row(1, &Row::from_values(vec![Value::Null(DataType::Text)]));
-    let path = write_volume_to_disk(dir.path(), "metadata", 1, &builder.finish()).unwrap();
+    let path = write_volume_to_disk(dir.path(), "metadata", 1, &builder.finish().unwrap()).unwrap();
     let bytes = std::fs::read(&path).unwrap();
     (dir, path, bytes)
 }

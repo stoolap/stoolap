@@ -793,7 +793,7 @@ mod tests {
             2,
             &Row::from_values(vec![Value::Integer(2), Value::text("world")]),
         );
-        let vol = builder.finish();
+        let vol = builder.finish().unwrap();
 
         let path = write_volume_to_disk(dir.path(), "test_table", 1, &vol).unwrap();
         assert!(path.exists());
@@ -814,7 +814,7 @@ mod tests {
         for i in 0..3 {
             let mut builder = VolumeBuilder::new(&schema);
             builder.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
-            let vol = builder.finish();
+            let vol = builder.finish().unwrap();
             write_volume_to_disk(dir.path(), "my_table", i as u64, &vol).unwrap();
         }
 
@@ -832,7 +832,7 @@ mod tests {
         for i in 1..=3 {
             let mut builder = VolumeBuilder::new(&schema);
             builder.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
-            let vol = builder.finish();
+            let vol = builder.finish().unwrap();
             write_volume_to_disk(dir.path(), "t", i as u64, &vol).unwrap();
         }
 
@@ -912,7 +912,7 @@ mod tests {
 
         let mut builder = VolumeBuilder::new(&schema);
         builder.add_row(1, &Row::from_values(vec![Value::Integer(1)]));
-        let vol = builder.finish();
+        let vol = builder.finish().unwrap();
         write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
 
         assert_eq!(list_volumes(dir.path(), "t").len(), 1);
@@ -954,7 +954,7 @@ mod tests {
                 Value::Float(3.00),
             ]),
         );
-        let vol = builder.finish();
+        let vol = builder.finish().unwrap();
 
         // write_volume_to_disk with compress=true produces V4
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
@@ -1009,7 +1009,7 @@ mod tests {
             3,
             &Row::from_values(vec![Value::Integer(3), Value::Float(30.0)]),
         );
-        let vol = builder.finish();
+        let vol = builder.finish().unwrap();
 
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
         let loaded = read_volume_from_disk(&path).unwrap();
@@ -1042,7 +1042,7 @@ mod tests {
                 ]),
             );
         }
-        let vol = builder.finish();
+        let vol = builder.finish().unwrap();
 
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
         let loaded = read_volume_from_disk(&path).unwrap();
@@ -1088,7 +1088,7 @@ mod tests {
                 Value::Boolean(false),
             ]),
         );
-        let vol = builder.finish();
+        let vol = builder.finish().unwrap();
 
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
         let loaded = read_volume_from_disk(&path).unwrap();
@@ -1117,7 +1117,7 @@ mod tests {
             1,
             &Row::from_values(vec![Value::Integer(42), Value::text("test")]),
         );
-        let vol = builder.finish();
+        let vol = builder.finish().unwrap();
 
         let path = write_volume_to_disk(dir.path(), "t", 1, &vol).unwrap();
         let loaded = read_volume_from_disk(&path).unwrap();

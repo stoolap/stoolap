@@ -1205,7 +1205,7 @@ impl MVCCEngine {
             }
             true
         })?;
-        let mut volume = builder.finish();
+        let mut volume = builder.finish()?;
         let vol_row_count = volume.meta.row_count;
 
         // Write volume file to disk and retain CompressedBlockStore for
@@ -5718,7 +5718,13 @@ impl MVCCEngine {
                     };
                     builder.add_row(row_id, &row);
                 }
-                let mut compacted = builder.finish();
+                let mut compacted = match builder.finish() {
+                    Ok(volume) => volume,
+                    Err(e) => {
+                        prepare_error = Some(e);
+                        break 'prepare;
+                    }
+                };
                 for (col_indices, _) in &unique_columns {
                     if let Err(e) = compacted.prebuild_unique_index(col_indices) {
                         prepare_error = Some(e.into());
@@ -8243,7 +8249,7 @@ mod tests {
             2,
             &Row::from_values(vec![Value::Integer(2), Value::Integer(45)]),
         );
-        engine.register_volume("items", Arc::new(builder.finish()));
+        engine.register_volume("items", Arc::new(builder.finish().unwrap()));
 
         let tx = engine.begin_transaction().unwrap();
         let table = tx.get_table("items").unwrap();
@@ -8288,7 +8294,7 @@ mod tests {
             2,
             &Row::from_values(vec![Value::Integer(2), Value::text("dup")]),
         );
-        engine.register_volume("items", Arc::new(builder.finish()));
+        engine.register_volume("items", Arc::new(builder.finish().unwrap()));
 
         let tx = engine.begin_transaction().unwrap();
         let table = tx.get_table("items").unwrap();
@@ -8326,7 +8332,7 @@ mod tests {
             2,
             &Row::from_values(vec![Value::Integer(2), Value::text("bob")]),
         );
-        engine.register_volume("items", Arc::new(builder.finish()));
+        engine.register_volume("items", Arc::new(builder.finish().unwrap()));
 
         let tx = engine.begin_transaction().unwrap();
         let table = tx.get_table("items").unwrap();
@@ -8358,7 +8364,7 @@ mod tests {
             1,
             &Row::from_values(vec![Value::Integer(1), Value::vector(vec![1.0, 0.0])]),
         );
-        engine.register_volume("items", Arc::new(builder.finish()));
+        engine.register_volume("items", Arc::new(builder.finish().unwrap()));
 
         let tx = engine.begin_transaction().unwrap();
         let table = tx.get_table("items").unwrap();

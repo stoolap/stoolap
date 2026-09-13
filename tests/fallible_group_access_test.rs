@@ -404,7 +404,7 @@ fn range_scan_without_group_metadata_preserves_matching_rows() {
     for id in 1..=rows as i64 {
         builder.add_row(id, &Row::from_values(vec![Value::Integer(id); 2]));
     }
-    let mut volume = builder.finish();
+    let mut volume = builder.finish().unwrap();
     let store =
         CompressedBlockStore::compress_columns(&volume.columns, &[DataType::Integer; 2], rows)
             .unwrap();
@@ -881,7 +881,7 @@ fn two_column_volume() -> stoolap::storage::volume::writer::FrozenVolume {
             &Row::from_values(vec![Value::Integer(id), Value::Integer(id)]),
         );
     }
-    builder.finish()
+    builder.finish().unwrap()
 }
 
 fn malformed_columns() -> LazyColumns {
@@ -1302,7 +1302,7 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
         for row_id in start..=end {
             builder.add_row(row_id, &Row::from_values(vec![Value::Integer(row_id); 2]));
         }
-        let volume = builder.finish();
+        let volume = builder.finish().unwrap();
         let path = write_volume_to_disk(&volume_dir, "group_access", volume_id, &volume).unwrap();
         if volume_id == 2 {
             good_last_file = std::fs::read(&path).unwrap();

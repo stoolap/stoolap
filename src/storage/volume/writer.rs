@@ -31,7 +31,7 @@ pub static GLOBAL_EVICTION_EPOCH: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 use crate::common::SmartString;
-use crate::core::{DataType, Row, Schema, Value};
+use crate::core::{DataType, Error, Result, Row, Schema, Value};
 
 use super::column::{ColumnData, ZoneMap, ROW_GROUP_SIZE};
 use super::format::{
@@ -1588,8 +1588,9 @@ impl VolumeBuilder {
         self.row_count += 1;
     }
 
-    /// Freeze the builder into a FrozenVolume.
-    pub fn finish(mut self) -> FrozenVolume {
+    /// Freeze the builder into a FrozenVolume. Rows must have been added
+    /// in ascending row id order; any other order is an error
+    pub fn finish(mut self) -> Result<FrozenVolume> {
         debug_assert_eq!(self.row_ids.len(), self.row_count);
         let mut columns = Vec::with_capacity(self.num_cols);
         let mut sorted_columns = Vec::with_capacity(self.num_cols);
@@ -1681,15 +1682,12 @@ impl VolumeBuilder {
             })
             .collect();
 
-        // Ensure row_ids are sorted — binary_search in manifest/table depends on this.
-        // All production paths (seal via BTree iter, compact via explicit sort, snapshot
-        // recovery via BTreeMap iter) provide rows in ascending row_id order. This
-        // check catches any future caller that violates this invariant.
-        // Using a regular check (not debug_assert) because silent corruption in
-        // release builds from unsorted row_ids would be catastrophic.
+        // Row ids name the payload at each position and lookups binary
+        // search them, so they cannot be reordered apart from the columns
         if !self.row_ids.windows(2).all(|w| w[0] < w[1]) {
-            // Sort as fallback instead of panicking
-            self.row_ids.sort_unstable();
+            return Err(Error::internal(
+                "volume rows were not added in ascending row id order",
+            ));
         }
 
         let column_name_map: AHashMap<SmartString, usize> = column_names
@@ -1731,7 +1729,7 @@ impl VolumeBuilder {
             Vec::new()
         };
 
-        FrozenVolume {
+        Ok(FrozenVolume {
             columns: LazyColumns::eager(columns, column_types.clone()),
             meta: Arc::new(VolumeMeta {
                 zone_maps: self.zone_maps,
@@ -1749,7 +1747,7 @@ impl VolumeBuilder {
             last_access_epoch: std::sync::atomic::AtomicU64::new(
                 GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
             ),
-        }
+        })
     }
 }
 
@@ -2202,7 +2200,7 @@ mod tests {
             ]),
         );
 
-        let volume = builder.finish();
+        let volume = builder.finish().unwrap();
 
         assert_eq!(volume.meta.row_count, 3);
         assert_eq!(volume.columns.len(), 4);
@@ -2257,7 +2255,7 @@ mod tests {
             ]),
         );
 
-        let volume = builder.finish();
+        let volume = builder.finish().unwrap();
         assert!(volume.columns.get(1).unwrap().is_null(0));
         assert!(volume.columns.get(3).unwrap().is_null(0));
         assert!(!volume.columns.get(0).unwrap().is_null(0));
@@ -2280,7 +2278,7 @@ mod tests {
             builder.add_row(i, &Row::from_values(vec![Value::Timestamp(ts)]));
         }
 
-        let volume = builder.finish();
+        let volume = builder.finish().unwrap();
         assert!(volume.is_sorted(0));
 
         // Binary search for row 50
@@ -2312,7 +2310,7 @@ mod tests {
             ]),
         );
 
-        let volume = builder.finish();
+        let volume = builder.finish().unwrap();
 
         // Project only id and price (columns 0 and 3)
         let row = volume.get_row_projected(0, &[0, 3]).unwrap();

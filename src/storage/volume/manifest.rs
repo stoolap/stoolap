@@ -2963,7 +2963,7 @@ mod tests {
         for i in 1..=10i64 {
             builder.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
         }
-        let volume = Arc::new(builder.finish());
+        let volume = Arc::new(builder.finish().unwrap());
 
         let mgr = SegmentManager::new("test", None);
         let meta = SegmentMeta {
@@ -2996,7 +2996,7 @@ mod tests {
         for i in 1..=10i64 {
             builder.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
         }
-        let volume = Arc::new(builder.finish());
+        let volume = Arc::new(builder.finish().unwrap());
 
         let mgr = SegmentManager::new("test", None);
         mgr.register_segment(
@@ -3046,7 +3046,7 @@ mod tests {
                 seg_id as i64,
                 &Row::from_values(vec![Value::Integer(seg_id as i64)]),
             );
-            let vol = Arc::new(builder.finish());
+            let vol = Arc::new(builder.finish().unwrap());
             mgr.register_segment(
                 seg_id,
                 vol,
@@ -3115,7 +3115,7 @@ mod tests {
                 &Row::from_values(vec![Value::Integer(i), Value::from(format!("name_{}", i))]),
             );
         }
-        let mut volume = builder.finish();
+        let mut volume = builder.finish().unwrap();
         // Attach compressed store so hot→warm transition works.
         let (_, store) = crate::storage::volume::io::serialize_v4_public(&volume).unwrap();
         volume.columns.attach_compressed_store(store);
@@ -3285,7 +3285,7 @@ mod tests {
         for i in 1..=100i64 {
             builder.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
         }
-        let mut volume = builder.finish();
+        let mut volume = builder.finish().unwrap();
         let (_, store) = crate::storage::volume::io::serialize_v4_public(&volume).unwrap();
         volume.columns.attach_compressed_store(store);
         mgr.register_segment(
@@ -3354,7 +3354,7 @@ mod tests {
             for i in vals {
                 b.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
             }
-            Arc::new(b.finish())
+            Arc::new(b.finish().unwrap())
         };
 
         mgr.register_segment(
@@ -3414,7 +3414,7 @@ mod tests {
         for i in 1..=10i64 {
             b.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
         }
-        let mut volume = b.finish();
+        let mut volume = b.finish().unwrap();
         let (_, store) = crate::storage::volume::io::serialize_v4_public(&volume).unwrap();
         volume.columns.attach_compressed_store(store);
         mgr.register_segment(

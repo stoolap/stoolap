@@ -1484,7 +1484,7 @@ mod tests {
                 Value::Float(8.00),
             ]),
         );
-        Arc::new(builder.finish())
+        Arc::new(builder.finish().unwrap())
     }
 
     #[test]
