@@ -92,3 +92,47 @@ fn a_negated_literal_list_holding_null_keeps_nothing() {
         vec![2, 3]
     );
 }
+
+#[test]
+fn a_negated_subquery_set_holding_null_keeps_nothing() {
+    let db = Database::open("memory://not_exists_null_subquery_set").unwrap();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO p VALUES (1), (2), (3)", ())
+        .unwrap();
+    db.execute("INSERT INTO c VALUES (1, 1), (2, NULL)", ())
+        .unwrap();
+    // The set the subquery builds holds a NULL, so the primary key probe
+    // must stand down: nothing is known to be outside it
+    for _ in 0..3 {
+        assert!(ids(
+            &db,
+            "SELECT id FROM p WHERE id NOT IN (SELECT p_id FROM c) OR id IS NULL ORDER BY id"
+        )
+        .is_empty());
+    }
+}
+
+#[test]
+fn an_inner_result_of_only_nulls_keeps_every_outer_row() {
+    let db = Database::open("memory://not_exists_only_null_inner").unwrap();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO p VALUES (1), (2), (3)", ())
+        .unwrap();
+    db.execute("INSERT INTO c VALUES (1, NULL), (2, NULL)", ())
+        .unwrap();
+    for _ in 0..3 {
+        assert_eq!(
+            ids(
+                &db,
+                "SELECT id FROM p WHERE NOT EXISTS (SELECT 1 FROM c WHERE c.p_id = p.id) ORDER BY id"
+            ),
+            vec![1, 2, 3]
+        );
+    }
+}
