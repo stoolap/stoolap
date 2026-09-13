@@ -3851,10 +3851,19 @@ impl Table for SegmentedTable {
         // Pre-compute column mappings for each volume.
         struct VolSource<'a> {
             row_ids: &'a [i64],
+            /// Positions in id order when the ids themselves are not
+            order: Option<&'a [u32]>,
             cursor: usize,
             mapping: super::writer::ColumnMapping,
             volume: Arc<FrozenVolume>,
             visible: Option<Arc<Vec<u64>>>,
+        }
+
+        impl VolSource<'_> {
+            /// The physical position of the k-th row in id order
+            fn position(&self, k: usize) -> usize {
+                self.order.map_or(k, |order| order[k] as usize)
+            }
         }
 
         let mut vol_sources: Vec<VolSource> = Vec::with_capacity(volumes.len());
@@ -3867,6 +3876,7 @@ impl Table for SegmentedTable {
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
             vol_sources.push(VolSource {
                 row_ids: vol.row_ids()?,
+                order: vol.row_order(),
                 cursor: if ascending { 0 } else { vol.meta.row_count },
                 mapping,
                 volume: Arc::clone(&cs.volume),
@@ -3902,12 +3912,12 @@ impl Table for SegmentedTable {
                     if vs.cursor >= vs.row_ids.len() {
                         continue;
                     }
-                    vs.row_ids[vs.cursor]
+                    vs.row_ids[vs.position(vs.cursor)]
                 } else {
                     if vs.cursor == 0 {
                         continue;
                     }
-                    vs.row_ids[vs.cursor - 1]
+                    vs.row_ids[vs.position(vs.cursor - 1)]
                 };
 
                 let dominated = match best_row_id {
@@ -3944,7 +3954,7 @@ impl Table for SegmentedTable {
             } else {
                 // Volume source
                 let vs = &mut vol_sources[best_source - 1];
-                let idx = if ascending {
+                let k = if ascending {
                     let i = vs.cursor;
                     vs.cursor += 1;
                     i
@@ -3952,6 +3962,7 @@ impl Table for SegmentedTable {
                     vs.cursor -= 1;
                     vs.cursor
                 };
+                let idx = vs.position(k);
 
                 let rid = vs.row_ids[idx];
 
@@ -6929,6 +6940,20 @@ mod tests {
             );
         }
         assert!(!mgr.row_exists(4).unwrap());
+
+        // An ordered scan of the primary key walks the volume in id order,
+        // not in the order the rows were added
+        let first = |ascending: bool| -> Vec<i64> {
+            table
+                .collect_rows_ordered_by_index("id", ascending, 3, 0)
+                .unwrap()
+                .expect("the merge path answers a primary key order")
+                .iter()
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        assert_eq!(first(true), vec![1, 2, 3]);
+        assert_eq!(first(false), vec![3, 2, 1]);
 
         assert_eq!(table.delete_by_row_ids(&[2]).unwrap(), 1);
         table.commit().unwrap();

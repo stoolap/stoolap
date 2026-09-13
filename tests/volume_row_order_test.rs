@@ -128,3 +128,24 @@ fn a_producer_that_ordered_its_rows_may_not_repeat_an_id() {
         .expect("a repeated row id was accepted");
     assert!(err.to_string().contains("repeat"), "{err}");
 }
+
+#[test]
+fn the_permutation_of_an_ordered_producer_is_counted_in_the_metadata_size() {
+    let ascending = builder_with(&[(1, "a"), (2, "b"), (3, "c")])
+        .finish()
+        .unwrap();
+    let mut builder = builder_with(&[]);
+    builder.allow_any_row_order();
+    for (id, name) in [(3, "c"), (1, "a"), (2, "b")] {
+        builder.add_row(
+            id,
+            &Row::from_values(vec![Value::Integer(id), Value::text(name)]),
+        );
+    }
+    let permuted = builder.finish().unwrap();
+    // Four bytes per row for the positions sorted by id
+    assert_eq!(
+        permuted.meta.memory_size(),
+        ascending.meta.memory_size() + 3 * 4
+    );
+}

@@ -1251,6 +1251,10 @@ impl VolumeMeta {
         let mut size = 0usize;
         // row_ids: Vec<i64>
         size += self.row_ids.len() * 8;
+        // row_order: one u32 per row when the ids do not ascend
+        if let Some(Some(order)) = self.row_order.get() {
+            size += order.len() * 4;
+        }
         // zone_maps: 2 Values (16 bytes each) + 2 u32 per column
         size += self.zone_maps.len() * (16 + 16 + 8);
         // bloom_filters: Vec<u64> bitsets
@@ -1881,6 +1885,34 @@ impl FrozenVolume {
         Ok(&self.meta.row_ids)
     }
 
+    /// Positions sorted by row id when the ids do not ascend; None when
+    /// the ids themselves are in order. Decided once per volume
+    pub fn row_order(&self) -> Option<&[u32]> {
+        let ids = &self.meta.row_ids;
+        self.meta
+            .row_order
+            .get_or_init(|| (!ids.windows(2).all(|w| w[0] < w[1])).then(|| row_order_of(ids)))
+            .as_deref()
+    }
+
+    /// The smallest and largest row id held, without a scan once the
+    /// order is known
+    pub fn id_bounds(&self) -> Option<(i64, i64)> {
+        let ids = &self.meta.row_ids;
+        match self.row_order() {
+            None => Some((*ids.first()?, *ids.last()?)),
+            Some(order) => Some((ids[*order.first()? as usize], ids[*order.last()? as usize])),
+        }
+    }
+
+    /// Carry the order decided for an earlier form of this volume over to
+    /// this one, so a reload does not decide it again
+    pub fn inherit_row_order(&self, from: &FrozenVolume) {
+        if let Some(order) = from.meta.row_order.get() {
+            let _ = self.meta.row_order.set(order.clone());
+        }
+    }
+
     /// Position of `row_id` in this volume in whatever order its rows were
     /// added: a binary search over ascending ids, otherwise over a
     /// permutation built on first use
@@ -1889,11 +1921,7 @@ impl FrozenVolume {
         let (Some(&first), Some(&last)) = (ids.first(), ids.last()) else {
             return None;
         };
-        let order = self
-            .meta
-            .row_order
-            .get_or_init(|| (!ids.windows(2).all(|w| w[0] < w[1])).then(|| row_order_of(ids)));
-        match order {
+        match self.row_order() {
             None => {
                 if row_id < first || row_id > last {
                     return None;

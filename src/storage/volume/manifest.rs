@@ -1499,6 +1499,7 @@ impl SegmentManager {
                     *volume.unique_indices.write() =
                         std::mem::take(&mut *cs.volume.unique_indices.write());
                 }
+                volume.inherit_row_order(&cs.volume);
                 volume.mark_accessed();
                 cs.volume = volume;
             }
@@ -2690,6 +2691,7 @@ impl SegmentManager {
         if !cs.volume.unique_indices.read().is_empty() {
             *volume.unique_indices.write() = std::mem::take(&mut *cs.volume.unique_indices.write());
         }
+        volume.inherit_row_order(&cs.volume);
         cs.volume = Arc::clone(&volume);
         let still_cold = new_map.values().any(|cs| cs.volume.is_cold());
         *segments = Arc::new(new_map);
