@@ -39,7 +39,7 @@ use super::writer::{FrozenVolume, VolumeBuilder};
 ///
 /// # Returns
 /// A FrozenVolume ready to be queried and/or written to disk.
-pub fn seal_rows(schema: &Schema, rows: &[(i64, Row)]) -> FrozenVolume {
+pub fn seal_rows(schema: &Schema, rows: &[(i64, Row)]) -> Result<FrozenVolume> {
     let mut builder = VolumeBuilder::with_capacity(schema, rows.len());
     for (row_id, row) in rows {
         builder.add_row(*row_id, row);
@@ -81,7 +81,7 @@ pub fn seal_and_persist_opts(
     table_name: &str,
     compress: bool,
 ) -> Result<(Arc<FrozenVolume>, std::path::PathBuf, u64)> {
-    let mut volume = seal_rows(schema, rows);
+    let mut volume = seal_rows(schema, rows)?;
     let volume_id = io::next_volume_id();
     let (path, store) =
         io::write_volume_to_disk_opts(volume_dir, table_name, volume_id, &volume, compress)?;
@@ -117,7 +117,7 @@ pub fn seal_and_persist_multi(
 
     let mut results = Vec::new();
     for chunk in rows.chunks(chunk_size) {
-        let mut volume = seal_rows(schema, chunk);
+        let mut volume = seal_rows(schema, chunk)?;
         let volume_id = io::next_volume_id();
         match io::write_volume_to_disk_opts(volume_dir, table_name, volume_id, &volume, compress) {
             Ok((path, store)) => {
@@ -163,7 +163,7 @@ mod tests {
             ),
         ];
 
-        let volume = seal_rows(&schema, &rows);
+        let volume = seal_rows(&schema, &rows).unwrap();
         assert_eq!(volume.meta.row_count, 3);
         assert_eq!(volume.columns.get(0).unwrap().get_i64(0), 1);
         assert_eq!(volume.columns.get(1).unwrap().get_str(2), "carol");

@@ -6449,7 +6449,7 @@ mod tests {
         for (id, row) in rows {
             builder.add_row(*id, row);
         }
-        let vol = Arc::new(builder.finish());
+        let vol = Arc::new(builder.finish().unwrap());
         let min_id = rows.first().map(|(id, _)| *id).unwrap_or(0);
         let max_id = rows.last().map(|(id, _)| *id).unwrap_or(0);
 

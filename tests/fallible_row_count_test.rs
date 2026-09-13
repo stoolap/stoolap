@@ -51,7 +51,7 @@ fn cold_table_with_index(dir: &Path, snapshot: bool, indexed: bool) -> (Segmente
             &Row::from_values(vec![Value::Integer(id), Value::Integer(id * 10)]),
         );
     }
-    let path = write_volume_to_disk(dir, "t", 1, &builder.finish()).unwrap();
+    let path = write_volume_to_disk(dir, "t", 1, &builder.finish().unwrap()).unwrap();
     let volume = Arc::new(read_volume_from_disk(&path).unwrap());
     assert!(volume.is_warm());
     volume.mark_accessed();

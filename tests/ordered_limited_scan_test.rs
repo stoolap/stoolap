@@ -368,7 +368,7 @@ fn test_top_k_reports_a_block_it_cannot_decode_instead_of_an_empty_answer() {
     let mut builder = VolumeBuilder::new(&schema);
     builder.add_row(1, &Row::from_values(vec![Value::Integer(10)]));
     builder.add_row(2, &Row::from_values(vec![Value::Integer(20)]));
-    let volume = builder.finish();
+    let volume = builder.finish().unwrap();
     let path = write_volume_to_disk(dir.path(), "c", 1, &volume).unwrap();
 
     // Keep the framing, metadata and CRC valid; replace the column block
