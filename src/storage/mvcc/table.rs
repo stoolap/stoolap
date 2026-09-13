@@ -72,6 +72,26 @@ fn collect_conjuncts<'a>(
     }
 }
 
+/// The primary key value when `expr` is `pk = <integer>` on a single-column
+/// integer PK; anything else takes the general path
+pub(crate) fn pk_equality_id(expr: &dyn Expression, schema: &Schema) -> Option<i64> {
+    use crate::core::Operator;
+
+    let pk_indices = schema.primary_key_indices();
+    if pk_indices.len() != 1 {
+        return None;
+    }
+    let pk_col = &schema.columns[pk_indices[0]];
+    let (col_name, operator, value) = expr.get_comparison_info()?;
+    if !col_name.eq_ignore_ascii_case(&pk_col.name) || operator != Operator::Eq {
+        return None;
+    }
+    match value {
+        Value::Integer(i) => Some(*i),
+        _ => None,
+    }
+}
+
 impl MVCCTable {
     /// Creates a new MVCC table with an owned transaction version store
     /// (wraps it in Arc<RwLock> internally)
@@ -199,29 +219,7 @@ impl MVCCTable {
     ///
     /// Returns Some(row_id) if the expression is a simple equality on the PK column
     fn try_pk_lookup(&self, expr: &dyn Expression, schema: &Schema) -> Option<i64> {
-        use crate::core::Operator;
-
-        // Get PK column info
-        let pk_indices = schema.primary_key_indices();
-        if pk_indices.len() != 1 {
-            return None; // Only support single-column PK for now
-        }
-        let pk_col_idx = pk_indices[0];
-        let pk_col = &schema.columns[pk_col_idx];
-
-        // Use the new get_comparison_info method (no downcasting required)
-        let (col_name, operator, value) = expr.get_comparison_info()?;
-
-        // Check if it's an equality on the PK column (case-insensitive comparison)
-        if !col_name.eq_ignore_ascii_case(&pk_col.name) || operator != Operator::Eq {
-            return None;
-        }
-
-        // Get the integer value (PKs are always integers in our system)
-        match value {
-            Value::Integer(i) => Some(*i),
-            _ => None,
-        }
+        pk_equality_id(expr, schema)
     }
 
     /// Try to identify a PK range lookup (WHERE id >= X AND id < Y)
