@@ -187,3 +187,35 @@ fn a_negated_subquery_with_a_limit_is_read_as_written_beside_an_exists() {
         vec![1]
     );
 }
+
+#[test]
+fn a_negated_subquery_shaped_by_distinct_on_or_as_of_is_read_as_written() {
+    let db = Database::open("memory://not_in_subquery_distinct_on_as_of").unwrap();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INTEGER, g INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO p VALUES (1), (2), (3)", ())
+        .unwrap();
+    db.execute("INSERT INTO c VALUES (1, 1, 1), (2, NULL, 1)", ())
+        .unwrap();
+    // DISTINCT ON keeps the first row of the group, whose p_id is 1
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM p WHERE id NOT IN (SELECT DISTINCT ON (g) p_id FROM c ORDER BY g, id) OR EXISTS (SELECT 1 FROM c WHERE c.p_id = p.id) ORDER BY id"
+        ),
+        vec![1, 2, 3]
+    );
+    // Before the table held anything, the result is empty
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM p WHERE id NOT IN (SELECT p_id FROM c AS OF TIMESTAMP '1970-01-01 00:00:00') OR EXISTS (SELECT 1 FROM c WHERE c.p_id = p.id) ORDER BY id"
+        ),
+        vec![1, 2, 3]
+    );
+}
