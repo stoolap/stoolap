@@ -422,11 +422,12 @@ impl Drop for PublishGuard {
 
 /// What a committing transaction holds while it publishes: a guard per
 /// table it writes, and the tables' stores so their index updates can be
-/// undone if the commit fails after they were applied
+/// undone if the commit fails after they were applied. Four tables fit
+/// inline; past that the vectors grow as a Vec would
 #[derive(Default)]
 pub struct PublishHold {
-    guards: SmallVec<[PublishGuard; 1]>,
-    stores: SmallVec<[Arc<std::sync::RwLock<TransactionVersionStore>>; 1]>,
+    guards: SmallVec<[PublishGuard; 4]>,
+    stores: SmallVec<[Arc<std::sync::RwLock<TransactionVersionStore>>; 4]>,
 }
 
 impl PublishHold {
