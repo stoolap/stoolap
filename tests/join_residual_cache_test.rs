@@ -197,3 +197,95 @@ fn the_cached_rest_of_the_on_clause_follows_a_schema_change() {
         assert!((18..78).contains(&age), "age column misread as {age}");
     }
 }
+
+const NESTED_JOIN: &str = "SELECT a.id, c.v FROM a JOIN (SELECT * FROM b) b ON a.id = b.a_id JOIN c ON a.id = c.id AND a.v = c.v";
+
+/// An index on the nested join's key flips that join's output between
+/// `[b.*, a.*]` and `[a.*, b.*]` without a schema change; the enclosing
+/// join's residual reads `a.v` by position, so it must follow
+fn nested_join_follows_an_index_change(name: &str, indexed_first: bool) {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO a VALUES (1, 10)", ()).unwrap();
+    db.execute("INSERT INTO b VALUES (2, 1)", ()).unwrap();
+    db.execute("INSERT INTO c VALUES (1, 10)", ()).unwrap();
+    if indexed_first {
+        db.execute("CREATE INDEX idx_b_a ON b(a_id)", ()).unwrap();
+    }
+    let stmt = db.prepare(NESTED_JOIN).unwrap();
+    let read = || {
+        stmt.query(())
+            .unwrap()
+            .map(|r| {
+                let r = r.unwrap();
+                (r.get::<i64>(0).unwrap(), r.get::<i64>(1).unwrap())
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(read(), vec![(1, 10)]);
+    assert_eq!(read(), vec![(1, 10)]);
+    if indexed_first {
+        db.execute("DROP INDEX idx_b_a ON b", ()).unwrap();
+    } else {
+        db.execute("CREATE INDEX idx_b_a ON b(a_id)", ()).unwrap();
+    }
+    assert_eq!(
+        read(),
+        vec![(1, 10)],
+        "the residual kept reading the outer columns at their old positions"
+    );
+}
+
+#[test]
+fn the_cached_rest_of_the_on_clause_follows_an_index_created_under_a_nested_join() {
+    nested_join_follows_an_index_change("join_residual_nested_create_index", false);
+}
+
+#[test]
+fn the_cached_rest_of_the_on_clause_follows_an_index_dropped_under_a_nested_join() {
+    nested_join_follows_an_index_change("join_residual_nested_drop_index", true);
+}
+
+#[test]
+fn a_plan_run_with_an_outer_row_keeps_no_program() {
+    use stoolap::common::CompactArc;
+    use stoolap::core::Value;
+    use stoolap::executor::{context::ExecutionContext, Executor};
+
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let db = Database::open("memory://join_residual_outer_row").unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO a VALUES (1, 1)", ()).unwrap();
+    db.execute("INSERT INTO b VALUES (1, 10)", ()).unwrap();
+    let executor = Executor::new(std::sync::Arc::clone(db.engine()));
+    // The outer row's value is written into the WHERE before the join
+    // splits it, so a program kept from one execution would carry it
+    let sql = "SELECT a.id FROM a JOIN b ON a.k = b.id WHERE b.v = parent.v";
+    let read = |value: i64| {
+        let ctx = ExecutionContext::new().with_outer_row(
+            [("parent.v".into(), Value::Integer(value))]
+                .into_iter()
+                .collect(),
+            CompactArc::new(vec!["parent.v".to_string()]),
+        );
+        let mut rows = executor.execute_with_context(sql, &ctx).unwrap();
+        let mut ids = Vec::new();
+        while rows.next() {
+            ids.push(rows.row()[0].clone());
+        }
+        assert!(rows.last_error().is_none());
+        ids
+    };
+    assert_eq!(read(10), vec![Value::Integer(1)]);
+    assert_eq!(read(20), Vec::<Value>::new());
+    assert_eq!(read(10), vec![Value::Integer(1)]);
+}

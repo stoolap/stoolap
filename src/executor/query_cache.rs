@@ -248,6 +248,9 @@ pub struct CompiledCountStar {
 pub struct CompiledJoinResidual {
     /// Whether the join ran with its sides swapped
     pub swapped: bool,
+    /// The outer columns the program reads by position; a nested join
+    /// can reorder them without a schema change
+    pub outer_cols: Vec<String>,
     /// The key equality the probe answers, left out of the program
     pub outer_col: String,
     pub inner_col: String,

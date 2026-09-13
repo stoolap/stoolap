@@ -4623,11 +4623,15 @@ impl Executor {
                             .next()
                             .is_some_and(|name| name.eq_ignore_ascii_case(&inner_col))
                     });
-                    // The program lives on the plan, keyed by the schema epoch
-                    // and the key equality it leaves out. A clause that read a
-                    // subquery this execution holds that value, so it is not kept
-                    let residual_slot = compiled
-                        .filter(|_| processed_on.is_none() && !classification.where_has_subqueries);
+                    // The program lives on the plan, keyed by the schema epoch,
+                    // the outer columns and the key equality it leaves out. A
+                    // clause that read a subquery or an outer row this execution
+                    // holds that value, so it is not kept
+                    let residual_slot = compiled.filter(|_| {
+                        processed_on.is_none()
+                            && !classification.where_has_subqueries
+                            && ctx.outer_row().is_none()
+                    });
                     let epoch = self.engine.schema_epoch();
                     let build_residual_filter = || {
                         if let Some(guard) = residual_slot.and_then(|slot| slot.read().ok()) {
@@ -4636,6 +4640,7 @@ impl Executor {
                                     && kept.swapped == swapped
                                     && kept.outer_col == outer_col
                                     && kept.inner_col == inner_col
+                                    && kept.outer_cols == outer_cols
                                 {
                                     return kept.program.as_ref().map(|program| {
                                         JoinFilter::from_program(CompactArc::clone(program))
@@ -4688,6 +4693,7 @@ impl Executor {
                             if !taken {
                                 *guard = CompiledExecution::JoinResidual(CompiledJoinResidual {
                                     swapped,
+                                    outer_cols: outer_cols.clone(),
                                     outer_col: outer_col.clone(),
                                     inner_col: inner_col.clone(),
                                     program: filter
