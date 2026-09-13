@@ -106,8 +106,8 @@ impl Executor {
         // Extract table name (must be a simple table reference, not a join or subquery)
         // Use pre-computed lowercase from Identifier (avoids allocation and case conversion)
         let table_name: &str = match table_expr.as_ref() {
-            Expression::TableSource(ts) => ts.name.value_lower.as_str(),
-            _ => return None, // Join, subquery, or other complex source
+            Expression::TableSource(ts) if ts.as_of.is_none() => ts.name.value_lower.as_str(),
+            _ => return None, // Join, subquery, AS OF, or other complex source
         };
 
         // Try to extract PK lookup info from WHERE clause
@@ -520,7 +520,7 @@ impl Executor {
 
         // Extract table name (use pre-computed lowercase)
         let table_name: &str = match table_expr.as_ref() {
-            Expression::TableSource(ts) => ts.name.value_lower.as_str(),
+            Expression::TableSource(ts) if ts.as_of.is_none() => ts.name.value_lower.as_str(),
             _ => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;
