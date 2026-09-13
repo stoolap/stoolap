@@ -425,8 +425,8 @@ impl Drop for PublishGuard {
 /// undone if the commit fails after they were applied
 #[derive(Default)]
 pub struct PublishHold {
-    guards: Vec<PublishGuard>,
-    stores: Vec<Arc<std::sync::RwLock<TransactionVersionStore>>>,
+    guards: SmallVec<[PublishGuard; 1]>,
+    stores: SmallVec<[Arc<std::sync::RwLock<TransactionVersionStore>>; 1]>,
 }
 
 impl PublishHold {
@@ -463,12 +463,25 @@ impl PublishHold {
     }
 }
 
+/// One index call a single-row commit has made: index position, whether it
+/// was an add, and the key it was made with
+type CompletedIndexOp = (usize, bool, SmallVec<[Value; 2]>);
+
 /// The index entries a commit added and removed for one index, kept until
-/// the commit is visible or undone
-struct IndexUndo {
-    index: Arc<dyn Index>,
-    added: Vec<(i64, Vec<Value>)>,
-    removed: Vec<(i64, Vec<Value>)>,
+/// the commit is visible or undone. The single-row form carries the key
+/// the index call was made with, so recording it allocates nothing.
+enum IndexUndo {
+    Row {
+        index: Arc<dyn Index>,
+        row_id: i64,
+        values: SmallVec<[Value; 2]>,
+        is_add: bool,
+    },
+    Batch {
+        index: Arc<dyn Index>,
+        added: Vec<(i64, Vec<Value>)>,
+        removed: Vec<(i64, Vec<Value>)>,
+    },
 }
 
 /// VersionStore tracks the latest committed version of each row for a table
@@ -5653,7 +5666,7 @@ pub struct TransactionVersionStore {
     /// Lazily allocated on first write to avoid allocation overhead for read-only queries
     write_set: Option<I64Map<WriteSetEntry>>,
     /// Index updates applied by commit, until the commit is visible or undone
-    index_undo: Mutex<Vec<IndexUndo>>,
+    index_undo: Mutex<SmallVec<[IndexUndo; 2]>>,
 }
 
 impl TransactionVersionStore {
@@ -5669,29 +5682,51 @@ impl TransactionVersionStore {
             parent_store,
             txn_id,
             write_set: None,
-            index_undo: Mutex::new(Vec::new()),
+            index_undo: Mutex::new(SmallVec::new()),
         }
     }
 
     /// Takes back the index updates of this transaction's commit, in reverse
     pub fn undo_index_updates(&self) {
-        let undo: Vec<IndexUndo> = std::mem::take(&mut *self.index_undo.lock());
+        let undo: SmallVec<[IndexUndo; 2]> = std::mem::take(&mut *self.index_undo.lock());
         for entry in undo.iter().rev() {
-            if !entry.added.is_empty() {
-                let batch: Vec<(i64, &[Value])> = entry
-                    .added
-                    .iter()
-                    .map(|(row_id, values)| (*row_id, values.as_slice()))
-                    .collect();
-                let _ = entry.index.remove_batch_slice(&batch);
-            }
-            if !entry.removed.is_empty() {
-                let batch: Vec<(i64, &[Value])> = entry
-                    .removed
-                    .iter()
-                    .map(|(row_id, values)| (*row_id, values.as_slice()))
-                    .collect();
-                let _ = entry.index.add_batch_slice(&batch);
+            match entry {
+                IndexUndo::Row {
+                    index,
+                    row_id,
+                    values,
+                    is_add: true,
+                } => {
+                    let _ = index.remove(values, *row_id, *row_id);
+                }
+                IndexUndo::Row {
+                    index,
+                    row_id,
+                    values,
+                    is_add: false,
+                } => {
+                    let _ = index.add(values, *row_id, *row_id);
+                }
+                IndexUndo::Batch {
+                    index,
+                    added,
+                    removed,
+                } => {
+                    if !added.is_empty() {
+                        let batch: Vec<(i64, &[Value])> = added
+                            .iter()
+                            .map(|(row_id, values)| (*row_id, values.as_slice()))
+                            .collect();
+                        let _ = index.remove_batch_slice(&batch);
+                    }
+                    if !removed.is_empty() {
+                        let batch: Vec<(i64, &[Value])> = removed
+                            .iter()
+                            .map(|(row_id, values)| (*row_id, values.as_slice()))
+                            .collect();
+                        let _ = index.add_batch_slice(&batch);
+                    }
+                }
             }
         }
     }
@@ -6577,7 +6612,7 @@ impl TransactionVersionStore {
             if add_batches[idx].is_empty() && remove_batches[idx].is_empty() {
                 continue;
             }
-            undo.push(IndexUndo {
+            undo.push(IndexUndo::Batch {
                 index: Arc::clone(index),
                 added: std::mem::take(&mut add_batches[idx]),
                 removed: std::mem::take(&mut remove_batches[idx]),
@@ -6614,8 +6649,9 @@ impl TransactionVersionStore {
             .and_then(|entry| entry.read_version.as_ref())
             .map(|rv| &rv.data);
 
-        // Track what we've done for rollback on error
-        let mut completed_ops: SmallVec<[(usize, bool); 4]> = SmallVec::new(); // (index_idx, is_add)
+        // Every index call made so far, with the key it was made with, for
+        // rollback on error and for the undo log on success
+        let mut completed_ops: SmallVec<[CompletedIndexOp; 4]> = SmallVec::new();
 
         for (idx, index) in indexes.iter().enumerate() {
             let column_ids = index.column_ids();
@@ -6658,24 +6694,16 @@ impl TransactionVersionStore {
                         })
                         .collect();
 
-                    // Remove old, add new
+                    // Remove old, add new; the removal is in completed_ops,
+                    // so a failed add re-adds it through the rollback
                     let _ = index.remove(&old_values, row_id, row_id);
-                    completed_ops.push((idx, false)); // false = removal
+                    completed_ops.push((idx, false, old_values));
 
                     if let Err(e) = index.add(&new_values, row_id, row_id) {
-                        // Rollback: re-add the old value we removed
-                        let _ = index.add(&old_values, row_id, row_id);
-                        // Rollback previous indexes
-                        self.rollback_single_row_ops(
-                            &completed_ops,
-                            indexes,
-                            row_id,
-                            old_row,
-                            new_row,
-                        );
+                        self.rollback_single_row_ops(&completed_ops, indexes, row_id);
                         return Err(e);
                     }
-                    completed_ops.push((idx, true)); // true = addition
+                    completed_ops.push((idx, true, new_values));
                     continue;
                 }
             }
@@ -6693,7 +6721,7 @@ impl TransactionVersionStore {
                     })
                     .collect();
                 let _ = index.remove(&values_to_remove, row_id, row_id);
-                completed_ops.push((idx, false));
+                completed_ops.push((idx, false, values_to_remove));
             } else {
                 // INSERT: add values to index
                 let new_values: SmallVec<[Value; 2]> = column_ids
@@ -6707,37 +6735,20 @@ impl TransactionVersionStore {
                     .collect();
 
                 if let Err(e) = index.add(&new_values, row_id, row_id) {
-                    // Rollback previous indexes
-                    self.rollback_single_row_ops(&completed_ops, indexes, row_id, old_row, new_row);
+                    self.rollback_single_row_ops(&completed_ops, indexes, row_id);
                     return Err(e);
                 }
-                completed_ops.push((idx, true));
+                completed_ops.push((idx, true, new_values));
             }
         }
 
         let mut undo = self.index_undo.lock();
-        for &(idx, is_add) in completed_ops.iter() {
-            let index = &indexes[idx];
-            let source = if is_add {
-                new_row
-            } else {
-                old_row.unwrap_or(new_row)
-            };
-            let values: Vec<Value> = index
-                .column_ids()
-                .iter()
-                .map(|&col_id| {
-                    source
-                        .get(col_id as usize)
-                        .cloned()
-                        .unwrap_or(Value::Null(DataType::Null))
-                })
-                .collect();
-            let entry = vec![(row_id, values)];
-            undo.push(IndexUndo {
-                index: Arc::clone(index),
-                added: if is_add { entry.clone() } else { Vec::new() },
-                removed: if is_add { Vec::new() } else { entry },
+        for (idx, is_add, values) in completed_ops {
+            undo.push(IndexUndo::Row {
+                index: Arc::clone(&indexes[idx]),
+                row_id,
+                values,
+                is_add,
             });
         }
 
@@ -6748,41 +6759,16 @@ impl TransactionVersionStore {
     #[inline]
     fn rollback_single_row_ops(
         &self,
-        completed_ops: &[(usize, bool)],
+        completed_ops: &[CompletedIndexOp],
         indexes: &[Arc<dyn Index>],
         row_id: i64,
-        old_row: Option<&Row>,
-        new_row: &Row,
     ) {
-        for &(idx, is_add) in completed_ops.iter().rev() {
-            let index = &indexes[idx];
-            let column_ids = index.column_ids();
-
-            if is_add {
-                // We added new values - remove them
-                let values: SmallVec<[Value; 2]> = column_ids
-                    .iter()
-                    .map(|&col_id| {
-                        new_row
-                            .get(col_id as usize)
-                            .cloned()
-                            .unwrap_or(Value::Null(DataType::Null))
-                    })
-                    .collect();
-                let _ = index.remove(&values, row_id, row_id);
+        for (idx, is_add, values) in completed_ops.iter().rev() {
+            let index = &indexes[*idx];
+            if *is_add {
+                let _ = index.remove(values, row_id, row_id);
             } else {
-                // We removed old values - re-add them
-                let source = old_row.unwrap_or(new_row);
-                let values: SmallVec<[Value; 2]> = column_ids
-                    .iter()
-                    .map(|&col_id| {
-                        source
-                            .get(col_id as usize)
-                            .cloned()
-                            .unwrap_or(Value::Null(DataType::Null))
-                    })
-                    .collect();
-                let _ = index.add(&values, row_id, row_id);
+                let _ = index.add(values, row_id, row_id);
             }
         }
     }
