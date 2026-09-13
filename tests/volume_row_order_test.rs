@@ -63,3 +63,26 @@ fn rows_added_out_of_row_id_order_are_refused() {
 fn a_repeated_row_id_is_refused() {
     assert!(builder_with(&[(1, "a"), (1, "b")]).finish().is_err());
 }
+
+#[test]
+fn a_later_chunk_out_of_order_leaves_no_volume_file_behind() {
+    use stoolap::storage::volume::seal::seal_and_persist_multi;
+    let dir = tempfile::tempdir().unwrap();
+    let schema = SchemaBuilder::new("t")
+        .column("id", DataType::Integer, false, true)
+        .build();
+    // Two chunks of 65,536 rows plus two; the last two ids are swapped, so
+    // the first chunk is written before the second is refused
+    let mut rows: Vec<(i64, Row)> = (1..=65_538)
+        .map(|id| (id, Row::from_values(vec![Value::Integer(id)])))
+        .collect();
+    rows.swap(65_536, 65_537);
+    let err = seal_and_persist_multi(&schema, &rows, dir.path(), "t", true, 65_536)
+        .err()
+        .expect("a later chunk out of row id order was accepted");
+    assert!(err.to_string().contains("row id order"), "{err}");
+    let left: Vec<_> = std::fs::read_dir(dir.path().join("t"))
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "volume files left behind: {left:?}");
+}
