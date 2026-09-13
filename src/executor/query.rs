@@ -84,6 +84,7 @@ use super::operators::index_nested_loop::{
 use super::operators::BloomFilterOperator;
 use super::parallel::{self, ParallelConfig};
 use super::pushdown;
+use super::query_cache::{CompiledExecution, CompiledJoinResidual};
 use super::query_classification::{get_classification, QueryClassification};
 use super::result::{
     DistinctOnResult, DistinctResult, ExecResult, ExecutorResult, ExprMappedResult, FilteredResult,
@@ -278,7 +279,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        self.execute_select_with_plan(stmt, ctx, None)
+        self.execute_select_with_plan(stmt, ctx, None, None)
     }
 
     /// `execute_select` with the cached plan's classification slot, so
@@ -289,6 +290,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         plan_classification: Option<&std::sync::OnceLock<Arc<QueryClassification>>>,
+        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
     ) -> Result<Box<dyn QueryResult>> {
         // Start timeout guard ONLY at the top level (query_depth == 0).
         // For nested queries (subqueries, views), the parent's TimeoutGuard handles timeout.
@@ -495,7 +497,7 @@ impl Executor {
             &branch_stmt
         };
         let (mut result, columns, limit_offset_applied, deferred_projection) =
-            self.execute_select_internal(branch, ctx, &classification)?;
+            self.execute_select_internal(branch, ctx, &classification, compiled)?;
 
         // Apply set operations (UNION, INTERSECT, EXCEPT)
         // Pass limit+offset to enable early termination for UNION ALL
@@ -1251,6 +1253,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
+        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
     ) -> SelectResult {
         // Get table source
         let table_expr = match &stmt.table_expr {
@@ -1284,7 +1287,7 @@ impl Executor {
                 self.execute_simple_table_scan(table_source, stmt, ctx, classification)
             }
             Expression::JoinSource(join_source) => {
-                self.execute_join_source(join_source, stmt, ctx, classification)
+                self.execute_join_source(join_source, stmt, ctx, classification, compiled)
             }
             Expression::SubquerySource(subquery_source) => {
                 self.execute_subquery_source(subquery_source, stmt, ctx, classification)
@@ -4016,6 +4019,7 @@ impl Executor {
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
+        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
     ) -> SelectResult {
         let reduction = std::cell::Cell::new(None);
         let mut left_cap = None;
@@ -4025,6 +4029,7 @@ impl Executor {
                 stmt,
                 ctx,
                 classification,
+                compiled,
                 left_cap,
                 &reduction,
             )?;
@@ -4053,12 +4058,14 @@ impl Executor {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_join_source_capped(
         &self,
         join_source: &JoinTableSource,
         stmt: &SelectStatement,
         ctx: &ExecutionContext,
         classification: &std::sync::Arc<QueryClassification>,
+        compiled: Option<&std::sync::RwLock<CompiledExecution>>,
         left_cap_override: Option<usize>,
         reduction: &std::cell::Cell<Option<ReductionPass>>,
     ) -> SelectResult {
@@ -4616,7 +4623,27 @@ impl Executor {
                             .next()
                             .is_some_and(|name| name.eq_ignore_ascii_case(&inner_col))
                     });
+                    // The program lives on the plan, keyed by the schema epoch
+                    // and the key equality it leaves out. A clause that read a
+                    // subquery this execution holds that value, so it is not kept
+                    let residual_slot = compiled
+                        .filter(|_| processed_on.is_none() && !classification.where_has_subqueries);
+                    let epoch = self.engine.schema_epoch();
                     let build_residual_filter = || {
+                        if let Some(guard) = residual_slot.and_then(|slot| slot.read().ok()) {
+                            if let CompiledExecution::JoinResidual(kept) = &*guard {
+                                if kept.cached_epoch == epoch
+                                    && kept.swapped == swapped
+                                    && kept.outer_col == outer_col
+                                    && kept.inner_col == inner_col
+                                {
+                                    return kept.program.as_ref().map(|program| {
+                                        JoinFilter::from_program(CompactArc::clone(program))
+                                            .with_context(ctx)
+                                    });
+                                }
+                            }
+                        }
                         let inner_filter = nl_right_filter
                             .as_ref()
                             .map(|rf| add_table_qualifier(rf, inner_alias));
@@ -4643,7 +4670,7 @@ impl Executor {
                             (None, Some(f)) => Some(f),
                             (None, None) => None,
                         };
-                        combined.and_then(|expr| {
+                        let filter = combined.and_then(|expr| {
                             JoinFilter::new(
                                 &expr,
                                 &outer_cols,
@@ -4652,7 +4679,25 @@ impl Executor {
                             )
                             .ok()
                             .map(|f| f.with_context(ctx))
-                        })
+                        });
+                        if let Some(mut guard) = residual_slot.and_then(|slot| slot.write().ok()) {
+                            // A plan with two index joins keeps the first one's
+                            // program rather than swapping them every execution
+                            let taken = matches!(&*guard,
+                                CompiledExecution::JoinResidual(kept) if kept.cached_epoch == epoch);
+                            if !taken {
+                                *guard = CompiledExecution::JoinResidual(CompiledJoinResidual {
+                                    swapped,
+                                    outer_col: outer_col.clone(),
+                                    inner_col: inner_col.clone(),
+                                    program: filter
+                                        .as_ref()
+                                        .map(|f| CompactArc::clone(f.program())),
+                                    cached_epoch: epoch,
+                                });
+                            }
+                        }
+                        filter
                     };
 
                     // Execute Index Nested Loop Join using operators
@@ -6774,7 +6819,7 @@ impl Executor {
                 // Get classification for the synthetic SELECT statement
                 let classification = get_classification(&select_all);
                 let (result, columns, _, _) =
-                    self.execute_join_source(js, &select_all, ctx, &classification)?;
+                    self.execute_join_source(js, &select_all, ctx, &classification, None)?;
                 Ok((result, columns.to_vec()))
             }
             Expression::SubquerySource(ss) => {

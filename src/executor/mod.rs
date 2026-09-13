@@ -439,6 +439,7 @@ impl Executor {
                 ctx,
                 active_txn_id,
                 Some(&cached.classification),
+                Some(&cached.compiled),
             );
         }
 
@@ -479,6 +480,7 @@ impl Executor {
                 ctx,
                 active_txn_id,
                 Some(&cached_plan.classification),
+                Some(&cached_plan.compiled),
             );
         }
 
@@ -597,7 +599,7 @@ impl Executor {
         statement: &Statement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
-        self.execute_statement_inner(statement, ctx, self.active_txn_id(), None)
+        self.execute_statement_inner(statement, ctx, self.active_txn_id(), None, None)
     }
 
     /// Execute a single statement with pre-captured transaction state.
@@ -615,6 +617,7 @@ impl Executor {
         plan_classification: Option<
             &std::sync::OnceLock<Arc<query_classification::QueryClassification>>,
         >,
+        compiled: Option<&std::sync::RwLock<query_cache::CompiledExecution>>,
     ) -> Result<Box<dyn QueryResult>> {
         // If there's an active transaction, inject the transaction ID into the context
         // This enables CURRENT_TRANSACTION_ID() function to return the correct value
@@ -653,7 +656,7 @@ impl Executor {
                     }
                 }
                 // Fall back to full query execution
-                self.execute_select_with_plan(stmt, ctx, plan_classification)
+                self.execute_select_with_plan(stmt, ctx, plan_classification, compiled)
             }
 
             // Transaction control
@@ -785,6 +788,7 @@ impl Executor {
             ctx,
             active_txn_id,
             Some(&plan.classification),
+            Some(&plan.compiled),
         )
     }
 }
