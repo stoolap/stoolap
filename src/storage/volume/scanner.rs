@@ -475,6 +475,7 @@ impl VolumeScanner {
                     column_names: Vec::new(),
                     column_types: Vec::new(),
                     row_ids: Vec::new(),
+                    row_order: std::sync::OnceLock::new(),
                     sorted_columns: Vec::new(),
                     column_name_map: ahash::AHashMap::new(),
                     row_groups: Vec::new(),

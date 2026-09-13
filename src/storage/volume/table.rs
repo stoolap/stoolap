@@ -1131,16 +1131,7 @@ impl SegmentedTable {
                 continue;
             };
             let vol = &cold.volume;
-            let ids = vol.row_ids()?;
-            if ids.is_empty() {
-                continue;
-            }
-            let min_id = ids[0];
-            let max_id = ids[ids.len() - 1];
-            if row_id < min_id || row_id > max_id {
-                continue;
-            }
-            if let Ok(idx) = ids.binary_search(&row_id) {
+            if let Some(idx) = vol.locate(row_id) {
                 vol.mark_accessed();
                 return Ok(Some((seg_id, cold.clone(), idx)));
             }
@@ -1208,16 +1199,7 @@ impl SegmentedTable {
                 continue;
             };
             let vol = &cold.volume;
-            let ids = vol.row_ids()?;
-            if ids.is_empty() {
-                continue;
-            }
-            let min_id = ids[0];
-            let max_id = ids[ids.len() - 1];
-            if row_id < min_id || row_id > max_id {
-                continue;
-            }
-            if let Ok(idx) = ids.binary_search(&row_id) {
+            if let Some(idx) = vol.locate(row_id) {
                 if vol.is_cold() {
                     drop(segs);
                     if let Some(loaded) = self.segment_mgr.ensure_volume(seg_id)? {
@@ -1258,7 +1240,7 @@ impl SegmentedTable {
                 continue;
             };
             let vol = &cold.volume;
-            if let Ok(idx) = vol.row_ids()?.binary_search(&row_id) {
+            if let Some(idx) = vol.locate(row_id) {
                 // segments_snapshot fails closed, so vol is never cold here.
                 vol.mark_accessed();
                 return Ok(Some((seg_id, Arc::clone(vol), idx)));
@@ -6901,5 +6883,57 @@ mod tests {
         assert!(mgr.row_exists(1).unwrap());
         assert!(mgr.row_exists(3).unwrap());
         assert!(!mgr.row_exists(2).unwrap());
+    }
+
+    /// A volume whose producer ordered the rows itself is looked up by row
+    /// id all the same
+    #[test]
+    fn cold_rows_added_in_any_order_are_found_by_id() {
+        let schema = test_schema();
+        let mut builder = VolumeBuilder::with_capacity(&schema, 3);
+        builder.allow_any_row_order();
+        for (id, v) in [(3, 30.0), (1, 10.0), (2, 20.0)] {
+            builder.add_row(
+                id,
+                &Row::from_values(vec![Value::Integer(id), Value::Float(v)]),
+            );
+        }
+        let vol = Arc::new(builder.finish().unwrap());
+        let mgr = Arc::new(SegmentManager::new("test", None));
+        mgr.register_segment(
+            1,
+            vol,
+            SegmentMeta {
+                segment_id: 1,
+                file_path: PathBuf::from("test.vol"),
+                row_count: 3,
+                min_row_id: 1,
+                max_row_id: 3,
+                schema_version: 0,
+                creation_lsn: 0,
+                seal_seq: 0,
+            },
+            None,
+        );
+        let hot = MockHotTable::new(schema.clone(), vec![]);
+        let mut table = SegmentedTable::new(Box::new(hot), Arc::clone(&mgr));
+
+        for id in 1..=3 {
+            assert!(mgr.row_exists(id).unwrap(), "row {id} not found");
+            let (_, vol, idx) = table.find_segment_row(id).unwrap().unwrap();
+            let row = vol.get_row(idx).unwrap();
+            assert_eq!(
+                row.get(0),
+                Some(&Value::Integer(id)),
+                "row {id} carries {row:?}"
+            );
+        }
+        assert!(!mgr.row_exists(4).unwrap());
+
+        assert_eq!(table.delete_by_row_ids(&[2]).unwrap(), 1);
+        table.commit().unwrap();
+        assert!(!mgr.row_exists(2).unwrap());
+        assert!(mgr.row_exists(1).unwrap());
+        assert!(mgr.row_exists(3).unwrap());
     }
 }

@@ -3109,8 +3109,8 @@ impl MVCCEngine {
     ) {
         use crate::storage::volume::manifest::SegmentMeta;
         let mgr = self.get_or_create_segment_manager(table_name);
-        let min_id = volume.meta.row_ids.first().copied().unwrap_or(0);
-        let max_id = volume.meta.row_ids.last().copied().unwrap_or(0);
+        let min_id = volume.meta.row_ids.iter().min().copied().unwrap_or(0);
+        let max_id = volume.meta.row_ids.iter().max().copied().unwrap_or(0);
         let row_count = volume.meta.row_count;
         // None = identity mapping (volume was just built from current schema).
         // Load paths that may have schema mismatch pass Some(schema).
@@ -3430,7 +3430,7 @@ impl MVCCEngine {
 
         for (_, mgr, max_vol_row_id) in &mut segment_data {
             for vol in mgr.get_segments_ordered_meta() {
-                if let Some(&last_id) = vol.row_ids()?.last() {
+                if let Some(&last_id) = vol.row_ids()?.iter().max() {
                     *max_vol_row_id = (*max_vol_row_id).max(last_id);
                 }
             }

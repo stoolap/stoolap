@@ -86,3 +86,45 @@ fn a_later_chunk_out_of_order_leaves_no_volume_file_behind() {
         .unwrap_or_default();
     assert!(left.is_empty(), "volume files left behind: {left:?}");
 }
+
+#[test]
+fn a_producer_that_ordered_its_rows_gets_them_located_by_id() {
+    let mut builder = builder_with(&[]);
+    builder.allow_any_row_order();
+    for (id, name) in [(3, "c"), (1, "a"), (2, "b")] {
+        builder.add_row(
+            id,
+            &Row::from_values(vec![Value::Integer(id), Value::text(name)]),
+        );
+    }
+    let volume = builder.finish().unwrap();
+    assert_eq!(volume.row_ids().unwrap(), &[3, 1, 2]);
+    for id in 1..=3 {
+        let idx = volume.locate(id).expect("row id not located");
+        let row = volume.get_row(idx).unwrap();
+        assert_eq!(
+            row.get(0),
+            Some(&Value::Integer(id)),
+            "row {id} carries {row:?}"
+        );
+    }
+    assert_eq!(volume.locate(4), None);
+    assert_eq!(volume.locate(0), None);
+}
+
+#[test]
+fn a_producer_that_ordered_its_rows_may_not_repeat_an_id() {
+    let mut builder = builder_with(&[]);
+    builder.allow_any_row_order();
+    for (id, name) in [(2, "b"), (1, "a"), (2, "c")] {
+        builder.add_row(
+            id,
+            &Row::from_values(vec![Value::Integer(id), Value::text(name)]),
+        );
+    }
+    let err = builder
+        .finish()
+        .err()
+        .expect("a repeated row id was accepted");
+    assert!(err.to_string().contains("repeat"), "{err}");
+}

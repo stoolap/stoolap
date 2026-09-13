@@ -399,6 +399,7 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
             column_names: meta.column_names,
             column_types: meta.column_types,
             row_ids: meta.row_ids,
+            row_order: std::sync::OnceLock::new(),
             sorted_columns: meta.col_sorted,
             column_name_map: meta.column_name_map,
             row_groups: meta.row_groups,
