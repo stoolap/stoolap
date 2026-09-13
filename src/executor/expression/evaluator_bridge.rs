@@ -843,6 +843,16 @@ impl JoinFilter {
         })
     }
 
+    /// A filter over a program compiled earlier for the same column lists
+    pub fn from_program(program: SharedProgram) -> Self {
+        Self {
+            program,
+            params: EMPTY_PARAMS.clone(),
+            named_params: EMPTY_NAMED_PARAMS.clone(),
+            transaction_id: None,
+        }
+    }
+
     /// Set parameters and the transaction from the execution context.
     /// Required when the join condition holds parameter placeholders
     /// ($1, $2, ...) or reads CURRENT_TRANSACTION_ID().
