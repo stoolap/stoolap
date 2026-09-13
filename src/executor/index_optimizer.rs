@@ -1194,6 +1194,10 @@ impl Executor {
         } else if let Some(ref idx) = index {
             // Index probe for each value - use _into to avoid intermediate allocations
             for value in &values {
+                // A NULL member equals nothing, so it is not looked up
+                if value.is_null() {
+                    continue;
+                }
                 idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
             }
         }
@@ -1428,6 +1432,10 @@ impl Executor {
         } else if let Some(ref idx) = index {
             // Index probe for each value - use _into to avoid intermediate allocations
             for value in &values {
+                // A NULL member equals nothing, so it is not looked up
+                if value.is_null() {
+                    continue;
+                }
                 idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
             }
         }
@@ -1845,6 +1853,10 @@ impl Executor {
                     if all_row_ids.len() >= target {
                         break;
                     }
+                }
+                // A NULL member equals nothing, so it is not looked up
+                if value.is_null() {
+                    continue;
                 }
                 idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
             }

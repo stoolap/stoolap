@@ -121,3 +121,39 @@ fn a_negated_subquery_set_holding_null_keeps_nothing_after_the_in_form_ran() {
         assert!(rows.is_empty(), "execution {i} returned {rows:?}");
     }
 }
+
+#[test]
+fn a_negated_subquery_set_holding_null_keeps_nothing_beside_an_exists() {
+    let db = tables("not_in_subquery_null_or_exists");
+    // The OR turns the NOT IN into a semi-join rewrite; the NULL member
+    // must survive that, so only the row with a child comes back
+    for limit in ["", " LIMIT 10"] {
+        assert_eq!(
+            ids(
+                &db,
+                &format!("SELECT id FROM p WHERE id NOT IN (SELECT p_id FROM c) OR EXISTS (SELECT 1 FROM c WHERE c.p_id = p.id) ORDER BY id{limit}")
+            ),
+            vec![1],
+            "with{limit:?}"
+        );
+    }
+}
+
+#[test]
+fn a_positive_in_through_a_secondary_index_skips_null() {
+    let db = tables("in_subquery_null_secondary_index");
+    db.execute("INSERT INTO p VALUES (4, NULL)", ()).unwrap();
+    db.execute("CREATE INDEX idx_p_k ON p(k)", ()).unwrap();
+    // A NULL member of the set equals nothing, so the row whose k is NULL
+    // does not match it
+    for limit in ["", " LIMIT 10"] {
+        assert_eq!(
+            ids(
+                &db,
+                &format!("SELECT id FROM p WHERE k IN (SELECT p_id FROM c) ORDER BY id{limit}")
+            ),
+            vec![1],
+            "with{limit:?}"
+        );
+    }
+}

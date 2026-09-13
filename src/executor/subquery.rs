@@ -4227,13 +4227,13 @@ impl Executor {
 
         // Collect values into Vec first (faster than direct FxHashSet insertion),
         // then convert to FxHashSet for deduplication and O(1) lookups
+        // A NULL member stays: a negated IN keeps nothing beside one, and
+        // the EXISTS rewrite reads it as matching nothing
         let mut values_vec = Vec::with_capacity(10_000);
         while result.next() {
             let row = result.row();
             if let Some(value) = row.get(0) {
-                if !value.is_null() {
-                    values_vec.push(value.clone());
-                }
+                values_vec.push(value.clone());
             }
         }
         if let Some(err) = result.last_error() {
@@ -4669,6 +4669,14 @@ impl Executor {
                     {
                         // Execute subquery once and build hash set
                         let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
+                        // A NULL member leaves no value known to be outside
+                        // the set, so a negated IN keeps nothing
+                        if info.is_negated && hash_set.contains(&Value::null_unknown()) {
+                            return Ok(Some(Expression::BooleanLiteral(BooleanLiteral {
+                                token: dummy_token_clone(),
+                                value: false,
+                            })));
+                        }
                         return Ok(Some(Self::transform_exists_to_in_list(&info, hash_set)));
                     }
                 }
