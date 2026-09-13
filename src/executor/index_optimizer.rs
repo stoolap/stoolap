@@ -2006,7 +2006,7 @@ impl Executor {
                 let Expression::InHashSet(in_hash) = infix.left.as_ref() else {
                     return None;
                 };
-                if !in_hash.not || in_hash.values.iter().any(|v| v.is_null()) {
+                if !in_hash.not || in_hash.values.contains(&Value::null_unknown()) {
                     return None;
                 }
                 let column_name = match in_hash.column.as_ref() {

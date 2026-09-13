@@ -4449,7 +4449,7 @@ impl Executor {
         // for NOT EXISTS it is not, since the answer there is true. So the
         // negated set is asked without its NULLs, and an outer NULL, which
         // no inner row can match, is kept alongside
-        let (hash_set, not) = if info.is_negated && hash_set.iter().any(|v| v.is_null()) {
+        let (hash_set, not) = if info.is_negated && hash_set.contains(&Value::null_unknown()) {
             let without_nulls: ValueSet =
                 hash_set.iter().filter(|v| !v.is_null()).cloned().collect();
             if without_nulls.is_empty() {
