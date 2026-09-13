@@ -1,0 +1,123 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A NOT IN over a subquery whose result holds a NULL keeps nothing:
+//! no value is known to be outside such a set.
+
+use stoolap::Database;
+
+fn ids(db: &Database, sql: &str) -> Vec<i64> {
+    db.query(sql, ())
+        .unwrap()
+        .map(|r| r.unwrap().get::<i64>(0).unwrap())
+        .collect()
+}
+
+fn tables(name: &str) -> Database {
+    let db = Database::open(&format!("memory://{name}")).unwrap();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO p VALUES (1, 1), (2, 2), (3, 3)", ())
+        .unwrap();
+    db.execute("INSERT INTO c VALUES (1, 1), (2, NULL)", ())
+        .unwrap();
+    db
+}
+
+#[test]
+fn a_negated_subquery_set_holding_null_keeps_nothing_on_the_primary_key() {
+    let db = tables("not_in_subquery_null_pk");
+    for i in 0..3 {
+        let rows = ids(
+            &db,
+            "SELECT id FROM p WHERE id NOT IN (SELECT p_id FROM c) ORDER BY id",
+        );
+        assert!(rows.is_empty(), "execution {i} returned {rows:?}");
+    }
+}
+
+#[test]
+fn a_negated_subquery_set_holding_null_keeps_nothing_on_a_plain_column() {
+    let db = tables("not_in_subquery_null_col");
+    assert!(ids(
+        &db,
+        "SELECT id FROM p WHERE k NOT IN (SELECT p_id FROM c) ORDER BY id"
+    )
+    .is_empty());
+}
+
+#[test]
+fn a_negated_subquery_set_without_null_keeps_the_rest() {
+    let db = tables("not_in_subquery_no_null");
+    db.execute("DELETE FROM c WHERE p_id IS NULL", ()).unwrap();
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM p WHERE id NOT IN (SELECT p_id FROM c) ORDER BY id"
+        ),
+        vec![2, 3]
+    );
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM p WHERE id IN (SELECT p_id FROM c) ORDER BY id"
+        ),
+        vec![1]
+    );
+}
+
+#[test]
+fn a_subquery_set_holding_null_still_answers_in() {
+    let db = tables("in_subquery_null");
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM p WHERE id IN (SELECT p_id FROM c) ORDER BY id"
+        ),
+        vec![1]
+    );
+}
+
+#[test]
+fn a_negated_subquery_set_holding_null_keeps_nothing_under_a_limit() {
+    let db = tables("not_in_subquery_null_limit");
+    assert!(ids(
+        &db,
+        "SELECT id FROM p WHERE id NOT IN (SELECT p_id FROM c) ORDER BY id LIMIT 10"
+    )
+    .is_empty());
+}
+
+#[test]
+fn a_negated_subquery_set_holding_null_keeps_nothing_after_the_in_form_ran() {
+    let db = tables("not_in_subquery_null_after_in");
+    // The IN form runs the same subquery first and may keep its values
+    // for the next execution; the negated form must still see the NULL
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM p WHERE id IN (SELECT p_id FROM c) ORDER BY id"
+        ),
+        vec![1]
+    );
+    for i in 0..2 {
+        let rows = ids(
+            &db,
+            "SELECT id FROM p WHERE id NOT IN (SELECT p_id FROM c) ORDER BY id",
+        );
+        assert!(rows.is_empty(), "execution {i} returned {rows:?}");
+    }
+}
