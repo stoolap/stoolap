@@ -1148,6 +1148,29 @@ impl SegmentedTable {
         Ok(None)
     }
 
+    /// Deletes a sealed row the caller has already located in the statement
+    /// snapshot. Takes the fields it mutates so the seal guard's borrow of
+    /// `segment_mgr` can stay alive across the call.
+    fn delete_located_cold_row(
+        hot: &mut Box<dyn Table>,
+        segment_mgr: &super::manifest::SegmentManager,
+        txn_id: i64,
+        row_id: i64,
+        has_int_pk: bool,
+    ) -> Result<()> {
+        // Claim the cold row to prevent concurrent lost deletes.
+        hot.try_claim_row(row_id)?;
+        if has_int_pk {
+            // A swallowed failure here tombstones the cold row while
+            // its hot PK index entry survives, wedging that PK value.
+            hot.delete_by_row_ids(&[row_id])?;
+        }
+        // Track tombstone for commit. Pending tombstones are applied on commit
+        // and discarded on rollback to prevent isolation violations.
+        segment_mgr.add_pending_tombstone(txn_id, row_id);
+        Ok(())
+    }
+
     fn find_segment_row(&self, row_id: i64) -> Result<Option<(u64, Arc<FrozenVolume>, usize)>> {
         // Hot buffer shadows cold: if the row exists in hot, the cold copy is stale
         if self.hot.has_row_id(row_id)? {
@@ -1430,6 +1453,13 @@ impl Table for SegmentedTable {
         where_expr: Option<&dyn Expression>,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
+        // A bare `pk = k` names one row: resolve it by id instead of walking
+        // every cold row and collecting every hot id
+        if let Some(pk) = where_expr
+            .and_then(|e| crate::storage::mvcc::table::pk_equality_id(e, self.hot.schema()))
+        {
+            return self.update_by_row_ids(&[pk], setter);
+        }
         let _seal_guard = self.segment_mgr.acquire_seal_read();
         // Capture a verified all-warm segment snapshot BEFORE mutating the
         // hot buffer and use it for the entire statement: eviction CoWs
@@ -1695,21 +1725,18 @@ impl Table for SegmentedTable {
 
         for &row_id in row_ids {
             let found = match &cold_snapshot {
-                Some(snap) => self.find_segment_row_in(snap, row_id)?,
-                None => None,
+                Some(snap) => self.find_segment_row_in(snap, row_id)?.is_some(),
+                None => false,
             };
-            if let Some((_seg_id, _cs, _idx)) = found {
-                // Claim the cold row to prevent concurrent lost deletes.
-                self.hot.try_claim_row(row_id)?;
-                if has_int_pk {
-                    // A swallowed failure here tombstones the cold row while
-                    // its hot PK index entry survives, wedging that PK value.
-                    self.hot.delete_by_row_ids(&[row_id])?;
-                }
-                // Track tombstone for commit. Pending tombstones are applied on commit
-                // and discarded on rollback to prevent isolation violations.
-                self.segment_mgr
-                    .add_pending_tombstone(self.txn_id(), row_id);
+            if found {
+                let txn_id = self.txn_id();
+                Self::delete_located_cold_row(
+                    &mut self.hot,
+                    &self.segment_mgr,
+                    txn_id,
+                    row_id,
+                    has_int_pk,
+                )?;
                 count += 1;
             } else {
                 hot_ids.push(row_id);
@@ -1757,6 +1784,39 @@ impl Table for SegmentedTable {
     }
 
     fn delete(&mut self, where_expr: Option<&dyn Expression>) -> Result<i32> {
+        // A bare `pk = k` names one row: the hot half keeps the predicate and
+        // the cold half resolves the id instead of walking every cold row
+        if let Some(pk) = where_expr
+            .and_then(|e| crate::storage::mvcc::table::pk_equality_id(e, self.hot.schema()))
+        {
+            let _seal_guard = self.segment_mgr.acquire_seal_read();
+            let cold_snapshot = if self.segment_mgr.has_segments() {
+                Some(self.segment_mgr.statement_snapshot()?)
+            } else {
+                None
+            };
+            let mut count = self.hot.delete(where_expr)?;
+            if let Some(snap) = &cold_snapshot {
+                let has_int_pk = self
+                    .hot
+                    .schema()
+                    .columns
+                    .iter()
+                    .any(|c| c.primary_key && c.data_type == DataType::Integer);
+                if self.find_segment_row_in(snap, pk)?.is_some() {
+                    let txn_id = self.txn_id();
+                    Self::delete_located_cold_row(
+                        &mut self.hot,
+                        &self.segment_mgr,
+                        txn_id,
+                        pk,
+                        has_int_pk,
+                    )?;
+                    count += 1;
+                }
+            }
+            return Ok(count);
+        }
         let _seal_guard = self.segment_mgr.acquire_seal_read();
         // Capture a verified all-warm segment snapshot BEFORE mutating the
         // hot buffer and use it for the entire statement: eviction CoWs
