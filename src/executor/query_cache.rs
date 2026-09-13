@@ -79,6 +79,8 @@ pub struct CompiledPkLookup {
     pub schema: CompactArc<Schema>,
     /// Pre-computed column names for result (CompactArc<Vec<String>> for zero-copy O(1) clone on execution)
     pub column_names: CompactArc<Vec<String>>,
+    /// Schema column indices to return; None for `SELECT *`
+    pub projection: Option<CompactArc<[usize]>>,
     /// How to extract the PK value
     pub pk_value_source: PkValueSource,
     /// Schema epoch at compilation time (for fast cache invalidation)
