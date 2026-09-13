@@ -527,6 +527,11 @@ impl Transaction for MvccTransaction {
         } else {
             // Read-only transaction - just mark as committed in registry
             self.registry.complete_commit(self.id);
+            // Nothing to publish; drop the stores its reads opened, as a
+            // rollback does
+            if let Some(ops) = &self.engine_operations {
+                ops.rollback_all_tables(self.id);
+            }
         }
 
         // Mark as committed
