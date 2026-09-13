@@ -38,6 +38,9 @@ use super::query_cache::{CompiledExecution, CompiledPkLookup, PkValueSource};
 use super::result::ExecutorResult;
 use super::Executor;
 
+/// Column indices to return (None for `SELECT *`) and the result column names
+type PkProjection = (Option<CompactArc<[usize]>>, CompactArc<Vec<String>>);
+
 /// Information extracted from a simple PK lookup query
 struct PkLookupInfo {
     /// Table name (already lowercased for storage lookups)
@@ -46,6 +49,10 @@ struct PkLookupInfo {
     pk_value: i64,
     /// Cached schema to avoid second lookup
     schema: CompactArc<Schema>,
+    /// Result column names, already projected
+    column_names: CompactArc<Vec<String>>,
+    /// Schema column indices to return; None for `SELECT *`
+    projection: Option<CompactArc<[usize]>>,
 }
 
 impl Executor {
@@ -98,23 +105,66 @@ impl Executor {
             return None;
         }
 
-        // Must be SELECT * (for now - column projection adds complexity)
-        if stmt.columns.len() != 1 || !matches!(&stmt.columns[0], Expression::Star(_)) {
+        if !Self::pk_select_list_is_simple(&stmt.columns) {
             return None;
         }
 
         // Extract table name (must be a simple table reference, not a join or subquery)
         // Use pre-computed lowercase from Identifier (avoids allocation and case conversion)
         let table_name: &str = match table_expr.as_ref() {
-            Expression::TableSource(ts) => ts.name.value_lower.as_str(),
-            _ => return None, // Join, subquery, or other complex source
+            Expression::TableSource(ts) if ts.as_of.is_none() => ts.name.value_lower.as_str(),
+            _ => return None, // Join, subquery, AS OF, or other complex source
         };
 
         // Try to extract PK lookup info from WHERE clause
-        let lookup_info = self.extract_pk_lookup_info(table_name, where_clause, ctx)?;
+        let lookup_info =
+            self.extract_pk_lookup_info(table_name, where_clause, &stmt.columns, ctx)?;
 
         // Execute the fast-path lookup
         Some(self.execute_pk_lookup(lookup_info))
+    }
+
+    /// True for `SELECT *` or a list of plain column names; anything else
+    /// takes the general path
+    fn pk_select_list_is_simple(columns: &[Expression]) -> bool {
+        (columns.len() == 1 && matches!(columns[0], Expression::Star(_)))
+            || columns
+                .iter()
+                .all(|c| matches!(c, Expression::Identifier(_)))
+    }
+
+    /// Resolves a simple select list against the schema: no indices for `*`,
+    /// otherwise the column indices, or no value when a name is unknown
+    fn pk_projection(columns: &[Expression], schema: &Schema) -> Option<PkProjection> {
+        if columns.len() == 1 && matches!(columns[0], Expression::Star(_)) {
+            return Some((None, schema.column_names_arc()));
+        }
+        let mut indices = Vec::with_capacity(columns.len());
+        let mut names = Vec::with_capacity(columns.len());
+        for column in columns {
+            let Expression::Identifier(id) = column else {
+                return None;
+            };
+            let index = schema
+                .columns
+                .iter()
+                .position(|c| c.name_lower == id.value_lower)?;
+            indices.push(index);
+            names.push(id.value.to_string());
+        }
+        Some((Some(CompactArc::from(indices)), CompactArc::new(names)))
+    }
+
+    fn project_pk_row(row: Row, projection: Option<&CompactArc<[usize]>>) -> Row {
+        match projection {
+            None => row,
+            Some(indices) => Row::from_values(
+                indices
+                    .iter()
+                    .map(|&i| row.get(i).cloned().unwrap_or_else(Value::null_unknown))
+                    .collect(),
+            ),
+        }
     }
 
     /// Extract PK lookup information from a WHERE clause
@@ -122,15 +172,19 @@ impl Executor {
         &self,
         table_name: &str,
         where_clause: &Expression,
+        columns: &[Expression],
         ctx: &ExecutionContext,
     ) -> Option<PkLookupInfo> {
         let (pk_value_source, schema) =
             self.extract_pk_lookup_structure(table_name, where_clause)?;
+        let (projection, column_names) = Self::pk_projection(columns, &schema)?;
         let pk_value = self.extract_pk_value_fast(&pk_value_source, ctx)?;
         Some(PkLookupInfo {
             table_name: table_name.to_string(),
             pk_value,
             schema,
+            column_names,
+            projection,
         })
     }
 
@@ -270,9 +324,6 @@ impl Executor {
 
     /// Execute the fast-path PK lookup using Engine::fetch_rows_by_ids
     fn execute_pk_lookup(&self, info: PkLookupInfo) -> Result<Box<dyn QueryResult>> {
-        // Use cached schema for column names - Arc clone is O(1)
-        let columns = info.schema.column_names_arc();
-
         // Use engine's fetch_rows_by_ids for direct MVCC lookup
         // This bypasses the full query planner and goes straight to version store
         // Note: table_name is already lowercased, so storage layer won't call to_lowercase again
@@ -284,11 +335,17 @@ impl Executor {
         let result_rows: RowVec = rows
             .into_iter()
             .enumerate()
-            .map(|(i, (_, row))| (i as i64, Self::normalize_row_to_schema(row, &info.schema)))
+            .map(|(i, (_, row))| {
+                let row = Self::normalize_row_to_schema(row, &info.schema);
+                (
+                    i as i64,
+                    Self::project_pk_row(row, info.projection.as_ref()),
+                )
+            })
             .collect();
 
         Ok(Box::new(ExecutorResult::with_arc_columns(
-            columns,
+            info.column_names,
             result_rows,
         )))
     }
@@ -437,9 +494,10 @@ impl Executor {
         // Pre-allocate with capacity 1 for single PK lookup (avoids realloc)
         let mut result_rows = RowVec::with_capacity(1);
         for (row_id, (_, row)) in rows.into_iter().enumerate() {
+            let row = Self::normalize_row_to_schema(row, &lookup.schema);
             result_rows.push((
                 row_id as i64,
-                Self::normalize_row_to_schema(row, &lookup.schema),
+                Self::project_pk_row(row, lookup.projection.as_ref()),
             ));
         }
         // Use Arc columns - O(1) clone since column_names is CompactArc<Vec<String>>
@@ -512,15 +570,14 @@ impl Executor {
             return None;
         }
 
-        // Must be SELECT *
         // Don't set NotOptimizable here - other fast paths (like COUNT DISTINCT) may handle this
-        if stmt.columns.len() != 1 || !matches!(&stmt.columns[0], Expression::Star(_)) {
+        if !Self::pk_select_list_is_simple(&stmt.columns) {
             return None;
         }
 
         // Extract table name (use pre-computed lowercase)
         let table_name: &str = match table_expr.as_ref() {
-            Expression::TableSource(ts) => ts.name.value_lower.as_str(),
+            Expression::TableSource(ts) if ts.as_of.is_none() => ts.name.value_lower.as_str(),
             _ => {
                 *compiled_guard = CompiledExecution::NotOptimizable(self.engine.schema_epoch());
                 return None;
@@ -535,13 +592,13 @@ impl Executor {
         match self.extract_pk_lookup_structure(table_name, where_clause) {
             Some((pk_value_source, schema)) => {
                 // Build and cache compiled lookup
-                // Use schema's column_names_arc() directly - O(1) Arc clone on execution
-                let column_names = schema.column_names_arc();
+                let (projection, column_names) = Self::pk_projection(&stmt.columns, &schema)?;
                 let cached_epoch = self.engine.schema_epoch();
                 let compiled_lookup = CompiledPkLookup {
                     table_name: SmartString::new(table_name),
                     schema: schema.clone(),
-                    column_names,
+                    column_names: column_names.clone(),
+                    projection: projection.clone(),
                     pk_value_source: pk_value_source.clone(),
                     cached_epoch,
                 };
@@ -555,6 +612,8 @@ impl Executor {
                     table_name: table_name.to_string(),
                     pk_value,
                     schema,
+                    column_names,
+                    projection,
                 }))
             }
             None => {
