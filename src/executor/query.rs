@@ -3227,8 +3227,14 @@ impl Executor {
                     let still_correlated = Self::has_correlated_subqueries(&current_expr);
 
                     if any_optimized && !still_correlated {
-                        // All correlated subqueries were optimized away
-                        (Some(current_expr), false)
+                        // All correlated subqueries were optimized away; a
+                        // subquery the rewrite refused is read once here
+                        let processed = if Self::has_subqueries(&current_expr) {
+                            self.process_where_subqueries(&current_expr, ctx)?
+                        } else {
+                            current_expr
+                        };
+                        (Some(processed), false)
                     } else if any_optimized {
                         // Some optimizations applied but still have correlated parts
                         (Some(current_expr), true)

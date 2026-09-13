@@ -4227,13 +4227,13 @@ impl Executor {
 
         // Collect values into Vec first (faster than direct FxHashSet insertion),
         // then convert to FxHashSet for deduplication and O(1) lookups
+        // A NULL member stays: a negated IN keeps nothing beside one, and
+        // the EXISTS rewrite reads it as matching nothing
         let mut values_vec = Vec::with_capacity(10_000);
         while result.next() {
             let row = result.row();
             if let Some(value) = row.get(0) {
-                if !value.is_null() {
-                    values_vec.push(value.clone());
-                }
+                values_vec.push(value.clone());
             }
         }
         if let Some(err) = result.last_error() {
@@ -4669,6 +4669,14 @@ impl Executor {
                     {
                         // Execute subquery once and build hash set
                         let hash_set = self.execute_semi_join_optimization(&info, ctx)?;
+                        // A NULL member leaves no value known to be outside
+                        // the set, so a negated IN keeps nothing
+                        if info.is_negated && hash_set.contains(&Value::null_unknown()) {
+                            return Ok(Some(Expression::BooleanLiteral(BooleanLiteral {
+                                token: dummy_token_clone(),
+                                value: false,
+                            })));
+                        }
                         return Ok(Some(Self::transform_exists_to_in_list(&info, hash_set)));
                     }
                 }
@@ -4776,6 +4784,20 @@ impl Executor {
             return None;
         }
 
+        // The set is rebuilt as a plain scan of the column, which cannot
+        // reproduce a result shaped by a LIMIT, an OFFSET, a DISTINCT ON, a
+        // grouping, a set operation or a WITH
+        if subquery.limit.is_some()
+            || subquery.offset.is_some()
+            || !subquery.distinct_on.is_empty()
+            || !subquery.group_by.columns.is_empty()
+            || subquery.having.is_some()
+            || !subquery.set_operations.is_empty()
+            || subquery.with.is_some()
+        {
+            return None;
+        }
+
         // Extract inner column name from SELECT
         let inner_column: String = match &subquery.columns[0] {
             Expression::Identifier(id) => id.value.to_string(),
@@ -4788,10 +4810,11 @@ impl Executor {
             _ => return None, // Can't handle expressions in SELECT
         };
 
-        // 3. Check for simple table source (not a join)
+        // 3. Check for simple table source (not a join); the rebuilt scan
+        // reads the current table, so an AS OF is not reproduced either
         let (inner_table, inner_alias): (String, Option<String>) =
             match subquery.table_expr.as_ref().map(|b| b.as_ref()) {
-                Some(Expression::TableSource(ts)) => {
+                Some(Expression::TableSource(ts)) if ts.as_of.is_none() => {
                     let alias = ts.alias.as_ref().map(|a| a.value.to_string());
                     (ts.name.value.to_string(), alias)
                 }

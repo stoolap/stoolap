@@ -173,8 +173,14 @@ pub fn get_cached_in_subquery_set(key: &str) -> Option<CompactArc<crate::core::V
     })
 }
 
-/// Cache an IN subquery result with the tables it references.
+/// Cache an IN subquery result with the tables it references. A result
+/// holding a NULL is not kept: the negated form of the same subquery reads
+/// this cache and keeps no row for such a set, which its readers decide
+/// on a fresh list alone
 pub fn cache_in_subquery(key: String, tables: SmallVec<[CompactArc<str>; 2]>, values: Vec<Value>) {
+    if values.iter().any(|v| v.is_null()) {
+        return;
+    }
     IN_SUBQUERY_CACHE.with(|cache| {
         cache.borrow_mut().put(key, (tables, values, None));
     });

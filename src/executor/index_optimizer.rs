@@ -1053,18 +1053,26 @@ impl Executor {
 
             // Collect all values from the first column
             let mut values = Vec::new();
+            let mut has_null = false;
             while result.next() {
                 let row = result.row();
                 if !row.is_empty() {
-                    values.push(
-                        row.get(0)
-                            .cloned()
-                            .unwrap_or_else(crate::core::Value::null_unknown),
-                    );
+                    let value = row
+                        .get(0)
+                        .cloned()
+                        .unwrap_or_else(crate::core::Value::null_unknown);
+                    has_null |= value.is_null();
+                    values.push(value);
                 }
             }
             if let Some(err) = result.last_error() {
                 return Err(err);
+            }
+            // A negated set holding a NULL keeps no row, which the rows
+            // outside the set cannot say; the evaluator answers that. A
+            // cached list never holds one, so only a fresh list is asked
+            if is_negated && has_null {
+                return Ok(None);
             }
             // Cache for future use
             if let Some(key) = cache_key {
@@ -1186,6 +1194,10 @@ impl Executor {
         } else if let Some(ref idx) = index {
             // Index probe for each value - use _into to avoid intermediate allocations
             for value in &values {
+                // A NULL member equals nothing, so it is not looked up
+                if value.is_null() {
+                    continue;
+                }
                 idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
             }
         }
@@ -1420,6 +1432,10 @@ impl Executor {
         } else if let Some(ref idx) = index {
             // Index probe for each value - use _into to avoid intermediate allocations
             for value in &values {
+                // A NULL member equals nothing, so it is not looked up
+                if value.is_null() {
+                    continue;
+                }
                 idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
             }
         }
@@ -1838,6 +1854,10 @@ impl Executor {
                         break;
                     }
                 }
+                // A NULL member equals nothing, so it is not looked up
+                if value.is_null() {
+                    continue;
+                }
                 idx.get_row_ids_equal_into(std::slice::from_ref(value), &mut all_row_ids);
             }
         }
@@ -1986,6 +2006,11 @@ impl Executor {
         match expr {
             // Direct InHashSet: column IN {hash_set}
             Expression::InHashSet(in_hash) => {
+                // A negated set holding a NULL keeps no row, which the probe
+                // of the keys outside the set cannot say; the evaluator can
+                if in_hash.not && in_hash.values.contains(&Value::null_unknown()) {
+                    return None;
+                }
                 // Get the column name from the column expression (lowercase for case-insensitive match)
                 let column_name = match in_hash.column.as_ref() {
                     Expression::Identifier(id) => id.value_lower.to_string(),
