@@ -157,3 +157,33 @@ fn a_positive_in_through_a_secondary_index_skips_null() {
         );
     }
 }
+
+#[test]
+fn a_negated_subquery_with_a_limit_is_read_as_written_beside_an_exists() {
+    let db = tables("not_in_subquery_limit_or_exists");
+    // The subquery keeps only the row with id 1, whose p_id is 1: the NULL
+    // is not in its result, so every id but 1 is outside the set
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM p WHERE id NOT IN (SELECT p_id FROM c ORDER BY id LIMIT 1) OR EXISTS (SELECT 1 FROM c WHERE c.p_id = p.id) ORDER BY id"
+        ),
+        vec![1, 2, 3]
+    );
+    // An empty result leaves everything outside the set
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM p WHERE id NOT IN (SELECT p_id FROM c LIMIT 0) OR EXISTS (SELECT 1 FROM c WHERE c.p_id = p.id) ORDER BY id"
+        ),
+        vec![1, 2, 3]
+    );
+    // And the positive form reads the same result
+    assert_eq!(
+        ids(
+            &db,
+            "SELECT id FROM p WHERE id IN (SELECT p_id FROM c ORDER BY id DESC LIMIT 1) OR EXISTS (SELECT 1 FROM c WHERE c.p_id = p.id) ORDER BY id"
+        ),
+        vec![1]
+    );
+}

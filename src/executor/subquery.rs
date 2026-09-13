@@ -4784,6 +4784,19 @@ impl Executor {
             return None;
         }
 
+        // The set is rebuilt as a plain scan of the column, which cannot
+        // reproduce a result shaped by a LIMIT, an OFFSET, a grouping, a
+        // set operation or a WITH
+        if subquery.limit.is_some()
+            || subquery.offset.is_some()
+            || !subquery.group_by.columns.is_empty()
+            || subquery.having.is_some()
+            || !subquery.set_operations.is_empty()
+            || subquery.with.is_some()
+        {
+            return None;
+        }
+
         // Extract inner column name from SELECT
         let inner_column: String = match &subquery.columns[0] {
             Expression::Identifier(id) => id.value.to_string(),
