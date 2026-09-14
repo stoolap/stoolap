@@ -20,10 +20,12 @@
 //!
 //! This runs as a periodic background operation, similar to snapshot creation.
 
+use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::core::{Result, Row, Schema};
+use crate::core::{Result, Row, Schema, Value};
 
+use super::column::value_kind;
 use super::io;
 use super::writer::{FrozenVolume, VolumeBuilder};
 
@@ -41,10 +43,44 @@ use super::writer::{FrozenVolume, VolumeBuilder};
 /// A FrozenVolume ready to be queried and/or written to disk.
 pub fn seal_rows(schema: &Schema, rows: &[(i64, Row)]) -> Result<FrozenVolume> {
     let mut builder = VolumeBuilder::with_capacity(schema, rows.len());
+    // A clustered table's rows arrive in key order, which the caller decided
+    if !schema.cluster_key.is_empty() {
+        builder.allow_any_row_order();
+    }
     for (row_id, row) in rows {
         builder.add_row(*row_id, row);
     }
     builder.finish()
+}
+
+/// Orders two values of a clustering key column: by kind, then by value
+fn compare_key_value(a: &Value, b: &Value) -> Ordering {
+    let kinds = value_kind(a).cmp(&value_kind(b));
+    if kinds != Ordering::Equal || a.is_null() {
+        return kinds;
+    }
+    a.compare(b).unwrap_or(Ordering::Equal)
+}
+
+/// Orders two values of one clustering key column
+pub fn compare_key_values(a: &Value, b: &Value) -> Ordering {
+    compare_key_value(a, b)
+}
+
+/// Orders two rows of a clustered table by its key, then by row id
+pub fn cluster_order(schema: &Schema, a: &(i64, Row), b: &(i64, Row)) -> Ordering {
+    let null = Value::null_unknown();
+    schema
+        .cluster_key
+        .iter()
+        .map(|&column| {
+            compare_key_value(
+                a.1.get(column).unwrap_or(&null),
+                b.1.get(column).unwrap_or(&null),
+            )
+        })
+        .find(|o| *o != Ordering::Equal)
+        .unwrap_or_else(|| a.0.cmp(&b.0))
 }
 
 /// Seal hot buffer rows and write the volume to disk.

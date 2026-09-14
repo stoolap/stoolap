@@ -25,6 +25,7 @@
 use std::sync::Arc;
 
 use crate::common::SmartString;
+use crate::core::value::cmp_i64_f64;
 use crate::core::{DataType, Value};
 
 /// A dictionary column, the local index a caller's window starts at in it,
@@ -34,6 +35,28 @@ pub type DictFilter<'a> = (&'a ColumnData, usize, u32);
 /// A dictionary column's raw ids and nulls, the local index its window
 /// starts at, and the id looked for
 type DictSlice<'a> = (&'a [u32], &'a [bool], usize, u32);
+
+/// Where a value sorts among the kinds a clustering key column can hold:
+/// NULL, then booleans, numbers, text, timestamps, then what has no order.
+/// A column whose type changed after rows were written holds more than
+/// one kind, and comparing across kinds by value is not transitive, so
+/// the kind decides first
+pub fn value_kind(value: &Value) -> u8 {
+    match value {
+        Value::Null(_) => 0,
+        Value::Boolean(_) => 1,
+        Value::Integer(_) | Value::Float(_) => 2,
+        Value::Text(_) => 3,
+        Value::Timestamp(_) => 4,
+        _ => 5,
+    }
+}
+
+/// Orders two floats totally: NaN sorts after every number
+fn cmp_f64(a: f64, b: f64) -> std::cmp::Ordering {
+    a.partial_cmp(&b)
+        .unwrap_or_else(|| a.is_nan().cmp(&b.is_nan()))
+}
 
 /// Typed column data stored contiguously for cache-friendly access.
 ///
@@ -396,6 +419,80 @@ impl ColumnData {
             | ColumnData::Boolean { nulls, .. }
             | ColumnData::Dictionary { nulls, .. }
             | ColumnData::Bytes { nulls, .. } => nulls[idx],
+        }
+    }
+
+    /// Where a cell sorts among the kinds a key column can hold: NULL, then
+    /// booleans, numbers, text, timestamps, then what has no order
+    fn cell_kind(&self, idx: usize) -> u8 {
+        if self.is_null(idx) {
+            return 0;
+        }
+        match self {
+            ColumnData::Boolean { .. } => 1,
+            ColumnData::Int64 { .. } | ColumnData::Float64 { .. } => 2,
+            ColumnData::Dictionary { .. } => 3,
+            ColumnData::TimestampNanos { .. } => 4,
+            ColumnData::Bytes { .. } => 5,
+        }
+    }
+
+    /// Orders this column's cell `i` against `other`'s cell `j` the way a
+    /// clustering key orders values, reading the typed arrays in place:
+    /// by kind, then by value within the kind
+    pub fn compare_cells(&self, i: usize, other: &ColumnData, j: usize) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let kind = self.cell_kind(i);
+        let kinds = kind.cmp(&other.cell_kind(j));
+        if kinds != Ordering::Equal || kind == 0 {
+            return kinds;
+        }
+        match (self, other) {
+            (ColumnData::Int64 { .. }, ColumnData::Int64 { .. }) => {
+                self.get_i64(i).cmp(&other.get_i64(j))
+            }
+            (ColumnData::Int64 { .. }, ColumnData::Float64 { .. }) => {
+                cmp_i64_f64(self.get_i64(i), other.get_f64(j)).unwrap_or(Ordering::Less)
+            }
+            (ColumnData::Float64 { .. }, ColumnData::Int64 { .. }) => {
+                cmp_i64_f64(other.get_i64(j), self.get_f64(i))
+                    .map(Ordering::reverse)
+                    .unwrap_or(Ordering::Greater)
+            }
+            (ColumnData::Float64 { .. }, ColumnData::Float64 { .. }) => {
+                cmp_f64(self.get_f64(i), other.get_f64(j))
+            }
+            (ColumnData::Dictionary { .. }, _) => self.get_str(i).cmp(other.get_str(j)),
+            (ColumnData::TimestampNanos { .. }, _) => self.get_i64(i).cmp(&other.get_i64(j)),
+            (ColumnData::Boolean { .. }, _) => self.get_bool(i).cmp(&other.get_bool(j)),
+            _ => Ordering::Equal,
+        }
+    }
+
+    /// Orders this column's cell `i` against a value, the way `compare_cells`
+    /// orders two cells, without building a value for the cell
+    pub fn compare_cell_with_value(&self, i: usize, value: &Value) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let kind = self.cell_kind(i);
+        let kinds = kind.cmp(&value_kind(value));
+        if kinds != Ordering::Equal || kind == 0 {
+            return kinds;
+        }
+        match (self, value) {
+            (ColumnData::Int64 { .. }, Value::Integer(v)) => self.get_i64(i).cmp(v),
+            (ColumnData::Int64 { .. }, Value::Float(v)) => {
+                cmp_i64_f64(self.get_i64(i), *v).unwrap_or(Ordering::Less)
+            }
+            (ColumnData::Float64 { .. }, Value::Integer(v)) => cmp_i64_f64(*v, self.get_f64(i))
+                .map(Ordering::reverse)
+                .unwrap_or(Ordering::Greater),
+            (ColumnData::Float64 { .. }, Value::Float(v)) => cmp_f64(self.get_f64(i), *v),
+            (ColumnData::Dictionary { .. }, Value::Text(s)) => self.get_str(i).cmp(s.as_str()),
+            (ColumnData::TimestampNanos { .. }, Value::Timestamp(ts)) => self
+                .get_i64(i)
+                .cmp(&ts.timestamp_nanos_opt().unwrap_or(i64::MAX)),
+            (ColumnData::Boolean { .. }, Value::Boolean(b)) => self.get_bool(i).cmp(b),
+            _ => Ordering::Equal,
         }
     }
 

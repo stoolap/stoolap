@@ -1692,6 +1692,7 @@ impl Parser {
                 columns: Vec::new(),
                 table_constraints: Vec::new(),
                 as_select: Some(Box::new(select_stmt)),
+                cluster_by: Vec::new(),
             });
         }
 
@@ -1710,6 +1711,35 @@ impl Parser {
             return None;
         }
 
+        // Optional CLUSTER BY (col, ...); CLUSTER is not a reserved word
+        let cluster_by = if self.peek_token.literal.eq_ignore_ascii_case("CLUSTER") {
+            self.next_token();
+            if !self.peek_token_is_keyword("BY") {
+                self.add_error(format!("expected BY at {}", self.peek_token.position));
+                return None;
+            }
+            self.next_token();
+            if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
+                self.add_error(format!("expected '(' at {}", self.cur_token.position));
+                return None;
+            }
+            let columns = self.parse_identifier_list();
+            if columns.is_empty() {
+                self.add_error(format!(
+                    "expected a column in CLUSTER BY at {}",
+                    self.cur_token.position
+                ));
+                return None;
+            }
+            if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
+                self.add_error(format!("expected ')' at {}", self.cur_token.position));
+                return None;
+            }
+            columns
+        } else {
+            Vec::new()
+        };
+
         Some(CreateTableStatement {
             token,
             table_name,
@@ -1717,6 +1747,7 @@ impl Parser {
             columns,
             table_constraints,
             as_select: None,
+            cluster_by,
         })
     }
 

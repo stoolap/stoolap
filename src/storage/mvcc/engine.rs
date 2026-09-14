@@ -117,6 +117,7 @@ fn strip_fk_references(
                     old_schema.updated_at,
                 );
                 std::mem::swap(&mut new_schema.foreign_keys, &mut new_fks);
+                new_schema.cluster_key = old_schema.cluster_key.clone();
                 let new_arc = CompactArc::new(new_schema);
 
                 if let Some(vs) = version_stores.get(child_name.as_str()) {
@@ -2109,11 +2110,31 @@ impl MVCCEngine {
             }
         }
 
-        Ok(Schema::with_foreign_keys(
-            &table_name,
-            columns,
-            foreign_keys,
-        ))
+        // Clustering key (absent in schemas written before it existed)
+        let mut cluster_key = Vec::new();
+        if pos + 2 <= data.len() {
+            let count = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            for _ in 0..count {
+                if pos + 2 > data.len() {
+                    return Err(Error::internal(
+                        "corrupted schema: truncated clustering key",
+                    ));
+                }
+                let column = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+                pos += 2;
+                if column >= columns.len() {
+                    return Err(Error::internal(
+                        "corrupted schema: clustering key names a column past the end",
+                    ));
+                }
+                cluster_key.push(column);
+            }
+        }
+
+        let mut schema = Schema::with_foreign_keys(&table_name, columns, foreign_keys);
+        schema.cluster_key = cluster_key;
+        Ok(schema)
     }
 
     /// Closes the engine (inherent method)
@@ -2668,6 +2689,12 @@ impl MVCCEngine {
                     buf.extend_from_slice(&0u16.to_le_bytes());
                 }
             }
+        }
+
+        // Clustering key (after the defaults; a reader without it stops there)
+        buf.extend_from_slice(&(schema.cluster_key.len() as u16).to_le_bytes());
+        for &column in &schema.cluster_key {
+            buf.extend_from_slice(&(column as u16).to_le_bytes());
         }
 
         buf
@@ -3845,6 +3872,36 @@ impl MVCCEngine {
             }
         }
 
+        Self::validate_cluster_key(schema)
+    }
+
+    /// The clustering key names existing columns, each once, and each with
+    /// an order; checked wherever a schema enters or changes, since a key
+    /// that fails this is refused again when the schema is read back
+    pub(crate) fn validate_cluster_key(schema: &Schema) -> Result<()> {
+        let mut seen = FxHashSet::default();
+        for &column in &schema.cluster_key {
+            let Some(col) = schema.columns.get(column) else {
+                return Err(Error::internal(format!(
+                    "CLUSTER BY names column {} of table '{}', which has {} columns",
+                    column,
+                    schema.table_name,
+                    schema.columns.len()
+                )));
+            };
+            if !seen.insert(column) {
+                return Err(Error::Parse(format!(
+                    "CLUSTER BY names column '{}' twice",
+                    col.name
+                )));
+            }
+            if matches!(col.data_type, DataType::Json | DataType::Vector) {
+                return Err(Error::Parse(format!(
+                    "CLUSTER BY column '{}' has type {:?}, which has no order",
+                    col.name, col.data_type
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -5616,8 +5673,6 @@ impl MVCCEngine {
                 }
             }
 
-            live_refs.sort_unstable_by_key(|(id, _, _)| *id);
-
             if live_refs.is_empty() {
                 // All rows in merged volumes are tombstoned. Remove those
                 // volumes and their tombstones, but keep unmerged volumes intact.
@@ -5674,6 +5729,66 @@ impl MVCCEngine {
                 .map(|(seg_id, _vol)| mgr.get_volume_mapping(*seg_id, &schema))
                 .collect();
 
+            // The merged volumes hold their rows in row id order, or in key
+            // order for a clustered table, read through each volume's mapping
+            if schema.cluster_key.is_empty() {
+                live_refs.sort_unstable_by_key(|(id, _, _)| *id);
+            } else {
+                use crate::storage::volume::writer::ColSource;
+                // The key columns are compared in place, cell against cell,
+                // through one column handle per key column per volume; a
+                // column a volume predates is its default for every row
+                use crate::storage::volume::column::ColumnData;
+                let mut key_cells: Vec<Vec<Option<&ColumnData>>> = Vec::new();
+                let mut key_defaults: Vec<Vec<Option<Value>>> = Vec::new();
+                for &column in &schema.cluster_key {
+                    let mut cells = Vec::with_capacity(volumes.len());
+                    let mut defaults = Vec::with_capacity(volumes.len());
+                    for (vol_idx, (_, vol)) in volumes.iter().enumerate() {
+                        let mapping = &vol_mappings[vol_idx];
+                        let (source, default) = if mapping.is_identity {
+                            (Some(column), None)
+                        } else {
+                            match mapping.sources.get(column) {
+                                Some(ColSource::Volume(v)) => (Some(*v), None),
+                                Some(ColSource::Default(value)) => (None, Some(value.clone())),
+                                None => (None, Some(Value::null_unknown())),
+                            }
+                        };
+                        cells.push(source.and_then(|v| vol.columns.get(v).ok()));
+                        defaults.push(default);
+                    }
+                    key_cells.push(cells);
+                    key_defaults.push(defaults);
+                }
+                let null = Value::null_unknown();
+                let default_of =
+                    |k: usize, vol_idx: usize| key_defaults[k][vol_idx].as_ref().unwrap_or(&null);
+                let compare_key = |k: usize, a: (usize, usize), b: (usize, usize)| match (
+                    key_cells[k][a.0],
+                    key_cells[k][b.0],
+                ) {
+                    (Some(ca), Some(cb)) => ca.compare_cells(a.1, cb, b.1),
+                    (Some(ca), None) => ca.compare_cell_with_value(a.1, default_of(k, b.0)),
+                    (None, Some(cb)) => cb
+                        .compare_cell_with_value(b.1, default_of(k, a.0))
+                        .reverse(),
+                    (None, None) => crate::storage::volume::seal::compare_key_values(
+                        default_of(k, a.0),
+                        default_of(k, b.0),
+                    ),
+                };
+                let mut order: Vec<u32> = (0..live_refs.len() as u32).collect();
+                order.sort_unstable_by(|&a, &b| {
+                    let (ra, rb) = (live_refs[a as usize], live_refs[b as usize]);
+                    (0..schema.cluster_key.len())
+                        .map(|k| compare_key(k, (ra.1, ra.2), (rb.1, rb.2)))
+                        .find(|o| *o != std::cmp::Ordering::Equal)
+                        .unwrap_or_else(|| ra.0.cmp(&rb.0))
+                });
+                live_refs = order.iter().map(|&i| live_refs[i as usize]).collect();
+            }
+
             // Split live_refs into target-sized chunks and build one volume per chunk.
             // Row-group aligned split: round to 64K boundary so every volume
             // has complete row groups. Optimal for LZ4 compression and zone maps.
@@ -5700,6 +5815,9 @@ impl MVCCEngine {
                     &schema,
                     chunk.len(),
                 );
+                if !schema.cluster_key.is_empty() {
+                    builder.allow_any_row_order();
+                }
                 for &(row_id, vol_idx, row_idx) in chunk {
                     let vol = &volumes[vol_idx].1;
                     let mapping = &vol_mappings[vol_idx];
@@ -5742,8 +5860,7 @@ impl MVCCEngine {
                     Ok((_path, store)) => {
                         // Retain compressed store for hot→warm eviction.
                         compacted.columns.attach_compressed_store(store);
-                        let min_id = chunk.first().map(|(id, _, _)| *id).unwrap_or(0);
-                        let max_id = chunk.last().map(|(id, _, _)| *id).unwrap_or(0);
+                        let (min_id, max_id) = compacted.id_bounds().unwrap_or((0, 0));
                         new_volumes.push((
                             compact_vol_id,
                             Arc::new(compacted),
@@ -6010,6 +6127,11 @@ impl MVCCEngine {
                 }
             }
 
+            // A clustered table's volumes hold their rows in key order
+            if !schema.cluster_key.is_empty() {
+                all_rows.sort_by(|a, b| crate::storage::volume::seal::cluster_order(&schema, a, b));
+            }
+
             let vol_dir = pm.path().join("volumes");
 
             // Build volumes from rows, splitting at target_volume_rows boundary.
@@ -6082,7 +6204,7 @@ impl MVCCEngine {
                     mgr.add_tombstones(&all_skipped_inner, seal_seq);
                 }
 
-                if let Some(&(max_id, _)) = all_rows.last() {
+                if let Some(max_id) = all_rows.iter().map(|(id, _)| *id).max() {
                     let current = store.get_auto_increment_counter();
                     if max_id > current {
                         store.set_auto_increment_counter(max_id);

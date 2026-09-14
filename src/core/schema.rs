@@ -221,6 +221,10 @@ pub struct Schema {
     /// Foreign key constraints
     pub foreign_keys: Vec<ForeignKeyConstraint>,
 
+    /// Column indices the sealed rows are ordered by; empty when the
+    /// table is not clustered
+    pub cluster_key: Vec<usize>,
+
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
 
@@ -278,6 +282,7 @@ impl Clone for Schema {
             table_name_lower: self.table_name_lower.clone(),
             columns: self.columns.clone(),
             foreign_keys: self.foreign_keys.clone(),
+            cluster_key: self.cluster_key.clone(),
             created_at: self.created_at,
             updated_at: self.updated_at,
             column_names_cache,
@@ -294,6 +299,7 @@ impl PartialEq for Schema {
         self.table_name == other.table_name
             && self.columns == other.columns
             && self.foreign_keys == other.foreign_keys
+            && self.cluster_key == other.cluster_key
             && self.created_at == other.created_at
             && self.updated_at == other.updated_at
     }
@@ -360,6 +366,7 @@ impl Schema {
             table_name_lower: name_lower,
             columns,
             foreign_keys,
+            cluster_key: Vec::new(),
             created_at: now,
             updated_at: now,
             column_names_cache,
@@ -440,6 +447,7 @@ impl Schema {
             table_name_lower: name_lower,
             columns,
             foreign_keys,
+            cluster_key: Vec::new(),
             created_at,
             updated_at,
             column_names_cache,
@@ -665,7 +673,20 @@ impl Schema {
         let idx = self
             .get_column_index(name)
             .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
+        // The clustering key names columns by position: a key column
+        // cannot go, and the columns after a removed one move down
+        if self.cluster_key.contains(&idx) {
+            return Err(Error::Parse(format!(
+                "column '{}' is in the CLUSTER BY key of table '{}'",
+                name, self.table_name
+            )));
+        }
         let column = self.columns.remove(idx);
+        for key in &mut self.cluster_key {
+            if *key > idx {
+                *key -= 1;
+            }
+        }
 
         // Re-index remaining columns
         for (i, col) in self.columns.iter_mut().enumerate() {
@@ -709,6 +730,13 @@ impl Schema {
             .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
 
         if let Some(dt) = data_type {
+            // A column of the clustering key keeps a type with an order
+            if self.cluster_key.contains(&idx) && matches!(dt, DataType::Json | DataType::Vector) {
+                return Err(Error::Parse(format!(
+                    "column '{}' is in the CLUSTER BY key of table '{}' and cannot become {:?}, which has no order",
+                    name, self.table_name, dt
+                )));
+            }
             self.columns[idx].data_type = dt;
         }
         if let Some(n) = nullable {
@@ -745,6 +773,7 @@ pub struct SchemaBuilder {
     table_name: String,
     columns: Vec<SchemaColumn>,
     foreign_keys: Vec<ForeignKeyConstraint>,
+    cluster_key: Vec<usize>,
 }
 
 impl SchemaBuilder {
@@ -754,6 +783,7 @@ impl SchemaBuilder {
             table_name: table_name.into(),
             columns: Vec::new(),
             foreign_keys: Vec::new(),
+            cluster_key: Vec::new(),
         }
     }
 
@@ -845,8 +875,17 @@ impl SchemaBuilder {
     }
 
     /// Build the schema
+    /// Order the sealed rows by these columns, given as indices
+    pub fn cluster_by(mut self, columns: Vec<usize>) -> Self {
+        self.cluster_key = columns;
+        self
+    }
+
     pub fn build(self) -> Schema {
-        Schema::with_foreign_keys(self.table_name, self.columns, self.foreign_keys)
+        let mut schema =
+            Schema::with_foreign_keys(self.table_name, self.columns, self.foreign_keys);
+        schema.cluster_key = self.cluster_key;
+        schema
     }
 }
 

@@ -441,6 +441,12 @@ fn serialize_snapshot_schema(schema: &Schema) -> Vec<u8> {
         }
     }
 
+    // Clustering key (after the defaults; a reader without it stops there)
+    buf.extend_from_slice(&(schema.cluster_key.len() as u16).to_le_bytes());
+    for &column in &schema.cluster_key {
+        buf.extend_from_slice(&(column as u16).to_le_bytes());
+    }
+
     buf
 }
 
@@ -739,13 +745,37 @@ fn deserialize_snapshot_schema(data: &[u8]) -> Result<Schema> {
         }
     }
 
-    Ok(Schema::with_timestamps_and_foreign_keys(
+    // Clustering key (absent in snapshots written before it existed)
+    let mut cluster_key = Vec::new();
+    if pos + 2 <= data.len() {
+        let count = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        for _ in 0..count {
+            if pos + 2 > data.len() {
+                return Err(Error::internal(
+                    "corrupted snapshot schema: truncated clustering key",
+                ));
+            }
+            let column = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            if column >= columns.len() {
+                return Err(Error::internal(
+                    "corrupted snapshot schema: clustering key names a column past the end",
+                ));
+            }
+            cluster_key.push(column);
+        }
+    }
+
+    let mut schema = Schema::with_timestamps_and_foreign_keys(
         table_name,
         columns,
         foreign_keys,
         created_at,
         updated_at,
-    ))
+    );
+    schema.cluster_key = cluster_key;
+    Ok(schema)
 }
 
 // ============================================================================

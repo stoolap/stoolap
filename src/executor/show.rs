@@ -151,6 +151,14 @@ impl Executor {
         }
 
         create_sql.push(')');
+        if !schema.cluster_key.is_empty() {
+            let key: Vec<&str> = schema
+                .cluster_key
+                .iter()
+                .map(|&c| schema.columns[c].name.as_str())
+                .collect();
+            create_sql.push_str(&format!(" CLUSTER BY ({})", key.join(", ")));
+        }
 
         let columns = vec!["Table".to_string(), "Create Table".to_string()];
         let mut rows = RowVec::with_capacity(1);

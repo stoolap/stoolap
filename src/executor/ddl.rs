@@ -337,6 +337,35 @@ impl Executor {
             }
         }
 
+        // CLUSTER BY names columns of this table, in the order the sealed
+        // rows are kept
+        if !stmt.cluster_by.is_empty() {
+            let mut key = Vec::with_capacity(stmt.cluster_by.len());
+            for column in &stmt.cluster_by {
+                let index = stmt
+                    .columns
+                    .iter()
+                    .position(|c| c.name.value.eq_ignore_ascii_case(&column.value))
+                    .ok_or_else(|| Error::ColumnNotFound(column.value.to_string()))?;
+                if key.contains(&index) {
+                    return Err(Error::Parse(format!(
+                        "CLUSTER BY names column '{}' twice",
+                        column.value
+                    )));
+                }
+                // The key orders rows, so every column of it must order
+                let data_type = self.parse_data_type(&stmt.columns[index].data_type)?;
+                if matches!(data_type, DataType::Json | DataType::Vector) {
+                    return Err(Error::Parse(format!(
+                        "CLUSTER BY column '{}' has type {:?}, which has no order",
+                        column.value, data_type
+                    )));
+                }
+                key.push(index);
+            }
+            schema_builder = schema_builder.cluster_by(key);
+        }
+
         let schema = schema_builder.build();
 
         // Collect FK columns that need auto-created indexes (skip PK and UNIQUE columns)
