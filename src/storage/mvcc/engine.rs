@@ -509,6 +509,9 @@ pub struct MVCCEngine {
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
     compaction_running: Arc<AtomicBool>,
+    /// Held across a DDL statement's schema change and its WAL record, so
+    /// the log replays in the order the changes were applied
+    ddl_serial: parking_lot::Mutex<()>,
     /// Global epoch counter for volume eviction. Incremented each checkpoint
     /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
     #[cfg(not(target_arch = "wasm32"))]
@@ -606,6 +609,7 @@ impl MVCCEngine {
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
             compaction_running: Arc::new(AtomicBool::new(false)),
+            ddl_serial: parking_lot::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             eviction_epoch: AtomicU64::new(0),
         }
@@ -3611,6 +3615,13 @@ impl MVCCEngine {
         self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
+    }
+
+    /// Serializes a DDL statement's schema change with its WAL record
+    /// against other DDL, so replay applies the changes in the order they
+    /// were made
+    pub fn ddl_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.ddl_serial.lock()
     }
 
     /// Order a table's sealed rows by `key` from the next seal on; the

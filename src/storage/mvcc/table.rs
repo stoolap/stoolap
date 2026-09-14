@@ -2054,9 +2054,10 @@ impl Table for MVCCTable {
         default_expr: Option<String>,
         default_value: Option<Value>,
     ) -> Result<()> {
-        // Create a SchemaColumn and add to both version store and cached schema
-        // Get the next column ID
-        let next_id = self.cached_schema.columns.len();
+        // The version store's schema is the truth: the new column's id
+        // comes from it, and the cached copy follows it whole
+        let mut schema_guard = self.version_store.schema_mut();
+        let next_id = schema_guard.columns.len();
         let column = SchemaColumn::with_default_value(
             next_id,
             name,
@@ -2068,21 +2069,15 @@ impl Table for MVCCTable {
             default_value,
             None, // check_expr
         );
-        {
-            let mut schema_guard = self.version_store.schema_mut();
-            CompactArc::make_mut(&mut *schema_guard).add_column(column.clone())?;
-        }
-        CompactArc::make_mut(&mut self.cached_schema).add_column(column)?;
+        CompactArc::make_mut(&mut *schema_guard).add_column(column)?;
+        self.cached_schema = CompactArc::clone(&schema_guard);
         Ok(())
     }
 
     fn drop_column(&mut self, name: &str) -> Result<()> {
-        // Remove column from both version store and cached schema
-        {
-            let mut schema_guard = self.version_store.schema_mut();
-            CompactArc::make_mut(&mut *schema_guard).remove_column(name)?;
-        }
-        CompactArc::make_mut(&mut self.cached_schema).remove_column(name)?;
+        let mut schema_guard = self.version_store.schema_mut();
+        CompactArc::make_mut(&mut *schema_guard).remove_column(name)?;
+        self.cached_schema = CompactArc::clone(&schema_guard);
         Ok(())
     }
 
@@ -4157,30 +4152,22 @@ impl Table for MVCCTable {
     }
 
     fn rename_column(&mut self, old_name: &str, new_name: &str) -> Result<()> {
-        // Rename column in both version store and cached schema
-        {
-            let mut schema_guard = self.version_store.schema_mut();
-            CompactArc::make_mut(&mut *schema_guard).rename_column(old_name, new_name)?;
-        }
-        CompactArc::make_mut(&mut self.cached_schema).rename_column(old_name, new_name)?;
+        // The version store's schema is the truth; the cached copy follows
+        // it whole, since another statement may have changed it meanwhile
+        let mut schema_guard = self.version_store.schema_mut();
+        CompactArc::make_mut(&mut *schema_guard).rename_column(old_name, new_name)?;
+        self.cached_schema = CompactArc::clone(&schema_guard);
         Ok(())
     }
 
     fn modify_column(&mut self, name: &str, column_type: DataType, nullable: bool) -> Result<()> {
-        // Modify column in both version store and cached schema
-        {
-            let mut schema_guard = self.version_store.schema_mut();
-            CompactArc::make_mut(&mut *schema_guard).modify_column(
-                name,
-                Some(column_type),
-                Some(nullable),
-            )?;
-        }
-        CompactArc::make_mut(&mut self.cached_schema).modify_column(
+        let mut schema_guard = self.version_store.schema_mut();
+        CompactArc::make_mut(&mut *schema_guard).modify_column(
             name,
             Some(column_type),
             Some(nullable),
         )?;
+        self.cached_schema = CompactArc::clone(&schema_guard);
         Ok(())
     }
 

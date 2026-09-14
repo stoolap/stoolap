@@ -674,3 +674,84 @@ fn alter_table_cluster_by_checks_its_columns() {
         vec![1, 0]
     );
 }
+
+#[test]
+fn a_retained_table_handle_follows_a_key_change_made_elsewhere() {
+    let db = Database::open("memory://cluster_by_retained_handle").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER) CLUSTER BY (a)",
+        (),
+    )
+    .unwrap();
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let mut table = tx.get_table("t").unwrap();
+    // The key moves to b while the handle still remembers a
+    db.engine().set_cluster_key("t", vec![2]).unwrap();
+    // a is free now: the change must go through and both copies agree
+    // (the engine's cache is the executor's to refresh, so it is asked to)
+    table.modify_column("a", DataType::Json, true).unwrap();
+    db.engine().refresh_schema_cache("t").unwrap();
+    let live = db.engine().get_table_schema("t").unwrap();
+    assert_eq!(live.columns[1].data_type, DataType::Json);
+    assert_eq!(table.schema().columns[1].data_type, DataType::Json);
+    assert_eq!(table.schema().cluster_key, vec![2]);
+    table.drop_column("a").unwrap();
+    db.engine().refresh_schema_cache("t").unwrap();
+    let live = db.engine().get_table_schema("t").unwrap();
+    assert!(live.get_column_index("a").is_none());
+    assert_eq!(
+        live.cluster_key,
+        vec![1],
+        "the key did not follow the dropped column"
+    );
+    assert_eq!(table.schema().cluster_key, vec![1]);
+    // b is the key now: the handle refuses to make it JSON
+    assert!(table.modify_column("b", DataType::Json, true).is_err());
+    tx.rollback().unwrap();
+}
+
+#[test]
+fn concurrent_alters_replay_in_the_order_they_were_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    let expected = {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER) CLUSTER BY (a)",
+            (),
+        )
+        .unwrap();
+        let db1 = db.clone();
+        let db2 = db.clone();
+        let keys = std::thread::spawn(move || {
+            for round in 0..40 {
+                let key = if round % 2 == 0 { "(b)" } else { "(c)" };
+                db1.execute(&format!("ALTER TABLE t CLUSTER BY {key}"), ())
+                    .unwrap();
+            }
+        });
+        let columns = std::thread::spawn(move || {
+            for round in 0..40 {
+                let sql = if round % 2 == 0 {
+                    "ALTER TABLE t ADD COLUMN x INTEGER"
+                } else {
+                    "ALTER TABLE t DROP COLUMN x"
+                };
+                db2.execute(sql, ()).unwrap();
+            }
+        });
+        keys.join().unwrap();
+        columns.join().unwrap();
+        let schema = db.engine().get_table_schema("t").unwrap();
+        let names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        (names, schema.cluster_key.clone())
+    };
+    let db = Database::open(&dsn).unwrap();
+    let schema = db.engine().get_table_schema("t").unwrap();
+    let names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(
+        (names, schema.cluster_key.clone()),
+        expected,
+        "the replayed schema differs from the one the statements left"
+    );
+}

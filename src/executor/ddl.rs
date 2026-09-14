@@ -958,6 +958,10 @@ impl Executor {
             return Err(Error::TableNotFound(table_name.to_string()));
         }
 
+        // One ALTER at a time, from its schema change to its WAL record, so
+        // the log replays the changes in the order they were made
+        let _ddl = self.engine.ddl_guard();
+
         // Get the table for modifications
         let mut tx = self.engine.begin_transaction()?;
         let mut table = tx.get_table(table_name)?;
