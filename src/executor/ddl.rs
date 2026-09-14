@@ -1041,13 +1041,14 @@ impl Executor {
                     // Refresh schema cache FIRST so invalidate_mappings sees the post-drop schema
                     self.engine.refresh_schema_cache(table_name)?;
 
+                    // Record ALTER TABLE DROP COLUMN to WAL for persistence,
+                    // before the manifest takes the drop with its log position
+                    self.engine
+                        .record_alter_table_drop_column(table_name, &col_name.value)?;
+
                     // Record column drop in manifest and recompute cold volume mappings
                     self.engine
                         .propagate_column_drop(table_name, &col_name.value);
-
-                    // Record ALTER TABLE DROP COLUMN to WAL for persistence
-                    self.engine
-                        .record_alter_table_drop_column(table_name, &col_name.value)?;
                 } else {
                     return Err(Error::InvalidArgument(
                         "DROP COLUMN requires column name".to_string(),
@@ -1061,19 +1062,20 @@ impl Executor {
                     // Refresh schema cache FIRST so invalidate_mappings sees the renamed schema
                     self.engine.refresh_schema_cache(table_name)?;
 
+                    // Record ALTER TABLE RENAME COLUMN to WAL for persistence,
+                    // before the manifest takes the rename with its log position
+                    self.engine.record_alter_table_rename_column(
+                        table_name,
+                        &old_name.value,
+                        &new_name.value,
+                    )?;
+
                     // Propagate rename alias to cold volumes
                     self.engine.propagate_column_alias(
                         table_name,
                         &new_name.value,
                         &old_name.value,
                     );
-
-                    // Record ALTER TABLE RENAME COLUMN to WAL for persistence
-                    self.engine.record_alter_table_rename_column(
-                        table_name,
-                        &old_name.value,
-                        &new_name.value,
-                    )?;
                 }
                 _ => {
                     return Err(Error::InvalidArgument(

@@ -550,3 +550,65 @@ fn renames_survive_a_full_checkpoint_and_a_reopen_through_the_manifest_alone() {
         assert_eq!(rows, 1);
     }
 }
+
+/// A checkpoint that runs while a rename statement is in progress seals
+/// whatever is sealable and writes the manifest out only once the
+/// statement is complete, under the DDL guard, so the manifest never
+/// holds the rename without its log position or the position without the
+/// rename, whichever way the seal and the statement interleave
+#[test]
+fn a_checkpoint_during_a_rename_statement_persists_the_whole_statement_or_none() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 1)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.execute("INSERT INTO t VALUES (2, 2)", ()).unwrap();
+        // The statement's steps, as the executor runs them, under the guard
+        // it holds; a checkpoint started meanwhile seals row 2 before or
+        // after the rename and waits for the guard to write the manifest
+        let ddl = db.engine().ddl_guard();
+        let checkpointer = db.clone();
+        let checkpoint = std::thread::spawn(move || {
+            checkpointer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        });
+        {
+            let txn = db.engine().begin_transaction().unwrap();
+            let mut table = txn.get_table("t").unwrap();
+            table.rename_column("a", "b").unwrap();
+        }
+        db.engine().refresh_schema_cache("t").unwrap();
+        db.engine()
+            .record_alter_table_rename_column("t", "a", "b")
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        db.engine().propagate_column_alias("t", "b", "a");
+        drop(ddl);
+        checkpoint.join().unwrap();
+        db.execute("INSERT INTO t VALUES (3, 3)", ()).unwrap();
+        for id in 1..=3 {
+            assert_eq!(
+                values(&db, &format!("SELECT id, b FROM t WHERE id = {id}")),
+                vec![Some(id), Some(id)],
+                "row {id} live"
+            );
+        }
+    }
+    for _ in 0..2 {
+        let db = Database::open(&dsn).unwrap();
+        for id in 1..=3 {
+            assert_eq!(
+                values(&db, &format!("SELECT id, b FROM t WHERE id = {id}")),
+                vec![Some(id), Some(id)],
+                "row {id} after a reopen"
+            );
+        }
+    }
+}

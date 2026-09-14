@@ -2994,11 +2994,9 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower, schema);
+                self.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
-
-        // Increment schema epoch for cache invalidation
-        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -3061,11 +3059,9 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower, schema);
+                self.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
-
-        // Increment schema epoch for cache invalidation
-        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -3093,10 +3089,10 @@ impl MVCCEngine {
         // Update the engine's schema cache
         let mut schemas = self.schemas.write().unwrap();
         schemas.insert(table_name_lower, vs_schema);
-        drop(schemas);
-
-        // Bump schema epoch so compiled fast paths detect the change
         self.schema_epoch.fetch_add(1, Ordering::Release);
+        // The epoch moves under the same lock the schema does, so a reader
+        // holding it sees the two together
+        drop(schemas);
 
         Ok(())
     }
@@ -3181,8 +3177,15 @@ impl MVCCEngine {
         let mgr = self.get_or_create_segment_manager(table_name);
         let (min_id, max_id) = volume.id_bounds().unwrap_or((0, 0));
         let row_count = volume.meta.row_count;
-        // None = identity mapping (volume was just built from current schema).
-        // Load paths that may have schema mismatch pass Some(schema).
+        // The mapping is computed against the schema current now: a volume
+        // built from an older schema, sealed under that schema's version,
+        // resolves through the changes made since, from its first read
+        let schema = self
+            .schemas
+            .read()
+            .unwrap()
+            .get(&table_name.to_lowercase())
+            .cloned();
         mgr.register_segment(
             seg_id,
             volume,
@@ -3196,7 +3199,7 @@ impl MVCCEngine {
                 seal_seq,
                 schema_version,
             },
-            None,
+            schema.as_deref(),
         );
     }
 
@@ -3543,11 +3546,9 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower, schema);
+                self.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
-
-        // Increment schema epoch for cache invalidation
-        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         // Record the drop in the segment manifest so cold volume mappings
         // mask stale data. Same as the live DDL path in ddl.rs. Without this,
@@ -3621,13 +3622,12 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower.clone(), schema);
+                self.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
 
         // Increment schema epoch for cache invalidation, before the rename
         // is recorded under it, as the SQL path does
-        self.schema_epoch.fetch_add(1, Ordering::Release);
-
         // Propagate rename to cold volumes (persists in manifest) and recompute mappings
         {
             let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
@@ -3686,6 +3686,7 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower.clone(), schema);
+                self.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
 
@@ -3695,28 +3696,25 @@ impl MVCCEngine {
             mgr.request_recluster();
         }
 
-        self.schema_epoch.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
     /// Record a column drop so old cold volumes don't leak stale data.
     pub fn propagate_column_drop(&self, table_name: &str, col_name: &str) {
-        self.propagate_column_drop_inner(table_name, col_name, None);
+        self.propagate_column_drop_inner(table_name, col_name, self.recorded_ddl_lsn());
     }
 
-    fn propagate_column_drop_inner(
-        &self,
-        table_name: &str,
-        col_name: &str,
-        replayed_lsn: Option<u64>,
-    ) {
+    /// `ddl_lsn` is the log position of the change's record: a statement's
+    /// own, just written, or a replayed one, which the manifest may hold
+    /// already and then records nothing for
+    fn propagate_column_drop_inner(&self, table_name: &str, col_name: &str, ddl_lsn: Option<u64>) {
         let table_name_lower = table_name.to_lowercase();
         let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
         let current_epoch = self.schema_epoch.load(Ordering::Acquire);
         if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
-            let held_already = replayed_lsn.is_some_and(|lsn| lsn <= mgr.ddl_recorded_lsn());
+            let held_already = ddl_lsn.is_some_and(|lsn| lsn <= mgr.ddl_recorded_lsn());
             if !held_already {
-                mgr.record_column_drop(col_name, current_epoch, replayed_lsn);
+                mgr.record_column_drop(col_name, current_epoch, ddl_lsn);
             }
             if let Some(ref s) = schema {
                 mgr.invalidate_mappings(s);
@@ -3724,33 +3722,32 @@ impl MVCCEngine {
         }
     }
 
-    /// The log position the statement's record took, noted on the table's
-    /// manifest so a replay of the same record does not add it again
-    fn note_ddl_recorded(&self, table_name: &str) {
-        let Some(pm) = self.persistence.as_ref() else {
-            return;
-        };
-        if !pm.is_enabled() {
-            return;
-        }
-        let table_name_lower = table_name.to_lowercase();
-        if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
-            mgr.note_ddl_lsn(pm.current_lsn());
+    /// The log position the last record took, when the log is on: a
+    /// statement records itself before it propagates, so the manifest
+    /// takes the change and the position it reaches in one write
+    fn recorded_ddl_lsn(&self) -> Option<u64> {
+        match self.persistence.as_ref() {
+            Some(pm) if pm.is_enabled() => Some(pm.current_lsn()),
+            _ => None,
         }
     }
 
     /// Record a column rename and propagate alias to all cold volumes.
     /// Persists in the manifest so aliases survive restart.
     pub fn propagate_column_alias(&self, table_name: &str, new_name: &str, old_name: &str) {
+        let ddl_lsn = self.recorded_ddl_lsn();
         let table_name_lower = table_name.to_lowercase();
         let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
         if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
-            mgr.record_column_rename(
-                old_name,
-                new_name,
-                self.schema_epoch.load(Ordering::Acquire),
-                None,
-            );
+            let held_already = ddl_lsn.is_some_and(|lsn| lsn <= mgr.ddl_recorded_lsn());
+            if !held_already {
+                mgr.record_column_rename(
+                    old_name,
+                    new_name,
+                    self.schema_epoch.load(Ordering::Acquire),
+                    ddl_lsn,
+                );
+            }
             if let Some(ref s) = schema {
                 mgr.invalidate_mappings(s);
             }
@@ -3806,11 +3803,9 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower, schema);
+                self.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
-
-        // Increment schema epoch for cache invalidation
-        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -3867,11 +3862,9 @@ impl MVCCEngine {
             if let Some(schema) = vs_schema {
                 let mut schemas = self.schemas.write().unwrap();
                 schemas.insert(table_name_lower, schema);
+                self.schema_epoch.fetch_add(1, Ordering::Release);
             }
         }
-
-        // Increment schema epoch for cache invalidation
-        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }
@@ -5380,6 +5373,10 @@ impl MVCCEngine {
                 if checkpoint_lsn > 0 {
                     mgr.manifest_mut().checkpoint_lsn = checkpoint_lsn;
                 }
+                // Written out under the DDL guard, so the manifest never shows a
+                // statement halfway: its schema change, its log record and its
+                // manifest record go out together or not at all
+                let _ddl = self.ddl_guard();
                 if let Err(e) = mgr.persist_manifest_only() {
                     eprintln!(
                         "Warning: Failed to persist manifest for {}: {}",
@@ -5881,6 +5878,10 @@ impl MVCCEngine {
                 mgr.remove_tombstones_matching_snapshot(&applied_tombstones, &seen);
 
                 // Persist manifest BEFORE deleting files (same safety as non-empty path).
+                // Written out under the DDL guard, so the manifest never shows a
+                // statement halfway: its schema change, its log record and its
+                // manifest record go out together or not at all
+                let _ddl = self.ddl_guard();
                 if let Err(e) = mgr.persist_manifest_only() {
                     eprintln!(
                         "Warning: Failed to persist manifest after compaction for {}: {}",
@@ -6109,6 +6110,14 @@ impl MVCCEngine {
             // Atomically register all new volumes and remove old segments.
             let new_ids: Vec<u64> = new_volumes.iter().map(|entry| entry.0).collect();
             mgr.replace_segments_atomic_multi(new_volumes, &old_ids);
+            // A schema change during the rewrite: the outputs were built
+            // from the older schema and carry its version, so their
+            // mappings are computed against the schema current now
+            if self.schema_epoch.load(Ordering::Acquire) != schema_version {
+                if let Some(current) = self.schemas.read().unwrap().get(table_name) {
+                    mgr.invalidate_mappings(current);
+                }
+            }
             // The volumes just written are in the key's order
             if !schema.cluster_key.is_empty() {
                 for id in new_ids {
@@ -6121,6 +6130,10 @@ impl MVCCEngine {
             mgr.remove_tombstones_matching_snapshot(&applied_tombstones, &seen);
 
             // CRITICAL: Persist manifest BEFORE deleting old files.
+            // Written out under the DDL guard, so the manifest never shows a
+            // statement halfway: its schema change, its log record and its
+            // manifest record go out together or not at all
+            let _ddl = self.ddl_guard();
             if let Err(e) = mgr.persist_manifest_only() {
                 eprintln!(
                     "Warning: Failed to persist manifest after compaction for {}: {}",
@@ -6791,9 +6804,7 @@ impl Engine for MVCCEngine {
         data.extend_from_slice(&(column_name.len() as u16).to_le_bytes());
         data.extend_from_slice(column_name.as_bytes());
 
-        self.record_ddl(table_name, WALOperationType::AlterTable, &data)?;
-        self.note_ddl_recorded(table_name);
-        Ok(())
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
 
     fn record_alter_table_rename_column(
@@ -6823,9 +6834,7 @@ impl Engine for MVCCEngine {
         data.extend_from_slice(&(new_column_name.len() as u16).to_le_bytes());
         data.extend_from_slice(new_column_name.as_bytes());
 
-        self.record_ddl(table_name, WALOperationType::AlterTable, &data)?;
-        self.note_ddl_recorded(table_name);
-        Ok(())
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
 
     fn record_alter_table_modify_column(
