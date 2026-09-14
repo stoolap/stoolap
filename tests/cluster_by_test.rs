@@ -755,3 +755,32 @@ fn concurrent_alters_replay_in_the_order_they_were_applied() {
         "the replayed schema differs from the one the statements left"
     );
 }
+
+/// A checkpoint re-records every table's CREATE after the point it
+/// truncates the log to. An ALTER landing between the checkpoint's read
+/// of the catalog and its records would replay before the CREATE that
+/// carries the older key and be refused, so the checkpoint takes the DDL
+/// guard for that stretch: while a statement holds it, the checkpoint
+/// waits
+#[test]
+fn a_checkpoint_waits_for_the_ddl_guard_before_re_recording_the_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER) CLUSTER BY (a)",
+        (),
+    )
+    .unwrap();
+    let held = db.engine().ddl_guard();
+    let checkpointer = db.clone();
+    let checkpoint = std::thread::spawn(move || {
+        checkpointer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        !checkpoint.is_finished(),
+        "the checkpoint re-recorded the catalog while a DDL statement held the guard"
+    );
+    drop(held);
+    checkpoint.join().unwrap();
+}

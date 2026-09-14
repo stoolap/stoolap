@@ -3618,8 +3618,8 @@ impl MVCCEngine {
     }
 
     /// Serializes a DDL statement's schema change with its WAL record
-    /// against other DDL, so replay applies the changes in the order they
-    /// were made
+    /// against other DDL and against a checkpoint's re-recording of the
+    /// catalog, so replay applies the changes in the order they were made
     pub fn ddl_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
         self.ddl_serial.lock()
     }
@@ -5410,6 +5410,10 @@ impl MVCCEngine {
     /// Order matters: CreateTable must come before CreateIndex for the same table,
     /// because index replay needs the version store to exist.
     fn rerecord_ddl_to_wal(&self) -> Result<()> {
+        // One DDL statement at a time between the read of the catalog and
+        // the records written from it: a statement landing in between
+        // would replay before the records that carry the state it changed
+        let _ddl = self.ddl_guard();
         // Collect CreateTable entries and table names in a single schemas lock
         let (table_entries, table_names_for_indexes): (Vec<(String, Vec<u8>)>, Vec<String>) = {
             let schemas = self.schemas.read().unwrap();
