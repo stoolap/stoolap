@@ -1642,13 +1642,14 @@ impl SegmentManager {
         Ok(verdict)
     }
 
-    /// Keep that the volume of `seg_id` was written in `key` order
-    pub fn record_key_order(&self, seg_id: u64, key: &[usize]) {
-        if let Some(columns) = self.volume_key(seg_id, key) {
-            self.key_order_verdicts
-                .lock()
-                .insert(seg_id, (columns, true));
-        }
+    /// Keep that the volume of `seg_id` was written in the order of its own
+    /// `columns`: the physical positions, which the writer knows, not a
+    /// schema key, which the mapping current at the time would resolve
+    /// against a schema the volume may no longer match
+    pub fn record_key_order(&self, seg_id: u64, columns: &[usize]) {
+        self.key_order_verdicts
+            .lock()
+            .insert(seg_id, (columns.to_vec(), true));
     }
 
     /// Drop the verdicts of segments that are gone
@@ -3356,6 +3357,55 @@ mod tests {
         mgr.invalidate_mappings(&widened);
         assert!(mgr.decide_key_order(1, &[2]).unwrap());
         assert!(!mgr.decide_key_order(1, &[2, 1]).unwrap());
+    }
+
+    #[test]
+    fn a_recorded_order_is_kept_by_physical_column_and_read_through_the_mapping() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+        // Built and sealed as (id, d, k, v), k the key at position 2 and in
+        // order; d is dropped afterwards, so the schema's k is at 1 and v at 2
+        let sealed_with = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("d", DataType::Integer, false, false)
+            .column("k", DataType::Integer, false, false)
+            .column("v", DataType::Integer, false, false)
+            .build();
+        let mut builder = super::super::writer::VolumeBuilder::new(&sealed_with);
+        for i in 1..=4i64 {
+            builder.add_row(
+                i,
+                &Row::from_values(vec![
+                    Value::Integer(i),
+                    Value::Integer(0),
+                    Value::Integer(i),
+                    Value::Integer(5 - i),
+                ]),
+            );
+        }
+        let volume = Arc::new(builder.finish().unwrap());
+        let mgr = SegmentManager::new("t", None);
+        mgr.register_segment(1, volume, meta_of(1, 4), Some(&sealed_with));
+        // The drop completes before the writer records the order it wrote:
+        // the schema's positions have moved, the volume's have not
+        let current = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("k", DataType::Integer, false, false)
+            .column("v", DataType::Integer, false, false)
+            .build();
+        mgr.record_column_drop("d", 1, None);
+        mgr.invalidate_mappings(&current);
+        mgr.record_key_order(1, &[2]);
+        assert_eq!(
+            mgr.known_key_order(1, &[1]),
+            Some(true),
+            "k moved to position 1 and is still the recorded ordered column"
+        );
+        assert_eq!(
+            mgr.known_key_order(1, &[2]),
+            None,
+            "v at position 2 was never checked; a record by the old key position would claim it"
+        );
+        assert!(!mgr.decide_key_order(1, &[2]).unwrap());
     }
 
     #[test]

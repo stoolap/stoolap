@@ -6122,7 +6122,10 @@ impl MVCCEngine {
                     schemas.get(table_name).map(|s| &**s),
                 );
             }
-            // The volumes just written are in the key's order
+            // The volumes just written are in the key's order. They were
+            // built in the rewrite schema's column order, so the key's
+            // positions in that schema are their physical columns, whatever
+            // the schema has become since
             if !schema.cluster_key.is_empty() {
                 for id in new_ids {
                     mgr.record_key_order(id, &schema.cluster_key);
