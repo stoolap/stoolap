@@ -5630,19 +5630,20 @@ impl MVCCEngine {
                 // A clustered table rewrites the volumes not in its key
                 // order. A volume is decided once, a cold one loaded to
                 // decide, and a cycle decides at most compact_threshold of
-                // them and selects at most as many for the rewrite, decided
-                // earlier or now, so what a cycle loads and rewrites stays
-                // bounded. The request closes once a cycle finds every
-                // volume in order, none left undecided, unselected or
-                // deferred behind a snapshot
-                let mut reclustering = false;
+                // them and rewrites at most as many beyond the volumes
+                // size or tombstones call for, the ones the closure below
+                // pulls in included, so what a cycle loads and rewrites
+                // stays bounded. The request closes once a cycle finds
+                // every volume in order, none left undecided, unselected
+                // or deferred behind a snapshot
+                let base: Vec<bool> = planned.iter().map(|entry| entry.2).collect();
+                let mut selected: Vec<usize> = Vec::new();
+                let mut all_checked = !deferred;
                 if let Some(request) = recluster_request {
                     let key = &schema.cluster_key;
-                    let mut all_checked = !deferred;
                     if !key.is_empty() {
                         let mut decided = 0usize;
-                        let mut selected = 0usize;
-                        for entry in planned.iter_mut() {
+                        for (position, entry) in planned.iter().enumerate() {
                             if entry.3 {
                                 continue;
                             }
@@ -5660,16 +5661,14 @@ impl MVCCEngine {
                             if in_order {
                                 continue;
                             }
-                            if selected >= compact_threshold {
+                            if selected.len() >= compact_threshold {
                                 all_checked = false;
                                 continue;
                             }
-                            selected += 1;
-                            entry.2 = true;
-                            reclustering = true;
+                            selected.push(position);
                         }
                     }
-                    if key.is_empty() || (all_checked && !reclustering) {
+                    if key.is_empty() {
                         mgr.recluster_done(request);
                     }
                 }
@@ -5679,47 +5678,26 @@ impl MVCCEngine {
                 // member. A volume left between two members that shares a
                 // row with the batch would then win over a newer copy of it
                 // or lose to an older one, so the batch is closed over
-                // overlap: every such volume joins it, and one deferred
-                // behind a snapshot holds the table for this cycle
-                let first = planned.iter().position(|entry| entry.2);
-                let last = planned.iter().rposition(|entry| entry.2);
-                let mut held = false;
-                if let (Some(first), Some(last)) = (first, last) {
-                    if last > first {
-                        let segs = mgr.segments_raw();
-                        let ids_of = |id: u64| -> &[i64] {
+                // overlap, within the limit, and one deferred behind a
+                // snapshot holds the table for this cycle
+                let (held, reduced) = {
+                    let segs = mgr.segments_raw();
+                    close_batch_over_overlap(
+                        &mut planned,
+                        &base,
+                        &mut selected,
+                        compact_threshold,
+                        |id| {
                             segs.get(&id)
                                 .map(|cs| cs.volume.meta.row_ids.as_slice())
                                 .unwrap_or(&[])
-                        };
-                        let mut batch_ids: FxHashSet<i64> = FxHashSet::default();
-                        for entry in &planned[first..=last] {
-                            if entry.2 {
-                                batch_ids.extend(ids_of(entry.0).iter().copied());
-                            }
-                        }
-                        loop {
-                            let mut grew = false;
-                            for entry in planned[first..=last].iter_mut() {
-                                if entry.2 {
-                                    continue;
-                                }
-                                let ids = ids_of(entry.0);
-                                if !ids.iter().any(|id| batch_ids.contains(id)) {
-                                    continue;
-                                }
-                                if entry.3 {
-                                    held = true;
-                                } else {
-                                    entry.2 = true;
-                                    batch_ids.extend(ids.iter().copied());
-                                    grew = true;
-                                }
-                            }
-                            if !grew {
-                                break;
-                            }
-                        }
+                        },
+                    )
+                };
+                let reclustering = !selected.is_empty();
+                if let Some(request) = recluster_request {
+                    if !schema.cluster_key.is_empty() && all_checked && !reduced && !reclustering {
+                        mgr.recluster_done(request);
                     }
                 }
                 if held {
@@ -8193,10 +8171,150 @@ impl TransactionEngineOperations for EngineOperations {
     }
 }
 
+/// Closes a compaction batch over the rows its members share, and keeps
+/// the recluster's share of the batch within `limit`.
+///
+/// `planned` lists the table's volumes in manifest order as (segment id,
+/// row count, rewrite, deferred); `base` says which of them size or
+/// tombstones already call for, and `selected` the positions the
+/// recluster chose, in order. On return the rewrite flag is set for
+/// every member: the base, the selection, and every volume between the
+/// first and last member that shares a row with the batch. While the
+/// members beyond the base exceed `limit`, the selection loses its last
+/// position and the closure is taken again, down to one selection, since
+/// one volume's overlap must be rewritten with it. Returns whether a
+/// deferred volume shares a row with the batch, which holds the table,
+/// and whether the selection was reduced
+fn close_batch_over_overlap<'a>(
+    planned: &mut [(u64, usize, bool, bool)],
+    base: &[bool],
+    selected: &mut Vec<usize>,
+    limit: usize,
+    ids_of: impl Fn(u64) -> &'a [i64],
+) -> (bool, bool) {
+    let mut reduced = false;
+    loop {
+        for (position, entry) in planned.iter_mut().enumerate() {
+            entry.2 = base[position] || selected.contains(&position);
+        }
+        let mut held = false;
+        let first = planned.iter().position(|entry| entry.2);
+        let last = planned.iter().rposition(|entry| entry.2);
+        if let (Some(first), Some(last)) = (first, last) {
+            if last > first {
+                let mut batch_ids: FxHashSet<i64> = FxHashSet::default();
+                for entry in &planned[first..=last] {
+                    if entry.2 {
+                        batch_ids.extend(ids_of(entry.0).iter().copied());
+                    }
+                }
+                loop {
+                    let mut grew = false;
+                    for entry in planned[first..=last].iter_mut() {
+                        if entry.2 {
+                            continue;
+                        }
+                        let ids = ids_of(entry.0);
+                        if !ids.iter().any(|id| batch_ids.contains(id)) {
+                            continue;
+                        }
+                        if entry.3 {
+                            held = true;
+                        } else {
+                            entry.2 = true;
+                            batch_ids.extend(ids.iter().copied());
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+            }
+        }
+        let extra = planned
+            .iter()
+            .enumerate()
+            .filter(|(position, entry)| entry.2 && !base[*position])
+            .count();
+        if extra <= limit || selected.len() <= 1 {
+            return (held, reduced);
+        }
+        selected.pop();
+        reduced = true;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::{DataType, IndexType, Row, SchemaBuilder, Value};
+
+    /// Volumes at positions 0..n with the given row ids; none base, none
+    /// deferred unless said
+    fn batch_of(ids: &[&[i64]]) -> Vec<(u64, usize, bool, bool)> {
+        ids.iter()
+            .enumerate()
+            .map(|(i, rows)| (i as u64 + 1, rows.len(), false, false))
+            .collect()
+    }
+
+    #[test]
+    fn a_closed_batch_stays_within_the_recluster_limit() {
+        let rows: Vec<&[i64]> = vec![&[1, 2], &[2, 3], &[3, 4]];
+        let ids_of = |id: u64| rows[id as usize - 1];
+        // Two selected around an ordered volume that shares rows with both:
+        // the closure would take all three, so the selection drops to one
+        let mut planned = batch_of(&rows);
+        let mut selected = vec![0, 2];
+        let (held, reduced) =
+            close_batch_over_overlap(&mut planned, &[false; 3], &mut selected, 2, ids_of);
+        assert!(!held && reduced);
+        assert_eq!(selected, vec![0]);
+        assert_eq!(
+            planned.iter().map(|e| e.2).collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+        // With room for three the closure takes the middle volume
+        let mut planned = batch_of(&rows);
+        let mut selected = vec![0, 2];
+        let (_, reduced) =
+            close_batch_over_overlap(&mut planned, &[false; 3], &mut selected, 3, ids_of);
+        assert!(!reduced);
+        assert!(planned.iter().all(|e| e.2));
+        // One selection keeps its overlap whatever the limit
+        let rows: Vec<&[i64]> = vec![&[1], &[1, 2], &[2, 3], &[3]];
+        let ids_of = |id: u64| rows[id as usize - 1];
+        let mut planned = batch_of(&rows);
+        planned[3].2 = true;
+        let mut selected = vec![0];
+        let (_, reduced) = close_batch_over_overlap(
+            &mut planned,
+            &[false, false, false, true],
+            &mut selected,
+            2,
+            ids_of,
+        );
+        assert!(!reduced);
+        assert!(planned.iter().all(|e| e.2));
+    }
+
+    #[test]
+    fn a_deferred_volume_sharing_a_row_with_the_batch_holds_it() {
+        let rows: Vec<&[i64]> = vec![&[1], &[1, 2], &[5], &[5, 6]];
+        let ids_of = |id: u64| rows[id as usize - 1];
+        let mut planned = batch_of(&rows);
+        planned[1].3 = true;
+        let mut selected = vec![0, 3];
+        let (held, reduced) =
+            close_batch_over_overlap(&mut planned, &[false; 4], &mut selected, 3, ids_of);
+        assert!(held && !reduced);
+        assert!(!planned[1].2, "a deferred volume joined the batch");
+        assert!(
+            planned[2].2,
+            "the volume sharing a row with a member was left out"
+        );
+    }
 
     #[test]
     fn test_engine_creation() {
