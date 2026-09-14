@@ -1836,6 +1836,28 @@ impl ColumnMapping {
     }
 }
 
+/// The volume column a schema column's name came from, following the
+/// rename records back until a name the volume holds: a column renamed
+/// more than once since the seal is reached through every step. None
+/// when no record leads to the volume
+fn renamed_source(
+    name: &str,
+    column_renames: &[(crate::common::SmartString, crate::common::SmartString)],
+    volume: &FrozenVolume,
+) -> Option<usize> {
+    let mut name = name;
+    for _ in 0..=column_renames.len() {
+        let (old, _) = column_renames
+            .iter()
+            .find(|(_, new)| new.as_str() == name)?;
+        if let Some(idx) = volume.column_index(old.as_str()) {
+            return Some(idx);
+        }
+        name = old.as_str();
+    }
+    None
+}
+
 /// Compute column mapping from current schema to a frozen volume.
 /// Handles renames (via column_renames fallback) and drops.
 /// `volume_schema_version` is the schema epoch when the volume was created.
@@ -1860,10 +1882,7 @@ pub fn compute_column_mapping_with_drops(
         // Try rename fallback FIRST (higher priority: a renamed column's
         // old physical slot belongs to the renamed column, not a new column
         // that happens to reuse the old name).
-        let vol_idx = column_renames
-            .iter()
-            .find(|(_, new)| new.as_str() == col.name_lower)
-            .and_then(|(old, _)| volume.column_index(old.as_str()))
+        let vol_idx = renamed_source(&col.name_lower, column_renames, volume)
             .or_else(|| volume.column_index(&col.name_lower));
 
         if let Some(vol_idx) = vol_idx {

@@ -1058,15 +1058,15 @@ impl Executor {
                 (Some(old_name), Some(new_name)) => {
                     table.rename_column(&old_name.value, &new_name.value)?;
 
+                    // Refresh schema cache FIRST so invalidate_mappings sees the renamed schema
+                    self.engine.refresh_schema_cache(table_name)?;
+
                     // Propagate rename alias to cold volumes
                     self.engine.propagate_column_alias(
                         table_name,
                         &new_name.value,
                         &old_name.value,
                     );
-
-                    // Refresh engine's schema cache from version store
-                    self.engine.refresh_schema_cache(table_name)?;
 
                     // Record ALTER TABLE RENAME COLUMN to WAL for persistence
                     self.engine.record_alter_table_rename_column(

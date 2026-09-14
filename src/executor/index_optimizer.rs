@@ -115,6 +115,11 @@ impl Executor {
             _ => return Ok(None),
         };
 
+        // The index knows nothing of this transaction's own writes
+        if table.has_local_changes() {
+            return Ok(None);
+        }
+
         // Try to get value from index
         let value = if func.function == "MIN" {
             table.get_index_min_value(&column_name)
