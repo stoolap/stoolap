@@ -232,6 +232,12 @@ pub trait Engine: Send + Sync {
     }
 
     /// Record ALTER TABLE MODIFY COLUMN operation to WAL for persistence
+    /// Record ALTER TABLE ... CLUSTER BY, the key as column indices
+    fn record_alter_table_cluster_by(&self, table_name: &str, key: &[usize]) -> Result<()> {
+        let _ = (table_name, key);
+        Ok(())
+    }
+
     fn record_alter_table_modify_column(
         &self,
         table_name: &str,

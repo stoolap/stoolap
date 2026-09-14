@@ -509,6 +509,9 @@ pub struct MVCCEngine {
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
     compaction_running: Arc<AtomicBool>,
+    /// Held across a DDL statement's schema change and its WAL record, so
+    /// the log replays in the order the changes were applied
+    ddl_serial: parking_lot::Mutex<()>,
     /// Global epoch counter for volume eviction. Incremented each checkpoint
     /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
     #[cfg(not(target_arch = "wasm32"))]
@@ -606,6 +609,7 @@ impl MVCCEngine {
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
             compaction_running: Arc::new(AtomicBool::new(false)),
+            ddl_serial: parking_lot::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             eviction_epoch: AtomicU64::new(0),
         }
@@ -2579,6 +2583,27 @@ impl MVCCEngine {
                 // Apply the RENAME TABLE using engine method
                 self.rename_table(&table_name, &new_table_name)?;
             }
+            6 => {
+                // ClusterBy: count (u16) then column indices (u16 each)
+                if pos + 2 > data.len() {
+                    return Err(Error::internal(
+                        "invalid ALTER TABLE data: missing CLUSTER BY column count",
+                    ));
+                }
+                let count = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+                pos += 2;
+                let mut key = Vec::with_capacity(count);
+                for _ in 0..count {
+                    if pos + 2 > data.len() {
+                        return Err(Error::internal(
+                            "invalid ALTER TABLE data: truncated CLUSTER BY columns",
+                        ));
+                    }
+                    key.push(u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize);
+                    pos += 2;
+                }
+                self.set_cluster_key(&table_name, key)?;
+            }
             _ => {
                 return Err(Error::internal(format!(
                     "unknown ALTER TABLE operation type: {}",
@@ -3592,6 +3617,49 @@ impl MVCCEngine {
         Ok(())
     }
 
+    /// Serializes a DDL statement's schema change with its WAL record
+    /// against other DDL and against a checkpoint's re-recording of the
+    /// catalog, so replay applies the changes in the order they were made
+    pub fn ddl_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.ddl_serial.lock()
+    }
+
+    /// Order a table's sealed rows by `key` from the next seal on; the
+    /// volumes already sealed keep their order and are read all the same
+    pub fn set_cluster_key(&self, table_name: &str, key: Vec<usize>) -> Result<()> {
+        if !self.is_open() {
+            return Err(Error::EngineNotOpen);
+        }
+        let table_name_lower = table_name.to_lowercase();
+
+        // The version store schema is the source of truth; it validates the key
+        {
+            let stores = self.version_stores.read().unwrap();
+            let store = stores
+                .get(&table_name_lower)
+                .ok_or_else(|| Error::TableNotFound(table_name_lower.to_string()))?;
+            let mut vs_schema_guard = store.schema_mut();
+            CompactArc::make_mut(&mut *vs_schema_guard).set_cluster_key(key)?;
+        }
+
+        // Sync engine schema cache from version store
+        {
+            let vs_schema = {
+                let stores = self.version_stores.read().unwrap();
+                stores
+                    .get(&table_name_lower)
+                    .map(|store| store.schema().clone())
+            };
+            if let Some(schema) = vs_schema {
+                let mut schemas = self.schemas.write().unwrap();
+                schemas.insert(table_name_lower.clone(), schema);
+            }
+        }
+
+        self.schema_epoch.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
     /// Record a column drop so old cold volumes don't leak stale data.
     pub fn propagate_column_drop(&self, table_name: &str, col_name: &str) {
         let table_name_lower = table_name.to_lowercase();
@@ -3872,37 +3940,7 @@ impl MVCCEngine {
             }
         }
 
-        Self::validate_cluster_key(schema)
-    }
-
-    /// The clustering key names existing columns, each once, and each with
-    /// an order; checked wherever a schema enters or changes, since a key
-    /// that fails this is refused again when the schema is read back
-    pub(crate) fn validate_cluster_key(schema: &Schema) -> Result<()> {
-        let mut seen = FxHashSet::default();
-        for &column in &schema.cluster_key {
-            let Some(col) = schema.columns.get(column) else {
-                return Err(Error::internal(format!(
-                    "CLUSTER BY names column {} of table '{}', which has {} columns",
-                    column,
-                    schema.table_name,
-                    schema.columns.len()
-                )));
-            };
-            if !seen.insert(column) {
-                return Err(Error::Parse(format!(
-                    "CLUSTER BY names column '{}' twice",
-                    col.name
-                )));
-            }
-            if matches!(col.data_type, DataType::Json | DataType::Vector) {
-                return Err(Error::Parse(format!(
-                    "CLUSTER BY column '{}' has type {:?}, which has no order",
-                    col.name, col.data_type
-                )));
-            }
-        }
-        Ok(())
+        schema.validate_cluster_key()
     }
 
     /// Creates an engine operations wrapper for a transaction
@@ -5372,6 +5410,10 @@ impl MVCCEngine {
     /// Order matters: CreateTable must come before CreateIndex for the same table,
     /// because index replay needs the version store to exist.
     fn rerecord_ddl_to_wal(&self) -> Result<()> {
+        // One DDL statement at a time between the read of the catalog and
+        // the records written from it: a statement landing in between
+        // would replay before the records that carry the state it changed
+        let _ddl = self.ddl_guard();
         // Collect CreateTable entries and table names in a single schemas lock
         let (table_entries, table_names_for_indexes): (Vec<(String, Vec<u8>)>, Vec<String>) = {
             let schemas = self.schemas.read().unwrap();
@@ -6654,6 +6696,20 @@ impl Engine for MVCCEngine {
         // Nullable
         data.push(if nullable { 1 } else { 0 });
 
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
+    }
+
+    fn record_alter_table_cluster_by(&self, table_name: &str, key: &[usize]) -> Result<()> {
+        // Serialize: operation_type(1) + table_name_len(2) + table_name
+        //          + column_count(2) + column_index(2) each
+        let mut data = Vec::new();
+        data.push(6u8); // Operation type: ClusterBy = 6
+        data.extend_from_slice(&(table_name.len() as u16).to_le_bytes());
+        data.extend_from_slice(table_name.as_bytes());
+        data.extend_from_slice(&(key.len() as u16).to_le_bytes());
+        for &column in key {
+            data.extend_from_slice(&(column as u16).to_le_bytes());
+        }
         self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
 

@@ -149,6 +149,7 @@ impl Executor {
         stmt: &CreateTableStatement,
         ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _ddl = self.engine.ddl_guard();
         let table_name = &stmt.table_name.value;
 
         // Check if table already exists
@@ -630,6 +631,7 @@ impl Executor {
         stmt: &DropTableStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _ddl = self.engine.ddl_guard();
         let table_name = &stmt.table_name.value;
 
         // Check if table exists
@@ -678,6 +680,7 @@ impl Executor {
         stmt: &CreateIndexStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _ddl = self.engine.ddl_guard();
         let table_name = &stmt.table_name.value;
         let index_name = &stmt.index_name.value;
 
@@ -904,6 +907,7 @@ impl Executor {
         stmt: &DropIndexStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _ddl = self.engine.ddl_guard();
         let index_name = &stmt.index_name.value;
 
         // Get table name if specified
@@ -957,6 +961,10 @@ impl Executor {
         if !self.engine.table_exists(table_name)? {
             return Err(Error::TableNotFound(table_name.to_string()));
         }
+
+        // One ALTER at a time, from its schema change to its WAL record, so
+        // the log replays the changes in the order they were made
+        let _ddl = self.engine.ddl_guard();
 
         // Get the table for modifications
         let mut tx = self.engine.begin_transaction()?;
@@ -1126,6 +1134,24 @@ impl Executor {
                     ));
                 }
             }
+            AlterTableOperation::ClusterBy => {
+                // The key names columns of this table; the schema checks that
+                // each exists, appears once and has an order
+                let key: Vec<usize> = {
+                    let schema = table.schema();
+                    stmt.cluster_by
+                        .iter()
+                        .map(|column| {
+                            schema
+                                .get_column_index(&column.value)
+                                .ok_or_else(|| Error::ColumnNotFound(column.value.to_string()))
+                        })
+                        .collect::<Result<_>>()?
+                };
+                self.engine.set_cluster_key(table_name, key.clone())?;
+                self.engine
+                    .record_alter_table_cluster_by(table_name, &key)?;
+            }
             AlterTableOperation::RenameTable => {
                 if let Some(ref new_name) = stmt.new_table_name {
                     tx.rename_table(table_name, &new_name.value)?;
@@ -1158,6 +1184,7 @@ impl Executor {
         stmt: &CreateViewStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _ddl = self.engine.ddl_guard();
         let view_name = &stmt.view_name.value;
 
         // Check if a table with the same name exists
@@ -1181,6 +1208,7 @@ impl Executor {
         stmt: &DropViewStatement,
         _ctx: &ExecutionContext,
     ) -> Result<Box<dyn QueryResult>> {
+        let _ddl = self.engine.ddl_guard();
         let view_name = &stmt.view_name.value;
 
         // Drop the view (engine handles if_exists logic)

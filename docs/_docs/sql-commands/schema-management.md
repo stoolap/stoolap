@@ -70,7 +70,15 @@ CREATE TABLE ticks (
 
 Queries that filter on a prefix of the key and read a range of the last column touch only the volume row groups that hold those rows, instead of every row group of the table. Rows in the hot buffer are unaffected: the order applies when the checkpoint cycle seals them, and compaction keeps it when it merges volumes.
 
-The key columns must have an order, so `JSON` and `VECTOR` columns cannot be part of it. A key column cannot be dropped with `ALTER TABLE ... DROP COLUMN`; dropping another column keeps the key on the same columns. `SHOW CREATE TABLE` shows the clause, and a snapshot restore or a reopen keeps it. Tables without the clause keep their rows in row id order, as before.
+The key columns must have an order, so `JSON` and `VECTOR` columns cannot be part of it. A key column cannot be dropped with `ALTER TABLE ... DROP COLUMN` or changed to one of those types; dropping another column keeps the key on the same columns. `SHOW CREATE TABLE` shows the clause, and a snapshot restore or a reopen keeps it. Tables without the clause keep their rows in row id order, as before.
+
+An existing table gets a key, or a new one, with `ALTER TABLE`:
+
+```sql
+ALTER TABLE ticks CLUSTER BY (exchange, symbol, time);
+```
+
+The volumes sealed before the change keep their order and stay readable; rows sealed from then on take the key order, and the next compaction that rewrites the older volumes puts them in key order too.
 
 ### Altering Tables
 

@@ -2506,18 +2506,48 @@ impl Parser {
         }
         let table_name = Identifier::new(self.cur_token.clone(), self.cur_token.literal.clone());
 
-        // Parse operation
-        if !self.peek_token_is(TokenType::Keyword) {
+        // Parse operation; CLUSTER is not a reserved word, so it arrives as
+        // an identifier
+        if !self.peek_token_is(TokenType::Keyword)
+            && !self.peek_token.literal.eq_ignore_ascii_case("CLUSTER")
+        {
             self.add_error(
-                "expected ALTER action (ADD, DROP, RENAME) after table name".to_string(),
+                "expected ALTER action (ADD, DROP, RENAME, MODIFY, CLUSTER BY) after table name"
+                    .to_string(),
             );
             return None;
         }
         self.next_token();
 
         let operation_keyword = self.cur_token.literal.to_uppercase();
+        let mut cluster_by = Vec::new();
         let (operation, column_def, column_name, new_column_name, new_table_name) =
             match operation_keyword.as_str() {
+                "CLUSTER" => {
+                    // CLUSTER BY (col, ...)
+                    if !self.peek_token_is_keyword("BY") {
+                        self.add_error(format!("expected BY at {}", self.peek_token.position));
+                        return None;
+                    }
+                    self.next_token();
+                    if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != "(" {
+                        self.add_error(format!("expected '(' at {}", self.cur_token.position));
+                        return None;
+                    }
+                    cluster_by = self.parse_identifier_list();
+                    if cluster_by.is_empty() {
+                        self.add_error(format!(
+                            "expected a column in CLUSTER BY at {}",
+                            self.cur_token.position
+                        ));
+                        return None;
+                    }
+                    if !self.expect_peek(TokenType::Punctuator) || self.cur_token.literal != ")" {
+                        self.add_error(format!("expected ')' at {}", self.cur_token.position));
+                        return None;
+                    }
+                    (AlterTableOperation::ClusterBy, None, None, None, None)
+                }
                 "ADD" => {
                     // Check for optional COLUMN keyword
                     if self.peek_token_is_keyword("COLUMN") {
@@ -2615,7 +2645,7 @@ impl Parser {
                 }
                 _ => {
                     self.add_error(format!(
-                        "expected ADD, DROP, RENAME, or MODIFY at {}",
+                        "expected ADD, DROP, RENAME, MODIFY, or CLUSTER BY at {}",
                         self.cur_token.position
                     ));
                     return None;
@@ -2630,6 +2660,7 @@ impl Parser {
             column_name,
             new_column_name,
             new_table_name,
+            cluster_by,
         })
     }
 

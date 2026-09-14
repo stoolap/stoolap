@@ -564,3 +564,223 @@ fn key_cells_compare_integers_and_floats_exactly() {
         std::cmp::Ordering::Less
     );
 }
+
+#[test]
+fn alter_table_cluster_by_sets_the_key_and_orders_the_next_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?compact_threshold=2", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE ticks (id INTEGER PRIMARY KEY, exchange TEXT NOT NULL, symbol TEXT NOT NULL, time INTEGER NOT NULL, price REAL)",
+            (),
+        )
+        .unwrap();
+        // The first volume is sealed before the key exists: id order
+        insert_ticks(&db, 1_000);
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.execute("ALTER TABLE ticks CLUSTER BY (exchange, symbol, time)", ())
+            .unwrap();
+        let schema = db.engine().get_table_schema("ticks").unwrap();
+        assert_eq!(schema.cluster_key, vec![1, 2, 3]);
+        let shown: String = db
+            .query("SHOW CREATE TABLE ticks", ())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get::<String>(1)
+            .unwrap();
+        assert!(
+            shown.ends_with("CLUSTER BY (exchange, symbol, time)"),
+            "{shown}"
+        );
+        // The next seal is in key order; the earlier volume keeps its order
+        let insert = db
+            .prepare("INSERT INTO ticks VALUES (?, ?, ?, ?, ?)")
+            .unwrap();
+        for id in 1_001..=2_000i64 {
+            let exchange = if id % 2 == 0 { "b" } else { "a" };
+            let symbol = if id % 3 == 0 { "y" } else { "x" };
+            insert
+                .execute((id, exchange, symbol, 3_000 - id, id as f64))
+                .unwrap();
+        }
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let volumes = sealed_volumes(dir.path(), "ticks", &[1, 2, 3]);
+        assert_eq!(volumes.len(), 2);
+        let ordered: Vec<bool> = volumes.iter().map(|v| in_key_order(v)).collect();
+        assert_eq!(
+            ordered,
+            vec![false, true],
+            "one volume before the key, one after"
+        );
+        // A compaction rewrites both in key order
+        for id in 2_001..=3_000i64 {
+            let exchange = if id % 2 == 0 { "b" } else { "a" };
+            let symbol = if id % 3 == 0 { "y" } else { "x" };
+            insert
+                .execute((id, exchange, symbol, 3_000 - id, id as f64))
+                .unwrap();
+        }
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let volumes = sealed_volumes(dir.path(), "ticks", &[1, 2, 3]);
+        assert_eq!(
+            volumes.len(),
+            1,
+            "compaction did not merge the three volumes"
+        );
+        assert!(in_key_order(&volumes[0]));
+        assert_eq!(volumes[0].len(), 3_000);
+        assert_eq!(ids(&db, "SELECT id FROM ticks WHERE id = 1500"), vec![1500]);
+    }
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(
+        db.engine().get_table_schema("ticks").unwrap().cluster_key,
+        vec![1, 2, 3],
+        "the key set by ALTER TABLE did not survive the reopen"
+    );
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM ticks", ()).unwrap();
+    assert_eq!(count, 3_000);
+}
+
+#[test]
+fn alter_table_cluster_by_checks_its_columns() {
+    let db = Database::open("memory://alter_cluster_by_errors").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, doc JSON)",
+        (),
+    )
+    .unwrap();
+    assert!(db.execute("ALTER TABLE t CLUSTER BY (b)", ()).is_err());
+    assert!(db.execute("ALTER TABLE t CLUSTER BY (a, a)", ()).is_err());
+    assert!(db.execute("ALTER TABLE t CLUSTER BY (doc)", ()).is_err());
+    assert!(db.execute("ALTER TABLE t CLUSTER BY ()", ()).is_err());
+    assert!(db
+        .engine()
+        .get_table_schema("t")
+        .unwrap()
+        .cluster_key
+        .is_empty());
+    db.execute("ALTER TABLE t CLUSTER BY (a)", ()).unwrap();
+    assert_eq!(
+        db.engine().get_table_schema("t").unwrap().cluster_key,
+        vec![1]
+    );
+    // A second ALTER replaces the key
+    db.execute("ALTER TABLE t CLUSTER BY (a, id)", ()).unwrap();
+    assert_eq!(
+        db.engine().get_table_schema("t").unwrap().cluster_key,
+        vec![1, 0]
+    );
+}
+
+#[test]
+fn a_retained_table_handle_follows_a_key_change_made_elsewhere() {
+    let db = Database::open("memory://cluster_by_retained_handle").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER) CLUSTER BY (a)",
+        (),
+    )
+    .unwrap();
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let mut table = tx.get_table("t").unwrap();
+    // The key moves to b while the handle still remembers a
+    db.engine().set_cluster_key("t", vec![2]).unwrap();
+    // a is free now: the change must go through and both copies agree
+    // (the engine's cache is the executor's to refresh, so it is asked to)
+    table.modify_column("a", DataType::Json, true).unwrap();
+    db.engine().refresh_schema_cache("t").unwrap();
+    let live = db.engine().get_table_schema("t").unwrap();
+    assert_eq!(live.columns[1].data_type, DataType::Json);
+    assert_eq!(table.schema().columns[1].data_type, DataType::Json);
+    assert_eq!(table.schema().cluster_key, vec![2]);
+    table.drop_column("a").unwrap();
+    db.engine().refresh_schema_cache("t").unwrap();
+    let live = db.engine().get_table_schema("t").unwrap();
+    assert!(live.get_column_index("a").is_none());
+    assert_eq!(
+        live.cluster_key,
+        vec![1],
+        "the key did not follow the dropped column"
+    );
+    assert_eq!(table.schema().cluster_key, vec![1]);
+    // b is the key now: the handle refuses to make it JSON
+    assert!(table.modify_column("b", DataType::Json, true).is_err());
+    tx.rollback().unwrap();
+}
+
+#[test]
+fn concurrent_alters_replay_in_the_order_they_were_applied() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    let expected = {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c INTEGER) CLUSTER BY (a)",
+            (),
+        )
+        .unwrap();
+        let db1 = db.clone();
+        let db2 = db.clone();
+        let keys = std::thread::spawn(move || {
+            for round in 0..40 {
+                let key = if round % 2 == 0 { "(b)" } else { "(c)" };
+                db1.execute(&format!("ALTER TABLE t CLUSTER BY {key}"), ())
+                    .unwrap();
+            }
+        });
+        let columns = std::thread::spawn(move || {
+            for round in 0..40 {
+                let sql = if round % 2 == 0 {
+                    "ALTER TABLE t ADD COLUMN x INTEGER"
+                } else {
+                    "ALTER TABLE t DROP COLUMN x"
+                };
+                db2.execute(sql, ()).unwrap();
+            }
+        });
+        keys.join().unwrap();
+        columns.join().unwrap();
+        let schema = db.engine().get_table_schema("t").unwrap();
+        let names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        (names, schema.cluster_key.clone())
+    };
+    let db = Database::open(&dsn).unwrap();
+    let schema = db.engine().get_table_schema("t").unwrap();
+    let names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(
+        (names, schema.cluster_key.clone()),
+        expected,
+        "the replayed schema differs from the one the statements left"
+    );
+}
+
+/// A checkpoint re-records every table's CREATE after the point it
+/// truncates the log to. An ALTER landing between the checkpoint's read
+/// of the catalog and its records would replay before the CREATE that
+/// carries the older key and be refused, so the checkpoint takes the DDL
+/// guard for that stretch: while a statement holds it, the checkpoint
+/// waits
+#[test]
+fn a_checkpoint_waits_for_the_ddl_guard_before_re_recording_the_catalog() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER) CLUSTER BY (a)",
+        (),
+    )
+    .unwrap();
+    let held = db.engine().ddl_guard();
+    let checkpointer = db.clone();
+    let checkpoint = std::thread::spawn(move || {
+        checkpointer.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        !checkpoint.is_finished(),
+        "the checkpoint re-recorded the catalog while a DDL statement held the guard"
+    );
+    drop(held);
+    checkpoint.join().unwrap();
+}

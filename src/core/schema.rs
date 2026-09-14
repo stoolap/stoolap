@@ -668,6 +668,49 @@ impl Schema {
         Ok(())
     }
 
+    /// The clustering key names existing columns, each once, and each with
+    /// an order; a key that fails this is refused again when the schema is
+    /// read back, so it is checked wherever a schema enters or changes
+    pub fn validate_cluster_key(&self) -> Result<()> {
+        let mut seen = Vec::with_capacity(self.cluster_key.len());
+        for &column in &self.cluster_key {
+            let Some(col) = self.columns.get(column) else {
+                return Err(Error::internal(format!(
+                    "CLUSTER BY names column {} of table '{}', which has {} columns",
+                    column,
+                    self.table_name,
+                    self.columns.len()
+                )));
+            };
+            if seen.contains(&column) {
+                return Err(Error::Parse(format!(
+                    "CLUSTER BY names column '{}' twice",
+                    col.name
+                )));
+            }
+            seen.push(column);
+            if matches!(col.data_type, DataType::Json | DataType::Vector) {
+                return Err(Error::Parse(format!(
+                    "CLUSTER BY column '{}' has type {:?}, which has no order",
+                    col.name, col.data_type
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Order the sealed rows by these columns from the next seal on; the
+    /// volumes already sealed keep their order
+    pub fn set_cluster_key(&mut self, key: Vec<usize>) -> Result<()> {
+        let previous = std::mem::replace(&mut self.cluster_key, key);
+        if let Err(e) = self.validate_cluster_key() {
+            self.cluster_key = previous;
+            return Err(e);
+        }
+        self.mark_updated();
+        Ok(())
+    }
+
     /// Remove a column by name
     pub fn remove_column(&mut self, name: &str) -> Result<SchemaColumn> {
         let idx = self
