@@ -730,6 +730,13 @@ impl Schema {
             .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
 
         if let Some(dt) = data_type {
+            // A column of the clustering key keeps a type with an order
+            if self.cluster_key.contains(&idx) && matches!(dt, DataType::Json | DataType::Vector) {
+                return Err(Error::Parse(format!(
+                    "column '{}' is in the CLUSTER BY key of table '{}' and cannot become {:?}, which has no order",
+                    name, self.table_name, dt
+                )));
+            }
             self.columns[idx].data_type = dt;
         }
         if let Some(n) = nullable {

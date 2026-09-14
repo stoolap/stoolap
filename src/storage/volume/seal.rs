@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::core::{Result, Row, Schema, Value};
 
+use super::column::value_kind;
 use super::io;
 use super::writer::{FrozenVolume, VolumeBuilder};
 
@@ -52,24 +53,9 @@ pub fn seal_rows(schema: &Schema, rows: &[(i64, Row)]) -> Result<FrozenVolume> {
     builder.finish()
 }
 
-/// Where a value sorts among the kinds a key column can hold: NULL, then
-/// booleans, numbers, text, timestamps. A column whose type changed
-/// after some rows were written holds more than one kind, and comparing
-/// across kinds by value is not transitive, so the kind decides first
-fn key_kind(value: &Value) -> u8 {
-    match value {
-        Value::Null(_) => 0,
-        Value::Boolean(_) => 1,
-        Value::Integer(_) | Value::Float(_) => 2,
-        Value::Text(_) => 3,
-        Value::Timestamp(_) => 4,
-        _ => 5,
-    }
-}
-
 /// Orders two values of a clustering key column: by kind, then by value
 fn compare_key_value(a: &Value, b: &Value) -> Ordering {
-    let kinds = key_kind(a).cmp(&key_kind(b));
+    let kinds = value_kind(a).cmp(&value_kind(b));
     if kinds != Ordering::Equal || a.is_null() {
         return kinds;
     }

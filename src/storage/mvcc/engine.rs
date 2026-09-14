@@ -3641,7 +3641,6 @@ impl MVCCEngine {
             if !schema_arc.has_column(column_name) {
                 return Err(Error::ColumnNotFound(column_name.to_string()));
             }
-            Self::check_key_column_type(schema_arc, column_name, data_type)?;
         }
 
         // Update version store schema first (source of truth)
@@ -3702,7 +3701,6 @@ impl MVCCEngine {
             if !schema_arc.has_column(column_name) {
                 return Err(Error::ColumnNotFound(column_name.to_string()));
             }
-            Self::check_key_column_type(schema_arc, column_name, data_type)?;
         }
 
         // Update version store schema first (source of truth)
@@ -3875,24 +3873,6 @@ impl MVCCEngine {
         }
 
         Self::validate_cluster_key(schema)
-    }
-
-    /// A key column keeps a type with an order through MODIFY COLUMN
-    fn check_key_column_type(
-        schema: &Schema,
-        column_name: &str,
-        data_type: DataType,
-    ) -> Result<()> {
-        let in_key = schema
-            .get_column_index(column_name)
-            .is_some_and(|idx| schema.cluster_key.contains(&idx));
-        if in_key && matches!(data_type, DataType::Json | DataType::Vector) {
-            return Err(Error::Parse(format!(
-                "column '{}' is in the CLUSTER BY key of table '{}' and cannot become {:?}, which has no order",
-                column_name, schema.table_name, data_type
-            )));
-        }
-        Ok(())
     }
 
     /// The clustering key names existing columns, each once, and each with
@@ -5781,24 +5761,22 @@ impl MVCCEngine {
                     key_cells.push(cells);
                     key_defaults.push(defaults);
                 }
+                let null = Value::null_unknown();
+                let default_of =
+                    |k: usize, vol_idx: usize| key_defaults[k][vol_idx].as_ref().unwrap_or(&null);
                 let compare_key = |k: usize, a: (usize, usize), b: (usize, usize)| match (
                     key_cells[k][a.0],
                     key_cells[k][b.0],
                 ) {
                     (Some(ca), Some(cb)) => ca.compare_cells(a.1, cb, b.1),
-                    (ca, cb) => {
-                        let null = Value::null_unknown();
-                        let va = ca.map(|c| c.get_value(a.1));
-                        let vb = cb.map(|c| c.get_value(b.1));
-                        crate::storage::volume::seal::compare_key_values(
-                            va.as_ref()
-                                .or(key_defaults[k][a.0].as_ref())
-                                .unwrap_or(&null),
-                            vb.as_ref()
-                                .or(key_defaults[k][b.0].as_ref())
-                                .unwrap_or(&null),
-                        )
-                    }
+                    (Some(ca), None) => ca.compare_cell_with_value(a.1, default_of(k, b.0)),
+                    (None, Some(cb)) => cb
+                        .compare_cell_with_value(b.1, default_of(k, a.0))
+                        .reverse(),
+                    (None, None) => crate::storage::volume::seal::compare_key_values(
+                        default_of(k, a.0),
+                        default_of(k, b.0),
+                    ),
                 };
                 let mut order: Vec<u32> = (0..live_refs.len() as u32).collect();
                 order.sort_unstable_by(|&a, &b| {

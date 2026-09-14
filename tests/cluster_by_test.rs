@@ -486,3 +486,81 @@ fn a_key_column_cannot_be_changed_to_a_type_without_an_order() {
     assert_eq!(schema.cluster_key, vec![1]);
     assert_eq!(schema.columns[1].data_type, DataType::Text);
 }
+
+#[test]
+fn compaction_of_volumes_whose_keys_are_all_null_does_not_panic() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?compact_threshold=2",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT) CLUSTER BY (k)",
+        (),
+    )
+    .unwrap();
+    // Three single-row volumes with a NULL key: their dictionaries are
+    // empty, and the merge compares the NULL cells against each other
+    for id in 1..=3 {
+        db.execute(&format!("INSERT INTO t VALUES ({id}, NULL)"), ())
+            .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    assert_eq!(ids(&db, "SELECT id FROM t ORDER BY id"), vec![1, 2, 3]);
+    let volumes = sealed_volumes(dir.path(), "t", &[1]);
+    assert_eq!(volumes.iter().map(|v| v.len()).sum::<usize>(), 3);
+}
+
+#[test]
+fn a_key_column_cannot_lose_its_order_through_the_table_api() {
+    let db = Database::open("memory://cluster_by_table_api").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER) CLUSTER BY (k)",
+        (),
+    )
+    .unwrap();
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let mut table = tx.get_table("t").unwrap();
+    assert!(
+        table.modify_column("k", DataType::Json, true).is_err(),
+        "the table API turned a key column into JSON"
+    );
+    table.modify_column("k", DataType::Text, true).unwrap();
+    tx.rollback().unwrap();
+}
+
+#[test]
+fn key_cells_compare_integers_and_floats_exactly() {
+    use stoolap::storage::volume::column::ColumnData;
+    let ints = ColumnData::Int64 {
+        values: vec![9_007_199_254_740_993, 3],
+        nulls: vec![false, false],
+    };
+    let floats = ColumnData::Float64 {
+        values: vec![9_007_199_254_740_992.0, 3.0],
+        nulls: vec![false, false],
+    };
+    // 2^53 + 1 is not representable as an f64: a cast would call them equal
+    assert_eq!(
+        ints.compare_cells(0, &floats, 0),
+        std::cmp::Ordering::Greater
+    );
+    assert_eq!(floats.compare_cells(0, &ints, 0), std::cmp::Ordering::Less);
+    assert_eq!(ints.compare_cells(1, &floats, 1), std::cmp::Ordering::Equal);
+    assert_eq!(
+        ints.compare_cell_with_value(0, &Value::Float(9_007_199_254_740_992.0)),
+        std::cmp::Ordering::Greater
+    );
+    // Two NULL text cells are equal without a dictionary to read
+    let nulls = ColumnData::Dictionary {
+        ids: vec![0],
+        dictionary: std::sync::Arc::from(Vec::<stoolap::common::SmartString>::new()),
+        nulls: vec![true],
+    };
+    assert_eq!(nulls.compare_cells(0, &nulls, 0), std::cmp::Ordering::Equal);
+    assert_eq!(
+        nulls.compare_cell_with_value(0, &Value::text("a")),
+        std::cmp::Ordering::Less
+    );
+}
