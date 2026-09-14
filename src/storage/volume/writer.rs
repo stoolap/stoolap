@@ -1232,6 +1232,9 @@ pub struct VolumeMeta {
     pub column_types: Vec<DataType>,
     /// Row IDs for each row (preserves original IDs for index compatibility)
     pub row_ids: Vec<i64>,
+    /// Positions sorted by row id when the ids are not ascending, built on
+    /// first use; None when a binary search over `row_ids` works
+    pub row_order: std::sync::OnceLock<Option<Box<[u32]>>>,
     /// Whether the time/integer columns are sorted (enables binary search)
     pub sorted_columns: Vec<bool>,
     /// Precomputed lowercase column name -> index map for O(1) lookup.
@@ -1248,6 +1251,10 @@ impl VolumeMeta {
         let mut size = 0usize;
         // row_ids: Vec<i64>
         size += self.row_ids.len() * 8;
+        // row_order: one u32 per row when the ids do not ascend
+        if let Some(Some(order)) = self.row_order.get() {
+            size += order.len() * 4;
+        }
         // zone_maps: 2 Values (16 bytes each) + 2 u32 per column
         size += self.zone_maps.len() * (16 + 16 + 8);
         // bloom_filters: Vec<u64> bitsets
@@ -1316,11 +1323,20 @@ pub struct VolumeBuilder {
     stats: VolumeAggregateStats,
     // Row IDs
     row_ids: Vec<i64>,
+    /// The producer orders the rows itself, so ids need not ascend
+    any_row_order: bool,
     // Sort tracking
     last_values: Vec<Option<i64>>,
     sorted: Vec<bool>,
     // Row count
     row_count: usize,
+}
+
+/// Positions of `ids` sorted by id
+pub(crate) fn row_order_of(ids: &[i64]) -> Box<[u32]> {
+    let mut order: Vec<u32> = (0..ids.len() as u32).collect();
+    order.sort_unstable_by_key(|&i| ids[i as usize]);
+    order.into_boxed_slice()
 }
 
 #[derive(Clone, Copy)]
@@ -1419,10 +1435,17 @@ impl VolumeBuilder {
                 .collect(),
             stats: VolumeAggregateStats::new(num_cols),
             row_ids: Vec::new(),
+            any_row_order: false,
             last_values,
             sorted,
             row_count: 0,
         }
+    }
+
+    /// Accept rows in the order the producer chose; lookups by row id then
+    /// go through a sorted permutation instead of the ids themselves
+    pub fn allow_any_row_order(&mut self) {
+        self.any_row_order = true;
     }
 
     /// Create a builder with pre-allocated capacity.
@@ -1682,13 +1705,25 @@ impl VolumeBuilder {
             })
             .collect();
 
-        // Row ids name the payload at each position and lookups binary
-        // search them, so they cannot be reordered apart from the columns
-        if !self.row_ids.windows(2).all(|w| w[0] < w[1]) {
+        // Row ids name the payload at each position: lookups binary search
+        // ascending ids, and otherwise a permutation only a producer that
+        // ordered the rows itself gets to need
+        let row_order = if self.row_ids.windows(2).all(|w| w[0] < w[1]) {
+            None
+        } else if !self.any_row_order {
             return Err(Error::internal(
                 "volume rows were not added in ascending row id order",
             ));
-        }
+        } else {
+            let order = row_order_of(&self.row_ids);
+            if order
+                .windows(2)
+                .any(|w| self.row_ids[w[0] as usize] == self.row_ids[w[1] as usize])
+            {
+                return Err(Error::internal("volume rows repeat a row id"));
+            }
+            Some(order)
+        };
 
         let column_name_map: AHashMap<SmartString, usize> = column_names
             .iter()
@@ -1739,6 +1774,7 @@ impl VolumeBuilder {
                 column_names,
                 column_types,
                 row_ids: self.row_ids,
+                row_order: std::sync::OnceLock::from(row_order),
                 sorted_columns,
                 column_name_map,
                 row_groups,
@@ -1847,6 +1883,62 @@ impl FrozenVolume {
     #[inline]
     pub fn row_ids(&self) -> std::io::Result<&[i64]> {
         Ok(&self.meta.row_ids)
+    }
+
+    /// Positions sorted by row id when the ids do not ascend; None when
+    /// the ids themselves are in order. Decided once per volume
+    pub fn row_order(&self) -> Option<&[u32]> {
+        let ids = &self.meta.row_ids;
+        self.meta
+            .row_order
+            .get_or_init(|| (!ids.windows(2).all(|w| w[0] < w[1])).then(|| row_order_of(ids)))
+            .as_deref()
+    }
+
+    /// The smallest and largest row id held, without a scan once the
+    /// order is known
+    pub fn id_bounds(&self) -> Option<(i64, i64)> {
+        let ids = &self.meta.row_ids;
+        match self.row_order() {
+            None => Some((*ids.first()?, *ids.last()?)),
+            Some(order) => Some((ids[*order.first()? as usize], ids[*order.last()? as usize])),
+        }
+    }
+
+    /// Carry the order decided for an earlier form of this volume over to
+    /// this one, so a reload does not decide it again
+    pub fn inherit_row_order(&self, from: &FrozenVolume) {
+        if let Some(order) = from.meta.row_order.get() {
+            let _ = self.meta.row_order.set(order.clone());
+        }
+    }
+
+    /// Position of `row_id` in this volume in whatever order its rows were
+    /// added: a binary search over ascending ids, otherwise over a
+    /// permutation built on first use
+    pub fn locate(&self, row_id: i64) -> Option<usize> {
+        let ids = &self.meta.row_ids;
+        let (Some(&first), Some(&last)) = (ids.first(), ids.last()) else {
+            return None;
+        };
+        match self.row_order() {
+            None => {
+                if row_id < first || row_id > last {
+                    return None;
+                }
+                ids.binary_search(&row_id).ok()
+            }
+            Some(order) => {
+                if row_id < ids[order[0] as usize] || row_id > ids[order[order.len() - 1] as usize]
+                {
+                    return None;
+                }
+                order
+                    .binary_search_by(|&i| ids[i as usize].cmp(&row_id))
+                    .ok()
+                    .map(|k| order[k] as usize)
+            }
+        }
     }
 
     /// Get a row using a precomputed column mapping.

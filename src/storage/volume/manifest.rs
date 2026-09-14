@@ -974,7 +974,7 @@ impl SegmentManager {
     ) -> crate::core::Result<Option<crate::core::Value>> {
         for seg_id in seg_ids {
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.row_ids()?.binary_search(&row_id) {
+                if let Some(idx) = cold.volume.locate(row_id) {
                     let pi = if cold.mapping.is_identity {
                         col_idx
                     } else if col_idx < cold.mapping.sources.len() {
@@ -1499,6 +1499,7 @@ impl SegmentManager {
                     *volume.unique_indices.write() =
                         std::mem::take(&mut *cs.volume.unique_indices.write());
                 }
+                volume.inherit_row_order(&cs.volume);
                 volume.mark_accessed();
                 cs.volume = volume;
             }
@@ -1912,7 +1913,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if cold.volume.row_ids()?.binary_search(&row_id).is_ok() {
+                if cold.volume.locate(row_id).is_some() {
                     return Ok(true);
                 }
             }
@@ -1944,7 +1945,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.row_ids()?.binary_search(&row_id) {
+                if let Some(idx) = cold.volume.locate(row_id) {
                     if cold.volume.is_cold() {
                         if let Some(vol) = self.ensure_volume(*seg_id)? {
                             return Ok(Some(vol.get_row(idx)?));
@@ -1976,7 +1977,7 @@ impl SegmentManager {
         };
         for seg_id in &seg_ids {
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.row_ids()?.binary_search(&row_id) {
+                if let Some(idx) = cold.volume.locate(row_id) {
                     if cold.volume.is_cold() {
                         return Err(crate::core::Error::Internal {
                             message: format!(
@@ -2024,7 +2025,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.row_ids()?.binary_search(&row_id) {
+                if let Some(idx) = cold.volume.locate(row_id) {
                     let vol = if cold.volume.is_cold() {
                         match self.ensure_volume(*seg_id)? {
                             Some(v) => v,
@@ -2068,7 +2069,7 @@ impl SegmentManager {
         };
         for seg_id in &seg_ids {
             if let Some(cold) = segments.get(seg_id) {
-                if let Ok(idx) = cold.volume.row_ids()?.binary_search(&row_id) {
+                if let Some(idx) = cold.volume.locate(row_id) {
                     if cold.volume.is_cold() {
                         return Err(crate::core::Error::Internal {
                             message: format!(
@@ -2109,7 +2110,7 @@ impl SegmentManager {
                 continue;
             }
             if let Some(cold) = segments.get(seg_id) {
-                if cold.volume.row_ids()?.binary_search(&row_id).is_ok() {
+                if cold.volume.locate(row_id).is_some() {
                     return Ok(true);
                 }
             }
@@ -2690,6 +2691,7 @@ impl SegmentManager {
         if !cs.volume.unique_indices.read().is_empty() {
             *volume.unique_indices.write() = std::mem::take(&mut *cs.volume.unique_indices.write());
         }
+        volume.inherit_row_order(&cs.volume);
         cs.volume = Arc::clone(&volume);
         let still_cold = new_map.values().any(|cs| cs.volume.is_cold());
         *segments = Arc::new(new_map);
