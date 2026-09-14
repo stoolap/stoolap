@@ -54,6 +54,24 @@ CREATE TABLE order_items (
 );
 ```
 
+### Clustered Tables
+
+A table can declare the order its rows are kept in once they are sealed into cold volumes. `CLUSTER BY` names one or more columns of the table; rows with equal leading values sit together on disk, ordered by the columns that follow.
+
+```sql
+CREATE TABLE ticks (
+    id INTEGER PRIMARY KEY,
+    exchange TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    time TIMESTAMP NOT NULL,
+    price FLOAT
+) CLUSTER BY (exchange, symbol, time);
+```
+
+Queries that filter on a prefix of the key and read a range of the last column touch only the volume row groups that hold those rows, instead of every row group of the table. Rows in the hot buffer are unaffected: the order applies when the checkpoint cycle seals them, and compaction keeps it when it merges volumes.
+
+The key columns must have an order, so `JSON` and `VECTOR` columns cannot be part of it. A key column cannot be dropped with `ALTER TABLE ... DROP COLUMN`; dropping another column keeps the key on the same columns. `SHOW CREATE TABLE` shows the clause, and a snapshot restore or a reopen keeps it. Tables without the clause keep their rows in row id order, as before.
+
 ### Altering Tables
 
 Tables can be modified after creation using `ALTER TABLE` statements:

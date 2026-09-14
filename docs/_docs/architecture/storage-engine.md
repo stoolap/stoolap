@@ -75,6 +75,7 @@ When persistence is enabled, data is stored on disk with:
 - **Binary serialization** - Compact binary format for storage
 - **WAL files** - Write-ahead log for durability
 - **Volume files** - Immutable columnar cold segments with manifests
+- **Row order inside a volume** - Row id order by default; a table created with `CLUSTER BY` holds its sealed rows in key order, and lookups by row id go through a per-volume position index instead of the row id list
 - **Snapshot files** - Optional backup files (via PRAGMA SNAPSHOT)
 
 ## MVCC Implementation
@@ -162,9 +163,9 @@ When persistence is enabled:
 ### Checkpoint Cycle
 
 The background thread periodically seals hot rows into cold volumes:
-1. Hot buffer rows are written to immutable columnar `.vol` files
+1. Hot buffer rows are written to immutable columnar `.vol` files, in row id order, or in key order for a table with `CLUSTER BY`
 2. Manifests (volume list, tombstones, checkpoint LSN) are persisted
-3. Compaction merges sub-target, oversized, and tombstoned volumes into target-sized outputs
+3. Compaction merges sub-target, oversized, and tombstoned volumes into target-sized outputs, keeping the table's row order
 4. WAL is truncated when all hot data is sealed
 
 ### Recovery Process
