@@ -78,7 +78,7 @@ An existing table gets a key, or a new one, with `ALTER TABLE`:
 ALTER TABLE ticks CLUSTER BY (exchange, symbol, time);
 ```
 
-The volumes sealed before the change keep their order and stay readable; rows sealed from then on take the key order, and the next compaction that rewrites the older volumes puts them in key order too.
+The volumes sealed before the change stay readable as they are; rows sealed from then on take the key order, and the next checkpoint cycle rewrites the older volumes into key order through compaction, one pass over each. Until that cycle runs, queries on the older rows answer as before, without the locality the key gives.
 
 ### Altering Tables
 

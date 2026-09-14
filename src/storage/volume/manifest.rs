@@ -623,6 +623,12 @@ pub struct SegmentManager {
     pub current_eviction_epoch: std::sync::atomic::AtomicU64,
     /// True when any segment in the map is cold (metadata only, needs reload).
     has_cold: std::sync::atomic::AtomicBool,
+    /// Set until compaction has checked every volume against the table's
+    /// clustering key: at construction and after the key changes
+    recluster_pending: std::sync::atomic::AtomicBool,
+    /// Whether a volume holds its rows in a given key's order; volumes are
+    /// immutable, so a verdict for (volume, key) stands
+    key_order_verdicts: parking_lot::Mutex<FxHashMap<u64, (Vec<usize>, bool)>>,
     /// Serializes reload attempts. Concurrent callers block on this mutex
     /// instead of spinning, preventing CPU waste during disk I/O.
     reloading: parking_lot::Mutex<()>,
@@ -680,6 +686,8 @@ impl SegmentManager {
             volume_dir,
             has_segments_flag: std::sync::atomic::AtomicBool::new(false),
             has_cold: std::sync::atomic::AtomicBool::new(false),
+            recluster_pending: std::sync::atomic::AtomicBool::new(true),
+            key_order_verdicts: parking_lot::Mutex::new(FxHashMap::default()),
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(FxHashMap::default())),
@@ -704,6 +712,8 @@ impl SegmentManager {
             volume_dir,
             has_segments_flag: std::sync::atomic::AtomicBool::new(false),
             has_cold: std::sync::atomic::AtomicBool::new(false),
+            recluster_pending: std::sync::atomic::AtomicBool::new(true),
+            key_order_verdicts: parking_lot::Mutex::new(FxHashMap::default()),
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(tombstone_map)),
@@ -1510,6 +1520,46 @@ impl SegmentManager {
             self.has_cold
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// True until compaction has checked every volume against the table's
+    /// clustering key
+    pub fn recluster_pending(&self) -> bool {
+        self.recluster_pending
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Set after the key changes, cleared once every volume is in its order
+    pub fn set_recluster_pending(&self, pending: bool) {
+        self.recluster_pending
+            .store(pending, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the volume holds its rows in `key` order, decided once per
+    /// (volume, key); a cold volume is loaded to decide
+    pub fn key_order_verdict(&self, seg_id: u64, key: &[usize]) -> crate::core::Result<bool> {
+        if let Some((for_key, verdict)) = self.key_order_verdicts.lock().get(&seg_id) {
+            if for_key == key {
+                return Ok(*verdict);
+            }
+        }
+        let volume = {
+            let segs = self.segments.read();
+            segs.get(&seg_id).map(|cs| Arc::clone(&cs.volume))
+        };
+        let volume = match volume {
+            Some(v) if !v.is_cold() => Some(v),
+            Some(_) => self.ensure_volume(seg_id)?,
+            None => None,
+        };
+        let Some(volume) = volume else {
+            return Ok(true);
+        };
+        let verdict = volume.in_key_order(key)?;
+        self.key_order_verdicts
+            .lock()
+            .insert(seg_id, (key.to_vec(), verdict));
+        Ok(verdict)
     }
 
     /// Count segments below the target row count (sub-target volumes that need merging).

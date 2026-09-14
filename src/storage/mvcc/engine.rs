@@ -3656,6 +3656,12 @@ impl MVCCEngine {
             }
         }
 
+        // The volumes already sealed are checked against the new key by
+        // the next compaction, which rewrites the ones out of order
+        if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
+            mgr.set_recluster_pending(true);
+        }
+
         self.schema_epoch.fetch_add(1, Ordering::Release);
         Ok(())
     }
@@ -5526,6 +5532,10 @@ impl MVCCEngine {
                     if mgr.max_segment_row_count() > oversized_threshold {
                         return true;
                     }
+                    // Volumes not yet checked against a clustering key
+                    if mgr.recluster_pending() && mgr.segment_count() >= 1 {
+                        return true;
+                    }
                     false
                 })
                 .map(|(name, _)| name.clone())
@@ -5614,6 +5624,36 @@ impl MVCCEngine {
                     // At-target with no tombstones: frozen, don't touch
                 }
 
+                // A clustered table rewrites the volumes that are not in its
+                // key order: those sealed before the key was declared. Each
+                // is checked once; the flag drops when none is left
+                let mut reclustering = false;
+                if mgr.recluster_pending() {
+                    let mut out_of_order = false;
+                    if !schema.cluster_key.is_empty() {
+                        for (idx, seg) in manifest.segments.iter().enumerate() {
+                            if let Some(limit) = compact_seal_seq_limit {
+                                if seg.seal_seq > 0 && seg.seal_seq > limit {
+                                    continue;
+                                }
+                            }
+                            if !mgr.key_order_verdict(seg.segment_id, &schema.cluster_key)? {
+                                out_of_order = true;
+                                if !merge_indices.contains(&idx) {
+                                    merge_indices.push(idx);
+                                }
+                            }
+                        }
+                        merge_indices.sort_unstable();
+                    }
+                    // The flag drops only once every volume is in order; a
+                    // volume this cycle leaves alone keeps it set
+                    reclustering = out_of_order;
+                    if !out_of_order {
+                        mgr.set_recluster_pending(false);
+                    }
+                }
+
                 if merge_indices.is_empty() {
                     continue;
                 }
@@ -5621,7 +5661,8 @@ impl MVCCEngine {
                 // more to accumulate before merging.
                 // A single at-target/oversized volume with tombstones should
                 // NOT be skipped — it needs rewriting to remove dead rows.
-                if merge_indices.len() == 1 {
+                // A volume out of its table's key order is rewritten alone.
+                if merge_indices.len() == 1 && !reclustering {
                     let seg = &manifest.segments[merge_indices[0]];
                     if seg.row_count < target_volume_rows {
                         continue; // small volume, wait for more
