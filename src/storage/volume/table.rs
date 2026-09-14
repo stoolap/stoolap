@@ -697,14 +697,17 @@ impl SegmentedTable {
     /// `bloom_hashes` are pre-computed per-comparison to avoid redundant hashing.
     fn prune_volume(
         vol: &FrozenVolume,
+        mapping: &super::writer::ColumnMapping,
         comparisons: &[(&str, crate::core::Operator, &Value)],
         bloom_hashes: &[Option<u64>],
     ) -> Result<(bool, usize, usize)> {
         let mut start = 0usize;
         let mut end = vol.meta.row_count;
 
+        // A filter column resolves through the mapping: the volume may
+        // still hold a dropped column of that name
         for (comp_idx, &(col_name, op, value)) in comparisons.iter().enumerate() {
-            if let Some(col_idx) = vol.column_index(col_name) {
+            if let Some(col_idx) = mapping.volume_column(vol, col_name) {
                 let zm = &vol.meta.zone_maps[col_idx];
                 let dominated =
                     match op {
@@ -848,7 +851,8 @@ impl SegmentedTable {
 
         for (seg_id, cs) in volumes.iter() {
             let vol = &cs.volume;
-            let (should_skip, start, end) = Self::prune_volume(vol, &comparisons, &bloom_hashes)?;
+            let (should_skip, start, end) =
+                Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
             if should_skip {
                 continue;
             }
@@ -860,7 +864,8 @@ impl SegmentedTable {
                     Some(v) => v,
                     None => continue,
                 };
-                let (_, s, e) = Self::prune_volume(&loaded, &comparisons, &bloom_hashes)?;
+                let (_, s, e) =
+                    Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
                 (&loaded, s, e)
             } else {
                 (vol, start, end)
@@ -934,7 +939,13 @@ impl SegmentedTable {
         let mut pruned_volumes = Vec::with_capacity(volumes.len());
         for volume in volumes.iter() {
             if comparisons.is_empty()
-                || !Self::prune_volume(&volume.1.volume, &comparisons, &bloom_hashes)?.0
+                || !Self::prune_volume(
+                    &volume.1.volume,
+                    &volume.1.mapping,
+                    &comparisons,
+                    &bloom_hashes,
+                )?
+                .0
             {
                 pruned_volumes.push(volume);
             }
@@ -947,7 +958,7 @@ impl SegmentedTable {
             |(seg_id, cs): &(u64, super::manifest::ColdSegment)| -> Result<Option<RowVec>> {
                 let vol = &cs.volume;
                 let (should_skip, start, end) =
-                    Self::prune_volume(vol, &comparisons, &bloom_hashes)?;
+                    Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
                 if should_skip {
                     return Ok(None);
                 }
@@ -958,7 +969,8 @@ impl SegmentedTable {
                         Some(v) => v,
                         None => return Ok(None),
                     };
-                    let (_, s, e) = Self::prune_volume(&loaded, &comparisons, &bloom_hashes)?;
+                    let (_, s, e) =
+                        Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
                     (&loaded, s, e)
                 } else {
                     vol.mark_accessed();
@@ -1489,7 +1501,8 @@ impl Table for SegmentedTable {
             let vol = &cs.volume;
 
             // Prune volume by zone maps and bloom filters.
-            let (should_skip, _, _) = Self::prune_volume(vol, &comparisons, &bloom_hashes)?;
+            let (should_skip, _, _) =
+                Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
             if should_skip {
                 continue;
             }
@@ -1874,7 +1887,8 @@ impl Table for SegmentedTable {
             let vol = &cs.volume;
 
             // Prune volume by zone maps and bloom filters.
-            let (should_skip, _, _) = Self::prune_volume(vol, &comparisons, &bloom_hashes)?;
+            let (should_skip, _, _) =
+                Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
             if should_skip {
                 continue;
             }
@@ -2242,7 +2256,8 @@ impl Table for SegmentedTable {
         'done: for (nf_idx, (seg_id, cs)) in volumes.iter().enumerate().rev() {
             let vol = &cs.volume;
             if !comparisons.is_empty() {
-                let (skip, _, _) = Self::prune_volume(vol, &comparisons, &bloom_hashes)?;
+                let (skip, _, _) =
+                    Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
                 if skip {
                     continue;
                 }
@@ -2354,7 +2369,8 @@ impl Table for SegmentedTable {
             let vol = &cs.volume;
             // Zone-map pruning: skip entire volume if no rows can match.
             let pruned = if !comparisons.is_empty() {
-                let (skip, _, _) = Self::prune_volume(vol, &comparisons, &bloom_hashes)?;
+                let (skip, _, _) =
+                    Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
                 skip
             } else {
                 false
@@ -4184,7 +4200,7 @@ impl Table for SegmentedTable {
             }
             let (seg_id, cs) = &volumes[i];
             let (should_skip, mut narrow_start, mut narrow_end) =
-                Self::prune_volume(&cs.volume, &comparisons, &bloom_hashes)?;
+                Self::prune_volume(&cs.volume, &cs.mapping, &comparisons, &bloom_hashes)?;
             if should_skip {
                 continue;
             }
@@ -4197,7 +4213,7 @@ impl Table for SegmentedTable {
                 // Only a loaded volume can narrow the range through the sorted
                 // columns' binary search; a warm one already did above
                 (_, narrow_start, narrow_end) =
-                    Self::prune_volume(&loaded, &comparisons, &bloom_hashes)?;
+                    Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
                 &loaded
             } else {
                 &cs.volume
@@ -5198,7 +5214,13 @@ impl Table for SegmentedTable {
         for volume in volumes.iter() {
             if comparisons_for_prune.is_empty()
                 || !volume.1.mapping.is_identity
-                || !Self::prune_volume(&volume.1.volume, &comparisons_for_prune, &bloom_hashes)?.0
+                || !Self::prune_volume(
+                    &volume.1.volume,
+                    &volume.1.mapping,
+                    &comparisons_for_prune,
+                    &bloom_hashes,
+                )?
+                .0
             {
                 pruned_volumes.push(volume);
             }

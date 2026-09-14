@@ -1815,6 +1815,27 @@ pub struct ColumnMapping {
     pub is_identity: bool,
 }
 
+impl ColumnMapping {
+    /// The volume column a filter's column name stands for under the
+    /// schema this mapping was computed for: by name in the volume when
+    /// the mapping is the identity, through `sources` otherwise, since the
+    /// volume may still hold a dropped column of the same name. None for a
+    /// column the volume does not hold
+    pub fn volume_column(&self, volume: &FrozenVolume, name: &str) -> Option<usize> {
+        if self.names.is_empty() {
+            return volume.column_index(name);
+        }
+        let position = self
+            .names
+            .iter()
+            .position(|n| n.as_str().eq_ignore_ascii_case(name))?;
+        match self.sources.get(position)? {
+            ColSource::Volume(v) => Some(*v),
+            ColSource::Default(_) => None,
+        }
+    }
+}
+
 /// Compute column mapping from current schema to a frozen volume.
 /// Handles renames (via column_renames fallback) and drops.
 /// `volume_schema_version` is the schema epoch when the volume was created.

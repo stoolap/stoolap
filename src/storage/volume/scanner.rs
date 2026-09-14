@@ -829,18 +829,8 @@ impl VolumeScanner {
     /// same name, and None for a column the volume does not hold, which
     /// the full filter evaluates on the materialized row
     fn filter_column(&self, name: &str) -> Option<usize> {
-        use super::writer::ColSource;
         match &self.column_mapping {
-            Some(mapping) => {
-                let position = mapping
-                    .names
-                    .iter()
-                    .position(|n| n.as_str().eq_ignore_ascii_case(name))?;
-                match mapping.sources.get(position)? {
-                    ColSource::Volume(v) => Some(*v),
-                    ColSource::Default(_) => None,
-                }
-            }
+            Some(mapping) => mapping.volume_column(&self.volume, name),
             None => self.volume.column_index(name),
         }
     }
