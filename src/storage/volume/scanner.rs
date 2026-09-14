@@ -65,16 +65,20 @@ struct GroupColumnCache {
 }
 
 impl GroupColumnCache {
-    /// Get column data and local row index for a global row index.
+    /// Get column data and local row index for a global row index; None
+    /// when the cache holds another column or another group, which the
+    /// caller then reads from the whole column. The cache can be behind
+    /// the row when the volume's columns became resident during the scan
+    /// and the group cache stopped being refreshed
     #[inline(always)]
     fn col_and_local(
         &self,
         col_idx: usize,
         global_idx: usize,
     ) -> Option<(&super::column::ColumnData, usize)> {
-        self.columns[col_idx]
-            .as_deref()
-            .map(|col| (col, global_idx - self.group_start))
+        let col = self.columns.get(col_idx)?.as_deref()?;
+        let local = global_idx.checked_sub(self.group_start)?;
+        (local < col.len()).then_some((col, local))
     }
 }
 
@@ -240,6 +244,9 @@ impl VolumeScanner {
     /// dictionary filters the group's candidates are found in one pass.
     fn next_reverse(&mut self) -> Result<bool> {
         let use_group_cache = self.volume.columns.should_use_group_cache();
+        if !use_group_cache && self.group_cache.is_some() {
+            self.group_cache = None;
+        }
         while self.current_idx < self.end_idx {
             let idx = self.end_idx - 1;
             let group_idx = idx / super::column::ROW_GROUP_SIZE;
@@ -1145,6 +1152,12 @@ impl VolumeScanner {
 
         // Fast path: use pre-computed matching indices (from dictionary filters).
         let use_group_cache_fast = self.volume.columns.should_use_group_cache();
+        // The volume's columns can become resident between two rows (a
+        // reader of every column promotes them); the group cache is then
+        // no longer refreshed and must not be read for rows past its group
+        if !use_group_cache_fast && self.group_cache.is_some() {
+            self.group_cache = None;
+        }
         if self.matching_indices.is_some() {
             loop {
                 let idx = match self.matching_indices.as_ref() {
