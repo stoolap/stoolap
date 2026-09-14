@@ -5581,8 +5581,9 @@ impl MVCCEngine {
                 let oversized_threshold = target_volume_rows * 3 / 2;
 
                 // (segment id, row count, whether size or tombstones already
-                // call for a rewrite) of every volume this cycle may touch
-                let mut planned: Vec<(u64, usize, bool)> = Vec::new();
+                // call for a rewrite, whether a snapshot defers it) of every
+                // volume, in manifest order
+                let mut planned: Vec<(u64, usize, bool, bool)> = Vec::new();
                 let mut deferred = false;
                 {
                     let segs = mgr.segments_raw();
@@ -5595,6 +5596,7 @@ impl MVCCEngine {
                         if let Some(limit) = compact_seal_seq_limit {
                             if seg.seal_seq > 0 && seg.seal_seq > limit {
                                 deferred = true;
+                                planned.push((seg.segment_id, seg.row_count, false, true));
                                 continue;
                             }
                         }
@@ -5621,23 +5623,29 @@ impl MVCCEngine {
                                     })
                                 })
                         };
-                        planned.push((seg.segment_id, seg.row_count, rewrite));
+                        planned.push((seg.segment_id, seg.row_count, rewrite, false));
                     }
                 }
 
                 // A clustered table rewrites the volumes not in its key
                 // order. A volume is decided once, a cold one loaded to
                 // decide, and a cycle decides at most compact_threshold of
-                // them, so what a cycle loads and rewrites stays bounded.
-                // The request closes once a cycle finds every volume in
-                // order, none left undecided or deferred behind a snapshot
+                // them and selects at most as many for the rewrite, decided
+                // earlier or now, so what a cycle loads and rewrites stays
+                // bounded. The request closes once a cycle finds every
+                // volume in order, none left undecided, unselected or
+                // deferred behind a snapshot
                 let mut reclustering = false;
                 if let Some(request) = recluster_request {
                     let key = &schema.cluster_key;
                     let mut all_checked = !deferred;
                     if !key.is_empty() {
                         let mut decided = 0usize;
+                        let mut selected = 0usize;
                         for entry in planned.iter_mut() {
+                            if entry.3 {
+                                continue;
+                            }
                             let in_order = match mgr.known_key_order(entry.0, key) {
                                 Some(in_order) => in_order,
                                 None if decided < compact_threshold => {
@@ -5649,15 +5657,73 @@ impl MVCCEngine {
                                     continue;
                                 }
                             };
-                            if !in_order {
-                                entry.2 = true;
-                                reclustering = true;
+                            if in_order {
+                                continue;
                             }
+                            if selected >= compact_threshold {
+                                all_checked = false;
+                                continue;
+                            }
+                            selected += 1;
+                            entry.2 = true;
+                            reclustering = true;
                         }
                     }
                     if key.is_empty() || (all_checked && !reclustering) {
                         mgr.recluster_done(request);
                     }
+                }
+
+                // Volumes take precedence by manifest position, newest last,
+                // and the rewrite takes the position of the batch's first
+                // member. A volume left between two members that shares a
+                // row with the batch would then win over a newer copy of it
+                // or lose to an older one, so the batch is closed over
+                // overlap: every such volume joins it, and one deferred
+                // behind a snapshot holds the table for this cycle
+                let first = planned.iter().position(|entry| entry.2);
+                let last = planned.iter().rposition(|entry| entry.2);
+                let mut held = false;
+                if let (Some(first), Some(last)) = (first, last) {
+                    if last > first {
+                        let segs = mgr.segments_raw();
+                        let ids_of = |id: u64| -> &[i64] {
+                            segs.get(&id)
+                                .map(|cs| cs.volume.meta.row_ids.as_slice())
+                                .unwrap_or(&[])
+                        };
+                        let mut batch_ids: FxHashSet<i64> = FxHashSet::default();
+                        for entry in &planned[first..=last] {
+                            if entry.2 {
+                                batch_ids.extend(ids_of(entry.0).iter().copied());
+                            }
+                        }
+                        loop {
+                            let mut grew = false;
+                            for entry in planned[first..=last].iter_mut() {
+                                if entry.2 {
+                                    continue;
+                                }
+                                let ids = ids_of(entry.0);
+                                if !ids.iter().any(|id| batch_ids.contains(id)) {
+                                    continue;
+                                }
+                                if entry.3 {
+                                    held = true;
+                                } else {
+                                    entry.2 = true;
+                                    batch_ids.extend(ids.iter().copied());
+                                    grew = true;
+                                }
+                            }
+                            if !grew {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if held {
+                    continue;
                 }
                 let merge: Vec<(u64, usize)> = planned
                     .into_iter()
@@ -5707,8 +5773,9 @@ impl MVCCEngine {
                 if removed {
                     continue;
                 }
-                // Sort by segment_id descending (newest first) for correct dedup.
-                vols.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+                // Newest first for the dedup: precedence is manifest
+                // position, and old_ids holds the batch in manifest order
+                vols.reverse();
                 let ts = mgr.tombstone_set_arc();
                 (old_ids, Arc::new(vols), ts)
             };

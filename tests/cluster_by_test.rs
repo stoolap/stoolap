@@ -984,6 +984,22 @@ fn a_key_with_a_column_added_after_the_seal_reclusters_the_older_volume() {
     assert_eq!(venues, vec![1_000]);
 }
 
+/// `rows` ticks with ids from `after + 1`, the key walking against the
+/// id, price equal to the id's offset
+fn insert_series(db: &Database, after: i64, rows: i64) {
+    db.execute(
+        &format!(
+            "INSERT INTO ticks SELECT g.value + {after}, \
+             CASE WHEN g.value % 2 = 0 THEN 'b' ELSE 'a' END, \
+             CASE WHEN g.value % 3 = 0 THEN 'y' ELSE 'x' END, \
+             200000 - g.value - {after}, g.value \
+             FROM generate_series(1, {rows}) g"
+        ),
+        (),
+    )
+    .unwrap();
+}
+
 /// Three at-target volumes and a threshold of two: the first cycle after
 /// the key rewrites two, the next the third, and a cycle after that
 /// touches nothing
@@ -997,18 +1013,7 @@ fn a_checkpoint_cycle_reclusters_at_most_compact_threshold_volumes() {
     .unwrap();
     db.execute(UNCLUSTERED, ()).unwrap();
     for round in 0..3i64 {
-        db.execute(
-            &format!(
-                "INSERT INTO ticks SELECT g.value + {off}, \
-                 CASE WHEN g.value % 2 = 0 THEN 'b' ELSE 'a' END, \
-                 CASE WHEN g.value % 3 = 0 THEN 'y' ELSE 'x' END, \
-                 200000 - g.value - {off}, g.value \
-                 FROM generate_series(1, 65536) g",
-                off = round * 65_536
-            ),
-            (),
-        )
-        .unwrap();
+        insert_series(&db, round * 65_536, 65_536);
         db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     }
     let before = volume_files(dir.path(), "ticks");
@@ -1038,4 +1043,53 @@ fn a_checkpoint_cycle_reclusters_at_most_compact_threshold_volumes() {
         .all(|v| in_key_order(v)));
     let count: i64 = db.query_one("SELECT COUNT(*) FROM ticks", ()).unwrap();
     assert_eq!(count, 3 * 65_536);
+}
+
+/// A batch leaves newer volumes outside it, and its rewrite takes the
+/// batch's place in the manifest: the copy of a row that a later volume
+/// holds must still win, in reads and in the next compaction
+#[test]
+fn a_recluster_batch_keeps_the_newer_copy_of_a_row_left_outside_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?target_volume_rows=65536&compact_threshold=2",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(UNCLUSTERED, ()).unwrap();
+    insert_series(&db, 0, 65_536);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    insert_series(&db, 65_536, 65_536);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    // The newer copy of id 5 seals into the third volume
+    db.execute("UPDATE ticks SET price = -1 WHERE id = 5", ())
+        .unwrap();
+    insert_series(&db, 131_072, 65_535);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(volume_files(dir.path(), "ticks").len(), 3);
+    let price = |db: &Database| -> f64 {
+        db.query_one("SELECT price FROM ticks WHERE id = 5", ())
+            .unwrap()
+    };
+    assert_eq!(price(&db), -1.0);
+
+    // The first two volumes are rewritten, the third stays behind them
+    db.execute("ALTER TABLE ticks CLUSTER BY (exchange, symbol, time)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(price(&db), -1.0);
+    // A tombstone in the rewritten volume that holds the older copy of
+    // id 5 (id 7 shares its (a, x) group) and the third volume's turn put
+    // both copies into one compaction
+    db.execute("DELETE FROM ticks WHERE id = 7", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(
+        price(&db),
+        -1.0,
+        "the rewritten older copy of id 5 won over the newer one"
+    );
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM ticks", ()).unwrap();
+    assert_eq!(count, 65_536 + 65_536 + 65_535 - 1);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(price(&db), -1.0);
 }
