@@ -1126,6 +1126,24 @@ impl Executor {
                     ));
                 }
             }
+            AlterTableOperation::ClusterBy => {
+                // The key names columns of this table; the schema checks that
+                // each exists, appears once and has an order
+                let key: Vec<usize> = {
+                    let schema = table.schema();
+                    stmt.cluster_by
+                        .iter()
+                        .map(|column| {
+                            schema
+                                .get_column_index(&column.value)
+                                .ok_or_else(|| Error::ColumnNotFound(column.value.to_string()))
+                        })
+                        .collect::<Result<_>>()?
+                };
+                self.engine.set_cluster_key(table_name, key.clone())?;
+                self.engine
+                    .record_alter_table_cluster_by(table_name, &key)?;
+            }
             AlterTableOperation::RenameTable => {
                 if let Some(ref new_name) = stmt.new_table_name {
                     tx.rename_table(table_name, &new_name.value)?;

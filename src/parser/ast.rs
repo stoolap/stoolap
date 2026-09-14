@@ -2011,6 +2011,8 @@ pub enum AlterTableOperation {
     RenameColumn,
     ModifyColumn,
     RenameTable,
+    /// CLUSTER BY (cols): the order the sealed rows are kept in
+    ClusterBy,
 }
 
 /// ALTER TABLE statement
@@ -2023,6 +2025,8 @@ pub struct AlterTableStatement {
     pub column_name: Option<Identifier>,
     pub new_column_name: Option<Identifier>,
     pub new_table_name: Option<Identifier>,
+    /// Columns of a CLUSTER BY operation
+    pub cluster_by: Vec<Identifier>,
 }
 
 impl fmt::Display for AlterTableStatement {
@@ -2053,6 +2057,10 @@ impl fmt::Display for AlterTableStatement {
                 if let Some(ref name) = self.new_table_name {
                     result.push_str(&format!("RENAME TO {}", name));
                 }
+            }
+            AlterTableOperation::ClusterBy => {
+                let columns: Vec<String> = self.cluster_by.iter().map(|c| c.to_string()).collect();
+                result.push_str(&format!("CLUSTER BY ({})", columns.join(", ")));
             }
         }
         write!(f, "{}", result)

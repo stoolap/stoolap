@@ -564,3 +564,113 @@ fn key_cells_compare_integers_and_floats_exactly() {
         std::cmp::Ordering::Less
     );
 }
+
+#[test]
+fn alter_table_cluster_by_sets_the_key_and_orders_the_next_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?compact_threshold=2", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE ticks (id INTEGER PRIMARY KEY, exchange TEXT NOT NULL, symbol TEXT NOT NULL, time INTEGER NOT NULL, price REAL)",
+            (),
+        )
+        .unwrap();
+        // The first volume is sealed before the key exists: id order
+        insert_ticks(&db, 1_000);
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.execute("ALTER TABLE ticks CLUSTER BY (exchange, symbol, time)", ())
+            .unwrap();
+        let schema = db.engine().get_table_schema("ticks").unwrap();
+        assert_eq!(schema.cluster_key, vec![1, 2, 3]);
+        let shown: String = db
+            .query("SHOW CREATE TABLE ticks", ())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get::<String>(1)
+            .unwrap();
+        assert!(
+            shown.ends_with("CLUSTER BY (exchange, symbol, time)"),
+            "{shown}"
+        );
+        // The next seal is in key order; the earlier volume keeps its order
+        let insert = db
+            .prepare("INSERT INTO ticks VALUES (?, ?, ?, ?, ?)")
+            .unwrap();
+        for id in 1_001..=2_000i64 {
+            let exchange = if id % 2 == 0 { "b" } else { "a" };
+            let symbol = if id % 3 == 0 { "y" } else { "x" };
+            insert
+                .execute((id, exchange, symbol, 3_000 - id, id as f64))
+                .unwrap();
+        }
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let volumes = sealed_volumes(dir.path(), "ticks", &[1, 2, 3]);
+        assert_eq!(volumes.len(), 2);
+        let ordered: Vec<bool> = volumes.iter().map(|v| in_key_order(v)).collect();
+        assert_eq!(
+            ordered,
+            vec![false, true],
+            "one volume before the key, one after"
+        );
+        // A compaction rewrites both in key order
+        for id in 2_001..=3_000i64 {
+            let exchange = if id % 2 == 0 { "b" } else { "a" };
+            let symbol = if id % 3 == 0 { "y" } else { "x" };
+            insert
+                .execute((id, exchange, symbol, 3_000 - id, id as f64))
+                .unwrap();
+        }
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        let volumes = sealed_volumes(dir.path(), "ticks", &[1, 2, 3]);
+        assert_eq!(
+            volumes.len(),
+            1,
+            "compaction did not merge the three volumes"
+        );
+        assert!(in_key_order(&volumes[0]));
+        assert_eq!(volumes[0].len(), 3_000);
+        assert_eq!(ids(&db, "SELECT id FROM ticks WHERE id = 1500"), vec![1500]);
+    }
+    let db = Database::open(&dsn).unwrap();
+    assert_eq!(
+        db.engine().get_table_schema("ticks").unwrap().cluster_key,
+        vec![1, 2, 3],
+        "the key set by ALTER TABLE did not survive the reopen"
+    );
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM ticks", ()).unwrap();
+    assert_eq!(count, 3_000);
+}
+
+#[test]
+fn alter_table_cluster_by_checks_its_columns() {
+    let db = Database::open("memory://alter_cluster_by_errors").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, doc JSON)",
+        (),
+    )
+    .unwrap();
+    assert!(db.execute("ALTER TABLE t CLUSTER BY (b)", ()).is_err());
+    assert!(db.execute("ALTER TABLE t CLUSTER BY (a, a)", ()).is_err());
+    assert!(db.execute("ALTER TABLE t CLUSTER BY (doc)", ()).is_err());
+    assert!(db.execute("ALTER TABLE t CLUSTER BY ()", ()).is_err());
+    assert!(db
+        .engine()
+        .get_table_schema("t")
+        .unwrap()
+        .cluster_key
+        .is_empty());
+    db.execute("ALTER TABLE t CLUSTER BY (a)", ()).unwrap();
+    assert_eq!(
+        db.engine().get_table_schema("t").unwrap().cluster_key,
+        vec![1]
+    );
+    // A second ALTER replaces the key
+    db.execute("ALTER TABLE t CLUSTER BY (a, id)", ()).unwrap();
+    assert_eq!(
+        db.engine().get_table_schema("t").unwrap().cluster_key,
+        vec![1, 0]
+    );
+}
