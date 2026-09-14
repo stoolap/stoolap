@@ -1836,6 +1836,103 @@ impl ColumnMapping {
     }
 }
 
+/// The drop-list name under which a rename's schema version is kept: a
+/// byte no column name can hold, then the rename's ordinal in the rename
+/// list. It never matches a column, and it is short whatever the names
+pub fn rename_marker(ordinal: usize) -> String {
+    format!("\0{ordinal}")
+}
+
+/// The drop-list name under which the log position the manifest's renames
+/// and drops reach is kept
+pub const DDL_LSN_MARKER: &str = "\0lsn";
+
+/// A change of the schema since a volume was sealed
+enum SchemaEvent<'a> {
+    Renamed { old: &'a str, new: &'a str },
+    Dropped(&'a str),
+}
+
+/// The schema changes made after `volume_schema_version`, newest first,
+/// or None when a rename carries no version marker (recorded before the
+/// markers existed), in which case the history has no order to walk
+fn schema_events_since<'a>(
+    volume_schema_version: u64,
+    dropped_columns: &'a [(crate::common::SmartString, u64)],
+    column_renames: &'a [(crate::common::SmartString, crate::common::SmartString)],
+) -> Option<Vec<(u64, usize, SchemaEvent<'a>)>> {
+    let mut events = Vec::new();
+    for (ordinal, (old, new)) in column_renames.iter().enumerate() {
+        let marker = rename_marker(ordinal);
+        let (_, version) = dropped_columns
+            .iter()
+            .find(|(name, _)| name.as_str() == marker)?;
+        if *version > volume_schema_version {
+            events.push((
+                *version,
+                ordinal,
+                SchemaEvent::Renamed {
+                    old: old.as_str(),
+                    new: new.as_str(),
+                },
+            ));
+        }
+    }
+    for (order, (name, version)) in dropped_columns.iter().enumerate() {
+        if !name.starts_with('\0') && *version > volume_schema_version {
+            events.push((*version, order, SchemaEvent::Dropped(name.as_str())));
+        }
+    }
+    events.sort_by_key(|event| std::cmp::Reverse((event.0, event.1)));
+    Some(events)
+}
+
+/// The volume column a schema column stands for, or None when the
+/// column's identity began after the seal (a drop ended the identity that
+/// carried the name, or the name never reached the volume). The name is
+/// walked back through the changes since the seal, newest first: a rename
+/// into the name takes the name it had before, a drop of the name ends
+/// the walk
+fn source_before_changes<'a>(
+    name_now: &'a str,
+    events: &[(u64, usize, SchemaEvent<'a>)],
+    volume: &FrozenVolume,
+) -> Option<usize> {
+    let mut name = name_now;
+    for (_, _, event) in events {
+        match event {
+            SchemaEvent::Renamed { old, new } if new.eq_ignore_ascii_case(name) => name = old,
+            SchemaEvent::Dropped(dropped) if dropped.eq_ignore_ascii_case(name) => return None,
+            _ => {}
+        }
+    }
+    volume.column_index(name)
+}
+
+/// The resolution used before renames carried a version: one rename
+/// record back, the renamed column's old slot taking precedence over a
+/// column that reuses the name, and a name dropped at or after the seal
+/// resolving to nothing
+fn source_without_order(
+    name_now: &str,
+    volume_schema_version: u64,
+    dropped_columns: &[(crate::common::SmartString, u64)],
+    column_renames: &[(crate::common::SmartString, crate::common::SmartString)],
+    volume: &FrozenVolume,
+) -> Option<usize> {
+    let was_dropped = dropped_columns
+        .iter()
+        .any(|(d, drop_ver)| d.as_str() == name_now && volume_schema_version <= *drop_ver);
+    if was_dropped {
+        return None;
+    }
+    column_renames
+        .iter()
+        .find(|(_, new)| new.as_str() == name_now)
+        .and_then(|(old, _)| volume.column_index(old.as_str()))
+        .or_else(|| volume.column_index(name_now))
+}
+
 /// Compute column mapping from current schema to a frozen volume.
 /// Handles renames (via column_renames fallback) and drops.
 /// `volume_schema_version` is the schema epoch when the volume was created.
@@ -1855,25 +1952,25 @@ pub fn compute_column_mapping_with_drops(
     // RENAME a→b then ADD COLUMN a, both "b" via rename and "a" via direct
     // match would hit the same old physical column without this guard).
     let mut used_vol_indices = smallvec::SmallVec::<[usize; 16]>::new();
+    let events = schema_events_since(volume_schema_version, dropped_columns, column_renames);
 
     for (pos, col) in schema.columns.iter().enumerate() {
-        // Try rename fallback FIRST (higher priority: a renamed column's
-        // old physical slot belongs to the renamed column, not a new column
-        // that happens to reuse the old name).
-        let vol_idx = column_renames
-            .iter()
-            .find(|(_, new)| new.as_str() == col.name_lower)
-            .and_then(|(old, _)| volume.column_index(old.as_str()))
-            .or_else(|| volume.column_index(&col.name_lower));
+        let vol_idx = match &events {
+            Some(events) => source_before_changes(&col.name_lower, events, volume),
+            None => source_without_order(
+                &col.name_lower,
+                volume_schema_version,
+                dropped_columns,
+                column_renames,
+                volume,
+            ),
+        };
 
         if let Some(vol_idx) = vol_idx {
             let type_matches = vol_idx < volume.meta.column_types.len()
                 && volume.meta.column_types[vol_idx] == col.data_type;
-            let was_dropped = dropped_columns.iter().any(|(d, drop_ver)| {
-                d.as_str() == col.name_lower && volume_schema_version <= *drop_ver
-            });
             let already_used = used_vol_indices.contains(&vol_idx);
-            if type_matches && !was_dropped && !already_used {
+            if type_matches && !already_used {
                 if is_identity && vol_idx != pos {
                     is_identity = false;
                 }
@@ -2222,21 +2319,6 @@ impl FrozenVolume {
         self.meta.column_name_map.get(lower.as_str()).copied()
     }
 
-    /// Merge a column rename directly into column_name_map.
-    /// Must be called BEFORE wrapping in Arc (takes &mut self).
-    /// After this, column_index() finds both old and new names via the map.
-    pub fn merge_column_rename(&mut self, new_name: &str, old_name: &str) {
-        let meta = Arc::make_mut(&mut self.meta);
-        let old_lower = SmartString::from(old_name.to_lowercase());
-        let new_lower = SmartString::from(new_name.to_lowercase());
-        if let Some(&idx) = meta.column_name_map.get(&old_lower) {
-            meta.column_name_map.insert(new_lower, idx);
-        } else if let Some(&idx) = meta.column_name_map.get(&new_lower) {
-            // Already has the new name (chained rename handled)
-            let _ = idx;
-        }
-    }
-
     /// Return the dictionary for a dictionary-encoded column.
     /// Avoids decompressing the full column — extracts from the shared
     /// dictionary stored in the compressed block store or OnceLock slot.
@@ -2396,6 +2478,66 @@ mod tests {
         let row = volume.get_row(0).unwrap();
         assert_eq!(row.get(0), Some(&Value::Integer(1)));
         assert_eq!(row.get(2), Some(&Value::text("binance")));
+    }
+
+    /// One sealed volume (id, a, c) with a = 1 and c = 9, read under
+    /// schemas that reached their names by renames and drops
+    fn sealed_ac() -> FrozenVolume {
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("a", DataType::Integer, false, false)
+            .column("c", DataType::Integer, false, false)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![
+                Value::Integer(1),
+                Value::Integer(1),
+                Value::Integer(9),
+            ]),
+        );
+        builder.finish().unwrap()
+    }
+
+    fn sm(s: &str) -> crate::common::SmartString {
+        crate::common::SmartString::from(s)
+    }
+
+    #[test]
+    fn a_history_with_versions_is_walked_in_order_and_one_without_is_read_as_before() {
+        let volume = sealed_ac();
+        // Sealed at version 1; then a renamed to b (2), b dropped (3), c
+        // renamed to b (4): the schema's b is the old c
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("b", DataType::Integer, false, false)
+            .build();
+        let renames = vec![(sm("a"), sm("b")), (sm("c"), sm("b"))];
+        let drops = vec![
+            (sm(&rename_marker(0)), 2),
+            (sm("b"), 3),
+            (sm(&rename_marker(1)), 4),
+        ];
+        let mapping = compute_column_mapping_with_drops(&schema, &volume, &drops, 1, &renames);
+        assert!(matches!(mapping.sources[1], ColSource::Volume(2)));
+        // The same records without the rename markers have no order: the
+        // one-step reading of before applies, and b, dropped at or after
+        // the seal, resolves to its default
+        let drops = vec![(sm("b"), 3)];
+        let mapping = compute_column_mapping_with_drops(&schema, &volume, &drops, 1, &renames);
+        assert!(matches!(mapping.sources[1], ColSource::Default(_)));
+        // A rename recorded in the version the seal carries happened
+        // before the seal and is not walked
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("a", DataType::Integer, false, false)
+            .column("c", DataType::Integer, false, false)
+            .build();
+        let renames = vec![(sm("x"), sm("a"))];
+        let drops = vec![(sm(&rename_marker(0)), 1)];
+        let mapping = compute_column_mapping_with_drops(&schema, &volume, &drops, 1, &renames);
+        assert!(mapping.is_identity && matches!(mapping.sources[1], ColSource::Volume(1)));
     }
 
     #[test]

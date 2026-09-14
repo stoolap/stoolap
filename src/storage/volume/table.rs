@@ -920,6 +920,14 @@ impl SegmentedTable {
         where_expr: Option<&dyn Expression>,
         hot_skip: FxHashSet<i64>,
     ) -> Result<RowVec> {
+        // A filter evaluates by column position and rejects every row until
+        // it is prepared for the schema; callers hand it over as written
+        let prepared = where_expr.map(|expr| {
+            let mut prepared = expr.clone_box();
+            prepared.prepare_for_schema(self.hot.schema());
+            prepared
+        });
+        let where_expr = prepared.as_deref();
         let comparisons = where_expr
             .map(|e| e.collect_comparisons())
             .unwrap_or_default();
@@ -985,7 +993,9 @@ impl SegmentedTable {
                     if op != crate::core::Operator::Eq {
                         continue;
                     }
-                    if let Some(col_idx) = vol.column_index(col_name) {
+                    // Through the mapping: the volume may hold a dropped or
+                    // renamed column under this name
+                    if let Some(col_idx) = cs.mapping.volume_column(vol, col_name) {
                         if let Value::Text(s) = value {
                             let dict_id = if let Some(st) = store {
                                 st.dict_lookup(col_idx, s.as_str())
@@ -4158,7 +4168,9 @@ impl Table for SegmentedTable {
         let mut ordered: Vec<(usize, usize, Value)> = Vec::with_capacity(volumes.len());
         for (i, (_, cs)) in volumes.iter().enumerate() {
             let vol = &cs.volume;
-            let Some(vcol) = vol.column_index(&col_lower) else {
+            // Through the mapping, so a renamed column's bounds and stop
+            // key come from the column the schema means
+            let Some(vcol) = cs.mapping.volume_column(vol, &col_lower) else {
                 return Ok(None);
             };
             let Some(zm) = vol.meta.zone_maps.get(vcol) else {
@@ -4487,13 +4499,13 @@ impl Table for SegmentedTable {
             return result;
         }
         let hot_min = self.hot.get_index_min_value(column_name);
-        let segments = self.segment_mgr.get_segments_ordered_meta();
+        let segments = self.segment_mgr.segments_raw();
         let mut vol_min: Option<Value> = None;
-        for vol in &segments {
-            // Resolve physical column index per volume (schema evolution safe)
-            let Some(pi) = vol.column_index(column_name) else {
-                continue;
-            };
+        for cs in segments.values() {
+            let vol = &cs.volume;
+            // Through the mapping; a column a volume does not hold carries a
+            // default for every row of it, which this shortcut cannot see
+            let pi = cs.mapping.volume_column(vol, column_name)?;
             if pi >= vol.meta.zone_maps.len() {
                 continue;
             }
@@ -4528,13 +4540,13 @@ impl Table for SegmentedTable {
             return result;
         }
         let hot_max = self.hot.get_index_max_value(column_name);
-        let segments = self.segment_mgr.get_segments_ordered_meta();
+        let segments = self.segment_mgr.segments_raw();
         let mut vol_max: Option<Value> = None;
-        for vol in &segments {
-            // Resolve physical column index per volume (schema evolution safe)
-            let Some(pi) = vol.column_index(column_name) else {
-                continue;
-            };
+        for cs in segments.values() {
+            let vol = &cs.volume;
+            // Through the mapping; a column a volume does not hold carries a
+            // default for every row of it, which this shortcut cannot see
+            let pi = cs.mapping.volume_column(vol, column_name)?;
             if pi >= vol.meta.zone_maps.len() {
                 continue;
             }

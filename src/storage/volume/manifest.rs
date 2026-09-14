@@ -577,6 +577,35 @@ fn compute_visibility_bitmaps(
 
 /// Per-table segment manager.
 ///
+/// The mapping a segment is published with: computed against `schema`
+/// from the manifest's history and the segment's own version, or the
+/// identity when the caller vouches the volume matches the schema. Taken
+/// under the manifest lock the publication holds, so the mapping and the
+/// segment appear together
+fn mapping_for(
+    manifest: &TableManifest,
+    volume: &FrozenVolume,
+    schema_version: u64,
+    schema: Option<&crate::core::Schema>,
+) -> super::writer::ColumnMapping {
+    match schema {
+        Some(schema) => super::writer::compute_column_mapping_with_drops(
+            schema,
+            volume,
+            &manifest.dropped_columns,
+            schema_version,
+            &manifest.column_renames,
+        ),
+        None => super::writer::ColumnMapping {
+            sources: (0..volume.columns.len())
+                .map(super::writer::ColSource::Volume)
+                .collect(),
+            names: Vec::new(),
+            is_identity: true,
+        },
+    }
+}
+
 /// Owns the manifest, loaded segments, and tombstone set for one table.
 /// Tombstones track cold row_ids that have been deleted or superseded
 /// by hot buffer versions. They are persisted in the manifest and used
@@ -1613,13 +1642,14 @@ impl SegmentManager {
         Ok(verdict)
     }
 
-    /// Keep that the volume of `seg_id` was written in `key` order
-    pub fn record_key_order(&self, seg_id: u64, key: &[usize]) {
-        if let Some(columns) = self.volume_key(seg_id, key) {
-            self.key_order_verdicts
-                .lock()
-                .insert(seg_id, (columns, true));
-        }
+    /// Keep that the volume of `seg_id` was written in the order of its own
+    /// `columns`: the physical positions, which the writer knows, not a
+    /// schema key, which the mapping current at the time would resolve
+    /// against a schema the volume may no longer match
+    pub fn record_key_order(&self, seg_id: u64, columns: &[usize]) {
+        self.key_order_verdicts
+            .lock()
+            .insert(seg_id, (columns.to_vec(), true));
     }
 
     /// Drop the verdicts of segments that are gone
@@ -1687,25 +1717,7 @@ impl SegmentManager {
                 manifest.next_segment_id = segment_id + 1;
             }
             manifest.add_segment(meta);
-            let mapping = if let Some(s) = schema {
-                let drops = manifest.dropped_columns.clone();
-                let renames = manifest.column_renames.clone();
-                super::writer::compute_column_mapping_with_drops(
-                    s,
-                    &volume,
-                    &drops,
-                    seg_schema_version,
-                    &renames,
-                )
-            } else {
-                super::writer::ColumnMapping {
-                    sources: (0..volume.columns.len())
-                        .map(super::writer::ColSource::Volume)
-                        .collect(),
-                    names: Vec::new(),
-                    is_identity: true,
-                }
-            };
+            let mapping = mapping_for(&manifest, &volume, seg_schema_version, schema);
             let cold = ColdSegment {
                 volume,
                 mapping,
@@ -2394,7 +2406,7 @@ impl SegmentManager {
     /// Record a column drop so old volumes don't leak stale data.
     /// `schema_version` is the current schema epoch at drop time. Only volumes
     /// with schema_version <= this value will have the column masked.
-    pub fn record_column_drop(&self, col_name: &str, schema_version: u64) {
+    pub fn record_column_drop(&self, col_name: &str, schema_version: u64, ddl_lsn: Option<u64>) {
         let lower = SmartString::from(col_name.to_lowercase());
         let mut manifest = self.manifest.write();
         // Remove any existing entry for this column name before adding the new one.
@@ -2403,6 +2415,39 @@ impl SegmentManager {
             .dropped_columns
             .retain(|(name, _)| name.as_str() != lower.as_str());
         manifest.dropped_columns.push((lower, schema_version));
+        if let Some(lsn) = ddl_lsn {
+            Self::note_ddl_lsn_in(&mut manifest, lsn);
+        }
+    }
+
+    /// The log position up to which this manifest holds every rename and
+    /// drop, kept in the drop list under a name no column can carry; a
+    /// change replayed from the log at or below it is already here
+    pub fn ddl_recorded_lsn(&self) -> u64 {
+        self.manifest
+            .read()
+            .dropped_columns
+            .iter()
+            .find(|(name, _)| name.as_str() == super::writer::DDL_LSN_MARKER)
+            .map_or(0, |(_, lsn)| *lsn)
+    }
+
+    /// Raise the recorded log position to `lsn`
+    pub fn note_ddl_lsn(&self, lsn: u64) {
+        Self::note_ddl_lsn_in(&mut self.manifest.write(), lsn);
+    }
+
+    fn note_ddl_lsn_in(manifest: &mut TableManifest, lsn: u64) {
+        match manifest
+            .dropped_columns
+            .iter_mut()
+            .find(|(name, _)| name.as_str() == super::writer::DDL_LSN_MARKER)
+        {
+            Some((_, recorded)) => *recorded = (*recorded).max(lsn),
+            None => manifest
+                .dropped_columns
+                .push((SmartString::from(super::writer::DDL_LSN_MARKER), lsn)),
+        }
     }
 
     /// Note: record_column_readd was removed. dropped_columns is permanent
@@ -2471,12 +2516,44 @@ impl SegmentManager {
 
     /// Record a column rename. The caller must call invalidate_mappings()
     /// afterwards to recompute column mappings with the new rename.
-    pub fn record_column_rename(&self, old_name: &str, new_name: &str) {
-        // Persist in manifest for restart
-        self.manifest
-            .write()
+    pub fn record_column_rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        schema_version: u64,
+        ddl_lsn: Option<u64>,
+    ) {
+        // Persist in manifest for restart. The version goes into the drop
+        // list under a name no column can carry, so the order of renames
+        // against drops survives without a change of format; a reader that
+        // does not know the marker never matches it against a column
+        let mut manifest = self.manifest.write();
+        let ordinal = manifest.column_renames.len();
+        manifest
             .column_renames
             .push((SmartString::from(old_name), SmartString::from(new_name)));
+        manifest.dropped_columns.push((
+            SmartString::from(super::writer::rename_marker(ordinal).as_str()),
+            schema_version,
+        ));
+        if let Some(lsn) = ddl_lsn {
+            Self::note_ddl_lsn_in(&mut manifest, lsn);
+        }
+    }
+
+    /// The largest schema version this table's manifest carries: of its
+    /// segments, its drops and its rename markers. The engine's schema
+    /// epoch restarts above it after an open, so versions recorded from
+    /// then on order against the persisted ones
+    pub fn max_schema_version(&self) -> u64 {
+        let manifest = self.manifest.read();
+        let segments = manifest.segments.iter().map(|s| s.schema_version);
+        let drops = manifest
+            .dropped_columns
+            .iter()
+            .filter(|(name, _)| name.as_str() != super::writer::DDL_LSN_MARKER)
+            .map(|(_, v)| *v);
+        segments.chain(drops).max().unwrap_or(0)
     }
 
     /// Load manifest from disk.
@@ -2558,6 +2635,7 @@ impl SegmentManager {
         new_volume: Arc<FrozenVolume>,
         new_meta: SegmentMeta,
         old_segment_ids: &[u64],
+        schema: Option<&crate::core::Schema>,
     ) {
         // Atomic: manifest + segments updated under both write locks.
         // Bitmap computation runs inside — safe because writers are serialized.
@@ -2577,13 +2655,7 @@ impl SegmentManager {
             manifest.segments.insert(insert_pos, new_meta);
 
             let cold = ColdSegment {
-                mapping: super::writer::ColumnMapping {
-                    sources: (0..new_volume.columns.len())
-                        .map(super::writer::ColSource::Volume)
-                        .collect(),
-                    names: Vec::new(),
-                    is_identity: true,
-                },
+                mapping: mapping_for(&manifest, &new_volume, seg_schema_version, schema),
                 volume: new_volume,
                 schema_version: seg_schema_version,
                 visible: None,
@@ -2615,6 +2687,7 @@ impl SegmentManager {
         &self,
         new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
         old_segment_ids: &[u64],
+        schema: Option<&crate::core::Schema>,
     ) {
         if new_volumes.is_empty() {
             self.replace_segments_atomic_remove_only(old_segment_ids);
@@ -2622,7 +2695,7 @@ impl SegmentManager {
         }
         if new_volumes.len() == 1 {
             let (id, vol, meta) = new_volumes.into_iter().next().unwrap();
-            self.replace_segments_atomic(id, vol, meta, old_segment_ids);
+            self.replace_segments_atomic(id, vol, meta, old_segment_ids, schema);
             return;
         }
         {
@@ -2649,13 +2722,7 @@ impl SegmentManager {
                 manifest.segments.insert(insert_pos + i, meta);
 
                 let cold = ColdSegment {
-                    mapping: super::writer::ColumnMapping {
-                        sources: (0..vol.columns.len())
-                            .map(super::writer::ColSource::Volume)
-                            .collect(),
-                        names: Vec::new(),
-                        is_identity: true,
-                    },
+                    mapping: mapping_for(&manifest, &vol, seg_schema_version, schema),
                     volume: vol,
                     schema_version: seg_schema_version,
                     visible: None,
@@ -3293,6 +3360,55 @@ mod tests {
     }
 
     #[test]
+    fn a_recorded_order_is_kept_by_physical_column_and_read_through_the_mapping() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+        // Built and sealed as (id, d, k, v), k the key at position 2 and in
+        // order; d is dropped afterwards, so the schema's k is at 1 and v at 2
+        let sealed_with = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("d", DataType::Integer, false, false)
+            .column("k", DataType::Integer, false, false)
+            .column("v", DataType::Integer, false, false)
+            .build();
+        let mut builder = super::super::writer::VolumeBuilder::new(&sealed_with);
+        for i in 1..=4i64 {
+            builder.add_row(
+                i,
+                &Row::from_values(vec![
+                    Value::Integer(i),
+                    Value::Integer(0),
+                    Value::Integer(i),
+                    Value::Integer(5 - i),
+                ]),
+            );
+        }
+        let volume = Arc::new(builder.finish().unwrap());
+        let mgr = SegmentManager::new("t", None);
+        mgr.register_segment(1, volume, meta_of(1, 4), Some(&sealed_with));
+        // The drop completes before the writer records the order it wrote:
+        // the schema's positions have moved, the volume's have not
+        let current = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("k", DataType::Integer, false, false)
+            .column("v", DataType::Integer, false, false)
+            .build();
+        mgr.record_column_drop("d", 1, None);
+        mgr.invalidate_mappings(&current);
+        mgr.record_key_order(1, &[2]);
+        assert_eq!(
+            mgr.known_key_order(1, &[1]),
+            Some(true),
+            "k moved to position 1 and is still the recorded ordered column"
+        );
+        assert_eq!(
+            mgr.known_key_order(1, &[2]),
+            None,
+            "v at position 2 was never checked; a record by the old key position would claim it"
+        );
+        assert!(!mgr.decide_key_order(1, &[2]).unwrap());
+    }
+
+    #[test]
     fn a_verdict_leaves_with_its_segment() {
         use crate::core::{DataType, SchemaBuilder};
         let schema = SchemaBuilder::new("t")
@@ -3310,7 +3426,13 @@ mod tests {
             );
             assert!(!mgr.decide_key_order(seg_id, &[2]).unwrap());
         }
-        mgr.replace_segments_atomic(5, descending_k_volume(&schema, 4), meta_of(5, 4), &[1]);
+        mgr.replace_segments_atomic(
+            5,
+            descending_k_volume(&schema, 4),
+            meta_of(5, 4),
+            &[1],
+            None,
+        );
         mgr.remove_segments(&[2]);
         mgr.replace_segments_atomic_remove_only(&[3]);
         mgr.record_key_order(5, &[2]);
@@ -3646,6 +3768,7 @@ mod tests {
                 schema_version: 0,
             },
             &[1],
+            None,
         );
 
         // The snapshot must keep serving ITS view: segment 1, one volume.
