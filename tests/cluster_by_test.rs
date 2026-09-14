@@ -1093,3 +1093,70 @@ fn a_recluster_batch_keeps_the_newer_copy_of_a_row_left_outside_it() {
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     assert_eq!(price(&db), -1.0);
 }
+
+/// `rows` ticks with ids from `after + 1`, one exchange and symbol and
+/// the time equal to the id, so the volume is in key order as sealed
+fn insert_ordered(db: &Database, after: i64, rows: i64) {
+    db.execute(
+        &format!(
+            "INSERT INTO ticks SELECT g.value + {after}, 'a', 'x', g.value + {after}, g.value \
+             FROM generate_series(1, {rows}) g"
+        ),
+        (),
+    )
+    .unwrap();
+}
+
+/// One volume out of order, then a chain of ordered volumes each holding
+/// a newer copy of a row of the one before, and a dirty volume at the
+/// end. The chain ties the first volume to the dirty one, so together
+/// they exceed the threshold; the first volume must still be rewritten
+/// rather than wait behind dirty work that a single small volume never
+/// finishes
+#[test]
+fn a_selection_tied_to_distant_dirty_work_is_reclustered_on_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?target_volume_rows=65536&compact_threshold=2",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(UNCLUSTERED, ()).unwrap();
+    insert_series(&db, 0, 65_536);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let first = volume_files(dir.path(), "ticks");
+    assert_eq!(first.len(), 1);
+    // Each newer volume takes one row of the previous one, moved to the
+    // front of the key order so the volume stays ordered as sealed
+    for (round, moved) in [(1i64, 5i64), (2, 65_537), (3, 131_073)] {
+        db.execute(
+            &format!(
+                "UPDATE ticks SET exchange = 'a', symbol = 'x', time = {round} WHERE id = {moved}"
+            ),
+            (),
+        )
+        .unwrap();
+        insert_ordered(&db, round * 65_536, 65_535);
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    assert_eq!(volume_files(dir.path(), "ticks").len(), 4);
+    db.execute("DELETE FROM ticks WHERE id = 196700", ())
+        .unwrap();
+
+    db.execute("ALTER TABLE ticks CLUSTER BY (exchange, symbol, time)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert!(
+        !volume_files(dir.path(), "ticks").contains(&first[0]),
+        "the out-of-order volume waited behind the dirty one"
+    );
+    for _ in 0..3 {
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM ticks", ()).unwrap();
+    assert_eq!(count, 65_536 + 3 * 65_535 - 1);
+    let time: i64 = db
+        .query_one("SELECT time FROM ticks WHERE id = 5", ())
+        .unwrap();
+    assert_eq!(time, 1);
+}

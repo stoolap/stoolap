@@ -8182,10 +8182,11 @@ impl TransactionEngineOperations for EngineOperations {
 /// first and last member that shares a row with the batch. While the
 /// members beyond the base exceed `limit`, the selection loses its last
 /// position and the closure is taken again; a last selection that still
-/// exceeds the limit beside base work is left for a cycle of its own,
-/// and a lone member closes over nothing. Returns whether a deferred
-/// volume shares a row with the batch, which holds the table, and
-/// whether the selection was reduced
+/// exceeds the limit beside base work goes alone and the base work
+/// waits for the next cycle, since a lone member closes over nothing
+/// while base work can wait behind the single-volume rule for good.
+/// Returns whether a deferred volume shares a row with the batch, which
+/// holds the table, and whether the selection was reduced
 fn close_batch_over_overlap<'a>(
     planned: &mut [(u64, usize, bool, bool)],
     base: &[bool],
@@ -8194,9 +8195,10 @@ fn close_batch_over_overlap<'a>(
     ids_of: impl Fn(u64) -> &'a [i64],
 ) -> (bool, bool) {
     let mut reduced = false;
+    let mut with_base = true;
     loop {
         for (position, entry) in planned.iter_mut().enumerate() {
-            entry.2 = base[position] || selected.contains(&position);
+            entry.2 = (with_base && base[position]) || selected.contains(&position);
         }
         let mut held = false;
         let first = planned.iter().position(|entry| entry.2);
@@ -8238,15 +8240,15 @@ fn close_batch_over_overlap<'a>(
             .enumerate()
             .filter(|(position, entry)| entry.2 && !base[*position])
             .count();
-        if extra <= limit || selected.is_empty() {
+        if extra <= limit || selected.is_empty() || !with_base {
             return (held, reduced);
         }
         if selected.len() > 1 {
             selected.pop();
+            reduced = true;
         } else {
-            selected.clear();
+            with_base = false;
         }
-        reduced = true;
     }
 }
 
@@ -8300,8 +8302,8 @@ mod tests {
             planned.iter().map(|e| e.2).collect::<Vec<_>>(),
             vec![true, false, false, false]
         );
-        // Beside distant base work the same selection waits for a cycle of
-        // its own, and the base work goes alone
+        // Beside distant base work the same selection goes alone and the
+        // base work waits for the next cycle
         let mut planned = batch_of(&rows);
         planned[3].2 = true;
         let mut selected = vec![0];
@@ -8312,10 +8314,10 @@ mod tests {
             2,
             ids_of,
         );
-        assert!(reduced && selected.is_empty());
+        assert!(!reduced && selected == vec![0]);
         assert_eq!(
             planned.iter().map(|e| e.2).collect::<Vec<_>>(),
-            vec![false, false, false, true]
+            vec![true, false, false, false]
         );
     }
 
