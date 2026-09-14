@@ -1833,7 +1833,7 @@ impl MVCCEngine {
             }
             WALOperationType::AlterTable => {
                 // Schema modification - replay the ALTER TABLE operation
-                if let Err(e) = self.replay_alter_table(&entry.data) {
+                if let Err(e) = self.replay_alter_table(&entry.data, entry.lsn) {
                     eprintln!("Warning: Failed to replay ALTER TABLE: {}", e);
                 }
             }
@@ -2355,7 +2355,7 @@ impl MVCCEngine {
     }
 
     /// Replay an ALTER TABLE operation from WAL
-    fn replay_alter_table(&self, data: &[u8]) -> Result<()> {
+    fn replay_alter_table(&self, data: &[u8], lsn: u64) -> Result<()> {
         if data.is_empty() {
             return Err(Error::internal("empty ALTER TABLE data"));
         }
@@ -2471,7 +2471,7 @@ impl MVCCEngine {
                     .map_err(|e| Error::internal(format!("invalid column name: {}", e)))?;
 
                 // Apply the DROP COLUMN using engine method
-                self.drop_column(&table_name, &column_name)?;
+                self.drop_column_from_log(&table_name, &column_name, lsn)?;
             }
             3 => {
                 // RenameColumn
@@ -2513,7 +2513,7 @@ impl MVCCEngine {
                     .map_err(|e| Error::internal(format!("invalid new column name: {}", e)))?;
 
                 // Apply the RENAME COLUMN using engine method
-                self.rename_column(&table_name, &old_name, &new_name)?;
+                self.rename_column_from_log(&table_name, &old_name, &new_name, lsn)?;
             }
             4 => {
                 // ModifyColumn
@@ -3160,7 +3160,13 @@ impl MVCCEngine {
         volume: Arc<crate::storage::volume::writer::FrozenVolume>,
         seg_id: u64,
     ) {
-        self.register_volume_with_id_and_seal_seq(table_name, volume, seg_id, 0);
+        self.register_volume_with_id_and_seal_seq(
+            table_name,
+            volume,
+            seg_id,
+            0,
+            self.schema_epoch.load(Ordering::Acquire),
+        );
     }
 
     fn register_volume_with_id_and_seal_seq(
@@ -3169,6 +3175,7 @@ impl MVCCEngine {
         volume: Arc<crate::storage::volume::writer::FrozenVolume>,
         seg_id: u64,
         seal_seq: u64,
+        schema_version: u64,
     ) {
         use crate::storage::volume::manifest::SegmentMeta;
         let mgr = self.get_or_create_segment_manager(table_name);
@@ -3187,7 +3194,7 @@ impl MVCCEngine {
                 max_row_id: max_id,
                 creation_lsn: 0,
                 seal_seq,
-                schema_version: self.schema_epoch.load(Ordering::Acquire),
+                schema_version,
             },
             None,
         );
@@ -3321,28 +3328,10 @@ impl MVCCEngine {
             let mut standalone: Vec<(u64, Arc<crate::storage::volume::writer::FrozenVolume>)> =
                 Vec::new();
 
-            // Get column renames from manifest (if any) to merge into volumes.
-            let mgr_for_renames = self.get_or_create_segment_manager(&table_name);
-            let renames: Vec<(String, String)> = {
-                let manifest = mgr_for_renames.manifest();
-                manifest
-                    .column_renames
-                    .iter()
-                    .map(|(old, new)| (old.to_string(), new.to_string()))
-                    .collect()
-            };
-
             for path in paths {
                 let volume_id = parse_volume_id(&path);
                 let volume = match crate::storage::volume::io::read_volume_from_disk(&path) {
-                    Ok(mut volume) => {
-                        // Merge renames into column_name_map BEFORE Arc wrapping.
-                        // No RwLock needed — volume is still exclusively owned.
-                        for (old_name, new_name) in &renames {
-                            volume.merge_column_rename(new_name, old_name);
-                        }
-                        Arc::new(volume)
-                    }
+                    Ok(volume) => Arc::new(volume),
                     Err(e) => {
                         eprintln!(
                             "Warning: Failed to read volume {:?}: {}. Skipping file.",
@@ -3442,22 +3431,9 @@ impl MVCCEngine {
                     continue;
                 }
 
-                // Segment is in manifest but not yet loaded — read from disk.
-                let renames: Vec<(String, String)> = {
-                    let manifest = mgr.manifest();
-                    manifest
-                        .column_renames
-                        .iter()
-                        .map(|(old, new)| (old.to_string(), new.to_string()))
-                        .collect()
-                };
+                // Segment is in manifest but not yet loaded: read from disk.
                 let volume = match crate::storage::volume::io::read_volume_from_disk(&path) {
-                    Ok(mut volume) => {
-                        for (old_name, new_name) in &renames {
-                            volume.merge_column_rename(new_name, old_name);
-                        }
-                        Arc::new(volume)
-                    }
+                    Ok(volume) => Arc::new(volume),
                     Err(e) => {
                         eprintln!(
                             "Warning: Failed to read volume {:?}: {}. Skipping file.",
@@ -3511,6 +3487,21 @@ impl MVCCEngine {
 
     /// Drops a column from a table
     pub fn drop_column(&self, table_name: &str, column_name: &str) -> Result<()> {
+        self.drop_column_inner(table_name, column_name, None)
+    }
+
+    /// A DROP COLUMN replayed from the log at `lsn`: the manifest records
+    /// the drop only if it does not hold it already
+    fn drop_column_from_log(&self, table_name: &str, column_name: &str, lsn: u64) -> Result<()> {
+        self.drop_column_inner(table_name, column_name, Some(lsn))
+    }
+
+    fn drop_column_inner(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        replayed_lsn: Option<u64>,
+    ) -> Result<()> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3561,13 +3552,35 @@ impl MVCCEngine {
         // Record the drop in the segment manifest so cold volume mappings
         // mask stale data. Same as the live DDL path in ddl.rs. Without this,
         // crash recovery (WAL replay) loses dropped_columns metadata.
-        self.propagate_column_drop(table_name, column_name);
+        self.propagate_column_drop_inner(table_name, column_name, replayed_lsn);
 
         Ok(())
     }
 
     /// Renames a column in a table
     pub fn rename_column(&self, table_name: &str, old_name: &str, new_name: &str) -> Result<()> {
+        self.rename_column_inner(table_name, old_name, new_name, None)
+    }
+
+    /// A RENAME COLUMN replayed from the log at `lsn`: the manifest records
+    /// the rename only if it does not hold it already
+    fn rename_column_from_log(
+        &self,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+        lsn: u64,
+    ) -> Result<()> {
+        self.rename_column_inner(table_name, old_name, new_name, Some(lsn))
+    }
+
+    fn rename_column_inner(
+        &self,
+        table_name: &str,
+        old_name: &str,
+        new_name: &str,
+        replayed_lsn: Option<u64>,
+    ) -> Result<()> {
         if !self.is_open() {
             return Err(Error::EngineNotOpen);
         }
@@ -3619,11 +3632,15 @@ impl MVCCEngine {
         {
             let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
             if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
-                mgr.record_column_rename(
-                    old_name,
-                    new_name,
-                    self.schema_epoch.load(Ordering::Acquire),
-                );
+                let held_already = replayed_lsn.is_some_and(|lsn| lsn <= mgr.ddl_recorded_lsn());
+                if !held_already {
+                    mgr.record_column_rename(
+                        old_name,
+                        new_name,
+                        self.schema_epoch.load(Ordering::Acquire),
+                        replayed_lsn,
+                    );
+                }
                 if let Some(ref s) = schema {
                     mgr.invalidate_mappings(s);
                 }
@@ -3684,14 +3701,41 @@ impl MVCCEngine {
 
     /// Record a column drop so old cold volumes don't leak stale data.
     pub fn propagate_column_drop(&self, table_name: &str, col_name: &str) {
+        self.propagate_column_drop_inner(table_name, col_name, None);
+    }
+
+    fn propagate_column_drop_inner(
+        &self,
+        table_name: &str,
+        col_name: &str,
+        replayed_lsn: Option<u64>,
+    ) {
         let table_name_lower = table_name.to_lowercase();
         let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
         let current_epoch = self.schema_epoch.load(Ordering::Acquire);
         if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
-            mgr.record_column_drop(col_name, current_epoch);
+            let held_already = replayed_lsn.is_some_and(|lsn| lsn <= mgr.ddl_recorded_lsn());
+            if !held_already {
+                mgr.record_column_drop(col_name, current_epoch, replayed_lsn);
+            }
             if let Some(ref s) = schema {
                 mgr.invalidate_mappings(s);
             }
+        }
+    }
+
+    /// The log position the statement's record took, noted on the table's
+    /// manifest so a replay of the same record does not add it again
+    fn note_ddl_recorded(&self, table_name: &str) {
+        let Some(pm) = self.persistence.as_ref() else {
+            return;
+        };
+        if !pm.is_enabled() {
+            return;
+        }
+        let table_name_lower = table_name.to_lowercase();
+        if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
+            mgr.note_ddl_lsn(pm.current_lsn());
         }
     }
 
@@ -3705,6 +3749,7 @@ impl MVCCEngine {
                 old_name,
                 new_name,
                 self.schema_epoch.load(Ordering::Acquire),
+                None,
             );
             if let Some(ref s) = schema {
                 mgr.invalidate_mappings(s);
@@ -5571,10 +5616,10 @@ impl MVCCEngine {
             // The request is read before the schema: a key set between the
             // two opens a newer request, which this cycle cannot close
             let recluster_request = mgr.recluster_request();
-            let schema = {
+            let (schema, schema_version) = {
                 let schemas = self.schemas.read().unwrap();
                 match schemas.get(table_name) {
-                    Some(s) => s.clone(),
+                    Some(s) => (s.clone(), self.schema_epoch.load(Ordering::Acquire)),
                     None => continue,
                 }
             };
@@ -6021,7 +6066,7 @@ impl MVCCEngine {
                                 max_row_id: max_id,
                                 creation_lsn: 0,
                                 seal_seq: 0,
-                                schema_version: self.schema_epoch.load(Ordering::Acquire),
+                                schema_version,
                             },
                         ));
                     }
@@ -6215,17 +6260,19 @@ impl MVCCEngine {
                 .collect()
         };
 
-        // Step 3: Look up schemas (separate lock acquisition)
-        let table_names: Vec<(String, CompactArc<Schema>, Arc<VersionStore>, bool)> = {
-            let schemas = self.schemas.read().unwrap();
-            candidates
-                .into_iter()
-                .filter_map(|(table_name, store, has_seg)| {
-                    let schema = schemas.get(&table_name)?.clone();
-                    Some((table_name, schema, store, has_seg))
-                })
-                .collect()
-        };
+        // Step 3: Look up schemas (separate lock acquisition). The schema
+        // version is read under the same lock, so a volume built from
+        // these schemas carries the version they had, not a later one
+        let schemas = self.schemas.read().unwrap();
+        let sealed_schema_version = self.schema_epoch.load(Ordering::Acquire);
+        let table_names: Vec<(String, CompactArc<Schema>, Arc<VersionStore>, bool)> = candidates
+            .into_iter()
+            .filter_map(|(table_name, store, has_seg)| {
+                let schema = schemas.get(&table_name)?.clone();
+                Some((table_name, schema, store, has_seg))
+            })
+            .collect();
+        drop(schemas);
 
         // Batch size for hot removal only. Volume is built once per table.
         // Smaller batches = shorter write lock hold time per batch.
@@ -6341,6 +6388,7 @@ impl MVCCEngine {
                         Arc::clone(volume),
                         *volume_id,
                         current_seal_seq,
+                        sealed_schema_version,
                     );
                 }
 
@@ -6743,7 +6791,9 @@ impl Engine for MVCCEngine {
         data.extend_from_slice(&(column_name.len() as u16).to_le_bytes());
         data.extend_from_slice(column_name.as_bytes());
 
-        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)?;
+        self.note_ddl_recorded(table_name);
+        Ok(())
     }
 
     fn record_alter_table_rename_column(
@@ -6773,7 +6823,9 @@ impl Engine for MVCCEngine {
         data.extend_from_slice(&(new_column_name.len() as u16).to_le_bytes());
         data.extend_from_slice(new_column_name.as_bytes());
 
-        self.record_ddl(table_name, WALOperationType::AlterTable, &data)
+        self.record_ddl(table_name, WALOperationType::AlterTable, &data)?;
+        self.note_ddl_recorded(table_name);
+        Ok(())
     }
 
     fn record_alter_table_modify_column(

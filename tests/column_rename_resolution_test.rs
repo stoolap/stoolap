@@ -463,3 +463,90 @@ fn renames_replayed_from_the_log_keep_their_order_against_the_seal() {
         );
     }
 }
+
+/// A rename the manifest holds already is replayed from the log when the
+/// log was kept past it (a snapshot held the truncation back): the
+/// replay must not record it a second time, or the volume sealed after
+/// the rename is read as if it predated it
+#[test]
+fn a_rename_replayed_over_a_manifest_that_holds_it_is_not_recorded_twice() {
+    use stoolap::IsolationLevel;
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 1)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.execute("ALTER TABLE t RENAME COLUMN a TO b", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (2, 2)", ()).unwrap();
+        // A snapshot begun here keeps row 3 in the hot store through the
+        // checkpoint, so the log is not truncated while the manifest,
+        // holding the rename, is written out with the second volume
+        let snapshot = db
+            .begin_with_isolation(IsolationLevel::SnapshotIsolation)
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (3, 3)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        drop(snapshot);
+        assert_eq!(
+            values(&db, "SELECT id, b FROM t WHERE id = 2"),
+            vec![Some(2), Some(2)]
+        );
+    }
+    for _ in 0..2 {
+        let db = Database::open(&dsn).unwrap();
+        for id in 1..=3 {
+            assert_eq!(
+                values(&db, &format!("SELECT id, b FROM t WHERE id = {id}")),
+                vec![Some(id), Some(id)],
+                "row {id} after a reopen"
+            );
+        }
+    }
+}
+
+/// After a full checkpoint the log holds no renames and the manifest is
+/// the only history: a volume read back from disk keeps its own column
+/// names, and the renamed names resolve through the mapping alone
+#[test]
+fn renames_survive_a_full_checkpoint_and_a_reopen_through_the_manifest_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 1, 2)", ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.execute("ALTER TABLE t RENAME COLUMN a TO t", ())
+            .unwrap();
+        db.execute("ALTER TABLE t RENAME COLUMN b TO a", ())
+            .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        assert_eq!(
+            values(&db, "SELECT t, a FROM t WHERE id = 1"),
+            vec![Some(1), Some(2)]
+        );
+    }
+    for _ in 0..2 {
+        let db = Database::open(&dsn).unwrap();
+        assert_eq!(
+            values(&db, "SELECT t, a FROM t WHERE id = 1"),
+            vec![Some(1), Some(2)]
+        );
+        let rows = db
+            .query("SELECT id FROM t WHERE a = 2 AND t = 1", ())
+            .unwrap()
+            .count();
+        assert_eq!(rows, 1);
+    }
+}

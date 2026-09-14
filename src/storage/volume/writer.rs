@@ -1843,6 +1843,10 @@ pub fn rename_marker(ordinal: usize) -> String {
     format!("\0{ordinal}")
 }
 
+/// The drop-list name under which the log position the manifest's renames
+/// and drops reach is kept
+pub const DDL_LSN_MARKER: &str = "\0lsn";
+
 /// A change of the schema since a volume was sealed
 enum SchemaEvent<'a> {
     Renamed { old: &'a str, new: &'a str },
@@ -2313,21 +2317,6 @@ impl FrozenVolume {
         }
         let lower = name.to_lowercase();
         self.meta.column_name_map.get(lower.as_str()).copied()
-    }
-
-    /// Merge a column rename directly into column_name_map.
-    /// Must be called BEFORE wrapping in Arc (takes &mut self).
-    /// After this, column_index() finds both old and new names via the map.
-    pub fn merge_column_rename(&mut self, new_name: &str, old_name: &str) {
-        let meta = Arc::make_mut(&mut self.meta);
-        let old_lower = SmartString::from(old_name.to_lowercase());
-        let new_lower = SmartString::from(new_name.to_lowercase());
-        if let Some(&idx) = meta.column_name_map.get(&old_lower) {
-            meta.column_name_map.insert(new_lower, idx);
-        } else if let Some(&idx) = meta.column_name_map.get(&new_lower) {
-            // Already has the new name (chained rename handled)
-            let _ = idx;
-        }
     }
 
     /// Return the dictionary for a dictionary-encoded column.

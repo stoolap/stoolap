@@ -2394,7 +2394,7 @@ impl SegmentManager {
     /// Record a column drop so old volumes don't leak stale data.
     /// `schema_version` is the current schema epoch at drop time. Only volumes
     /// with schema_version <= this value will have the column masked.
-    pub fn record_column_drop(&self, col_name: &str, schema_version: u64) {
+    pub fn record_column_drop(&self, col_name: &str, schema_version: u64, ddl_lsn: Option<u64>) {
         let lower = SmartString::from(col_name.to_lowercase());
         let mut manifest = self.manifest.write();
         // Remove any existing entry for this column name before adding the new one.
@@ -2403,6 +2403,39 @@ impl SegmentManager {
             .dropped_columns
             .retain(|(name, _)| name.as_str() != lower.as_str());
         manifest.dropped_columns.push((lower, schema_version));
+        if let Some(lsn) = ddl_lsn {
+            Self::note_ddl_lsn_in(&mut manifest, lsn);
+        }
+    }
+
+    /// The log position up to which this manifest holds every rename and
+    /// drop, kept in the drop list under a name no column can carry; a
+    /// change replayed from the log at or below it is already here
+    pub fn ddl_recorded_lsn(&self) -> u64 {
+        self.manifest
+            .read()
+            .dropped_columns
+            .iter()
+            .find(|(name, _)| name.as_str() == super::writer::DDL_LSN_MARKER)
+            .map_or(0, |(_, lsn)| *lsn)
+    }
+
+    /// Raise the recorded log position to `lsn`
+    pub fn note_ddl_lsn(&self, lsn: u64) {
+        Self::note_ddl_lsn_in(&mut self.manifest.write(), lsn);
+    }
+
+    fn note_ddl_lsn_in(manifest: &mut TableManifest, lsn: u64) {
+        match manifest
+            .dropped_columns
+            .iter_mut()
+            .find(|(name, _)| name.as_str() == super::writer::DDL_LSN_MARKER)
+        {
+            Some((_, recorded)) => *recorded = (*recorded).max(lsn),
+            None => manifest
+                .dropped_columns
+                .push((SmartString::from(super::writer::DDL_LSN_MARKER), lsn)),
+        }
     }
 
     /// Note: record_column_readd was removed. dropped_columns is permanent
@@ -2471,7 +2504,13 @@ impl SegmentManager {
 
     /// Record a column rename. The caller must call invalidate_mappings()
     /// afterwards to recompute column mappings with the new rename.
-    pub fn record_column_rename(&self, old_name: &str, new_name: &str, schema_version: u64) {
+    pub fn record_column_rename(
+        &self,
+        old_name: &str,
+        new_name: &str,
+        schema_version: u64,
+        ddl_lsn: Option<u64>,
+    ) {
         // Persist in manifest for restart. The version goes into the drop
         // list under a name no column can carry, so the order of renames
         // against drops survives without a change of format; a reader that
@@ -2485,6 +2524,9 @@ impl SegmentManager {
             SmartString::from(super::writer::rename_marker(ordinal).as_str()),
             schema_version,
         ));
+        if let Some(lsn) = ddl_lsn {
+            Self::note_ddl_lsn_in(&mut manifest, lsn);
+        }
     }
 
     /// The largest schema version this table's manifest carries: of its
@@ -2494,7 +2536,11 @@ impl SegmentManager {
     pub fn max_schema_version(&self) -> u64 {
         let manifest = self.manifest.read();
         let segments = manifest.segments.iter().map(|s| s.schema_version);
-        let drops = manifest.dropped_columns.iter().map(|(_, v)| *v);
+        let drops = manifest
+            .dropped_columns
+            .iter()
+            .filter(|(name, _)| name.as_str() != super::writer::DDL_LSN_MARKER)
+            .map(|(_, v)| *v);
         segments.chain(drops).max().unwrap_or(0)
     }
 
