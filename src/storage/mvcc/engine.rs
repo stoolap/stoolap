@@ -117,6 +117,7 @@ fn strip_fk_references(
                     old_schema.updated_at,
                 );
                 std::mem::swap(&mut new_schema.foreign_keys, &mut new_fks);
+                new_schema.cluster_key = old_schema.cluster_key.clone();
                 let new_arc = CompactArc::new(new_schema);
 
                 if let Some(vs) = version_stores.get(child_name.as_str()) {
@@ -5704,40 +5705,47 @@ impl MVCCEngine {
                 live_refs.sort_unstable_by_key(|(id, _, _)| *id);
             } else {
                 use crate::storage::volume::writer::ColSource;
-                let key_of = |vol_idx: usize, row_idx: usize| -> Vec<Value> {
+                // One buffer per key column over all live rows, then an
+                // index sort: a handful of allocations for the whole merge
+                let key_value = |vol_idx: usize, row_idx: usize, column: usize| -> Value {
                     let vol = &volumes[vol_idx].1;
                     let mapping = &vol_mappings[vol_idx];
-                    schema
-                        .cluster_key
-                        .iter()
-                        .map(|&column| {
-                            let source = if mapping.is_identity {
-                                Some(column)
-                            } else {
-                                match mapping.sources.get(column) {
-                                    Some(ColSource::Volume(v)) => Some(*v),
-                                    Some(ColSource::Default(value)) => return value.clone(),
-                                    None => None,
-                                }
-                            };
-                            source
-                                .and_then(|v| vol.columns.get(v).ok())
-                                .map(|col| col.get_value(row_idx))
-                                .unwrap_or_else(Value::null_unknown)
-                        })
-                        .collect()
+                    let source = if mapping.is_identity {
+                        Some(column)
+                    } else {
+                        match mapping.sources.get(column) {
+                            Some(ColSource::Volume(v)) => Some(*v),
+                            Some(ColSource::Default(value)) => return value.clone(),
+                            None => None,
+                        }
+                    };
+                    source
+                        .and_then(|v| vol.columns.get(v).ok())
+                        .map(|col| col.get_value(row_idx))
+                        .unwrap_or_else(Value::null_unknown)
                 };
-                let mut keyed: Vec<(Vec<Value>, (i64, usize, usize))> = live_refs
+                let key_columns: Vec<Vec<Value>> = schema
+                    .cluster_key
                     .iter()
-                    .map(|&(row_id, vol_idx, row_idx)| {
-                        (key_of(vol_idx, row_idx), (row_id, vol_idx, row_idx))
+                    .map(|&column| {
+                        live_refs
+                            .iter()
+                            .map(|&(_, vol_idx, row_idx)| key_value(vol_idx, row_idx, column))
+                            .collect()
                     })
                     .collect();
-                keyed.sort_by(|a, b| {
-                    crate::storage::volume::seal::compare_cluster_keys(&a.0, &b.0)
-                        .then(a.1 .0.cmp(&b.1 .0))
+                let mut order: Vec<u32> = (0..live_refs.len() as u32).collect();
+                order.sort_unstable_by(|&a, &b| {
+                    let (a, b) = (a as usize, b as usize);
+                    key_columns
+                        .iter()
+                        .map(|values| {
+                            crate::storage::volume::seal::compare_key_values(&values[a], &values[b])
+                        })
+                        .find(|o| *o != std::cmp::Ordering::Equal)
+                        .unwrap_or_else(|| live_refs[a].0.cmp(&live_refs[b].0))
                 });
-                live_refs = keyed.into_iter().map(|(_, r)| r).collect();
+                live_refs = order.iter().map(|&i| live_refs[i as usize]).collect();
             }
 
             // Split live_refs into target-sized chunks and build one volume per chunk.

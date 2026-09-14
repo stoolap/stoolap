@@ -353,6 +353,14 @@ impl Executor {
                         column.value
                     )));
                 }
+                // The key orders rows, so every column of it must order
+                let data_type = self.parse_data_type(&stmt.columns[index].data_type)?;
+                if matches!(data_type, DataType::Json | DataType::Vector) {
+                    return Err(Error::Parse(format!(
+                        "CLUSTER BY column '{}' has type {:?}, which has no order",
+                        column.value, data_type
+                    )));
+                }
                 key.push(index);
             }
             schema_builder = schema_builder.cluster_by(key);

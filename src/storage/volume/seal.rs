@@ -52,23 +52,33 @@ pub fn seal_rows(schema: &Schema, rows: &[(i64, Row)]) -> Result<FrozenVolume> {
     builder.finish()
 }
 
-/// Orders two values of a clustering key column: NULL first, then by value
-fn compare_key_value(a: &Value, b: &Value) -> Ordering {
-    match (a.is_null(), b.is_null()) {
-        (true, true) => Ordering::Equal,
-        (true, false) => Ordering::Less,
-        (false, true) => Ordering::Greater,
-        (false, false) => a.compare(b).unwrap_or(Ordering::Equal),
+/// Where a value sorts among the kinds a key column can hold: NULL, then
+/// booleans, numbers, text, timestamps. A column whose type changed
+/// after some rows were written holds more than one kind, and comparing
+/// across kinds by value is not transitive, so the kind decides first
+fn key_kind(value: &Value) -> u8 {
+    match value {
+        Value::Null(_) => 0,
+        Value::Boolean(_) => 1,
+        Value::Integer(_) | Value::Float(_) => 2,
+        Value::Text(_) => 3,
+        Value::Timestamp(_) => 4,
+        _ => 5,
     }
 }
 
-/// Orders two clustering keys column by column
-pub fn compare_cluster_keys(a: &[Value], b: &[Value]) -> Ordering {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| compare_key_value(x, y))
-        .find(|o| *o != Ordering::Equal)
-        .unwrap_or(Ordering::Equal)
+/// Orders two values of a clustering key column: by kind, then by value
+fn compare_key_value(a: &Value, b: &Value) -> Ordering {
+    let kinds = key_kind(a).cmp(&key_kind(b));
+    if kinds != Ordering::Equal || a.is_null() {
+        return kinds;
+    }
+    a.compare(b).unwrap_or(Ordering::Equal)
+}
+
+/// Orders two values of one clustering key column
+pub fn compare_key_values(a: &Value, b: &Value) -> Ordering {
+    compare_key_value(a, b)
 }
 
 /// Orders two rows of a clustered table by its key, then by row id

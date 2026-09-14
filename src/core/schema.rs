@@ -673,7 +673,20 @@ impl Schema {
         let idx = self
             .get_column_index(name)
             .ok_or_else(|| Error::ColumnNotFound(name.to_string()))?;
+        // The clustering key names columns by position: a key column
+        // cannot go, and the columns after a removed one move down
+        if self.cluster_key.contains(&idx) {
+            return Err(Error::Parse(format!(
+                "column '{}' is in the CLUSTER BY key of table '{}'",
+                name, self.table_name
+            )));
+        }
         let column = self.columns.remove(idx);
+        for key in &mut self.cluster_key {
+            if *key > idx {
+                *key -= 1;
+            }
+        }
 
         // Re-index remaining columns
         for (i, col) in self.columns.iter_mut().enumerate() {

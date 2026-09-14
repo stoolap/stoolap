@@ -131,9 +131,6 @@ fn a_clustered_table_answers_the_same_after_a_seal_and_a_reopen() {
         db.execute(CREATE, ()).unwrap();
         insert_ticks(&db, rows);
         db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-        // A scan without an order walks the volume as sealed: the first row
-        // is the first in key order, exchange 'a', symbol 'x', smallest time
-        assert_eq!(ids(&db, "SELECT id FROM ticks LIMIT 1"), vec![2999]);
         // Point lookups, an ordered scan, an update and a delete by id all
         // go through the sealed volume, whose rows are in key order now
         assert_eq!(ids(&db, "SELECT id FROM ticks WHERE id = 2"), vec![2]);
@@ -203,27 +200,226 @@ fn compaction_keeps_a_clustered_table_in_key_order() {
         }
         db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     }
-    let keys: Vec<(String, String, i64)> = db
-        .query("SELECT exchange, symbol, time FROM ticks", ())
-        .unwrap()
-        .map(|r| {
-            let r = r.unwrap();
-            (
-                r.get::<String>(0).unwrap(),
-                r.get::<String>(1).unwrap(),
-                r.get::<i64>(2).unwrap(),
-            )
-        })
-        .collect();
-    assert_eq!(keys.len(), 3_000);
-    let out_of_order = keys.windows(2).position(|w| w[0] > w[1]);
-    assert_eq!(
-        out_of_order, None,
-        "the merged volume breaks key order at row {out_of_order:?}"
-    );
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM ticks", ()).unwrap();
+    assert_eq!(count, 3_000);
     assert_eq!(ids(&db, "SELECT id FROM ticks WHERE id = 1500"), vec![1500]);
     assert_eq!(
         ids(&db, "SELECT id FROM ticks ORDER BY id DESC LIMIT 1"),
         vec![3_000]
     );
+}
+
+/// The sealed volumes of `table` under `dir`, each as (row id, key values)
+/// in physical order, read from disk
+fn sealed_volumes(
+    dir: &std::path::Path,
+    table: &str,
+    key: &[usize],
+) -> Vec<Vec<(i64, Vec<Value>)>> {
+    use stoolap::storage::volume::io::read_volume_from_disk;
+    let mut paths: Vec<_> = std::fs::read_dir(dir.join("volumes").join(table))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "vol"))
+        .collect();
+    paths.sort();
+    paths
+        .iter()
+        .map(|path| {
+            let volume = read_volume_from_disk(path).unwrap();
+            let ids = volume.row_ids().unwrap().to_vec();
+            ids.iter()
+                .enumerate()
+                .map(|(i, &id)| {
+                    let row = volume.get_row(i).unwrap();
+                    (
+                        id,
+                        key.iter().map(|&c| row.get(c).cloned().unwrap()).collect(),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn in_key_order(rows: &[(i64, Vec<Value>)]) -> bool {
+    rows.windows(2).all(|w| {
+        w[0].1
+            .iter()
+            .zip(&w[1].1)
+            .map(|(a, b)| a.compare(b).unwrap())
+            .find(|o| *o != std::cmp::Ordering::Equal)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            != std::cmp::Ordering::Greater
+    })
+}
+
+#[test]
+fn the_sealed_volume_holds_the_rows_in_key_order_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    db.execute(CREATE, ()).unwrap();
+    insert_ticks(&db, 3_000);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let volumes = sealed_volumes(dir.path(), "ticks", &[1, 2, 3]);
+    assert_eq!(volumes.len(), 1);
+    let rows = &volumes[0];
+    assert_eq!(rows.len(), 3_000);
+    assert!(in_key_order(rows), "the sealed volume is not in key order");
+    // Exchange 'a', symbol 'x', smallest time first: the largest odd id
+    // that is not a multiple of three
+    assert_eq!(rows[0].0, 2_999);
+    assert_ne!(
+        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+        (1..=3_000).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn the_merged_volume_of_a_compaction_is_in_key_order_on_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?compact_threshold=2",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(CREATE, ()).unwrap();
+    let insert = db
+        .prepare("INSERT INTO ticks VALUES (?, ?, ?, ?, ?)")
+        .unwrap();
+    for round in 0..3i64 {
+        for id in round * 1_000 + 1..=(round + 1) * 1_000 {
+            let exchange = if id % 2 == 0 { "b" } else { "a" };
+            let symbol = if id % 3 == 0 { "y" } else { "x" };
+            insert
+                .execute((id, exchange, symbol, 3_000 - id, id as f64))
+                .unwrap();
+        }
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    let volumes = sealed_volumes(dir.path(), "ticks", &[1, 2, 3]);
+    let total: usize = volumes.iter().map(|v| v.len()).sum();
+    assert_eq!(total, 3_000);
+    assert_eq!(
+        volumes.len(),
+        1,
+        "compaction did not merge the three volumes"
+    );
+    assert!(
+        in_key_order(&volumes[0]),
+        "the merged volume is not in key order"
+    );
+}
+
+#[test]
+fn a_key_column_cannot_be_dropped_and_the_key_follows_a_dropped_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, k INTEGER, z INTEGER) CLUSTER BY (k)",
+            (),
+        )
+        .unwrap();
+        assert!(
+            db.execute("ALTER TABLE t DROP COLUMN k", ()).is_err(),
+            "a key column was dropped"
+        );
+        db.execute("ALTER TABLE t DROP COLUMN a", ()).unwrap();
+        let schema = db.engine().get_table_schema("t").unwrap();
+        assert_eq!(schema.cluster_key, vec![1]);
+        assert_eq!(schema.columns[1].name, "k");
+        let shown: String = db
+            .query("SHOW CREATE TABLE t", ())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .get::<String>(1)
+            .unwrap();
+        assert!(shown.ends_with("CLUSTER BY (k)"), "{shown}");
+    }
+    let db = Database::open(&dsn).unwrap();
+    let schema = db.engine().get_table_schema("t").unwrap();
+    assert_eq!(schema.cluster_key, vec![1]);
+    assert_eq!(schema.columns[1].name, "k");
+}
+
+#[test]
+fn a_snapshot_restore_keeps_the_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER) CLUSTER BY (k)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 5), (2, 3)", ())
+        .unwrap();
+    db.execute("PRAGMA SNAPSHOT", ()).unwrap();
+    db.execute("PRAGMA RESTORE", ()).unwrap();
+    assert_eq!(
+        db.engine().get_table_schema("t").unwrap().cluster_key,
+        vec![1]
+    );
+}
+
+#[test]
+fn dropping_a_referenced_parent_keeps_the_child_key() {
+    let db = Database::open("memory://cluster_by_parent_drop").unwrap();
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY)", ())
+        .unwrap();
+    db.execute(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, p_id INTEGER REFERENCES p(id), k INTEGER) CLUSTER BY (k)",
+        (),
+    )
+    .unwrap();
+    db.execute("DROP TABLE p", ()).unwrap();
+    assert_eq!(
+        db.engine().get_table_schema("c").unwrap().cluster_key,
+        vec![2]
+    );
+}
+
+#[test]
+fn a_key_column_must_have_an_order() {
+    let db = Database::open("memory://cluster_by_unordered_types").unwrap();
+    assert!(db
+        .execute(
+            "CREATE TABLE j (id INTEGER PRIMARY KEY, doc JSON) CLUSTER BY (doc)",
+            ()
+        )
+        .is_err());
+    assert!(db
+        .execute(
+            "CREATE TABLE v (id INTEGER PRIMARY KEY, e VECTOR(3)) CLUSTER BY (e)",
+            ()
+        )
+        .is_err());
+}
+
+#[test]
+fn a_key_column_holding_more_than_one_kind_orders_by_kind_then_value() {
+    use stoolap::storage::volume::seal::cluster_order;
+    let schema = SchemaBuilder::new("t")
+        .column("id", DataType::Integer, false, true)
+        .column("k", DataType::Text, false, false)
+        .cluster_by(vec![1])
+        .build();
+    // A column changed to TEXT after integers were written holds both
+    let mut rows: Vec<(i64, Row)> = [
+        (1, Value::text("15")),
+        (2, Value::Integer(10)),
+        (3, Value::text("a")),
+        (4, Value::Integer(2)),
+        (5, Value::null_unknown()),
+    ]
+    .into_iter()
+    .map(|(id, k)| (id, Row::from_values(vec![Value::Integer(id), k])))
+    .collect();
+    rows.sort_by(|a, b| cluster_order(&schema, a, b));
+    let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, vec![5, 4, 2, 1, 3]);
 }
