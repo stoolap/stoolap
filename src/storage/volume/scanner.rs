@@ -544,7 +544,7 @@ impl VolumeScanner {
                 .iter()
                 .map(|rg| {
                     for &(col_name, op, value) in &comparisons {
-                        let col_idx = match self.volume.column_index(col_name) {
+                        let col_idx = match self.filter_column(col_name) {
                             Some(idx) if idx < rg.zone_maps.len() => idx,
                             _ => continue,
                         };
@@ -585,7 +585,7 @@ impl VolumeScanner {
                 continue;
             }
             if let Value::Text(s) = value {
-                if let Some(col_idx) = self.volume.column_index(col_name) {
+                if let Some(col_idx) = self.filter_column(col_name) {
                     let dict_id = if let Some(st) = store {
                         st.dict_lookup(col_idx, s.as_str())
                     } else {
@@ -690,8 +690,12 @@ impl VolumeScanner {
                 let mut lo = self.current_idx;
                 let mut vectorized = true;
                 while lo < self.end_idx && m.len() <= selectivity_cap {
-                    let hi = (lo + super::column::ROW_GROUP_SIZE).min(self.end_idx);
-                    if self.group_pruned(lo / super::column::ROW_GROUP_SIZE) {
+                    // One chunk per row group, ending at the group's own
+                    // boundary, so a range starting inside a group does not
+                    // carry the skip of that group into the next
+                    let gi = lo / super::column::ROW_GROUP_SIZE;
+                    let hi = ((gi + 1) * super::column::ROW_GROUP_SIZE).min(self.end_idx);
+                    if self.group_pruned(gi) {
                         lo = hi;
                         continue;
                     }
@@ -748,7 +752,7 @@ impl VolumeScanner {
             ) {
                 continue;
             }
-            let col_idx = match self.volume.column_index(col_name) {
+            let col_idx = match self.filter_column(col_name) {
                 Some(idx) => idx,
                 None => continue,
             };
@@ -817,6 +821,28 @@ impl VolumeScanner {
 
         self.filter = Some(filter);
         Ok(())
+    }
+
+    /// The volume column a filter's column name stands for under the
+    /// current schema: through the column mapping when the volume predates
+    /// the schema, since the volume may still hold a dropped column of the
+    /// same name, and None for a column the volume does not hold, which
+    /// the full filter evaluates on the materialized row
+    fn filter_column(&self, name: &str) -> Option<usize> {
+        use super::writer::ColSource;
+        match &self.column_mapping {
+            Some(mapping) => {
+                let position = mapping
+                    .names
+                    .iter()
+                    .position(|n| n.as_str().eq_ignore_ascii_case(name))?;
+                match mapping.sources.get(position)? {
+                    ColSource::Volume(v) => Some(*v),
+                    ColSource::Default(_) => None,
+                }
+            }
+            None => self.volume.column_index(name),
+        }
     }
 
     /// Whether the zone maps ruled row group `gi` out for this filter

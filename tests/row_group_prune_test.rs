@@ -191,3 +191,66 @@ fn a_group_of_null_keys_is_left_out_of_an_equality_and_kept_for_is_null() {
         .unwrap();
     assert_eq!(nulls, 70_000);
 }
+
+/// A range that starts inside a row group, on the columns as sealed (no
+/// reopen): the dictionary pass chunks the range by row group, so a
+/// pruned group does not take the start of the next one with it
+#[test]
+fn a_range_starting_inside_a_pruned_group_keeps_the_next_group_rows() {
+    let _serial = SERIAL.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL, symbol TEXT NOT NULL)",
+        (),
+    )
+    .unwrap();
+    // symbol a through id 65,536 (group 0), b for the next 6,000 rows at
+    // the start of group 1, c after
+    db.execute(
+        "INSERT INTO t SELECT g.value, g.value, CASE WHEN g.value <= 65536 THEN 'a' WHEN g.value <= 71536 THEN 'b' ELSE 'c' END FROM generate_series(1, 196608) g",
+        (),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    for sql in [
+        "SELECT id FROM t WHERE id > 10000 AND symbol = 'b'",
+        "SELECT id FROM t WHERE n > 10000 AND symbol = 'b'",
+    ] {
+        let rows = db.query(sql, ()).unwrap().count();
+        assert_eq!(rows, 6_000, "{sql}");
+    }
+}
+
+/// A column dropped and added back with a default: the volume still holds
+/// the old column of that name, and its bounds must not prune groups whose
+/// rows carry the default now
+#[test]
+fn a_column_added_back_with_a_default_is_not_filtered_by_the_dropped_one() {
+    let _serial = SERIAL.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT NOT NULL, x INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+        // needle in the first ten rows; x is 1 in the first group, 10 after
+        db.execute(
+            "INSERT INTO t SELECT g.value, CASE WHEN g.value <= 10 THEN 'needle' ELSE 'hay' END, CASE WHEN g.value <= 65536 THEN 1 ELSE 10 END FROM generate_series(1, 196608) g",
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    db.execute("ALTER TABLE t DROP COLUMN x", ()).unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN x FLOAT DEFAULT 5.0", ())
+        .unwrap();
+    let (got, _) = project(&db, "SELECT id, x FROM t WHERE k = 'needle' AND x >= 5.0");
+    assert_eq!(got, (10, 50.0), "the old column's bounds pruned the rows");
+    let (got, _) = project(&db, "SELECT id, x FROM t WHERE k = 'needle' AND x < 5.0");
+    assert_eq!(got, (0, 0.0));
+}

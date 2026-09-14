@@ -970,6 +970,7 @@ fn assert_row_materializer_failure(which: usize) {
     volume.columns = malformed_columns();
     let mapping = ColumnMapping {
         sources: vec![ColSource::Volume(0), ColSource::Volume(1)],
+        names: Vec::new(),
         is_identity: true,
     };
     assert_io_failure(
@@ -1024,6 +1025,7 @@ fn projections_leave_unrequested_corrupt_columns_untouched() {
     volume.columns = malformed_columns();
     let mapping = ColumnMapping {
         sources: vec![ColSource::Volume(0), ColSource::Default(Value::Integer(9))],
+        names: Vec::new(),
         is_identity: false,
     };
     for row in [

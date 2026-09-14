@@ -1804,6 +1804,11 @@ pub enum ColSource {
 pub struct ColumnMapping {
     /// For each schema column position, how to get the value.
     pub sources: Vec<ColSource>,
+    /// The schema's column names, by position, so a column named in a
+    /// filter resolves through `sources` rather than by name in the volume,
+    /// which may still hold a dropped column of that name. Empty for an
+    /// identity mapping
+    pub names: Vec<crate::common::SmartString>,
     /// True when every schema column maps 1:1 to the same volume column
     /// in the same order. When true, callers can skip the mapping and
     /// use get_row()/get_row_projected() directly.
@@ -1872,8 +1877,18 @@ pub fn compute_column_mapping_with_drops(
         }
     }
 
+    let names = if is_identity {
+        Vec::new()
+    } else {
+        schema
+            .columns
+            .iter()
+            .map(|col| crate::common::SmartString::from(col.name.as_str()))
+            .collect()
+    };
     ColumnMapping {
         sources,
+        names,
         is_identity,
     }
 }
