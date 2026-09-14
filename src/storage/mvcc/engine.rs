@@ -2109,11 +2109,31 @@ impl MVCCEngine {
             }
         }
 
-        Ok(Schema::with_foreign_keys(
-            &table_name,
-            columns,
-            foreign_keys,
-        ))
+        // Clustering key (absent in schemas written before it existed)
+        let mut cluster_key = Vec::new();
+        if pos + 2 <= data.len() {
+            let count = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            for _ in 0..count {
+                if pos + 2 > data.len() {
+                    return Err(Error::internal(
+                        "corrupted schema: truncated clustering key",
+                    ));
+                }
+                let column = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap()) as usize;
+                pos += 2;
+                if column >= columns.len() {
+                    return Err(Error::internal(
+                        "corrupted schema: clustering key names a column past the end",
+                    ));
+                }
+                cluster_key.push(column);
+            }
+        }
+
+        let mut schema = Schema::with_foreign_keys(&table_name, columns, foreign_keys);
+        schema.cluster_key = cluster_key;
+        Ok(schema)
     }
 
     /// Closes the engine (inherent method)
@@ -2668,6 +2688,12 @@ impl MVCCEngine {
                     buf.extend_from_slice(&0u16.to_le_bytes());
                 }
             }
+        }
+
+        // Clustering key (after the defaults; a reader without it stops there)
+        buf.extend_from_slice(&(schema.cluster_key.len() as u16).to_le_bytes());
+        for &column in &schema.cluster_key {
+            buf.extend_from_slice(&(column as u16).to_le_bytes());
         }
 
         buf
@@ -5616,8 +5642,6 @@ impl MVCCEngine {
                 }
             }
 
-            live_refs.sort_unstable_by_key(|(id, _, _)| *id);
-
             if live_refs.is_empty() {
                 // All rows in merged volumes are tombstoned. Remove those
                 // volumes and their tombstones, but keep unmerged volumes intact.
@@ -5674,6 +5698,48 @@ impl MVCCEngine {
                 .map(|(seg_id, _vol)| mgr.get_volume_mapping(*seg_id, &schema))
                 .collect();
 
+            // The merged volumes hold their rows in row id order, or in key
+            // order for a clustered table, read through each volume's mapping
+            if schema.cluster_key.is_empty() {
+                live_refs.sort_unstable_by_key(|(id, _, _)| *id);
+            } else {
+                use crate::storage::volume::writer::ColSource;
+                let key_of = |vol_idx: usize, row_idx: usize| -> Vec<Value> {
+                    let vol = &volumes[vol_idx].1;
+                    let mapping = &vol_mappings[vol_idx];
+                    schema
+                        .cluster_key
+                        .iter()
+                        .map(|&column| {
+                            let source = if mapping.is_identity {
+                                Some(column)
+                            } else {
+                                match mapping.sources.get(column) {
+                                    Some(ColSource::Volume(v)) => Some(*v),
+                                    Some(ColSource::Default(value)) => return value.clone(),
+                                    None => None,
+                                }
+                            };
+                            source
+                                .and_then(|v| vol.columns.get(v).ok())
+                                .map(|col| col.get_value(row_idx))
+                                .unwrap_or_else(Value::null_unknown)
+                        })
+                        .collect()
+                };
+                let mut keyed: Vec<(Vec<Value>, (i64, usize, usize))> = live_refs
+                    .iter()
+                    .map(|&(row_id, vol_idx, row_idx)| {
+                        (key_of(vol_idx, row_idx), (row_id, vol_idx, row_idx))
+                    })
+                    .collect();
+                keyed.sort_by(|a, b| {
+                    crate::storage::volume::seal::compare_cluster_keys(&a.0, &b.0)
+                        .then(a.1 .0.cmp(&b.1 .0))
+                });
+                live_refs = keyed.into_iter().map(|(_, r)| r).collect();
+            }
+
             // Split live_refs into target-sized chunks and build one volume per chunk.
             // Row-group aligned split: round to 64K boundary so every volume
             // has complete row groups. Optimal for LZ4 compression and zone maps.
@@ -5700,6 +5766,9 @@ impl MVCCEngine {
                     &schema,
                     chunk.len(),
                 );
+                if !schema.cluster_key.is_empty() {
+                    builder.allow_any_row_order();
+                }
                 for &(row_id, vol_idx, row_idx) in chunk {
                     let vol = &volumes[vol_idx].1;
                     let mapping = &vol_mappings[vol_idx];
@@ -5742,8 +5811,7 @@ impl MVCCEngine {
                     Ok((_path, store)) => {
                         // Retain compressed store for hot→warm eviction.
                         compacted.columns.attach_compressed_store(store);
-                        let min_id = chunk.first().map(|(id, _, _)| *id).unwrap_or(0);
-                        let max_id = chunk.last().map(|(id, _, _)| *id).unwrap_or(0);
+                        let (min_id, max_id) = compacted.id_bounds().unwrap_or((0, 0));
                         new_volumes.push((
                             compact_vol_id,
                             Arc::new(compacted),
@@ -6010,6 +6078,11 @@ impl MVCCEngine {
                 }
             }
 
+            // A clustered table's volumes hold their rows in key order
+            if !schema.cluster_key.is_empty() {
+                all_rows.sort_by(|a, b| crate::storage::volume::seal::cluster_order(&schema, a, b));
+            }
+
             let vol_dir = pm.path().join("volumes");
 
             // Build volumes from rows, splitting at target_volume_rows boundary.
@@ -6082,7 +6155,7 @@ impl MVCCEngine {
                     mgr.add_tombstones(&all_skipped_inner, seal_seq);
                 }
 
-                if let Some(&(max_id, _)) = all_rows.last() {
+                if let Some(max_id) = all_rows.iter().map(|(id, _)| *id).max() {
                     let current = store.get_auto_increment_counter();
                     if max_id > current {
                         store.set_auto_increment_counter(max_id);

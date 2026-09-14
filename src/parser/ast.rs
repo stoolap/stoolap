@@ -1734,6 +1734,8 @@ pub struct CreateTableStatement {
     pub table_constraints: Vec<TableConstraint>,
     /// Optional SELECT statement for CREATE TABLE ... AS SELECT
     pub as_select: Option<Box<SelectStatement>>,
+    /// Columns the sealed rows are ordered by (CLUSTER BY); empty when none
+    pub cluster_by: Vec<Identifier>,
 }
 
 impl fmt::Display for CreateTableStatement {
@@ -1759,6 +1761,10 @@ impl fmt::Display for CreateTableStatement {
             result.push_str(&constraints.join(", "));
         }
         result.push(')');
+        if !self.cluster_by.is_empty() {
+            let columns: Vec<String> = self.cluster_by.iter().map(|c| c.to_string()).collect();
+            result.push_str(&format!(" CLUSTER BY ({})", columns.join(", ")));
+        }
         write!(f, "{}", result)
     }
 }
@@ -2548,6 +2554,7 @@ mod tests {
             ],
             table_constraints: vec![],
             as_select: None,
+            cluster_by: vec![],
         };
         assert_eq!(
             stmt.to_string(),
