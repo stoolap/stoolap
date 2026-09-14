@@ -1806,8 +1806,8 @@ pub struct ColumnMapping {
     pub sources: Vec<ColSource>,
     /// The schema's column names, by position, so a column named in a
     /// filter resolves through `sources` rather than by name in the volume,
-    /// which may still hold a dropped column of that name. Empty for an
-    /// identity mapping
+    /// which may still hold a dropped column of that name, or a renamed
+    /// column under its old name. Empty when the names match by position
     pub names: Vec<crate::common::SmartString>,
     /// True when every schema column maps 1:1 to the same volume column
     /// in the same order. When true, callers can skip the mapping and
@@ -1898,7 +1898,17 @@ pub fn compute_column_mapping_with_drops(
         }
     }
 
-    let names = if is_identity {
+    // The names travel with the mapping when a filter's column name may
+    // not resolve by name in the volume: the schema differs in shape, or a
+    // column was renamed in place (two renames can swap names and leave
+    // every column where it was)
+    let names_match = is_identity
+        && schema
+            .columns
+            .iter()
+            .zip(volume.meta.column_names.iter())
+            .all(|(col, name)| col.name.eq_ignore_ascii_case(name));
+    let names = if names_match {
         Vec::new()
     } else {
         schema

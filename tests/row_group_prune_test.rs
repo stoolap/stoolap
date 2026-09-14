@@ -300,3 +300,44 @@ fn a_volume_is_not_pruned_by_the_bloom_filter_of_a_dropped_column() {
         .count();
     assert_eq!(rows, 10);
 }
+
+/// Two renames that swap names leave every column in place, so the
+/// mapping is the identity by position; a filter on the swapped name must
+/// still reach the column the schema means, not the volume column that
+/// used to carry that name
+#[test]
+fn a_filter_on_a_swapped_column_name_reaches_the_renamed_column() {
+    let _serial = SERIAL.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO r SELECT g.value, 1, 9 FROM generate_series(1, 1000) g",
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    db.execute("ALTER TABLE r RENAME COLUMN x TO z", ())
+        .unwrap();
+    db.execute("ALTER TABLE r RENAME COLUMN y TO x", ())
+        .unwrap();
+    let count = |sql: &str| db.query(sql, ()).unwrap().count();
+    assert_eq!(
+        count("SELECT id FROM r WHERE x = 9"),
+        1_000,
+        "x = 9 read the old x column"
+    );
+    assert_eq!(count("SELECT id FROM r WHERE x = 1"), 0);
+    assert_eq!(count("SELECT id FROM r WHERE z = 1"), 1_000);
+    assert_eq!(count("SELECT id FROM r WHERE z = 9"), 0);
+    let x: i64 = db.query_one("SELECT x FROM r WHERE id = 7", ()).unwrap();
+    assert_eq!(x, 9);
+}
