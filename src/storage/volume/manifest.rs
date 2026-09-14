@@ -1702,6 +1702,7 @@ impl SegmentManager {
                     sources: (0..volume.columns.len())
                         .map(super::writer::ColSource::Volume)
                         .collect(),
+                    names: Vec::new(),
                     is_identity: true,
                 }
             };
@@ -1752,6 +1753,7 @@ impl SegmentManager {
                     sources: (0..volume.columns.len())
                         .map(super::writer::ColSource::Volume)
                         .collect(),
+                    names: Vec::new(),
                     is_identity: true,
                 },
                 volume,
@@ -2362,6 +2364,7 @@ impl SegmentManager {
         } else {
             super::writer::ColumnMapping {
                 sources: Vec::new(),
+                names: Vec::new(),
                 is_identity: true,
             }
         }
@@ -2578,6 +2581,7 @@ impl SegmentManager {
                     sources: (0..new_volume.columns.len())
                         .map(super::writer::ColSource::Volume)
                         .collect(),
+                    names: Vec::new(),
                     is_identity: true,
                 },
                 volume: new_volume,
@@ -2649,6 +2653,7 @@ impl SegmentManager {
                         sources: (0..vol.columns.len())
                             .map(super::writer::ColSource::Volume)
                             .collect(),
+                        names: Vec::new(),
                         is_identity: true,
                     },
                     volume: vol,
