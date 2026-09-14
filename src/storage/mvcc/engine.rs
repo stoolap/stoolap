@@ -3656,6 +3656,12 @@ impl MVCCEngine {
             }
         }
 
+        // The volumes already sealed are checked against the new key by
+        // the next compaction, which rewrites the ones out of order
+        if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
+            mgr.request_recluster();
+        }
+
         self.schema_epoch.fetch_add(1, Ordering::Release);
         Ok(())
     }
@@ -5526,6 +5532,10 @@ impl MVCCEngine {
                     if mgr.max_segment_row_count() > oversized_threshold {
                         return true;
                     }
+                    // Volumes not yet checked against a clustering key
+                    if mgr.recluster_pending() && mgr.segment_count() >= 1 {
+                        return true;
+                    }
                     false
                 })
                 .map(|(name, _)| name.clone())
@@ -5537,6 +5547,10 @@ impl MVCCEngine {
         }
 
         for table_name in &tables_to_compact {
+            let mgr = self.get_or_create_segment_manager(table_name);
+            // The request is read before the schema: a key set between the
+            // two opens a newer request, which this cycle cannot close
+            let recluster_request = mgr.recluster_request();
             let schema = {
                 let schemas = self.schemas.read().unwrap();
                 match schemas.get(table_name) {
@@ -5544,8 +5558,6 @@ impl MVCCEngine {
                     None => continue,
                 }
             };
-
-            let mgr = self.get_or_create_segment_manager(table_name);
 
             // Per-table snapshot gating: capture the current min snapshot begin_seq
             // for each table to close the TOCTOU window. A snapshot starting between
@@ -5561,90 +5573,164 @@ impl MVCCEngine {
             // - Oversized (> target * 3/2): large volumes to split
             // - At-target: properly sized, never rewrite
             let (old_ids, volumes, tombstones) = {
-                // Use segments_raw for planning — only metadata (row_ids,
-                // row_count) is needed. Avoids reloading ALL cold volumes
-                // for tables where only sub-target volumes need compaction.
-                let segs = mgr.segments_raw();
-                let manifest = mgr.manifest();
+                // Planning reads the manifest for metadata only and lets it
+                // go before any volume is read: a seal holds the table's
+                // fence while it waits for the manifest, and DML waits on
+                // the fence
                 let ts = mgr.tombstone_set_arc();
-
                 let oversized_threshold = target_volume_rows * 3 / 2;
 
-                let mut merge_indices: Vec<usize> = Vec::new();
-                for (idx, seg) in manifest.segments.iter().enumerate() {
-                    // Skip volumes sealed after the earliest snapshot began.
-                    // seal_seq = cutoff used during extraction. A volume with
-                    // seal_seq <= limit contains only pre-snapshot data (safe).
-                    // seal_seq > limit means the volume may have post-snapshot data.
-                    if let Some(limit) = compact_seal_seq_limit {
-                        if seg.seal_seq > 0 && seg.seal_seq > limit {
-                            continue;
-                        }
-                    }
-                    if seg.row_count < target_volume_rows {
-                        // Sub-target: merge together to reach target size
-                        merge_indices.push(idx);
-                    } else if seg.row_count > oversized_threshold {
-                        // Oversized: needs splitting
-                        merge_indices.push(idx);
-                    } else if !ts.is_empty() {
-                        // At-target: include only if it has tombstoned rows that
-                        // compaction can actually apply. When snapshots are active,
-                        // only count tombstones with commit_seq < limit (post-snapshot
-                        // tombstones will be preserved, so rewriting is pointless).
-                        if let Some(cs) = segs.get(&seg.segment_id) {
-                            let tombstone_count = cs
-                                .volume
-                                .meta
-                                .row_ids
-                                .iter()
-                                .filter(|rid| {
-                                    if let Some(limit) = compact_seal_seq_limit {
-                                        ts.get(rid).is_some_and(|&commit_seq| commit_seq < limit)
-                                    } else {
-                                        ts.contains_key(rid)
-                                    }
-                                })
-                                .count();
-                            if tombstone_count > 0 {
-                                merge_indices.push(idx);
+                // (segment id, row count, whether size or tombstones already
+                // call for a rewrite, whether a snapshot defers it) of every
+                // volume, in manifest order
+                let mut planned: Vec<(u64, usize, bool, bool)> = Vec::new();
+                let mut deferred = false;
+                {
+                    let segs = mgr.segments_raw();
+                    let manifest = mgr.manifest();
+                    for seg in manifest.segments.iter() {
+                        // Skip volumes sealed after the earliest snapshot began.
+                        // seal_seq = cutoff used during extraction. A volume with
+                        // seal_seq <= limit contains only pre-snapshot data (safe).
+                        // seal_seq > limit means the volume may have post-snapshot data.
+                        if let Some(limit) = compact_seal_seq_limit {
+                            if seg.seal_seq > 0 && seg.seal_seq > limit {
+                                deferred = true;
+                                planned.push((seg.segment_id, seg.row_count, false, true));
+                                continue;
                             }
                         }
+                        let rewrite = if seg.row_count < target_volume_rows {
+                            // Sub-target: merge together to reach target size
+                            true
+                        } else if seg.row_count > oversized_threshold {
+                            // Oversized: needs splitting
+                            true
+                        } else {
+                            // At-target: include only if it has tombstoned rows that
+                            // compaction can actually apply. When snapshots are active,
+                            // only count tombstones with commit_seq < limit (post-snapshot
+                            // tombstones will be preserved, so rewriting is pointless).
+                            !ts.is_empty()
+                                && segs.get(&seg.segment_id).is_some_and(|cs| {
+                                    cs.volume.meta.row_ids.iter().any(|rid| {
+                                        if let Some(limit) = compact_seal_seq_limit {
+                                            ts.get(rid)
+                                                .is_some_and(|&commit_seq| commit_seq < limit)
+                                        } else {
+                                            ts.contains_key(rid)
+                                        }
+                                    })
+                                })
+                        };
+                        planned.push((seg.segment_id, seg.row_count, rewrite, false));
                     }
-                    // At-target with no tombstones: frozen, don't touch
                 }
 
-                if merge_indices.is_empty() {
+                // A clustered table rewrites the volumes not in its key
+                // order. A volume is decided once, a cold one loaded to
+                // decide, and a cycle decides at most compact_threshold of
+                // them and rewrites at most as many beyond the volumes
+                // size or tombstones call for, the ones the closure below
+                // pulls in included, so what a cycle loads and rewrites
+                // stays bounded. The request closes once a cycle finds
+                // every volume in order, none left undecided, unselected
+                // or deferred behind a snapshot
+                let base: Vec<bool> = planned.iter().map(|entry| entry.2).collect();
+                let mut selected: Vec<usize> = Vec::new();
+                let mut all_checked = !deferred;
+                if let Some(request) = recluster_request {
+                    let key = &schema.cluster_key;
+                    if !key.is_empty() {
+                        let mut decided = 0usize;
+                        for (position, entry) in planned.iter().enumerate() {
+                            if entry.3 {
+                                continue;
+                            }
+                            let in_order = match mgr.known_key_order(entry.0, key) {
+                                Some(in_order) => in_order,
+                                None if decided < compact_threshold => {
+                                    decided += 1;
+                                    mgr.decide_key_order(entry.0, key)?
+                                }
+                                None => {
+                                    all_checked = false;
+                                    continue;
+                                }
+                            };
+                            if in_order {
+                                continue;
+                            }
+                            if selected.len() >= compact_threshold {
+                                all_checked = false;
+                                continue;
+                            }
+                            selected.push(position);
+                        }
+                    }
+                    if key.is_empty() {
+                        mgr.recluster_done(request);
+                    }
+                }
+
+                // Volumes take precedence by manifest position, newest last,
+                // and the rewrite takes the position of the batch's first
+                // member. A volume left between two members that shares a
+                // row with the batch would then win over a newer copy of it
+                // or lose to an older one, so the batch is closed over
+                // overlap, within the limit, and one deferred behind a
+                // snapshot holds the table for this cycle
+                let (held, reduced) = {
+                    let segs = mgr.segments_raw();
+                    close_batch_over_overlap(
+                        &mut planned,
+                        &base,
+                        &mut selected,
+                        compact_threshold,
+                        |id| {
+                            segs.get(&id)
+                                .map(|cs| cs.volume.meta.row_ids.as_slice())
+                                .unwrap_or(&[])
+                        },
+                    )
+                };
+                let reclustering = !selected.is_empty();
+                if let Some(request) = recluster_request {
+                    if !schema.cluster_key.is_empty() && all_checked && !reduced && !reclustering {
+                        mgr.recluster_done(request);
+                    }
+                }
+                if held {
+                    continue;
+                }
+                let merge: Vec<(u64, usize)> = planned
+                    .into_iter()
+                    .filter(|entry| entry.2)
+                    .map(|entry| (entry.0, entry.1))
+                    .collect();
+
+                if merge.is_empty() {
                     continue;
                 }
                 // Single sub-target volume (too small, not dirty): wait for
                 // more to accumulate before merging.
                 // A single at-target/oversized volume with tombstones should
                 // NOT be skipped — it needs rewriting to remove dead rows.
-                if merge_indices.len() == 1 {
-                    let seg = &manifest.segments[merge_indices[0]];
-                    if seg.row_count < target_volume_rows {
-                        continue; // small volume, wait for more
-                    }
+                // A volume out of its table's key order is rewritten alone.
+                if merge.len() == 1 && !reclustering && merge[0].1 < target_volume_rows {
+                    continue; // small volume, wait for more
                 }
 
                 // Load only the merge-candidate volumes (not the entire table).
                 // Cold volumes are loaded on demand via ensure_volume.
-                let old_ids: Vec<u64> = merge_indices
-                    .iter()
-                    .map(|&i| manifest.segments[i].segment_id)
-                    .collect();
+                let old_ids: Vec<u64> = merge.iter().map(|entry| entry.0).collect();
+                let segs = mgr.segments_raw();
                 let mut vols: Vec<(u64, Arc<crate::storage::volume::writer::FrozenVolume>)> =
-                    merge_indices
+                    old_ids
                         .iter()
-                        .filter_map(|&i| {
-                            let seg = &manifest.segments[i];
-                            let vol = segs.get(&seg.segment_id)?;
-                            Some((seg.segment_id, Arc::clone(&vol.volume)))
-                        })
+                        .filter_map(|id| segs.get(id).map(|cs| (*id, Arc::clone(&cs.volume))))
                         .collect();
                 drop(segs);
-                drop(manifest);
 
                 // Every manifest entry must have a loaded volume.
                 if vols.len() != old_ids.len() {
@@ -5665,8 +5751,9 @@ impl MVCCEngine {
                 if removed {
                     continue;
                 }
-                // Sort by segment_id descending (newest first) for correct dedup.
-                vols.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+                // Newest first for the dedup: precedence is manifest
+                // position, and old_ids holds the batch in manifest order
+                vols.reverse();
                 let ts = mgr.tombstone_set_arc();
                 (old_ids, Arc::new(vols), ts)
             };
@@ -5955,7 +6042,14 @@ impl MVCCEngine {
             }
 
             // Atomically register all new volumes and remove old segments.
+            let new_ids: Vec<u64> = new_volumes.iter().map(|entry| entry.0).collect();
             mgr.replace_segments_atomic_multi(new_volumes, &old_ids);
+            // The volumes just written are in the key's order
+            if !schema.cluster_key.is_empty() {
+                for id in new_ids {
+                    mgr.record_key_order(id, &schema.cluster_key);
+                }
+            }
 
             // Clear only tombstones that existed at snapshot time for
             // row_ids in the merged volumes.
@@ -8077,10 +8171,172 @@ impl TransactionEngineOperations for EngineOperations {
     }
 }
 
+/// Closes a compaction batch over the rows its members share, and keeps
+/// the recluster's share of the batch within `limit`.
+///
+/// `planned` lists the table's volumes in manifest order as (segment id,
+/// row count, rewrite, deferred); `base` says which of them size or
+/// tombstones already call for, and `selected` the positions the
+/// recluster chose, in order. On return the rewrite flag is set for
+/// every member: the base, the selection, and every volume between the
+/// first and last member that shares a row with the batch. While the
+/// members beyond the base exceed `limit`, the selection loses its last
+/// position and the closure is taken again; a last selection that still
+/// exceeds the limit beside base work goes alone and the base work
+/// waits for the next cycle, since a lone member closes over nothing
+/// while base work can wait behind the single-volume rule for good.
+/// Returns whether a deferred volume shares a row with the batch, which
+/// holds the table, and whether the selection was reduced
+fn close_batch_over_overlap<'a>(
+    planned: &mut [(u64, usize, bool, bool)],
+    base: &[bool],
+    selected: &mut Vec<usize>,
+    limit: usize,
+    ids_of: impl Fn(u64) -> &'a [i64],
+) -> (bool, bool) {
+    let mut reduced = false;
+    let mut with_base = true;
+    loop {
+        for (position, entry) in planned.iter_mut().enumerate() {
+            entry.2 = (with_base && base[position]) || selected.contains(&position);
+        }
+        let mut held = false;
+        let first = planned.iter().position(|entry| entry.2);
+        let last = planned.iter().rposition(|entry| entry.2);
+        if let (Some(first), Some(last)) = (first, last) {
+            if last > first {
+                let mut batch_ids: FxHashSet<i64> = FxHashSet::default();
+                for entry in &planned[first..=last] {
+                    if entry.2 {
+                        batch_ids.extend(ids_of(entry.0).iter().copied());
+                    }
+                }
+                loop {
+                    let mut grew = false;
+                    for entry in planned[first..=last].iter_mut() {
+                        if entry.2 {
+                            continue;
+                        }
+                        let ids = ids_of(entry.0);
+                        if !ids.iter().any(|id| batch_ids.contains(id)) {
+                            continue;
+                        }
+                        if entry.3 {
+                            held = true;
+                        } else {
+                            entry.2 = true;
+                            batch_ids.extend(ids.iter().copied());
+                            grew = true;
+                        }
+                    }
+                    if !grew {
+                        break;
+                    }
+                }
+            }
+        }
+        let extra = planned
+            .iter()
+            .enumerate()
+            .filter(|(position, entry)| entry.2 && !base[*position])
+            .count();
+        if extra <= limit || selected.is_empty() || !with_base {
+            return (held, reduced);
+        }
+        if selected.len() > 1 {
+            selected.pop();
+            reduced = true;
+        } else {
+            with_base = false;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::{DataType, IndexType, Row, SchemaBuilder, Value};
+
+    /// Volumes at positions 0..n with the given row ids; none base, none
+    /// deferred unless said
+    fn batch_of(ids: &[&[i64]]) -> Vec<(u64, usize, bool, bool)> {
+        ids.iter()
+            .enumerate()
+            .map(|(i, rows)| (i as u64 + 1, rows.len(), false, false))
+            .collect()
+    }
+
+    #[test]
+    fn a_closed_batch_stays_within_the_recluster_limit() {
+        let rows: Vec<&[i64]> = vec![&[1, 2], &[2, 3], &[3, 4]];
+        let ids_of = |id: u64| rows[id as usize - 1];
+        // Two selected around an ordered volume that shares rows with both:
+        // the closure would take all three, so the selection drops to one
+        let mut planned = batch_of(&rows);
+        let mut selected = vec![0, 2];
+        let (held, reduced) =
+            close_batch_over_overlap(&mut planned, &[false; 3], &mut selected, 2, ids_of);
+        assert!(!held && reduced);
+        assert_eq!(selected, vec![0]);
+        assert_eq!(
+            planned.iter().map(|e| e.2).collect::<Vec<_>>(),
+            vec![true, false, false]
+        );
+        // With room for three the closure takes the middle volume
+        let mut planned = batch_of(&rows);
+        let mut selected = vec![0, 2];
+        let (_, reduced) =
+            close_batch_over_overlap(&mut planned, &[false; 3], &mut selected, 3, ids_of);
+        assert!(!reduced);
+        assert!(planned.iter().all(|e| e.2));
+        // A lone member closes over nothing: the volumes around it keep
+        // their places on either side of its rewrite
+        let rows: Vec<&[i64]> = vec![&[1], &[1, 2], &[2, 3], &[3, 4]];
+        let ids_of = |id: u64| rows[id as usize - 1];
+        let mut planned = batch_of(&rows);
+        let mut selected = vec![0];
+        let (_, reduced) =
+            close_batch_over_overlap(&mut planned, &[false; 4], &mut selected, 2, ids_of);
+        assert!(!reduced);
+        assert_eq!(
+            planned.iter().map(|e| e.2).collect::<Vec<_>>(),
+            vec![true, false, false, false]
+        );
+        // Beside distant base work the same selection goes alone and the
+        // base work waits for the next cycle
+        let mut planned = batch_of(&rows);
+        planned[3].2 = true;
+        let mut selected = vec![0];
+        let (_, reduced) = close_batch_over_overlap(
+            &mut planned,
+            &[false, false, false, true],
+            &mut selected,
+            2,
+            ids_of,
+        );
+        assert!(!reduced && selected == vec![0]);
+        assert_eq!(
+            planned.iter().map(|e| e.2).collect::<Vec<_>>(),
+            vec![true, false, false, false]
+        );
+    }
+
+    #[test]
+    fn a_deferred_volume_sharing_a_row_with_the_batch_holds_it() {
+        let rows: Vec<&[i64]> = vec![&[1], &[1, 2], &[5], &[5, 6]];
+        let ids_of = |id: u64| rows[id as usize - 1];
+        let mut planned = batch_of(&rows);
+        planned[1].3 = true;
+        let mut selected = vec![0, 3];
+        let (held, reduced) =
+            close_batch_over_overlap(&mut planned, &[false; 4], &mut selected, 3, ids_of);
+        assert!(held && !reduced);
+        assert!(!planned[1].2, "a deferred volume joined the batch");
+        assert!(
+            planned[2].2,
+            "the volume sharing a row with a member was left out"
+        );
+    }
 
     #[test]
     fn test_engine_creation() {

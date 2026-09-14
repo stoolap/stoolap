@@ -1905,6 +1905,26 @@ impl FrozenVolume {
         }
     }
 
+    /// Whether the rows are held in the order of `key`, compared cell by
+    /// cell in place; an empty key orders nothing and is always satisfied
+    pub fn in_key_order(&self, key: &[usize]) -> std::io::Result<bool> {
+        let n = self.meta.row_count;
+        let mut columns = Vec::with_capacity(key.len());
+        for &c in key {
+            columns.push(self.columns.get(c)?);
+        }
+        for i in 1..n {
+            for col in &columns {
+                match col.compare_cells(i - 1, col, i) {
+                    std::cmp::Ordering::Less => break,
+                    std::cmp::Ordering::Equal => continue,
+                    std::cmp::Ordering::Greater => return Ok(false),
+                }
+            }
+        }
+        Ok(true)
+    }
+
     /// Carry the order decided for an earlier form of this volume over to
     /// this one, so a reload does not decide it again
     pub fn inherit_row_order(&self, from: &FrozenVolume) {
