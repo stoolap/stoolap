@@ -577,6 +577,35 @@ fn compute_visibility_bitmaps(
 
 /// Per-table segment manager.
 ///
+/// The mapping a segment is published with: computed against `schema`
+/// from the manifest's history and the segment's own version, or the
+/// identity when the caller vouches the volume matches the schema. Taken
+/// under the manifest lock the publication holds, so the mapping and the
+/// segment appear together
+fn mapping_for(
+    manifest: &TableManifest,
+    volume: &FrozenVolume,
+    schema_version: u64,
+    schema: Option<&crate::core::Schema>,
+) -> super::writer::ColumnMapping {
+    match schema {
+        Some(schema) => super::writer::compute_column_mapping_with_drops(
+            schema,
+            volume,
+            &manifest.dropped_columns,
+            schema_version,
+            &manifest.column_renames,
+        ),
+        None => super::writer::ColumnMapping {
+            sources: (0..volume.columns.len())
+                .map(super::writer::ColSource::Volume)
+                .collect(),
+            names: Vec::new(),
+            is_identity: true,
+        },
+    }
+}
+
 /// Owns the manifest, loaded segments, and tombstone set for one table.
 /// Tombstones track cold row_ids that have been deleted or superseded
 /// by hot buffer versions. They are persisted in the manifest and used
@@ -1687,25 +1716,7 @@ impl SegmentManager {
                 manifest.next_segment_id = segment_id + 1;
             }
             manifest.add_segment(meta);
-            let mapping = if let Some(s) = schema {
-                let drops = manifest.dropped_columns.clone();
-                let renames = manifest.column_renames.clone();
-                super::writer::compute_column_mapping_with_drops(
-                    s,
-                    &volume,
-                    &drops,
-                    seg_schema_version,
-                    &renames,
-                )
-            } else {
-                super::writer::ColumnMapping {
-                    sources: (0..volume.columns.len())
-                        .map(super::writer::ColSource::Volume)
-                        .collect(),
-                    names: Vec::new(),
-                    is_identity: true,
-                }
-            };
+            let mapping = mapping_for(&manifest, &volume, seg_schema_version, schema);
             let cold = ColdSegment {
                 volume,
                 mapping,
@@ -2623,6 +2634,7 @@ impl SegmentManager {
         new_volume: Arc<FrozenVolume>,
         new_meta: SegmentMeta,
         old_segment_ids: &[u64],
+        schema: Option<&crate::core::Schema>,
     ) {
         // Atomic: manifest + segments updated under both write locks.
         // Bitmap computation runs inside — safe because writers are serialized.
@@ -2642,13 +2654,7 @@ impl SegmentManager {
             manifest.segments.insert(insert_pos, new_meta);
 
             let cold = ColdSegment {
-                mapping: super::writer::ColumnMapping {
-                    sources: (0..new_volume.columns.len())
-                        .map(super::writer::ColSource::Volume)
-                        .collect(),
-                    names: Vec::new(),
-                    is_identity: true,
-                },
+                mapping: mapping_for(&manifest, &new_volume, seg_schema_version, schema),
                 volume: new_volume,
                 schema_version: seg_schema_version,
                 visible: None,
@@ -2680,6 +2686,7 @@ impl SegmentManager {
         &self,
         new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
         old_segment_ids: &[u64],
+        schema: Option<&crate::core::Schema>,
     ) {
         if new_volumes.is_empty() {
             self.replace_segments_atomic_remove_only(old_segment_ids);
@@ -2687,7 +2694,7 @@ impl SegmentManager {
         }
         if new_volumes.len() == 1 {
             let (id, vol, meta) = new_volumes.into_iter().next().unwrap();
-            self.replace_segments_atomic(id, vol, meta, old_segment_ids);
+            self.replace_segments_atomic(id, vol, meta, old_segment_ids, schema);
             return;
         }
         {
@@ -2714,13 +2721,7 @@ impl SegmentManager {
                 manifest.segments.insert(insert_pos + i, meta);
 
                 let cold = ColdSegment {
-                    mapping: super::writer::ColumnMapping {
-                        sources: (0..vol.columns.len())
-                            .map(super::writer::ColSource::Volume)
-                            .collect(),
-                        names: Vec::new(),
-                        is_identity: true,
-                    },
+                    mapping: mapping_for(&manifest, &vol, seg_schema_version, schema),
                     volume: vol,
                     schema_version: seg_schema_version,
                     visible: None,
@@ -3375,7 +3376,13 @@ mod tests {
             );
             assert!(!mgr.decide_key_order(seg_id, &[2]).unwrap());
         }
-        mgr.replace_segments_atomic(5, descending_k_volume(&schema, 4), meta_of(5, 4), &[1]);
+        mgr.replace_segments_atomic(
+            5,
+            descending_k_volume(&schema, 4),
+            meta_of(5, 4),
+            &[1],
+            None,
+        );
         mgr.remove_segments(&[2]);
         mgr.replace_segments_atomic_remove_only(&[3]);
         mgr.record_key_order(5, &[2]);
@@ -3711,6 +3718,7 @@ mod tests {
                 schema_version: 0,
             },
             &[1],
+            None,
         );
 
         // The snapshot must keep serving ITS view: segment 1, one volume.

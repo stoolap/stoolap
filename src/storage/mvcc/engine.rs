@@ -3177,15 +3177,14 @@ impl MVCCEngine {
         let mgr = self.get_or_create_segment_manager(table_name);
         let (min_id, max_id) = volume.id_bounds().unwrap_or((0, 0));
         let row_count = volume.meta.row_count;
-        // The mapping is computed against the schema current now: a volume
-        // built from an older schema, sealed under that schema's version,
-        // resolves through the changes made since, from its first read
-        let schema = self
-            .schemas
-            .read()
-            .unwrap()
-            .get(&table_name.to_lowercase())
-            .cloned();
+        // The mapping is computed against the schema current now, under
+        // the schema cache's read lock held until the segment is visible:
+        // a change replaces the schema under that lock's write side and
+        // propagates its history after, so this publication is wholly
+        // before the change, whose propagation then covers it, or wholly
+        // after it
+        let schemas = self.schemas.read().unwrap();
+        let schema = schemas.get(&table_name.to_lowercase()).map(|s| &**s);
         mgr.register_segment(
             seg_id,
             volume,
@@ -3199,8 +3198,9 @@ impl MVCCEngine {
                 seal_seq,
                 schema_version,
             },
-            schema.as_deref(),
+            schema,
         );
+        drop(schemas);
     }
 
     /// Discover volume table directories and load their manifests before WAL replay.
@@ -6109,14 +6109,18 @@ impl MVCCEngine {
 
             // Atomically register all new volumes and remove old segments.
             let new_ids: Vec<u64> = new_volumes.iter().map(|entry| entry.0).collect();
-            mgr.replace_segments_atomic_multi(new_volumes, &old_ids);
-            // A schema change during the rewrite: the outputs were built
-            // from the older schema and carry its version, so their
-            // mappings are computed against the schema current now
-            if self.schema_epoch.load(Ordering::Acquire) != schema_version {
-                if let Some(current) = self.schemas.read().unwrap().get(table_name) {
-                    mgr.invalidate_mappings(current);
-                }
+            // The outputs' mappings are computed against the schema current
+            // now, under the schema cache's read lock held until they are
+            // visible, as a seal's registration does: a change completing
+            // during the rewrite is then either before this publication,
+            // and its propagation covers the outputs, or after it
+            {
+                let schemas = self.schemas.read().unwrap();
+                mgr.replace_segments_atomic_multi(
+                    new_volumes,
+                    &old_ids,
+                    schemas.get(table_name).map(|s| &**s),
+                );
             }
             // The volumes just written are in the key's order
             if !schema.cluster_key.is_empty() {
