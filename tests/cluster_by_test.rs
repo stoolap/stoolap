@@ -883,3 +883,159 @@ fn the_recluster_of_older_volumes_survives_a_reopen() {
     );
     assert_eq!(ids(&db, "SELECT id FROM ticks WHERE id = 7"), vec![7]);
 }
+
+/// The key is checked through each volume's column mapping: dropping an
+/// earlier column shifts the key's schema positions, and the volume
+/// sealed before the drop still holds that column
+#[test]
+fn dropping_an_earlier_column_does_not_hide_a_volume_from_the_recluster() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?target_volume_rows=1000&compact_threshold=100",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute("CREATE TABLE ticks (id INTEGER PRIMARY KEY, seq INTEGER NOT NULL, exchange TEXT NOT NULL, symbol TEXT NOT NULL, time INTEGER NOT NULL, price REAL)", ()).unwrap();
+    let insert = db
+        .prepare("INSERT INTO ticks VALUES (?, ?, ?, ?, ?, ?)")
+        .unwrap();
+    for id in 1..=1_000i64 {
+        let exchange = if id % 2 == 0 { "b" } else { "a" };
+        let symbol = if id % 3 == 0 { "y" } else { "x" };
+        // seq ascends with the id: read in place of the key, it passes
+        insert
+            .execute((id, id, exchange, symbol, 1_000 - id, id as f64))
+            .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let before = volume_files(dir.path(), "ticks");
+    assert_eq!(before.len(), 1);
+
+    db.execute("ALTER TABLE ticks DROP COLUMN seq", ()).unwrap();
+    db.execute("ALTER TABLE ticks CLUSTER BY (exchange, symbol, time)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_ne!(
+        volume_files(dir.path(), "ticks"),
+        before,
+        "the volume was not rewritten"
+    );
+    let volumes = sealed_volumes(dir.path(), "ticks", &[1, 2, 3]);
+    assert_eq!(volumes.len(), 1);
+    assert_eq!(volumes[0].len(), 1_000);
+    assert!(
+        in_key_order(&volumes[0]),
+        "the rewritten volume is not in key order"
+    );
+    let row = db
+        .query("SELECT exchange, symbol, time FROM ticks WHERE id = 7", ())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (
+            row.get::<String>(0).unwrap(),
+            row.get::<String>(1).unwrap(),
+            row.get::<i64>(2).unwrap()
+        ),
+        ("a".to_string(), "x".to_string(), 993)
+    );
+}
+
+/// A key column added after the seal is one value for every row of the
+/// older volume; the check leaves it out instead of reading past the
+/// volume's columns
+#[test]
+fn a_key_with_a_column_added_after_the_seal_reclusters_the_older_volume() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?target_volume_rows=1000&compact_threshold=100",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(UNCLUSTERED, ()).unwrap();
+    insert_ticks(&db, 1_000);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let before = volume_files(dir.path(), "ticks");
+
+    db.execute("ALTER TABLE ticks ADD COLUMN venue TEXT DEFAULT 'z'", ())
+        .unwrap();
+    db.execute(
+        "ALTER TABLE ticks CLUSTER BY (venue, exchange, symbol, time)",
+        (),
+    )
+    .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ())
+        .expect("the checkpoint failed on the key column the volume predates");
+    assert_ne!(
+        volume_files(dir.path(), "ticks"),
+        before,
+        "the volume was not rewritten"
+    );
+    let volumes = sealed_volumes(dir.path(), "ticks", &[5, 1, 2, 3]);
+    assert_eq!(volumes.len(), 1);
+    assert_eq!(volumes[0].len(), 1_000);
+    assert!(
+        in_key_order(&volumes[0]),
+        "the rewritten volume is not in key order"
+    );
+    let venues = ids(&db, "SELECT COUNT(*) FROM ticks WHERE venue = 'z'");
+    assert_eq!(venues, vec![1_000]);
+}
+
+/// Three at-target volumes and a threshold of two: the first cycle after
+/// the key rewrites two, the next the third, and a cycle after that
+/// touches nothing
+#[test]
+fn a_checkpoint_cycle_reclusters_at_most_compact_threshold_volumes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?target_volume_rows=65536&compact_threshold=2",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(UNCLUSTERED, ()).unwrap();
+    for round in 0..3i64 {
+        db.execute(
+            &format!(
+                "INSERT INTO ticks SELECT g.value + {off}, \
+                 CASE WHEN g.value % 2 = 0 THEN 'b' ELSE 'a' END, \
+                 CASE WHEN g.value % 3 = 0 THEN 'y' ELSE 'x' END, \
+                 200000 - g.value - {off}, g.value \
+                 FROM generate_series(1, 65536) g",
+                off = round * 65_536
+            ),
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    let before = volume_files(dir.path(), "ticks");
+    assert_eq!(before.len(), 3);
+    let remaining = |now: &[String]| before.iter().filter(|f| now.contains(f)).count();
+
+    db.execute("ALTER TABLE ticks CLUSTER BY (exchange, symbol, time)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let first = volume_files(dir.path(), "ticks");
+    assert_eq!(
+        remaining(&first),
+        1,
+        "the first cycle did not rewrite exactly two volumes"
+    );
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let second = volume_files(dir.path(), "ticks");
+    assert_eq!(
+        remaining(&second),
+        0,
+        "the second cycle left the third volume alone"
+    );
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(volume_files(dir.path(), "ticks"), second);
+    assert!(sealed_volumes(dir.path(), "ticks", &[1, 2, 3])
+        .iter()
+        .all(|v| in_key_order(v)));
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM ticks", ()).unwrap();
+    assert_eq!(count, 3 * 65_536);
+}

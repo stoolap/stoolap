@@ -3659,7 +3659,7 @@ impl MVCCEngine {
         // The volumes already sealed are checked against the new key by
         // the next compaction, which rewrites the ones out of order
         if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
-            mgr.set_recluster_pending(true);
+            mgr.request_recluster();
         }
 
         self.schema_epoch.fetch_add(1, Ordering::Release);
@@ -5547,6 +5547,10 @@ impl MVCCEngine {
         }
 
         for table_name in &tables_to_compact {
+            let mgr = self.get_or_create_segment_manager(table_name);
+            // The request is read before the schema: a key set between the
+            // two opens a newer request, which this cycle cannot close
+            let recluster_request = mgr.recluster_request();
             let schema = {
                 let schemas = self.schemas.read().unwrap();
                 match schemas.get(table_name) {
@@ -5554,8 +5558,6 @@ impl MVCCEngine {
                     None => continue,
                 }
             };
-
-            let mgr = self.get_or_create_segment_manager(table_name);
 
             // Per-table snapshot gating: capture the current min snapshot begin_seq
             // for each table to close the TOCTOU window. A snapshot starting between
@@ -5571,90 +5573,99 @@ impl MVCCEngine {
             // - Oversized (> target * 3/2): large volumes to split
             // - At-target: properly sized, never rewrite
             let (old_ids, volumes, tombstones) = {
-                // Use segments_raw for planning — only metadata (row_ids,
-                // row_count) is needed. Avoids reloading ALL cold volumes
-                // for tables where only sub-target volumes need compaction.
-                let segs = mgr.segments_raw();
-                let manifest = mgr.manifest();
+                // Planning reads the manifest for metadata only and lets it
+                // go before any volume is read: a seal holds the table's
+                // fence while it waits for the manifest, and DML waits on
+                // the fence
                 let ts = mgr.tombstone_set_arc();
-
                 let oversized_threshold = target_volume_rows * 3 / 2;
 
-                let mut merge_indices: Vec<usize> = Vec::new();
-                for (idx, seg) in manifest.segments.iter().enumerate() {
-                    // Skip volumes sealed after the earliest snapshot began.
-                    // seal_seq = cutoff used during extraction. A volume with
-                    // seal_seq <= limit contains only pre-snapshot data (safe).
-                    // seal_seq > limit means the volume may have post-snapshot data.
-                    if let Some(limit) = compact_seal_seq_limit {
-                        if seg.seal_seq > 0 && seg.seal_seq > limit {
-                            continue;
-                        }
-                    }
-                    if seg.row_count < target_volume_rows {
-                        // Sub-target: merge together to reach target size
-                        merge_indices.push(idx);
-                    } else if seg.row_count > oversized_threshold {
-                        // Oversized: needs splitting
-                        merge_indices.push(idx);
-                    } else if !ts.is_empty() {
-                        // At-target: include only if it has tombstoned rows that
-                        // compaction can actually apply. When snapshots are active,
-                        // only count tombstones with commit_seq < limit (post-snapshot
-                        // tombstones will be preserved, so rewriting is pointless).
-                        if let Some(cs) = segs.get(&seg.segment_id) {
-                            let tombstone_count = cs
-                                .volume
-                                .meta
-                                .row_ids
-                                .iter()
-                                .filter(|rid| {
-                                    if let Some(limit) = compact_seal_seq_limit {
-                                        ts.get(rid).is_some_and(|&commit_seq| commit_seq < limit)
-                                    } else {
-                                        ts.contains_key(rid)
-                                    }
-                                })
-                                .count();
-                            if tombstone_count > 0 {
-                                merge_indices.push(idx);
+                // (segment id, row count, whether size or tombstones already
+                // call for a rewrite) of every volume this cycle may touch
+                let mut planned: Vec<(u64, usize, bool)> = Vec::new();
+                let mut deferred = false;
+                {
+                    let segs = mgr.segments_raw();
+                    let manifest = mgr.manifest();
+                    for seg in manifest.segments.iter() {
+                        // Skip volumes sealed after the earliest snapshot began.
+                        // seal_seq = cutoff used during extraction. A volume with
+                        // seal_seq <= limit contains only pre-snapshot data (safe).
+                        // seal_seq > limit means the volume may have post-snapshot data.
+                        if let Some(limit) = compact_seal_seq_limit {
+                            if seg.seal_seq > 0 && seg.seal_seq > limit {
+                                deferred = true;
+                                continue;
                             }
                         }
+                        let rewrite = if seg.row_count < target_volume_rows {
+                            // Sub-target: merge together to reach target size
+                            true
+                        } else if seg.row_count > oversized_threshold {
+                            // Oversized: needs splitting
+                            true
+                        } else {
+                            // At-target: include only if it has tombstoned rows that
+                            // compaction can actually apply. When snapshots are active,
+                            // only count tombstones with commit_seq < limit (post-snapshot
+                            // tombstones will be preserved, so rewriting is pointless).
+                            !ts.is_empty()
+                                && segs.get(&seg.segment_id).is_some_and(|cs| {
+                                    cs.volume.meta.row_ids.iter().any(|rid| {
+                                        if let Some(limit) = compact_seal_seq_limit {
+                                            ts.get(rid)
+                                                .is_some_and(|&commit_seq| commit_seq < limit)
+                                        } else {
+                                            ts.contains_key(rid)
+                                        }
+                                    })
+                                })
+                        };
+                        planned.push((seg.segment_id, seg.row_count, rewrite));
                     }
-                    // At-target with no tombstones: frozen, don't touch
                 }
 
-                // A clustered table rewrites the volumes that are not in its
-                // key order: those sealed before the key was declared. Each
-                // is checked once; the flag drops when none is left
+                // A clustered table rewrites the volumes not in its key
+                // order. A volume is decided once, a cold one loaded to
+                // decide, and a cycle decides at most compact_threshold of
+                // them, so what a cycle loads and rewrites stays bounded.
+                // The request closes once a cycle finds every volume in
+                // order, none left undecided or deferred behind a snapshot
                 let mut reclustering = false;
-                if mgr.recluster_pending() {
-                    let mut out_of_order = false;
-                    if !schema.cluster_key.is_empty() {
-                        for (idx, seg) in manifest.segments.iter().enumerate() {
-                            if let Some(limit) = compact_seal_seq_limit {
-                                if seg.seal_seq > 0 && seg.seal_seq > limit {
+                if let Some(request) = recluster_request {
+                    let key = &schema.cluster_key;
+                    let mut all_checked = !deferred;
+                    if !key.is_empty() {
+                        let mut decided = 0usize;
+                        for entry in planned.iter_mut() {
+                            let in_order = match mgr.known_key_order(entry.0, key) {
+                                Some(in_order) => in_order,
+                                None if decided < compact_threshold => {
+                                    decided += 1;
+                                    mgr.decide_key_order(entry.0, key)?
+                                }
+                                None => {
+                                    all_checked = false;
                                     continue;
                                 }
-                            }
-                            if !mgr.key_order_verdict(seg.segment_id, &schema.cluster_key)? {
-                                out_of_order = true;
-                                if !merge_indices.contains(&idx) {
-                                    merge_indices.push(idx);
-                                }
+                            };
+                            if !in_order {
+                                entry.2 = true;
+                                reclustering = true;
                             }
                         }
-                        merge_indices.sort_unstable();
                     }
-                    // The flag drops only once every volume is in order; a
-                    // volume this cycle leaves alone keeps it set
-                    reclustering = out_of_order;
-                    if !out_of_order {
-                        mgr.set_recluster_pending(false);
+                    if key.is_empty() || (all_checked && !reclustering) {
+                        mgr.recluster_done(request);
                     }
                 }
+                let merge: Vec<(u64, usize)> = planned
+                    .into_iter()
+                    .filter(|entry| entry.2)
+                    .map(|entry| (entry.0, entry.1))
+                    .collect();
 
-                if merge_indices.is_empty() {
+                if merge.is_empty() {
                     continue;
                 }
                 // Single sub-target volume (too small, not dirty): wait for
@@ -5662,30 +5673,20 @@ impl MVCCEngine {
                 // A single at-target/oversized volume with tombstones should
                 // NOT be skipped — it needs rewriting to remove dead rows.
                 // A volume out of its table's key order is rewritten alone.
-                if merge_indices.len() == 1 && !reclustering {
-                    let seg = &manifest.segments[merge_indices[0]];
-                    if seg.row_count < target_volume_rows {
-                        continue; // small volume, wait for more
-                    }
+                if merge.len() == 1 && !reclustering && merge[0].1 < target_volume_rows {
+                    continue; // small volume, wait for more
                 }
 
                 // Load only the merge-candidate volumes (not the entire table).
                 // Cold volumes are loaded on demand via ensure_volume.
-                let old_ids: Vec<u64> = merge_indices
-                    .iter()
-                    .map(|&i| manifest.segments[i].segment_id)
-                    .collect();
+                let old_ids: Vec<u64> = merge.iter().map(|entry| entry.0).collect();
+                let segs = mgr.segments_raw();
                 let mut vols: Vec<(u64, Arc<crate::storage::volume::writer::FrozenVolume>)> =
-                    merge_indices
+                    old_ids
                         .iter()
-                        .filter_map(|&i| {
-                            let seg = &manifest.segments[i];
-                            let vol = segs.get(&seg.segment_id)?;
-                            Some((seg.segment_id, Arc::clone(&vol.volume)))
-                        })
+                        .filter_map(|id| segs.get(id).map(|cs| (*id, Arc::clone(&cs.volume))))
                         .collect();
                 drop(segs);
-                drop(manifest);
 
                 // Every manifest entry must have a loaded volume.
                 if vols.len() != old_ids.len() {
@@ -5996,7 +5997,14 @@ impl MVCCEngine {
             }
 
             // Atomically register all new volumes and remove old segments.
+            let new_ids: Vec<u64> = new_volumes.iter().map(|entry| entry.0).collect();
             mgr.replace_segments_atomic_multi(new_volumes, &old_ids);
+            // The volumes just written are in the key's order
+            if !schema.cluster_key.is_empty() {
+                for id in new_ids {
+                    mgr.record_key_order(id, &schema.cluster_key);
+                }
+            }
 
             // Clear only tombstones that existed at snapshot time for
             // row_ids in the merged volumes.

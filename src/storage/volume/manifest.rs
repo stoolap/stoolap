@@ -623,11 +623,12 @@ pub struct SegmentManager {
     pub current_eviction_epoch: std::sync::atomic::AtomicU64,
     /// True when any segment in the map is cold (metadata only, needs reload).
     has_cold: std::sync::atomic::AtomicBool,
-    /// Set until compaction has checked every volume against the table's
-    /// clustering key: at construction and after the key changes
-    recluster_pending: std::sync::atomic::AtomicBool,
-    /// Whether a volume holds its rows in a given key's order; volumes are
-    /// immutable, so a verdict for (volume, key) stands
+    /// Recluster requests, one at construction and one per key change, and
+    /// the last request a full check of the volumes closed
+    recluster_requested: std::sync::atomic::AtomicU64,
+    recluster_done: std::sync::atomic::AtomicU64,
+    /// Per segment, the volume columns checked for order and the verdict;
+    /// volumes are immutable, so a verdict stands until the segment goes
     key_order_verdicts: parking_lot::Mutex<FxHashMap<u64, (Vec<usize>, bool)>>,
     /// Serializes reload attempts. Concurrent callers block on this mutex
     /// instead of spinning, preventing CPU waste during disk I/O.
@@ -686,7 +687,8 @@ impl SegmentManager {
             volume_dir,
             has_segments_flag: std::sync::atomic::AtomicBool::new(false),
             has_cold: std::sync::atomic::AtomicBool::new(false),
-            recluster_pending: std::sync::atomic::AtomicBool::new(true),
+            recluster_requested: std::sync::atomic::AtomicU64::new(1),
+            recluster_done: std::sync::atomic::AtomicU64::new(0),
             key_order_verdicts: parking_lot::Mutex::new(FxHashMap::default()),
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
@@ -712,7 +714,8 @@ impl SegmentManager {
             volume_dir,
             has_segments_flag: std::sync::atomic::AtomicBool::new(false),
             has_cold: std::sync::atomic::AtomicBool::new(false),
-            recluster_pending: std::sync::atomic::AtomicBool::new(true),
+            recluster_requested: std::sync::atomic::AtomicU64::new(1),
+            recluster_done: std::sync::atomic::AtomicU64::new(0),
             key_order_verdicts: parking_lot::Mutex::new(FxHashMap::default()),
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
@@ -1522,27 +1525,75 @@ impl SegmentManager {
         }
     }
 
-    /// True until compaction has checked every volume against the table's
-    /// clustering key
+    /// The recluster request still open, if any: not every volume has been
+    /// checked against the table's key since the request was opened
+    pub fn recluster_request(&self) -> Option<u64> {
+        let requested = self
+            .recluster_requested
+            .load(std::sync::atomic::Ordering::Acquire);
+        let done = self
+            .recluster_done
+            .load(std::sync::atomic::Ordering::Acquire);
+        (requested != done).then_some(requested)
+    }
+
+    /// Whether a recluster request is open
     pub fn recluster_pending(&self) -> bool {
-        self.recluster_pending
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.recluster_request().is_some()
     }
 
-    /// Set after the key changes, cleared once every volume is in its order
-    pub fn set_recluster_pending(&self, pending: bool) {
-        self.recluster_pending
-            .store(pending, std::sync::atomic::Ordering::Release);
+    /// Open a request: the key changed
+    pub fn request_recluster(&self) {
+        self.recluster_requested
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
-    /// Whether the volume holds its rows in `key` order, decided once per
-    /// (volume, key); a cold volume is loaded to decide
-    pub fn key_order_verdict(&self, seg_id: u64, key: &[usize]) -> crate::core::Result<bool> {
-        if let Some((for_key, verdict)) = self.key_order_verdicts.lock().get(&seg_id) {
-            if for_key == key {
-                return Ok(*verdict);
-            }
-        }
+    /// Close `request`: every volume was checked against the key it was
+    /// opened for. A request opened since stays open
+    pub fn recluster_done(&self, request: u64) {
+        self.recluster_done
+            .fetch_max(request, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The key as the volume of `seg_id` holds it: each schema column
+    /// through the volume's column mapping. A column the volume predates
+    /// holds one value for every row and orders nothing, so it is left
+    /// out. None when the segment is not registered
+    fn volume_key(&self, seg_id: u64, key: &[usize]) -> Option<Vec<usize>> {
+        use super::writer::ColSource;
+        let segs = self.segments.read();
+        let mapping = &segs.get(&seg_id)?.mapping;
+        Some(
+            key.iter()
+                .filter_map(|&column| {
+                    if mapping.is_identity {
+                        return Some(column);
+                    }
+                    match mapping.sources.get(column) {
+                        Some(ColSource::Volume(v)) => Some(*v),
+                        _ => None,
+                    }
+                })
+                .collect(),
+        )
+    }
+
+    /// The verdict decided earlier for the volume of `seg_id` under `key`
+    pub fn known_key_order(&self, seg_id: u64, key: &[usize]) -> Option<bool> {
+        let columns = self.volume_key(seg_id, key)?;
+        self.key_order_verdicts
+            .lock()
+            .get(&seg_id)
+            .and_then(|(checked, verdict)| (*checked == columns).then_some(*verdict))
+    }
+
+    /// Decide whether the volume of `seg_id` holds its rows in `key` order,
+    /// loading a cold volume to do it, and keep the verdict; a segment no
+    /// longer registered is in order
+    pub fn decide_key_order(&self, seg_id: u64, key: &[usize]) -> crate::core::Result<bool> {
+        let Some(columns) = self.volume_key(seg_id, key) else {
+            return Ok(true);
+        };
         let volume = {
             let segs = self.segments.read();
             segs.get(&seg_id).map(|cs| Arc::clone(&cs.volume))
@@ -1555,11 +1606,28 @@ impl SegmentManager {
         let Some(volume) = volume else {
             return Ok(true);
         };
-        let verdict = volume.in_key_order(key)?;
+        let verdict = volume.in_key_order(&columns)?;
         self.key_order_verdicts
             .lock()
-            .insert(seg_id, (key.to_vec(), verdict));
+            .insert(seg_id, (columns, verdict));
         Ok(verdict)
+    }
+
+    /// Keep that the volume of `seg_id` was written in `key` order
+    pub fn record_key_order(&self, seg_id: u64, key: &[usize]) {
+        if let Some(columns) = self.volume_key(seg_id, key) {
+            self.key_order_verdicts
+                .lock()
+                .insert(seg_id, (columns, true));
+        }
+    }
+
+    /// Drop the verdicts of segments that are gone
+    fn forget_key_order(&self, segment_ids: &[u64]) {
+        let mut verdicts = self.key_order_verdicts.lock();
+        for id in segment_ids {
+            verdicts.remove(id);
+        }
     }
 
     /// Count segments below the target row count (sub-target volumes that need merging).
@@ -2432,6 +2500,7 @@ impl SegmentManager {
         }
         *self.segments.write() = Arc::new(FxHashMap::default());
         *self.tombstones.write() = Arc::new(FxHashMap::default());
+        self.key_order_verdicts.lock().clear();
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         self.has_segments_flag
@@ -2471,6 +2540,7 @@ impl SegmentManager {
             }
             *segments = Arc::new(new_map);
         }
+        self.forget_key_order(segment_ids);
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2530,6 +2600,7 @@ impl SegmentManager {
             }
             *segments = Arc::new(new_map);
         }
+        self.forget_key_order(old_segment_ids);
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2599,6 +2670,7 @@ impl SegmentManager {
         }
         self.has_segments_flag
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.forget_key_order(old_segment_ids);
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     }
@@ -2627,6 +2699,7 @@ impl SegmentManager {
             self.has_segments_flag
                 .store(has_any, std::sync::atomic::Ordering::Relaxed);
         }
+        self.forget_key_order(old_segment_ids);
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     }
@@ -3123,6 +3196,131 @@ mod tests {
         assert_eq!(newest_first[0].0, 2);
         assert_eq!(newest_first[1].0, 3);
         assert_eq!(newest_first[2].0, 1);
+    }
+
+    #[test]
+    fn a_recluster_request_opened_during_a_check_stays_open() {
+        let mgr = SegmentManager::new("t", None);
+        let first = mgr
+            .recluster_request()
+            .expect("a new manager starts with a request open");
+        // The key changes while the check for `first` runs
+        mgr.request_recluster();
+        mgr.recluster_done(first);
+        assert!(
+            mgr.recluster_pending(),
+            "closing the older request closed the one opened since"
+        );
+        let second = mgr.recluster_request().unwrap();
+        mgr.recluster_done(second);
+        assert!(!mgr.recluster_pending());
+        // A stale close changes nothing
+        mgr.recluster_done(first);
+        assert!(!mgr.recluster_pending());
+    }
+
+    /// One row per id, `k` walking down as the id walks up, so the
+    /// volume is in id order and out of `k` order
+    fn descending_k_volume(schema: &crate::core::Schema, rows: i64) -> Arc<FrozenVolume> {
+        use crate::core::{Row, Value};
+        let mut builder = super::super::writer::VolumeBuilder::new(schema);
+        for i in 1..=rows {
+            builder.add_row(
+                i,
+                &Row::from_values(vec![
+                    Value::Integer(i),
+                    Value::Integer(i),
+                    Value::Integer(rows - i),
+                ]),
+            );
+        }
+        Arc::new(builder.finish().unwrap())
+    }
+
+    fn meta_of(seg_id: u64, rows: i64) -> SegmentMeta {
+        SegmentMeta {
+            segment_id: seg_id,
+            file_path: PathBuf::from(format!("vol_{}.vol", seg_id)),
+            row_count: rows as usize,
+            min_row_id: 1,
+            max_row_id: rows,
+            creation_lsn: 0,
+            seal_seq: 0,
+            schema_version: 0,
+        }
+    }
+
+    #[test]
+    fn a_key_is_checked_through_the_volume_column_mapping() {
+        use crate::core::{DataType, SchemaBuilder};
+        let sealed_with = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("a", DataType::Integer, false, false)
+            .column("k", DataType::Integer, false, false)
+            .build();
+        // `a` was dropped since: k is schema column 1 and volume column 2
+        let current = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("k", DataType::Integer, false, false)
+            .build();
+        let mgr = SegmentManager::new("t", None);
+        mgr.register_segment(
+            1,
+            descending_k_volume(&sealed_with, 8),
+            meta_of(1, 8),
+            Some(&current),
+        );
+        assert_eq!(mgr.known_key_order(1, &[1]), None);
+        assert!(
+            !mgr.decide_key_order(1, &[1]).unwrap(),
+            "the verdict read volume column 1 (ascending a) for schema column 1 (descending k)"
+        );
+        assert_eq!(mgr.known_key_order(1, &[1]), Some(false));
+        // A key column the volume predates orders nothing
+        let widened = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("k", DataType::Integer, false, false)
+            .column("z", DataType::Integer, true, false)
+            .build();
+        mgr.invalidate_mappings(&widened);
+        assert!(mgr.decide_key_order(1, &[2]).unwrap());
+        assert!(!mgr.decide_key_order(1, &[2, 1]).unwrap());
+    }
+
+    #[test]
+    fn a_verdict_leaves_with_its_segment() {
+        use crate::core::{DataType, SchemaBuilder};
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("a", DataType::Integer, false, false)
+            .column("k", DataType::Integer, false, false)
+            .build();
+        let mgr = SegmentManager::new("t", None);
+        for seg_id in [1u64, 2, 3, 4] {
+            mgr.register_segment(
+                seg_id,
+                descending_k_volume(&schema, 4),
+                meta_of(seg_id, 4),
+                Some(&schema),
+            );
+            assert!(!mgr.decide_key_order(seg_id, &[2]).unwrap());
+        }
+        mgr.replace_segments_atomic(5, descending_k_volume(&schema, 4), meta_of(5, 4), &[1]);
+        mgr.remove_segments(&[2]);
+        mgr.replace_segments_atomic_remove_only(&[3]);
+        mgr.record_key_order(5, &[2]);
+        {
+            let verdicts = mgr.key_order_verdicts.lock();
+            assert!(
+                !verdicts.contains_key(&1)
+                    && !verdicts.contains_key(&2)
+                    && !verdicts.contains_key(&3)
+            );
+            assert_eq!(verdicts.get(&4).map(|v| v.1), Some(false));
+            assert_eq!(verdicts.get(&5).map(|v| v.1), Some(true));
+        }
+        mgr.clear();
+        assert!(mgr.key_order_verdicts.lock().is_empty());
     }
 
     #[test]
