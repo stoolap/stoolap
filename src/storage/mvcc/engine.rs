@@ -3641,6 +3641,7 @@ impl MVCCEngine {
             if !schema_arc.has_column(column_name) {
                 return Err(Error::ColumnNotFound(column_name.to_string()));
             }
+            Self::check_key_column_type(schema_arc, column_name, data_type)?;
         }
 
         // Update version store schema first (source of truth)
@@ -3701,6 +3702,7 @@ impl MVCCEngine {
             if !schema_arc.has_column(column_name) {
                 return Err(Error::ColumnNotFound(column_name.to_string()));
             }
+            Self::check_key_column_type(schema_arc, column_name, data_type)?;
         }
 
         // Update version store schema first (source of truth)
@@ -3872,6 +3874,54 @@ impl MVCCEngine {
             }
         }
 
+        Self::validate_cluster_key(schema)
+    }
+
+    /// A key column keeps a type with an order through MODIFY COLUMN
+    fn check_key_column_type(
+        schema: &Schema,
+        column_name: &str,
+        data_type: DataType,
+    ) -> Result<()> {
+        let in_key = schema
+            .get_column_index(column_name)
+            .is_some_and(|idx| schema.cluster_key.contains(&idx));
+        if in_key && matches!(data_type, DataType::Json | DataType::Vector) {
+            return Err(Error::Parse(format!(
+                "column '{}' is in the CLUSTER BY key of table '{}' and cannot become {:?}, which has no order",
+                column_name, schema.table_name, data_type
+            )));
+        }
+        Ok(())
+    }
+
+    /// The clustering key names existing columns, each once, and each with
+    /// an order; checked wherever a schema enters or changes, since a key
+    /// that fails this is refused again when the schema is read back
+    pub(crate) fn validate_cluster_key(schema: &Schema) -> Result<()> {
+        let mut seen = FxHashSet::default();
+        for &column in &schema.cluster_key {
+            let Some(col) = schema.columns.get(column) else {
+                return Err(Error::internal(format!(
+                    "CLUSTER BY names column {} of table '{}', which has {} columns",
+                    column,
+                    schema.table_name,
+                    schema.columns.len()
+                )));
+            };
+            if !seen.insert(column) {
+                return Err(Error::Parse(format!(
+                    "CLUSTER BY names column '{}' twice",
+                    col.name
+                )));
+            }
+            if matches!(col.data_type, DataType::Json | DataType::Vector) {
+                return Err(Error::Parse(format!(
+                    "CLUSTER BY column '{}' has type {:?}, which has no order",
+                    col.name, col.data_type
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -5705,45 +5755,58 @@ impl MVCCEngine {
                 live_refs.sort_unstable_by_key(|(id, _, _)| *id);
             } else {
                 use crate::storage::volume::writer::ColSource;
-                // One buffer per key column over all live rows, then an
-                // index sort: a handful of allocations for the whole merge
-                let key_value = |vol_idx: usize, row_idx: usize, column: usize| -> Value {
-                    let vol = &volumes[vol_idx].1;
-                    let mapping = &vol_mappings[vol_idx];
-                    let source = if mapping.is_identity {
-                        Some(column)
-                    } else {
-                        match mapping.sources.get(column) {
-                            Some(ColSource::Volume(v)) => Some(*v),
-                            Some(ColSource::Default(value)) => return value.clone(),
-                            None => None,
-                        }
-                    };
-                    source
-                        .and_then(|v| vol.columns.get(v).ok())
-                        .map(|col| col.get_value(row_idx))
-                        .unwrap_or_else(Value::null_unknown)
+                // The key columns are compared in place, cell against cell,
+                // through one column handle per key column per volume; a
+                // column a volume predates is its default for every row
+                use crate::storage::volume::column::ColumnData;
+                let mut key_cells: Vec<Vec<Option<&ColumnData>>> = Vec::new();
+                let mut key_defaults: Vec<Vec<Option<Value>>> = Vec::new();
+                for &column in &schema.cluster_key {
+                    let mut cells = Vec::with_capacity(volumes.len());
+                    let mut defaults = Vec::with_capacity(volumes.len());
+                    for (vol_idx, (_, vol)) in volumes.iter().enumerate() {
+                        let mapping = &vol_mappings[vol_idx];
+                        let (source, default) = if mapping.is_identity {
+                            (Some(column), None)
+                        } else {
+                            match mapping.sources.get(column) {
+                                Some(ColSource::Volume(v)) => (Some(*v), None),
+                                Some(ColSource::Default(value)) => (None, Some(value.clone())),
+                                None => (None, Some(Value::null_unknown())),
+                            }
+                        };
+                        cells.push(source.and_then(|v| vol.columns.get(v).ok()));
+                        defaults.push(default);
+                    }
+                    key_cells.push(cells);
+                    key_defaults.push(defaults);
+                }
+                let compare_key = |k: usize, a: (usize, usize), b: (usize, usize)| match (
+                    key_cells[k][a.0],
+                    key_cells[k][b.0],
+                ) {
+                    (Some(ca), Some(cb)) => ca.compare_cells(a.1, cb, b.1),
+                    (ca, cb) => {
+                        let null = Value::null_unknown();
+                        let va = ca.map(|c| c.get_value(a.1));
+                        let vb = cb.map(|c| c.get_value(b.1));
+                        crate::storage::volume::seal::compare_key_values(
+                            va.as_ref()
+                                .or(key_defaults[k][a.0].as_ref())
+                                .unwrap_or(&null),
+                            vb.as_ref()
+                                .or(key_defaults[k][b.0].as_ref())
+                                .unwrap_or(&null),
+                        )
+                    }
                 };
-                let key_columns: Vec<Vec<Value>> = schema
-                    .cluster_key
-                    .iter()
-                    .map(|&column| {
-                        live_refs
-                            .iter()
-                            .map(|&(_, vol_idx, row_idx)| key_value(vol_idx, row_idx, column))
-                            .collect()
-                    })
-                    .collect();
                 let mut order: Vec<u32> = (0..live_refs.len() as u32).collect();
                 order.sort_unstable_by(|&a, &b| {
-                    let (a, b) = (a as usize, b as usize);
-                    key_columns
-                        .iter()
-                        .map(|values| {
-                            crate::storage::volume::seal::compare_key_values(&values[a], &values[b])
-                        })
+                    let (ra, rb) = (live_refs[a as usize], live_refs[b as usize]);
+                    (0..schema.cluster_key.len())
+                        .map(|k| compare_key(k, (ra.1, ra.2), (rb.1, rb.2)))
                         .find(|o| *o != std::cmp::Ordering::Equal)
-                        .unwrap_or_else(|| live_refs[a].0.cmp(&live_refs[b].0))
+                        .unwrap_or_else(|| ra.0.cmp(&rb.0))
                 });
                 live_refs = order.iter().map(|&i| live_refs[i as usize]).collect();
             }

@@ -1102,6 +1102,20 @@ impl Executor {
                         }
                     }
 
+                    // A column of the clustering key keeps a type with an order
+                    {
+                        let schema = table.schema();
+                        let in_key = schema
+                            .get_column_index(&col_def.name.value)
+                            .is_some_and(|i| schema.cluster_key.contains(&i));
+                        if in_key && matches!(data_type, DataType::Json | DataType::Vector) {
+                            return Err(Error::Parse(format!(
+                                "column '{}' is in the CLUSTER BY key of table '{}' and cannot become {:?}, which has no order",
+                                col_def.name.value, table_name, data_type
+                            )));
+                        }
+                    }
+
                     table.modify_column(&col_def.name.value, data_type, nullable)?;
 
                     // Refresh engine's schema cache from version store

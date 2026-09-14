@@ -423,3 +423,66 @@ fn a_key_column_holding_more_than_one_kind_orders_by_kind_then_value() {
     let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
     assert_eq!(ids, vec![5, 4, 2, 1, 3]);
 }
+
+#[test]
+fn a_key_built_outside_sql_is_checked_when_the_table_is_created() {
+    let db = Database::open("memory://cluster_by_engine_boundary").unwrap();
+    let past_the_end = SchemaBuilder::new("t")
+        .column("id", DataType::Integer, false, true)
+        .cluster_by(vec![1])
+        .build();
+    assert!(
+        db.engine().create_table(past_the_end).is_err(),
+        "a key past the last column was accepted"
+    );
+    let twice = SchemaBuilder::new("t")
+        .column("id", DataType::Integer, false, true)
+        .column("k", DataType::Integer, false, false)
+        .cluster_by(vec![1, 1])
+        .build();
+    assert!(
+        db.engine().create_table(twice).is_err(),
+        "a repeated key column was accepted"
+    );
+    let unordered = SchemaBuilder::new("t")
+        .column("id", DataType::Integer, false, true)
+        .column("doc", DataType::Json, true, false)
+        .cluster_by(vec![1])
+        .build();
+    assert!(
+        db.engine().create_table(unordered).is_err(),
+        "a JSON key column was accepted"
+    );
+    let fine = SchemaBuilder::new("t")
+        .column("id", DataType::Integer, false, true)
+        .column("k", DataType::Integer, false, false)
+        .cluster_by(vec![1])
+        .build();
+    db.engine().create_table(fine).unwrap();
+    assert_eq!(
+        db.engine().get_table_schema("t").unwrap().cluster_key,
+        vec![1]
+    );
+}
+
+#[test]
+fn a_key_column_cannot_be_changed_to_a_type_without_an_order() {
+    let db = Database::open("memory://cluster_by_modify_column").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER) CLUSTER BY (k)",
+        (),
+    )
+    .unwrap();
+    assert!(
+        db.execute("ALTER TABLE t MODIFY COLUMN k JSON", ())
+            .is_err(),
+        "a key column was changed to JSON"
+    );
+    db.execute("ALTER TABLE t MODIFY COLUMN v JSON", ())
+        .unwrap();
+    db.execute("ALTER TABLE t MODIFY COLUMN k TEXT", ())
+        .unwrap();
+    let schema = db.engine().get_table_schema("t").unwrap();
+    assert_eq!(schema.cluster_key, vec![1]);
+    assert_eq!(schema.columns[1].data_type, DataType::Text);
+}

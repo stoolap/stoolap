@@ -399,6 +399,55 @@ impl ColumnData {
         }
     }
 
+    /// Where a cell sorts among the kinds a key column can hold: NULL, then
+    /// booleans, numbers, text, timestamps, then what has no order
+    fn cell_kind(&self, idx: usize) -> u8 {
+        if self.is_null(idx) {
+            return 0;
+        }
+        match self {
+            ColumnData::Boolean { .. } => 1,
+            ColumnData::Int64 { .. } | ColumnData::Float64 { .. } => 2,
+            ColumnData::Dictionary { .. } => 3,
+            ColumnData::TimestampNanos { .. } => 4,
+            ColumnData::Bytes { .. } => 5,
+        }
+    }
+
+    /// Orders this column's cell `i` against `other`'s cell `j` the way a
+    /// clustering key orders values, reading the typed arrays in place:
+    /// by kind, then by value within the kind
+    pub fn compare_cells(&self, i: usize, other: &ColumnData, j: usize) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let kinds = self.cell_kind(i).cmp(&other.cell_kind(j));
+        if kinds != Ordering::Equal {
+            return kinds;
+        }
+        match (self, other) {
+            (ColumnData::Int64 { .. }, ColumnData::Int64 { .. }) => {
+                self.get_i64(i).cmp(&other.get_i64(j))
+            }
+            (ColumnData::Int64 { .. } | ColumnData::Float64 { .. }, _) => {
+                let a = if matches!(self, ColumnData::Int64 { .. }) {
+                    self.get_i64(i) as f64
+                } else {
+                    self.get_f64(i)
+                };
+                let b = if matches!(other, ColumnData::Int64 { .. }) {
+                    other.get_i64(j) as f64
+                } else {
+                    other.get_f64(j)
+                };
+                a.partial_cmp(&b)
+                    .unwrap_or_else(|| a.is_nan().cmp(&b.is_nan()))
+            }
+            (ColumnData::Dictionary { .. }, _) => self.get_str(i).cmp(other.get_str(j)),
+            (ColumnData::TimestampNanos { .. }, _) => self.get_i64(i).cmp(&other.get_i64(j)),
+            (ColumnData::Boolean { .. }, _) => self.get_bool(i).cmp(&other.get_bool(j)),
+            _ => Ordering::Equal,
+        }
+    }
+
     /// Reconstruct a Value for row `idx`.
     ///
     /// This is the "slow path" used when the executor needs a full Value
