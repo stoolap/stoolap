@@ -345,3 +345,121 @@ fn a_name_dropped_and_added_back_reads_the_default_not_the_dropped_data() {
         assert_eq!(rows, 0);
     }
 }
+
+/// The engine's schema epoch starts over at an open while the versions a
+/// manifest carries persist; the epoch must restart above them, or a
+/// change made after the open orders before the seal
+#[test]
+fn a_rename_after_a_reopen_orders_after_a_seal_made_at_a_high_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE q (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+        // Raise the schema version well above what a fresh open starts at
+        for i in 0..8 {
+            db.execute(&format!("ALTER TABLE q ADD COLUMN pad{i} INTEGER"), ())
+                .unwrap();
+            db.execute(&format!("ALTER TABLE q DROP COLUMN pad{i}"), ())
+                .unwrap();
+        }
+        db.execute(
+            "INSERT INTO q SELECT g.value, 1, 2 FROM generate_series(1, 100) g",
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    db.execute("ALTER TABLE q RENAME COLUMN a TO z", ())
+        .unwrap();
+    db.execute("ALTER TABLE q RENAME COLUMN b TO a", ())
+        .unwrap();
+    for _ in 0..2 {
+        let db = Database::open(&dsn).unwrap();
+        assert_eq!(
+            values(&db, "SELECT z, a FROM q WHERE id = 5"),
+            vec![Some(1), Some(2)]
+        );
+    }
+    assert_eq!(
+        values(&db, "SELECT z, a FROM q WHERE id = 5"),
+        vec![Some(1), Some(2)]
+    );
+}
+
+/// A rename made in the same schema version a later seal carries happened
+/// before that seal: the sealed rows already carry the new name and the
+/// rename must not be walked again
+#[test]
+fn a_rename_made_just_before_a_seal_is_not_applied_to_the_sealed_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}", dir.path().display())).unwrap();
+    db.execute(
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO q SELECT g.value, 11, 22 FROM generate_series(1, 100) g",
+        (),
+    )
+    .unwrap();
+    db.execute("ALTER TABLE q RENAME COLUMN x TO z", ())
+        .unwrap();
+    db.execute("ALTER TABLE q RENAME COLUMN y TO x", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("ALTER TABLE q RENAME COLUMN z TO y", ())
+        .unwrap();
+    db.execute("ALTER TABLE q RENAME COLUMN x TO z", ())
+        .unwrap();
+    assert_eq!(
+        values(&db, "SELECT y, z FROM q WHERE id = 5"),
+        vec![Some(11), Some(22)]
+    );
+}
+
+/// Renames replayed from the log after an open without a checkpoint take
+/// the same versions the statements took, so a volume sealed between them
+/// sees the same order either way
+#[test]
+fn renames_replayed_from_the_log_keep_their_order_against_the_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE q (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO q SELECT g.value, 1, 2 FROM generate_series(1, 100) g",
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.execute("ALTER TABLE q RENAME COLUMN a TO tmp", ())
+            .unwrap();
+        db.execute("ALTER TABLE q RENAME COLUMN b TO a", ())
+            .unwrap();
+        db.execute("ALTER TABLE q RENAME COLUMN tmp TO b", ())
+            .unwrap();
+        assert_eq!(
+            values(&db, "SELECT a, b FROM q WHERE id = 5"),
+            vec![Some(2), Some(1)]
+        );
+    }
+    for _ in 0..2 {
+        let db = Database::open(&dsn).unwrap();
+        assert_eq!(
+            values(&db, "SELECT a, b FROM q WHERE id = 5"),
+            vec![Some(2), Some(1)]
+        );
+    }
+}

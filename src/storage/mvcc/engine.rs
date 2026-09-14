@@ -653,6 +653,17 @@ impl MVCCEngine {
 
                 // Volume recovery takes priority over snapshot backup files.
                 let volume_lsn = self.load_manifests_from_volumes()?;
+                // The schema epoch restarts above every version the
+                // manifests carry, before the log is replayed, so a change
+                // replayed or made from now on orders after the seals and
+                // changes made before the open
+                let persisted = {
+                    let mgrs = self.segment_managers.read().unwrap();
+                    mgrs.values().map(|mgr| mgr.max_schema_version()).max()
+                };
+                if let Some(persisted) = persisted {
+                    self.schema_epoch.fetch_max(persisted + 1, Ordering::AcqRel);
+                }
 
                 // Legacy snapshots: only used when volumes/ does NOT exist.
                 // This handles migration from pre-volume databases.
@@ -3600,6 +3611,10 @@ impl MVCCEngine {
             }
         }
 
+        // Increment schema epoch for cache invalidation, before the rename
+        // is recorded under it, as the SQL path does
+        self.schema_epoch.fetch_add(1, Ordering::Release);
+
         // Propagate rename to cold volumes (persists in manifest) and recompute mappings
         {
             let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
@@ -3614,9 +3629,6 @@ impl MVCCEngine {
                 }
             }
         }
-
-        // Increment schema epoch for cache invalidation
-        self.schema_epoch.fetch_add(1, Ordering::Release);
 
         Ok(())
     }

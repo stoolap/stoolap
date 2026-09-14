@@ -2477,13 +2477,25 @@ impl SegmentManager {
         // against drops survives without a change of format; a reader that
         // does not know the marker never matches it against a column
         let mut manifest = self.manifest.write();
+        let ordinal = manifest.column_renames.len();
         manifest
             .column_renames
             .push((SmartString::from(old_name), SmartString::from(new_name)));
         manifest.dropped_columns.push((
-            SmartString::from(super::writer::rename_marker(old_name, new_name).as_str()),
+            SmartString::from(super::writer::rename_marker(ordinal).as_str()),
             schema_version,
         ));
+    }
+
+    /// The largest schema version this table's manifest carries: of its
+    /// segments, its drops and its rename markers. The engine's schema
+    /// epoch restarts above it after an open, so versions recorded from
+    /// then on order against the persisted ones
+    pub fn max_schema_version(&self) -> u64 {
+        let manifest = self.manifest.read();
+        let segments = manifest.segments.iter().map(|s| s.schema_version);
+        let drops = manifest.dropped_columns.iter().map(|(_, v)| *v);
+        segments.chain(drops).max().unwrap_or(0)
     }
 
     /// Load manifest from disk.
