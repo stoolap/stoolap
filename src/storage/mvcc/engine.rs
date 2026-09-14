@@ -3604,7 +3604,11 @@ impl MVCCEngine {
         {
             let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
             if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
-                mgr.record_column_rename(old_name, new_name);
+                mgr.record_column_rename(
+                    old_name,
+                    new_name,
+                    self.schema_epoch.load(Ordering::Acquire),
+                );
                 if let Some(ref s) = schema {
                     mgr.invalidate_mappings(s);
                 }
@@ -3685,7 +3689,11 @@ impl MVCCEngine {
         let table_name_lower = table_name.to_lowercase();
         let schema = self.schemas.read().unwrap().get(&table_name_lower).cloned();
         if let Some(mgr) = self.segment_managers.read().unwrap().get(&table_name_lower) {
-            mgr.record_column_rename(old_name, new_name);
+            mgr.record_column_rename(
+                old_name,
+                new_name,
+                self.schema_epoch.load(Ordering::Acquire),
+            );
             if let Some(ref s) = schema {
                 mgr.invalidate_mappings(s);
             }

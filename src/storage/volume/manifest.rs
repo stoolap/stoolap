@@ -2471,12 +2471,19 @@ impl SegmentManager {
 
     /// Record a column rename. The caller must call invalidate_mappings()
     /// afterwards to recompute column mappings with the new rename.
-    pub fn record_column_rename(&self, old_name: &str, new_name: &str) {
-        // Persist in manifest for restart
-        self.manifest
-            .write()
+    pub fn record_column_rename(&self, old_name: &str, new_name: &str, schema_version: u64) {
+        // Persist in manifest for restart. The version goes into the drop
+        // list under a name no column can carry, so the order of renames
+        // against drops survives without a change of format; a reader that
+        // does not know the marker never matches it against a column
+        let mut manifest = self.manifest.write();
+        manifest
             .column_renames
             .push((SmartString::from(old_name), SmartString::from(new_name)));
+        manifest.dropped_columns.push((
+            SmartString::from(super::writer::rename_marker(old_name, new_name).as_str()),
+            schema_version,
+        ));
     }
 
     /// Load manifest from disk.

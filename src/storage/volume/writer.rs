@@ -1836,26 +1836,82 @@ impl ColumnMapping {
     }
 }
 
-/// The volume column a schema column's name came from, following the
-/// rename records back until a name the volume holds: a column renamed
-/// more than once since the seal is reached through every step. None
-/// when no record leads to the volume
-fn renamed_source(
-    name: &str,
-    column_renames: &[(crate::common::SmartString, crate::common::SmartString)],
+/// The drop-list name under which a rename's schema version is kept: the
+/// two names joined by a byte no column name can hold
+pub fn rename_marker(old_name: &str, new_name: &str) -> String {
+    format!("{}\0{}", old_name.to_lowercase(), new_name.to_lowercase())
+}
+
+/// A change of the schema since a volume was sealed, in the order the
+/// changes were made
+enum SchemaEvent<'a> {
+    Renamed { old: &'a str, new: &'a str },
+    Dropped(&'a str),
+}
+
+/// The schema changes that happened at or after `volume_schema_version`,
+/// newest first. A rename with no version marker (recorded before the
+/// markers existed) counts as the newest change
+fn schema_events_since<'a>(
+    volume_schema_version: u64,
+    dropped_columns: &'a [(crate::common::SmartString, u64)],
+    column_renames: &'a [(crate::common::SmartString, crate::common::SmartString)],
+) -> Vec<(u64, usize, SchemaEvent<'a>)> {
+    let mut events = Vec::new();
+    let mut taken = vec![false; dropped_columns.len()];
+    for (order, (old, new)) in column_renames.iter().enumerate() {
+        let marker = rename_marker(old, new);
+        let version = dropped_columns
+            .iter()
+            .enumerate()
+            .find(|(i, (name, _))| !taken[*i] && name.as_str() == marker)
+            .map(|(i, (_, version))| {
+                taken[i] = true;
+                *version
+            })
+            .unwrap_or(u64::MAX);
+        if version >= volume_schema_version {
+            events.push((
+                version,
+                order,
+                SchemaEvent::Renamed {
+                    old: old.as_str(),
+                    new: new.as_str(),
+                },
+            ));
+        }
+    }
+    for (order, (name, version)) in dropped_columns.iter().enumerate() {
+        if !name.contains('\0') && *version >= volume_schema_version {
+            events.push((*version, order, SchemaEvent::Dropped(name.as_str())));
+        }
+    }
+    events.sort_by_key(|event| std::cmp::Reverse((event.0, event.1)));
+    events
+}
+
+/// The volume column a schema column stands for, or None when the
+/// column's identity began after the seal (a drop ended the identity that
+/// carried the name, or the name never reached the volume). The name is
+/// walked back through the changes since the seal, newest first: a rename
+/// into the name takes the name it had before, a drop of the name ends
+/// the walk
+fn source_before_changes<'a>(
+    name_now: &'a str,
+    events: &[(u64, usize, SchemaEvent<'a>)],
     volume: &FrozenVolume,
 ) -> Option<usize> {
-    let mut name = name;
-    for _ in 0..=column_renames.len() {
-        let (old, _) = column_renames
-            .iter()
-            .find(|(_, new)| new.as_str() == name)?;
-        if let Some(idx) = volume.column_index(old.as_str()) {
-            return Some(idx);
+    let mut name = name_now;
+    for (_, _, event) in events {
+        match event {
+            SchemaEvent::Renamed { old, new } if new.eq_ignore_ascii_case(name) => name = old,
+            SchemaEvent::Dropped(dropped) if dropped.eq_ignore_ascii_case(name) => return None,
+            _ => {}
         }
-        name = old.as_str();
     }
-    None
+    volume
+        .column_index(name)
+        .or_else(|| volume.column_index(name_now))
 }
 
 /// Compute column mapping from current schema to a frozen volume.
@@ -1877,22 +1933,16 @@ pub fn compute_column_mapping_with_drops(
     // RENAME a→b then ADD COLUMN a, both "b" via rename and "a" via direct
     // match would hit the same old physical column without this guard).
     let mut used_vol_indices = smallvec::SmallVec::<[usize; 16]>::new();
+    let events = schema_events_since(volume_schema_version, dropped_columns, column_renames);
 
     for (pos, col) in schema.columns.iter().enumerate() {
-        // Try rename fallback FIRST (higher priority: a renamed column's
-        // old physical slot belongs to the renamed column, not a new column
-        // that happens to reuse the old name).
-        let vol_idx = renamed_source(&col.name_lower, column_renames, volume)
-            .or_else(|| volume.column_index(&col.name_lower));
+        let vol_idx = source_before_changes(&col.name_lower, &events, volume);
 
         if let Some(vol_idx) = vol_idx {
             let type_matches = vol_idx < volume.meta.column_types.len()
                 && volume.meta.column_types[vol_idx] == col.data_type;
-            let was_dropped = dropped_columns.iter().any(|(d, drop_ver)| {
-                d.as_str() == col.name_lower && volume_schema_version <= *drop_ver
-            });
             let already_used = used_vol_indices.contains(&vol_idx);
-            if type_matches && !was_dropped && !already_used {
+            if type_matches && !already_used {
                 if is_identity && vol_idx != pos {
                     is_identity = false;
                 }

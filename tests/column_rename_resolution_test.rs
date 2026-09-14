@@ -222,3 +222,126 @@ fn an_anti_join_filter_reaches_the_sealed_rows_of_the_inner_table() {
         "the sealed inner rows were all rejected"
     );
 }
+
+/// Sealed rows, then a history of renames and drops that can only be
+/// resolved by the order of the changes; each case reads the sealed rows
+/// after the history, and once more after a reopen so the order is read
+/// back from the manifest
+fn sealed_then(dir: &std::path::Path, create: &str, insert: &str, history: &[&str]) -> String {
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(create, ()).unwrap();
+        db.execute(insert, ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    for sql in history {
+        db.execute(sql, ()).unwrap();
+    }
+    dsn
+}
+
+fn values(db: &Database, sql: &str) -> Vec<Option<i64>> {
+    let row = db.query(sql, ()).unwrap().next().unwrap().unwrap();
+    (0..row.len())
+        .map(|i| row.get::<Option<i64>>(i).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_temporary_name_used_twice_resolves_each_column_to_its_own_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = sealed_then(
+        dir.path(),
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, b INTEGER NOT NULL)",
+        "INSERT INTO t SELECT g.value, 1, 2 FROM generate_series(1, 100) g",
+        &[
+            "ALTER TABLE t RENAME COLUMN a TO tmp",
+            "ALTER TABLE t RENAME COLUMN tmp TO a",
+            "ALTER TABLE t RENAME COLUMN b TO tmp",
+            "ALTER TABLE t RENAME COLUMN tmp TO b",
+            "ALTER TABLE t ADD COLUMN marker INTEGER DEFAULT 0",
+        ],
+    );
+    for _ in 0..2 {
+        let db = Database::open(&dsn).unwrap();
+        assert_eq!(
+            values(&db, "SELECT a, b, marker FROM t WHERE id = 5"),
+            vec![Some(1), Some(2), Some(0)]
+        );
+    }
+}
+
+#[test]
+fn a_name_dropped_and_added_back_then_renamed_carries_the_default_not_the_old_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = sealed_then(
+        dir.path(),
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL)",
+        "INSERT INTO t SELECT g.value, 1 FROM generate_series(1, 100) g",
+        &[
+            "ALTER TABLE t RENAME COLUMN a TO b",
+            "ALTER TABLE t DROP COLUMN b",
+            "ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 4",
+            "ALTER TABLE t RENAME COLUMN b TO c",
+        ],
+    );
+    for _ in 0..2 {
+        let db = Database::open(&dsn).unwrap();
+        assert_eq!(values(&db, "SELECT c FROM t WHERE id = 5"), vec![Some(4)]);
+        let rows = db
+            .query("SELECT id FROM t WHERE c = 4", ())
+            .unwrap()
+            .count();
+        assert_eq!(rows, 100);
+    }
+}
+
+#[test]
+fn a_name_freed_by_a_drop_and_taken_by_a_rename_reads_the_renamed_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = sealed_then(
+        dir.path(),
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL, c INTEGER NOT NULL)",
+        "INSERT INTO t SELECT g.value, 1, 9 FROM generate_series(1, 100) g",
+        &[
+            "ALTER TABLE t RENAME COLUMN a TO b",
+            "ALTER TABLE t DROP COLUMN b",
+            "ALTER TABLE t RENAME COLUMN c TO b",
+        ],
+    );
+    for _ in 0..2 {
+        let db = Database::open(&dsn).unwrap();
+        assert_eq!(values(&db, "SELECT b FROM t WHERE id = 5"), vec![Some(9)]);
+        let rows = db
+            .query("SELECT id FROM t WHERE b = 9", ())
+            .unwrap()
+            .count();
+        assert_eq!(rows, 100);
+    }
+}
+
+#[test]
+fn a_name_dropped_and_added_back_reads_the_default_not_the_dropped_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = sealed_then(
+        dir.path(),
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER NOT NULL)",
+        "INSERT INTO t SELECT g.value, 1 FROM generate_series(1, 100) g",
+        &[
+            "ALTER TABLE t RENAME COLUMN a TO b",
+            "ALTER TABLE t DROP COLUMN b",
+            "ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 4",
+        ],
+    );
+    for _ in 0..2 {
+        let db = Database::open(&dsn).unwrap();
+        assert_eq!(values(&db, "SELECT b FROM t WHERE id = 5"), vec![Some(4)]);
+        let rows = db
+            .query("SELECT id FROM t WHERE b = 1", ())
+            .unwrap()
+            .count();
+        assert_eq!(rows, 0);
+    }
+}
