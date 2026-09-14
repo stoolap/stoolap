@@ -829,18 +829,8 @@ impl VolumeScanner {
     /// same name, and None for a column the volume does not hold, which
     /// the full filter evaluates on the materialized row
     fn filter_column(&self, name: &str) -> Option<usize> {
-        use super::writer::ColSource;
         match &self.column_mapping {
-            Some(mapping) => {
-                let position = mapping
-                    .names
-                    .iter()
-                    .position(|n| n.as_str().eq_ignore_ascii_case(name))?;
-                match mapping.sources.get(position)? {
-                    ColSource::Volume(v) => Some(*v),
-                    ColSource::Default(_) => None,
-                }
-            }
+            Some(mapping) => mapping.volume_column(&self.volume, name),
             None => self.volume.column_index(name),
         }
     }
@@ -907,12 +897,22 @@ impl VolumeScanner {
     }
 
     /// Set a precomputed column mapping for schema-evolved volumes.
-    /// Only stores it if the mapping is non-identity (avoids overhead
-    /// when the volume matches the current schema).
+    /// Kept when the mapping is not the identity, or carries names a
+    /// filter must resolve through; rows go through it only in the first
+    /// case (see `row_mapping`)
     pub fn set_column_mapping(&mut self, mapping: super::writer::ColumnMapping) {
-        if !mapping.is_identity {
+        if !mapping.is_identity || !mapping.names.is_empty() {
             self.column_mapping = Some(mapping);
         }
+    }
+
+    /// The mapping rows are read through: none when the columns are in
+    /// place and only names differ
+    #[inline(always)]
+    fn row_mapping(&self) -> Option<&super::writer::ColumnMapping> {
+        self.column_mapping
+            .as_ref()
+            .filter(|mapping| !mapping.is_identity)
     }
 
     /// Get (column_data, local_index) for a global row index.
@@ -1034,12 +1034,12 @@ impl VolumeScanner {
     fn materialize_row(&mut self, idx: usize) -> Result<bool> {
         // Per-group cache path: only when no schema mapping is needed.
         // Schema-evolved volumes require column_mapping which remaps positions.
-        if self.group_cache.is_some() && self.column_mapping.is_none() {
+        if self.group_cache.is_some() && self.row_mapping().is_none() {
             return self.materialize_row_from_cache(idx);
         }
 
         if let Some(ref filter) = self.filter {
-            let full_row = match (&self.needed_cols, &self.column_mapping) {
+            let full_row = match (&self.needed_cols, self.row_mapping()) {
                 (Some(mask), Some(mapping)) => {
                     self.volume.get_row_mapped_needed(idx, mapping, mask)
                 }
@@ -1065,7 +1065,7 @@ impl VolumeScanner {
                         .collect(),
                 );
             }
-        } else if let Some(ref mapping) = self.column_mapping {
+        } else if let Some(mapping) = self.row_mapping() {
             if self.is_full_projection {
                 self.current_row = self.volume.get_row_mapped(idx, mapping)?;
             } else {

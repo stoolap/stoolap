@@ -1806,13 +1806,34 @@ pub struct ColumnMapping {
     pub sources: Vec<ColSource>,
     /// The schema's column names, by position, so a column named in a
     /// filter resolves through `sources` rather than by name in the volume,
-    /// which may still hold a dropped column of that name. Empty for an
-    /// identity mapping
+    /// which may still hold a dropped column of that name, or a renamed
+    /// column under its old name. Empty when the names match by position
     pub names: Vec<crate::common::SmartString>,
     /// True when every schema column maps 1:1 to the same volume column
     /// in the same order. When true, callers can skip the mapping and
     /// use get_row()/get_row_projected() directly.
     pub is_identity: bool,
+}
+
+impl ColumnMapping {
+    /// The volume column a filter's column name stands for under the
+    /// schema this mapping was computed for: by name in the volume when
+    /// the mapping is the identity, through `sources` otherwise, since the
+    /// volume may still hold a dropped column of the same name. None for a
+    /// column the volume does not hold
+    pub fn volume_column(&self, volume: &FrozenVolume, name: &str) -> Option<usize> {
+        if self.names.is_empty() {
+            return volume.column_index(name);
+        }
+        let position = self
+            .names
+            .iter()
+            .position(|n| n.as_str().eq_ignore_ascii_case(name))?;
+        match self.sources.get(position)? {
+            ColSource::Volume(v) => Some(*v),
+            ColSource::Default(_) => None,
+        }
+    }
 }
 
 /// Compute column mapping from current schema to a frozen volume.
@@ -1877,7 +1898,17 @@ pub fn compute_column_mapping_with_drops(
         }
     }
 
-    let names = if is_identity {
+    // The names travel with the mapping when a filter's column name may
+    // not resolve by name in the volume: the schema differs in shape, or a
+    // column was renamed in place (two renames can swap names and leave
+    // every column where it was)
+    let names_match = is_identity
+        && schema
+            .columns
+            .iter()
+            .zip(volume.meta.column_names.iter())
+            .all(|(col, name)| col.name.eq_ignore_ascii_case(name));
+    let names = if names_match {
         Vec::new()
     } else {
         schema

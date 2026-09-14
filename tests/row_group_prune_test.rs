@@ -254,3 +254,90 @@ fn a_column_added_back_with_a_default_is_not_filtered_by_the_dropped_one() {
     let (got, _) = project(&db, "SELECT id, x FROM t WHERE k = 'needle' AND x < 5.0");
     assert_eq!(got, (0, 0.0));
 }
+
+/// The volume-level pruning resolves the same way: a text column dropped
+/// and added back with a default must not have the whole volume ruled
+/// out by the dropped column's bloom filter and bounds
+#[test]
+fn a_volume_is_not_pruned_by_the_bloom_filter_of_a_dropped_column() {
+    let _serial = SERIAL.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k TEXT NOT NULL, x INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO t SELECT g.value, CASE WHEN g.value <= 10 THEN 'needle' ELSE 'hay' END, g.value FROM generate_series(1, 70000) g",
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    db.execute("ALTER TABLE t DROP COLUMN k", ()).unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN k TEXT DEFAULT 'z'", ())
+        .unwrap();
+    let rows = db
+        .query("SELECT id FROM t WHERE k = 'z'", ())
+        .unwrap()
+        .count();
+    assert_eq!(
+        rows, 70_000,
+        "the dropped column's bloom filter ruled the volume out"
+    );
+    let rows = db
+        .query("SELECT id FROM t WHERE k = 'needle'", ())
+        .unwrap()
+        .count();
+    assert_eq!(rows, 0);
+    let rows = db
+        .query("SELECT id FROM t WHERE k = 'z' AND x > 69990", ())
+        .unwrap()
+        .count();
+    assert_eq!(rows, 10);
+}
+
+/// Two renames that swap names leave every column in place, so the
+/// mapping is the identity by position; a filter on the swapped name must
+/// still reach the column the schema means, not the volume column that
+/// used to carry that name
+#[test]
+fn a_filter_on_a_swapped_column_name_reaches_the_renamed_column() {
+    let _serial = SERIAL.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE r (id INTEGER PRIMARY KEY, x INTEGER NOT NULL, y INTEGER NOT NULL)",
+            (),
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO r SELECT g.value, 1, 9 FROM generate_series(1, 1000) g",
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    db.execute("ALTER TABLE r RENAME COLUMN x TO z", ())
+        .unwrap();
+    db.execute("ALTER TABLE r RENAME COLUMN y TO x", ())
+        .unwrap();
+    let count = |sql: &str| db.query(sql, ()).unwrap().count();
+    assert_eq!(
+        count("SELECT id FROM r WHERE x = 9"),
+        1_000,
+        "x = 9 read the old x column"
+    );
+    assert_eq!(count("SELECT id FROM r WHERE x = 1"), 0);
+    assert_eq!(count("SELECT id FROM r WHERE z = 1"), 1_000);
+    assert_eq!(count("SELECT id FROM r WHERE z = 9"), 0);
+    let x: i64 = db.query_one("SELECT x FROM r WHERE id = 7", ()).unwrap();
+    assert_eq!(x, 9);
+}
