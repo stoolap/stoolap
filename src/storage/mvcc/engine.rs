@@ -8181,10 +8181,11 @@ impl TransactionEngineOperations for EngineOperations {
 /// every member: the base, the selection, and every volume between the
 /// first and last member that shares a row with the batch. While the
 /// members beyond the base exceed `limit`, the selection loses its last
-/// position and the closure is taken again, down to one selection, since
-/// one volume's overlap must be rewritten with it. Returns whether a
-/// deferred volume shares a row with the batch, which holds the table,
-/// and whether the selection was reduced
+/// position and the closure is taken again; a last selection that still
+/// exceeds the limit beside base work is left for a cycle of its own,
+/// and a lone member closes over nothing. Returns whether a deferred
+/// volume shares a row with the batch, which holds the table, and
+/// whether the selection was reduced
 fn close_batch_over_overlap<'a>(
     planned: &mut [(u64, usize, bool, bool)],
     base: &[bool],
@@ -8237,10 +8238,14 @@ fn close_batch_over_overlap<'a>(
             .enumerate()
             .filter(|(position, entry)| entry.2 && !base[*position])
             .count();
-        if extra <= limit || selected.len() <= 1 {
+        if extra <= limit || selected.is_empty() {
             return (held, reduced);
         }
-        selected.pop();
+        if selected.len() > 1 {
+            selected.pop();
+        } else {
+            selected.clear();
+        }
         reduced = true;
     }
 }
@@ -8282,9 +8287,21 @@ mod tests {
             close_batch_over_overlap(&mut planned, &[false; 3], &mut selected, 3, ids_of);
         assert!(!reduced);
         assert!(planned.iter().all(|e| e.2));
-        // One selection keeps its overlap whatever the limit
-        let rows: Vec<&[i64]> = vec![&[1], &[1, 2], &[2, 3], &[3]];
+        // A lone member closes over nothing: the volumes around it keep
+        // their places on either side of its rewrite
+        let rows: Vec<&[i64]> = vec![&[1], &[1, 2], &[2, 3], &[3, 4]];
         let ids_of = |id: u64| rows[id as usize - 1];
+        let mut planned = batch_of(&rows);
+        let mut selected = vec![0];
+        let (_, reduced) =
+            close_batch_over_overlap(&mut planned, &[false; 4], &mut selected, 2, ids_of);
+        assert!(!reduced);
+        assert_eq!(
+            planned.iter().map(|e| e.2).collect::<Vec<_>>(),
+            vec![true, false, false, false]
+        );
+        // Beside distant base work the same selection waits for a cycle of
+        // its own, and the base work goes alone
         let mut planned = batch_of(&rows);
         planned[3].2 = true;
         let mut selected = vec![0];
@@ -8295,8 +8312,11 @@ mod tests {
             2,
             ids_of,
         );
-        assert!(!reduced);
-        assert!(planned.iter().all(|e| e.2));
+        assert!(reduced && selected.is_empty());
+        assert_eq!(
+            planned.iter().map(|e| e.2).collect::<Vec<_>>(),
+            vec![false, false, false, true]
+        );
     }
 
     #[test]
