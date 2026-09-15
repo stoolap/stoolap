@@ -3171,7 +3171,7 @@ impl FrozenVolume {
         let mut values = Vec::with_capacity(mapping.sources.len());
         for src in &mapping.sources {
             values.push(match src {
-                ColSource::Volume(vol_idx) => self.columns.get(*vol_idx)?.get_value(idx),
+                ColSource::Volume(vol_idx) => self.cell(*vol_idx, idx)?,
                 ColSource::Default(val) => val.clone(),
             });
         }
@@ -3189,7 +3189,7 @@ impl FrozenVolume {
         let mut values = Vec::with_capacity(col_indices.len());
         for &ci in col_indices {
             values.push(match &mapping.sources[ci] {
-                ColSource::Volume(vol_idx) => self.columns.get(*vol_idx)?.get_value(idx),
+                ColSource::Volume(vol_idx) => self.cell(*vol_idx, idx)?,
                 ColSource::Default(val) => val.clone(),
             });
         }
@@ -3205,7 +3205,7 @@ impl FrozenVolume {
         let mut values = Vec::with_capacity(self.columns.len());
         for ci in 0..self.columns.len() {
             values.push(if ci < needed.len() && needed[ci] {
-                self.columns.get(ci)?.get_value(idx)
+                self.cell(ci, idx)?
             } else {
                 Value::Null(self.columns.data_type(ci))
             });
@@ -3227,7 +3227,7 @@ impl FrozenVolume {
         for (ci, src) in mapping.sources.iter().enumerate() {
             values.push(if ci < needed.len() && needed[ci] {
                 match src {
-                    ColSource::Volume(vol_idx) => self.columns.get(*vol_idx)?.get_value(idx),
+                    ColSource::Volume(vol_idx) => self.cell(*vol_idx, idx)?,
                     ColSource::Default(val) => val.clone(),
                 }
             } else {
@@ -3243,8 +3243,8 @@ impl FrozenVolume {
     /// Get a row as a Vec of Values (for executor compatibility).
     pub fn get_row(&self, idx: usize) -> std::io::Result<Row> {
         let mut values = Vec::with_capacity(self.columns.len());
-        for col in &self.columns {
-            values.push(col?.get_value(idx));
+        for ci in 0..self.columns.len() {
+            values.push(self.cell(ci, idx)?);
         }
         Ok(Row::from_values(values))
     }
@@ -3253,7 +3253,7 @@ impl FrozenVolume {
     pub fn get_row_projected(&self, idx: usize, col_indices: &[usize]) -> std::io::Result<Row> {
         let mut values = Vec::with_capacity(col_indices.len());
         for &col in col_indices {
-            values.push(self.columns.get(col)?.get_value(idx));
+            values.push(self.cell(col, idx)?);
         }
         Ok(Row::from_values(values))
     }
@@ -3325,6 +3325,51 @@ impl FrozenVolume {
         }
 
         Ok(())
+    }
+
+    /// Calls `f` with the column's data from the group holding `from` on,
+    /// each call with the first row's index and the rows the call covers:
+    /// the whole column at once when it is decoded, otherwise one group
+    /// at a time through the decoded group cache. `f` returns whether to
+    /// go on
+    pub fn for_each_group_from<E: From<std::io::Error>>(
+        &self,
+        col_idx: usize,
+        from: usize,
+        mut f: impl FnMut(usize, &ColumnData) -> std::result::Result<bool, E>,
+    ) -> std::result::Result<(), E> {
+        if let Some(column) = self.columns.resident(col_idx) {
+            f(0, column)?;
+            return Ok(());
+        }
+        let store = self.columns.compressed_store().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
+        })?;
+        let groups = store.num_groups(col_idx);
+        for group in from / ROW_GROUP_SIZE..groups {
+            let column = store.group_column(col_idx, group)?;
+            if !f(group * ROW_GROUP_SIZE, &column)? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// The first row index whose value is at least `target` in a sorted
+    /// integer or timestamp column, None when every value is below it;
+    /// a group at a time through the decoded group cache until the group
+    /// that holds it
+    pub fn first_index_ge(&self, col_idx: usize, target: i64) -> std::io::Result<Option<usize>> {
+        let mut first = None;
+        self.for_each_group_from::<std::io::Error>(col_idx, 0, |start, column| {
+            let local = column.binary_search_ge(target);
+            if local < column.len() {
+                first = Some(start + local);
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+        Ok(first)
     }
 
     /// One cell, read from the column already decoded or from the row's
