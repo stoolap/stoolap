@@ -1030,12 +1030,12 @@ impl SegmentManager {
                     };
                     if cold.volume.is_cold() {
                         if let Some(vol) = self.ensure_volume(*seg_id)? {
-                            return Ok(Some(vol.columns.get(pi)?.get_value(idx)));
+                            return Ok(Some(vol.cell(pi, idx)?));
                         }
                         return Ok(None);
                     }
                     cold.volume.mark_accessed();
-                    return Ok(Some(cold.volume.columns.get(pi)?.get_value(idx)));
+                    return Ok(Some(cold.volume.cell(pi, idx)?));
                 }
             }
         }
@@ -1099,29 +1099,25 @@ impl SegmentManager {
             };
             if let Some(target) = target {
                 let row_ids = vol.row_ids()?;
-                let col = vol.columns.get(pi)?;
-                if vol.is_sorted(pi) {
-                    let start = col.binary_search_ge(target);
-                    let mut i = start;
-                    while i < vol.meta.row_count && col.get_i64(i) == target {
-                        let rid = row_ids[i];
-                        if seen.insert(rid) && !ts.contains_key(&rid) {
-                            if seg_ids.len() > 1 {
-                                if let Some(current_val) =
-                                    self.get_authoritative_value(seg_ids, segs, rid, col_idx)?
-                                {
-                                    if &current_val != value {
-                                        i += 1;
-                                        continue;
-                                    }
-                                }
-                            }
-                            return Ok(Some(rid));
-                        }
-                        i += 1;
+                // The column is read a group at a time; a sorted column
+                // from the group its first candidate is in
+                let first = if vol.is_sorted(pi) {
+                    match vol.first_index_ge(pi, target)? {
+                        Some(first) => first,
+                        None => continue,
                     }
                 } else {
-                    for (i, &rid) in row_ids.iter().enumerate() {
+                    0
+                };
+                let mut found: Option<i64> = None;
+                vol.for_each_group_from::<crate::core::Error>(pi, first, |start, col| {
+                    let local_first = first.saturating_sub(start);
+                    for i in local_first..col.len() {
+                        let global = start + i;
+                        if vol.is_sorted(pi) && (col.is_null(i) || col.get_i64(i) != target) {
+                            return Ok(false);
+                        }
+                        let rid = row_ids[global];
                         if !seen.insert(rid) {
                             continue;
                         }
@@ -1135,9 +1131,14 @@ impl SegmentManager {
                                     }
                                 }
                             }
-                            return Ok(Some(rid));
+                            found = Some(rid);
+                            return Ok(false);
                         }
                     }
+                    Ok(true)
+                })?;
+                if found.is_some() {
+                    return Ok(found);
                 }
             }
         }
@@ -1313,21 +1314,26 @@ impl SegmentManager {
                 })?;
             } else {
                 // Schema-evolved volume: some columns missing (default matches).
-                // Check only the columns that exist in the volume.
-                let present_cols: Vec<_> = vol_col_indices
+                // Check only the columns that exist in the volume, cell by
+                // cell through the row's group
+                let present: Vec<(usize, usize)> = vol_col_indices
                     .iter()
                     .enumerate()
                     .filter(|(_, &vi)| vi != usize::MAX)
-                    .map(|(i, &vi)| vol.columns.get(vi).map(|col| (i, col)))
-                    .collect::<std::io::Result<_>>()?;
+                    .map(|(i, &vi)| (i, vi))
+                    .collect();
                 for (i, &rid) in row_ids.iter().enumerate() {
                     if ts.contains_key(&rid) || !seen.insert(rid) {
                         continue;
                     }
-                    let matches = present_cols.iter().all(|&(val_idx, col)| {
-                        let v = col.get_value(i);
-                        !v.is_null() && v == *values[val_idx]
-                    });
+                    let mut matches = true;
+                    for &(val_idx, vi) in &present {
+                        let v = vol.cell(vi, i)?;
+                        if v.is_null() || v != *values[val_idx] {
+                            matches = false;
+                            break;
+                        }
+                    }
                     if matches {
                         vol_result = Some(rid);
                         break;
@@ -3638,27 +3644,23 @@ mod tests {
         }
 
         // ── Stop querying. After idle cycles: should eventually go cold ──
-        // Epoch 7: the volume was marked u64::MAX by get_volumes_newest_first.
-        // Eviction at epoch 4 reset it to 4. At epoch 7: delta = 3 → evict
-        // hot→warm (OnceLock filled by get_row, so is_eager=true). This is the
-        // first demotion. The new warm volume starts at GLOBAL (7).
-        run_eviction(&mgr, 7);
-        // Epochs 8, 9: delta grows from warm volume's start epoch (7)
-        run_eviction(&mgr, 8);
-        run_eviction(&mgr, 9);
+        // The volume was marked u64::MAX by get_volumes_newest_first and
+        // the eviction at epoch 4 reset it to 4. The row read above went
+        // through the row's group, not the whole column, so the volume is
+        // still warm: at epoch 6 the delta is 2 and it stays, at epoch 7
+        // the delta is 3 and warm goes cold
         {
             let segs = mgr.segments_raw();
             let cs = segs.get(&1).unwrap();
-            assert!(!cs.volume.is_cold(), "epoch 9: delta=2, still warm");
+            assert!(cs.volume.is_warm(), "epoch 6: delta=2, still warm");
         }
-        // Epoch 10: delta=3 → warm → cold
-        run_eviction(&mgr, 10);
+        run_eviction(&mgr, 7);
         {
             let segs = mgr.segments_raw();
             let cs = segs.get(&1).unwrap();
             assert!(
                 cs.volume.is_cold(),
-                "epoch 10: should be cold after 3 idle cycles"
+                "epoch 7: should be cold after 3 idle cycles"
             );
             assert!(
                 !cs.volume.columns.has_compressed_store(),

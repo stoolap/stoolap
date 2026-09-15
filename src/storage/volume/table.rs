@@ -168,6 +168,32 @@ impl TopK {
 /// Normal secondary indexes exist only for hot rows. Volume rows are never
 /// inserted into hot indexes. Constraint checks (PK/UNIQUE) against cold data
 /// use segment metadata (zone maps, sorted columns, dictionary pre-filters).
+/// A cold row an UPDATE changes: prepared outside the seal fence, applied
+/// under it
+struct ColdChange {
+    row_id: i64,
+    old_row: Row,
+    new_row: Row,
+}
+
+/// What an UPDATE has prepared so far, across the rounds a landing seal
+/// makes it take
+#[derive(Default)]
+struct ColdPrepare {
+    round: u32,
+    /// The rows the setter ran on, with the volume each was read from
+    visited: FxHashMap<i64, u64>,
+    /// The rows a new version is prepared for: their old keys are gone
+    /// once the statement applies
+    shadowed: FxHashSet<i64>,
+    /// The volumes walked whole at a settled generation
+    seen_segments: FxHashSet<u64>,
+    unique_indexes: Option<Vec<(String, Vec<String>)>>,
+    changes: Vec<ColdChange>,
+    /// The ids named by the statement that no cold volume holds
+    hot_ids: Vec<i64>,
+}
+
 pub struct SegmentedTable {
     /// The hot buffer (current in-memory MVCC table for writes)
     hot: Box<dyn Table>,
@@ -521,11 +547,350 @@ impl SegmentedTable {
     /// Uses zone maps, bloom filters, dictionary pre-filters, and binary search
     /// on sorted columns for fast rejection. No index population needed.
     /// Check cold unique constraints for UPDATE, excluding the row being updated.
+    /// The seal generation of a settled state, read under the fence: a
+    /// seal halfway through its publication, its segment registered and
+    /// its hot rows not yet removed, is never taken for done
+    fn settled_generation(mgr: &super::manifest::SegmentManager) -> u64 {
+        let _fence = mgr.acquire_seal_read();
+        mgr.seal_generation()
+    }
+
+    /// The generation and the volumes of a settled state, read together
+    /// under the fence
+    fn settled_state(mgr: &super::manifest::SegmentManager) -> (u64, smallvec::SmallVec<[u64; 4]>) {
+        let _fence = mgr.acquire_seal_read();
+        (mgr.seal_generation(), mgr.cold_snapshot().seg_ids)
+    }
+
+    /// Runs `check` against a cold snapshot at a settled generation, then
+    /// takes the fence; the check stands when the generation is the same,
+    /// otherwise it runs again, after three rounds under the fence. None
+    /// when the table has no segments under the fence
+    fn fence_after_cold_check<'m, T>(
+        mgr: &'m super::manifest::SegmentManager,
+        mut check: impl FnMut(&super::manifest::ColdSnapshot) -> Result<T>,
+    ) -> Result<(parking_lot::RwLockReadGuard<'m, ()>, Option<T>)> {
+        if !mgr.has_segments() {
+            let guard = mgr.acquire_seal_read();
+            if !mgr.has_segments() {
+                return Ok((guard, None));
+            }
+            drop(guard);
+        }
+        for _ in 0..3 {
+            let generation = Self::settled_generation(mgr);
+            let snapshot = mgr.cold_snapshot();
+            let checked = check(&snapshot)?;
+            let guard = mgr.acquire_seal_read();
+            if mgr.seal_generation() == generation {
+                return Ok((guard, Some(checked)));
+            }
+        }
+        let guard = mgr.acquire_seal_read();
+        let snapshot = mgr.cold_snapshot();
+        let checked = check(&snapshot)?;
+        Ok((guard, Some(checked)))
+    }
+
+    fn write_conflict(row_id: i64) -> crate::core::Error {
+        crate::core::Error::internal(format!(
+            "write conflict: row {row_id} was changed by another transaction while the statement read it"
+        ))
+    }
+
+    /// Prepares the cold rows an UPDATE changes outside the seal fence and
+    /// returns the fence once no seal moved rows since: each round walks
+    /// only the volumes the snapshot gained, after three rounds under the
+    /// fence. With `ids` the rows are the ones named, and the ids no cold
+    /// volume holds come back for the hot store
+    fn prepare_cold_updates<'m>(
+        &self,
+        mgr: &'m super::manifest::SegmentManager,
+        ids: Option<&[i64]>,
+        where_expr: Option<&dyn Expression>,
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+    ) -> Result<(
+        parking_lot::RwLockReadGuard<'m, ()>,
+        Vec<ColdChange>,
+        Vec<i64>,
+    )> {
+        if !mgr.has_segments() {
+            let guard = mgr.acquire_seal_read();
+            if !mgr.has_segments() {
+                let hot_ids = ids.map(<[i64]>::to_vec).unwrap_or_default();
+                return Ok((guard, Vec::new(), hot_ids));
+            }
+            drop(guard);
+        }
+        let comparisons = where_expr
+            .map(|e| e.collect_comparisons())
+            .unwrap_or_default();
+        let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
+        let mut prep = ColdPrepare::default();
+        loop {
+            let under_fence = prep.round == 3;
+            let held = under_fence.then(|| mgr.acquire_seal_read());
+            let (generation, settled) = if under_fence {
+                (mgr.seal_generation(), mgr.cold_snapshot().seg_ids)
+            } else {
+                Self::settled_state(mgr)
+            };
+            let snap = mgr.statement_snapshot()?;
+            prep.hot_ids.clear();
+            if prep.round > 0 {
+                self.revalidate_prepared(&snap, &mut prep)?;
+            }
+            match ids {
+                Some(ids) => self.prepare_cold_rows_by_id(&snap, ids, setter, &mut prep)?,
+                None => self.prepare_cold_rows_where(
+                    &snap,
+                    where_expr,
+                    &comparisons,
+                    &bloom_hashes,
+                    setter,
+                    &mut prep,
+                )?,
+            }
+            // A volume registered at a settled generation is walked whole;
+            // one a seal added meanwhile may have hidden rows still hot
+            prep.seen_segments.extend(settled);
+            let guard = held.unwrap_or_else(|| mgr.acquire_seal_read());
+            if under_fence || mgr.seal_generation() == generation {
+                return Ok((guard, prep.changes, prep.hot_ids));
+            }
+            drop(guard);
+            prep.round += 1;
+        }
+    }
+
+    /// The rows prepared in earlier rounds are still the rows they were
+    /// read from: a hot version or a tombstone since is another
+    /// transaction's change; a row moved to another volume is the same
+    /// row when it reads the same, as compaction leaves it, and a
+    /// change otherwise
+    fn revalidate_prepared(
+        &self,
+        snap: &super::manifest::StatementSnapshot,
+        prep: &mut ColdPrepare,
+    ) -> Result<()> {
+        for change in &prep.changes {
+            let Some((seg_id, cs, idx)) = self.find_segment_row_in(snap, change.row_id)? else {
+                return Err(Self::write_conflict(change.row_id));
+            };
+            if prep.visited.get(&change.row_id) == Some(&seg_id) {
+                continue;
+            }
+            let mut reader = super::writer::RowReader::new(Arc::clone(&cs.volume));
+            if reader.row(idx, &cs.mapping)? != change.old_row {
+                return Err(Self::write_conflict(change.row_id));
+            }
+            prep.visited.insert(change.row_id, seg_id);
+        }
+        Ok(())
+    }
+
+    /// One round over the rows named that no round set yet
+    fn prepare_cold_rows_by_id(
+        &self,
+        snap: &super::manifest::StatementSnapshot,
+        ids: &[i64],
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        prep: &mut ColdPrepare,
+    ) -> Result<()> {
+        let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
+        for &row_id in ids {
+            let Some((seg_id, cs, idx)) = self.find_segment_row_in(snap, row_id)? else {
+                prep.hot_ids.push(row_id);
+                continue;
+            };
+            if prep.visited.contains_key(&row_id) {
+                continue;
+            }
+            // One reader per volume for the statement: the groups it
+            // reads stay held across the rows; mapping from the SAME
+            // snapshot segment
+            if !cached
+                .as_ref()
+                .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &cs.volume))
+            {
+                cached = Some((
+                    super::writer::RowReader::new(Arc::clone(&cs.volume)),
+                    cs.mapping.clone(),
+                ));
+            }
+            let (reader, mapping) = cached
+                .as_mut()
+                .map(|(reader, mapping)| (reader, &*mapping))
+                .expect("reader just set");
+            let row = reader.row(idx, mapping)?;
+            self.prepare_cold_row(snap, seg_id, row_id, row, setter, prep)?;
+        }
+        Ok(())
+    }
+
+    /// One round over the rows the filter selects, in the volumes not
+    /// walked whole yet
+    fn prepare_cold_rows_where(
+        &self,
+        snap: &super::manifest::StatementSnapshot,
+        where_expr: Option<&dyn Expression>,
+        comparisons: &[(&str, crate::core::Operator, &Value)],
+        bloom_hashes: &[Option<u64>],
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        prep: &mut ColdPrepare,
+    ) -> Result<()> {
+        let tombstones_arc = Arc::clone(&snap.tombstones);
+        let mut hot_skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+        self.hot.collect_hot_row_ids_into(&mut hot_skip);
+        self.segment_mgr
+            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+        for (seg_id, cs) in snap.volumes_newest_first().iter() {
+            if prep.seen_segments.contains(seg_id) {
+                continue;
+            }
+            let vol = &cs.volume;
+            // Prune volume by zone maps and bloom filters.
+            let (should_skip, _, _) =
+                Self::prune_volume(vol, &cs.mapping, comparisons, bloom_hashes)?;
+            if should_skip {
+                continue;
+            }
+            // Load cold volume on demand after pruning.
+            let loaded;
+            let vol = if vol.is_cold() {
+                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
+                    Some(v) => v,
+                    None => continue,
+                };
+                &loaded
+            } else {
+                vol.mark_accessed();
+                vol
+            };
+            let mapping = cs.mapping.clone();
+            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+            for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
+                if !cs.is_visible(i) {
+                    continue;
+                }
+                if self.is_row_tombstoned(&tombstones_arc, row_id)
+                    || hot_skip.contains(&row_id)
+                    || prep.visited.contains_key(&row_id)
+                {
+                    continue;
+                }
+                let row = reader.row(i, &mapping)?;
+                if let Some(expr) = where_expr {
+                    if !expr.evaluate_fast(&row) {
+                        continue;
+                    }
+                }
+                self.prepare_cold_row(snap, *seg_id, row_id, row, setter, prep)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Runs the setter on one cold row and keeps its new version
+    fn prepare_cold_row(
+        &self,
+        snap: &super::manifest::StatementSnapshot,
+        seg_id: u64,
+        row_id: i64,
+        row: Row,
+        setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
+        prep: &mut ColdPrepare,
+    ) -> Result<()> {
+        prep.visited.insert(row_id, seg_id);
+        let old_row = row.clone();
+        let (new_row, changed) = setter(row)?;
+        if !changed {
+            return Ok(());
+        }
+        if self.hot.has_unique_non_pk_indexes() {
+            self.check_cold_unique_for_update(
+                &new_row,
+                row_id,
+                Some(snap),
+                &prep.shadowed,
+                &mut prep.unique_indexes,
+            )?;
+        }
+        prep.shadowed.insert(row_id);
+        prep.changes.push(ColdChange {
+            row_id,
+            old_row,
+            new_row,
+        });
+        Ok(())
+    }
+
+    /// Claims every prepared row under the fence before anything is
+    /// written, so no other transaction can change one from here on; a
+    /// row already claimed by another, or with a hot version since it
+    /// was prepared, is that transaction's, and the statement fails
+    fn claim_prepared(hot: &dyn Table, changes: &[ColdChange]) -> Result<()> {
+        for change in changes {
+            hot.try_claim_row(change.row_id)?;
+            if hot.has_row_id(change.row_id)? {
+                return Err(Self::write_conflict(change.row_id));
+            }
+        }
+        Ok(())
+    }
+
+    /// Moves a prepared cold change into the hot store under the fence:
+    /// the claim, the mirror of the old row for an integer key, the new
+    /// row, and the tombstone that lets the hot version shadow the cold
+    fn apply_cold_update(
+        hot: &mut Box<dyn Table>,
+        segment_mgr: &super::manifest::SegmentManager,
+        txn_id: i64,
+        change: ColdChange,
+        has_int_pk: bool,
+    ) -> Result<()> {
+        let ColdChange {
+            row_id,
+            old_row,
+            new_row,
+        } = change;
+        // Insert the NEW row into hot. For int PK tables, first mirror the
+        // old row (so UPDATE can find it), then update. If any step fails,
+        // clean up to avoid phantoms.
+        if has_int_pk {
+            match hot.insert_discard(old_row) {
+                Ok(())
+                | Err(crate::core::Error::PrimaryKeyConstraint { .. })
+                | Err(crate::core::Error::UniqueConstraint { .. }) => {}
+                Err(e) => return Err(e),
+            }
+            let mut new_row_opt = Some(new_row);
+            let update_result = hot.update_by_row_ids(&[row_id], &mut |_| {
+                Ok((new_row_opt.take().unwrap_or_default(), true))
+            });
+            if let Err(e) = update_result {
+                let _ = hot.delete_by_row_ids(&[row_id]);
+                return Err(e);
+            }
+        } else {
+            hot.insert_discard(new_row)?;
+        }
+        // Add tombstone so row_count() doesn't double-count. The hot
+        // version now shadows the cold version via skip set.
+        segment_mgr.add_pending_tombstone(txn_id, row_id);
+        Ok(())
+    }
+
+    /// `shadowed` are the cold rows this statement already prepared a new
+    /// version for: their old keys are gone once the statement applies,
+    /// so they are no conflict for a later row's new keys
     fn check_cold_unique_for_update(
         &self,
         new_row: &Row,
         exclude_row_id: i64,
         snap: Option<&super::manifest::StatementSnapshot>,
+        shadowed: &FxHashSet<i64>,
         unique_indexes: &mut Option<Vec<(String, Vec<String>)>>,
     ) -> Result<()> {
         if unique_indexes.is_none() {
@@ -560,7 +925,7 @@ impl SegmentedTable {
                 None => self.find_segment_row_id_by_values(&col_indices, &values)?,
             };
             if let Some(found_id) = found {
-                if found_id != exclude_row_id {
+                if found_id != exclude_row_id && !shadowed.contains(&found_id) {
                     return Err(crate::core::Error::UniqueConstraint {
                         index: idx_name.to_string(),
                         column: col_names.join(", "),
@@ -585,11 +950,6 @@ impl SegmentedTable {
                 Ok(())
             })?;
         Ok(indexes)
-    }
-
-    fn check_segment_constraints(&self, row: &Row) -> Result<()> {
-        let snapshot = self.segment_mgr.cold_snapshot();
-        self.check_segment_constraints_with_snapshot(&snapshot, row, None)
     }
 
     fn check_segment_constraints_with_snapshot(
@@ -1035,6 +1395,7 @@ impl SegmentedTable {
                         &mut candidates,
                     )
                     .is_some();
+                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
                 let mut next_row = {
                     let mut pos = 0usize;
                     let mut plain = start;
@@ -1078,11 +1439,7 @@ impl SegmentedTable {
                         }
                     }
 
-                    let row = if mapping.is_identity {
-                        vol.get_row(i)
-                    } else {
-                        vol.get_row_mapped(i, &mapping)
-                    }?;
+                    let row = reader.row(i, &mapping)?;
                     if let Some(expr) = where_expr {
                         if !expr.evaluate_fast(&row) {
                             continue;
@@ -1404,34 +1761,30 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn insert(&mut self, row: Row) -> Result<Row> {
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        if self.segment_mgr.has_segments() {
-            self.check_segment_constraints(&row)?;
-        }
+        let (_seal_guard, checked) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
+            self.check_segment_constraints_with_snapshot(snapshot, &row, None)
+        })?;
         let result = self.hot.insert(row)?;
-        if self.segment_mgr.has_segments() {
+        if checked.is_some() {
             self.segment_mgr.record_txn_seal_generation(self.txn_id());
         }
         Ok(result)
     }
 
     fn insert_discard(&mut self, row: Row) -> Result<()> {
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        if self.segment_mgr.has_segments() {
-            self.check_segment_constraints(&row)?;
-        }
+        let (_seal_guard, checked) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
+            self.check_segment_constraints_with_snapshot(snapshot, &row, None)
+        })?;
         self.hot.insert_discard(row)?;
-        if self.segment_mgr.has_segments() {
+        if checked.is_some() {
             self.segment_mgr.record_txn_seal_generation(self.txn_id());
         }
         Ok(())
     }
 
     fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()> {
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        if self.segment_mgr.has_segments() {
+        let (_seal_guard, checked) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
             // Snapshot once for the entire batch — eliminates 3 lock reads per row.
-            let snapshot = self.segment_mgr.cold_snapshot();
             let unique_indexes = if rows.len() > 1 && self.hot.has_unique_non_pk_indexes() {
                 Some(self.cold_unique_indexes()?)
             } else {
@@ -1439,14 +1792,15 @@ impl Table for SegmentedTable {
             };
             for row in &rows {
                 self.check_segment_constraints_with_snapshot(
-                    &snapshot,
+                    snapshot,
                     row,
                     unique_indexes.as_deref(),
                 )?;
             }
-        }
+            Ok(())
+        })?;
         self.hot.insert_batch(rows)?;
-        if self.segment_mgr.has_segments() {
+        if checked.is_some() {
             self.segment_mgr.record_txn_seal_generation(self.txn_id());
         }
         Ok(())
@@ -1464,140 +1818,25 @@ impl Table for SegmentedTable {
         {
             return self.update_by_row_ids(&[pk], setter);
         }
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        // Capture a verified all-warm segment snapshot BEFORE mutating the
-        // hot buffer and use it for the entire statement: eviction CoWs
-        // new maps and new volume Arcs, so this snapshot's volumes keep
-        // their column data for the statement's duration and no
-        // mid-statement reload (or reload failure) is possible.
-        let cold_snapshot = if self.segment_mgr.has_segments() {
-            Some(self.segment_mgr.statement_snapshot()?)
-        } else {
-            None
-        };
-        let stmt_tombstones = cold_snapshot.as_ref().map(|s| Arc::clone(&s.tombstones));
-        let mut count = self.hot.update(where_expr, setter)?;
-
-        // Update matching segment rows from the statement snapshot
-        // (zone-map pruning still applies; volumes are already warm).
-        let volumes = match &cold_snapshot {
-            Some(snap) => snap.volumes_newest_first(),
-            None => Vec::new(),
-        };
         let has_int_pk = self
             .hot
             .schema()
             .columns
             .iter()
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
-
-        let tombstones_arc = stmt_tombstones
-            .clone()
-            .unwrap_or_else(|| self.segment_mgr.tombstone_set_arc());
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
-        // Zone-map / bloom pruning from WHERE clause.
-        let comparisons = where_expr
-            .map(|e| e.collect_comparisons())
-            .unwrap_or_default();
-        let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-
-        let mut unique_indexes = None;
-        for (seg_id, cs) in volumes.iter() {
-            let vol = &cs.volume;
-
-            // Prune volume by zone maps and bloom filters.
-            let (should_skip, _, _) =
-                Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
-            if should_skip {
-                continue;
-            }
-
-            // Load cold volume on demand after pruning.
-            let loaded;
-            let vol = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
-                    Some(v) => v,
-                    None => continue,
-                };
-                &loaded
-            } else {
-                vol.mark_accessed();
-                vol
-            };
-
-            let mapping = cs.mapping.clone();
-
-            for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
-                if !cs.is_visible(i) {
-                    continue;
-                }
-                if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
-                    continue;
-                }
-                let row = if mapping.is_identity {
-                    vol.get_row(i)
-                } else {
-                    vol.get_row_mapped(i, &mapping)
-                }?;
-                if let Some(expr) = where_expr {
-                    if !expr.evaluate_fast(&row) {
-                        continue;
-                    }
-                }
-                let old_row = row.clone();
-                let (new_row, changed) = setter(row)?;
-                if changed {
-                    // Claim the cold row to prevent concurrent lost updates.
-                    self.hot.try_claim_row(row_id)?;
-
-                    // Check unique constraints against cold segments.
-                    if self.hot.has_unique_non_pk_indexes() {
-                        self.check_cold_unique_for_update(
-                            &new_row,
-                            row_id,
-                            cold_snapshot.as_ref(),
-                            &mut unique_indexes,
-                        )?;
-                    }
-
-                    // Insert the NEW row into hot. For int PK tables, first
-                    // mirror the old row (so UPDATE can find it), then update.
-                    // If any step fails, clean up to avoid phantoms.
-                    if has_int_pk {
-                        match self.hot.insert_discard(old_row) {
-                            Ok(())
-                            | Err(crate::core::Error::PrimaryKeyConstraint { .. })
-                            | Err(crate::core::Error::UniqueConstraint { .. }) => {}
-                            Err(e) => {
-                                return Err(e);
-                            }
-                        }
-                        let mut new_row_opt = Some(new_row);
-                        let update_result = self.hot.update_by_row_ids(&[row_id], &mut |_| {
-                            Ok((new_row_opt.take().unwrap_or_else(Row::new), true))
-                        });
-                        if let Err(e) = update_result {
-                            let _ = self.hot.delete_by_row_ids(&[row_id]);
-                            return Err(e);
-                        }
-                    } else {
-                        self.hot.insert_discard(new_row)?;
-                    }
-                    // Add tombstone so row_count() doesn't double-count.
-                    // The hot version now shadows the cold version via skip set.
-                    self.segment_mgr
-                        .add_pending_tombstone(self.txn_id(), row_id);
-                    count += 1;
-                }
-            }
+        let txn_id = self.txn_id();
+        // The cold rows the statement changes are read, filtered, set and
+        // checked outside the fence; only the hot moves happen under it
+        let (_seal_guard, changes, _) =
+            self.prepare_cold_updates(&self.segment_mgr, None, where_expr, setter)?;
+        Self::claim_prepared(self.hot.as_ref(), &changes)?;
+        let mut count = self.hot.update(where_expr, setter)?;
+        for change in changes {
+            Self::apply_cold_update(&mut self.hot, &self.segment_mgr, txn_id, change, has_int_pk)?;
+            count += 1;
         }
         if count > 0 {
-            self.segment_mgr.record_txn_seal_generation(self.txn_id());
+            self.segment_mgr.record_txn_seal_generation(txn_id);
         }
         Ok(count)
     }
@@ -1607,94 +1846,22 @@ impl Table for SegmentedTable {
         row_ids: &[i64],
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        // Capture a verified all-warm segment snapshot BEFORE mutating the
-        // hot buffer and use it for the entire statement: eviction CoWs
-        // new maps and new volume Arcs, so this snapshot's volumes keep
-        // their column data for the statement's duration and no
-        // mid-statement reload (or reload failure) is possible.
-        let cold_snapshot = if self.segment_mgr.has_segments() {
-            Some(self.segment_mgr.statement_snapshot()?)
-        } else {
-            None
-        };
-        let mut count = 0i32;
-        let mut hot_ids = Vec::new();
-        let schema = self.hot.schema().clone();
-        let has_int_pk = schema
+        let has_int_pk = self
+            .hot
+            .schema()
             .columns
             .iter()
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
-
-        let mut cached_mapping: Option<(
-            *const super::writer::FrozenVolume,
-            super::writer::ColumnMapping,
-        )> = None;
-        let mut unique_indexes = None;
-        for &row_id in row_ids {
-            let found = match &cold_snapshot {
-                Some(snap) => self.find_segment_row_in(snap, row_id)?,
-                None => None,
-            };
-            if let Some((_seg_id, cs, idx)) = found {
-                let vol = Arc::clone(&cs.volume);
-                let vol_ptr = &*vol as *const super::writer::FrozenVolume;
-                let mapping = match &cached_mapping {
-                    Some((ptr, m)) if *ptr == vol_ptr => m,
-                    _ => {
-                        // Mapping from the SAME snapshot segment.
-                        cached_mapping = Some((vol_ptr, cs.mapping.clone()));
-                        &cached_mapping.as_ref().unwrap().1
-                    }
-                };
-                let row = if mapping.is_identity {
-                    vol.get_row(idx)
-                } else {
-                    vol.get_row_mapped(idx, mapping)
-                }?;
-                let old_row = row.clone();
-                let (new_row, changed) = setter(row)?;
-                if changed {
-                    // Claim the cold row to prevent concurrent lost updates.
-                    self.hot.try_claim_row(row_id)?;
-                    if self.hot.has_unique_non_pk_indexes() {
-                        self.check_cold_unique_for_update(
-                            &new_row,
-                            row_id,
-                            cold_snapshot.as_ref(),
-                            &mut unique_indexes,
-                        )?;
-                    }
-                    let result = if has_int_pk {
-                        let insert_ok = match self.hot.insert_discard(old_row) {
-                            Ok(()) => true,
-                            Err(crate::core::Error::PrimaryKeyConstraint { .. }) => true,
-                            Err(crate::core::Error::UniqueConstraint { .. }) => true,
-                            Err(e) => return Err(e),
-                        };
-                        if insert_ok {
-                            let mut new_row_opt = Some(new_row);
-                            self.hot
-                                .update_by_row_ids(&[row_id], &mut |_| {
-                                    Ok((new_row_opt.take().unwrap_or_else(Row::new), true))
-                                })
-                                .map(|_| ())
-                        } else {
-                            Ok(())
-                        }
-                    } else {
-                        self.hot.insert_discard(new_row)
-                    };
-                    result?;
-                    // Add tombstone so row_count() doesn't double-count.
-                    // The hot version now shadows the cold version via skip set.
-                    self.segment_mgr
-                        .add_pending_tombstone(self.txn_id(), row_id);
-                    count += 1;
-                }
-            } else {
-                hot_ids.push(row_id);
-            }
+        let txn_id = self.txn_id();
+        // The cold rows named are read, set and checked outside the fence;
+        // the ids no cold volume holds are the hot store's
+        let (_seal_guard, changes, hot_ids) =
+            self.prepare_cold_updates(&self.segment_mgr, Some(row_ids), None, setter)?;
+        Self::claim_prepared(self.hot.as_ref(), &changes)?;
+        let mut count = 0i32;
+        for change in changes {
+            Self::apply_cold_update(&mut self.hot, &self.segment_mgr, txn_id, change, has_int_pk)?;
+            count += 1;
         }
         if !hot_ids.is_empty() {
             // Same reasoning as update(): skip cold unique check for hot path
@@ -1702,7 +1869,7 @@ impl Table for SegmentedTable {
             count += self.hot.update_by_row_ids(&hot_ids, setter)?;
         }
         if count > 0 {
-            self.segment_mgr.record_txn_seal_generation(self.txn_id());
+            self.segment_mgr.record_txn_seal_generation(txn_id);
         }
         Ok(count)
     }
@@ -2109,29 +2276,24 @@ impl Table for SegmentedTable {
         let schema = self.hot.schema().clone();
         let mut result = RowVec::with_capacity(row_ids.len());
         let mut hot_ids = Vec::new();
-        let mut cached_mapping: Option<(
-            *const super::writer::FrozenVolume,
-            super::writer::ColumnMapping,
-        )> = None;
+        let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
 
         for &row_id in row_ids {
             if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
-                let vol_ptr = &*vol as *const super::writer::FrozenVolume;
-                let mapping = match &cached_mapping {
-                    Some((ptr, m)) if *ptr == vol_ptr => m,
-                    _ => {
-                        cached_mapping = Some((
-                            vol_ptr,
-                            self.segment_mgr.get_volume_mapping(seg_id, &schema),
-                        ));
-                        &cached_mapping.as_ref().unwrap().1
-                    }
-                };
-                let row = if mapping.is_identity {
-                    vol.get_row(idx)
-                } else {
-                    vol.get_row_mapped(idx, mapping)
-                }?;
+                if !cached
+                    .as_ref()
+                    .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &vol))
+                {
+                    cached = Some((
+                        super::writer::RowReader::new(Arc::clone(&vol)),
+                        self.segment_mgr.get_volume_mapping(seg_id, &schema),
+                    ));
+                }
+                let (reader, mapping) = cached
+                    .as_mut()
+                    .map(|(reader, mapping)| (reader, &*mapping))
+                    .expect("reader just set");
+                let row = reader.row(idx, mapping)?;
                 result.push((row_id, row));
             } else {
                 hot_ids.push(row_id);
@@ -2168,27 +2330,24 @@ impl Table for SegmentedTable {
 
         let mut hot_ids = Vec::new();
         let schema = self.hot.schema();
-        let mut cached_mapping: Option<(
-            *const super::writer::FrozenVolume,
-            super::writer::ColumnMapping,
-        )> = None;
+        let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
 
         for &row_id in row_ids {
             if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
-                let vol_ptr = &*vol as *const super::writer::FrozenVolume;
-                let mapping = match &cached_mapping {
-                    Some((ptr, m)) if *ptr == vol_ptr => m,
-                    _ => {
-                        cached_mapping =
-                            Some((vol_ptr, self.segment_mgr.get_volume_mapping(seg_id, schema)));
-                        &cached_mapping.as_ref().unwrap().1
-                    }
-                };
-                let row = if mapping.is_identity {
-                    vol.get_row(idx)
-                } else {
-                    vol.get_row_mapped(idx, mapping)
-                }?;
+                if !cached
+                    .as_ref()
+                    .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &vol))
+                {
+                    cached = Some((
+                        super::writer::RowReader::new(Arc::clone(&vol)),
+                        self.segment_mgr.get_volume_mapping(seg_id, schema),
+                    ));
+                }
+                let (reader, mapping) = cached
+                    .as_mut()
+                    .map(|(reader, mapping)| (reader, &*mapping))
+                    .expect("reader just set");
+                let row = reader.row(idx, mapping)?;
                 if filter.evaluate_fast(&row) {
                     buffer.push((row_id, row));
                 }
@@ -2287,16 +2446,13 @@ impl Table for SegmentedTable {
             };
 
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
+            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
 
             for (i, &rid) in vol.row_ids()?.iter().enumerate() {
                 if authority.get(&rid) != Some(&nf_idx) {
                     continue;
                 }
-                let row = if mapping.is_identity {
-                    vol.get_row(i)
-                } else {
-                    vol.get_row_mapped(i, &mapping)
-                }?;
+                let row = reader.row(i, &mapping)?;
                 if let Some(expr) = where_expr {
                     if !expr.evaluate_fast(&row) {
                         continue;
@@ -2404,6 +2560,7 @@ impl Table for SegmentedTable {
             };
 
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
+            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
 
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
                 if !cs.is_visible(i) {
@@ -2415,11 +2572,7 @@ impl Table for SegmentedTable {
                 // For rows with a WHERE clause, we must evaluate the filter
                 // even during the skip phase to get correct offset counting.
                 if where_expr.is_some() {
-                    let row = if mapping.is_identity {
-                        vol.get_row(i)
-                    } else {
-                        vol.get_row_mapped(i, &mapping)
-                    }?;
+                    let row = reader.row(i, &mapping)?;
                     if let Some(expr) = where_expr {
                         if !expr.evaluate_fast(&row) {
                             continue;
@@ -2436,11 +2589,7 @@ impl Table for SegmentedTable {
                     if cold_skipped < cold_skip {
                         cold_skipped += 1;
                     } else {
-                        let row = if mapping.is_identity {
-                            vol.get_row(i)
-                        } else {
-                            vol.get_row_mapped(i, &mapping)
-                        }?;
+                        let row = reader.row(i, &mapping)?;
                         result.push((row_id, row));
                     }
                 }
@@ -3651,6 +3800,7 @@ impl Table for SegmentedTable {
             };
 
             let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
+            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
             for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                 if !cs.is_visible(i) {
                     continue;
@@ -3668,11 +3818,7 @@ impl Table for SegmentedTable {
                 } else {
                     continue;
                 };
-                let row = if mapping.is_identity {
-                    vol.get_row(i)
-                } else {
-                    vol.get_row_mapped(i, mapping)
-                }?;
+                let row = reader.row(i, mapping)?;
                 groups.entry(val).or_default().push((rid, row));
             }
         }
@@ -3769,6 +3915,7 @@ impl Table for SegmentedTable {
             };
 
             let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
+            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
             for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                 if !cs.is_visible(i) {
                     continue;
@@ -3787,11 +3934,7 @@ impl Table for SegmentedTable {
                     true
                 };
                 if matches {
-                    let row = if mapping.is_identity {
-                        vol.get_row(i)
-                    } else {
-                        vol.get_row_mapped(i, mapping)
-                    }?;
+                    let row = reader.row(i, mapping)?;
                     result.push((rid, row));
                 }
             }
@@ -3881,8 +4024,9 @@ impl Table for SegmentedTable {
             order: Option<&'a [u32]>,
             cursor: usize,
             mapping: super::writer::ColumnMapping,
-            volume: Arc<FrozenVolume>,
             visible: Option<Arc<Vec<u64>>>,
+            /// Holds the groups the merge reads from this volume
+            reader: super::writer::RowReader,
         }
 
         impl VolSource<'_> {
@@ -3905,8 +4049,8 @@ impl Table for SegmentedTable {
                 order: vol.row_order(),
                 cursor: if ascending { 0 } else { vol.meta.row_count },
                 mapping,
-                volume: Arc::clone(&cs.volume),
                 visible: cs.visible.clone(),
+                reader: super::writer::RowReader::new(Arc::clone(&cs.volume)),
             });
         }
 
@@ -4008,11 +4152,7 @@ impl Table for SegmentedTable {
                 }
 
                 // Materialize the row
-                let row = if vs.mapping.is_identity {
-                    vs.volume.get_row(idx)
-                } else {
-                    vs.volume.get_row_mapped(idx, &vs.mapping)
-                }?;
+                let row = vs.reader.row(idx, &vs.mapping)?;
 
                 if skipped < offset {
                     skipped += 1;
@@ -4681,6 +4821,7 @@ impl Table for SegmentedTable {
             for (seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
+                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
                 for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
                     if !cs.is_visible(i) {
                         continue;
@@ -4715,11 +4856,7 @@ impl Table for SegmentedTable {
                             }
                         }
                     }
-                    let row = if mapping.is_identity {
-                        vol.get_row(i)
-                    } else {
-                        vol.get_row_mapped(i, &mapping)
-                    }?;
+                    let row = reader.row(i, &mapping)?;
                     if let Some(e) = expr {
                         if !e.evaluate_fast(&row) {
                             continue;

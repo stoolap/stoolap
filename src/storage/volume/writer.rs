@@ -1881,7 +1881,7 @@ fn group_zone_map(
 
 /// The timestamp value `nanos` decodes to, as `ColumnData::get_value` reads
 /// it; null when the nanos fall outside the calendar
-fn timestamp_value(nanos: i64) -> Value {
+pub(crate) fn timestamp_value(nanos: i64) -> Value {
     let secs = nanos.div_euclid(1_000_000_000);
     let sub_nanos = nanos.rem_euclid(1_000_000_000) as u32;
     match chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, sub_nanos) {
@@ -2018,6 +2018,14 @@ impl VolumeBuilder {
     /// Rows added so far
     pub fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    /// A text column's dictionary so far; None for another column
+    pub fn dictionary(&self, col_idx: usize) -> Option<&[SmartString]> {
+        match self.col_storage.get(col_idx) {
+            Some(StorageKind::Dictionary(idx)) => Some(&self.dict_tables[*idx]),
+            _ => None,
+        }
     }
 
     /// Rows in the accumulators, not yet flushed
@@ -2840,6 +2848,68 @@ impl VolumeBuilder {
     }
 }
 
+/// Reads rows of one volume by index with the groups they need held
+/// across the reads: a loop over many rows of a volume decodes each
+/// group once, not once per row and column, and lets the groups go when
+/// the reader does
+pub struct RowReader {
+    volume: Arc<FrozenVolume>,
+    /// By physical column: the group held and its first row
+    pinned: Vec<Option<(Arc<ColumnData>, usize)>>,
+}
+
+impl RowReader {
+    pub fn new(volume: Arc<FrozenVolume>) -> Self {
+        let columns = volume.columns.len();
+        Self {
+            volume,
+            pinned: vec![None; columns],
+        }
+    }
+
+    pub fn volume(&self) -> &Arc<FrozenVolume> {
+        &self.volume
+    }
+
+    fn cell(&mut self, col_idx: usize, row_idx: usize) -> std::io::Result<Value> {
+        if let Some(column) = self.volume.columns.resident(col_idx) {
+            return Ok(column.get_value(row_idx));
+        }
+        let start = row_idx / ROW_GROUP_SIZE * ROW_GROUP_SIZE;
+        if let Some((column, held)) = &self.pinned[col_idx] {
+            if *held == start {
+                return Ok(column.get_value(row_idx - start));
+            }
+        }
+        let store = self.volume.columns.compressed_store().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
+        })?;
+        let column = store.group_column(col_idx, row_idx / ROW_GROUP_SIZE)?;
+        let value = column.get_value(row_idx - start);
+        self.pinned[col_idx] = Some((column, start));
+        Ok(value)
+    }
+
+    /// The row at `idx` through `mapping`, every schema column
+    pub fn row(&mut self, idx: usize, mapping: &ColumnMapping) -> std::io::Result<Row> {
+        if mapping.is_identity {
+            let mut values = Vec::with_capacity(self.volume.columns.len());
+            for col_idx in 0..self.volume.columns.len() {
+                values.push(self.cell(col_idx, idx)?);
+            }
+            return Ok(Row::from_values(values));
+        }
+        let mut values = Vec::with_capacity(mapping.sources.len());
+        for source in &mapping.sources {
+            values.push(match source {
+                ColSource::Volume(col_idx) => self.cell(*col_idx, idx)?,
+                ColSource::Default(value) => value.clone(),
+            });
+        }
+        Ok(Row::from_values(values))
+    }
+}
+
 /// Source for a single schema column when reading from a frozen volume.
 /// Precomputed once per volume per scan, then used for every row.
 #[derive(Clone)]
@@ -3163,7 +3233,7 @@ impl FrozenVolume {
         let mut values = Vec::with_capacity(mapping.sources.len());
         for src in &mapping.sources {
             values.push(match src {
-                ColSource::Volume(vol_idx) => self.columns.get(*vol_idx)?.get_value(idx),
+                ColSource::Volume(vol_idx) => self.cell(*vol_idx, idx)?,
                 ColSource::Default(val) => val.clone(),
             });
         }
@@ -3181,7 +3251,7 @@ impl FrozenVolume {
         let mut values = Vec::with_capacity(col_indices.len());
         for &ci in col_indices {
             values.push(match &mapping.sources[ci] {
-                ColSource::Volume(vol_idx) => self.columns.get(*vol_idx)?.get_value(idx),
+                ColSource::Volume(vol_idx) => self.cell(*vol_idx, idx)?,
                 ColSource::Default(val) => val.clone(),
             });
         }
@@ -3197,7 +3267,7 @@ impl FrozenVolume {
         let mut values = Vec::with_capacity(self.columns.len());
         for ci in 0..self.columns.len() {
             values.push(if ci < needed.len() && needed[ci] {
-                self.columns.get(ci)?.get_value(idx)
+                self.cell(ci, idx)?
             } else {
                 Value::Null(self.columns.data_type(ci))
             });
@@ -3219,7 +3289,7 @@ impl FrozenVolume {
         for (ci, src) in mapping.sources.iter().enumerate() {
             values.push(if ci < needed.len() && needed[ci] {
                 match src {
-                    ColSource::Volume(vol_idx) => self.columns.get(*vol_idx)?.get_value(idx),
+                    ColSource::Volume(vol_idx) => self.cell(*vol_idx, idx)?,
                     ColSource::Default(val) => val.clone(),
                 }
             } else {
@@ -3235,8 +3305,8 @@ impl FrozenVolume {
     /// Get a row as a Vec of Values (for executor compatibility).
     pub fn get_row(&self, idx: usize) -> std::io::Result<Row> {
         let mut values = Vec::with_capacity(self.columns.len());
-        for col in &self.columns {
-            values.push(col?.get_value(idx));
+        for ci in 0..self.columns.len() {
+            values.push(self.cell(ci, idx)?);
         }
         Ok(Row::from_values(values))
     }
@@ -3245,7 +3315,7 @@ impl FrozenVolume {
     pub fn get_row_projected(&self, idx: usize, col_indices: &[usize]) -> std::io::Result<Row> {
         let mut values = Vec::with_capacity(col_indices.len());
         for &col in col_indices {
-            values.push(self.columns.get(col)?.get_value(idx));
+            values.push(self.cell(col, idx)?);
         }
         Ok(Row::from_values(values))
     }
@@ -3305,7 +3375,7 @@ impl FrozenVolume {
             }
             let mut matches = true;
             for (&ci, &val) in col_indices.iter().zip(values) {
-                let vol_val = self.columns.get(ci)?.get_value(row_idx as usize);
+                let vol_val = self.cell(ci, row_idx as usize)?;
                 if vol_val.is_null() || vol_val != *val {
                     matches = false;
                     break;
@@ -3317,6 +3387,84 @@ impl FrozenVolume {
         }
 
         Ok(())
+    }
+
+    /// Calls `f` with the column's data from the group holding `from` on,
+    /// each call with the first row's index and the rows the call covers:
+    /// the whole column at once when it is decoded, otherwise one group
+    /// at a time through the decoded group cache. `f` returns whether to
+    /// go on
+    pub fn for_each_group_from<E: From<std::io::Error>>(
+        &self,
+        col_idx: usize,
+        from: usize,
+        mut f: impl FnMut(usize, &ColumnData) -> std::result::Result<bool, E>,
+    ) -> std::result::Result<(), E> {
+        if let Some(column) = self.columns.resident(col_idx) {
+            f(0, column)?;
+            return Ok(());
+        }
+        let store = self.columns.compressed_store().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
+        })?;
+        let groups = store.num_groups(col_idx);
+        for group in from / ROW_GROUP_SIZE..groups {
+            let column = store.group_column(col_idx, group)?;
+            if !f(group * ROW_GROUP_SIZE, &column)? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// The first row index whose value is at least `target` in a sorted
+    /// integer or timestamp column, None when every value is below it.
+    /// The row groups' zone maps name the group that holds it, and only
+    /// that group is decoded, through the decoded group cache
+    pub fn first_index_ge(&self, col_idx: usize, target: i64) -> std::io::Result<Option<usize>> {
+        if let Some(column) = self.columns.resident(col_idx) {
+            let first = column.binary_search_ge(target);
+            return Ok((first < column.len()).then_some(first));
+        }
+        let store = self.columns.compressed_store().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
+        })?;
+        for group in 0..store.num_groups(col_idx) {
+            let below_target = self
+                .meta
+                .row_groups
+                .get(group)
+                .and_then(|rg| rg.zone_maps.get(col_idx))
+                .and_then(|zm| match &zm.max {
+                    Value::Integer(max) => Some(*max),
+                    Value::Timestamp(ts) => ts.timestamp_nanos_opt(),
+                    _ => None,
+                })
+                .is_some_and(|max| target > max);
+            if below_target {
+                continue;
+            }
+            let column = store.group_column(col_idx, group)?;
+            let local = column.binary_search_ge(target);
+            if local < column.len() {
+                return Ok(Some(group * ROW_GROUP_SIZE + local));
+            }
+        }
+        Ok(None)
+    }
+
+    /// One cell, read from the column already decoded or from the row's
+    /// group through the decoded group cache, never by decoding the
+    /// column whole
+    pub fn cell(&self, col_idx: usize, row_idx: usize) -> std::io::Result<Value> {
+        if let Some(column) = self.columns.resident(col_idx) {
+            return Ok(column.get_value(row_idx));
+        }
+        let store = self.columns.compressed_store().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
+        })?;
+        let group = store.group_column(col_idx, row_idx / ROW_GROUP_SIZE)?;
+        Ok(group.get_value(row_idx % ROW_GROUP_SIZE))
     }
 
     /// Pre-build the unique sorted index for a set of column indices.
@@ -3466,6 +3614,10 @@ mod tests {
             .build()
     }
 
+    /// The decoded-group cache is process global: a test that sets its
+    /// budget holds this and puts the default back
+    static CACHE_BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn a_read_during_a_move_waits_for_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -3551,6 +3703,58 @@ mod tests {
         letting_go.join().unwrap();
         assert!(!new_dir.join("v.vol").exists());
         assert!(VOLUME_FILES.lock().forwarded.is_empty());
+    }
+
+    #[test]
+    fn a_row_reader_decodes_each_group_once_for_a_loop() {
+        use crate::storage::volume::group_cache::{DECODED_GROUPS, DEFAULT_BUDGET_BYTES};
+        let _serial = CACHE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DECODED_GROUPS.set_budget_bytes(0);
+                DECODED_GROUPS.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+            }
+        }
+        let _restore = Restore;
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("name", DataType::Text, true, false)
+            .build();
+        let rows = ROW_GROUP_SIZE as i64 + 100;
+        let mut builder = VolumeBuilder::new(&schema);
+        for i in 0..rows {
+            builder.add_row(
+                i,
+                &Row::from_values(vec![Value::Integer(i), Value::text(format!("n{}", i % 7))]),
+            );
+        }
+        let mut volume = builder.finish().unwrap();
+        let (_, store) = crate::storage::volume::io::serialize_v4_public(&volume).unwrap();
+        volume.columns.attach_compressed_store(store);
+        let warm = Arc::new(volume.to_warm().unwrap());
+        // A cache too small for both groups of both columns, so a reader
+        // that let its groups go would decode them again row after row
+        DECODED_GROUPS.set_budget_bytes(0);
+        DECODED_GROUPS.set_budget_bytes(1);
+        let before = DECODED_GROUPS.stats().misses;
+        let mut reader = RowReader::new(Arc::clone(&warm));
+        for i in (0..rows as usize).step_by(97) {
+            let row = reader
+                .row(
+                    i,
+                    &ColumnMapping {
+                        sources: Vec::new(),
+                        names: Vec::new(),
+                        is_identity: true,
+                    },
+                )
+                .unwrap();
+            assert_eq!(row[0], Value::Integer(i as i64));
+        }
+        let misses = DECODED_GROUPS.stats().misses - before;
+        // Two groups, two columns: each decoded once
+        assert_eq!(misses, 4, "groups decoded {misses} times");
     }
 
     #[test]
