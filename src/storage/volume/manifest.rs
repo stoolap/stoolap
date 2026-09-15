@@ -3714,12 +3714,11 @@ mod tests {
         let held = Arc::clone(&mgr.segments_raw().get(&1).unwrap().volume);
         mgr.rename_with("after", || {
             assert_eq!(mgr.table_name(), "before");
-            std::fs::rename(dir.path().join("before"), dir.path().join("after"))?;
             super::super::writer::VolumeFile::relocate(
                 &dir.path().join("before"),
                 &dir.path().join("after"),
-            );
-            Ok(())
+                || std::fs::rename(dir.path().join("before"), dir.path().join("after")),
+            )
         })
         .unwrap();
         assert_eq!(mgr.table_name(), "after");

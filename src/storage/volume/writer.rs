@@ -91,28 +91,38 @@ impl VolumeFile {
         std::fs::File::open(&*self.path.read())
     }
 
-    /// Every file under `old_dir` is under `new_dir` from now on: the
-    /// holders open the new path, a table rename calls this once the
-    /// directory has moved
-    pub fn relocate(old_dir: &std::path::Path, new_dir: &std::path::Path) {
+    /// Moves every file under `old_dir` to `new_dir` through `move_dir`:
+    /// a holder's read meanwhile waits for the move and opens the new
+    /// path after it; a failed move leaves every path as it was
+    pub fn relocate(
+        old_dir: &std::path::Path,
+        new_dir: &std::path::Path,
+        move_dir: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         let mut files = VOLUME_FILES.lock();
-        let moved: Vec<(std::path::PathBuf, std::sync::Weak<VolumeFile>)> = files
+        // Strong holders outlive the registry lock: the last one's drop takes it
+        let moved: Vec<(std::path::PathBuf, Arc<VolumeFile>)> = files
             .iter()
             .filter(|(path, _)| path.starts_with(old_dir))
-            .map(|(path, file)| (path.clone(), file.clone()))
+            .filter_map(|(path, file)| Some((path.clone(), file.upgrade()?)))
             .collect();
-        for (old_path, weak) in moved {
-            files.remove(&old_path);
-            let Some(file) = weak.upgrade() else {
-                continue;
-            };
-            let Ok(rest) = old_path.strip_prefix(old_dir) else {
-                continue;
-            };
-            let new_path = new_dir.join(rest);
-            *file.path.write() = new_path.clone();
-            files.insert(new_path, weak);
+        let mut paths: Vec<_> = moved.iter().map(|(_, file)| file.path.write()).collect();
+        let result = move_dir();
+        if result.is_ok() {
+            for ((old_path, file), path) in moved.iter().zip(paths.iter_mut()) {
+                let Ok(rest) = old_path.strip_prefix(old_dir) else {
+                    continue;
+                };
+                let new_path = new_dir.join(rest);
+                files.remove(old_path);
+                files.insert(new_path.clone(), Arc::downgrade(file));
+                **path = new_path;
+            }
         }
+        drop(paths);
+        drop(files);
+        drop(moved);
+        result
     }
 }
 
@@ -3410,6 +3420,68 @@ mod tests {
             .column("exchange", DataType::Text, false, false)
             .column("price", DataType::Float, false, false)
             .build()
+    }
+
+    #[test]
+    fn a_read_during_a_move_waits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_dir = dir.path().join("old");
+        let new_dir = dir.path().join("new");
+        std::fs::create_dir(&old_dir).unwrap();
+        std::fs::write(old_dir.join("v.vol"), b"x").unwrap();
+        let file = VolumeFile::shared(&old_dir.join("v.vol"));
+        let reader = Arc::clone(&file);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let read = std::sync::Mutex::new(None);
+        VolumeFile::relocate(&old_dir, &new_dir, || {
+            let reader = Arc::clone(&reader);
+            let tx = tx.clone();
+            *read.lock().unwrap() = Some(std::thread::spawn(move || {
+                let opened = reader.open().map(|_| reader.path());
+                tx.send(()).unwrap();
+                opened
+            }));
+            // The read waits until the move is done
+            assert!(rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err());
+            std::fs::rename(&old_dir, &new_dir)
+        })
+        .unwrap();
+        let opened = read.lock().unwrap().take().unwrap().join().unwrap();
+        assert_eq!(opened.unwrap(), new_dir.join("v.vol"));
+        assert_eq!(file.path(), new_dir.join("v.vol"));
+    }
+
+    #[test]
+    fn a_holder_letting_go_during_a_move_does_not_block_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_dir = dir.path().join("old");
+        let new_dir = dir.path().join("new");
+        std::fs::create_dir(&old_dir).unwrap();
+        std::fs::write(old_dir.join("v.vol"), b"x").unwrap();
+        let file = VolumeFile::shared(&old_dir.join("v.vol"));
+        file.retire();
+        let moved = std::thread::spawn(move || {
+            VolumeFile::relocate(&old_dir, &new_dir, || {
+                drop(file);
+                std::fs::rename(&old_dir, &new_dir)
+            })
+            .unwrap();
+            new_dir
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !moved.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            moved.is_finished(),
+            "the move waits on its own registry lock"
+        );
+        let new_dir = moved.join().unwrap();
+        // The retired file went with the last holder, at its new place
+        assert!(!new_dir.join("v.vol").exists());
+        assert!(!dir.path().join("old").join("v.vol").exists());
     }
 
     #[test]

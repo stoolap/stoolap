@@ -3941,9 +3941,11 @@ impl MVCCEngine {
                     // moves with it, under the manager's reload lock, the
                     // name changing only once the move succeeded
                     let move_dir = || {
-                        std::fs::rename(&old_dir, &new_dir)?;
-                        crate::storage::volume::writer::VolumeFile::relocate(&old_dir, &new_dir);
-                        Ok(())
+                        crate::storage::volume::writer::VolumeFile::relocate(
+                            &old_dir,
+                            &new_dir,
+                            || std::fs::rename(&old_dir, &new_dir),
+                        )
                     };
                     let moved = match self.segment_managers.read().unwrap().get(&new_name_lower) {
                         Some(mgr) => mgr.rename_with(new_name_lower.as_str(), move_dir),
@@ -7762,9 +7764,11 @@ impl TransactionEngineOperations for EngineOperations {
                     // moves with it, under the manager's reload lock, the
                     // name changing only once the move succeeded
                     let move_dir = || {
-                        std::fs::rename(&old_dir, &new_dir)?;
-                        crate::storage::volume::writer::VolumeFile::relocate(&old_dir, &new_dir);
-                        Ok(())
+                        crate::storage::volume::writer::VolumeFile::relocate(
+                            &old_dir,
+                            &new_dir,
+                            || std::fs::rename(&old_dir, &new_dir),
+                        )
                     };
                     let moved = match self.segment_managers.read().unwrap().get(&new_name_lower) {
                         Some(mgr) => mgr.rename_with(new_name_lower.as_str(), move_dir),
