@@ -3614,6 +3614,10 @@ mod tests {
             .build()
     }
 
+    /// The decoded-group cache is process global: a test that sets its
+    /// budget holds this and puts the default back
+    static CACHE_BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn a_read_during_a_move_waits_for_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -3703,7 +3707,16 @@ mod tests {
 
     #[test]
     fn a_row_reader_decodes_each_group_once_for_a_loop() {
-        use crate::storage::volume::group_cache::DECODED_GROUPS;
+        use crate::storage::volume::group_cache::{DECODED_GROUPS, DEFAULT_BUDGET_BYTES};
+        let _serial = CACHE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DECODED_GROUPS.set_budget_bytes(0);
+                DECODED_GROUPS.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+            }
+        }
+        let _restore = Restore;
         let schema = SchemaBuilder::new("t")
             .column("id", DataType::Integer, false, true)
             .column("name", DataType::Text, true, false)

@@ -134,3 +134,134 @@ fn dml_on_cold_rows_stays_correct_while_seals_race_it() {
         .unwrap();
     assert_eq!(gone, 0);
 }
+
+fn cold_row(dir: &std::path::Path) -> Database {
+    let db = open(dir);
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 0)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db
+}
+
+fn bump(row: &mut stoolap::core::Row) -> (i64, i64) {
+    let id = row.get(0).and_then(|v| v.as_int64()).unwrap();
+    let old = row.get(1).and_then(|v| v.as_int64()).unwrap();
+    row.set(1, stoolap::core::Value::Integer(old + 1)).unwrap();
+    (id, old + 1)
+}
+
+#[test]
+fn a_cold_unique_shift_lands() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path());
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER UNIQUE)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 2)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    // Row 2's new key is row 1's old one, which the statement takes away
+    assert_eq!(
+        db.execute("UPDATE t SET k = k - 1 WHERE id IN (1, 2)", ())
+            .unwrap(),
+        2
+    );
+    let sum: i64 = db.query_one("SELECT SUM(k) FROM t", ()).unwrap();
+    assert_eq!(sum, 1);
+    assert_eq!(db.execute("UPDATE t SET k = k - 1", ()).unwrap(), 2);
+    let sum: i64 = db.query_one("SELECT SUM(k) FROM t", ()).unwrap();
+    assert_eq!(sum, -1);
+}
+
+#[test]
+fn a_seal_landing_while_a_row_is_prepared_runs_the_setter_once() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = cold_row(dir.path());
+    db.execute("INSERT INTO t VALUES (2, 0)", ()).unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let other = db.clone();
+    let mut calls = 0;
+    let mut returned = Vec::new();
+    let mut setter = |mut row: stoolap::core::Row| {
+        calls += 1;
+        returned.push(bump(&mut row));
+        if calls == 1 {
+            // A seal lands between the row's preparation and the fence
+            other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        Ok((row, true))
+    };
+    assert_eq!(table.update_by_row_ids(&[1], &mut setter).unwrap(), 1);
+    drop(table);
+    txn.commit().unwrap();
+    assert_eq!(calls, 1);
+    assert_eq!(returned, vec![(1, 1)]);
+    let v: i64 = db.query_one("SELECT v FROM t WHERE id = 1", ()).unwrap();
+    assert_eq!(v, 1);
+}
+
+#[test]
+fn a_row_another_transaction_changed_while_prepared_is_a_write_conflict() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = cold_row(dir.path());
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let other = db.clone();
+    let mut calls = 0;
+    let mut setter = |mut row: stoolap::core::Row| {
+        calls += 1;
+        bump(&mut row);
+        if calls == 1 {
+            other
+                .execute("UPDATE t SET v = 10 WHERE id = 1", ())
+                .unwrap();
+        }
+        Ok((row, true))
+    };
+    let err = table.update(None, &mut setter).unwrap_err().to_string();
+    assert!(err.contains("write conflict"), "{err}");
+    assert_eq!(calls, 1);
+    drop(table);
+    txn.rollback().unwrap();
+    let v: i64 = db.query_one("SELECT v FROM t WHERE id = 1", ()).unwrap();
+    assert_eq!(v, 10);
+}
+
+#[test]
+fn a_prepared_row_sealed_again_by_another_transaction_is_a_write_conflict() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = cold_row(dir.path());
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let other = db.clone();
+    let mut calls = 0;
+    let mut setter = |mut row: stoolap::core::Row| {
+        calls += 1;
+        bump(&mut row);
+        if calls == 1 {
+            // The row's newer version lands in a newer volume before the fence
+            other
+                .execute("UPDATE t SET v = 10 WHERE id = 1", ())
+                .unwrap();
+            other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        Ok((row, true))
+    };
+    let err = table
+        .update_by_row_ids(&[1], &mut setter)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("write conflict"), "{err}");
+    assert_eq!(calls, 1);
+    drop(table);
+    txn.rollback().unwrap();
+    let v: i64 = db.query_one("SELECT v FROM t WHERE id = 1", ()).unwrap();
+    assert_eq!(v, 10);
+}

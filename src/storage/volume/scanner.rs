@@ -909,6 +909,20 @@ impl VolumeScanner {
     /// case (see `row_mapping`)
     pub fn set_column_mapping(&mut self, mapping: super::writer::ColumnMapping) {
         if !mapping.is_identity || !mapping.names.is_empty() {
+            // The mask names schema columns: widen it to the schema the
+            // mapping describes, so a column added after the volume was
+            // sealed keeps its place in the projection
+            if !mapping.is_identity {
+                if let Some(mask) = self.needed_cols.as_mut() {
+                    let len = mapping.sources.len().max(mask.len());
+                    mask.resize(len, false);
+                    for &ci in &self.project_cols {
+                        if ci < len {
+                            mask[ci] = true;
+                        }
+                    }
+                }
+            }
             self.column_mapping = Some(mapping);
         }
     }
@@ -954,27 +968,47 @@ impl VolumeScanner {
         let col_count = self.volume.columns.len();
         let group_start = group_idx * super::column::ROW_GROUP_SIZE;
 
-        let mut columns: Vec<Option<Arc<super::column::ColumnData>>> = vec![None; col_count];
-        if let Some(ref needed) = self.needed_cols {
-            for (ci, &need) in needed.iter().enumerate() {
-                if need && ci < col_count {
-                    match store.group_column(ci, group_idx) {
-                        Ok(col) => columns[ci] = Some(col),
-                        Err(e) => {
-                            self.error = Some(Error::internal(format!("corrupt V4 block: {}", e)));
-                            return;
+        // The volume columns the rows need: the mask names schema columns,
+        // which a mapping resolves to the volume's
+        let mut wanted = vec![false; col_count];
+        match (self.needed_cols.as_deref(), self.row_mapping()) {
+            (Some(needed), Some(mapping)) => {
+                for (ci, src) in mapping.sources.iter().enumerate() {
+                    if let super::writer::ColSource::Volume(v) = src {
+                        if needed.get(ci).copied().unwrap_or(false) && *v < col_count {
+                            wanted[*v] = true;
                         }
                     }
                 }
             }
-        } else {
-            for (ci, slot) in columns.iter_mut().enumerate() {
-                match store.group_column(ci, group_idx) {
-                    Ok(col) => *slot = Some(col),
-                    Err(e) => {
-                        self.error = Some(Error::internal(format!("corrupt V4 block: {}", e)));
-                        return;
+            (Some(needed), None) => {
+                for (ci, &need) in needed.iter().enumerate() {
+                    if need && ci < col_count {
+                        wanted[ci] = true;
                     }
+                }
+            }
+            (None, Some(mapping)) => {
+                for src in &mapping.sources {
+                    if let super::writer::ColSource::Volume(v) = src {
+                        if *v < col_count {
+                            wanted[*v] = true;
+                        }
+                    }
+                }
+            }
+            (None, None) => wanted.iter_mut().for_each(|w| *w = true),
+        }
+        let mut columns: Vec<Option<Arc<super::column::ColumnData>>> = vec![None; col_count];
+        for (ci, need) in wanted.into_iter().enumerate() {
+            if !need {
+                continue;
+            }
+            match store.group_column(ci, group_idx) {
+                Ok(col) => columns[ci] = Some(col),
+                Err(e) => {
+                    self.error = Some(Error::internal(format!("corrupt V4 block: {}", e)));
+                    return;
                 }
             }
         }
@@ -1039,9 +1073,7 @@ impl VolumeScanner {
     /// rejects the row.
     #[inline(always)]
     fn materialize_row(&mut self, idx: usize) -> Result<bool> {
-        // Per-group cache path: only when no schema mapping is needed.
-        // Schema-evolved volumes require column_mapping which remaps positions.
-        if self.group_cache.is_some() && self.row_mapping().is_none() {
+        if self.group_cache.is_some() {
             return self.materialize_row_from_cache(idx);
         }
 
@@ -1092,8 +1124,29 @@ impl VolumeScanner {
     fn materialize_row_from_cache(&mut self, idx: usize) -> Result<bool> {
         let col_count = self.volume.columns.len();
 
-        // Build full-width row from cache
-        let full_row = if let Some(ref needed) = self.needed_cols {
+        // Build full-width row from cache; through the mapping when the
+        // volume's columns are not the schema's
+        let full_row = if let Some(mapping) = self.row_mapping() {
+            let mut values = Vec::with_capacity(mapping.sources.len());
+            for (ci, src) in mapping.sources.iter().enumerate() {
+                let needed = self
+                    .needed_cols
+                    .as_ref()
+                    .is_none_or(|mask| mask.get(ci).copied().unwrap_or(false));
+                values.push(match (src, needed) {
+                    (super::writer::ColSource::Volume(v), true) => {
+                        let (col, local) = self.col_and_idx(*v, idx)?;
+                        col.get_value(local)
+                    }
+                    (super::writer::ColSource::Volume(v), false) => {
+                        Value::Null(self.volume.columns.data_type(*v))
+                    }
+                    (super::writer::ColSource::Default(val), true) => val.clone(),
+                    (super::writer::ColSource::Default(val), false) => Value::Null(val.data_type()),
+                });
+            }
+            Row::from_values(values)
+        } else if let Some(ref needed) = self.needed_cols {
             let mut values = Vec::with_capacity(col_count);
             for ci in 0..col_count {
                 values.push(if ci < needed.len() && needed[ci] {
