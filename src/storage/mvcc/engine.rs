@@ -3937,14 +3937,17 @@ impl MVCCEngine {
                 let old_dir = vol_dir.join(&old_name_lower);
                 let new_dir = vol_dir.join(&new_name_lower);
                 if old_dir.exists() {
-                    // The volumes read from their files let the files go
-                    // first: a directory with an open file does not rename
-                    // everywhere, and the reads reload from the new name
+                    // The directory moves and every holder of a file in it
+                    // moves with it, under the manager's reload lock, the
+                    // name changing only once the move succeeded
+                    let move_dir = || {
+                        std::fs::rename(&old_dir, &new_dir)?;
+                        crate::storage::volume::writer::VolumeFile::relocate(&old_dir, &new_dir);
+                        Ok(())
+                    };
                     let moved = match self.segment_managers.read().unwrap().get(&new_name_lower) {
-                        Some(mgr) => mgr.rename_with(new_name_lower.as_str(), || {
-                            std::fs::rename(&old_dir, &new_dir)
-                        }),
-                        None => std::fs::rename(&old_dir, &new_dir),
+                        Some(mgr) => mgr.rename_with(new_name_lower.as_str(), move_dir),
+                        None => move_dir(),
                     };
                     if let Err(e) = moved {
                         // Revert in-memory segment manager rename on disk failure
@@ -7755,14 +7758,17 @@ impl TransactionEngineOperations for EngineOperations {
                 let old_dir = vol_dir.join(&old_name_lower);
                 let new_dir = vol_dir.join(&new_name_lower);
                 if old_dir.exists() {
-                    // The volumes read from their files let the files go
-                    // first: a directory with an open file does not rename
-                    // everywhere, and the reads reload from the new name
+                    // The directory moves and every holder of a file in it
+                    // moves with it, under the manager's reload lock, the
+                    // name changing only once the move succeeded
+                    let move_dir = || {
+                        std::fs::rename(&old_dir, &new_dir)?;
+                        crate::storage::volume::writer::VolumeFile::relocate(&old_dir, &new_dir);
+                        Ok(())
+                    };
                     let moved = match self.segment_managers.read().unwrap().get(&new_name_lower) {
-                        Some(mgr) => mgr.rename_with(new_name_lower.as_str(), || {
-                            std::fs::rename(&old_dir, &new_dir)
-                        }),
-                        None => std::fs::rename(&old_dir, &new_dir),
+                        Some(mgr) => mgr.rename_with(new_name_lower.as_str(), move_dir),
+                        None => move_dir(),
                     };
                     if let Err(e) = moved {
                         // Revert ALL in-memory renames on disk failure

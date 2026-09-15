@@ -764,32 +764,6 @@ impl SegmentManager {
         self.table_name.read().clone()
     }
 
-    /// Lets go of every open volume file: a volume whose blocks are read
-    /// from its file turns cold, metadata only, and reloads from the file
-    /// when it is read again. A directory holding an open file cannot be
-    /// renamed on every platform
-    pub fn release_file_handles(&self) {
-        let mut segments = self.segments.write();
-        let mut new_map = (**segments).clone();
-        let mut released = false;
-        for cs in new_map.values_mut() {
-            if cs
-                .volume
-                .columns
-                .compressed_store()
-                .is_some_and(|store| store.is_file_backed())
-            {
-                cs.volume = Arc::new(cs.volume.to_cold());
-                released = true;
-            }
-        }
-        if released {
-            *segments = Arc::new(new_map);
-            self.has_cold
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    }
-
     /// Ensure all volumes have column data before column access.
     /// Reloads cold segments (in map with metadata only, columns missing).
     fn ensure_columns(&self) {
@@ -1825,9 +1799,9 @@ impl SegmentManager {
     }
 
     /// Renames the table and moves its files as one step under the
-    /// reload lock: the volumes read from their files turn cold,
-    /// `move_dir` moves the directory, and the name changes only once the
-    /// move succeeded, so a reload meanwhile waits and then looks in the
+    /// reload lock: `move_dir` moves the directory and moves every
+    /// holder's path with it, and the name changes only once the move
+    /// succeeded, so a reload meanwhile waits and then looks in the
     /// right place. A failed move leaves the name and the files as they
     /// were
     pub fn rename_with(
@@ -1836,7 +1810,6 @@ impl SegmentManager {
         move_dir: impl FnOnce() -> std::io::Result<()>,
     ) -> std::io::Result<()> {
         let _reload = self.reloading.lock();
-        self.release_file_handles();
         move_dir()?;
         self.rename(new_name);
         Ok(())
@@ -3736,16 +3709,26 @@ mod tests {
             None,
         );
         assert!(mgr.segments_raw().get(&1).unwrap().volume.is_warm());
-        // While the files move the name is still the old one and the
-        // volume has let its file go
+        // A reader holds the volume across the move; while the files move
+        // the name is still the old one
+        let held = Arc::clone(&mgr.segments_raw().get(&1).unwrap().volume);
         mgr.rename_with("after", || {
             assert_eq!(mgr.table_name(), "before");
-            assert!(mgr.segments_raw().get(&1).unwrap().volume.is_cold());
-            std::fs::rename(dir.path().join("before"), dir.path().join("after"))
+            std::fs::rename(dir.path().join("before"), dir.path().join("after"))?;
+            super::super::writer::VolumeFile::relocate(
+                &dir.path().join("before"),
+                &dir.path().join("after"),
+            );
+            Ok(())
         })
         .unwrap();
         assert_eq!(mgr.table_name(), "after");
-        // The reload finds the file under the new name
+        // The reader still holding the volume reads it at its new place,
+        // and a reload finds it there too
+        assert_eq!(held.get_row(9).unwrap()[0], Value::Integer(10));
+        let cold = Arc::new(held.to_cold());
+        drop(held);
+        drop(cold);
         let reloaded = mgr.ensure_volume(1).unwrap().unwrap();
         assert_eq!(reloaded.get_row(9).unwrap()[0], Value::Integer(10));
         // A failed move leaves the name as it was

@@ -47,6 +47,93 @@ use super::stats::VolumeAggregateStats;
 /// Holds LZ4-compressed column data in RAM. Each column is split into row-group-
 /// sized blocks (64K rows). Decompression from RAM runs at ~4 GB/s, negligible
 /// compared to disk I/O. This is the backing store for LazyColumns.
+/// A volume file as every store that reads it shares it: the path a read
+/// opens, which a table rename moves under every holder, and whether the
+/// file is to be removed once the last holder lets go. One per file in
+/// the process, so a volume reloaded into a new store shares the file
+/// with the readers still holding the old one
+pub struct VolumeFile {
+    path: parking_lot::RwLock<std::path::PathBuf>,
+    retired: std::sync::atomic::AtomicBool,
+}
+
+static VOLUME_FILES: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, std::sync::Weak<VolumeFile>>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+impl VolumeFile {
+    /// The handle of the file at `path`, the one every holder shares
+    pub fn shared(path: &std::path::Path) -> Arc<VolumeFile> {
+        let mut files = VOLUME_FILES.lock();
+        if let Some(file) = files.get(path).and_then(std::sync::Weak::upgrade) {
+            return file;
+        }
+        let file = Arc::new(VolumeFile {
+            path: parking_lot::RwLock::new(path.to_path_buf()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+        });
+        files.insert(path.to_path_buf(), Arc::downgrade(&file));
+        file
+    }
+
+    /// Where the file is now
+    pub fn path(&self) -> std::path::PathBuf {
+        self.path.read().clone()
+    }
+
+    /// Removes the file once the last holder lets go
+    pub fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn open(&self) -> std::io::Result<std::fs::File> {
+        std::fs::File::open(&*self.path.read())
+    }
+
+    /// Every file under `old_dir` is under `new_dir` from now on: the
+    /// holders open the new path, a table rename calls this once the
+    /// directory has moved
+    pub fn relocate(old_dir: &std::path::Path, new_dir: &std::path::Path) {
+        let mut files = VOLUME_FILES.lock();
+        let moved: Vec<(std::path::PathBuf, std::sync::Weak<VolumeFile>)> = files
+            .iter()
+            .filter(|(path, _)| path.starts_with(old_dir))
+            .map(|(path, file)| (path.clone(), file.clone()))
+            .collect();
+        for (old_path, weak) in moved {
+            files.remove(&old_path);
+            let Some(file) = weak.upgrade() else {
+                continue;
+            };
+            let Ok(rest) = old_path.strip_prefix(old_dir) else {
+                continue;
+            };
+            let new_path = new_dir.join(rest);
+            *file.path.write() = new_path.clone();
+            files.insert(new_path, weak);
+        }
+    }
+}
+
+impl Drop for VolumeFile {
+    fn drop(&mut self) {
+        let path = self.path.get_mut().clone();
+        {
+            let mut files = VOLUME_FILES.lock();
+            if files
+                .get(&path)
+                .is_some_and(|file| file.strong_count() == 0)
+            {
+                files.remove(&path);
+            }
+        }
+        if self.retired.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// Where a store's blocks live: in memory for a volume just sealed or
 /// compressed from its columns, or in the volume's file, read by position
 /// when a group is decoded
@@ -55,15 +142,11 @@ enum BlockSource {
     /// The file is opened for each block read and closed after it, so a
     /// store holds no descriptor between reads
     File {
-        path: std::path::PathBuf,
+        file: Arc<VolumeFile>,
         /// offsets[col_idx][group_idx] and lens[col_idx][group_idx] of
         /// the compressed block in the file
         offsets: Vec<Vec<u64>>,
         lens: Vec<Vec<usize>>,
-        /// The file is removed when the store drops: compaction retires
-        /// a replaced volume's file this way, so a reader still holding
-        /// the volume keeps reading it until it lets go
-        unlink_on_drop: std::sync::atomic::AtomicBool,
     },
 }
 
@@ -134,16 +217,6 @@ fn next_store_id() -> usize {
 impl Drop for CompressedBlockStore {
     fn drop(&mut self) {
         super::group_cache::DECODED_GROUPS.remove_store(self.id);
-        if let BlockSource::File {
-            path,
-            unlink_on_drop,
-            ..
-        } = &self.source
-        {
-            if unlink_on_drop.load(std::sync::atomic::Ordering::Acquire) {
-                let _ = std::fs::remove_file(path);
-            }
-        }
     }
 }
 
@@ -350,10 +423,9 @@ impl CompressedBlockStore {
             .collect();
         Self {
             source: BlockSource::File {
-                path,
+                file: VolumeFile::shared(&path),
                 offsets,
                 lens: compressed_lens,
-                unlink_on_drop: std::sync::atomic::AtomicBool::new(false),
             },
             decompressed_lens,
             col_type_tags,
@@ -371,12 +443,12 @@ impl CompressedBlockStore {
         matches!(self.source, BlockSource::File { .. })
     }
 
-    /// Removes the volume's file once the last holder of this store lets
-    /// go; false when the blocks are not in a file
+    /// Removes the volume's file once its last holder lets go, whichever
+    /// store holds it; false when the blocks are not in a file
     pub fn retire_file(&self) -> bool {
         match &self.source {
-            BlockSource::File { unlink_on_drop, .. } => {
-                unlink_on_drop.store(true, std::sync::atomic::Ordering::Release);
+            BlockSource::File { file, .. } => {
+                file.retire();
                 true
             }
             BlockSource::Memory(_) => false,
@@ -414,10 +486,9 @@ impl CompressedBlockStore {
                 .map(Vec::as_slice)
                 .ok_or_else(missing),
             BlockSource::File {
-                path,
+                file,
                 offsets,
                 lens,
-                ..
             } => {
                 let offset = *offsets
                     .get(col_idx)
@@ -432,8 +503,7 @@ impl CompressedBlockStore {
                     .try_reserve_exact(len)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
                 scratch.resize(len, 0);
-                let file = std::fs::File::open(path)?;
-                read_exact_at(&file, scratch, offset)?;
+                read_exact_at(&file.open()?, scratch, offset)?;
                 Ok(scratch.as_slice())
             }
         }
@@ -3275,10 +3345,10 @@ impl FrozenVolume {
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Has the volume's file removed once the last holder of its block
-    /// store lets go, so a reader still holding the volume keeps reading
-    /// it; false when the volume holds no file-backed store, in which
-    /// case the caller removes the file itself
+    /// Has the volume's file removed once its last holder lets go, so a
+    /// reader still holding the volume, or a store reloaded from the
+    /// same file, keeps reading it; false when the volume holds no
+    /// file-backed store, in which case the caller removes the file itself
     pub fn retire_file(&self) -> bool {
         self.columns
             .compressed_store()

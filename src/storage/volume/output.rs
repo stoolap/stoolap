@@ -750,15 +750,16 @@ mod tests {
         let schema = schema();
         let (_, volume, path, _dir) = written(&schema, 100, 50);
         drop(volume);
+        // Two stores over the same file, as a reload beside a reader
+        // still holding the old volume leaves them: they share the file
         let first = Arc::new(read_volume_from_disk(&path).unwrap());
-        let second = Arc::clone(&first);
-        assert!(first.retire_file());
-        assert!(path.exists(), "retired too early");
-        // A holder still reads the file
-        assert_eq!(second.get_row(7).unwrap()[0], Value::Integer(7));
-        drop(first);
-        assert!(path.exists());
+        let second = Arc::new(read_volume_from_disk(&path).unwrap());
+        assert!(second.retire_file());
         drop(second);
+        assert!(path.exists(), "retired under a reader");
+        // The reader still holding the old store reads the file
+        assert_eq!(first.get_row(7).unwrap()[0], Value::Integer(7));
+        drop(first);
         assert!(!path.exists(), "the file outlived its last holder");
         // A volume without a file-backed store has nothing to retire
         let mut builder = VolumeBuilder::new(&schema);
