@@ -5930,9 +5930,12 @@ impl MVCCEngine {
 
                 let vol_dir = pm.path().join("volumes");
                 let vol_table_dir = vol_dir.join(table_name);
-                let old_filenames: FxHashSet<String> = old_ids
+                // A file read by a volume some reader may still hold is
+                // removed when the last holder lets go; the others now
+                let old_filenames: FxHashSet<String> = volumes
                     .iter()
-                    .map(|id| format!("vol_{:016x}.vol", id))
+                    .filter(|(_, vol)| !vol.retire_file())
+                    .map(|(id, _)| format!("vol_{:016x}.vol", id))
                     .collect();
                 if let Ok(entries) = std::fs::read_dir(&vol_table_dir) {
                     for entry in entries.flatten() {
@@ -6183,9 +6186,12 @@ impl MVCCEngine {
 
             // Now safe to delete old volume files + stale .dv files.
             let vol_table_dir = vol_dir.join(table_name);
-            let old_filenames: FxHashSet<String> = old_ids
+            // A file read by a volume some reader may still hold is removed
+            // when the last holder lets go; the others now
+            let old_filenames: FxHashSet<String> = volumes
                 .iter()
-                .map(|id| format!("vol_{:016x}.vol", id))
+                .filter(|(_, vol)| !vol.retire_file())
+                .map(|(id, _)| format!("vol_{:016x}.vol", id))
                 .collect();
             if let Ok(entries) = std::fs::read_dir(&vol_table_dir) {
                 for entry in entries.flatten() {

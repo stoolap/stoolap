@@ -60,6 +60,10 @@ enum BlockSource {
         /// the compressed block in the file
         offsets: Vec<Vec<u64>>,
         lens: Vec<Vec<usize>>,
+        /// The file is removed when the store drops: compaction retires
+        /// a replaced volume's file this way, so a reader still holding
+        /// the volume keeps reading it until it lets go
+        unlink_on_drop: std::sync::atomic::AtomicBool,
     },
 }
 
@@ -130,6 +134,16 @@ fn next_store_id() -> usize {
 impl Drop for CompressedBlockStore {
     fn drop(&mut self) {
         super::group_cache::DECODED_GROUPS.remove_store(self.id);
+        if let BlockSource::File {
+            path,
+            unlink_on_drop,
+            ..
+        } = &self.source
+        {
+            if unlink_on_drop.load(std::sync::atomic::Ordering::Acquire) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 }
 
@@ -339,6 +353,7 @@ impl CompressedBlockStore {
                 path,
                 offsets,
                 lens: compressed_lens,
+                unlink_on_drop: std::sync::atomic::AtomicBool::new(false),
             },
             decompressed_lens,
             col_type_tags,
@@ -354,6 +369,18 @@ impl CompressedBlockStore {
     /// Whether the blocks live in the volume's file rather than in RAM
     pub fn is_file_backed(&self) -> bool {
         matches!(self.source, BlockSource::File { .. })
+    }
+
+    /// Removes the volume's file once the last holder of this store lets
+    /// go; false when the blocks are not in a file
+    pub fn retire_file(&self) -> bool {
+        match &self.source {
+            BlockSource::File { unlink_on_drop, .. } => {
+                unlink_on_drop.store(true, std::sync::atomic::Ordering::Release);
+                true
+            }
+            BlockSource::Memory(_) => false,
+        }
     }
 
     /// The number of groups of a column, from wherever the blocks live
@@ -390,6 +417,7 @@ impl CompressedBlockStore {
                 path,
                 offsets,
                 lens,
+                ..
             } => {
                 let offset = *offsets
                     .get(col_idx)
@@ -3245,6 +3273,16 @@ impl FrozenVolume {
     pub fn mark_accessed(&self) {
         self.last_access_epoch
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Has the volume's file removed once the last holder of its block
+    /// store lets go, so a reader still holding the volume keeps reading
+    /// it; false when the volume holds no file-backed store, in which
+    /// case the caller removes the file itself
+    pub fn retire_file(&self) -> bool {
+        self.columns
+            .compressed_store()
+            .is_some_and(|store| store.retire_file())
     }
 
     /// Whether this volume is warm (compressed blocks in RAM, no decompressed columns).

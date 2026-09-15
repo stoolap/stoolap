@@ -746,6 +746,27 @@ mod tests {
     }
 
     #[test]
+    fn a_retired_file_stays_until_its_last_reader_lets_go() {
+        let schema = schema();
+        let (_, volume, path, _dir) = written(&schema, 100, 50);
+        drop(volume);
+        let first = Arc::new(read_volume_from_disk(&path).unwrap());
+        let second = Arc::clone(&first);
+        assert!(first.retire_file());
+        assert!(path.exists(), "retired too early");
+        // A holder still reads the file
+        assert_eq!(second.get_row(7).unwrap()[0], Value::Integer(7));
+        drop(first);
+        assert!(path.exists());
+        drop(second);
+        assert!(!path.exists(), "the file outlived its last holder");
+        // A volume without a file-backed store has nothing to retire
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.add_row(1, &row(1));
+        assert!(!builder.finish().unwrap().retire_file());
+    }
+
+    #[test]
     fn a_corrupted_file_is_refused_at_open_and_an_aborted_writer_leaves_nothing() {
         let schema = schema();
         let (_, volume, path, dir) = written(&schema, 200, 50);
