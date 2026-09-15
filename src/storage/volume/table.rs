@@ -521,6 +521,110 @@ impl SegmentedTable {
     /// Uses zone maps, bloom filters, dictionary pre-filters, and binary search
     /// on sorted columns for fast rejection. No index population needed.
     /// Check cold unique constraints for UPDATE, excluding the row being updated.
+    /// Takes the seal fence once the statement's cold checks are done
+    /// outside it, so the disk they may read never holds a seal up:
+    /// `check` runs against a cold snapshot taken without the fence, the
+    /// fence is then taken, and the check stands when no seal landed in
+    /// between, otherwise it runs again; after a few rounds it runs under
+    /// the fence, as it did before. None when the table has no segments
+    /// under the fence, so a first seal landing meanwhile is not missed
+    fn fence_after_cold_check<'m, T>(
+        mgr: &'m super::manifest::SegmentManager,
+        mut check: impl FnMut(&super::manifest::ColdSnapshot) -> Result<T>,
+    ) -> Result<(parking_lot::RwLockReadGuard<'m, ()>, Option<T>)> {
+        if !mgr.has_segments() {
+            let guard = mgr.acquire_seal_read();
+            if !mgr.has_segments() {
+                return Ok((guard, None));
+            }
+            drop(guard);
+        }
+        for _ in 0..3 {
+            let generation = mgr.seal_generation();
+            let snapshot = mgr.cold_snapshot();
+            let checked = check(&snapshot)?;
+            let guard = mgr.acquire_seal_read();
+            if mgr.seal_generation() == generation {
+                return Ok((guard, Some(checked)));
+            }
+        }
+        let guard = mgr.acquire_seal_read();
+        let snapshot = mgr.cold_snapshot();
+        let checked = check(&snapshot)?;
+        Ok((guard, Some(checked)))
+    }
+
+    /// The same for a statement's cold reads: `prepare` reads through a
+    /// statement snapshot, taken and verified all-warm outside the fence,
+    /// and what it prepared is applied under the fence when no seal
+    /// landed in between
+    fn fence_after_prepare<'m, T>(
+        mgr: &'m super::manifest::SegmentManager,
+        mut prepare: impl FnMut(&super::manifest::StatementSnapshot) -> Result<T>,
+    ) -> Result<(parking_lot::RwLockReadGuard<'m, ()>, Option<T>)> {
+        if !mgr.has_segments() {
+            let guard = mgr.acquire_seal_read();
+            if !mgr.has_segments() {
+                return Ok((guard, None));
+            }
+            drop(guard);
+        }
+        for _ in 0..3 {
+            let generation = mgr.seal_generation();
+            let snapshot = mgr.statement_snapshot()?;
+            let prepared = prepare(&snapshot)?;
+            let guard = mgr.acquire_seal_read();
+            if mgr.seal_generation() == generation {
+                return Ok((guard, Some(prepared)));
+            }
+        }
+        let guard = mgr.acquire_seal_read();
+        let snapshot = mgr.statement_snapshot()?;
+        let prepared = prepare(&snapshot)?;
+        Ok((guard, Some(prepared)))
+    }
+
+    /// Moves a cold row's new version into the hot store under the fence:
+    /// the claim, the mirror of the old row for an integer key, the new
+    /// row, and the tombstone that lets the hot version shadow the cold
+    fn apply_cold_update(
+        hot: &mut Box<dyn Table>,
+        segment_mgr: &super::manifest::SegmentManager,
+        txn_id: i64,
+        row_id: i64,
+        old_row: Row,
+        new_row: Row,
+        has_int_pk: bool,
+    ) -> Result<()> {
+        // Claim the cold row to prevent concurrent lost updates.
+        hot.try_claim_row(row_id)?;
+        // Insert the NEW row into hot. For int PK tables, first mirror the
+        // old row (so UPDATE can find it), then update. If any step fails,
+        // clean up to avoid phantoms.
+        if has_int_pk {
+            match hot.insert_discard(old_row) {
+                Ok(())
+                | Err(crate::core::Error::PrimaryKeyConstraint { .. })
+                | Err(crate::core::Error::UniqueConstraint { .. }) => {}
+                Err(e) => return Err(e),
+            }
+            let mut new_row_opt = Some(new_row);
+            let update_result = hot.update_by_row_ids(&[row_id], &mut |_| {
+                Ok((new_row_opt.take().unwrap_or_default(), true))
+            });
+            if let Err(e) = update_result {
+                let _ = hot.delete_by_row_ids(&[row_id]);
+                return Err(e);
+            }
+        } else {
+            hot.insert_discard(new_row)?;
+        }
+        // Add tombstone so row_count() doesn't double-count. The hot
+        // version now shadows the cold version via skip set.
+        segment_mgr.add_pending_tombstone(txn_id, row_id);
+        Ok(())
+    }
+
     fn check_cold_unique_for_update(
         &self,
         new_row: &Row,
@@ -585,11 +689,6 @@ impl SegmentedTable {
                 Ok(())
             })?;
         Ok(indexes)
-    }
-
-    fn check_segment_constraints(&self, row: &Row) -> Result<()> {
-        let snapshot = self.segment_mgr.cold_snapshot();
-        self.check_segment_constraints_with_snapshot(&snapshot, row, None)
     }
 
     fn check_segment_constraints_with_snapshot(
@@ -1035,7 +1134,7 @@ impl SegmentedTable {
                         &mut candidates,
                     )
                     .is_some();
-                let mut reader = super::writer::RowReader::new(Arc::clone(&cs.volume));
+                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
                 let mut next_row = {
                     let mut pos = 0usize;
                     let mut plain = start;
@@ -1401,34 +1500,30 @@ impl Table for SegmentedTable {
     // =========================================================================
 
     fn insert(&mut self, row: Row) -> Result<Row> {
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        if self.segment_mgr.has_segments() {
-            self.check_segment_constraints(&row)?;
-        }
+        let (_seal_guard, checked) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
+            self.check_segment_constraints_with_snapshot(snapshot, &row, None)
+        })?;
         let result = self.hot.insert(row)?;
-        if self.segment_mgr.has_segments() {
+        if checked.is_some() {
             self.segment_mgr.record_txn_seal_generation(self.txn_id());
         }
         Ok(result)
     }
 
     fn insert_discard(&mut self, row: Row) -> Result<()> {
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        if self.segment_mgr.has_segments() {
-            self.check_segment_constraints(&row)?;
-        }
+        let (_seal_guard, checked) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
+            self.check_segment_constraints_with_snapshot(snapshot, &row, None)
+        })?;
         self.hot.insert_discard(row)?;
-        if self.segment_mgr.has_segments() {
+        if checked.is_some() {
             self.segment_mgr.record_txn_seal_generation(self.txn_id());
         }
         Ok(())
     }
 
     fn insert_batch(&mut self, rows: Vec<Row>) -> Result<()> {
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        if self.segment_mgr.has_segments() {
+        let (_seal_guard, checked) = Self::fence_after_cold_check(&self.segment_mgr, |snapshot| {
             // Snapshot once for the entire batch — eliminates 3 lock reads per row.
-            let snapshot = self.segment_mgr.cold_snapshot();
             let unique_indexes = if rows.len() > 1 && self.hot.has_unique_non_pk_indexes() {
                 Some(self.cold_unique_indexes()?)
             } else {
@@ -1436,14 +1531,15 @@ impl Table for SegmentedTable {
             };
             for row in &rows {
                 self.check_segment_constraints_with_snapshot(
-                    &snapshot,
+                    snapshot,
                     row,
                     unique_indexes.as_deref(),
                 )?;
             }
-        }
+            Ok(())
+        })?;
         self.hot.insert_batch(rows)?;
-        if self.segment_mgr.has_segments() {
+        if checked.is_some() {
             self.segment_mgr.record_txn_seal_generation(self.txn_id());
         }
         Ok(())
@@ -1461,134 +1557,97 @@ impl Table for SegmentedTable {
         {
             return self.update_by_row_ids(&[pk], setter);
         }
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        // Capture a verified all-warm segment snapshot BEFORE mutating the
-        // hot buffer and use it for the entire statement: eviction CoWs
-        // new maps and new volume Arcs, so this snapshot's volumes keep
-        // their column data for the statement's duration and no
-        // mid-statement reload (or reload failure) is possible.
-        let cold_snapshot = if self.segment_mgr.has_segments() {
-            Some(self.segment_mgr.statement_snapshot()?)
-        } else {
-            None
-        };
-        let stmt_tombstones = cold_snapshot.as_ref().map(|s| Arc::clone(&s.tombstones));
-        let mut count = self.hot.update(where_expr, setter)?;
-
-        // Update matching segment rows from the statement snapshot
-        // (zone-map pruning still applies; volumes are already warm).
-        let volumes = match &cold_snapshot {
-            Some(snap) => snap.volumes_newest_first(),
-            None => Vec::new(),
-        };
         let has_int_pk = self
             .hot
             .schema()
             .columns
             .iter()
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
-
-        let tombstones_arc = stmt_tombstones
-            .clone()
-            .unwrap_or_else(|| self.segment_mgr.tombstone_set_arc());
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
         // Zone-map / bloom pruning from WHERE clause.
         let comparisons = where_expr
             .map(|e| e.collect_comparisons())
             .unwrap_or_default();
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
 
-        let mut unique_indexes = None;
-        for (seg_id, cs) in volumes.iter() {
-            let vol = &cs.volume;
-
-            // Prune volume by zone maps and bloom filters.
-            let (should_skip, _, _) =
-                Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
-            if should_skip {
-                continue;
-            }
-
-            // Load cold volume on demand after pruning.
-            let loaded;
-            let vol = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
-                    Some(v) => v,
-                    None => continue,
+        let txn_id = self.txn_id();
+        // The cold rows the statement changes are read, filtered, set and
+        // checked outside the fence; only the hot moves happen under it
+        let (_seal_guard, prepared) = Self::fence_after_prepare(&self.segment_mgr, |snap| {
+            let tombstones_arc = Arc::clone(&snap.tombstones);
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+            let mut unique_indexes = None;
+            let mut changes: Vec<(i64, Row, Row)> = Vec::new();
+            for (seg_id, cs) in snap.volumes_newest_first().iter() {
+                let vol = &cs.volume;
+                // Prune volume by zone maps and bloom filters.
+                let (should_skip, _, _) =
+                    Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
+                if should_skip {
+                    continue;
+                }
+                // Load cold volume on demand after pruning.
+                let loaded;
+                let vol = if vol.is_cold() {
+                    loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    &loaded
+                } else {
+                    vol.mark_accessed();
+                    vol
                 };
-                &loaded
-            } else {
-                vol.mark_accessed();
-                vol
-            };
-
-            let mapping = cs.mapping.clone();
-            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
-
-            for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
-                if !cs.is_visible(i) {
-                    continue;
-                }
-                if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
-                    continue;
-                }
-                let row = reader.row(i, &mapping)?;
-                if let Some(expr) = where_expr {
-                    if !expr.evaluate_fast(&row) {
+                let mapping = cs.mapping.clone();
+                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+                for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
+                    if !cs.is_visible(i) {
                         continue;
                     }
-                }
-                let old_row = row.clone();
-                let (new_row, changed) = setter(row)?;
-                if changed {
-                    // Claim the cold row to prevent concurrent lost updates.
-                    self.hot.try_claim_row(row_id)?;
-
+                    if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id)
+                    {
+                        continue;
+                    }
+                    let row = reader.row(i, &mapping)?;
+                    if let Some(expr) = where_expr {
+                        if !expr.evaluate_fast(&row) {
+                            continue;
+                        }
+                    }
+                    let old_row = row.clone();
+                    let (new_row, changed) = setter(row)?;
+                    if !changed {
+                        continue;
+                    }
                     // Check unique constraints against cold segments.
                     if self.hot.has_unique_non_pk_indexes() {
                         self.check_cold_unique_for_update(
                             &new_row,
                             row_id,
-                            cold_snapshot.as_ref(),
+                            Some(snap),
                             &mut unique_indexes,
                         )?;
                     }
-
-                    // Insert the NEW row into hot. For int PK tables, first
-                    // mirror the old row (so UPDATE can find it), then update.
-                    // If any step fails, clean up to avoid phantoms.
-                    if has_int_pk {
-                        match self.hot.insert_discard(old_row) {
-                            Ok(())
-                            | Err(crate::core::Error::PrimaryKeyConstraint { .. })
-                            | Err(crate::core::Error::UniqueConstraint { .. }) => {}
-                            Err(e) => {
-                                return Err(e);
-                            }
-                        }
-                        let mut new_row_opt = Some(new_row);
-                        let update_result = self.hot.update_by_row_ids(&[row_id], &mut |_| {
-                            Ok((new_row_opt.take().unwrap_or_else(Row::new), true))
-                        });
-                        if let Err(e) = update_result {
-                            let _ = self.hot.delete_by_row_ids(&[row_id]);
-                            return Err(e);
-                        }
-                    } else {
-                        self.hot.insert_discard(new_row)?;
-                    }
-                    // Add tombstone so row_count() doesn't double-count.
-                    // The hot version now shadows the cold version via skip set.
-                    self.segment_mgr
-                        .add_pending_tombstone(self.txn_id(), row_id);
-                    count += 1;
+                    changes.push((row_id, old_row, new_row));
                 }
             }
+            Ok(changes)
+        })?;
+        let mut count = self.hot.update(where_expr, setter)?;
+        for (row_id, old_row, new_row) in prepared.unwrap_or_default() {
+            Self::apply_cold_update(
+                &mut self.hot,
+                &self.segment_mgr,
+                txn_id,
+                row_id,
+                old_row,
+                new_row,
+                has_int_pk,
+            )?;
+            count += 1;
         }
         if count > 0 {
             self.segment_mgr.record_txn_seal_generation(self.txn_id());
@@ -1601,33 +1660,25 @@ impl Table for SegmentedTable {
         row_ids: &[i64],
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
     ) -> Result<i32> {
-        let _seal_guard = self.segment_mgr.acquire_seal_read();
-        // Capture a verified all-warm segment snapshot BEFORE mutating the
-        // hot buffer and use it for the entire statement: eviction CoWs
-        // new maps and new volume Arcs, so this snapshot's volumes keep
-        // their column data for the statement's duration and no
-        // mid-statement reload (or reload failure) is possible.
-        let cold_snapshot = if self.segment_mgr.has_segments() {
-            Some(self.segment_mgr.statement_snapshot()?)
-        } else {
-            None
-        };
-        let mut count = 0i32;
-        let mut hot_ids = Vec::new();
-        let schema = self.hot.schema().clone();
-        let has_int_pk = schema
+        let has_int_pk = self
+            .hot
+            .schema()
             .columns
             .iter()
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
-
-        let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
-        let mut unique_indexes = None;
-        for &row_id in row_ids {
-            let found = match &cold_snapshot {
-                Some(snap) => self.find_segment_row_in(snap, row_id)?,
-                None => None,
-            };
-            if let Some((_seg_id, cs, idx)) = found {
+        let txn_id = self.txn_id();
+        // The cold rows named are read, set and checked outside the fence;
+        // the ids not in cold are the hot store's
+        let (_seal_guard, prepared) = Self::fence_after_prepare(&self.segment_mgr, |snap| {
+            let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
+            let mut unique_indexes = None;
+            let mut changes: Vec<(i64, Row, Row)> = Vec::new();
+            let mut hot_ids = Vec::new();
+            for &row_id in row_ids {
+                let Some((_seg_id, cs, idx)) = self.find_segment_row_in(snap, row_id)? else {
+                    hot_ids.push(row_id);
+                    continue;
+                };
                 // One reader per volume for the statement: the groups it
                 // reads stay held across the rows; mapping from the SAME
                 // snapshot segment
@@ -1647,47 +1698,34 @@ impl Table for SegmentedTable {
                 let row = reader.row(idx, mapping)?;
                 let old_row = row.clone();
                 let (new_row, changed) = setter(row)?;
-                if changed {
-                    // Claim the cold row to prevent concurrent lost updates.
-                    self.hot.try_claim_row(row_id)?;
-                    if self.hot.has_unique_non_pk_indexes() {
-                        self.check_cold_unique_for_update(
-                            &new_row,
-                            row_id,
-                            cold_snapshot.as_ref(),
-                            &mut unique_indexes,
-                        )?;
-                    }
-                    let result = if has_int_pk {
-                        let insert_ok = match self.hot.insert_discard(old_row) {
-                            Ok(()) => true,
-                            Err(crate::core::Error::PrimaryKeyConstraint { .. }) => true,
-                            Err(crate::core::Error::UniqueConstraint { .. }) => true,
-                            Err(e) => return Err(e),
-                        };
-                        if insert_ok {
-                            let mut new_row_opt = Some(new_row);
-                            self.hot
-                                .update_by_row_ids(&[row_id], &mut |_| {
-                                    Ok((new_row_opt.take().unwrap_or_else(Row::new), true))
-                                })
-                                .map(|_| ())
-                        } else {
-                            Ok(())
-                        }
-                    } else {
-                        self.hot.insert_discard(new_row)
-                    };
-                    result?;
-                    // Add tombstone so row_count() doesn't double-count.
-                    // The hot version now shadows the cold version via skip set.
-                    self.segment_mgr
-                        .add_pending_tombstone(self.txn_id(), row_id);
-                    count += 1;
+                if !changed {
+                    continue;
                 }
-            } else {
-                hot_ids.push(row_id);
+                if self.hot.has_unique_non_pk_indexes() {
+                    self.check_cold_unique_for_update(
+                        &new_row,
+                        row_id,
+                        Some(snap),
+                        &mut unique_indexes,
+                    )?;
+                }
+                changes.push((row_id, old_row, new_row));
             }
+            Ok((changes, hot_ids))
+        })?;
+        let (changes, hot_ids) = prepared.unwrap_or_else(|| (Vec::new(), row_ids.to_vec()));
+        let mut count = 0i32;
+        for (row_id, old_row, new_row) in changes {
+            Self::apply_cold_update(
+                &mut self.hot,
+                &self.segment_mgr,
+                txn_id,
+                row_id,
+                old_row,
+                new_row,
+                has_int_pk,
+            )?;
+            count += 1;
         }
         if !hot_ids.is_empty() {
             // Same reasoning as update(): skip cold unique check for hot path
