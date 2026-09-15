@@ -1677,9 +1677,10 @@ impl VolumeBuilder {
     fn append_f64_cells(&mut self, col_idx: usize, idx: usize, values: &[f64], nulls: &[bool]) {
         let target = &mut self.float_cols[idx];
         let zone = &mut self.zone_maps[col_idx];
+        let stats = &mut self.stats.columns[col_idx];
         let null_col = &mut self.null_cols[col_idx];
         zone.row_count += values.len() as u32;
-        let (mut lo, mut hi, mut sum, mut count) = (f64::INFINITY, f64::NEG_INFINITY, 0f64, 0u64);
+        let (mut lo, mut hi, mut count) = (f64::INFINITY, f64::NEG_INFINITY, 0u64);
         for (&v, &is_null) in values.iter().zip(nulls) {
             null_col.push(is_null);
             if is_null {
@@ -1700,16 +1701,17 @@ impl VolumeBuilder {
             if v > hi {
                 hi = v;
             }
-            sum += v;
+            // The running sum takes each value in row order, as add_row
+            // does: a batch summed on its own can overflow where the
+            // running sum does not
+            stats.sum_float += v;
             count += 1;
         }
         if count == 0 {
             return;
         }
-        let stats = &mut self.stats.columns[col_idx];
         stats.non_null_count += count;
         stats.numeric_count += count;
-        stats.sum_float += sum;
         let (lo_value, hi_value) = (Value::Float(lo), Value::Float(hi));
         extend_extents(&mut zone.min, &mut zone.max, &lo_value);
         extend_extents(&mut zone.min, &mut zone.max, &hi_value);
@@ -2773,6 +2775,60 @@ mod tests {
             .column("exchange", DataType::Text, false, false)
             .column("price", DataType::Float, false, false)
             .build()
+    }
+
+    #[test]
+    fn a_float_sum_runs_in_row_order_across_typed_batches() {
+        // The volume's sum is what add_row reaches row by row: minus 1e308
+        // and zeros in one batch, two 1e308 in the next. Summing the
+        // second batch on its own overflows before it joins the running sum
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("v", DataType::Float, false, false)
+            .build();
+        let mut first = vec![0.0; 4096];
+        first[0] = -1e308;
+        let second = vec![1e308, 1e308];
+        let mut by_rows = VolumeBuilder::new(&schema);
+        let mut ids = Vec::new();
+        for (i, v) in first.iter().chain(&second).enumerate() {
+            by_rows.add_row(
+                i as i64,
+                &Row::from_values(vec![Value::Integer(i as i64), Value::Float(*v)]),
+            );
+            ids.push(i as i64);
+        }
+        let mut typed = VolumeBuilder::new(&schema);
+        let nulls = vec![false; 4096];
+        for (batch_ids, values) in [(&ids[..4096], &first[..]), (&ids[4096..], &second[..])] {
+            let ints: Vec<i64> = batch_ids.to_vec();
+            typed
+                .append_typed(
+                    batch_ids,
+                    &[
+                        TypedCells::Int64 {
+                            values: &ints,
+                            nulls: &nulls[..batch_ids.len()],
+                        },
+                        TypedCells::Float64 {
+                            values,
+                            nulls: &nulls[..batch_ids.len()],
+                        },
+                    ],
+                )
+                .unwrap();
+        }
+        let (by_rows, typed) = (by_rows.finish().unwrap(), typed.finish().unwrap());
+        let (want, got) = (
+            by_rows.meta.stats.columns[1].sum_float,
+            typed.meta.stats.columns[1].sum_float,
+        );
+        assert!(want.is_finite());
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "typed sum {got}, by rows {want}"
+        );
     }
 
     #[test]
