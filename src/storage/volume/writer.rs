@@ -53,16 +53,19 @@ use super::stats::VolumeAggregateStats;
 /// the process, so a volume reloaded into a new store shares the file
 /// with the readers still holding the old one
 pub struct VolumeFile {
+    id: u64,
     path: parking_lot::RwLock<std::path::PathBuf>,
     retired: std::sync::atomic::AtomicBool,
 }
 
+static NEXT_FILE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// The files of the process by path, and where a file whose last holder
-/// is letting go was moved meanwhile
+/// is letting go is now, by the file's id
 #[derive(Default)]
 struct VolumeFiles {
-    files: std::collections::HashMap<std::path::PathBuf, std::sync::Weak<VolumeFile>>,
-    forwarded: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+    files: std::collections::HashMap<std::path::PathBuf, (u64, std::sync::Weak<VolumeFile>)>,
+    letting_go: std::collections::HashMap<u64, std::path::PathBuf>,
 }
 
 static VOLUME_FILES: std::sync::LazyLock<parking_lot::Mutex<VolumeFiles>> =
@@ -72,16 +75,21 @@ impl VolumeFile {
     /// The handle of the file at `path`, the one every holder shares
     pub fn shared(path: &std::path::Path) -> Arc<VolumeFile> {
         let mut registry = VOLUME_FILES.lock();
-        if let Some(file) = registry.files.get(path).and_then(std::sync::Weak::upgrade) {
+        if let Some(file) = registry
+            .files
+            .get(path)
+            .and_then(|(_, file)| file.upgrade())
+        {
             return file;
         }
         let file = Arc::new(VolumeFile {
+            id: NEXT_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             path: parking_lot::RwLock::new(path.to_path_buf()),
             retired: std::sync::atomic::AtomicBool::new(false),
         });
         registry
             .files
-            .insert(path.to_path_buf(), Arc::downgrade(&file));
+            .insert(path.to_path_buf(), (file.id, Arc::downgrade(&file)));
         file
     }
 
@@ -117,8 +125,8 @@ impl VolumeFile {
     }
 
     /// The move under the registry lock; a file whose last holder is
-    /// letting go, its drop waiting on the lock, moves too and is
-    /// forwarded so that drop removes it at its new place
+    /// letting go, its drop waiting on the lock, moves too, its place
+    /// kept by id so that drop removes it where it is
     fn relocate_in(
         registry: &mut VolumeFiles,
         old_dir: &std::path::Path,
@@ -126,14 +134,14 @@ impl VolumeFile {
         move_dir: impl FnOnce() -> std::io::Result<()>,
     ) -> (std::io::Result<()>, Vec<Arc<VolumeFile>>) {
         let mut moved: Vec<(std::path::PathBuf, Arc<VolumeFile>)> = Vec::new();
-        let mut letting_go: Vec<std::path::PathBuf> = Vec::new();
-        for (path, file) in registry.files.iter() {
+        let mut letting_go: Vec<(std::path::PathBuf, u64)> = Vec::new();
+        for (path, (id, file)) in registry.files.iter() {
             if !path.starts_with(old_dir) {
                 continue;
             }
             match file.upgrade() {
                 Some(file) => moved.push((path.clone(), file)),
-                None => letting_go.push(path.clone()),
+                None => letting_go.push((path.clone(), *id)),
             }
         }
         let mut paths: Vec<_> = moved.iter().map(|(_, file)| file.path.write()).collect();
@@ -147,18 +155,18 @@ impl VolumeFile {
                 registry.files.remove(old_path);
                 registry
                     .files
-                    .insert(new_path.clone(), Arc::downgrade(file));
+                    .insert(new_path.clone(), (file.id, Arc::downgrade(file)));
                 **path = new_path;
             }
-            for old_path in letting_go {
+            for (old_path, id) in letting_go {
                 let Ok(rest) = old_path.strip_prefix(old_dir) else {
                     continue;
                 };
                 let new_path = new_dir.join(rest);
-                if let Some(weak) = registry.files.remove(&old_path) {
-                    registry.files.insert(new_path.clone(), weak);
+                if let Some(entry) = registry.files.remove(&old_path) {
+                    registry.files.insert(new_path.clone(), entry);
                 }
-                registry.forwarded.insert(old_path, new_path);
+                registry.letting_go.insert(id, new_path);
             }
         }
         drop(paths);
@@ -168,16 +176,16 @@ impl VolumeFile {
 
 impl Drop for VolumeFile {
     fn drop(&mut self) {
-        let mut path = self.path.get_mut().clone();
         // The file goes under the registry lock, which a move holds too
         let mut registry = VOLUME_FILES.lock();
-        while let Some(moved_to) = registry.forwarded.remove(&path) {
-            path = moved_to;
-        }
+        let path = registry
+            .letting_go
+            .remove(&self.id)
+            .unwrap_or_else(|| self.path.get_mut().clone());
         if registry
             .files
             .get(&path)
-            .is_some_and(|file| file.strong_count() == 0)
+            .is_some_and(|(_, file)| file.strong_count() == 0)
         {
             registry.files.remove(&path);
         }
@@ -3537,20 +3545,32 @@ mod tests {
         std::fs::write(old_dir.join("v.vol"), b"x").unwrap();
         let file = VolumeFile::shared(&old_dir.join("v.vol"));
         file.retire();
-        // The move holds the registry; the last holder lets go meanwhile,
+        let gone = Arc::downgrade(&file);
+        // The moves hold the registry; the last holder lets go meanwhile,
         // its drop waiting on the lock
         let mut registry = VOLUME_FILES.lock();
         let letting_go = std::thread::spawn(move || drop(file));
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        let (result, held) = VolumeFile::relocate_in(&mut registry, &old_dir, &new_dir, || {
-            std::fs::rename(&old_dir, &new_dir)
-        });
-        result.unwrap();
-        assert!(held.is_empty());
+        while gone.strong_count() > 0 {
+            std::thread::yield_now();
+        }
+        // There, back, and there again: the same names twice over
+        for (from, to) in [
+            (&old_dir, &new_dir),
+            (&new_dir, &old_dir),
+            (&old_dir, &new_dir),
+        ] {
+            let (result, held) =
+                VolumeFile::relocate_in(&mut registry, from, to, || std::fs::rename(from, to));
+            result.unwrap();
+            assert!(held.is_empty());
+        }
         drop(registry);
         letting_go.join().unwrap();
         assert!(!new_dir.join("v.vol").exists());
-        assert!(VOLUME_FILES.lock().forwarded.is_empty());
+        assert!(!old_dir.exists());
+        let registry = VOLUME_FILES.lock();
+        assert!(registry.letting_go.is_empty());
+        assert!(!registry.files.contains_key(&new_dir.join("v.vol")));
     }
 
     #[test]
