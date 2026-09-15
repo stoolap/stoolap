@@ -66,4 +66,5 @@ pub mod scanner;
 pub mod seal;
 pub mod stats;
 pub mod table;
+pub mod transfer;
 pub mod writer;
