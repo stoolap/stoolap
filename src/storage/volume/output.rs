@@ -36,6 +36,7 @@ use crate::core::{Error, Result, Schema};
 
 use super::column::ROW_GROUP_SIZE;
 use super::format::{serialize_typed_block, serialize_volume_metadata_parts};
+use super::transfer::TypedSink;
 use super::writer::{CompressedBlockStore, FrozenVolume, LazyColumns, TypedCells, VolumeBuilder};
 
 /// Bytes copied at a time when the final file is assembled
@@ -65,6 +66,25 @@ pub struct VolumeFileWriter {
     index: Vec<Vec<(u64, usize, usize)>>,
     packed: Vec<u8>,
     finished: bool,
+    /// The unique column sets indexed as the rows pass
+    unique: Vec<UniqueIndexing>,
+}
+
+/// One unique column set and its (hash, row) entries, hashed as the
+/// lookup hashes its values
+struct UniqueIndexing {
+    columns: Vec<usize>,
+    entries: Vec<(u64, u32)>,
+}
+
+impl TypedSink for VolumeFileWriter {
+    fn intern_text(&mut self, col_idx: usize, text: &str) -> Result<u32> {
+        self.builder()?.intern_text(col_idx, text)
+    }
+
+    fn append_typed(&mut self, row_ids: &[i64], columns: &[TypedCells<'_>]) -> Result<()> {
+        VolumeFileWriter::append_typed(self, row_ids, columns)
+    }
 }
 
 impl VolumeFileWriter {
@@ -103,7 +123,21 @@ impl VolumeFileWriter {
             block_pos: 0,
             packed: Vec::new(),
             finished: false,
+            unique: Vec::new(),
         })
+    }
+
+    /// Index these column sets for unique lookups as the rows pass, so
+    /// the volume is published with its indexes built and the first
+    /// INSERT after it reads no column whole
+    pub fn index_unique_sets(&mut self, sets: Vec<Vec<usize>>) {
+        self.unique = sets
+            .into_iter()
+            .map(|columns| UniqueIndexing {
+                columns,
+                entries: Vec::new(),
+            })
+            .collect();
     }
 
     /// Accept rows in the order the producer chose; see
@@ -134,6 +168,9 @@ impl VolumeFileWriter {
     /// crosses a group boundary is split there, so every group but the
     /// last holds exactly `ROW_GROUP_SIZE` rows
     pub fn append_typed(&mut self, row_ids: &[i64], columns: &[TypedCells<'_>]) -> Result<()> {
+        if !self.unique.is_empty() {
+            self.hash_unique(columns)?;
+        }
         let mut start = 0;
         while start < row_ids.len() {
             let builder = self.builder()?;
@@ -152,6 +189,91 @@ impl VolumeFileWriter {
                 self.flush_group()?;
             }
             start = end;
+        }
+        Ok(())
+    }
+
+    /// Hashes every row's cells of each unique column set the way
+    /// `unique_lookup_all` hashes its values; a row with a null in the
+    /// set is left out, as the index built over columns leaves it out
+    fn hash_unique(&mut self, columns: &[TypedCells<'_>]) -> Result<()> {
+        use std::hash::{Hash, Hasher};
+        let first = self.rows() as u32;
+        let rows = columns.first().map_or(0, TypedCells::len);
+        let builder = self
+            .builder
+            .as_ref()
+            .ok_or_else(|| Error::internal("volume writer already finished"))?;
+        for UniqueIndexing {
+            columns: set,
+            entries,
+        } in &mut self.unique
+        {
+            'rows: for row in 0..rows {
+                let mut hasher = ahash::AHasher::default();
+                for &col in set.iter() {
+                    let cells = columns
+                        .get(col)
+                        .ok_or_else(|| Error::internal("unique column beyond the batch"))?;
+                    let value = match cells {
+                        TypedCells::Int64 { values, nulls } => {
+                            if nulls[row] {
+                                continue 'rows;
+                            }
+                            crate::core::Value::Integer(values[row])
+                        }
+                        TypedCells::Float64 { values, nulls } => {
+                            if nulls[row] {
+                                continue 'rows;
+                            }
+                            crate::core::Value::Float(values[row])
+                        }
+                        TypedCells::TimestampNanos { values, nulls } => {
+                            if nulls[row] {
+                                continue 'rows;
+                            }
+                            super::writer::timestamp_value(values[row])
+                        }
+                        TypedCells::Boolean { values, nulls } => {
+                            if nulls[row] {
+                                continue 'rows;
+                            }
+                            crate::core::Value::Boolean(values[row])
+                        }
+                        TypedCells::Dictionary { ids, nulls } => {
+                            if nulls[row] {
+                                continue 'rows;
+                            }
+                            let text = builder
+                                .dictionary(col)
+                                .and_then(|dict| dict.get(ids[row] as usize))
+                                .ok_or_else(|| {
+                                    Error::internal("dictionary id beyond the dictionary")
+                                })?;
+                            crate::core::Value::Text(text.clone())
+                        }
+                        TypedCells::Bytes {
+                            data,
+                            offsets,
+                            nulls,
+                        } => {
+                            if nulls[row] {
+                                continue 'rows;
+                            }
+                            let (offset, length) = offsets[row];
+                            let (_, ext_tag) = builder.column_kind(col);
+                            let mut tagged = Vec::with_capacity(1 + length as usize);
+                            tagged.push(ext_tag);
+                            tagged.extend_from_slice(
+                                &data[offset as usize..(offset + length) as usize],
+                            );
+                            crate::core::Value::Extension(crate::common::CompactArc::from(tagged))
+                        }
+                    };
+                    value.hash(&mut hasher);
+                }
+                entries.push((hasher.finish(), first + row as u32));
+            }
         }
         Ok(())
     }
@@ -308,7 +430,7 @@ impl VolumeFileWriter {
     /// written: the block offsets follow from the lengths as the reader
     /// computes them
     fn publish(
-        &self,
+        &mut self,
         kinds: &[(u8, u8)],
         dict_tables: &[Vec<crate::common::SmartString>],
         meta: super::writer::VolumeMeta,
@@ -365,10 +487,19 @@ impl VolumeFileWriter {
             ROW_GROUP_SIZE,
             meta.row_count,
         );
+        let mut unique_indices = rustc_hash::FxHashMap::default();
+        for UniqueIndexing {
+            columns,
+            mut entries,
+        } in std::mem::take(&mut self.unique)
+        {
+            entries.sort_unstable_by_key(|&(h, _)| h);
+            unique_indices.insert(columns, Arc::new(entries));
+        }
         Ok(FrozenVolume {
             columns: LazyColumns::deferred(store, column_types),
             meta: Arc::new(meta),
-            unique_indices: Arc::new(parking_lot::RwLock::new(rustc_hash::FxHashMap::default())),
+            unique_indices: Arc::new(parking_lot::RwLock::new(unique_indices)),
             last_access_epoch: std::sync::atomic::AtomicU64::new(
                 super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
             ),

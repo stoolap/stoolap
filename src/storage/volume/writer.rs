@@ -1881,7 +1881,7 @@ fn group_zone_map(
 
 /// The timestamp value `nanos` decodes to, as `ColumnData::get_value` reads
 /// it; null when the nanos fall outside the calendar
-fn timestamp_value(nanos: i64) -> Value {
+pub(crate) fn timestamp_value(nanos: i64) -> Value {
     let secs = nanos.div_euclid(1_000_000_000);
     let sub_nanos = nanos.rem_euclid(1_000_000_000) as u32;
     match chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, sub_nanos) {
@@ -2018,6 +2018,14 @@ impl VolumeBuilder {
     /// Rows added so far
     pub fn row_count(&self) -> usize {
         self.row_count
+    }
+
+    /// A text column's dictionary so far; None for another column
+    pub fn dictionary(&self, col_idx: usize) -> Option<&[SmartString]> {
+        match self.col_storage.get(col_idx) {
+            Some(StorageKind::Dictionary(idx)) => Some(&self.dict_tables[*idx]),
+            _ => None,
+        }
     }
 
     /// Rows in the accumulators, not yet flushed
@@ -3305,7 +3313,7 @@ impl FrozenVolume {
             }
             let mut matches = true;
             for (&ci, &val) in col_indices.iter().zip(values) {
-                let vol_val = self.columns.get(ci)?.get_value(row_idx as usize);
+                let vol_val = self.cell(ci, row_idx as usize)?;
                 if vol_val.is_null() || vol_val != *val {
                     matches = false;
                     break;
@@ -3317,6 +3325,20 @@ impl FrozenVolume {
         }
 
         Ok(())
+    }
+
+    /// One cell, read from the column already decoded or from the row's
+    /// group through the decoded group cache, never by decoding the
+    /// column whole
+    pub fn cell(&self, col_idx: usize, row_idx: usize) -> std::io::Result<Value> {
+        if let Some(column) = self.columns.resident(col_idx) {
+            return Ok(column.get_value(row_idx));
+        }
+        let store = self.columns.compressed_store().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
+        })?;
+        let group = store.group_column(col_idx, row_idx / ROW_GROUP_SIZE)?;
+        Ok(group.get_value(row_idx % ROW_GROUP_SIZE))
     }
 
     /// Pre-build the unique sorted index for a set of column indices.
