@@ -28,13 +28,13 @@ use super::format::{deserialize_volume_metadata, serialize_volume_metadata};
 use super::writer::{CompressedBlockStore, FrozenVolume, LazyColumns};
 
 /// Volume file extension
-const VOLUME_EXT: &str = "vol";
+pub(crate) const VOLUME_EXT: &str = "vol";
 
 /// Magic bytes for V4 per-column per-group compressed format.
-const V4_MAGIC: [u8; 4] = *b"STV4";
+pub(crate) const V4_MAGIC: [u8; 4] = *b"STV4";
 
 /// V4 format version. Bump when the metadata or block layout changes.
-const V4_VERSION: u32 = 1;
+pub(crate) const V4_VERSION: u32 = 1;
 
 /// Volume catalog filename
 const CATALOG_FILE: &str = "volumes.catalog";
@@ -326,29 +326,40 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     let col_data_types = meta.column_types.clone();
     let group_size = ROW_GROUP_SIZE;
 
-    // 5. Read compressed blocks into CompressedBlockStore (deferred mode).
-    //    Blocks stay compressed in RAM. Decompression happens on first scan
-    //    via the group cache path (~4 GB/s from RAM, ~1ms per column per group).
-    //    Each block is read into a buffer then moved into the store.
-    let mut all_blocks: Vec<Vec<Vec<u8>>> = Vec::with_capacity(col_count);
+    // 5. The blocks stay in the file: their offsets follow from the index
+    //    (column-major, as written), and the rest of the file passes
+    //    through the hasher in a small buffer so the whole-file CRC is
+    //    verified without holding a block. A group is read by position
+    //    when it is decoded
+    let blocks_start = 20 + meta_len + index_len;
+    let mut all_offsets: Vec<Vec<u64>> = Vec::with_capacity(col_count);
+    let mut all_comp_lens: Vec<Vec<usize>> = Vec::with_capacity(col_count);
     let mut all_decomp_lens: Vec<Vec<usize>> = Vec::with_capacity(col_count);
     let mut block_idx = 0usize;
-
+    let mut position = blocks_start as u64;
     for _col_idx in 0..col_count {
-        let mut col_blocks = Vec::with_capacity(num_groups);
+        let mut col_offsets = Vec::with_capacity(num_groups);
+        let mut col_comp = Vec::with_capacity(num_groups);
         let mut col_lens = Vec::with_capacity(num_groups);
         for _gi in 0..num_groups {
-            let comp_len = compressed_lens[block_idx];
-            let decomp_len = decompressed_lens_flat[block_idx];
-            let mut block = vec![0u8; comp_len];
-            crc_read!(&mut block);
+            col_offsets.push(position);
+            col_comp.push(compressed_lens[block_idx]);
+            col_lens.push(decompressed_lens_flat[block_idx]);
+            position += compressed_lens[block_idx] as u64;
             block_idx += 1;
-            col_blocks.push(block);
-            col_lens.push(decomp_len);
         }
-        all_blocks.push(col_blocks);
+        all_offsets.push(col_offsets);
+        all_comp_lens.push(col_comp);
         all_decomp_lens.push(col_lens);
     }
+    let mut left = file_len - 24 - meta_len - index_len;
+    let mut chunk = vec![0u8; (1 << 20).min(left.max(1))];
+    while left > 0 {
+        let take = chunk.len().min(left);
+        crc_read!(&mut chunk[..take]);
+        left -= take;
+    }
+    drop(chunk);
 
     // 6. Verify CRC32 (computed incrementally over everything we read)
     let mut crc_buf = [0u8; 4];
@@ -359,11 +370,12 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     if hasher.finalize() != stored_crc {
         return Err(inv("CRC mismatch"));
     }
+    let file = Arc::new(reader.into_inner());
 
-    // 7. Build CompressedBlockStore + deferred LazyColumns.
-    //    Columns start cold (compressed in RAM). First scan decompresses
-    //    per-group on demand. After all columns are accessed, is_eager flips
-    //    to true (automatic hot promotion).
+    // 7. Build the file-backed CompressedBlockStore + deferred LazyColumns.
+    //    Columns start in the file. First scan decodes per group on
+    //    demand. After all columns are accessed, is_eager flips to true
+    //    (automatic hot promotion).
     let dict_ranges: Vec<(usize, usize, usize)> = {
         let mut ranges = Vec::new();
         let mut offset = 0usize;
@@ -376,8 +388,10 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
         }
         ranges
     };
-    let store = CompressedBlockStore::from_raw_blocks(
-        all_blocks,
+    let store = CompressedBlockStore::from_file(
+        file,
+        all_offsets,
+        all_comp_lens,
         all_decomp_lens,
         meta.col_type_tags.clone(),
         meta.column_types.clone(),

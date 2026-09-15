@@ -483,6 +483,68 @@ fn read_value(data: &[u8], pos: &mut usize) -> io::Result<Value> {
 
 /// Serialize a single column's row range [start, end) to raw bytes.
 /// For Dictionary columns, only nulls+ids are written (dictionary stored separately).
+/// One block from typed cells, the encoding `serialize_column_block` gives
+/// the same cells inside a column
+pub(crate) fn serialize_typed_block(cells: &super::writer::TypedCells<'_>) -> Vec<u8> {
+    use super::writer::TypedCells;
+    let count = cells.len();
+    let mut buf = Vec::with_capacity(match cells {
+        TypedCells::Int64 { .. } | TypedCells::TimestampNanos { .. } => count * 9,
+        TypedCells::Float64 { .. } => count * 9,
+        TypedCells::Boolean { .. } => count * 2,
+        TypedCells::Dictionary { .. } => count * 5,
+        TypedCells::Bytes { .. } => count * 17,
+    });
+    match cells {
+        TypedCells::Int64 { values, nulls } | TypedCells::TimestampNanos { values, nulls } => {
+            write_nulls(&mut buf, nulls).unwrap();
+            write_i64_bulk(&mut buf, values);
+        }
+        TypedCells::Float64 { values, nulls } => {
+            write_nulls(&mut buf, nulls).unwrap();
+            write_f64_bulk(&mut buf, values);
+        }
+        TypedCells::Boolean { values, nulls } => {
+            write_nulls(&mut buf, nulls).unwrap();
+            write_bool_bulk(&mut buf, values);
+        }
+        TypedCells::Dictionary { ids, nulls } => {
+            write_nulls(&mut buf, nulls).unwrap();
+            write_u32_bulk(&mut buf, ids);
+        }
+        TypedCells::Bytes {
+            data,
+            offsets,
+            nulls,
+        } => {
+            write_nulls(&mut buf, nulls).unwrap();
+            let mut new_data = Vec::new();
+            let mut new_offsets = Vec::with_capacity(count);
+            for &(off, len) in offsets.iter() {
+                let new_off = new_data.len() as u64;
+                if len > 0 && (off as usize) < data.len() {
+                    let end_pos = ((off + len) as usize).min(data.len());
+                    let actual_len = (end_pos - off as usize) as u64;
+                    new_data.extend_from_slice(&data[off as usize..end_pos]);
+                    new_offsets.push((new_off, actual_len));
+                } else {
+                    new_offsets.push((new_off, 0));
+                }
+            }
+            buf.write_all(&(new_offsets.len() as u64).to_le_bytes())
+                .unwrap();
+            for (off, len) in &new_offsets {
+                buf.write_all(&off.to_le_bytes()).unwrap();
+                buf.write_all(&len.to_le_bytes()).unwrap();
+            }
+            buf.write_all(&(new_data.len() as u64).to_le_bytes())
+                .unwrap();
+            buf.write_all(&new_data).unwrap();
+        }
+    }
+    buf
+}
+
 pub(crate) fn serialize_column_block(col: &ColumnData, start: usize, end: usize) -> Vec<u8> {
     let count = end - start;
     let estimated = match col {
@@ -1040,37 +1102,46 @@ pub(crate) struct VolumeMetadata {
 /// The caller LZ4-compresses the result before writing to disk.
 pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8>> {
     let col_count = vol.columns.len();
-    let row_ids = vol.row_ids()?;
+    let mut kinds = Vec::with_capacity(col_count);
+    let mut dictionaries: Vec<&[SmartString]> = Vec::new();
+    for i in 0..col_count {
+        let col = vol.columns.get(i)?;
+        kinds.push(match col {
+            ColumnData::Int64 { .. } => (COL_INT64, 0),
+            ColumnData::Float64 { .. } => (COL_FLOAT64, 0),
+            ColumnData::TimestampNanos { .. } => (COL_TIMESTAMP, 0),
+            ColumnData::Boolean { .. } => (COL_BOOLEAN, 0),
+            ColumnData::Dictionary { .. } => (COL_DICTIONARY, 0),
+            ColumnData::Bytes { ext_type, .. } => (COL_BYTES, *ext_type as u8),
+        });
+        if let ColumnData::Dictionary { dictionary, .. } = col {
+            dictionaries.push(dictionary);
+        }
+    }
+    serialize_volume_metadata_parts(&vol.meta, &kinds, &dictionaries)
+}
+
+/// The metadata section from its parts, for a producer that has no
+/// decoded columns: `kinds` is every column's (storage type tag, extension
+/// type tag), `dictionaries` the text columns' dictionaries in column order
+pub(crate) fn serialize_volume_metadata_parts(
+    meta: &super::writer::VolumeMeta,
+    kinds: &[(u8, u8)],
+    dictionaries: &[&[SmartString]],
+) -> io::Result<Vec<u8>> {
+    let col_count = kinds.len();
+    let row_ids = &meta.row_ids;
     let estimated = 12 + col_count * 6 + row_ids.len() * 8 + col_count * 40;
     let mut buf = Vec::with_capacity(estimated);
 
     // Row count + col count
-    buf.write_all(&(vol.meta.row_count as u64).to_le_bytes())?;
+    buf.write_all(&(meta.row_count as u64).to_le_bytes())?;
     buf.write_all(&(col_count as u32).to_le_bytes())?;
-
-    // Build shared dict from Dictionary columns
-    let mut shared_dict: Vec<SmartString> = Vec::new();
-    let mut dict_counts: Vec<u32> = Vec::new();
-    for i in 0..col_count {
-        if let ColumnData::Dictionary { dictionary, .. } = vol.columns.get(i)? {
-            dict_counts.push(dictionary.len() as u32);
-            shared_dict.extend(dictionary.iter().cloned());
-        }
-    }
 
     // Column directory: type(1) + flags(1) + extra(4) per column
     let mut dict_col_idx = 0usize;
-    for i in 0..col_count {
-        let col = vol.columns.get(i)?;
-        let type_tag = match col {
-            ColumnData::Int64 { .. } => COL_INT64,
-            ColumnData::Float64 { .. } => COL_FLOAT64,
-            ColumnData::TimestampNanos { .. } => COL_TIMESTAMP,
-            ColumnData::Boolean { .. } => COL_BOOLEAN,
-            ColumnData::Dictionary { .. } => COL_DICTIONARY,
-            ColumnData::Bytes { .. } => COL_BYTES,
-        };
-        let sorted_flag = if vol.meta.sorted_columns[i] {
+    for (i, &(type_tag, ext_tag)) in kinds.iter().enumerate() {
+        let sorted_flag = if meta.sorted_columns[i] {
             FLAG_SORTED
         } else {
             0
@@ -1078,22 +1149,25 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
         buf.push(type_tag);
         buf.push(sorted_flag);
         if type_tag == COL_DICTIONARY {
-            buf.write_all(&dict_counts[dict_col_idx].to_le_bytes())?;
+            let dictionary = dictionaries.get(dict_col_idx).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "text column without a dictionary",
+                )
+            })?;
+            buf.write_all(&(dictionary.len() as u32).to_le_bytes())?;
             dict_col_idx += 1;
         } else if type_tag == COL_BYTES {
-            let ext = match col {
-                ColumnData::Bytes { ext_type, .. } => *ext_type as u32,
-                _ => 0,
-            };
-            buf.write_all(&ext.to_le_bytes())?;
+            buf.write_all(&(ext_tag as u32).to_le_bytes())?;
         } else {
             buf.write_all(&[0u8; 4])?;
         }
     }
 
     // Shared dictionary
-    buf.write_all(&(shared_dict.len() as u32).to_le_bytes())?;
-    for s in &shared_dict {
+    let shared_len: usize = dictionaries.iter().map(|d| d.len()).sum();
+    buf.write_all(&(shared_len as u32).to_le_bytes())?;
+    for s in dictionaries.iter().flat_map(|d| d.iter()) {
         let bytes = s.as_bytes();
         buf.write_all(&(bytes.len() as u32).to_le_bytes())?;
         buf.write_all(bytes)?;
@@ -1103,7 +1177,7 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     write_i64_bulk(&mut buf, row_ids);
 
     // Zone maps
-    for zm in &vol.meta.zone_maps {
+    for zm in &meta.zone_maps {
         write_value(&mut buf, &zm.min)?;
         write_value(&mut buf, &zm.max)?;
         buf.write_all(&zm.null_count.to_le_bytes())?;
@@ -1111,8 +1185,8 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     }
 
     // Bloom filters
-    buf.write_all(&(vol.meta.bloom_filters.len() as u32).to_le_bytes())?;
-    for bf in &vol.meta.bloom_filters {
+    buf.write_all(&(meta.bloom_filters.len() as u32).to_le_bytes())?;
+    for bf in &meta.bloom_filters {
         buf.write_all(&(bf.num_bits() as u64).to_le_bytes())?;
         let data_bytes = bf.bits_as_bytes();
         buf.write_all(&(data_bytes.len() as u32).to_le_bytes())?;
@@ -1120,10 +1194,10 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     }
 
     // Stats
-    buf.write_all(&vol.meta.stats.total_rows.to_le_bytes())?;
-    buf.write_all(&vol.meta.stats.live_rows.to_le_bytes())?;
-    buf.write_all(&(vol.meta.stats.columns.len() as u32).to_le_bytes())?;
-    for cs in &vol.meta.stats.columns {
+    buf.write_all(&meta.stats.total_rows.to_le_bytes())?;
+    buf.write_all(&meta.stats.live_rows.to_le_bytes())?;
+    buf.write_all(&(meta.stats.columns.len() as u32).to_le_bytes())?;
+    for cs in &meta.stats.columns {
         buf.write_all(&cs.sum_int.to_le_bytes())?;
         buf.write_all(&cs.sum_float.to_le_bytes())?;
         buf.write_all(&cs.numeric_count.to_le_bytes())?;
@@ -1133,20 +1207,20 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
     }
 
     // Column names
-    for name in &vol.meta.column_names {
+    for name in &meta.column_names {
         let bytes = name.as_bytes();
         buf.write_all(&(bytes.len() as u32).to_le_bytes())?;
         buf.write_all(bytes)?;
     }
 
     // Column types
-    for dt in &vol.meta.column_types {
+    for dt in &meta.column_types {
         buf.push(*dt as u8);
     }
 
     // Row groups
-    buf.write_all(&(vol.meta.row_groups.len() as u32).to_le_bytes())?;
-    for rg in &vol.meta.row_groups {
+    buf.write_all(&(meta.row_groups.len() as u32).to_le_bytes())?;
+    for rg in &meta.row_groups {
         buf.write_all(&rg.start_idx.to_le_bytes())?;
         buf.write_all(&rg.end_idx.to_le_bytes())?;
         for zm in &rg.zone_maps {

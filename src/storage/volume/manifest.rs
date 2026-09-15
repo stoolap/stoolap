@@ -1398,8 +1398,12 @@ impl SegmentManager {
                 let vol = &cs.volume;
                 let tier = if vol.columns.is_eager() {
                     "hot"
-                } else if vol.columns.has_compressed_store() {
-                    "warm"
+                } else if let Some(store) = vol.columns.compressed_store() {
+                    if store.is_file_backed() {
+                        "file"
+                    } else {
+                        "warm"
+                    }
                 } else {
                     "cold"
                 };
