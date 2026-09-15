@@ -1299,7 +1299,11 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
     let manager = SegmentManager::new("group_access", Some(volume_dir.clone()));
     let mut good_last_file = Vec::new();
     let mut last_path = std::path::PathBuf::new();
-    for (volume_id, start, end) in [(1, 1, 65_536), (2, 65_537, 65_537)] {
+    // The oversized volume splits into outputs of 65,536 rows, the first
+    // written whole before the corrupt one-row volume is read for the
+    // second; the one-row volume joins because the split leaves one
+    // volume less with it than without
+    for (volume_id, start, end) in [(1, 1, 131_071), (2, 131_072, 131_072)] {
         let mut builder = VolumeBuilder::new(&schema);
         for row_id in start..=end {
             builder.add_row(row_id, &Row::from_values(vec![Value::Integer(row_id); 2]));
@@ -1353,7 +1357,7 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
                 .into_iter()
                 .map(|entry| (entry.1, entry.3))
                 .collect::<std::collections::BTreeSet<_>>(),
-            [(1, 65_536), (2, 1)].into()
+            [(1, 131_071), (2, 1)].into()
         );
         assert_eq!(volume_files(&table_dir), original_files);
         let manifest = TableManifest::read_from_disk(&manifest_path).unwrap();
@@ -1375,7 +1379,7 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
     let mut tx = engine.begin_transaction().unwrap();
     assert_eq!(
         tx.get_table("group_access").unwrap().row_count().unwrap(),
-        65_537
+        131_072
     );
     tx.rollback().unwrap();
     engine.close_engine().unwrap();
