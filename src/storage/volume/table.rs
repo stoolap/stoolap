@@ -1035,6 +1035,7 @@ impl SegmentedTable {
                         &mut candidates,
                     )
                     .is_some();
+                let mut reader = super::writer::RowReader::new(Arc::clone(&cs.volume));
                 let mut next_row = {
                     let mut pos = 0usize;
                     let mut plain = start;
@@ -1078,11 +1079,7 @@ impl SegmentedTable {
                         }
                     }
 
-                    let row = if mapping.is_identity {
-                        vol.get_row(i)
-                    } else {
-                        vol.get_row_mapped(i, &mapping)
-                    }?;
+                    let row = reader.row(i, &mapping)?;
                     if let Some(expr) = where_expr {
                         if !expr.evaluate_fast(&row) {
                             continue;
@@ -1531,6 +1528,7 @@ impl Table for SegmentedTable {
             };
 
             let mapping = cs.mapping.clone();
+            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
 
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
                 if !cs.is_visible(i) {
@@ -1539,11 +1537,7 @@ impl Table for SegmentedTable {
                 if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
                     continue;
                 }
-                let row = if mapping.is_identity {
-                    vol.get_row(i)
-                } else {
-                    vol.get_row_mapped(i, &mapping)
-                }?;
+                let row = reader.row(i, &mapping)?;
                 if let Some(expr) = where_expr {
                     if !expr.evaluate_fast(&row) {
                         continue;
@@ -1626,10 +1620,7 @@ impl Table for SegmentedTable {
             .iter()
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
 
-        let mut cached_mapping: Option<(
-            *const super::writer::FrozenVolume,
-            super::writer::ColumnMapping,
-        )> = None;
+        let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
         let mut unique_indexes = None;
         for &row_id in row_ids {
             let found = match &cold_snapshot {
@@ -1637,21 +1628,23 @@ impl Table for SegmentedTable {
                 None => None,
             };
             if let Some((_seg_id, cs, idx)) = found {
-                let vol = Arc::clone(&cs.volume);
-                let vol_ptr = &*vol as *const super::writer::FrozenVolume;
-                let mapping = match &cached_mapping {
-                    Some((ptr, m)) if *ptr == vol_ptr => m,
-                    _ => {
-                        // Mapping from the SAME snapshot segment.
-                        cached_mapping = Some((vol_ptr, cs.mapping.clone()));
-                        &cached_mapping.as_ref().unwrap().1
-                    }
-                };
-                let row = if mapping.is_identity {
-                    vol.get_row(idx)
-                } else {
-                    vol.get_row_mapped(idx, mapping)
-                }?;
+                // One reader per volume for the statement: the groups it
+                // reads stay held across the rows; mapping from the SAME
+                // snapshot segment
+                if !cached
+                    .as_ref()
+                    .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &cs.volume))
+                {
+                    cached = Some((
+                        super::writer::RowReader::new(Arc::clone(&cs.volume)),
+                        cs.mapping.clone(),
+                    ));
+                }
+                let (reader, mapping) = cached
+                    .as_mut()
+                    .map(|(reader, mapping)| (reader, &*mapping))
+                    .expect("reader just set");
+                let row = reader.row(idx, mapping)?;
                 let old_row = row.clone();
                 let (new_row, changed) = setter(row)?;
                 if changed {
@@ -2109,29 +2102,24 @@ impl Table for SegmentedTable {
         let schema = self.hot.schema().clone();
         let mut result = RowVec::with_capacity(row_ids.len());
         let mut hot_ids = Vec::new();
-        let mut cached_mapping: Option<(
-            *const super::writer::FrozenVolume,
-            super::writer::ColumnMapping,
-        )> = None;
+        let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
 
         for &row_id in row_ids {
             if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
-                let vol_ptr = &*vol as *const super::writer::FrozenVolume;
-                let mapping = match &cached_mapping {
-                    Some((ptr, m)) if *ptr == vol_ptr => m,
-                    _ => {
-                        cached_mapping = Some((
-                            vol_ptr,
-                            self.segment_mgr.get_volume_mapping(seg_id, &schema),
-                        ));
-                        &cached_mapping.as_ref().unwrap().1
-                    }
-                };
-                let row = if mapping.is_identity {
-                    vol.get_row(idx)
-                } else {
-                    vol.get_row_mapped(idx, mapping)
-                }?;
+                if !cached
+                    .as_ref()
+                    .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &vol))
+                {
+                    cached = Some((
+                        super::writer::RowReader::new(Arc::clone(&vol)),
+                        self.segment_mgr.get_volume_mapping(seg_id, &schema),
+                    ));
+                }
+                let (reader, mapping) = cached
+                    .as_mut()
+                    .map(|(reader, mapping)| (reader, &*mapping))
+                    .expect("reader just set");
+                let row = reader.row(idx, mapping)?;
                 result.push((row_id, row));
             } else {
                 hot_ids.push(row_id);
@@ -2168,27 +2156,24 @@ impl Table for SegmentedTable {
 
         let mut hot_ids = Vec::new();
         let schema = self.hot.schema();
-        let mut cached_mapping: Option<(
-            *const super::writer::FrozenVolume,
-            super::writer::ColumnMapping,
-        )> = None;
+        let mut cached: Option<(super::writer::RowReader, super::writer::ColumnMapping)> = None;
 
         for &row_id in row_ids {
             if let Some((seg_id, vol, idx)) = self.find_segment_row(row_id)? {
-                let vol_ptr = &*vol as *const super::writer::FrozenVolume;
-                let mapping = match &cached_mapping {
-                    Some((ptr, m)) if *ptr == vol_ptr => m,
-                    _ => {
-                        cached_mapping =
-                            Some((vol_ptr, self.segment_mgr.get_volume_mapping(seg_id, schema)));
-                        &cached_mapping.as_ref().unwrap().1
-                    }
-                };
-                let row = if mapping.is_identity {
-                    vol.get_row(idx)
-                } else {
-                    vol.get_row_mapped(idx, mapping)
-                }?;
+                if !cached
+                    .as_ref()
+                    .is_some_and(|(reader, _)| Arc::ptr_eq(reader.volume(), &vol))
+                {
+                    cached = Some((
+                        super::writer::RowReader::new(Arc::clone(&vol)),
+                        self.segment_mgr.get_volume_mapping(seg_id, schema),
+                    ));
+                }
+                let (reader, mapping) = cached
+                    .as_mut()
+                    .map(|(reader, mapping)| (reader, &*mapping))
+                    .expect("reader just set");
+                let row = reader.row(idx, mapping)?;
                 if filter.evaluate_fast(&row) {
                     buffer.push((row_id, row));
                 }
@@ -2287,16 +2272,13 @@ impl Table for SegmentedTable {
             };
 
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
+            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
 
             for (i, &rid) in vol.row_ids()?.iter().enumerate() {
                 if authority.get(&rid) != Some(&nf_idx) {
                     continue;
                 }
-                let row = if mapping.is_identity {
-                    vol.get_row(i)
-                } else {
-                    vol.get_row_mapped(i, &mapping)
-                }?;
+                let row = reader.row(i, &mapping)?;
                 if let Some(expr) = where_expr {
                     if !expr.evaluate_fast(&row) {
                         continue;
@@ -2404,6 +2386,7 @@ impl Table for SegmentedTable {
             };
 
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
+            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
 
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
                 if !cs.is_visible(i) {
@@ -2415,11 +2398,7 @@ impl Table for SegmentedTable {
                 // For rows with a WHERE clause, we must evaluate the filter
                 // even during the skip phase to get correct offset counting.
                 if where_expr.is_some() {
-                    let row = if mapping.is_identity {
-                        vol.get_row(i)
-                    } else {
-                        vol.get_row_mapped(i, &mapping)
-                    }?;
+                    let row = reader.row(i, &mapping)?;
                     if let Some(expr) = where_expr {
                         if !expr.evaluate_fast(&row) {
                             continue;
@@ -2436,11 +2415,7 @@ impl Table for SegmentedTable {
                     if cold_skipped < cold_skip {
                         cold_skipped += 1;
                     } else {
-                        let row = if mapping.is_identity {
-                            vol.get_row(i)
-                        } else {
-                            vol.get_row_mapped(i, &mapping)
-                        }?;
+                        let row = reader.row(i, &mapping)?;
                         result.push((row_id, row));
                     }
                 }
@@ -3651,6 +3626,7 @@ impl Table for SegmentedTable {
             };
 
             let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
+            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
             for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                 if !cs.is_visible(i) {
                     continue;
@@ -3668,11 +3644,7 @@ impl Table for SegmentedTable {
                 } else {
                     continue;
                 };
-                let row = if mapping.is_identity {
-                    vol.get_row(i)
-                } else {
-                    vol.get_row_mapped(i, mapping)
-                }?;
+                let row = reader.row(i, mapping)?;
                 groups.entry(val).or_default().push((rid, row));
             }
         }
@@ -3769,6 +3741,7 @@ impl Table for SegmentedTable {
             };
 
             let column = phys_col.map(|pc| vol.columns.get(pc)).transpose()?;
+            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
             for (i, &rid) in row_ids.iter().enumerate().skip(start) {
                 if !cs.is_visible(i) {
                     continue;
@@ -3787,11 +3760,7 @@ impl Table for SegmentedTable {
                     true
                 };
                 if matches {
-                    let row = if mapping.is_identity {
-                        vol.get_row(i)
-                    } else {
-                        vol.get_row_mapped(i, mapping)
-                    }?;
+                    let row = reader.row(i, mapping)?;
                     result.push((rid, row));
                 }
             }
@@ -3881,8 +3850,9 @@ impl Table for SegmentedTable {
             order: Option<&'a [u32]>,
             cursor: usize,
             mapping: super::writer::ColumnMapping,
-            volume: Arc<FrozenVolume>,
             visible: Option<Arc<Vec<u64>>>,
+            /// Holds the groups the merge reads from this volume
+            reader: super::writer::RowReader,
         }
 
         impl VolSource<'_> {
@@ -3905,8 +3875,8 @@ impl Table for SegmentedTable {
                 order: vol.row_order(),
                 cursor: if ascending { 0 } else { vol.meta.row_count },
                 mapping,
-                volume: Arc::clone(&cs.volume),
                 visible: cs.visible.clone(),
+                reader: super::writer::RowReader::new(Arc::clone(&cs.volume)),
             });
         }
 
@@ -4008,11 +3978,7 @@ impl Table for SegmentedTable {
                 }
 
                 // Materialize the row
-                let row = if vs.mapping.is_identity {
-                    vs.volume.get_row(idx)
-                } else {
-                    vs.volume.get_row_mapped(idx, &vs.mapping)
-                }?;
+                let row = vs.reader.row(idx, &vs.mapping)?;
 
                 if skipped < offset {
                     skipped += 1;
@@ -4681,6 +4647,7 @@ impl Table for SegmentedTable {
             for (seg_id, cs) in volumes.iter() {
                 let vol = &cs.volume;
                 let mapping = self.segment_mgr.get_volume_mapping(*seg_id, &schema);
+                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
                 for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
                     if !cs.is_visible(i) {
                         continue;
@@ -4715,11 +4682,7 @@ impl Table for SegmentedTable {
                             }
                         }
                     }
-                    let row = if mapping.is_identity {
-                        vol.get_row(i)
-                    } else {
-                        vol.get_row_mapped(i, &mapping)
-                    }?;
+                    let row = reader.row(i, &mapping)?;
                     if let Some(e) = expr {
                         if !e.evaluate_fast(&row) {
                             continue;
