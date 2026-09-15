@@ -5752,9 +5752,10 @@ impl MVCCEngine {
                 // volume forty times smaller or for one that ends up as a
                 // remainder anyway. A member with tombstones to shed,
                 // oversized, or out of key order keeps its own reason.
-                // The closure over overlap may pull a large volume back in;
-                // then the size-only members go and the closure is taken
-                // again, since what the closure adds cannot be left out
+                // The closure over overlap may pull volumes back in; the
+                // size-only members are judged again on the closed batch
+                // and the closure taken again, since what the closure adds
+                // cannot be left out
                 let (held, reduced) = {
                     let segs = mgr.segments_raw();
                     let ids_of = |id: u64| {
@@ -5762,52 +5763,15 @@ impl MVCCEngine {
                             .map(|cs| cs.volume.meta.row_ids.as_slice())
                             .unwrap_or(&[])
                     };
-                    drop_unaccepted_size_members(
-                        &planned,
+                    accept_batch(
+                        &mut planned,
                         &mut base,
                         &size_only,
-                        &selected,
-                        target_volume_rows,
-                    );
-                    let mut outcome = close_batch_over_overlap(
-                        &mut planned,
-                        &base,
                         &mut selected,
                         compact_threshold,
+                        target_volume_rows,
                         ids_of,
-                    );
-                    // The closure may have pulled a large volume in for the
-                    // rows it shares with the batch. If that volume is now
-                    // the largest member and breaks the ratio, the size-only
-                    // members it was pulled in for leave and the closure is
-                    // taken again; a largest member with a reason of its own
-                    // keeps the batch as it is
-                    let largest_from_closure = planned
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, entry)| entry.2)
-                        .max_by_key(|(_, entry)| entry.1)
-                        .is_some_and(|(position, _)| {
-                            !base[position] && !selected.contains(&position)
-                        });
-                    if largest_from_closure
-                        && !batch_within_proportion(&planned)
-                        && size_only.iter().zip(&base).any(|(s, b)| *s && *b)
-                    {
-                        for (position, only) in size_only.iter().enumerate() {
-                            if *only {
-                                base[position] = false;
-                            }
-                        }
-                        outcome = close_batch_over_overlap(
-                            &mut planned,
-                            &base,
-                            &mut selected,
-                            compact_threshold,
-                            ids_of,
-                        );
-                    }
-                    outcome
+                    )
                 };
                 let reclustering = !selected.is_empty();
                 if let Some(request) = recluster_request {
@@ -6044,8 +6008,7 @@ impl MVCCEngine {
             // Split live_refs into target-sized chunks and build one volume per chunk.
             // Row-group aligned split: round to 64K boundary so every volume
             // has complete row groups. Optimal for LZ4 compression and zone maps.
-            let row_group_size = 65_536usize;
-            let chunk_size = (target_volume_rows / row_group_size).max(1) * row_group_size;
+            let chunk_size = compaction_chunk_rows(target_volume_rows);
             let mut new_volumes: Vec<(
                 u64,
                 Arc<crate::storage::volume::writer::FrozenVolume>,
@@ -8336,34 +8299,111 @@ fn batch_within_proportion(planned: &[(u64, usize, bool, bool)]) -> bool {
     rows.len() < 2 || largest <= REWRITE_ACCEPTANCE_RATIO * (total - largest)
 }
 
+/// The rows a compaction output holds: the target rounded down to whole
+/// row groups of 65,536 rows, at least one, so every output has complete
+/// row groups
+fn compaction_chunk_rows(target_volume_rows: usize) -> usize {
+    let row_group_size = 65_536usize;
+    (target_volume_rows / row_group_size).max(1) * row_group_size
+}
+
+/// Settles a compaction batch's membership: the members that size alone
+/// put in the base are dropped while the batch does not accept them, the
+/// batch is closed over overlap, and the size-only members are judged
+/// again on the closed batch, the closure taken again after every change
+/// until it holds. A volume the closure pulled in is never dropped; if
+/// it is the largest member and breaks the ratio, the size-only members
+/// leave instead. Returns the closure's outcome, see
+/// `close_batch_over_overlap`
+fn accept_batch<'a>(
+    planned: &mut [(u64, usize, bool, bool)],
+    base: &mut [bool],
+    size_only: &[bool],
+    selected: &mut Vec<usize>,
+    limit: usize,
+    target_volume_rows: usize,
+    ids_of: impl Fn(u64) -> &'a [i64],
+) -> (bool, bool) {
+    let members: Vec<bool> = (0..planned.len())
+        .map(|position| base[position] || selected.contains(&position))
+        .collect();
+    drop_unaccepted_size_members(
+        planned,
+        &members,
+        base,
+        size_only,
+        selected,
+        target_volume_rows,
+    );
+    loop {
+        let outcome = close_batch_over_overlap(planned, base, selected, limit, &ids_of);
+        let largest_from_closure = planned
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.2)
+            .max_by_key(|(_, entry)| entry.1)
+            .is_some_and(|(position, _)| !base[position] && !selected.contains(&position));
+        let mut changed = false;
+        if largest_from_closure && !batch_within_proportion(planned) {
+            for (position, only) in size_only.iter().enumerate() {
+                if *only && base[position] {
+                    base[position] = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            let members: Vec<bool> = planned.iter().map(|entry| entry.2).collect();
+            changed = drop_unaccepted_size_members(
+                planned,
+                &members,
+                base,
+                size_only,
+                selected,
+                target_volume_rows,
+            );
+        }
+        if !changed {
+            return outcome;
+        }
+    }
+}
+
 /// Drops from the base of a batch the members that size alone put there
-/// and the batch does not accept, largest first, the batch (base and
-/// recluster selection together) recomputed after each drop. A member is
-/// dropped when it is the largest and holds more than the acceptance
-/// ratio allows against the rest, or when the batch removes no more
-/// volumes with it than without it: the estimated reduction is the
-/// member count less the estimated output count, `ceil(rows / target)`,
-/// an estimate from the manifest's row counts since deduplication and
-/// tombstones can shrink the output. A dropped member waits for peers
-/// of its own order while the others merge among themselves
+/// and the batch does not accept, largest first, the batch recomputed
+/// after each drop. `members` says which volumes the batch holds. A
+/// member is dropped when it is the largest and holds more than the
+/// acceptance ratio allows against the rest, or when the batch removes
+/// no more volumes with it than without it: the estimated reduction is
+/// the member count less the estimated output count, the rows over the
+/// output size, an estimate from the manifest's row counts since
+/// deduplication and tombstones can shrink the output. A dropped member
+/// waits for peers of its own order while the others merge among
+/// themselves. Returns whether a member was dropped
 fn drop_unaccepted_size_members(
     planned: &[(u64, usize, bool, bool)],
+    members: &[bool],
     base: &mut [bool],
     size_only: &[bool],
     selected: &[usize],
     target_volume_rows: usize,
-) {
-    let target = target_volume_rows.max(1);
-    let reduction = |members: usize, rows: usize| members as i64 - rows.div_ceil(target) as i64;
+) -> bool {
+    let output_rows = compaction_chunk_rows(target_volume_rows);
+    let reduction =
+        |members: usize, rows: usize| members as i64 - rows.div_ceil(output_rows) as i64;
+    let mut dropped = false;
     'batch: loop {
         let members: Vec<(usize, usize)> = planned
             .iter()
             .enumerate()
-            .filter(|(position, _)| base[*position] || selected.contains(position))
+            .filter(|(position, _)| {
+                members[*position]
+                    && (base[*position] || selected.contains(position) || !size_only[*position])
+            })
             .map(|(position, entry)| (position, entry.1))
             .collect();
         if members.len() < 2 {
-            return;
+            return dropped;
         }
         let total: usize = members.iter().map(|(_, rows)| rows).sum();
         let largest = members
@@ -8385,10 +8425,11 @@ fn drop_unaccepted_size_members(
                 largest == Some(position) && rows > REWRITE_ACCEPTANCE_RATIO * (total - rows);
             if breaks_ratio || reduction(members.len() - 1, total - rows) >= with_all {
                 base[position] = false;
+                dropped = true;
                 continue 'batch;
             }
         }
-        return;
+        return dropped;
     }
 }
 
@@ -8487,6 +8528,20 @@ mod tests {
             .collect()
     }
 
+    /// The pre-closure step: the batch is the base and the selection
+    fn drop_size_members(
+        planned: &[(u64, usize, bool, bool)],
+        base: &mut [bool],
+        size_only: &[bool],
+        selected: &[usize],
+        target: usize,
+    ) {
+        let members: Vec<bool> = (0..planned.len())
+            .map(|position| base[position] || selected.contains(&position))
+            .collect();
+        drop_unaccepted_size_members(planned, &members, base, size_only, selected, target);
+    }
+
     #[test]
     fn a_near_target_volume_is_not_rewritten_for_a_volume_forty_times_smaller() {
         let target = 1_048_576;
@@ -8494,23 +8549,23 @@ mod tests {
         // the seed waits, the small one stays in the batch alone
         let planned = vec![(1, 1_044_000, true, false), (2, 26_215, true, false)];
         let mut base = vec![true, true];
-        drop_unaccepted_size_members(&planned, &mut base, &[true, true], &[], target);
+        drop_size_members(&planned, &mut base, &[true, true], &[], target);
         assert_eq!(base, vec![false, true]);
         // Two volumes of the same order merge: one volume instead of two
         let planned = vec![(1, 600_000, true, false), (2, 200_000, true, false)];
         let mut base = vec![true, true];
-        drop_unaccepted_size_members(&planned, &mut base, &[true, true], &[], target);
+        drop_size_members(&planned, &mut base, &[true, true], &[], target);
         assert_eq!(base, vec![true, true]);
         // The largest is there to shed tombstones: its own reason, kept;
         // the small one would only come out as a remainder and waits
         let planned = vec![(1, 1_044_000, true, false), (2, 26_215, true, false)];
         let mut base = vec![true, true];
-        drop_unaccepted_size_members(&planned, &mut base, &[false, true], &[], target);
+        drop_size_members(&planned, &mut base, &[false, true], &[], target);
         assert_eq!(base, vec![true, false]);
         // The largest was selected by the recluster: kept as well
         let planned = vec![(1, 1_044_000, false, false), (2, 26_215, true, false)];
         let mut base = vec![false, true];
-        drop_unaccepted_size_members(&planned, &mut base, &[true, true], &[0], target);
+        drop_size_members(&planned, &mut base, &[true, true], &[0], target);
         assert_eq!(base, vec![false, false]);
         // Several small ones and one large: the large waits, the small merge
         let planned = vec![
@@ -8520,7 +8575,7 @@ mod tests {
             (4, 30_000, true, false),
         ];
         let mut base = vec![true; 4];
-        drop_unaccepted_size_members(&planned, &mut base, &[true; 4], &[], target);
+        drop_size_members(&planned, &mut base, &[true; 4], &[], target);
         assert_eq!(base, vec![false, true, true, true]);
         let mut members = planned.clone();
         for (entry, keep) in members.iter_mut().zip(&base) {
@@ -8545,7 +8600,7 @@ mod tests {
             (5, 13_108, true, false),
         ];
         let mut base = vec![true; 5];
-        drop_unaccepted_size_members(&planned, &mut base, &[true; 5], &[], target);
+        drop_size_members(&planned, &mut base, &[true; 5], &[], target);
         assert_eq!(base, vec![false, false, true, true, true]);
         // Without the seed the accumulated volume and the seals merge to
         // one volume instead of four
@@ -8561,14 +8616,70 @@ mod tests {
             .iter()
             .map(|(id, rows)| (*id, *rows, true, false))
             .collect();
-        drop_unaccepted_size_members(&planned, &mut base, &[true; 5], &[], target);
+        drop_size_members(&planned, &mut base, &[true; 5], &[], target);
         assert_eq!(base, vec![false, true, true, true, true]);
         // An oversized volume of exactly two targets and one row: the
         // split gives two volumes either way, the row waits
         let planned = vec![(1, 2 * target, true, false), (2, 1, true, false)];
         let mut base = vec![true, true];
-        drop_unaccepted_size_members(&planned, &mut base, &[false, true], &[], target);
+        drop_size_members(&planned, &mut base, &[false, true], &[], target);
         assert_eq!(base, vec![true, false]);
+    }
+
+    #[test]
+    fn the_estimated_output_count_uses_the_rows_an_output_holds() {
+        // A target of 100,000 rows writes outputs of 65,536: three volumes
+        // of 40,000 rows become two outputs, one volume fewer, and all
+        // three stay; against the raw target one of them would leave
+        let planned = vec![
+            (1, 40_000, true, false),
+            (2, 40_000, true, false),
+            (3, 40_000, true, false),
+        ];
+        let mut base = vec![true; 3];
+        drop_size_members(&planned, &mut base, &[true; 3], &[], 100_000);
+        assert_eq!(base, vec![true; 3]);
+        assert_eq!(compaction_chunk_rows(100_000), 65_536);
+        assert_eq!(compaction_chunk_rows(1_000), 65_536);
+        assert_eq!(compaction_chunk_rows(1_048_576), 1_048_576);
+    }
+
+    #[test]
+    fn the_closed_batch_is_judged_again() {
+        // Manifest order 31k, 85k, 31k, 1, 1, 1 at a target of 65,536: the
+        // five sub-target volumes give one output from five. The clean
+        // 85k volume shares a row with the first 31k one, so the closure
+        // pulls it in: six inputs for three outputs, and the first 31k
+        // volume no longer removes a volume. It leaves and the closure no
+        // longer reaches the 85k volume; the second 31k volume is then
+        // out of proportion with three single rows and waits as well
+        let rows: Vec<&[i64]> = vec![&[1, 2], &[2, 3], &[4], &[5], &[6], &[7]];
+        let ids_of = |id: u64| rows[id as usize - 1];
+        let mut planned = vec![
+            (1, 31_000, true, false),
+            (2, 85_000, false, false),
+            (3, 31_000, true, false),
+            (4, 1, true, false),
+            (5, 1, true, false),
+            (6, 1, true, false),
+        ];
+        let mut base = vec![true, false, true, true, true, true];
+        let size_only = vec![true, false, true, true, true, true];
+        let mut selected = Vec::new();
+        let (held, reduced) = accept_batch(
+            &mut planned,
+            &mut base,
+            &size_only,
+            &mut selected,
+            4,
+            65_536,
+            ids_of,
+        );
+        assert!(!held && !reduced);
+        assert_eq!(
+            planned.iter().map(|entry| entry.2).collect::<Vec<_>>(),
+            vec![false, false, false, true, true, true]
+        );
     }
 
     #[test]

@@ -157,3 +157,42 @@ fn a_small_volume_with_a_tombstone_is_rewritten_alone_while_the_large_one_waits(
     let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
     assert_eq!(count, 60_999);
 }
+
+#[test]
+fn the_estimate_counts_outputs_the_way_the_writer_splits_them() {
+    let dir = tempfile::tempdir().unwrap();
+    // A target of 100,000 rows writes outputs of 65,536 rows: three
+    // volumes of 40,000 rows merge into two outputs, one volume fewer,
+    // so all three are rewritten together
+    let db = Database::open(&format!(
+        "file://{}?target_volume_rows=100000&compact_threshold=2",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    for k in 0..3 {
+        db.execute(
+            &format!(
+                "INSERT INTO t SELECT g.value, g.value FROM generate_series({}, {}) g",
+                k * 40_000 + 1,
+                (k + 1) * 40_000
+            ),
+            (),
+        )
+        .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    let mut rows: Vec<i64> = db
+        .query("PRAGMA VOLUME_STATS", ())
+        .unwrap()
+        .map(|row| row.unwrap().get::<i64>(3).unwrap())
+        .collect();
+    rows.sort_unstable();
+    assert_eq!(rows, vec![54_464, 65_536]);
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(count, 120_000);
+}
