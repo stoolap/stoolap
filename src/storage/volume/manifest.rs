@@ -634,8 +634,8 @@ impl StatementSnapshot {
 }
 
 pub struct SegmentManager {
-    /// Table name.
-    table_name: SmartString,
+    /// Table name; a rename changes it under every open handle
+    table_name: RwLock<SmartString>,
     /// The manifest (source of truth for segment state).
     manifest: RwLock<TableManifest>,
     /// Loaded segments with pre-computed column mappings, keyed by segment_id.
@@ -710,7 +710,7 @@ impl SegmentManager {
     /// Create a new segment manager for a table.
     pub fn new(table_name: &str, volume_dir: Option<PathBuf>) -> Self {
         Self {
-            table_name: SmartString::from(table_name),
+            table_name: RwLock::new(SmartString::from(table_name)),
             manifest: RwLock::new(TableManifest::new(table_name)),
             segments: RwLock::new(Arc::new(FxHashMap::default())),
             volume_dir,
@@ -737,7 +737,7 @@ impl SegmentManager {
         let table_name = manifest.table_name.clone();
         let tombstone_map: FxHashMap<i64, u64> = manifest.tombstones.iter().copied().collect();
         Self {
-            table_name,
+            table_name: RwLock::new(table_name),
             manifest: RwLock::new(manifest),
             segments: RwLock::new(Arc::new(FxHashMap::default())),
             volume_dir,
@@ -760,8 +760,34 @@ impl SegmentManager {
     }
 
     /// Get the table name.
-    pub fn table_name(&self) -> &str {
-        &self.table_name
+    pub fn table_name(&self) -> SmartString {
+        self.table_name.read().clone()
+    }
+
+    /// Lets go of every open volume file: a volume whose blocks are read
+    /// from its file turns cold, metadata only, and reloads from the file
+    /// when it is read again. A directory holding an open file cannot be
+    /// renamed on every platform
+    pub fn release_file_handles(&self) {
+        let mut segments = self.segments.write();
+        let mut new_map = (**segments).clone();
+        let mut released = false;
+        for cs in new_map.values_mut() {
+            if cs
+                .volume
+                .columns
+                .compressed_store()
+                .is_some_and(|store| store.is_file_backed())
+            {
+                cs.volume = Arc::new(cs.volume.to_cold());
+                released = true;
+            }
+        }
+        if released {
+            *segments = Arc::new(new_map);
+            self.has_cold
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     /// Ensure all volumes have column data before column access.
@@ -829,7 +855,7 @@ impl SegmentManager {
                     message: format!(
                         "table '{}': cold volume reload failed for segment(s) {:?}; \
                          refusing to serve partial data",
-                        self.table_name,
+                        self.table_name.read(),
                         cold.iter().map(|(id, _)| *id).collect::<Vec<_>>()
                     ),
                 });
@@ -934,7 +960,8 @@ impl SegmentManager {
                     message: format!(
                         "table '{}': cold volume reload failed for segment(s) {:?}; \
                          refusing to serve partial data",
-                        self.table_name, cold
+                        self.table_name.read(),
+                        cold
                     ),
                 });
             }
@@ -1517,7 +1544,7 @@ impl SegmentManager {
         let mut failed = Vec::new();
         for &id in &ids {
             let filename = format!("vol_{:016x}.vol", id);
-            let full_path = vol_dir.join(self.table_name.as_str()).join(filename);
+            let full_path = vol_dir.join(self.table_name.read().as_str()).join(filename);
             match crate::storage::volume::io::read_volume_from_disk(&full_path) {
                 Ok(volume) => {
                     reloaded.push((id, Arc::new(volume)));
@@ -1525,7 +1552,9 @@ impl SegmentManager {
                 Err(e) => {
                     eprintln!(
                         "Warning: Failed to reload cold volume {} seg={}: {}",
-                        self.table_name, id, e
+                        self.table_name.read(),
+                        id,
+                        e
                     );
                     failed.push(id);
                 }
@@ -1790,8 +1819,8 @@ impl SegmentManager {
     }
 
     /// Rename this segment manager's table (for ALTER TABLE RENAME).
-    pub fn rename(&mut self, new_name: &str) {
-        self.table_name = SmartString::from(new_name);
+    pub fn rename(&self, new_name: &str) {
+        *self.table_name.write() = SmartString::from(new_name);
         self.manifest.write().table_name = SmartString::from(new_name);
     }
 
@@ -2119,7 +2148,8 @@ impl SegmentManager {
                             message: format!(
                                 "table '{}': cold volume reload failed for segment {}; \
                                  refusing to serve partial data",
-                                self.table_name, seg_id
+                                self.table_name.read(),
+                                seg_id
                             ),
                         });
                     }
@@ -2211,7 +2241,8 @@ impl SegmentManager {
                             message: format!(
                                 "table '{}': cold volume reload failed for segment {}; \
                                  refusing to serve partial data",
-                                self.table_name, seg_id
+                                self.table_name.read(),
+                                seg_id
                             ),
                         });
                     }
@@ -2809,7 +2840,8 @@ impl SegmentManager {
                 message: format!(
                     "table '{}': cold volume reload failed for segment(s) {:?}; \
                      refusing to serve partial data",
-                    self.table_name, cold
+                    self.table_name.read(),
+                    cold
                 ),
             });
         }
@@ -2861,11 +2893,12 @@ impl SegmentManager {
             .ok_or_else(|| crate::core::Error::Internal {
                 message: format!(
                     "table '{}': cold segment {} has no volume directory to reload from",
-                    self.table_name, seg_id
+                    self.table_name.read(),
+                    seg_id
                 ),
             })?;
         let filename = format!("vol_{:016x}.vol", seg_id);
-        let full_path = vol_dir.join(self.table_name.as_str()).join(filename);
+        let full_path = vol_dir.join(self.table_name.read().as_str()).join(filename);
         let volume = match crate::storage::volume::io::read_volume_from_disk(&full_path) {
             Ok(v) => Arc::new(v),
             Err(e) => {
@@ -2873,7 +2906,9 @@ impl SegmentManager {
                     message: format!(
                         "table '{}': failed to reload cold volume seg={}: {}; \
                          refusing to serve partial data",
-                        self.table_name, seg_id, e
+                        self.table_name.read(),
+                        seg_id,
+                        e
                     ),
                 });
             }

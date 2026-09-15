@@ -3915,8 +3915,7 @@ impl MVCCEngine {
         {
             let mut mgrs = self.segment_managers.write().unwrap();
             if let Some(mgr) = mgrs.remove(&old_name_lower) {
-                mgr.manifest_mut().table_name =
-                    crate::common::SmartString::from(new_name_lower.as_str());
+                mgr.rename(new_name_lower.as_str());
                 mgrs.insert(new_name_lower.clone(), mgr);
             }
         }
@@ -3927,12 +3926,17 @@ impl MVCCEngine {
                 let old_dir = vol_dir.join(&old_name_lower);
                 let new_dir = vol_dir.join(&new_name_lower);
                 if old_dir.exists() {
+                    // The volumes read from their files let the files go
+                    // first: a directory with an open file does not rename
+                    // everywhere, and the reads reload from the new name
+                    if let Some(mgr) = self.segment_managers.read().unwrap().get(&new_name_lower) {
+                        mgr.release_file_handles();
+                    }
                     if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
                         // Revert in-memory segment manager rename on disk failure
                         let mut mgrs = self.segment_managers.write().unwrap();
                         if let Some(mgr) = mgrs.remove(&new_name_lower) {
-                            mgr.manifest_mut().table_name =
-                                crate::common::SmartString::from(old_name_lower.as_str());
+                            mgr.rename(old_name_lower.as_str());
                             mgrs.insert(old_name_lower.clone(), mgr);
                         }
                         drop(mgrs);
@@ -7710,8 +7714,7 @@ impl TransactionEngineOperations for EngineOperations {
         {
             let mut mgrs = self.segment_managers.write().unwrap();
             if let Some(mgr) = mgrs.remove(&old_name_lower) {
-                mgr.manifest_mut().table_name =
-                    crate::common::SmartString::from(new_name_lower.as_str());
+                mgr.rename(new_name_lower.as_str());
                 mgrs.insert(new_name_lower.clone(), mgr);
             }
         }
@@ -7722,6 +7725,12 @@ impl TransactionEngineOperations for EngineOperations {
                 let old_dir = vol_dir.join(&old_name_lower);
                 let new_dir = vol_dir.join(&new_name_lower);
                 if old_dir.exists() {
+                    // The volumes read from their files let the files go
+                    // first: a directory with an open file does not rename
+                    // everywhere, and the reads reload from the new name
+                    if let Some(mgr) = self.segment_managers.read().unwrap().get(&new_name_lower) {
+                        mgr.release_file_handles();
+                    }
                     if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
                         // Revert ALL in-memory renames on disk failure
                         {
@@ -7748,8 +7757,7 @@ impl TransactionEngineOperations for EngineOperations {
                         {
                             let mut mgrs = self.segment_managers.write().unwrap();
                             if let Some(mgr) = mgrs.remove(&new_name_lower) {
-                                mgr.manifest_mut().table_name =
-                                    crate::common::SmartString::from(old_name_lower.as_str());
+                                mgr.rename(old_name_lower.as_str());
                                 mgrs.insert(old_name_lower.clone(), mgr);
                             }
                         }
