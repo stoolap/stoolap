@@ -6025,6 +6025,11 @@ impl MVCCEngine {
                 .map(|store| store.get_unique_non_pk_index_columns())
                 .unwrap_or_default();
 
+            // The rows move column by column in bounded batches, each
+            // input read through its mapping, a warm input one row group
+            // at a time
+            let mut transfer =
+                crate::storage::volume::transfer::Transfer::new(&schema, &volumes, &vol_mappings)?;
             'prepare: for chunk in live_refs.chunks(chunk_size) {
                 let mut builder = crate::storage::volume::writer::VolumeBuilder::with_capacity(
                     &schema,
@@ -6033,22 +6038,12 @@ impl MVCCEngine {
                 if !schema.cluster_key.is_empty() {
                     builder.allow_any_row_order();
                 }
-                for &(row_id, vol_idx, row_idx) in chunk {
-                    let vol = &volumes[vol_idx].1;
-                    let mapping = &vol_mappings[vol_idx];
-                    let row = if mapping.is_identity {
-                        vol.get_row(row_idx)
-                    } else {
-                        vol.get_row_mapped(row_idx, mapping)
-                    };
-                    let row = match row {
-                        Ok(row) => row,
-                        Err(e) => {
-                            prepare_error = Some(e.into());
-                            break 'prepare;
-                        }
-                    };
-                    builder.add_row(row_id, &row);
+                transfer.begin_output();
+                for batch in chunk.chunks(crate::storage::volume::transfer::TRANSFER_BATCH_ROWS) {
+                    if let Err(error) = transfer.append(batch, &mut builder) {
+                        prepare_error = Some(error);
+                        break 'prepare;
+                    }
                 }
                 let mut compacted = match builder.finish() {
                     Ok(volume) => volume,

@@ -1142,6 +1142,15 @@ impl LazyColumns {
         Ok(result)
     }
 
+    /// A column already decoded here, without decoding it: None while the
+    /// column is still in its compressed form or was never loaded
+    pub fn resident(&self, idx: usize) -> Option<&ColumnData> {
+        match self.slots.get(idx)?.get() {
+            Some(Ok(col)) => Some(col),
+            _ => None,
+        }
+    }
+
     /// Borrow a column, caching both successful decodes and failures.
     #[inline]
     pub fn get(&self, idx: usize) -> std::io::Result<&ColumnData> {
@@ -1332,6 +1341,81 @@ pub struct VolumeBuilder {
     row_count: usize,
 }
 
+/// One output column's cells for a batch of rows in the column's storage
+/// form: what `VolumeBuilder::append_typed` takes instead of rows
+pub enum TypedCells<'a> {
+    Int64 {
+        values: &'a [i64],
+        nulls: &'a [bool],
+    },
+    Float64 {
+        values: &'a [f64],
+        nulls: &'a [bool],
+    },
+    TimestampNanos {
+        values: &'a [i64],
+        nulls: &'a [bool],
+    },
+    Boolean {
+        values: &'a [bool],
+        nulls: &'a [bool],
+    },
+    /// Ids in the builder's dictionary for the column, from `intern_text`
+    Dictionary { ids: &'a [u32], nulls: &'a [bool] },
+    /// Extension payloads without their type tag, as `ColumnData::Bytes`
+    /// holds them
+    Bytes {
+        data: &'a [u8],
+        offsets: &'a [(u64, u64)],
+        nulls: &'a [bool],
+    },
+}
+
+impl TypedCells<'_> {
+    pub fn len(&self) -> usize {
+        match self {
+            TypedCells::Int64 { nulls, .. }
+            | TypedCells::Float64 { nulls, .. }
+            | TypedCells::TimestampNanos { nulls, .. }
+            | TypedCells::Boolean { nulls, .. }
+            | TypedCells::Dictionary { nulls, .. }
+            | TypedCells::Bytes { nulls, .. } => nulls.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Moves `min` and `max` to include `value`, the way `add_row` does cell
+/// by cell: a null extent takes the value, otherwise the value replaces
+/// the extent it lies beyond
+fn extend_extents(min: &mut Value, max: &mut Value, value: &Value) {
+    if min.is_null() {
+        *min = value.clone();
+        *max = value.clone();
+        return;
+    }
+    if let Ok(std::cmp::Ordering::Less) = value.compare(min) {
+        *min = value.clone();
+    }
+    if let Ok(std::cmp::Ordering::Greater) = value.compare(max) {
+        *max = value.clone();
+    }
+}
+
+/// The timestamp value `nanos` decodes to, as `ColumnData::get_value` reads
+/// it; null when the nanos fall outside the calendar
+fn timestamp_value(nanos: i64) -> Value {
+    let secs = nanos.div_euclid(1_000_000_000);
+    let sub_nanos = nanos.rem_euclid(1_000_000_000) as u32;
+    match chrono::TimeZone::timestamp_opt(&chrono::Utc, secs, sub_nanos) {
+        chrono::LocalResult::Single(dt) => Value::Timestamp(dt),
+        _ => Value::Null(DataType::Timestamp),
+    }
+}
+
 /// Positions of `ids` sorted by id
 pub(crate) fn row_order_of(ids: &[i64]) -> Box<[u32]> {
     let mut order: Vec<u32> = (0..ids.len() as u32).collect();
@@ -1446,6 +1530,296 @@ impl VolumeBuilder {
     /// go through a sorted permutation instead of the ids themselves
     pub fn allow_any_row_order(&mut self) {
         self.any_row_order = true;
+    }
+
+    /// The id of `text` in the column's dictionary, added when new. A new
+    /// entry also moves the column's text extents, since the minimum and
+    /// maximum of a text column change only with a new distinct value
+    pub fn intern_text(&mut self, col_idx: usize, text: &str) -> Result<u32> {
+        let idx = match self.col_storage.get(col_idx) {
+            Some(StorageKind::Dictionary(idx)) => *idx,
+            _ => return Err(Error::internal("intern_text on a column that is not text")),
+        };
+        if let Some(&id) = self.dict_maps[idx].get(text) {
+            return Ok(id);
+        }
+        let id = self.dict_tables[idx].len() as u32;
+        let entry = SmartString::from(text);
+        self.dict_tables[idx].push(entry.clone());
+        self.dict_maps[idx].insert(entry.clone(), id);
+        let value = Value::Text(entry);
+        let zone = &mut self.zone_maps[col_idx];
+        extend_extents(&mut zone.min, &mut zone.max, &value);
+        let stats = &mut self.stats.columns[col_idx];
+        extend_extents(&mut stats.min, &mut stats.max, &value);
+        Ok(id)
+    }
+
+    /// Appends a batch of rows given column by column in storage form, the
+    /// volume `add_row` would build from the same rows: one entry per
+    /// schema column, each with as many cells as `row_ids`, text as ids
+    /// from `intern_text`
+    pub fn append_typed(&mut self, row_ids: &[i64], columns: &[TypedCells<'_>]) -> Result<()> {
+        let rows = row_ids.len();
+        if columns.len() != self.num_cols {
+            return Err(Error::internal(
+                "typed batch does not cover the volume's columns",
+            ));
+        }
+        for (col_idx, cells) in columns.iter().enumerate() {
+            let matches = matches!(
+                (self.col_storage[col_idx], cells),
+                (StorageKind::Int64(_), TypedCells::Int64 { .. })
+                    | (StorageKind::Float64(_), TypedCells::Float64 { .. })
+                    | (StorageKind::Timestamp(_), TypedCells::TimestampNanos { .. })
+                    | (StorageKind::Boolean(_), TypedCells::Boolean { .. })
+                    | (StorageKind::Dictionary(_), TypedCells::Dictionary { .. })
+                    | (StorageKind::Bytes(..), TypedCells::Bytes { .. })
+            );
+            if !matches || cells.len() != rows {
+                return Err(Error::internal(
+                    "typed batch column does not match the column's storage",
+                ));
+            }
+        }
+        for (col_idx, cells) in columns.iter().enumerate() {
+            match (self.col_storage[col_idx], cells) {
+                (StorageKind::Int64(idx), TypedCells::Int64 { values, nulls }) => {
+                    self.append_i64_cells(col_idx, idx, false, values, nulls)
+                }
+                (StorageKind::Timestamp(idx), TypedCells::TimestampNanos { values, nulls }) => {
+                    self.append_i64_cells(col_idx, idx, true, values, nulls)
+                }
+                (StorageKind::Float64(idx), TypedCells::Float64 { values, nulls }) => {
+                    self.append_f64_cells(col_idx, idx, values, nulls)
+                }
+                (StorageKind::Boolean(idx), TypedCells::Boolean { values, nulls }) => {
+                    self.append_bool_cells(col_idx, idx, values, nulls)
+                }
+                (StorageKind::Dictionary(idx), TypedCells::Dictionary { ids, nulls }) => {
+                    self.append_dict_cells(col_idx, idx, ids, nulls)
+                }
+                (
+                    StorageKind::Bytes(idx, ext_type),
+                    TypedCells::Bytes {
+                        data,
+                        offsets,
+                        nulls,
+                    },
+                ) => self.append_bytes_cells(col_idx, idx, ext_type, data, offsets, nulls),
+                _ => unreachable!("typed batch columns were checked against the storage"),
+            }
+        }
+        self.row_ids.extend_from_slice(row_ids);
+        self.stats.total_rows += rows as u64;
+        self.stats.live_rows += rows as u64;
+        self.row_count += rows;
+        Ok(())
+    }
+
+    fn append_i64_cells(
+        &mut self,
+        col_idx: usize,
+        idx: usize,
+        timestamps: bool,
+        values: &[i64],
+        nulls: &[bool],
+    ) {
+        let target = if timestamps {
+            &mut self.ts_cols[idx]
+        } else {
+            &mut self.int_cols[idx]
+        };
+        let zone = &mut self.zone_maps[col_idx];
+        let null_col = &mut self.null_cols[col_idx];
+        zone.row_count += values.len() as u32;
+        let (mut lo, mut hi, mut sum, mut count) = (i64::MAX, i64::MIN, 0i128, 0u64);
+        for (&v, &is_null) in values.iter().zip(nulls) {
+            null_col.push(is_null);
+            if is_null {
+                zone.null_count += 1;
+                self.sorted[col_idx] = false;
+                target.push(0);
+                continue;
+            }
+            lo = lo.min(v);
+            hi = hi.max(v);
+            sum += v as i128;
+            count += 1;
+            if self.sorted[col_idx] {
+                if let Some(last) = self.last_values[col_idx] {
+                    if v < last {
+                        self.sorted[col_idx] = false;
+                    }
+                }
+                self.last_values[col_idx] = Some(v);
+            }
+            target.push(v);
+        }
+        if count == 0 {
+            return;
+        }
+        let stats = &mut self.stats.columns[col_idx];
+        stats.non_null_count += count;
+        let (lo_value, hi_value) = if timestamps {
+            (timestamp_value(lo), timestamp_value(hi))
+        } else {
+            stats.sum_int += sum;
+            stats.numeric_count += count;
+            (Value::Integer(lo), Value::Integer(hi))
+        };
+        extend_extents(&mut zone.min, &mut zone.max, &lo_value);
+        extend_extents(&mut zone.min, &mut zone.max, &hi_value);
+        extend_extents(&mut stats.min, &mut stats.max, &lo_value);
+        extend_extents(&mut stats.min, &mut stats.max, &hi_value);
+    }
+
+    fn append_f64_cells(&mut self, col_idx: usize, idx: usize, values: &[f64], nulls: &[bool]) {
+        let target = &mut self.float_cols[idx];
+        let zone = &mut self.zone_maps[col_idx];
+        let stats = &mut self.stats.columns[col_idx];
+        let null_col = &mut self.null_cols[col_idx];
+        zone.row_count += values.len() as u32;
+        let (mut lo, mut hi, mut count) = (f64::INFINITY, f64::NEG_INFINITY, 0u64);
+        for (&v, &is_null) in values.iter().zip(nulls) {
+            null_col.push(is_null);
+            if is_null {
+                zone.null_count += 1;
+                self.sorted[col_idx] = false;
+                target.push(0.0);
+                continue;
+            }
+            target.push(v);
+            // NaN counts for nothing, as in add_row: it neither sums nor
+            // bounds the column
+            if v.is_nan() {
+                continue;
+            }
+            if v < lo {
+                lo = v;
+            }
+            if v > hi {
+                hi = v;
+            }
+            // The running sum takes each value in row order, as add_row
+            // does: a batch summed on its own can overflow where the
+            // running sum does not
+            stats.sum_float += v;
+            count += 1;
+        }
+        if count == 0 {
+            return;
+        }
+        stats.non_null_count += count;
+        stats.numeric_count += count;
+        let (lo_value, hi_value) = (Value::Float(lo), Value::Float(hi));
+        extend_extents(&mut zone.min, &mut zone.max, &lo_value);
+        extend_extents(&mut zone.min, &mut zone.max, &hi_value);
+        extend_extents(&mut stats.min, &mut stats.max, &lo_value);
+        extend_extents(&mut stats.min, &mut stats.max, &hi_value);
+    }
+
+    fn append_bool_cells(&mut self, col_idx: usize, idx: usize, values: &[bool], nulls: &[bool]) {
+        let target = &mut self.bool_cols[idx];
+        let zone = &mut self.zone_maps[col_idx];
+        let null_col = &mut self.null_cols[col_idx];
+        zone.row_count += values.len() as u32;
+        let (mut any_true, mut any_false, mut count) = (false, false, 0u64);
+        for (&v, &is_null) in values.iter().zip(nulls) {
+            null_col.push(is_null);
+            if is_null {
+                zone.null_count += 1;
+                self.sorted[col_idx] = false;
+                target.push(false);
+                continue;
+            }
+            any_true |= v;
+            any_false |= !v;
+            count += 1;
+            target.push(v);
+        }
+        if count == 0 {
+            return;
+        }
+        let stats = &mut self.stats.columns[col_idx];
+        stats.non_null_count += count;
+        stats.numeric_count += count;
+        stats.sum_int += values
+            .iter()
+            .zip(nulls)
+            .filter(|(v, is_null)| **v && !**is_null)
+            .count() as i128;
+        let (lo_value, hi_value) = (Value::Boolean(!any_false), Value::Boolean(any_true));
+        extend_extents(&mut zone.min, &mut zone.max, &lo_value);
+        extend_extents(&mut zone.min, &mut zone.max, &hi_value);
+        extend_extents(&mut stats.min, &mut stats.max, &lo_value);
+        extend_extents(&mut stats.min, &mut stats.max, &hi_value);
+    }
+
+    fn append_dict_cells(&mut self, col_idx: usize, idx: usize, ids: &[u32], nulls: &[bool]) {
+        let target = &mut self.dict_cols[idx];
+        let zone = &mut self.zone_maps[col_idx];
+        let null_col = &mut self.null_cols[col_idx];
+        zone.row_count += ids.len() as u32;
+        let mut count = 0u64;
+        for (&id, &is_null) in ids.iter().zip(nulls) {
+            null_col.push(is_null);
+            if is_null {
+                zone.null_count += 1;
+                self.sorted[col_idx] = false;
+                target.push(0);
+                continue;
+            }
+            count += 1;
+            target.push(id);
+        }
+        // The extents moved when the ids were interned
+        self.stats.columns[col_idx].non_null_count += count;
+    }
+
+    fn append_bytes_cells(
+        &mut self,
+        col_idx: usize,
+        idx: usize,
+        ext_type: DataType,
+        data: &[u8],
+        offsets: &[(u64, u64)],
+        nulls: &[bool],
+    ) {
+        let (target_data, target_offsets) = &mut self.bytes_cols[idx];
+        let zone = &mut self.zone_maps[col_idx];
+        let stats = &mut self.stats.columns[col_idx];
+        let null_col = &mut self.null_cols[col_idx];
+        zone.row_count += offsets.len() as u32;
+        for (&(offset, length), &is_null) in offsets.iter().zip(nulls) {
+            null_col.push(is_null);
+            if is_null {
+                zone.null_count += 1;
+                self.sorted[col_idx] = false;
+                target_offsets.push((0, 0));
+                continue;
+            }
+            let payload = &data[offset as usize..(offset + length) as usize];
+            target_offsets.push((target_data.len() as u64, length));
+            target_data.extend_from_slice(payload);
+            stats.non_null_count += 1;
+            // Extension values compare equal or not at all, so the first
+            // non-null value is the column's minimum and maximum for good
+            if zone.min.is_null() || stats.min.is_null() {
+                let mut tagged = Vec::with_capacity(1 + payload.len());
+                tagged.push(ext_type as u8);
+                tagged.extend_from_slice(payload);
+                let value = Value::Extension(crate::common::CompactArc::from(tagged));
+                if zone.min.is_null() {
+                    zone.min = value.clone();
+                    zone.max = value.clone();
+                }
+                if stats.min.is_null() {
+                    stats.min = value.clone();
+                    stats.max = value;
+                }
+            }
+        }
     }
 
     /// Create a builder with pre-allocated capacity.
@@ -2401,6 +2775,60 @@ mod tests {
             .column("exchange", DataType::Text, false, false)
             .column("price", DataType::Float, false, false)
             .build()
+    }
+
+    #[test]
+    fn a_float_sum_runs_in_row_order_across_typed_batches() {
+        // The volume's sum is what add_row reaches row by row: minus 1e308
+        // and zeros in one batch, two 1e308 in the next. Summing the
+        // second batch on its own overflows before it joins the running sum
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("v", DataType::Float, false, false)
+            .build();
+        let mut first = vec![0.0; 4096];
+        first[0] = -1e308;
+        let second = vec![1e308, 1e308];
+        let mut by_rows = VolumeBuilder::new(&schema);
+        let mut ids = Vec::new();
+        for (i, v) in first.iter().chain(&second).enumerate() {
+            by_rows.add_row(
+                i as i64,
+                &Row::from_values(vec![Value::Integer(i as i64), Value::Float(*v)]),
+            );
+            ids.push(i as i64);
+        }
+        let mut typed = VolumeBuilder::new(&schema);
+        let nulls = vec![false; 4096];
+        for (batch_ids, values) in [(&ids[..4096], &first[..]), (&ids[4096..], &second[..])] {
+            let ints: Vec<i64> = batch_ids.to_vec();
+            typed
+                .append_typed(
+                    batch_ids,
+                    &[
+                        TypedCells::Int64 {
+                            values: &ints,
+                            nulls: &nulls[..batch_ids.len()],
+                        },
+                        TypedCells::Float64 {
+                            values,
+                            nulls: &nulls[..batch_ids.len()],
+                        },
+                    ],
+                )
+                .unwrap();
+        }
+        let (by_rows, typed) = (by_rows.finish().unwrap(), typed.finish().unwrap());
+        let (want, got) = (
+            by_rows.meta.stats.columns[1].sum_float,
+            typed.meta.stats.columns[1].sum_float,
+        );
+        assert!(want.is_finite());
+        assert_eq!(
+            got.to_bits(),
+            want.to_bits(),
+            "typed sum {got}, by rows {want}"
+        );
     }
 
     #[test]
