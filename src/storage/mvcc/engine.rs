@@ -8391,15 +8391,16 @@ fn drop_unaccepted_size_members(
     let output_rows = compaction_chunk_rows(target_volume_rows);
     let reduction =
         |members: usize, rows: usize| members as i64 - rows.div_ceil(output_rows) as i64;
+    // Membership and the leave to drop are separate: a member the batch
+    // holds on entry counts even when the closure brought it back after
+    // an earlier drop, and only what this call drops leaves the count
+    let mut dropped_here = vec![false; planned.len()];
     let mut dropped = false;
     'batch: loop {
         let members: Vec<(usize, usize)> = planned
             .iter()
             .enumerate()
-            .filter(|(position, _)| {
-                members[*position]
-                    && (base[*position] || selected.contains(position) || !size_only[*position])
-            })
+            .filter(|(position, _)| members[*position] && !dropped_here[*position])
             .map(|(position, entry)| (position, entry.1))
             .collect();
         if members.len() < 2 {
@@ -8425,6 +8426,7 @@ fn drop_unaccepted_size_members(
                 largest == Some(position) && rows > REWRITE_ACCEPTANCE_RATIO * (total - rows);
             if breaks_ratio || reduction(members.len() - 1, total - rows) >= with_all {
                 base[position] = false;
+                dropped_here[position] = true;
                 dropped = true;
                 continue 'batch;
             }
@@ -8680,6 +8682,42 @@ mod tests {
             planned.iter().map(|entry| entry.2).collect::<Vec<_>>(),
             vec![false, false, false, true, true, true]
         );
+    }
+
+    #[test]
+    fn a_member_the_closure_brings_back_counts_in_the_closed_batch() {
+        // Manifest order 5k, 40k, 20k, 20k, 1 at a target of 65,536, the
+        // 40k volume sharing a row with the 5k one. The base drops the
+        // 40k volume (four inputs give one output without it, five give
+        // two with it) and the closure brings it back. It then counts as
+        // a member of the closed batch: 85,001 rows for two outputs, and
+        // one 20k volume leaves for the same reduction of three at
+        // 65,001 rows, the closure holding through the 5k volume
+        let rows: Vec<&[i64]> = vec![&[1, 2], &[2, 3], &[4], &[5], &[6]];
+        let ids_of = |id: u64| rows[id as usize - 1];
+        let mut planned = vec![
+            (1, 5_000, true, false),
+            (2, 40_000, true, false),
+            (3, 20_000, true, false),
+            (4, 20_000, true, false),
+            (5, 1, true, false),
+        ];
+        let mut base = vec![true; 5];
+        let mut selected = Vec::new();
+        accept_batch(
+            &mut planned,
+            &mut base,
+            &[true; 5],
+            &mut selected,
+            4,
+            65_536,
+            ids_of,
+        );
+        assert_eq!(
+            planned.iter().map(|entry| entry.2).collect::<Vec<_>>(),
+            vec![true, true, false, true, true]
+        );
+        assert_eq!(base, vec![true, false, false, true, true]);
     }
 
     #[test]
