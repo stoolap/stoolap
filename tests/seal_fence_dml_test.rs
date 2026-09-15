@@ -265,3 +265,73 @@ fn a_prepared_row_sealed_again_by_another_transaction_is_a_write_conflict() {
     let v: i64 = db.query_one("SELECT v FROM t WHERE id = 1", ()).unwrap();
     assert_eq!(v, 10);
 }
+
+#[test]
+fn a_prepared_row_sealed_again_outside_the_filter_is_a_write_conflict() {
+    use stoolap::storage::expression::{ComparisonExpr, Expression};
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = cold_row(dir.path());
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let mut filter = ComparisonExpr::eq("v", stoolap::core::Value::Integer(0));
+    filter.prepare_for_schema(table.schema());
+    let other = db.clone();
+    let mut calls = 0;
+    let mut setter = |mut row: stoolap::core::Row| {
+        calls += 1;
+        bump(&mut row);
+        if calls == 1 {
+            // The newer version no longer matches the filter, so the next
+            // round's walk never reaches its volume
+            other
+                .execute("UPDATE t SET v = 10 WHERE id = 1", ())
+                .unwrap();
+            other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        Ok((row, true))
+    };
+    let err = table
+        .update(Some(&filter), &mut setter)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("write conflict"), "{err}");
+    assert_eq!(calls, 1);
+    drop(table);
+    txn.rollback().unwrap();
+    let v: i64 = db.query_one("SELECT v FROM t WHERE id = 1", ()).unwrap();
+    assert_eq!(v, 10);
+}
+
+#[test]
+fn a_compaction_moving_a_prepared_row_is_no_conflict() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = cold_row(dir.path());
+    db.execute("INSERT INTO t VALUES (3, 0)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (2, 0)", ()).unwrap();
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let other = db.clone();
+    let mut calls = 0;
+    let mut setter = |mut row: stoolap::core::Row| {
+        calls += 1;
+        bump(&mut row);
+        if calls == 1 {
+            // The seal of row 2 makes three volumes, which compact into one
+            other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        Ok((row, true))
+    };
+    assert_eq!(table.update_by_row_ids(&[1], &mut setter).unwrap(), 1);
+    assert_eq!(calls, 1);
+    drop(table);
+    txn.commit().unwrap();
+    let volumes = db.query("PRAGMA VOLUME_STATS", ()).unwrap().count();
+    assert_eq!(volumes, 1, "the three volumes compacted into one");
+    let v: i64 = db.query_one("SELECT v FROM t WHERE id = 1", ()).unwrap();
+    assert_eq!(v, 1);
+    let sum: i64 = db.query_one("SELECT SUM(v) FROM t", ()).unwrap();
+    assert_eq!(sum, 1);
+}
