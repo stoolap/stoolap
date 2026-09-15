@@ -3702,6 +3702,49 @@ mod tests {
     }
 
     #[test]
+    fn a_row_reader_decodes_each_group_once_for_a_loop() {
+        use crate::storage::volume::group_cache::DECODED_GROUPS;
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("name", DataType::Text, true, false)
+            .build();
+        let rows = ROW_GROUP_SIZE as i64 + 100;
+        let mut builder = VolumeBuilder::new(&schema);
+        for i in 0..rows {
+            builder.add_row(
+                i,
+                &Row::from_values(vec![Value::Integer(i), Value::text(format!("n{}", i % 7))]),
+            );
+        }
+        let mut volume = builder.finish().unwrap();
+        let (_, store) = crate::storage::volume::io::serialize_v4_public(&volume).unwrap();
+        volume.columns.attach_compressed_store(store);
+        let warm = Arc::new(volume.to_warm().unwrap());
+        // A cache too small for both groups of both columns, so a reader
+        // that let its groups go would decode them again row after row
+        DECODED_GROUPS.set_budget_bytes(0);
+        DECODED_GROUPS.set_budget_bytes(1);
+        let before = DECODED_GROUPS.stats().misses;
+        let mut reader = RowReader::new(Arc::clone(&warm));
+        for i in (0..rows as usize).step_by(97) {
+            let row = reader
+                .row(
+                    i,
+                    &ColumnMapping {
+                        sources: Vec::new(),
+                        names: Vec::new(),
+                        is_identity: true,
+                    },
+                )
+                .unwrap();
+            assert_eq!(row[0], Value::Integer(i as i64));
+        }
+        let misses = DECODED_GROUPS.stats().misses - before;
+        // Two groups, two columns: each decoded once
+        assert_eq!(misses, 4, "groups decoded {misses} times");
+    }
+
+    #[test]
     fn fed_bloom_filters_take_rows_added_either_way() {
         let schema = SchemaBuilder::new("t")
             .column("id", DataType::Integer, false, true)
