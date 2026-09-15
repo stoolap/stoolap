@@ -181,12 +181,12 @@ struct ColdChange {
 #[derive(Default)]
 struct ColdPrepare {
     round: u32,
-    /// The rows the setter ran on, with the round it ran in
-    visited: FxHashMap<i64, u32>,
+    /// The rows the setter ran on, with the volume each was read from
+    visited: FxHashMap<i64, u64>,
     /// The rows a new version is prepared for: their old keys are gone
     /// once the statement applies
     shadowed: FxHashSet<i64>,
-    /// The volumes an earlier round walked
+    /// The volumes walked whole at a settled generation
     seen_segments: FxHashSet<u64>,
     unique_indexes: Option<Vec<(String, Vec<String>)>>,
     changes: Vec<ColdChange>,
@@ -555,6 +555,13 @@ impl SegmentedTable {
         mgr.seal_generation()
     }
 
+    /// The generation and the volumes of a settled state, read together
+    /// under the fence
+    fn settled_state(mgr: &super::manifest::SegmentManager) -> (u64, smallvec::SmallVec<[u64; 4]>) {
+        let _fence = mgr.acquire_seal_read();
+        (mgr.seal_generation(), mgr.cold_snapshot().seg_ids)
+    }
+
     /// Runs `check` against a cold snapshot at a settled generation, then
     /// takes the fence; the check stands when the generation is the same,
     /// otherwise it runs again, after three rounds under the fence. None
@@ -623,13 +630,16 @@ impl SegmentedTable {
         loop {
             let under_fence = prep.round == 3;
             let held = under_fence.then(|| mgr.acquire_seal_read());
-            let generation = if under_fence {
-                mgr.seal_generation()
+            let (generation, settled) = if under_fence {
+                (mgr.seal_generation(), mgr.cold_snapshot().seg_ids)
             } else {
-                Self::settled_generation(mgr)
+                Self::settled_state(mgr)
             };
             let snap = mgr.statement_snapshot()?;
             prep.hot_ids.clear();
+            if prep.round > 0 {
+                self.revalidate_prepared(&snap, &mut prep)?;
+            }
             match ids {
                 Some(ids) => self.prepare_cold_rows_by_id(&snap, ids, setter, &mut prep)?,
                 None => self.prepare_cold_rows_where(
@@ -641,6 +651,9 @@ impl SegmentedTable {
                     &mut prep,
                 )?,
             }
+            // A volume registered at a settled generation is walked whole;
+            // one a seal added meanwhile may have hidden rows still hot
+            prep.seen_segments.extend(settled);
             let guard = held.unwrap_or_else(|| mgr.acquire_seal_read());
             if under_fence || mgr.seal_generation() == generation {
                 return Ok((guard, prep.changes, prep.hot_ids));
@@ -650,7 +663,33 @@ impl SegmentedTable {
         }
     }
 
-    /// One round over the rows named, in the volumes not walked yet
+    /// The rows prepared in earlier rounds are still the rows they were
+    /// read from: a hot version or a tombstone since is another
+    /// transaction's change; a row moved to another volume is the same
+    /// row when it reads the same, as compaction leaves it, and a
+    /// change otherwise
+    fn revalidate_prepared(
+        &self,
+        snap: &super::manifest::StatementSnapshot,
+        prep: &mut ColdPrepare,
+    ) -> Result<()> {
+        for change in &prep.changes {
+            let Some((seg_id, cs, idx)) = self.find_segment_row_in(snap, change.row_id)? else {
+                return Err(Self::write_conflict(change.row_id));
+            };
+            if prep.visited.get(&change.row_id) == Some(&seg_id) {
+                continue;
+            }
+            let mut reader = super::writer::RowReader::new(Arc::clone(&cs.volume));
+            if reader.row(idx, &cs.mapping)? != change.old_row {
+                return Err(Self::write_conflict(change.row_id));
+            }
+            prep.visited.insert(change.row_id, seg_id);
+        }
+        Ok(())
+    }
+
+    /// One round over the rows named that no round set yet
     fn prepare_cold_rows_by_id(
         &self,
         snap: &super::manifest::StatementSnapshot,
@@ -664,7 +703,7 @@ impl SegmentedTable {
                 prep.hot_ids.push(row_id);
                 continue;
             };
-            if prep.seen_segments.contains(&seg_id) {
+            if prep.visited.contains_key(&row_id) {
                 continue;
             }
             // One reader per volume for the statement: the groups it
@@ -684,14 +723,13 @@ impl SegmentedTable {
                 .map(|(reader, mapping)| (reader, &*mapping))
                 .expect("reader just set");
             let row = reader.row(idx, mapping)?;
-            self.prepare_cold_row(snap, row_id, row, setter, prep)?;
+            self.prepare_cold_row(snap, seg_id, row_id, row, setter, prep)?;
         }
-        prep.seen_segments.extend(snap.segs.keys().copied());
         Ok(())
     }
 
     /// One round over the rows the filter selects, in the volumes not
-    /// walked yet
+    /// walked whole yet
     fn prepare_cold_rows_where(
         &self,
         snap: &super::manifest::StatementSnapshot,
@@ -708,7 +746,7 @@ impl SegmentedTable {
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
         for (seg_id, cs) in snap.volumes_newest_first().iter() {
-            if !prep.seen_segments.insert(*seg_id) {
+            if prep.seen_segments.contains(seg_id) {
                 continue;
             }
             let vol = &cs.volume;
@@ -736,7 +774,10 @@ impl SegmentedTable {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
+                if self.is_row_tombstoned(&tombstones_arc, row_id)
+                    || hot_skip.contains(&row_id)
+                    || prep.visited.contains_key(&row_id)
+                {
                     continue;
                 }
                 let row = reader.row(i, &mapping)?;
@@ -745,27 +786,23 @@ impl SegmentedTable {
                         continue;
                     }
                 }
-                self.prepare_cold_row(snap, row_id, row, setter, prep)?;
+                self.prepare_cold_row(snap, *seg_id, row_id, row, setter, prep)?;
             }
         }
         Ok(())
     }
 
-    /// Runs the setter on one cold row and keeps its new version; an id
-    /// named twice in a round is set once
+    /// Runs the setter on one cold row and keeps its new version
     fn prepare_cold_row(
         &self,
         snap: &super::manifest::StatementSnapshot,
+        seg_id: u64,
         row_id: i64,
         row: Row,
         setter: &mut dyn FnMut(Row) -> Result<(Row, bool)>,
         prep: &mut ColdPrepare,
     ) -> Result<()> {
-        match prep.visited.insert(row_id, prep.round) {
-            None => {}
-            Some(round) if round == prep.round => return Ok(()),
-            Some(_) => return Err(Self::write_conflict(row_id)),
-        }
+        prep.visited.insert(row_id, seg_id);
         let old_row = row.clone();
         let (new_row, changed) = setter(row)?;
         if !changed {
