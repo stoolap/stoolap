@@ -404,3 +404,49 @@ mod invariants {
         );
     }
 }
+
+/// A scan through a column mapping holds a group's columns across its
+/// rows like a scan of the volume's own columns does, so two wide columns
+/// that do not fit the cache together are decoded once per group
+#[test]
+fn a_scan_through_a_column_mapping_decodes_each_group_once() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!("file://{}/mapped", dir.path().display());
+    let db = Database::open(&dsn).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, a JSON, b JSON)",
+        (),
+    )
+    .unwrap();
+    let mut stmt = String::from("INSERT INTO t VALUES ");
+    for i in 1..=64 {
+        if i > 1 {
+            stmt.push(',');
+        }
+        let doc = format!("{{\"payload\":\"{i}{}\"}}", "x".repeat(10_000));
+        stmt.push_str(&format!("({i}, 0, '{doc}', '{doc}')"));
+    }
+    db.execute(&stmt, ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    drop(db);
+    let db = Database::open(&dsn).unwrap();
+    db.execute("ALTER TABLE t ADD COLUMN z INTEGER DEFAULT 4", ())
+        .unwrap();
+    DECODED_GROUPS.set_budget_bytes(1 << 20);
+    let before = DECODED_GROUPS.stats().misses;
+    let mut rows = 0;
+    for row in db.query("SELECT * FROM t WHERE id > 0", ()).unwrap() {
+        let row = row.unwrap();
+        rows += 1;
+        assert_eq!(row.get::<i64>(4).unwrap(), 4);
+        assert!(row
+            .get::<String>(2)
+            .unwrap()
+            .contains(&format!("{rows}xxxx")));
+    }
+    assert_eq!(rows, 64);
+    let misses = DECODED_GROUPS.stats().misses - before;
+    // One group, four volume columns
+    assert_eq!(misses, 4, "groups decoded {misses} times");
+}
