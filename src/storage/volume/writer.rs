@@ -129,18 +129,18 @@ impl VolumeFile {
 impl Drop for VolumeFile {
     fn drop(&mut self) {
         let path = self.path.get_mut().clone();
+        // The file goes under the registry lock, which a move holds too
+        let mut files = VOLUME_FILES.lock();
+        if files
+            .get(&path)
+            .is_some_and(|file| file.strong_count() == 0)
         {
-            let mut files = VOLUME_FILES.lock();
-            if files
-                .get(&path)
-                .is_some_and(|file| file.strong_count() == 0)
-            {
-                files.remove(&path);
-            }
+            files.remove(&path);
         }
         if self.retired.load(std::sync::atomic::Ordering::Acquire) {
             let _ = std::fs::remove_file(&path);
         }
+        drop(files);
     }
 }
 
