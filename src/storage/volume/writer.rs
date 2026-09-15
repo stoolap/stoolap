@@ -2856,6 +2856,68 @@ impl VolumeBuilder {
     }
 }
 
+/// Reads rows of one volume by index with the groups they need held
+/// across the reads: a loop over many rows of a volume decodes each
+/// group once, not once per row and column, and lets the groups go when
+/// the reader does
+pub struct RowReader {
+    volume: Arc<FrozenVolume>,
+    /// By physical column: the group held and its first row
+    pinned: Vec<Option<(Arc<ColumnData>, usize)>>,
+}
+
+impl RowReader {
+    pub fn new(volume: Arc<FrozenVolume>) -> Self {
+        let columns = volume.columns.len();
+        Self {
+            volume,
+            pinned: vec![None; columns],
+        }
+    }
+
+    pub fn volume(&self) -> &Arc<FrozenVolume> {
+        &self.volume
+    }
+
+    fn cell(&mut self, col_idx: usize, row_idx: usize) -> std::io::Result<Value> {
+        if let Some(column) = self.volume.columns.resident(col_idx) {
+            return Ok(column.get_value(row_idx));
+        }
+        let start = row_idx / ROW_GROUP_SIZE * ROW_GROUP_SIZE;
+        if let Some((column, held)) = &self.pinned[col_idx] {
+            if *held == start {
+                return Ok(column.get_value(row_idx - start));
+            }
+        }
+        let store = self.volume.columns.compressed_store().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
+        })?;
+        let column = store.group_column(col_idx, row_idx / ROW_GROUP_SIZE)?;
+        let value = column.get_value(row_idx - start);
+        self.pinned[col_idx] = Some((column, start));
+        Ok(value)
+    }
+
+    /// The row at `idx` through `mapping`, every schema column
+    pub fn row(&mut self, idx: usize, mapping: &ColumnMapping) -> std::io::Result<Row> {
+        if mapping.is_identity {
+            let mut values = Vec::with_capacity(self.volume.columns.len());
+            for col_idx in 0..self.volume.columns.len() {
+                values.push(self.cell(col_idx, idx)?);
+            }
+            return Ok(Row::from_values(values));
+        }
+        let mut values = Vec::with_capacity(mapping.sources.len());
+        for source in &mapping.sources {
+            values.push(match source {
+                ColSource::Volume(col_idx) => self.cell(*col_idx, idx)?,
+                ColSource::Default(value) => value.clone(),
+            });
+        }
+        Ok(Row::from_values(values))
+    }
+}
+
 /// Source for a single schema column when reading from a frozen volume.
 /// Precomputed once per volume per scan, then used for every row.
 #[derive(Clone)]
@@ -3364,20 +3426,39 @@ impl FrozenVolume {
     }
 
     /// The first row index whose value is at least `target` in a sorted
-    /// integer or timestamp column, None when every value is below it;
-    /// a group at a time through the decoded group cache until the group
-    /// that holds it
+    /// integer or timestamp column, None when every value is below it.
+    /// The row groups' zone maps name the group that holds it, and only
+    /// that group is decoded, through the decoded group cache
     pub fn first_index_ge(&self, col_idx: usize, target: i64) -> std::io::Result<Option<usize>> {
-        let mut first = None;
-        self.for_each_group_from::<std::io::Error>(col_idx, 0, |start, column| {
+        if let Some(column) = self.columns.resident(col_idx) {
+            let first = column.binary_search_ge(target);
+            return Ok((first < column.len()).then_some(first));
+        }
+        let store = self.columns.compressed_store().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "column data is not loaded")
+        })?;
+        for group in 0..store.num_groups(col_idx) {
+            let below_target = self
+                .meta
+                .row_groups
+                .get(group)
+                .and_then(|rg| rg.zone_maps.get(col_idx))
+                .and_then(|zm| match &zm.max {
+                    Value::Integer(max) => Some(*max),
+                    Value::Timestamp(ts) => ts.timestamp_nanos_opt(),
+                    _ => None,
+                })
+                .is_some_and(|max| target > max);
+            if below_target {
+                continue;
+            }
+            let column = store.group_column(col_idx, group)?;
             let local = column.binary_search_ge(target);
             if local < column.len() {
-                first = Some(start + local);
-                return Ok(false);
+                return Ok(Some(group * ROW_GROUP_SIZE + local));
             }
-            Ok(true)
-        })?;
-        Ok(first)
+        }
+        Ok(None)
     }
 
     /// One cell, read from the column already decoded or from the row's
