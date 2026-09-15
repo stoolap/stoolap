@@ -289,20 +289,38 @@ impl VolumeFileWriter {
         let _ = std::fs::remove_file(&self.blocks_path);
         std::fs::rename(&tmp_path, &self.final_path)
             .map_err(|e| io_error("failed to rename volume file", e))?;
-        #[cfg(not(windows))]
-        if let Some(dir) = self.final_path.parent() {
-            if let Ok(d) = File::open(dir) {
-                d.sync_all()
-                    .map_err(|e| io_error("failed to fsync volume directory", e))?;
+        // From here the final file exists; whatever fails until the volume
+        // is handed over removes it, since nothing has published it
+        let published = self.publish(&kinds, &dict_tables, meta, col_count, num_groups);
+        match published {
+            Ok(volume) => {
+                self.finished = true;
+                Ok((volume, self.final_path.clone()))
+            }
+            Err(error) => {
+                let _ = std::fs::remove_file(&self.final_path);
+                Err(error)
             }
         }
-        self.finished = true;
+    }
 
-        // The volume over the file just written: the block offsets follow
-        // from the lengths as the reader computes them
-        let file = Arc::new(
-            File::open(&self.final_path).map_err(|e| io_error("failed to open volume file", e))?,
-        );
+    /// Syncs the directory and builds the volume over the file just
+    /// written: the block offsets follow from the lengths as the reader
+    /// computes them
+    fn publish(
+        &self,
+        kinds: &[(u8, u8)],
+        dict_tables: &[Vec<crate::common::SmartString>],
+        meta: super::writer::VolumeMeta,
+        col_count: usize,
+        num_groups: usize,
+    ) -> Result<FrozenVolume> {
+        #[cfg(not(windows))]
+        if let Some(dir) = self.final_path.parent() {
+            let d = File::open(dir).map_err(|e| io_error("failed to open volume directory", e))?;
+            d.sync_all()
+                .map_err(|e| io_error("failed to fsync volume directory", e))?;
+        }
         let blocks_start = 20 + lz4_meta_len(&self.final_path)? + col_count * num_groups * 16;
         let mut offsets = Vec::with_capacity(col_count);
         let mut comp_lens = Vec::with_capacity(col_count);
@@ -335,7 +353,7 @@ impl VolumeFileWriter {
         }
         let column_types = meta.column_types.clone();
         let store = CompressedBlockStore::from_file(
-            file,
+            self.final_path.clone(),
             offsets,
             comp_lens,
             decomp_lens,
@@ -347,15 +365,14 @@ impl VolumeFileWriter {
             ROW_GROUP_SIZE,
             meta.row_count,
         );
-        let volume = FrozenVolume {
+        Ok(FrozenVolume {
             columns: LazyColumns::deferred(store, column_types),
             meta: Arc::new(meta),
             unique_indices: Arc::new(parking_lot::RwLock::new(rustc_hash::FxHashMap::default())),
             last_access_epoch: std::sync::atomic::AtomicU64::new(
                 super::writer::GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
             ),
-        };
-        Ok((volume, self.final_path.clone()))
+        })
     }
 
     /// Drops the writer and removes what it wrote
@@ -604,10 +621,11 @@ mod tests {
             } => (ids, dictionary, nulls),
             _ => unreachable!(),
         };
-        // 4,096 a batch: the boundaries fall inside batches
+        // 10,000 a batch, which does not divide the group size: the
+        // boundaries fall inside batches
         let mut start = 0;
         while start < rows as usize {
-            let end = (start + 4_096).min(rows as usize);
+            let end = (start + 10_000).min(rows as usize);
             let interned: Vec<u32> = (start..end)
                 .map(|i| {
                     writer
@@ -658,6 +676,73 @@ mod tests {
             reread.columns.get(0).unwrap().get_i64(rows as usize - 1),
             rows - 1
         );
+    }
+
+    /// The final file is renamed into place before the volume is built
+    /// over it; a failure after the rename must not leave it behind
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_after_the_rename_removes_the_final_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let schema = schema();
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = VolumeFileWriter::new(dir.path(), "t", 13, &schema, 10, true).unwrap();
+        // The temporary file already exists, writable but not readable:
+        // the writer writes it, renames it, and cannot open it to read
+        let tmp = writer.path().with_extension("vol.tmp");
+        std::fs::write(&tmp, b"").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o200)).unwrap();
+        let ids = [1i64];
+        let nulls = [false];
+        let name = writer.builder().unwrap().intern_text(5, "a").unwrap();
+        writer
+            .append_typed(
+                &ids,
+                &[
+                    TypedCells::Int64 {
+                        values: &ids,
+                        nulls: &nulls,
+                    },
+                    TypedCells::Int64 {
+                        values: &[5],
+                        nulls: &nulls,
+                    },
+                    TypedCells::Float64 {
+                        values: &[0.5],
+                        nulls: &nulls,
+                    },
+                    TypedCells::TimestampNanos {
+                        values: &[1],
+                        nulls: &nulls,
+                    },
+                    TypedCells::Boolean {
+                        values: &[true],
+                        nulls: &nulls,
+                    },
+                    TypedCells::Dictionary {
+                        ids: &[name],
+                        nulls: &nulls,
+                    },
+                    TypedCells::Bytes {
+                        data: b"{}",
+                        offsets: &[(0, 2)],
+                        nulls: &nulls,
+                    },
+                ],
+            )
+            .unwrap();
+        let final_path = writer.path().to_path_buf();
+        let error = match writer.finish() {
+            Ok(_) => panic!("finish succeeded on an unreadable file"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("failed to open volume"),
+            "{error}"
+        );
+        assert!(!final_path.exists(), "the final file was left behind");
+        assert!(!final_path.with_extension("vol.tmp").exists());
+        assert!(!final_path.with_extension("blocks.tmp").exists());
     }
 
     #[test]

@@ -370,7 +370,7 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
     if hasher.finalize() != stored_crc {
         return Err(inv("CRC mismatch"));
     }
-    let file = Arc::new(reader.into_inner());
+    drop(reader);
 
     // 7. Build the file-backed CompressedBlockStore + deferred LazyColumns.
     //    Columns start in the file. First scan decodes per group on
@@ -389,7 +389,7 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
         ranges
     };
     let store = CompressedBlockStore::from_file(
-        file,
+        path.to_path_buf(),
         all_offsets,
         all_comp_lens,
         all_decomp_lens,

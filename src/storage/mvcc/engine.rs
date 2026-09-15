@@ -3915,8 +3915,19 @@ impl MVCCEngine {
         {
             let mut mgrs = self.segment_managers.write().unwrap();
             if let Some(mgr) = mgrs.remove(&old_name_lower) {
-                mgr.rename(new_name_lower.as_str());
                 mgrs.insert(new_name_lower.clone(), mgr);
+            }
+        }
+        // The manager takes the new name with the files: a table whose
+        // files are not moved takes it here
+        let files_to_move = (*self.persistence)
+            .as_ref()
+            .filter(|pm| pm.is_enabled())
+            .map(|pm| pm.path().join("volumes").join(&old_name_lower))
+            .is_some_and(|old_dir| old_dir.exists());
+        if !files_to_move {
+            if let Some(mgr) = self.segment_managers.read().unwrap().get(&new_name_lower) {
+                mgr.rename(new_name_lower.as_str());
             }
         }
         // Rename on-disk volume directory and tombstones so they survive restart
@@ -3929,14 +3940,16 @@ impl MVCCEngine {
                     // The volumes read from their files let the files go
                     // first: a directory with an open file does not rename
                     // everywhere, and the reads reload from the new name
-                    if let Some(mgr) = self.segment_managers.read().unwrap().get(&new_name_lower) {
-                        mgr.release_file_handles();
-                    }
-                    if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                    let moved = match self.segment_managers.read().unwrap().get(&new_name_lower) {
+                        Some(mgr) => mgr.rename_with(new_name_lower.as_str(), || {
+                            std::fs::rename(&old_dir, &new_dir)
+                        }),
+                        None => std::fs::rename(&old_dir, &new_dir),
+                    };
+                    if let Err(e) = moved {
                         // Revert in-memory segment manager rename on disk failure
                         let mut mgrs = self.segment_managers.write().unwrap();
                         if let Some(mgr) = mgrs.remove(&new_name_lower) {
-                            mgr.rename(old_name_lower.as_str());
                             mgrs.insert(old_name_lower.clone(), mgr);
                         }
                         drop(mgrs);
@@ -7714,8 +7727,19 @@ impl TransactionEngineOperations for EngineOperations {
         {
             let mut mgrs = self.segment_managers.write().unwrap();
             if let Some(mgr) = mgrs.remove(&old_name_lower) {
-                mgr.rename(new_name_lower.as_str());
                 mgrs.insert(new_name_lower.clone(), mgr);
+            }
+        }
+        // The manager takes the new name with the files: a table whose
+        // files are not moved takes it here
+        let files_to_move = (*self.persistence)
+            .as_ref()
+            .filter(|pm| pm.is_enabled())
+            .map(|pm| pm.path().join("volumes").join(&old_name_lower))
+            .is_some_and(|old_dir| old_dir.exists());
+        if !files_to_move {
+            if let Some(mgr) = self.segment_managers.read().unwrap().get(&new_name_lower) {
+                mgr.rename(new_name_lower.as_str());
             }
         }
         // Rename on-disk volume directory and tombstones
@@ -7728,10 +7752,13 @@ impl TransactionEngineOperations for EngineOperations {
                     // The volumes read from their files let the files go
                     // first: a directory with an open file does not rename
                     // everywhere, and the reads reload from the new name
-                    if let Some(mgr) = self.segment_managers.read().unwrap().get(&new_name_lower) {
-                        mgr.release_file_handles();
-                    }
-                    if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                    let moved = match self.segment_managers.read().unwrap().get(&new_name_lower) {
+                        Some(mgr) => mgr.rename_with(new_name_lower.as_str(), || {
+                            std::fs::rename(&old_dir, &new_dir)
+                        }),
+                        None => std::fs::rename(&old_dir, &new_dir),
+                    };
+                    if let Err(e) = moved {
                         // Revert ALL in-memory renames on disk failure
                         {
                             let mut schemas = self.schemas().write().unwrap();
@@ -7757,7 +7784,6 @@ impl TransactionEngineOperations for EngineOperations {
                         {
                             let mut mgrs = self.segment_managers.write().unwrap();
                             if let Some(mgr) = mgrs.remove(&new_name_lower) {
-                                mgr.rename(old_name_lower.as_str());
                                 mgrs.insert(old_name_lower.clone(), mgr);
                             }
                         }

@@ -52,8 +52,10 @@ use super::stats::VolumeAggregateStats;
 /// when a group is decoded
 enum BlockSource {
     Memory(Vec<Vec<Vec<u8>>>),
+    /// The file is opened for each block read and closed after it, so a
+    /// store holds no descriptor between reads
     File {
-        file: Arc<std::fs::File>,
+        path: std::path::PathBuf,
         /// offsets[col_idx][group_idx] and lens[col_idx][group_idx] of
         /// the compressed block in the file
         offsets: Vec<Vec<u64>>,
@@ -310,12 +312,13 @@ impl CompressedBlockStore {
         }
     }
 
-    /// A store whose blocks stay in the volume's file: `offsets` and
-    /// `compressed_lens` locate every (column, group) block, read by
-    /// position when a group is decoded. Nothing of the blocks is in RAM
+    /// A store whose blocks stay in the volume's file at `path`: `offsets`
+    /// and `compressed_lens` locate every (column, group) block, read by
+    /// position when a group is decoded, the file opened for the read.
+    /// Nothing of the blocks is in RAM and no descriptor is held
     #[allow(clippy::too_many_arguments)]
     pub fn from_file(
-        file: Arc<std::fs::File>,
+        path: std::path::PathBuf,
         offsets: Vec<Vec<u64>>,
         compressed_lens: Vec<Vec<usize>>,
         decompressed_lens: Vec<Vec<usize>>,
@@ -333,7 +336,7 @@ impl CompressedBlockStore {
             .collect();
         Self {
             source: BlockSource::File {
-                file,
+                path,
                 offsets,
                 lens: compressed_lens,
             },
@@ -384,7 +387,7 @@ impl CompressedBlockStore {
                 .map(Vec::as_slice)
                 .ok_or_else(missing),
             BlockSource::File {
-                file,
+                path,
                 offsets,
                 lens,
             } => {
@@ -401,7 +404,8 @@ impl CompressedBlockStore {
                     .try_reserve_exact(len)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
                 scratch.resize(len, 0);
-                read_exact_at(file, scratch, offset)?;
+                let file = std::fs::File::open(path)?;
+                read_exact_at(&file, scratch, offset)?;
                 Ok(scratch.as_slice())
             }
         }
@@ -1847,9 +1851,10 @@ impl VolumeBuilder {
         }
     }
 
-    /// Feed the bloom filters as cells arrive instead of building them over
-    /// the columns at the end; a streaming producer, whose columns leave
-    /// the accumulators group by group, needs this
+    /// Feed the bloom filters as cells arrive, from `add_row` and
+    /// `append_typed` alike, instead of building them over the columns at
+    /// the end; a streaming producer, whose columns leave the
+    /// accumulators group by group, needs this
     pub fn feed_bloom_filters(&mut self, expected_rows: usize) {
         self.bloom = Some(
             (0..self.num_cols)
@@ -2442,6 +2447,9 @@ impl VolumeBuilder {
                         }
                         self.last_values[col_idx] = Some(v);
                     }
+                    if let Some(bloom) = &mut self.bloom {
+                        bloom[col_idx].add_i64(v);
+                    }
                     self.int_cols[idx].push(v);
                 }
                 StorageKind::Float64(idx) => {
@@ -2449,6 +2457,9 @@ impl VolumeBuilder {
                         Value::Float(f) => *f,
                         _ => 0.0,
                     };
+                    if let Some(bloom) = &mut self.bloom {
+                        bloom[col_idx].add_f64(v);
+                    }
                     self.float_cols[idx].push(v);
                 }
                 StorageKind::Timestamp(idx) => {
@@ -2468,6 +2479,9 @@ impl VolumeBuilder {
                         }
                         self.last_values[col_idx] = Some(nanos);
                     }
+                    if let Some(bloom) = &mut self.bloom {
+                        bloom[col_idx].add_timestamp_nanos(nanos);
+                    }
                     self.ts_cols[idx].push(nanos);
                 }
                 StorageKind::Boolean(idx) => {
@@ -2475,6 +2489,9 @@ impl VolumeBuilder {
                         Value::Boolean(b) => *b,
                         _ => false,
                     };
+                    if let Some(bloom) = &mut self.bloom {
+                        bloom[col_idx].add_bool(v);
+                    }
                     self.bool_cols[idx].push(v);
                 }
                 StorageKind::Dictionary(idx) => {
@@ -2490,6 +2507,9 @@ impl VolumeBuilder {
                         self.dict_maps[idx].insert(s, id);
                         id
                     };
+                    if let Some(bloom) = &mut self.bloom {
+                        bloom[col_idx].add_str(self.dict_tables[idx][dict_id as usize].as_str());
+                    }
                     self.dict_cols[idx].push(dict_id);
                 }
                 StorageKind::Bytes(idx, _) => {
@@ -2502,6 +2522,9 @@ impl VolumeBuilder {
                     let offset = self.bytes_cols[idx].0.len() as u64;
                     let length = bytes.len() as u64;
                     self.bytes_cols[idx].0.extend_from_slice(bytes);
+                    if let Some(bloom) = &mut self.bloom {
+                        bloom[col_idx].add_extension_noop();
+                    }
                     self.bytes_cols[idx].1.push((offset, length));
                 }
             }
@@ -3279,6 +3302,43 @@ mod tests {
             .column("exchange", DataType::Text, false, false)
             .column("price", DataType::Float, false, false)
             .build()
+    }
+
+    #[test]
+    fn fed_bloom_filters_take_rows_added_either_way() {
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("name", DataType::Text, true, false)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.feed_bloom_filters(4);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Integer(1), Value::text("one")]),
+        );
+        let ids = [2i64];
+        let nulls = [false];
+        let name = builder.intern_text(1, "two").unwrap();
+        builder
+            .append_typed(
+                &ids,
+                &[
+                    TypedCells::Int64 {
+                        values: &ids,
+                        nulls: &nulls,
+                    },
+                    TypedCells::Dictionary {
+                        ids: &[name],
+                        nulls: &nulls,
+                    },
+                ],
+            )
+            .unwrap();
+        let volume = builder.finish().unwrap();
+        assert!(volume.meta.bloom_filters[0].might_contain(&Value::Integer(1)));
+        assert!(volume.meta.bloom_filters[0].might_contain(&Value::Integer(2)));
+        assert!(volume.meta.bloom_filters[1].might_contain(&Value::text("one")));
+        assert!(volume.meta.bloom_filters[1].might_contain(&Value::text("two")));
     }
 
     #[test]

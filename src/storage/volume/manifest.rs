@@ -1824,6 +1824,24 @@ impl SegmentManager {
         self.manifest.write().table_name = SmartString::from(new_name);
     }
 
+    /// Renames the table and moves its files as one step under the
+    /// reload lock: the volumes read from their files turn cold,
+    /// `move_dir` moves the directory, and the name changes only once the
+    /// move succeeded, so a reload meanwhile waits and then looks in the
+    /// right place. A failed move leaves the name and the files as they
+    /// were
+    pub fn rename_with(
+        &self,
+        new_name: &str,
+        move_dir: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let _reload = self.reloading.lock();
+        self.release_file_handles();
+        move_dir()?;
+        self.rename(new_name);
+        Ok(())
+    }
+
     /// Add tombstone row_ids with their commit_seq (when the tombstone was created).
     /// Lock order: manifest FIRST, then tombstones (matches read paths like
     /// deduped_row_count, total_row_count, check_value_exists_in_segments).
@@ -3684,6 +3702,58 @@ mod tests {
 
         // Volume is still in the map (not removed).
         assert_eq!(mgr.segment_count(), 1);
+    }
+
+    #[test]
+    fn a_rename_moves_the_files_before_the_name_changes() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+        let dir = tempfile::tempdir().unwrap();
+        let schema = SchemaBuilder::new("before")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = super::super::writer::VolumeBuilder::new(&schema);
+        for i in 1..=10i64 {
+            builder.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
+        }
+        let volume = builder.finish().unwrap();
+        let path =
+            crate::storage::volume::io::write_volume_to_disk(dir.path(), "before", 1, &volume)
+                .unwrap();
+        let mgr = SegmentManager::new("before", Some(dir.path().to_path_buf()));
+        mgr.register_segment(
+            1,
+            Arc::new(crate::storage::volume::io::read_volume_from_disk(&path).unwrap()),
+            SegmentMeta {
+                segment_id: 1,
+                file_path: PathBuf::from("vol_0000000000000001.vol"),
+                row_count: 10,
+                min_row_id: 1,
+                max_row_id: 10,
+                creation_lsn: 0,
+                seal_seq: 0,
+                schema_version: 0,
+            },
+            None,
+        );
+        assert!(mgr.segments_raw().get(&1).unwrap().volume.is_warm());
+        // While the files move the name is still the old one and the
+        // volume has let its file go
+        mgr.rename_with("after", || {
+            assert_eq!(mgr.table_name(), "before");
+            assert!(mgr.segments_raw().get(&1).unwrap().volume.is_cold());
+            std::fs::rename(dir.path().join("before"), dir.path().join("after"))
+        })
+        .unwrap();
+        assert_eq!(mgr.table_name(), "after");
+        // The reload finds the file under the new name
+        let reloaded = mgr.ensure_volume(1).unwrap().unwrap();
+        assert_eq!(reloaded.get_row(9).unwrap()[0], Value::Integer(10));
+        // A failed move leaves the name as it was
+        let error = mgr
+            .rename_with("elsewhere", || Err(std::io::Error::other("no move")))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "no move");
+        assert_eq!(mgr.table_name(), "after");
     }
 
     #[test]
