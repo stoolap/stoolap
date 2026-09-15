@@ -41,6 +41,23 @@ use crate::core::{DataType, Error, Result, Schema, Value};
 use super::column::{ColumnData, ROW_GROUP_SIZE};
 use super::writer::{ColSource, ColumnMapping, FrozenVolume, TypedCells, VolumeBuilder};
 
+/// Where a transfer's batches go: a builder in memory or a file writer.
+/// Text reaches the sink as ids of its own dictionary, from `intern_text`
+pub trait TypedSink {
+    fn intern_text(&mut self, col_idx: usize, text: &str) -> Result<u32>;
+    fn append_typed(&mut self, row_ids: &[i64], columns: &[TypedCells<'_>]) -> Result<()>;
+}
+
+impl TypedSink for VolumeBuilder {
+    fn intern_text(&mut self, col_idx: usize, text: &str) -> Result<u32> {
+        VolumeBuilder::intern_text(self, col_idx, text)
+    }
+
+    fn append_typed(&mut self, row_ids: &[i64], columns: &[TypedCells<'_>]) -> Result<()> {
+        VolumeBuilder::append_typed(self, row_ids, columns)
+    }
+}
+
 /// Rows a transfer moves per batch: the bound on the handles held at once
 /// and on the scratch buffers
 pub const TRANSFER_BATCH_ROWS: usize = 4096;
@@ -342,11 +359,11 @@ impl<'a> Transfer<'a> {
     }
 
     /// Appends `refs` (row id, input, row index), in that order, to
-    /// `builder`; at most `TRANSFER_BATCH_ROWS` of them per call
+    /// `sink`; at most `TRANSFER_BATCH_ROWS` of them per call
     pub fn append(
         &mut self,
         refs: &[(i64, usize, usize)],
-        builder: &mut VolumeBuilder,
+        sink: &mut impl TypedSink,
     ) -> Result<()> {
         if refs.len() > TRANSFER_BATCH_ROWS {
             return Err(Error::internal("transfer batch exceeds its bound"));
@@ -367,11 +384,11 @@ impl<'a> Transfer<'a> {
                 &mut self.remaps,
                 &mut self.default_ids,
                 &mut self.scratch[column],
-                builder,
+                sink,
             )?;
         }
         let cells: Vec<TypedCells<'_>> = self.scratch.iter().map(Scratch::cells).collect();
-        builder.append_typed(&self.row_ids, &cells)
+        sink.append_typed(&self.row_ids, &cells)
     }
 
     /// Holds a handle for every (input, group) the batch reads and lets
@@ -487,7 +504,7 @@ fn gather(
     remaps: &mut [Vec<Vec<u32>>],
     default_ids: &mut [Vec<Option<u32>>],
     scratch: &mut Scratch,
-    builder: &mut VolumeBuilder,
+    builder: &mut impl TypedSink,
 ) -> Result<()> {
     for (&(_, input, row), &handle) in refs.iter().zip(ref_handle) {
         let handle = &handles[handle as usize];
