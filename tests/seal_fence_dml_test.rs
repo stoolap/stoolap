@@ -335,3 +335,40 @@ fn a_compaction_moving_a_prepared_row_is_no_conflict() {
     let sum: i64 = db.query_one("SELECT SUM(v) FROM t", ()).unwrap();
     assert_eq!(sum, 1);
 }
+
+#[test]
+fn a_prepared_row_another_transaction_holds_fails_before_any_hot_write() {
+    use stoolap::storage::traits::Engine;
+    let dir = tempfile::tempdir().unwrap();
+    let db = cold_row(dir.path());
+    db.execute("INSERT INTO t VALUES (2, 0)", ()).unwrap();
+    // Another transaction holds row 1, uncommitted
+    let mut holder = db.engine().begin_transaction().unwrap();
+    let mut held = holder.get_table("t").unwrap();
+    assert_eq!(
+        held.update_by_row_ids(&[1], &mut |mut row| {
+            bump(&mut row);
+            Ok((row, true))
+        })
+        .unwrap(),
+        1
+    );
+    let mut txn = db.engine().begin_transaction().unwrap();
+    let mut table = txn.get_table("t").unwrap();
+    let mut calls = 0;
+    let mut setter = |mut row: stoolap::core::Row| {
+        calls += 1;
+        bump(&mut row);
+        Ok((row, true))
+    };
+    let err = table.update(None, &mut setter).unwrap_err().to_string();
+    assert!(err.contains("uncommitted changes"), "{err}");
+    // The cold row was prepared; the hot row was never set
+    assert_eq!(calls, 1);
+    drop(table);
+    txn.rollback().unwrap();
+    drop(held);
+    holder.rollback().unwrap();
+    let sum: i64 = db.query_one("SELECT SUM(v) FROM t", ()).unwrap();
+    assert_eq!(sum, 0);
+}

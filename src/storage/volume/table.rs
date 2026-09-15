@@ -826,11 +826,13 @@ impl SegmentedTable {
         Ok(())
     }
 
-    /// A hot version of a prepared row that appeared since it was
-    /// prepared is another transaction's: the statement fails with a
-    /// write conflict before it writes anything, rather than write over it
-    fn check_prepared_still_cold(hot: &dyn Table, changes: &[ColdChange]) -> Result<()> {
+    /// Claims every prepared row under the fence before anything is
+    /// written, so no other transaction can change one from here on; a
+    /// row already claimed by another, or with a hot version since it
+    /// was prepared, is that transaction's, and the statement fails
+    fn claim_prepared(hot: &dyn Table, changes: &[ColdChange]) -> Result<()> {
         for change in changes {
+            hot.try_claim_row(change.row_id)?;
             if hot.has_row_id(change.row_id)? {
                 return Err(Self::write_conflict(change.row_id));
             }
@@ -853,8 +855,6 @@ impl SegmentedTable {
             old_row,
             new_row,
         } = change;
-        // Claim the cold row to prevent concurrent lost updates.
-        hot.try_claim_row(row_id)?;
         // Insert the NEW row into hot. For int PK tables, first mirror the
         // old row (so UPDATE can find it), then update. If any step fails,
         // clean up to avoid phantoms.
@@ -1829,7 +1829,7 @@ impl Table for SegmentedTable {
         // checked outside the fence; only the hot moves happen under it
         let (_seal_guard, changes, _) =
             self.prepare_cold_updates(&self.segment_mgr, None, where_expr, setter)?;
-        Self::check_prepared_still_cold(self.hot.as_ref(), &changes)?;
+        Self::claim_prepared(self.hot.as_ref(), &changes)?;
         let mut count = self.hot.update(where_expr, setter)?;
         for change in changes {
             Self::apply_cold_update(&mut self.hot, &self.segment_mgr, txn_id, change, has_int_pk)?;
@@ -1857,7 +1857,7 @@ impl Table for SegmentedTable {
         // the ids no cold volume holds are the hot store's
         let (_seal_guard, changes, hot_ids) =
             self.prepare_cold_updates(&self.segment_mgr, Some(row_ids), None, setter)?;
-        Self::check_prepared_still_cold(self.hot.as_ref(), &changes)?;
+        Self::claim_prepared(self.hot.as_ref(), &changes)?;
         let mut count = 0i32;
         for change in changes {
             Self::apply_cold_update(&mut self.hot, &self.segment_mgr, txn_id, change, has_int_pk)?;
