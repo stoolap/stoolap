@@ -3915,9 +3915,19 @@ impl MVCCEngine {
         {
             let mut mgrs = self.segment_managers.write().unwrap();
             if let Some(mgr) = mgrs.remove(&old_name_lower) {
-                mgr.manifest_mut().table_name =
-                    crate::common::SmartString::from(new_name_lower.as_str());
                 mgrs.insert(new_name_lower.clone(), mgr);
+            }
+        }
+        // The manager takes the new name with the files: a table whose
+        // files are not moved takes it here
+        let files_to_move = (*self.persistence)
+            .as_ref()
+            .filter(|pm| pm.is_enabled())
+            .map(|pm| pm.path().join("volumes").join(&old_name_lower))
+            .is_some_and(|old_dir| old_dir.exists());
+        if !files_to_move {
+            if let Some(mgr) = self.segment_managers.read().unwrap().get(&new_name_lower) {
+                mgr.rename(new_name_lower.as_str());
             }
         }
         // Rename on-disk volume directory and tombstones so they survive restart
@@ -3927,12 +3937,24 @@ impl MVCCEngine {
                 let old_dir = vol_dir.join(&old_name_lower);
                 let new_dir = vol_dir.join(&new_name_lower);
                 if old_dir.exists() {
-                    if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                    // The directory moves and every holder of a file in it
+                    // moves with it, under the manager's reload lock, the
+                    // name changing only once the move succeeded
+                    let move_dir = || {
+                        crate::storage::volume::writer::VolumeFile::relocate(
+                            &old_dir,
+                            &new_dir,
+                            || std::fs::rename(&old_dir, &new_dir),
+                        )
+                    };
+                    let moved = match self.segment_managers.read().unwrap().get(&new_name_lower) {
+                        Some(mgr) => mgr.rename_with(new_name_lower.as_str(), move_dir),
+                        None => move_dir(),
+                    };
+                    if let Err(e) = moved {
                         // Revert in-memory segment manager rename on disk failure
                         let mut mgrs = self.segment_managers.write().unwrap();
                         if let Some(mgr) = mgrs.remove(&new_name_lower) {
-                            mgr.manifest_mut().table_name =
-                                crate::common::SmartString::from(old_name_lower.as_str());
                             mgrs.insert(old_name_lower.clone(), mgr);
                         }
                         drop(mgrs);
@@ -5913,9 +5935,12 @@ impl MVCCEngine {
 
                 let vol_dir = pm.path().join("volumes");
                 let vol_table_dir = vol_dir.join(table_name);
-                let old_filenames: FxHashSet<String> = old_ids
+                // A file read by a volume some reader may still hold is
+                // removed when the last holder lets go; the others now
+                let old_filenames: FxHashSet<String> = volumes
                     .iter()
-                    .map(|id| format!("vol_{:016x}.vol", id))
+                    .filter(|(_, vol)| !vol.retire_file())
+                    .map(|(id, _)| format!("vol_{:016x}.vol", id))
                     .collect();
                 if let Ok(entries) = std::fs::read_dir(&vol_table_dir) {
                     for entry in entries.flatten() {
@@ -6166,9 +6191,12 @@ impl MVCCEngine {
 
             // Now safe to delete old volume files + stale .dv files.
             let vol_table_dir = vol_dir.join(table_name);
-            let old_filenames: FxHashSet<String> = old_ids
+            // A file read by a volume some reader may still hold is removed
+            // when the last holder lets go; the others now
+            let old_filenames: FxHashSet<String> = volumes
                 .iter()
-                .map(|id| format!("vol_{:016x}.vol", id))
+                .filter(|(_, vol)| !vol.retire_file())
+                .map(|(id, _)| format!("vol_{:016x}.vol", id))
                 .collect();
             if let Ok(entries) = std::fs::read_dir(&vol_table_dir) {
                 for entry in entries.flatten() {
@@ -7710,9 +7738,19 @@ impl TransactionEngineOperations for EngineOperations {
         {
             let mut mgrs = self.segment_managers.write().unwrap();
             if let Some(mgr) = mgrs.remove(&old_name_lower) {
-                mgr.manifest_mut().table_name =
-                    crate::common::SmartString::from(new_name_lower.as_str());
                 mgrs.insert(new_name_lower.clone(), mgr);
+            }
+        }
+        // The manager takes the new name with the files: a table whose
+        // files are not moved takes it here
+        let files_to_move = (*self.persistence)
+            .as_ref()
+            .filter(|pm| pm.is_enabled())
+            .map(|pm| pm.path().join("volumes").join(&old_name_lower))
+            .is_some_and(|old_dir| old_dir.exists());
+        if !files_to_move {
+            if let Some(mgr) = self.segment_managers.read().unwrap().get(&new_name_lower) {
+                mgr.rename(new_name_lower.as_str());
             }
         }
         // Rename on-disk volume directory and tombstones
@@ -7722,7 +7760,21 @@ impl TransactionEngineOperations for EngineOperations {
                 let old_dir = vol_dir.join(&old_name_lower);
                 let new_dir = vol_dir.join(&new_name_lower);
                 if old_dir.exists() {
-                    if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+                    // The directory moves and every holder of a file in it
+                    // moves with it, under the manager's reload lock, the
+                    // name changing only once the move succeeded
+                    let move_dir = || {
+                        crate::storage::volume::writer::VolumeFile::relocate(
+                            &old_dir,
+                            &new_dir,
+                            || std::fs::rename(&old_dir, &new_dir),
+                        )
+                    };
+                    let moved = match self.segment_managers.read().unwrap().get(&new_name_lower) {
+                        Some(mgr) => mgr.rename_with(new_name_lower.as_str(), move_dir),
+                        None => move_dir(),
+                    };
+                    if let Err(e) = moved {
                         // Revert ALL in-memory renames on disk failure
                         {
                             let mut schemas = self.schemas().write().unwrap();
@@ -7748,8 +7800,6 @@ impl TransactionEngineOperations for EngineOperations {
                         {
                             let mut mgrs = self.segment_managers.write().unwrap();
                             if let Some(mgr) = mgrs.remove(&new_name_lower) {
-                                mgr.manifest_mut().table_name =
-                                    crate::common::SmartString::from(old_name_lower.as_str());
                                 mgrs.insert(old_name_lower.clone(), mgr);
                             }
                         }

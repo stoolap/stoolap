@@ -634,8 +634,8 @@ impl StatementSnapshot {
 }
 
 pub struct SegmentManager {
-    /// Table name.
-    table_name: SmartString,
+    /// Table name; a rename changes it under every open handle
+    table_name: RwLock<SmartString>,
     /// The manifest (source of truth for segment state).
     manifest: RwLock<TableManifest>,
     /// Loaded segments with pre-computed column mappings, keyed by segment_id.
@@ -710,7 +710,7 @@ impl SegmentManager {
     /// Create a new segment manager for a table.
     pub fn new(table_name: &str, volume_dir: Option<PathBuf>) -> Self {
         Self {
-            table_name: SmartString::from(table_name),
+            table_name: RwLock::new(SmartString::from(table_name)),
             manifest: RwLock::new(TableManifest::new(table_name)),
             segments: RwLock::new(Arc::new(FxHashMap::default())),
             volume_dir,
@@ -737,7 +737,7 @@ impl SegmentManager {
         let table_name = manifest.table_name.clone();
         let tombstone_map: FxHashMap<i64, u64> = manifest.tombstones.iter().copied().collect();
         Self {
-            table_name,
+            table_name: RwLock::new(table_name),
             manifest: RwLock::new(manifest),
             segments: RwLock::new(Arc::new(FxHashMap::default())),
             volume_dir,
@@ -760,8 +760,8 @@ impl SegmentManager {
     }
 
     /// Get the table name.
-    pub fn table_name(&self) -> &str {
-        &self.table_name
+    pub fn table_name(&self) -> SmartString {
+        self.table_name.read().clone()
     }
 
     /// Ensure all volumes have column data before column access.
@@ -829,7 +829,7 @@ impl SegmentManager {
                     message: format!(
                         "table '{}': cold volume reload failed for segment(s) {:?}; \
                          refusing to serve partial data",
-                        self.table_name,
+                        self.table_name.read(),
                         cold.iter().map(|(id, _)| *id).collect::<Vec<_>>()
                     ),
                 });
@@ -934,7 +934,8 @@ impl SegmentManager {
                     message: format!(
                         "table '{}': cold volume reload failed for segment(s) {:?}; \
                          refusing to serve partial data",
-                        self.table_name, cold
+                        self.table_name.read(),
+                        cold
                     ),
                 });
             }
@@ -1398,8 +1399,12 @@ impl SegmentManager {
                 let vol = &cs.volume;
                 let tier = if vol.columns.is_eager() {
                     "hot"
-                } else if vol.columns.has_compressed_store() {
-                    "warm"
+                } else if let Some(store) = vol.columns.compressed_store() {
+                    if store.is_file_backed() {
+                        "file"
+                    } else {
+                        "warm"
+                    }
                 } else {
                     "cold"
                 };
@@ -1513,7 +1518,7 @@ impl SegmentManager {
         let mut failed = Vec::new();
         for &id in &ids {
             let filename = format!("vol_{:016x}.vol", id);
-            let full_path = vol_dir.join(self.table_name.as_str()).join(filename);
+            let full_path = vol_dir.join(self.table_name.read().as_str()).join(filename);
             match crate::storage::volume::io::read_volume_from_disk(&full_path) {
                 Ok(volume) => {
                     reloaded.push((id, Arc::new(volume)));
@@ -1521,7 +1526,9 @@ impl SegmentManager {
                 Err(e) => {
                     eprintln!(
                         "Warning: Failed to reload cold volume {} seg={}: {}",
-                        self.table_name, id, e
+                        self.table_name.read(),
+                        id,
+                        e
                     );
                     failed.push(id);
                 }
@@ -1786,9 +1793,26 @@ impl SegmentManager {
     }
 
     /// Rename this segment manager's table (for ALTER TABLE RENAME).
-    pub fn rename(&mut self, new_name: &str) {
-        self.table_name = SmartString::from(new_name);
+    pub fn rename(&self, new_name: &str) {
+        *self.table_name.write() = SmartString::from(new_name);
         self.manifest.write().table_name = SmartString::from(new_name);
+    }
+
+    /// Renames the table and moves its files as one step under the
+    /// reload lock: `move_dir` moves the directory and moves every
+    /// holder's path with it, and the name changes only once the move
+    /// succeeded, so a reload meanwhile waits and then looks in the
+    /// right place. A failed move leaves the name and the files as they
+    /// were
+    pub fn rename_with(
+        &self,
+        new_name: &str,
+        move_dir: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let _reload = self.reloading.lock();
+        move_dir()?;
+        self.rename(new_name);
+        Ok(())
     }
 
     /// Add tombstone row_ids with their commit_seq (when the tombstone was created).
@@ -2115,7 +2139,8 @@ impl SegmentManager {
                             message: format!(
                                 "table '{}': cold volume reload failed for segment {}; \
                                  refusing to serve partial data",
-                                self.table_name, seg_id
+                                self.table_name.read(),
+                                seg_id
                             ),
                         });
                     }
@@ -2207,7 +2232,8 @@ impl SegmentManager {
                             message: format!(
                                 "table '{}': cold volume reload failed for segment {}; \
                                  refusing to serve partial data",
-                                self.table_name, seg_id
+                                self.table_name.read(),
+                                seg_id
                             ),
                         });
                     }
@@ -2805,7 +2831,8 @@ impl SegmentManager {
                 message: format!(
                     "table '{}': cold volume reload failed for segment(s) {:?}; \
                      refusing to serve partial data",
-                    self.table_name, cold
+                    self.table_name.read(),
+                    cold
                 ),
             });
         }
@@ -2857,11 +2884,12 @@ impl SegmentManager {
             .ok_or_else(|| crate::core::Error::Internal {
                 message: format!(
                     "table '{}': cold segment {} has no volume directory to reload from",
-                    self.table_name, seg_id
+                    self.table_name.read(),
+                    seg_id
                 ),
             })?;
         let filename = format!("vol_{:016x}.vol", seg_id);
-        let full_path = vol_dir.join(self.table_name.as_str()).join(filename);
+        let full_path = vol_dir.join(self.table_name.read().as_str()).join(filename);
         let volume = match crate::storage::volume::io::read_volume_from_disk(&full_path) {
             Ok(v) => Arc::new(v),
             Err(e) => {
@@ -2869,7 +2897,9 @@ impl SegmentManager {
                     message: format!(
                         "table '{}': failed to reload cold volume seg={}: {}; \
                          refusing to serve partial data",
-                        self.table_name, seg_id, e
+                        self.table_name.read(),
+                        seg_id,
+                        e
                     ),
                 });
             }
@@ -3645,6 +3675,67 @@ mod tests {
 
         // Volume is still in the map (not removed).
         assert_eq!(mgr.segment_count(), 1);
+    }
+
+    #[test]
+    fn a_rename_moves_the_files_before_the_name_changes() {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+        let dir = tempfile::tempdir().unwrap();
+        let schema = SchemaBuilder::new("before")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = super::super::writer::VolumeBuilder::new(&schema);
+        for i in 1..=10i64 {
+            builder.add_row(i, &Row::from_values(vec![Value::Integer(i)]));
+        }
+        let volume = builder.finish().unwrap();
+        let path =
+            crate::storage::volume::io::write_volume_to_disk(dir.path(), "before", 1, &volume)
+                .unwrap();
+        let mgr = SegmentManager::new("before", Some(dir.path().to_path_buf()));
+        mgr.register_segment(
+            1,
+            Arc::new(crate::storage::volume::io::read_volume_from_disk(&path).unwrap()),
+            SegmentMeta {
+                segment_id: 1,
+                file_path: PathBuf::from("vol_0000000000000001.vol"),
+                row_count: 10,
+                min_row_id: 1,
+                max_row_id: 10,
+                creation_lsn: 0,
+                seal_seq: 0,
+                schema_version: 0,
+            },
+            None,
+        );
+        assert!(mgr.segments_raw().get(&1).unwrap().volume.is_warm());
+        // A reader holds the volume across the move; while the files move
+        // the name is still the old one
+        let held = Arc::clone(&mgr.segments_raw().get(&1).unwrap().volume);
+        mgr.rename_with("after", || {
+            assert_eq!(mgr.table_name(), "before");
+            super::super::writer::VolumeFile::relocate(
+                &dir.path().join("before"),
+                &dir.path().join("after"),
+                || std::fs::rename(dir.path().join("before"), dir.path().join("after")),
+            )
+        })
+        .unwrap();
+        assert_eq!(mgr.table_name(), "after");
+        // The reader still holding the volume reads it at its new place,
+        // and a reload finds it there too
+        assert_eq!(held.get_row(9).unwrap()[0], Value::Integer(10));
+        let cold = Arc::new(held.to_cold());
+        drop(held);
+        drop(cold);
+        let reloaded = mgr.ensure_volume(1).unwrap().unwrap();
+        assert_eq!(reloaded.get_row(9).unwrap()[0], Value::Integer(10));
+        // A failed move leaves the name as it was
+        let error = mgr
+            .rename_with("elsewhere", || Err(std::io::Error::other("no move")))
+            .unwrap_err();
+        assert_eq!(error.to_string(), "no move");
+        assert_eq!(mgr.table_name(), "after");
     }
 
     #[test]

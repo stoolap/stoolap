@@ -47,9 +47,199 @@ use super::stats::VolumeAggregateStats;
 /// Holds LZ4-compressed column data in RAM. Each column is split into row-group-
 /// sized blocks (64K rows). Decompression from RAM runs at ~4 GB/s, negligible
 /// compared to disk I/O. This is the backing store for LazyColumns.
+/// A volume file as every store that reads it shares it: the path a read
+/// opens, which a table rename moves under every holder, and whether the
+/// file is to be removed once the last holder lets go. One per file in
+/// the process, so a volume reloaded into a new store shares the file
+/// with the readers still holding the old one
+pub struct VolumeFile {
+    path: parking_lot::RwLock<std::path::PathBuf>,
+    retired: std::sync::atomic::AtomicBool,
+}
+
+/// The files of the process by path, and where a file whose last holder
+/// is letting go was moved meanwhile
+#[derive(Default)]
+struct VolumeFiles {
+    files: std::collections::HashMap<std::path::PathBuf, std::sync::Weak<VolumeFile>>,
+    forwarded: std::collections::HashMap<std::path::PathBuf, std::path::PathBuf>,
+}
+
+static VOLUME_FILES: std::sync::LazyLock<parking_lot::Mutex<VolumeFiles>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(VolumeFiles::default()));
+
+impl VolumeFile {
+    /// The handle of the file at `path`, the one every holder shares
+    pub fn shared(path: &std::path::Path) -> Arc<VolumeFile> {
+        let mut registry = VOLUME_FILES.lock();
+        if let Some(file) = registry.files.get(path).and_then(std::sync::Weak::upgrade) {
+            return file;
+        }
+        let file = Arc::new(VolumeFile {
+            path: parking_lot::RwLock::new(path.to_path_buf()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+        });
+        registry
+            .files
+            .insert(path.to_path_buf(), Arc::downgrade(&file));
+        file
+    }
+
+    /// Where the file is now
+    pub fn path(&self) -> std::path::PathBuf {
+        self.path.read().clone()
+    }
+
+    /// Removes the file once the last holder lets go
+    pub fn retire(&self) {
+        self.retired
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn open(&self) -> std::io::Result<std::fs::File> {
+        std::fs::File::open(&*self.path.read())
+    }
+
+    /// Moves every file under `old_dir` to `new_dir` through `move_dir`:
+    /// a holder's read meanwhile waits for the move and opens the new
+    /// path after it; a failed move leaves every path as it was
+    pub fn relocate(
+        old_dir: &std::path::Path,
+        new_dir: &std::path::Path,
+        move_dir: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut registry = VOLUME_FILES.lock();
+        let (result, held) = Self::relocate_in(&mut registry, old_dir, new_dir, move_dir);
+        // Strong holders outlive the registry lock: the last one's drop takes it
+        drop(registry);
+        drop(held);
+        result
+    }
+
+    /// The move under the registry lock; a file whose last holder is
+    /// letting go, its drop waiting on the lock, moves too and is
+    /// forwarded so that drop removes it at its new place
+    fn relocate_in(
+        registry: &mut VolumeFiles,
+        old_dir: &std::path::Path,
+        new_dir: &std::path::Path,
+        move_dir: impl FnOnce() -> std::io::Result<()>,
+    ) -> (std::io::Result<()>, Vec<Arc<VolumeFile>>) {
+        let mut moved: Vec<(std::path::PathBuf, Arc<VolumeFile>)> = Vec::new();
+        let mut letting_go: Vec<std::path::PathBuf> = Vec::new();
+        for (path, file) in registry.files.iter() {
+            if !path.starts_with(old_dir) {
+                continue;
+            }
+            match file.upgrade() {
+                Some(file) => moved.push((path.clone(), file)),
+                None => letting_go.push(path.clone()),
+            }
+        }
+        let mut paths: Vec<_> = moved.iter().map(|(_, file)| file.path.write()).collect();
+        let result = move_dir();
+        if result.is_ok() {
+            for ((old_path, file), path) in moved.iter().zip(paths.iter_mut()) {
+                let Ok(rest) = old_path.strip_prefix(old_dir) else {
+                    continue;
+                };
+                let new_path = new_dir.join(rest);
+                registry.files.remove(old_path);
+                registry
+                    .files
+                    .insert(new_path.clone(), Arc::downgrade(file));
+                **path = new_path;
+            }
+            for old_path in letting_go {
+                let Ok(rest) = old_path.strip_prefix(old_dir) else {
+                    continue;
+                };
+                let new_path = new_dir.join(rest);
+                if let Some(weak) = registry.files.remove(&old_path) {
+                    registry.files.insert(new_path.clone(), weak);
+                }
+                registry.forwarded.insert(old_path, new_path);
+            }
+        }
+        drop(paths);
+        (result, moved.into_iter().map(|(_, file)| file).collect())
+    }
+}
+
+impl Drop for VolumeFile {
+    fn drop(&mut self) {
+        let mut path = self.path.get_mut().clone();
+        // The file goes under the registry lock, which a move holds too
+        let mut registry = VOLUME_FILES.lock();
+        while let Some(moved_to) = registry.forwarded.remove(&path) {
+            path = moved_to;
+        }
+        if registry
+            .files
+            .get(&path)
+            .is_some_and(|file| file.strong_count() == 0)
+        {
+            registry.files.remove(&path);
+        }
+        if self.retired.load(std::sync::atomic::Ordering::Acquire) {
+            let _ = std::fs::remove_file(&path);
+        }
+        drop(registry);
+    }
+}
+
+/// Where a store's blocks live: in memory for a volume just sealed or
+/// compressed from its columns, or in the volume's file, read by position
+/// when a group is decoded
+enum BlockSource {
+    Memory(Vec<Vec<Vec<u8>>>),
+    /// The file is opened for each block read and closed after it, so a
+    /// store holds no descriptor between reads
+    File {
+        file: Arc<VolumeFile>,
+        /// offsets[col_idx][group_idx] and lens[col_idx][group_idx] of
+        /// the compressed block in the file
+        offsets: Vec<Vec<u64>>,
+        lens: Vec<Vec<usize>>,
+    },
+}
+
+/// Reads `buf.len()` bytes at `offset` without moving a shared cursor
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "volume file ends inside a block",
+                ));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, buf, offset);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "positional volume reads are not supported on this platform",
+        ))
+    }
+}
+
 pub struct CompressedBlockStore {
-    /// blocks[col_idx][group_idx] = LZ4-compressed bytes (no size prefix)
-    blocks: Vec<Vec<Vec<u8>>>,
+    /// The compressed block of every (column, group), in memory or in the file
+    source: BlockSource,
     /// decompressed_lens[col_idx][group_idx] = exact decompressed size
     decompressed_lens: Vec<Vec<usize>>,
     /// Column type tags (COL_INT64, COL_FLOAT64, etc.) for deserialization
@@ -219,7 +409,7 @@ impl CompressedBlockStore {
             .map(|(ci, start, end)| (*ci, Arc::from(&shared_dict[*start..*end])))
             .collect();
         Ok(Self {
-            blocks: all_blocks,
+            source: BlockSource::Memory(all_blocks),
             decompressed_lens: all_decomp_lens,
             col_type_tags,
             col_data_types: col_data_types.to_vec(),
@@ -251,7 +441,7 @@ impl CompressedBlockStore {
             .collect();
         // shared_dict and dict_ranges are consumed — only col_dicts kept
         Self {
-            blocks,
+            source: BlockSource::Memory(blocks),
             decompressed_lens,
             col_type_tags,
             col_data_types,
@@ -263,15 +453,121 @@ impl CompressedBlockStore {
         }
     }
 
-    /// Decompress a single column from RAM. Concatenates all row-group blocks.
-    /// Runs at ~4 GB/s (LZ4 from RAM), typically <1ms per column.
-    pub fn decompress_column(&self, col_idx: usize) -> std::io::Result<ColumnData> {
-        let col_blocks = self.blocks.get(col_idx).ok_or_else(|| {
+    /// A store whose blocks stay in the volume's file at `path`: `offsets`
+    /// and `compressed_lens` locate every (column, group) block, read by
+    /// position when a group is decoded, the file opened for the read.
+    /// Nothing of the blocks is in RAM and no descriptor is held
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_file(
+        path: std::path::PathBuf,
+        offsets: Vec<Vec<u64>>,
+        compressed_lens: Vec<Vec<usize>>,
+        decompressed_lens: Vec<Vec<usize>>,
+        col_type_tags: Vec<u8>,
+        col_data_types: Vec<DataType>,
+        col_ext_types: Vec<u8>,
+        shared_dict: Vec<SmartString>,
+        dict_ranges: Vec<(usize, usize, usize)>,
+        group_size: usize,
+        row_count: usize,
+    ) -> Self {
+        let col_dicts: Vec<(usize, Arc<[SmartString]>)> = dict_ranges
+            .iter()
+            .map(|(ci, start, end)| (*ci, Arc::from(&shared_dict[*start..*end])))
+            .collect();
+        Self {
+            source: BlockSource::File {
+                file: VolumeFile::shared(&path),
+                offsets,
+                lens: compressed_lens,
+            },
+            decompressed_lens,
+            col_type_tags,
+            col_data_types,
+            col_ext_types,
+            col_dicts,
+            group_size,
+            row_count,
+            id: next_store_id(),
+        }
+    }
+
+    /// Whether the blocks live in the volume's file rather than in RAM
+    pub fn is_file_backed(&self) -> bool {
+        matches!(self.source, BlockSource::File { .. })
+    }
+
+    /// Removes the volume's file once its last holder lets go, whichever
+    /// store holds it; false when the blocks are not in a file
+    pub fn retire_file(&self) -> bool {
+        match &self.source {
+            BlockSource::File { file, .. } => {
+                file.retire();
+                true
+            }
+            BlockSource::Memory(_) => false,
+        }
+    }
+
+    /// The number of groups of a column, from wherever the blocks live
+    fn column_groups(&self, col_idx: usize) -> std::io::Result<usize> {
+        let groups = match &self.source {
+            BlockSource::Memory(blocks) => blocks.get(col_idx).map(Vec::len),
+            BlockSource::File { lens, .. } => lens.get(col_idx).map(Vec::len),
+        };
+        groups.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "column index out of range",
             )
-        })?;
+        })
+    }
+
+    /// The compressed block of (column, group): a slice of the store's
+    /// memory, or read from the file into `scratch`
+    fn block<'s>(
+        &'s self,
+        col_idx: usize,
+        group_idx: usize,
+        scratch: &'s mut Vec<u8>,
+    ) -> std::io::Result<&'s [u8]> {
+        let missing =
+            || std::io::Error::new(std::io::ErrorKind::InvalidInput, "group index out of range");
+        match &self.source {
+            BlockSource::Memory(blocks) => blocks
+                .get(col_idx)
+                .and_then(|col| col.get(group_idx))
+                .map(Vec::as_slice)
+                .ok_or_else(missing),
+            BlockSource::File {
+                file,
+                offsets,
+                lens,
+            } => {
+                let offset = *offsets
+                    .get(col_idx)
+                    .and_then(|col| col.get(group_idx))
+                    .ok_or_else(missing)?;
+                let len = *lens
+                    .get(col_idx)
+                    .and_then(|col| col.get(group_idx))
+                    .ok_or_else(missing)?;
+                scratch.clear();
+                scratch
+                    .try_reserve_exact(len)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))?;
+                scratch.resize(len, 0);
+                read_exact_at(&file.open()?, scratch, offset)?;
+                Ok(scratch.as_slice())
+            }
+        }
+    }
+
+    /// Decompress a single column from RAM. Concatenates all row-group blocks.
+    /// Runs at ~4 GB/s (LZ4 from RAM), typically <1ms per column.
+    pub fn decompress_column(&self, col_idx: usize) -> std::io::Result<ColumnData> {
+        let num_groups = self.column_groups(col_idx)?;
+        let mut block_buf = Vec::new();
         let type_tag = *self.col_type_tags.get(col_idx).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "missing column type tag")
         })?;
@@ -285,7 +581,6 @@ impl CompressedBlockStore {
                     "invalid extension type tag",
                 )
             })?;
-        let num_groups = col_blocks.len();
         if self.group_size == 0
             || num_groups != self.row_count.div_ceil(self.group_size)
             || self.decompressed_lens.get(col_idx).map(Vec::len) != Some(num_groups)
@@ -307,15 +602,8 @@ impl CompressedBlockStore {
         };
 
         if num_groups == 1 {
-            return self.decompress_block(
-                col_idx,
-                0,
-                &col_blocks[0],
-                type_tag,
-                num_groups,
-                dict,
-                ext_type,
-            );
+            let block = self.block(col_idx, 0, &mut block_buf)?;
+            return self.decompress_block(col_idx, 0, block, type_tag, num_groups, dict, ext_type);
         }
 
         // Validate all group lengths before reserving the full-column buffers.
@@ -332,7 +620,8 @@ impl CompressedBlockStore {
             super::format::COL_INT64 => {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
-                for (gi, block) in col_blocks.iter().enumerate() {
+                for gi in 0..num_groups {
+                    let block = self.block(col_idx, gi, &mut block_buf)?;
                     self.decompress_block_into(
                         col_idx,
                         gi,
@@ -357,7 +646,8 @@ impl CompressedBlockStore {
             super::format::COL_FLOAT64 => {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
-                for (gi, block) in col_blocks.iter().enumerate() {
+                for gi in 0..num_groups {
+                    let block = self.block(col_idx, gi, &mut block_buf)?;
                     self.decompress_block_into(
                         col_idx,
                         gi,
@@ -382,7 +672,8 @@ impl CompressedBlockStore {
             super::format::COL_TIMESTAMP => {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
-                for (gi, block) in col_blocks.iter().enumerate() {
+                for gi in 0..num_groups {
+                    let block = self.block(col_idx, gi, &mut block_buf)?;
                     self.decompress_block_into(
                         col_idx,
                         gi,
@@ -407,7 +698,8 @@ impl CompressedBlockStore {
             super::format::COL_BOOLEAN => {
                 let mut all_values = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
-                for (gi, block) in col_blocks.iter().enumerate() {
+                for gi in 0..num_groups {
+                    let block = self.block(col_idx, gi, &mut block_buf)?;
                     self.decompress_block_into(
                         col_idx,
                         gi,
@@ -432,7 +724,8 @@ impl CompressedBlockStore {
             COL_DICTIONARY => {
                 let mut all_ids = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
-                for (gi, block) in col_blocks.iter().enumerate() {
+                for gi in 0..num_groups {
+                    let block = self.block(col_idx, gi, &mut block_buf)?;
                     self.decompress_block_into(
                         col_idx,
                         gi,
@@ -478,7 +771,8 @@ impl CompressedBlockStore {
                 let mut all_data = Vec::new();
                 let mut all_offsets = Vec::with_capacity(self.row_count);
                 let mut all_nulls = Vec::with_capacity(self.row_count);
-                for (gi, block) in col_blocks.iter().enumerate() {
+                for gi in 0..num_groups {
+                    let block = self.block(col_idx, gi, &mut block_buf)?;
                     self.decompress_block_into(
                         col_idx,
                         gi,
@@ -679,16 +973,9 @@ impl CompressedBlockStore {
         col_idx: usize,
         group_idx: usize,
     ) -> std::io::Result<ColumnData> {
-        let col_blocks = self.blocks.get(col_idx).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "column index out of range",
-            )
-        })?;
-        let block = col_blocks.get(group_idx).ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "group index out of range")
-        })?;
-        let num_groups = col_blocks.len();
+        let num_groups = self.column_groups(col_idx)?;
+        let mut block_buf = Vec::new();
+        let block = self.block(col_idx, group_idx, &mut block_buf)?;
         let type_tag = *self.col_type_tags.get(col_idx).ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "missing column type tag")
         })?;
@@ -759,16 +1046,7 @@ impl CompressedBlockStore {
         row_groups: &[super::column::RowGroupMeta],
         strict: bool,
     ) -> std::io::Result<Option<usize>> {
-        let num_groups = self
-            .blocks
-            .get(col_idx)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "column index out of range",
-                )
-            })?
-            .len();
+        let num_groups = self.column_groups(col_idx)?;
         match self.col_type_tags.get(col_idx).copied() {
             Some(super::format::COL_INT64 | super::format::COL_TIMESTAMP) => {}
             Some(
@@ -849,7 +1127,7 @@ impl CompressedBlockStore {
 
     /// Number of groups for a given column.
     pub fn num_groups(&self, col_idx: usize) -> usize {
-        self.blocks[col_idx].len()
+        self.column_groups(col_idx).unwrap_or(0)
     }
 
     /// Number of rows in a specific group.
@@ -868,7 +1146,7 @@ impl CompressedBlockStore {
 
     /// Number of columns.
     pub fn col_count(&self) -> usize {
-        self.blocks.len()
+        self.col_type_tags.len()
     }
 
     /// Return the shared dictionary Arc for a dictionary-encoded column.
@@ -887,9 +1165,11 @@ impl CompressedBlockStore {
     /// Total compressed bytes in RAM.
     pub fn memory_size(&self) -> usize {
         let mut size = 0;
-        for col_blocks in &self.blocks {
-            for block in col_blocks {
-                size += block.len();
+        if let BlockSource::Memory(blocks) = &self.source {
+            for col_blocks in blocks {
+                for block in col_blocks {
+                    size += block.len();
+                }
             }
         }
         // Add dictionary memory (col_dicts Arcs)
@@ -902,8 +1182,12 @@ impl CompressedBlockStore {
     }
 
     /// Access raw compressed blocks (for V4 write without re-compression).
+    /// Empty for a file-backed store, whose blocks are in the volume's file
     pub fn raw_blocks(&self) -> &[Vec<Vec<u8>>] {
-        &self.blocks
+        match &self.source {
+            BlockSource::Memory(blocks) => blocks,
+            BlockSource::File { .. } => &[],
+        }
     }
 
     /// Column type tags.
@@ -1339,6 +1623,14 @@ pub struct VolumeBuilder {
     sorted: Vec<bool>,
     // Row count
     row_count: usize,
+    /// Bloom filters fed as the cells arrive, when the producer asked for
+    /// them; otherwise built over the columns at `finish`
+    bloom: Option<Vec<super::column::ColumnBloomFilter>>,
+    /// The row groups flushed out of the accumulators by a streaming
+    /// producer, with their zone maps
+    row_groups: Vec<super::column::RowGroupMeta>,
+    /// Rows flushed out of the accumulators so far
+    flushed_rows: usize,
 }
 
 /// One output column's cells for a batch of rows in the column's storage
@@ -1371,7 +1663,7 @@ pub enum TypedCells<'a> {
     },
 }
 
-impl TypedCells<'_> {
+impl<'a> TypedCells<'a> {
     pub fn len(&self) -> usize {
         match self {
             TypedCells::Int64 { nulls, .. }
@@ -1385,6 +1677,42 @@ impl TypedCells<'_> {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The cells at `range`; a bytes column keeps its whole payload with
+    /// the offsets of the range, which every consumer reads by offset
+    pub fn slice(&self, range: std::ops::Range<usize>) -> TypedCells<'a> {
+        match self {
+            TypedCells::Int64 { values, nulls } => TypedCells::Int64 {
+                values: &values[range.clone()],
+                nulls: &nulls[range],
+            },
+            TypedCells::Float64 { values, nulls } => TypedCells::Float64 {
+                values: &values[range.clone()],
+                nulls: &nulls[range],
+            },
+            TypedCells::TimestampNanos { values, nulls } => TypedCells::TimestampNanos {
+                values: &values[range.clone()],
+                nulls: &nulls[range],
+            },
+            TypedCells::Boolean { values, nulls } => TypedCells::Boolean {
+                values: &values[range.clone()],
+                nulls: &nulls[range],
+            },
+            TypedCells::Dictionary { ids, nulls } => TypedCells::Dictionary {
+                ids: &ids[range.clone()],
+                nulls: &nulls[range],
+            },
+            TypedCells::Bytes {
+                data,
+                offsets,
+                nulls,
+            } => TypedCells::Bytes {
+                data,
+                offsets: &offsets[range.clone()],
+                nulls: &nulls[range],
+            },
+        }
     }
 }
 
@@ -1402,6 +1730,152 @@ fn extend_extents(min: &mut Value, max: &mut Value, value: &Value) {
     }
     if let Ok(std::cmp::Ordering::Greater) = value.compare(max) {
         *max = value.clone();
+    }
+}
+
+/// Original and lowercase names to positions, one entry when they agree
+fn column_name_map(column_names: &[String]) -> AHashMap<SmartString, usize> {
+    column_names
+        .iter()
+        .enumerate()
+        .flat_map(|(i, name)| {
+            let lower = SmartString::from(name.to_lowercase());
+            let original = SmartString::from(name.as_str());
+            if lower == original {
+                vec![(lower, i)]
+            } else {
+                vec![(original, i), (lower, i)]
+            }
+        })
+        .collect()
+}
+
+/// The zone map of one row group over its typed cells, as
+/// `ColumnData::zone_map_for_range` computes it over a column: text by the
+/// dictionary's strings, an extension column without extents
+fn group_zone_map(
+    cells: &TypedCells<'_>,
+    dict: Option<&[SmartString]>,
+    ext_type: DataType,
+) -> ZoneMap {
+    let row_count = cells.len() as u32;
+    let mut null_count = 0u32;
+    let (min, max) = match cells {
+        TypedCells::Int64 { values, nulls } => {
+            let (mut lo, mut hi, mut seen) = (i64::MAX, i64::MIN, false);
+            for (&v, &is_null) in values.iter().zip(*nulls) {
+                if is_null {
+                    null_count += 1;
+                } else {
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                    seen = true;
+                }
+            }
+            if seen {
+                (Value::Integer(lo), Value::Integer(hi))
+            } else {
+                (
+                    Value::Null(DataType::Integer),
+                    Value::Null(DataType::Integer),
+                )
+            }
+        }
+        TypedCells::Float64 { values, nulls } => {
+            let (mut lo, mut hi, mut seen) = (f64::INFINITY, f64::NEG_INFINITY, false);
+            for (&v, &is_null) in values.iter().zip(*nulls) {
+                if is_null {
+                    null_count += 1;
+                } else if !v.is_nan() {
+                    if !seen || v < lo {
+                        lo = v;
+                    }
+                    if !seen || v > hi {
+                        hi = v;
+                    }
+                    seen = true;
+                }
+            }
+            if seen {
+                (Value::Float(lo), Value::Float(hi))
+            } else {
+                (Value::Null(DataType::Float), Value::Null(DataType::Float))
+            }
+        }
+        TypedCells::TimestampNanos { values, nulls } => {
+            let (mut lo, mut hi, mut seen) = (i64::MAX, i64::MIN, false);
+            for (&v, &is_null) in values.iter().zip(*nulls) {
+                if is_null {
+                    null_count += 1;
+                } else {
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                    seen = true;
+                }
+            }
+            if seen {
+                (timestamp_value(lo), timestamp_value(hi))
+            } else {
+                (
+                    Value::Null(DataType::Timestamp),
+                    Value::Null(DataType::Timestamp),
+                )
+            }
+        }
+        TypedCells::Boolean { values, nulls } => {
+            let (mut has_true, mut has_false) = (false, false);
+            for (&v, &is_null) in values.iter().zip(*nulls) {
+                if is_null {
+                    null_count += 1;
+                } else if v {
+                    has_true = true;
+                } else {
+                    has_false = true;
+                }
+            }
+            match (has_false, has_true) {
+                (true, true) => (Value::Boolean(false), Value::Boolean(true)),
+                (true, false) => (Value::Boolean(false), Value::Boolean(false)),
+                (false, true) => (Value::Boolean(true), Value::Boolean(true)),
+                (false, false) => (
+                    Value::Null(DataType::Boolean),
+                    Value::Null(DataType::Boolean),
+                ),
+            }
+        }
+        TypedCells::Dictionary { ids, nulls } => {
+            let dict = dict.unwrap_or(&[]);
+            let (mut lo, mut hi): (Option<&str>, Option<&str>) = (None, None);
+            for (&id, &is_null) in ids.iter().zip(*nulls) {
+                if is_null {
+                    null_count += 1;
+                    continue;
+                }
+                let s = dict.get(id as usize).map(|s| s.as_str()).unwrap_or("");
+                lo = Some(match lo {
+                    Some(cur) if cur <= s => cur,
+                    _ => s,
+                });
+                hi = Some(match hi {
+                    Some(cur) if cur >= s => cur,
+                    _ => s,
+                });
+            }
+            match (lo, hi) {
+                (Some(lo), Some(hi)) => (Value::text(lo), Value::text(hi)),
+                _ => (Value::Null(DataType::Text), Value::Null(DataType::Text)),
+            }
+        }
+        TypedCells::Bytes { nulls, .. } => {
+            null_count = nulls.iter().filter(|n| **n).count() as u32;
+            (Value::Null(ext_type), Value::Null(ext_type))
+        }
+    };
+    ZoneMap {
+        min,
+        max,
+        null_count,
+        row_count,
     }
 }
 
@@ -1523,7 +1997,193 @@ impl VolumeBuilder {
             last_values,
             sorted,
             row_count: 0,
+            bloom: None,
+            row_groups: Vec::new(),
+            flushed_rows: 0,
         }
+    }
+
+    /// Feed the bloom filters as cells arrive, from `add_row` and
+    /// `append_typed` alike, instead of building them over the columns at
+    /// the end; a streaming producer, whose columns leave the
+    /// accumulators group by group, needs this
+    pub fn feed_bloom_filters(&mut self, expected_rows: usize) {
+        self.bloom = Some(
+            (0..self.num_cols)
+                .map(|_| super::column::ColumnBloomFilter::new(expected_rows.max(1)))
+                .collect(),
+        );
+    }
+
+    /// Rows added so far
+    pub fn row_count(&self) -> usize {
+        self.row_count
+    }
+
+    /// Rows in the accumulators, not yet flushed
+    pub fn group_len(&self) -> usize {
+        self.row_count - self.flushed_rows
+    }
+
+    /// Hands the accumulated rows to `emit` column by column as typed
+    /// cells, records them as one row group with its zone maps, and
+    /// clears the accumulators, capacity kept. The row ids, dictionaries,
+    /// extents, stats and sortedness stay: they are the volume's
+    pub fn flush_group(
+        &mut self,
+        mut emit: impl FnMut(usize, TypedCells<'_>) -> Result<()>,
+    ) -> Result<()> {
+        let rows = self.group_len();
+        if rows == 0 {
+            return Ok(());
+        }
+        let mut zone_maps = Vec::with_capacity(self.num_cols);
+        for col_idx in 0..self.num_cols {
+            let cells = self.group_cells(col_idx);
+            let dict = match self.col_storage[col_idx] {
+                StorageKind::Dictionary(idx) => Some(self.dict_tables[idx].as_slice()),
+                _ => None,
+            };
+            let ext_type = match self.col_storage[col_idx] {
+                StorageKind::Bytes(_, ext_type) => ext_type,
+                _ => DataType::Null,
+            };
+            zone_maps.push(group_zone_map(&cells, dict, ext_type));
+            emit(col_idx, cells)?;
+        }
+        self.row_groups.push(super::column::RowGroupMeta {
+            start_idx: self.flushed_rows as u32,
+            end_idx: self.row_count as u32,
+            zone_maps,
+        });
+        self.flushed_rows = self.row_count;
+        for nulls in &mut self.null_cols {
+            nulls.clear();
+        }
+        for v in &mut self.int_cols {
+            v.clear();
+        }
+        for v in &mut self.float_cols {
+            v.clear();
+        }
+        for v in &mut self.ts_cols {
+            v.clear();
+        }
+        for v in &mut self.bool_cols {
+            v.clear();
+        }
+        for v in &mut self.dict_cols {
+            v.clear();
+        }
+        for (data, offsets) in &mut self.bytes_cols {
+            data.clear();
+            offsets.clear();
+        }
+        Ok(())
+    }
+
+    /// The accumulated cells of one column in storage form
+    fn group_cells(&self, col_idx: usize) -> TypedCells<'_> {
+        let nulls = &self.null_cols[col_idx];
+        match self.col_storage[col_idx] {
+            StorageKind::Int64(idx) => TypedCells::Int64 {
+                values: &self.int_cols[idx],
+                nulls,
+            },
+            StorageKind::Float64(idx) => TypedCells::Float64 {
+                values: &self.float_cols[idx],
+                nulls,
+            },
+            StorageKind::Timestamp(idx) => TypedCells::TimestampNanos {
+                values: &self.ts_cols[idx],
+                nulls,
+            },
+            StorageKind::Boolean(idx) => TypedCells::Boolean {
+                values: &self.bool_cols[idx],
+                nulls,
+            },
+            StorageKind::Dictionary(idx) => TypedCells::Dictionary {
+                ids: &self.dict_cols[idx],
+                nulls,
+            },
+            StorageKind::Bytes(idx, _) => TypedCells::Bytes {
+                data: &self.bytes_cols[idx].0,
+                offsets: &self.bytes_cols[idx].1,
+                nulls,
+            },
+        }
+    }
+
+    /// The column's storage type tag and extension type tag, as the
+    /// metadata records them
+    pub fn column_kind(&self, col_idx: usize) -> (u8, u8) {
+        match self.col_storage[col_idx] {
+            StorageKind::Int64(_) => (super::format::COL_INT64, 0),
+            StorageKind::Float64(_) => (super::format::COL_FLOAT64, 0),
+            StorageKind::Timestamp(_) => (super::format::COL_TIMESTAMP, 0),
+            StorageKind::Boolean(_) => (super::format::COL_BOOLEAN, 0),
+            StorageKind::Dictionary(_) => (COL_DICTIONARY, 0),
+            StorageKind::Bytes(_, ext_type) => (COL_BYTES, ext_type as u8),
+        }
+    }
+
+    /// The volume's metadata and dictionaries once every row has been
+    /// flushed by a streaming producer: what `finish` computes, without
+    /// the columns. Row groups are kept only for a volume of more than
+    /// one group, as `finish` keeps them
+    pub fn finish_streamed(mut self) -> Result<(VolumeMeta, Vec<Vec<SmartString>>)> {
+        if self.flushed_rows != self.row_count {
+            return Err(Error::internal("rows left in the accumulators at finish"));
+        }
+        let bloom_filters = self
+            .bloom
+            .take()
+            .ok_or_else(|| Error::internal("streamed volume without fed bloom filters"))?;
+        let row_order = self.row_order()?;
+        let column_names: Vec<String> =
+            self.schema.columns.iter().map(|c| c.name.clone()).collect();
+        let column_types: Vec<DataType> = self.schema.columns.iter().map(|c| c.data_type).collect();
+        let column_name_map = column_name_map(&column_names);
+        let row_groups = if self.row_count > super::column::ROW_GROUP_SIZE {
+            std::mem::take(&mut self.row_groups)
+        } else {
+            Vec::new()
+        };
+        let meta = VolumeMeta {
+            zone_maps: std::mem::take(&mut self.zone_maps),
+            bloom_filters,
+            stats: std::mem::replace(&mut self.stats, VolumeAggregateStats::new(0)),
+            row_count: self.row_count,
+            column_names,
+            column_types,
+            row_ids: std::mem::take(&mut self.row_ids),
+            row_order: std::sync::OnceLock::from(row_order),
+            sorted_columns: std::mem::take(&mut self.sorted),
+            column_name_map,
+            row_groups,
+        };
+        Ok((meta, std::mem::take(&mut self.dict_tables)))
+    }
+
+    /// The permutation lookups need when the row ids do not ascend; an
+    /// error when they do not and the producer did not say so
+    fn row_order(&self) -> Result<Option<Box<[u32]>>> {
+        if self.row_ids.windows(2).all(|w| w[0] < w[1]) {
+            return Ok(None);
+        }
+        if !self.any_row_order {
+            return Err(Error::internal(
+                "volume rows were not added in ascending row id order",
+            ));
+        }
+        let order = row_order_of(&self.row_ids);
+        if order
+            .windows(2)
+            .any(|w| self.row_ids[w[0] as usize] == self.row_ids[w[1] as usize])
+        {
+            return Err(Error::internal("volume rows repeat a row id"));
+        }
+        Ok(Some(order))
     }
 
     /// Accept rows in the order the producer chose; lookups by row id then
@@ -1646,6 +2306,13 @@ impl VolumeBuilder {
             hi = hi.max(v);
             sum += v as i128;
             count += 1;
+            if let Some(bloom) = &mut self.bloom {
+                if timestamps {
+                    bloom[col_idx].add_timestamp_nanos(v);
+                } else {
+                    bloom[col_idx].add_i64(v);
+                }
+            }
             if self.sorted[col_idx] {
                 if let Some(last) = self.last_values[col_idx] {
                     if v < last {
@@ -1690,6 +2357,9 @@ impl VolumeBuilder {
                 continue;
             }
             target.push(v);
+            if let Some(bloom) = &mut self.bloom {
+                bloom[col_idx].add_f64(v);
+            }
             // NaN counts for nothing, as in add_row: it neither sums nor
             // bounds the column
             if v.is_nan() {
@@ -1736,6 +2406,9 @@ impl VolumeBuilder {
             any_true |= v;
             any_false |= !v;
             count += 1;
+            if let Some(bloom) = &mut self.bloom {
+                bloom[col_idx].add_bool(v);
+            }
             target.push(v);
         }
         if count == 0 {
@@ -1771,6 +2444,11 @@ impl VolumeBuilder {
                 continue;
             }
             count += 1;
+            if let Some(bloom) = &mut self.bloom {
+                if let Some(text) = self.dict_tables[idx].get(id as usize) {
+                    bloom[col_idx].add_str(text.as_str());
+                }
+            }
             target.push(id);
         }
         // The extents moved when the ids were interned
@@ -1803,6 +2481,9 @@ impl VolumeBuilder {
             target_offsets.push((target_data.len() as u64, length));
             target_data.extend_from_slice(payload);
             stats.non_null_count += 1;
+            if let Some(bloom) = &mut self.bloom {
+                bloom[col_idx].add_extension_noop();
+            }
             // Extension values compare equal or not at all, so the first
             // non-null value is the column's minimum and maximum for good
             if zone.min.is_null() || stats.min.is_null() {
@@ -1918,6 +2599,9 @@ impl VolumeBuilder {
                         }
                         self.last_values[col_idx] = Some(v);
                     }
+                    if let Some(bloom) = &mut self.bloom {
+                        bloom[col_idx].add_i64(v);
+                    }
                     self.int_cols[idx].push(v);
                 }
                 StorageKind::Float64(idx) => {
@@ -1925,6 +2609,9 @@ impl VolumeBuilder {
                         Value::Float(f) => *f,
                         _ => 0.0,
                     };
+                    if let Some(bloom) = &mut self.bloom {
+                        bloom[col_idx].add_f64(v);
+                    }
                     self.float_cols[idx].push(v);
                 }
                 StorageKind::Timestamp(idx) => {
@@ -1944,6 +2631,9 @@ impl VolumeBuilder {
                         }
                         self.last_values[col_idx] = Some(nanos);
                     }
+                    if let Some(bloom) = &mut self.bloom {
+                        bloom[col_idx].add_timestamp_nanos(nanos);
+                    }
                     self.ts_cols[idx].push(nanos);
                 }
                 StorageKind::Boolean(idx) => {
@@ -1951,6 +2641,9 @@ impl VolumeBuilder {
                         Value::Boolean(b) => *b,
                         _ => false,
                     };
+                    if let Some(bloom) = &mut self.bloom {
+                        bloom[col_idx].add_bool(v);
+                    }
                     self.bool_cols[idx].push(v);
                 }
                 StorageKind::Dictionary(idx) => {
@@ -1966,6 +2659,9 @@ impl VolumeBuilder {
                         self.dict_maps[idx].insert(s, id);
                         id
                     };
+                    if let Some(bloom) = &mut self.bloom {
+                        bloom[col_idx].add_str(self.dict_tables[idx][dict_id as usize].as_str());
+                    }
                     self.dict_cols[idx].push(dict_id);
                 }
                 StorageKind::Bytes(idx, _) => {
@@ -1978,6 +2674,9 @@ impl VolumeBuilder {
                     let offset = self.bytes_cols[idx].0.len() as u64;
                     let length = bytes.len() as u64;
                     self.bytes_cols[idx].0.extend_from_slice(bytes);
+                    if let Some(bloom) = &mut self.bloom {
+                        bloom[col_idx].add_extension_noop();
+                    }
                     self.bytes_cols[idx].1.push((offset, length));
                 }
             }
@@ -1989,6 +2688,11 @@ impl VolumeBuilder {
     /// in ascending row id order; any other order is an error
     pub fn finish(mut self) -> Result<FrozenVolume> {
         debug_assert_eq!(self.row_ids.len(), self.row_count);
+        if self.flushed_rows != 0 {
+            return Err(Error::internal(
+                "a builder whose groups were flushed does not finish in memory",
+            ));
+        }
         let mut columns = Vec::with_capacity(self.num_cols);
         let mut sorted_columns = Vec::with_capacity(self.num_cols);
 
@@ -2037,9 +2741,14 @@ impl VolumeBuilder {
 
         // Build bloom filters from column data using typed methods
         // to avoid allocating a Value per cell (saves ~500K allocs for 100K rows).
+        let fed = self.bloom.take();
         let bloom_filters: Vec<super::column::ColumnBloomFilter> = columns
             .iter()
-            .map(|col| {
+            .enumerate()
+            .map(|(col_idx, col)| {
+                if let Some(fed) = &fed {
+                    return fed[col_idx].clone();
+                }
                 let mut bf = super::column::ColumnBloomFilter::new(self.row_count.max(1));
                 for i in 0..self.row_count {
                     if col.is_null(i) {
@@ -2082,38 +2791,8 @@ impl VolumeBuilder {
         // Row ids name the payload at each position: lookups binary search
         // ascending ids, and otherwise a permutation only a producer that
         // ordered the rows itself gets to need
-        let row_order = if self.row_ids.windows(2).all(|w| w[0] < w[1]) {
-            None
-        } else if !self.any_row_order {
-            return Err(Error::internal(
-                "volume rows were not added in ascending row id order",
-            ));
-        } else {
-            let order = row_order_of(&self.row_ids);
-            if order
-                .windows(2)
-                .any(|w| self.row_ids[w[0] as usize] == self.row_ids[w[1] as usize])
-            {
-                return Err(Error::internal("volume rows repeat a row id"));
-            }
-            Some(order)
-        };
-
-        let column_name_map: AHashMap<SmartString, usize> = column_names
-            .iter()
-            .enumerate()
-            .flat_map(|(i, name)| {
-                let lower = SmartString::from(name.to_lowercase());
-                let original = SmartString::from(name.as_str());
-                if lower == original {
-                    // Already lowercase — one entry
-                    vec![(lower, i)]
-                } else {
-                    // Store both original and lowercase for zero-alloc lookup
-                    vec![(original, i), (lower, i)]
-                }
-            })
-            .collect();
+        let row_order = self.row_order()?;
+        let column_name_map = column_name_map(&column_names);
 
         // Build row-group zone maps for sub-volume pruning.
         // Only worth it for volumes larger than one group.
@@ -2720,6 +3399,16 @@ impl FrozenVolume {
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Has the volume's file removed once its last holder lets go, so a
+    /// reader still holding the volume, or a store reloaded from the
+    /// same file, keeps reading it; false when the volume holds no
+    /// file-backed store, in which case the caller removes the file itself
+    pub fn retire_file(&self) -> bool {
+        self.columns
+            .compressed_store()
+            .is_some_and(|store| store.retire_file())
+    }
+
     /// Whether this volume is warm (compressed blocks in RAM, no decompressed columns).
     pub fn is_warm(&self) -> bool {
         !self.columns.is_eager() && self.columns.has_compressed_store()
@@ -2775,6 +3464,130 @@ mod tests {
             .column("exchange", DataType::Text, false, false)
             .column("price", DataType::Float, false, false)
             .build()
+    }
+
+    #[test]
+    fn a_read_during_a_move_waits_for_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_dir = dir.path().join("old");
+        let new_dir = dir.path().join("new");
+        std::fs::create_dir(&old_dir).unwrap();
+        std::fs::write(old_dir.join("v.vol"), b"x").unwrap();
+        let file = VolumeFile::shared(&old_dir.join("v.vol"));
+        let reader = Arc::clone(&file);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let read = std::sync::Mutex::new(None);
+        VolumeFile::relocate(&old_dir, &new_dir, || {
+            let reader = Arc::clone(&reader);
+            let tx = tx.clone();
+            *read.lock().unwrap() = Some(std::thread::spawn(move || {
+                let opened = reader.open().map(|_| reader.path());
+                tx.send(()).unwrap();
+                opened
+            }));
+            // The read waits until the move is done
+            assert!(rx
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err());
+            std::fs::rename(&old_dir, &new_dir)
+        })
+        .unwrap();
+        let opened = read.lock().unwrap().take().unwrap().join().unwrap();
+        assert_eq!(opened.unwrap(), new_dir.join("v.vol"));
+        assert_eq!(file.path(), new_dir.join("v.vol"));
+    }
+
+    #[test]
+    fn a_holder_letting_go_during_a_move_does_not_block_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_dir = dir.path().join("old");
+        let new_dir = dir.path().join("new");
+        std::fs::create_dir(&old_dir).unwrap();
+        std::fs::write(old_dir.join("v.vol"), b"x").unwrap();
+        let file = VolumeFile::shared(&old_dir.join("v.vol"));
+        file.retire();
+        let moved = std::thread::spawn(move || {
+            VolumeFile::relocate(&old_dir, &new_dir, || {
+                drop(file);
+                std::fs::rename(&old_dir, &new_dir)
+            })
+            .unwrap();
+            new_dir
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !moved.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            moved.is_finished(),
+            "the move waits on its own registry lock"
+        );
+        let new_dir = moved.join().unwrap();
+        // The retired file went with the last holder, at its new place
+        assert!(!new_dir.join("v.vol").exists());
+        assert!(!dir.path().join("old").join("v.vol").exists());
+    }
+
+    #[test]
+    fn a_file_whose_last_holder_lets_go_during_a_move_is_removed_at_its_new_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_dir = dir.path().join("old");
+        let new_dir = dir.path().join("new");
+        std::fs::create_dir(&old_dir).unwrap();
+        std::fs::write(old_dir.join("v.vol"), b"x").unwrap();
+        let file = VolumeFile::shared(&old_dir.join("v.vol"));
+        file.retire();
+        // The move holds the registry; the last holder lets go meanwhile,
+        // its drop waiting on the lock
+        let mut registry = VOLUME_FILES.lock();
+        let letting_go = std::thread::spawn(move || drop(file));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let (result, held) = VolumeFile::relocate_in(&mut registry, &old_dir, &new_dir, || {
+            std::fs::rename(&old_dir, &new_dir)
+        });
+        result.unwrap();
+        assert!(held.is_empty());
+        drop(registry);
+        letting_go.join().unwrap();
+        assert!(!new_dir.join("v.vol").exists());
+        assert!(VOLUME_FILES.lock().forwarded.is_empty());
+    }
+
+    #[test]
+    fn fed_bloom_filters_take_rows_added_either_way() {
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("name", DataType::Text, true, false)
+            .build();
+        let mut builder = VolumeBuilder::new(&schema);
+        builder.feed_bloom_filters(4);
+        builder.add_row(
+            1,
+            &Row::from_values(vec![Value::Integer(1), Value::text("one")]),
+        );
+        let ids = [2i64];
+        let nulls = [false];
+        let name = builder.intern_text(1, "two").unwrap();
+        builder
+            .append_typed(
+                &ids,
+                &[
+                    TypedCells::Int64 {
+                        values: &ids,
+                        nulls: &nulls,
+                    },
+                    TypedCells::Dictionary {
+                        ids: &[name],
+                        nulls: &nulls,
+                    },
+                ],
+            )
+            .unwrap();
+        let volume = builder.finish().unwrap();
+        assert!(volume.meta.bloom_filters[0].might_contain(&Value::Integer(1)));
+        assert!(volume.meta.bloom_filters[0].might_contain(&Value::Integer(2)));
+        assert!(volume.meta.bloom_filters[1].might_contain(&Value::text("one")));
+        assert!(volume.meta.bloom_filters[1].might_contain(&Value::text("two")));
     }
 
     #[test]
