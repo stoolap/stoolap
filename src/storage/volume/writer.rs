@@ -3757,24 +3757,33 @@ mod tests {
         // that let its groups go would decode them again row after row
         DECODED_GROUPS.set_budget_bytes(0);
         DECODED_GROUPS.set_budget_bytes(1);
-        let before = DECODED_GROUPS.stats().misses;
-        let mut reader = RowReader::new(Arc::clone(&warm));
-        for i in (0..rows as usize).step_by(97) {
-            let row = reader
-                .row(
-                    i,
-                    &ColumnMapping {
-                        sources: Vec::new(),
-                        names: Vec::new(),
-                        is_identity: true,
-                    },
-                )
-                .unwrap();
-            assert_eq!(row[0], Value::Integer(i as i64));
+        // The miss count is process wide and other tests decode meanwhile:
+        // a reader that let its groups go decodes on every row, so one
+        // undisturbed attempt at exactly four is the proof
+        let mut misses = 0;
+        for _ in 0..5 {
+            let before = DECODED_GROUPS.stats().misses;
+            let mut reader = RowReader::new(Arc::clone(&warm));
+            for i in (0..rows as usize).step_by(97) {
+                let row = reader
+                    .row(
+                        i,
+                        &ColumnMapping {
+                            sources: Vec::new(),
+                            names: Vec::new(),
+                            is_identity: true,
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(row[0], Value::Integer(i as i64));
+            }
+            misses = DECODED_GROUPS.stats().misses - before;
+            // Two groups, two columns: each decoded once
+            if misses == 4 {
+                return;
+            }
         }
-        let misses = DECODED_GROUPS.stats().misses - before;
-        // Two groups, two columns: each decoded once
-        assert_eq!(misses, 4, "groups decoded {misses} times");
+        panic!("groups decoded {misses} times");
     }
 
     #[test]

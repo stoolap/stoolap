@@ -145,6 +145,8 @@ pub struct VolumeScanner {
     /// of all columns. Built in set_filter() from filter's referenced
     /// columns ∪ project_cols. None = materialize all (fallback).
     needed_cols: Option<Vec<bool>>,
+    /// The mask names the columns the caller reads, not the projection
+    wanted: bool,
     /// Pre-computed row group skip decisions. group_idx → can skip entirely.
     /// None = no row groups (small volume or no filter). Computed in set_filter().
     row_group_skips: Option<Vec<bool>>,
@@ -363,6 +365,7 @@ impl VolumeScanner {
             snapshot_seq: None,
             typed_predicates: Vec::new(),
             needed_cols: None,
+            wanted: false,
             row_group_skips: None,
             group_cache: None,
             next_group_boundary: 0,
@@ -421,6 +424,7 @@ impl VolumeScanner {
             snapshot_seq: None,
             typed_predicates: Vec::new(),
             needed_cols: None,
+            wanted: false,
             row_group_skips: None,
             group_cache: None,
             next_group_boundary: 0,
@@ -511,6 +515,7 @@ impl VolumeScanner {
             snapshot_seq: None,
             typed_predicates: Vec::new(),
             needed_cols: None,
+            wanted: false,
             row_group_skips: None,
             group_cache: None,
             next_group_boundary: 0,
@@ -808,15 +813,23 @@ impl VolumeScanner {
             } else {
                 num_cols
             };
-            let mut mask = vec![false; mask_len];
+            let mut mask = match self.needed_cols.take() {
+                Some(mut mask) if self.wanted => {
+                    mask.resize(mask_len.max(mask.len()), false);
+                    mask
+                }
+                _ => vec![false; mask_len],
+            };
             for &ci in &filter_cols {
-                if ci < mask_len {
+                if ci < mask.len() {
                     mask[ci] = true;
                 }
             }
-            for &ci in &self.project_cols {
-                if ci < mask_len {
-                    mask[ci] = true;
+            if !self.wanted {
+                for &ci in &self.project_cols {
+                    if ci < mask.len() {
+                        mask[ci] = true;
+                    }
                 }
             }
             self.needed_cols = Some(mask);
@@ -916,15 +929,31 @@ impl VolumeScanner {
                 if let Some(mask) = self.needed_cols.as_mut() {
                     let len = mapping.sources.len().max(mask.len());
                     mask.resize(len, false);
-                    for &ci in &self.project_cols {
-                        if ci < len {
-                            mask[ci] = true;
+                    if !self.wanted {
+                        for &ci in &self.project_cols {
+                            if ci < len {
+                                mask[ci] = true;
+                            }
                         }
                     }
                 }
             }
             self.column_mapping = Some(mapping);
         }
+    }
+
+    /// The columns the caller reads, by schema position: the rest of a
+    /// row comes back as typed NULLs. Set after the mapping, before the
+    /// filter, whose columns are added to it
+    pub fn set_needed_cols(&mut self, needed: &[bool]) {
+        let len = needed
+            .len()
+            .max(self.volume.columns.len())
+            .max(self.column_mapping.as_ref().map_or(0, |m| m.sources.len()));
+        let mut mask = vec![false; len];
+        mask[..needed.len()].copy_from_slice(needed);
+        self.needed_cols = Some(mask);
+        self.wanted = true;
     }
 
     /// The mapping rows are read through: none when the columns are in
@@ -1105,17 +1134,20 @@ impl VolumeScanner {
                 );
             }
         } else if let Some(mapping) = self.row_mapping() {
-            if self.is_full_projection {
-                self.current_row = self.volume.get_row_mapped(idx, mapping)?;
+            self.current_row = if !self.is_full_projection {
+                self.volume
+                    .get_row_mapped_projected(idx, mapping, &self.project_cols)?
+            } else if let Some(mask) = &self.needed_cols {
+                self.volume.get_row_mapped_needed(idx, mapping, mask)?
             } else {
-                self.current_row =
-                    self.volume
-                        .get_row_mapped_projected(idx, mapping, &self.project_cols)?;
-            }
-        } else if self.is_full_projection {
-            self.current_row = self.volume.get_row(idx)?;
-        } else {
+                self.volume.get_row_mapped(idx, mapping)?
+            };
+        } else if !self.is_full_projection {
             self.current_row = self.volume.get_row_projected(idx, &self.project_cols)?;
+        } else if let Some(mask) = &self.needed_cols {
+            self.current_row = self.volume.get_row_needed(idx, mask)?;
+        } else {
+            self.current_row = self.volume.get_row(idx)?;
         }
         Ok(true)
     }

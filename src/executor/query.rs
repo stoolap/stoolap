@@ -2967,7 +2967,19 @@ impl Executor {
             if let Some((column_indices, output_columns)) = simple_projection {
                 // All columns are simple references - we can stream!
                 let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
-                let scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
+                // A table that reads by need materializes only the projected
+                // columns when the whole filter went to storage
+                let scanner = if !needs_memory_filter && table.narrows_scans() {
+                    let mut needed = vec![false; all_columns.len()];
+                    for &ci in &column_indices {
+                        if ci < needed.len() {
+                            needed[ci] = true;
+                        }
+                    }
+                    table.scan_needed(&column_idx_vec, &needed, storage_expr.as_deref())?
+                } else {
+                    table.scan(&column_idx_vec, storage_expr.as_deref())?
+                };
 
                 // Wrap scanner in ScannerResult
                 let mut result: Box<dyn QueryResult> =
