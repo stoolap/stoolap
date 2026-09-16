@@ -6055,67 +6055,63 @@ impl MVCCEngine {
             // at a time
             let mut transfer =
                 crate::storage::volume::transfer::Transfer::new(&schema, &volumes, &vol_mappings)?;
+            // Each output goes to its file as the batches arrive: one row
+            // group of typed buffers at a time, the unique indexes built
+            // from the batches, the volume published over the file
             'prepare: for chunk in live_refs.chunks(chunk_size) {
-                let mut builder = crate::storage::volume::writer::VolumeBuilder::with_capacity(
+                let compact_vol_id = crate::storage::volume::io::next_volume_id();
+                let mut writer = match crate::storage::volume::output::VolumeFileWriter::new(
+                    &vol_dir,
+                    table_name,
+                    compact_vol_id,
                     &schema,
                     chunk.len(),
-                );
+                    compress,
+                ) {
+                    Ok(writer) => writer,
+                    Err(error) => {
+                        prepare_error = Some(error);
+                        break 'prepare;
+                    }
+                };
                 if !schema.cluster_key.is_empty() {
-                    builder.allow_any_row_order();
+                    writer.allow_any_row_order();
                 }
+                writer.index_unique_sets(
+                    unique_columns
+                        .iter()
+                        .map(|(col_indices, _)| col_indices.clone())
+                        .collect(),
+                );
                 transfer.begin_output();
                 for batch in chunk.chunks(crate::storage::volume::transfer::TRANSFER_BATCH_ROWS) {
-                    if let Err(error) = transfer.append(batch, &mut builder) {
+                    if let Err(error) = transfer.append(batch, &mut writer) {
                         prepare_error = Some(error);
                         break 'prepare;
                     }
                 }
-                let mut compacted = match builder.finish() {
-                    Ok(volume) => volume,
-                    Err(e) => {
-                        prepare_error = Some(e);
+                let compacted = match writer.finish() {
+                    Ok((volume, _path)) => volume,
+                    Err(error) => {
+                        prepare_error = Some(error);
                         break 'prepare;
                     }
                 };
-                for (col_indices, _) in &unique_columns {
-                    if let Err(e) = compacted.prebuild_unique_index(col_indices) {
-                        prepare_error = Some(e.into());
-                        break 'prepare;
-                    }
-                }
-
-                let compact_vol_id = crate::storage::volume::io::next_volume_id();
-                match crate::storage::volume::io::write_volume_to_disk_opts(
-                    &vol_dir,
-                    table_name,
+                let (min_id, max_id) = compacted.id_bounds().unwrap_or((0, 0));
+                new_volumes.push((
                     compact_vol_id,
-                    &compacted,
-                    compress,
-                ) {
-                    Ok((_path, store)) => {
-                        // Retain compressed store for hot→warm eviction.
-                        compacted.columns.attach_compressed_store(store);
-                        let (min_id, max_id) = compacted.id_bounds().unwrap_or((0, 0));
-                        new_volumes.push((
-                            compact_vol_id,
-                            Arc::new(compacted),
-                            crate::storage::volume::manifest::SegmentMeta {
-                                segment_id: compact_vol_id,
-                                file_path: std::path::PathBuf::new(),
-                                row_count: chunk.len(),
-                                min_row_id: min_id,
-                                max_row_id: max_id,
-                                creation_lsn: 0,
-                                seal_seq: 0,
-                                schema_version,
-                            },
-                        ));
-                    }
-                    Err(e) => {
-                        prepare_error = Some(e);
-                        break;
-                    }
-                }
+                    Arc::new(compacted),
+                    crate::storage::volume::manifest::SegmentMeta {
+                        segment_id: compact_vol_id,
+                        file_path: std::path::PathBuf::new(),
+                        row_count: chunk.len(),
+                        min_row_id: min_id,
+                        max_row_id: max_id,
+                        creation_lsn: 0,
+                        seal_seq: 0,
+                        schema_version,
+                    },
+                ));
             }
 
             if prepare_error.is_none() && !new_volumes.is_empty() {
