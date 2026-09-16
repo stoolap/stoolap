@@ -1181,9 +1181,49 @@ impl SegmentedTable {
     ///
     /// The `hot_skip` MUST be derived from actual hot scan results (not a
     /// separate B-tree read) to prevent the seal race.
+    /// Cold scanners over the segments, then the hot rows
+    fn scan_cold_and_hot(
+        &self,
+        column_indices: &[usize],
+        needed: Option<&[bool]>,
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<Box<dyn Scanner>> {
+        if let Some(result) = self.unsealed(|hot| hot.scan(column_indices, where_expr)) {
+            return result;
+        }
+
+        // Collect hot rows FIRST to get a consistent snapshot of hot row_ids.
+        // The skip set for cold scanners is derived from these actual results,
+        // preventing the race where remove_sealed_rows runs between building
+        // the skip set and hot scanner execution (which would lose rows).
+        let hot_rows = self.hot.collect_all_rows(where_expr)?;
+
+        let mut skip: FxHashSet<i64> =
+            FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
+        for &(id, _) in &hot_rows {
+            skip.insert(id);
+        }
+        self.segment_mgr
+            .insert_pending_tombstones_into(self.txn_id(), &mut skip);
+
+        // Create lazy cold scanners with the skip set (no eager collection).
+        // This avoids O(total_cold_rows) memory allocation that was making
+        // ALL queries slow during checkpoint.
+        let cold_scanners =
+            self.create_segment_scanners_filtered(column_indices, needed, where_expr, skip)?;
+
+        // Chain: cold scanners (lazy, streamed) + hot rows (already collected)
+        let hot_scanner = Box::new(RowVecScanner::new(hot_rows)) as Box<dyn Scanner>;
+        let mut sources: Vec<Box<dyn Scanner>> = cold_scanners;
+        sources.push(hot_scanner);
+
+        Ok(Box::new(super::scanner::MergingScanner::new(sources)))
+    }
+
     fn create_segment_scanners_filtered(
         &self,
         column_indices: &[usize],
+        needed: Option<&[bool]>,
         where_expr: Option<&dyn Expression>,
         hot_skip: FxHashSet<i64>,
     ) -> Result<Vec<Box<dyn Scanner>>> {
@@ -1251,6 +1291,9 @@ impl SegmentedTable {
             let current_schema = self.hot.schema();
             let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
             scanner.set_column_mapping(mapping);
+            if let Some(needed) = needed {
+                scanner.set_needed_cols(needed);
+            }
 
             if let Some(expr) = where_expr {
                 let filter = expr.with_aliases(&Default::default());
@@ -2188,36 +2231,20 @@ impl Table for SegmentedTable {
         column_indices: &[usize],
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>> {
-        if let Some(result) = self.unsealed(|hot| hot.scan(column_indices, where_expr)) {
-            return result;
-        }
+        self.scan_cold_and_hot(column_indices, None, where_expr)
+    }
 
-        // Collect hot rows FIRST to get a consistent snapshot of hot row_ids.
-        // The skip set for cold scanners is derived from these actual results,
-        // preventing the race where remove_sealed_rows runs between building
-        // the skip set and hot scanner execution (which would lose rows).
-        let hot_rows = self.hot.collect_all_rows(where_expr)?;
+    fn narrows_scans(&self) -> bool {
+        self.segment_mgr.has_segments()
+    }
 
-        let mut skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(hot_rows.len(), Default::default());
-        for &(id, _) in &hot_rows {
-            skip.insert(id);
-        }
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut skip);
-
-        // Create lazy cold scanners with the skip set (no eager collection).
-        // This avoids O(total_cold_rows) memory allocation that was making
-        // ALL queries slow during checkpoint.
-        let cold_scanners =
-            self.create_segment_scanners_filtered(column_indices, where_expr, skip)?;
-
-        // Chain: cold scanners (lazy, streamed) + hot rows (already collected)
-        let hot_scanner = Box::new(RowVecScanner::new(hot_rows)) as Box<dyn Scanner>;
-        let mut sources: Vec<Box<dyn Scanner>> = cold_scanners;
-        sources.push(hot_scanner);
-
-        Ok(Box::new(super::scanner::MergingScanner::new(sources)))
+    fn scan_needed(
+        &self,
+        column_indices: &[usize],
+        needed: &[bool],
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<Box<dyn Scanner>> {
+        self.scan_cold_and_hot(column_indices, Some(needed), where_expr)
     }
 
     fn collect_all_rows(&self, where_expr: Option<&dyn Expression>) -> Result<RowVec> {

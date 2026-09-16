@@ -450,3 +450,78 @@ fn a_scan_through_a_column_mapping_decodes_each_group_once() {
     // One group, four volume columns
     assert_eq!(misses, 4, "groups decoded {misses} times");
 }
+
+/// A cold table of wide columns, sealed and reopened, under a cache too
+/// small for a group of them
+fn wide_table(dir: &tempfile::TempDir) -> (Database, String) {
+    let dsn = format!("file://{}/wide", dir.path().display());
+    let db = Database::open(&dsn).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, a JSON, b JSON, c JSON)",
+        (),
+    )
+    .unwrap();
+    let mut stmt = String::from("INSERT INTO t VALUES ");
+    for i in 1..=64 {
+        if i > 1 {
+            stmt.push(',');
+        }
+        let doc = format!("{{\"payload\":\"{i}{}\"}}", "x".repeat(10_000));
+        stmt.push_str(&format!("({i}, {}, '{doc}', '{doc}', '{doc}')", i % 3));
+    }
+    db.execute(&stmt, ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    drop(db);
+    (Database::open(&dsn).unwrap(), dsn)
+}
+
+/// A projection over a cold table decodes the columns it reads and the
+/// filter's, not the volume's every column
+#[test]
+fn a_projected_scan_decodes_only_the_columns_it_reads() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let (db, _) = wide_table(&dir);
+    DECODED_GROUPS.set_budget_bytes(1 << 20);
+    let before = DECODED_GROUPS.stats().misses;
+    let mut rows = 0;
+    let mut sum = 0;
+    for row in db.query("SELECT id, a FROM t WHERE k >= 1", ()).unwrap() {
+        let row = row.unwrap();
+        rows += 1;
+        let id = row.get::<i64>(0).unwrap();
+        sum += id;
+        assert!(row.get::<String>(1).unwrap().contains(&format!("{id}xxxx")));
+    }
+    assert_eq!(rows, 43);
+    assert_eq!(sum, (1..=64).filter(|i| i % 3 >= 1).sum::<i64>());
+    let misses = DECODED_GROUPS.stats().misses - before;
+    // One group: id, a and the filter's k
+    assert_eq!(misses, 3, "groups decoded {misses} times");
+
+    // A column added after the seal comes from its default, the filter's
+    // column and the projected one from the volume
+    db.execute("ALTER TABLE t ADD COLUMN z INTEGER DEFAULT 4", ())
+        .unwrap();
+    DECODED_GROUPS.set_budget_bytes(0);
+    DECODED_GROUPS.set_budget_bytes(1 << 20);
+    let before = DECODED_GROUPS.stats().misses;
+    let mut rows = 0;
+    for row in db.query("SELECT id, z FROM t WHERE k = 0", ()).unwrap() {
+        let row = row.unwrap();
+        rows += 1;
+        assert_eq!(row.get::<i64>(1).unwrap(), 4);
+    }
+    assert_eq!(rows, 21);
+    let misses = DECODED_GROUPS.stats().misses - before;
+    assert_eq!(misses, 2, "groups decoded {misses} times");
+
+    // A filter the storage cannot take whole reads every column it needs
+    let count: i64 = db
+        .query_one(
+            "SELECT COUNT(*) FROM (SELECT id, a FROM t WHERE k >= 1 AND LENGTH(b) > 5)",
+            (),
+        )
+        .unwrap();
+    assert_eq!(count, 43);
+}

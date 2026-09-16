@@ -441,6 +441,26 @@ pub trait Table: Send + Sync {
         where_expr: Option<&dyn Expression>,
     ) -> Result<Box<dyn Scanner>>;
 
+    /// Whether a scan can leave the columns the caller does not read
+    /// unmaterialized: see `scan_needed`
+    fn narrows_scans(&self) -> bool {
+        false
+    }
+
+    /// `scan` with the columns the caller reads marked in `needed`, by
+    /// schema position; rows keep their width, and a column not marked
+    /// may come back as a typed NULL. The filter's own columns are read
+    /// whether marked or not
+    fn scan_needed(
+        &self,
+        column_indices: &[usize],
+        needed: &[bool],
+        where_expr: Option<&dyn Expression>,
+    ) -> Result<Box<dyn Scanner>> {
+        let _ = needed;
+        self.scan(column_indices, where_expr)
+    }
+
     /// Collects all rows matching the expression without intermediate cloning
     ///
     /// This is more efficient than using scan() when you need all rows at once,
