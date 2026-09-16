@@ -2967,18 +2967,18 @@ impl Executor {
             if let Some((column_indices, output_columns)) = simple_projection {
                 // All columns are simple references - we can stream!
                 let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
-                // A table that reads by need materializes only the projected
-                // columns when the whole filter went to storage
-                let scanner = if !needs_memory_filter && table.narrows_scans() {
-                    let mut needed = vec![false; all_columns.len()];
-                    for &ci in &column_indices {
-                        if ci < needed.len() {
-                            needed[ci] = true;
-                        }
+                // A table that reads by need materializes only the columns
+                // the statement names
+                let needed = (table.narrows_scans()
+                    && !has_outer_context
+                    && !classification.where_has_subqueries)
+                    .then(|| super::utils::needed_columns(stmt, where_to_use, &all_columns_lower))
+                    .flatten();
+                let scanner = match needed {
+                    Some(mask) => {
+                        table.scan_needed(&column_idx_vec, &mask, storage_expr.as_deref())?
                     }
-                    table.scan_needed(&column_idx_vec, &needed, storage_expr.as_deref())?
-                } else {
-                    table.scan(&column_idx_vec, storage_expr.as_deref())?
+                    None => table.scan(&column_idx_vec, storage_expr.as_deref())?,
                 };
 
                 // Wrap scanner in ScannerResult
@@ -3037,7 +3037,18 @@ impl Executor {
                 // This avoids batch allocation when SELECT contains expressions like CASE
                 // NOTE: Only use this path when SELECT doesn't have subqueries (which need special processing)
                 let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
-                let scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
+                let needed = (table.narrows_scans()
+                    && !has_outer_context
+                    && !classification.has_window_functions
+                    && !classification.where_has_subqueries)
+                    .then(|| super::utils::needed_columns(stmt, where_to_use, &all_columns_lower))
+                    .flatten();
+                let scanner = match needed {
+                    Some(mask) => {
+                        table.scan_needed(&column_idx_vec, &mask, storage_expr.as_deref())?
+                    }
+                    None => table.scan(&column_idx_vec, storage_expr.as_deref())?,
+                };
 
                 let mut result: Box<dyn QueryResult> =
                     Box::new(ScannerResult::new(scanner, all_columns.clone()));
@@ -3084,6 +3095,13 @@ impl Executor {
             // Path 1: Need in-memory filtering (subqueries or complex expressions)
             // For memory filter, we need all columns to evaluate the WHERE clause
             let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
+            let needed = (table.narrows_scans()
+                && !has_outer_context
+                && !classification.has_window_functions
+                && !classification.select_has_scalar_subqueries
+                && !classification.where_has_subqueries)
+                .then(|| super::utils::needed_columns(stmt, where_to_use, &all_columns_lower))
+                .flatten();
 
             // OPTIMIZATION: Delay scanner creation until we know we need all rows.
             // For early termination path, we'll collect rows directly with a limit.
@@ -3444,7 +3462,12 @@ impl Executor {
                 let all_rows = if storage_expr.is_none() {
                     table.collect_all_rows(None)?
                 } else {
-                    let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
+                    let mut scanner = match needed.as_deref() {
+                        Some(mask) => {
+                            table.scan_needed(&column_idx_vec, mask, storage_expr.as_deref())?
+                        }
+                        None => table.scan(&column_idx_vec, storage_expr.as_deref())?,
+                    };
                     let mut all_rows =
                         RowVec::with_capacity(scanner.estimated_count().unwrap_or(64));
                     while scanner.next() {
@@ -3543,7 +3566,12 @@ impl Executor {
                 // Create scanner for the correlated subquery path
                 // For correlated subqueries, we can't push down the WHERE clause to storage
                 // because it depends on outer row values that change per row
-                let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
+                let mut scanner = match needed.as_deref() {
+                    Some(mask) => {
+                        table.scan_needed(&column_idx_vec, mask, storage_expr.as_deref())?
+                    }
+                    None => table.scan(&column_idx_vec, storage_expr.as_deref())?,
+                };
 
                 // Pre-allocate to reduce reallocations - 64 avoids first 6 grow operations
                 let mut rows: RowVec = RowVec::with_capacity(64);
@@ -3707,7 +3735,19 @@ impl Executor {
             // Path 2: WHERE clause with pushdown - use scanner for index optimization
             // Note: We fetch all columns here because downstream projection uses all_columns indices
             let column_idx_vec: Vec<usize> = (0..all_columns.len()).collect();
-            let mut scanner = table.scan(&column_idx_vec, storage_expr.as_deref())?;
+            // A table that reads by need materializes only the columns the
+            // statement names; anything a name cannot stand for reads all
+            let needed = (table.narrows_scans()
+                && !has_outer_context
+                && !classification.has_window_functions
+                && !classification.select_has_scalar_subqueries
+                && !classification.where_has_subqueries)
+                .then(|| super::utils::needed_columns(stmt, where_to_use, &all_columns_lower))
+                .flatten();
+            let mut scanner = match needed {
+                Some(mask) => table.scan_needed(&column_idx_vec, &mask, storage_expr.as_deref())?,
+                None => table.scan(&column_idx_vec, storage_expr.as_deref())?,
+            };
 
             // OPTIMIZATION: Use take_row() to avoid cloning each row
             // Pre-allocate to reduce reallocations - 64 avoids first 6 grow operations

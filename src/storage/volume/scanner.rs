@@ -833,7 +833,7 @@ impl VolumeScanner {
                 }
             }
             self.needed_cols = Some(mask);
-        } else {
+        } else if !self.wanted {
             // Cannot determine filter columns — materialize all columns
             // so the filter evaluates against real data, not Null.
             self.needed_cols = None;
@@ -942,9 +942,10 @@ impl VolumeScanner {
         }
     }
 
-    /// The columns the caller reads, by schema position: the rest of a
-    /// row comes back as typed NULLs. Set after the mapping, before the
-    /// filter, whose columns are added to it
+    /// The columns the caller reads, the filter's included, by schema
+    /// position: the rest of a row comes back as typed NULLs. Set after
+    /// the mapping, before the filter, whose columns are added to it
+    /// when it can name them
     pub fn set_needed_cols(&mut self, needed: &[bool]) {
         let len = needed
             .len()

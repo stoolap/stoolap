@@ -447,10 +447,9 @@ pub trait Table: Send + Sync {
         false
     }
 
-    /// `scan` with the columns the caller reads marked in `needed`, by
-    /// schema position; rows keep their width, and a column not marked
-    /// may come back as a typed NULL. The filter's own columns are read
-    /// whether marked or not
+    /// `scan` with every column the statement reads marked in `needed`,
+    /// by schema position, the filter's included; rows keep their width,
+    /// and a column not marked may come back as a typed NULL
     fn scan_needed(
         &self,
         column_indices: &[usize],

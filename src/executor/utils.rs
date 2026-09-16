@@ -37,10 +37,10 @@ use crate::executor::operators::index_nested_loop::ColumnSource;
 use crate::parser::ast::{
     AliasedExpression, AllAnyExpression, BetweenExpression, BooleanLiteral, CaseExpression,
     CastExpression, DistinctExpression, ExistsExpression, Expression, ExpressionList, FloatLiteral,
-    FunctionCall, Identifier, InExpression, InHashSetExpression, InfixExpression, InfixOperator,
-    IntegerLiteral, JoinTableSource, LikeExpression, ListExpression, NullLiteral, PrefixExpression,
-    QualifiedIdentifier, ScalarSubquery, SelectStatement, StringLiteral, SubqueryTableSource,
-    WhenClause, WindowFrameBound,
+    FunctionCall, GroupByModifier, Identifier, InExpression, InHashSetExpression, InfixExpression,
+    InfixOperator, IntegerLiteral, JoinTableSource, LikeExpression, ListExpression, NullLiteral,
+    PrefixExpression, QualifiedIdentifier, ScalarSubquery, SelectStatement, StringLiteral,
+    SubqueryTableSource, WhenClause, WindowFrameBound,
 };
 use crate::parser::token::{Position, Token, TokenType};
 
@@ -904,6 +904,131 @@ pub fn rows_equal(a: &Row, b: &Row) -> bool {
 // ============================================================================
 // Expression Extraction Utilities
 // ============================================================================
+
+/// The columns an expression reads, by lower-case name; false when the
+/// expression reads something a name cannot stand for (a star outside a
+/// function's argument, a subquery, a window), so the caller reads every
+/// column instead
+pub(crate) fn collect_column_names(
+    expr: &Expression,
+    out: &mut Vec<crate::common::SmartString>,
+) -> bool {
+    fn all(exprs: &[Expression], out: &mut Vec<crate::common::SmartString>) -> bool {
+        exprs.iter().all(|e| collect_column_names(e, out))
+    }
+    match expr {
+        Expression::Identifier(id) => {
+            out.push(id.value_lower.clone());
+            true
+        }
+        Expression::QualifiedIdentifier(q) => {
+            out.push(q.name.value_lower.clone());
+            true
+        }
+        Expression::IntegerLiteral(_)
+        | Expression::FloatLiteral(_)
+        | Expression::StringLiteral(_)
+        | Expression::BooleanLiteral(_)
+        | Expression::NullLiteral(_)
+        | Expression::IntervalLiteral(_)
+        | Expression::Parameter(_) => true,
+        Expression::Prefix(p) => collect_column_names(&p.right, out),
+        Expression::Infix(i) => {
+            collect_column_names(&i.left, out) && collect_column_names(&i.right, out)
+        }
+        Expression::List(l) => all(&l.elements, out),
+        Expression::ExpressionList(l) => all(&l.expressions, out),
+        Expression::Distinct(d) => collect_column_names(&d.expr, out),
+        Expression::In(i) => {
+            collect_column_names(&i.left, out) && collect_column_names(&i.right, out)
+        }
+        Expression::InHashSet(h) => collect_column_names(&h.column, out),
+        Expression::Between(b) => {
+            collect_column_names(&b.expr, out)
+                && collect_column_names(&b.lower, out)
+                && collect_column_names(&b.upper, out)
+        }
+        Expression::Like(l) => {
+            collect_column_names(&l.left, out)
+                && collect_column_names(&l.pattern, out)
+                && l.escape
+                    .as_deref()
+                    .is_none_or(|e| collect_column_names(e, out))
+        }
+        Expression::Case(c) => {
+            c.value
+                .as_deref()
+                .is_none_or(|v| collect_column_names(v, out))
+                && c.when_clauses.iter().all(|w| {
+                    collect_column_names(&w.condition, out)
+                        && collect_column_names(&w.then_result, out)
+                })
+                && c.else_value
+                    .as_deref()
+                    .is_none_or(|e| collect_column_names(e, out))
+        }
+        Expression::Cast(c) => collect_column_names(&c.expr, out),
+        Expression::FunctionCall(f) => {
+            f.arguments
+                .iter()
+                .all(|a| matches!(a, Expression::Star(_)) || collect_column_names(a, out))
+                && f.filter
+                    .as_deref()
+                    .is_none_or(|e| collect_column_names(e, out))
+                && f.order_by
+                    .iter()
+                    .all(|o| collect_column_names(&o.expression, out))
+        }
+        Expression::Aliased(a) => collect_column_names(&a.expression, out),
+        _ => false,
+    }
+}
+
+/// The columns a single-table statement reads, as a mask over the table's
+/// columns, from its SELECT list, filter, GROUP BY, HAVING and ORDER BY;
+/// None when any of them reads something a name cannot stand for, or a
+/// name that is neither a column nor a SELECT alias
+pub(crate) fn needed_columns(
+    stmt: &SelectStatement,
+    where_expr: Option<&Expression>,
+    columns_lower: &[String],
+) -> Option<Vec<bool>> {
+    let mut names = Vec::new();
+    let grouping_sets = match &stmt.group_by.modifier {
+        GroupByModifier::GroupingSets(sets) => sets.as_slice(),
+        _ => &[],
+    };
+    let exprs = stmt
+        .columns
+        .iter()
+        .chain(stmt.distinct_on.iter())
+        .chain(stmt.group_by.columns.iter())
+        .chain(grouping_sets.iter().flatten())
+        .chain(stmt.having.as_deref())
+        .chain(stmt.order_by.iter().map(|o| &o.expression))
+        .chain(where_expr);
+    for expr in exprs {
+        if !collect_column_names(expr, &mut names) {
+            return None;
+        }
+    }
+    let mut mask = vec![false; columns_lower.len()];
+    for name in names {
+        match columns_lower.iter().position(|c| *c == name.as_str()) {
+            Some(pos) => mask[pos] = true,
+            None => {
+                let is_alias = stmt
+                    .columns
+                    .iter()
+                    .any(|c| matches!(c, Expression::Aliased(a) if a.alias.value_lower == name));
+                if !is_alias {
+                    return None;
+                }
+            }
+        }
+    }
+    Some(mask)
+}
 
 /// Extract the column name from an Identifier or QualifiedIdentifier expression.
 /// Returns the column name without table qualifier.
