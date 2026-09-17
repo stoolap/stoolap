@@ -442,6 +442,13 @@ impl WALEntry {
         buf
     }
 
+    /// Stamp the LSNs into an encoded record's header, after they are
+    /// taken under the buffer lock. The CRC covers the data only.
+    pub fn stamp_lsns(encoded: &mut [u8], lsn: u64, previous_lsn: u64) {
+        encoded[8..16].copy_from_slice(&lsn.to_le_bytes());
+        encoded[16..24].copy_from_slice(&previous_lsn.to_le_bytes());
+    }
+
     /// Decode entry from data portion (after header has been parsed)
     ///
     /// Parameters:
@@ -943,6 +950,10 @@ pub struct WALManager {
     wal_file: Mutex<Option<File>>,
     /// Current WAL file name
     current_wal_file: Mutex<String>,
+    /// Held while checkpoint.meta is written, by a checkpoint's publication
+    /// and by a rotation, so the file it names is the one current at the
+    /// write. Taken before `wal_file`, never after it.
+    checkpoint_meta: Mutex<()>,
     /// Current Log Sequence Number
     current_lsn: AtomicU64,
     /// Previous LSN for entry chaining (enables backward traversal)
@@ -1221,6 +1232,7 @@ impl WALManager {
             path,
             wal_file: Mutex::new(wal_file),
             current_wal_file: Mutex::new(wal_filename),
+            checkpoint_meta: Mutex::new(()),
             current_lsn: AtomicU64::new(initial_lsn),
             previous_lsn: AtomicU64::new(initial_lsn),
             buffer: Mutex::new(Vec::with_capacity(buffer_size)),
@@ -1272,7 +1284,18 @@ impl WALManager {
     }
 
     /// Append a WAL entry
-    pub fn append_entry(&self, mut entry: WALEntry) -> Result<u64> {
+    pub fn append_entry(&self, entry: WALEntry) -> Result<u64> {
+        self.append(entry, true)
+    }
+
+    /// Append a checkpoint's copy of a catalog record. It gets no flush or
+    /// sync of its own: the checkpoint's `sync_for_checkpoint` makes the
+    /// whole batch durable at once.
+    pub fn append_catalog_entry(&self, entry: WALEntry) -> Result<u64> {
+        self.append(entry, false)
+    }
+
+    fn append(&self, mut entry: WALEntry, durable: bool) -> Result<u64> {
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
         }
@@ -1282,37 +1305,31 @@ impl WALManager {
             ));
         }
 
-        // Get previous LSN and assign new LSN atomically
-        let prev_lsn = self.previous_lsn.load(Ordering::Acquire);
-        entry.previous_lsn = prev_lsn;
-
-        // Check for LSN overflow before incrementing
-        // u64::MAX is ~18 quintillion, practically unreachable, but check for safety
-        let current = self.current_lsn.load(Ordering::Acquire);
-        if current == u64::MAX {
-            return Err(Error::internal(
-                "WAL LSN overflow: maximum sequence number reached. Database requires maintenance.",
-            ));
-        }
-        entry.lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Update previous_lsn for next entry's chain link
-        self.previous_lsn.store(entry.lsn, Ordering::Release);
-
-        // Encode entry with new V2 format
-        let encoded = entry.encode();
-        let encoded_len = encoded.len() as u64;
-
-        // Write to buffer. Flush at commit/DDL boundaries in both durable
-        // modes: mid-txn DML needs no independent flush or fsync, the
-        // commit-marker flush carries all buffered entries, and recovery
-        // discards uncommitted transactions either way.
+        // Encoded outside the lock; the LSNs are taken and stamped into
+        // the header under the one lock the record is buffered under, so a
+        // checkpoint cut read under it is never ahead of a record still on
+        // its way into the buffer. Flush at commit/DDL boundaries in both
+        // durable modes: mid-txn DML needs no independent flush or fsync,
+        // the commit-marker flush carries all buffered entries, and
+        // recovery discards uncommitted transactions either way.
+        let mut encoded = entry.encode();
         let do_flush = {
             let mut buffer = self.buffer.lock().unwrap();
+            entry.previous_lsn = self.previous_lsn.load(Ordering::Acquire);
+            let current = self.current_lsn.load(Ordering::Acquire);
+            if current == u64::MAX {
+                return Err(Error::internal(
+                    "WAL LSN overflow: maximum sequence number reached. Database requires maintenance.",
+                ));
+            }
+            entry.lsn = self.current_lsn.fetch_add(1, Ordering::SeqCst) + 1;
+            self.previous_lsn.store(entry.lsn, Ordering::Release);
+            WALEntry::stamp_lsns(&mut encoded, entry.lsn, entry.previous_lsn);
             buffer.extend_from_slice(&encoded);
 
             let needs_flush = buffer.len() >= self.flush_trigger as usize;
-            let force_flush = self.sync_mode != SyncMode::None
+            let force_flush = durable
+                && self.sync_mode != SyncMode::None
                 && (entry.operation.is_transaction_end() || entry.operation.is_ddl());
             needs_flush || force_flush
         };
@@ -1323,12 +1340,9 @@ impl WALManager {
             // crash inside the sync interval discards the unsynced marker.
             let ddl_commit = entry.operation.is_transaction_end()
                 && entry.txn_id == crate::storage::mvcc::persistence::DDL_TXN_ID;
-            self.flush_and_maybe_sync(self.should_sync(entry.operation) || ddl_commit)?;
+            let sync = durable && (self.should_sync(entry.operation) || ddl_commit);
+            self.flush_and_maybe_sync(sync)?;
         }
-
-        // Track that we wrote encoded_len bytes (even if buffered)
-        // This is approximate but sufficient for rotation decision
-        let _ = encoded_len;
 
         Ok(entry.lsn)
     }
@@ -1347,6 +1361,10 @@ impl WALManager {
     /// `poison_and_truncate`); afterwards every append/flush fails until
     /// the database is reopened.
     fn flush_and_maybe_sync(&self, sync: bool) -> Result<()> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        if sync {
+            crate::test_failpoints::wal_sync_starting();
+        }
         // Fast-path check; the authoritative one is under the lock below.
         if self.poisoned.load(Ordering::Acquire) {
             return Err(Error::internal(
@@ -1529,6 +1547,7 @@ impl WALManager {
 
         // Update current WAL file references
         {
+            let _meta = self.checkpoint_meta.lock().unwrap();
             let old_filename = {
                 let mut wal_file = self.wal_file.lock().unwrap();
                 let mut current_filename = self.current_wal_file.lock().unwrap();
@@ -2075,21 +2094,45 @@ impl WALManager {
     /// this LSN is guaranteed to be durably written to disk when this returns.
     /// This LSN should be used for snapshot creation to ensure consistency.
     pub fn create_checkpoint(&self, active_transactions: Vec<i64>) -> Result<u64> {
-        // CRITICAL: Wait for any in-flight writes before flushing
-        // This prevents the race condition where we read current_lsn before
-        // all writes at that LSN are actually on disk
-        self.wait_for_in_flight_writes()?;
+        let checkpoint_lsn = self.checkpoint_cut()?;
+        self.sync_for_checkpoint()?;
+        self.publish_checkpoint(checkpoint_lsn, active_transactions)?;
+        Ok(checkpoint_lsn)
+    }
 
-        // Flush and sync
-        self.flush()?;
-        self.sync_locked()?;
+    /// A checkpoint's cut: every record up to this LSN is in the buffer or
+    /// the file, so the `sync_for_checkpoint` that follows makes all of
+    /// them durable. Read under the buffer lock, which an append holds
+    /// from taking its LSN to buffering its record.
+    pub fn checkpoint_cut(&self) -> Result<u64> {
+        if !self.running.load(Ordering::Acquire) {
+            return Err(Error::WalNotRunning);
+        }
+        let _buffer = self.buffer.lock().unwrap();
+        Ok(self.current_lsn.load(Ordering::Acquire))
+    }
 
-        // Wait again after flush to catch any writes that started during flush
-        self.wait_for_in_flight_writes()?;
+    /// Write out and fsync everything appended so far: the records up to
+    /// the cut and the catalog copies appended after it, in one sync.
+    pub fn sync_for_checkpoint(&self) -> Result<()> {
+        if !self.running.load(Ordering::Acquire) {
+            return Err(Error::WalNotRunning);
+        }
+        // Drain and fsync under the one lock hold: a write failing in
+        // between would cut the copies back out of the file and the sync
+        // would report them durable
+        self.flush_and_maybe_sync(true)
+    }
 
-        // CRITICAL: Capture the LSN atomically after all syncs complete
-        // This LSN is the checkpoint point - all data up to this LSN is now on disk
-        let checkpoint_lsn = self.current_lsn.load(Ordering::Acquire);
+    /// Publish the cut as the recovery boundary in checkpoint.meta, naming
+    /// the WAL file current at the write. A rotation waits on the same
+    /// lock, so the name and the boundary never cross.
+    pub fn publish_checkpoint(
+        &self,
+        checkpoint_lsn: u64,
+        active_transactions: Vec<i64>,
+    ) -> Result<()> {
+        let _meta = self.checkpoint_meta.lock().unwrap();
         let wal_file = self.current_wal_file.lock().unwrap().clone();
 
         let now = SystemTime::now()
@@ -2120,7 +2163,7 @@ impl WALManager {
         self.last_checkpoint
             .store(checkpoint_lsn, Ordering::Release);
 
-        Ok(checkpoint_lsn)
+        Ok(())
     }
 
     /// Close the WAL manager
@@ -3101,6 +3144,108 @@ mod tests {
         assert!(checkpoint_path.exists());
 
         wal.close().unwrap();
+    }
+
+    fn catalog_record() -> WALEntry {
+        WALEntry::new(
+            crate::storage::mvcc::persistence::DDL_TXN_ID,
+            "t".to_string(),
+            0,
+            WALOperationType::CreateTable,
+            vec![1, 2, 3],
+        )
+    }
+
+    #[test]
+    fn a_catalog_copy_syncs_with_the_checkpoint_while_a_ddl_record_syncs_itself() {
+        let dir = tempdir().unwrap();
+        let wal = WALManager::new(dir.path().join("wal"), SyncMode::Normal).unwrap();
+
+        wal.append_entry(catalog_record()).unwrap();
+        let written = wal.current_file_position.load(Ordering::Relaxed);
+        assert!(written > 0);
+        assert_eq!(
+            wal.synced_position.load(Ordering::Relaxed),
+            written,
+            "a DDL record syncs on its own"
+        );
+
+        wal.append_catalog_entry(catalog_record()).unwrap();
+        wal.append_catalog_entry(WALEntry::commit_marker(
+            crate::storage::mvcc::persistence::DDL_TXN_ID,
+        ))
+        .unwrap();
+        assert_eq!(
+            wal.current_file_position.load(Ordering::Relaxed),
+            written,
+            "a catalog copy stays in the buffer"
+        );
+
+        wal.sync_for_checkpoint().unwrap();
+        let after = wal.current_file_position.load(Ordering::Relaxed);
+        assert!(after > written, "the checkpoint sync writes the copies out");
+        assert_eq!(wal.synced_position.load(Ordering::Relaxed), after);
+        wal.close().unwrap();
+    }
+
+    #[test]
+    fn the_cut_is_the_last_record_taken_and_a_record_after_it_survives_the_truncation() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal");
+        let wal = WALManager::new(&wal_path, SyncMode::Normal).unwrap();
+        let row = |txn: i64, row_id: i64| {
+            WALEntry::new(
+                txn,
+                "t".to_string(),
+                row_id,
+                WALOperationType::Insert,
+                vec![],
+            )
+        };
+
+        wal.append_entry(row(1, 1)).unwrap();
+        wal.write_commit_marker(1).unwrap();
+        let cut = wal.checkpoint_cut().unwrap();
+        assert_eq!(cut, 2, "two records were taken before the cut");
+
+        wal.append_entry(row(2, 2)).unwrap();
+        wal.write_commit_marker(2).unwrap();
+        wal.append_catalog_entry(catalog_record()).unwrap();
+        wal.append_catalog_entry(WALEntry::commit_marker(
+            crate::storage::mvcc::persistence::DDL_TXN_ID,
+        ))
+        .unwrap();
+        wal.sync_for_checkpoint().unwrap();
+        wal.publish_checkpoint(cut, vec![]).unwrap();
+        wal.truncate_wal(cut).unwrap();
+        wal.close().unwrap();
+
+        let reopened = WALManager::new(&wal_path, SyncMode::Normal).unwrap();
+        let mut replayed = Vec::new();
+        reopened
+            .replay_two_phase(0, |entry| {
+                replayed.push((entry.txn_id, entry.operation, entry.row_id));
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            replayed.contains(&(2, WALOperationType::Insert, 2)),
+            "the row committed after the cut is replayed: {:?}",
+            replayed
+        );
+        assert!(
+            replayed.iter().any(|(txn, op, _)| *txn
+                == crate::storage::mvcc::persistence::DDL_TXN_ID
+                && *op == WALOperationType::CreateTable),
+            "the catalog copy is replayed: {:?}",
+            replayed
+        );
+        assert!(
+            !replayed.contains(&(1, WALOperationType::Insert, 1)),
+            "the row before the cut is behind the boundary: {:?}",
+            replayed
+        );
+        reopened.close().unwrap();
     }
 
     #[test]

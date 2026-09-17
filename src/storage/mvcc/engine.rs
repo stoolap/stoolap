@@ -2644,6 +2644,25 @@ impl MVCCEngine {
         Ok(())
     }
 
+    /// A checkpoint's copy of a catalog record: no sync of its own, the
+    /// batch is synced once by `rerecord_ddl_to_wal`.
+    fn record_catalog_copy(
+        &self,
+        table_name: &str,
+        op: WALOperationType,
+        schema_data: &[u8],
+    ) -> Result<()> {
+        if self.should_skip_wal() {
+            return Ok(());
+        }
+        if let Some(ref pm) = *self.persistence {
+            if pm.is_enabled() {
+                pm.record_catalog_copy(table_name, op, schema_data)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Serialize a schema to binary format for WAL
     pub fn serialize_schema(schema: &Schema) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -5330,10 +5349,8 @@ impl MVCCEngine {
         seal_result?;
 
         // Step 3: Brief fence — block commits just long enough to check if all
-        // hot buffers are empty and capture checkpoint_lsn. NO disk I/O inside
-        // the fence. Previously this ran a full seal_hot_buffers() (with volume
-        // building + disk writes) while blocking all commits, causing 1-2s INSERT
-        // stalls. Now the fence is held for microseconds (atomic counter reads).
+        // hot buffers are empty and take the cut. NO disk I/O inside the
+        // fence: the WAL sync and the checkpoint.meta write follow outside it.
         // If hot buffers aren't empty after steps 1-2, we skip WAL truncation
         // this cycle and let the next cycle's bulk seal drain them.
         let checkpoint_lsn = match self
@@ -5352,9 +5369,10 @@ impl MVCCEngine {
                 };
 
                 if all_hot_empty {
-                    // All data is in volumes. Safe to advance the WAL checkpoint.
+                    // All data is in volumes: the cut is the boundary to
+                    // publish once the catalog copies are durable
                     if let Some(ref pm) = *self.persistence {
-                        pm.create_checkpoint(vec![])?
+                        pm.checkpoint_cut()?
                     } else {
                         0
                     }
@@ -5371,12 +5389,17 @@ impl MVCCEngine {
             }
         };
 
-        // Re-record DDL OUTSIDE the fence. DDL writes to WAL (append-only,
-        // thread-safe) and doesn't need to block commits.
+        // Outside the fence: the catalog copies go into the WAL and one sync
+        // makes them, and every record up to the cut, durable. Only then is
+        // the cut published as the boundary recovery starts from, so a
+        // failure here leaves the boundary where it was.
         if checkpoint_lsn > 0 {
             if let Err(e) = self.rerecord_ddl_to_wal() {
                 eprintln!("Warning: Failed to re-record DDL to WAL: {}", e);
                 return Ok(());
+            }
+            if let Some(ref pm) = *self.persistence {
+                pm.publish_checkpoint(checkpoint_lsn)?;
             }
         }
 
@@ -5496,6 +5519,8 @@ impl MVCCEngine {
     /// After WAL truncation, any CreateTable/CreateIndex/CreateView entries before
     /// the checkpoint LSN are lost. Re-recording them places fresh entries at
     /// the WAL head so they survive truncation and are replayed on recovery.
+    /// Recovery also skips records below the boundary it starts from, so the
+    /// copies are durable, with one sync for the batch, when this returns.
     ///
     /// Order matters: CreateTable must come before CreateIndex for the same table,
     /// because index replay needs the version store to exist.
@@ -5503,7 +5528,7 @@ impl MVCCEngine {
         // One DDL statement at a time between the read of the catalog and
         // the records written from it: a statement landing in between
         // would replay before the records that carry the state it changed
-        let _ddl = self.ddl_guard();
+        let ddl = self.ddl_guard();
         // Collect CreateTable entries and table names in a single schemas lock
         let (table_entries, table_names_for_indexes): (Vec<(String, Vec<u8>)>, Vec<String>) = {
             let schemas = self.schemas.read().unwrap();
@@ -5558,17 +5583,26 @@ impl MVCCEngine {
 
         // Write CreateTable entries first (schemas must exist before indexes)
         for (table_name, data) in &table_entries {
-            self.record_ddl(table_name, WALOperationType::CreateTable, data)?;
+            self.record_catalog_copy(table_name, WALOperationType::CreateTable, data)?;
         }
 
         for (table_name, data) in &index_entries {
-            self.record_ddl(table_name, WALOperationType::CreateIndex, data)?;
+            self.record_catalog_copy(table_name, WALOperationType::CreateIndex, data)?;
         }
 
         for (view_name, data) in &view_entries {
-            self.record_ddl(view_name, WALOperationType::CreateView, data)?;
+            self.record_catalog_copy(view_name, WALOperationType::CreateView, data)?;
         }
+        drop(ddl);
 
+        if self.should_skip_wal() {
+            return Ok(());
+        }
+        if let Some(ref pm) = *self.persistence {
+            if pm.is_enabled() {
+                pm.sync_wal_for_checkpoint()?;
+            }
+        }
         Ok(())
     }
 

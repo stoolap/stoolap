@@ -59,6 +59,22 @@ pub(crate) fn version_root_captured() {
     }
 }
 
+thread_local! {
+    static WAL_SYNC_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread right before its next WAL fsync takes the file lock.
+pub fn before_wal_sync(hook: impl FnOnce() + 'static) {
+    WAL_SYNC_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn wal_sync_starting() {
+    let hook = WAL_SYNC_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Reset all failpoints to disabled state
 pub fn reset_all() {
     use std::sync::atomic::Ordering::Release;
@@ -69,6 +85,7 @@ pub fn reset_all() {
     SNAPSHOT_RENAME_FAIL.store(false, Release);
     CHECKPOINT_WRITE_FAIL.store(false, Release);
     VERSION_ROOT_HOOK.with(|slot| *slot.borrow_mut() = None);
+    WAL_SYNC_HOOK.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.

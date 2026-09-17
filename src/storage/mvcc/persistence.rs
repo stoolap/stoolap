@@ -437,6 +437,68 @@ impl PersistenceManager {
         Ok(())
     }
 
+    /// Append a checkpoint's copy of a catalog record with its commit
+    /// marker, without a sync of their own: `sync_wal_for_checkpoint`
+    /// makes the whole batch durable.
+    pub fn record_catalog_copy(
+        &self,
+        table_name: &str,
+        op: WALOperationType,
+        schema_data: &[u8],
+    ) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
+        let entry = WALEntry::new(
+            DDL_TXN_ID,
+            table_name.to_string(),
+            0,
+            op,
+            schema_data.to_vec(),
+        );
+        wal.append_catalog_entry(entry)?;
+        wal.append_catalog_entry(WALEntry::commit_marker(DDL_TXN_ID))?;
+        Ok(())
+    }
+
+    /// The LSN a checkpoint cuts at; see `WALManager::checkpoint_cut`.
+    pub fn checkpoint_cut(&self) -> Result<u64> {
+        if !self.is_enabled() {
+            return Ok(0);
+        }
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
+        wal.checkpoint_cut()
+    }
+
+    /// One flush and fsync covering the cut and the catalog copies, then
+    /// the rotation check their appends skipped.
+    pub fn sync_wal_for_checkpoint(&self) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
+        wal.sync_for_checkpoint()?;
+        let _ = wal.maybe_rotate();
+        Ok(())
+    }
+
+    /// Publish the cut as the recovery boundary.
+    pub fn publish_checkpoint(&self, checkpoint_lsn: u64) -> Result<()> {
+        if !self.is_enabled() {
+            return Ok(());
+        }
+        let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
+        wal.publish_checkpoint(checkpoint_lsn, vec![])?;
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        self.meta.last_checkpoint_time.store(now, Ordering::Release);
+        Ok(())
+    }
+
     /// Record an index operation (CREATE INDEX, DROP INDEX)
     pub fn record_index_operation(
         &self,
