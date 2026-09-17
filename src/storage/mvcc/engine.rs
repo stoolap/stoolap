@@ -5972,7 +5972,29 @@ impl MVCCEngine {
 
             // The merged volumes hold their rows in row id order, or in key
             // order for a clustered table, read through each volume's mapping
-            if schema.cluster_key.is_empty() {
+            // Inputs in the key's order merge, one row group of key columns
+            // per input at a time, the merge checking the order as it goes;
+            // an input known to be out of order sends the batch to the sort,
+            // with the key columns loaded whole
+            let mut key_held_peak = 0usize;
+            let merged = if schema.cluster_key.is_empty()
+                || volumes
+                    .iter()
+                    .any(|(id, _)| mgr.known_key_order(*id, &schema.cluster_key) == Some(false))
+            {
+                None
+            } else {
+                crate::storage::volume::merge::merge_key_order(
+                    &schema,
+                    &volumes,
+                    &vol_mappings,
+                    &live_refs,
+                )?
+            };
+            if let Some(merged) = merged {
+                key_held_peak = merged.peak_held_bytes;
+                live_refs = merged.refs;
+            } else if schema.cluster_key.is_empty() {
                 live_refs.sort_unstable_by_key(|(id, _, _)| *id);
             } else {
                 use crate::storage::volume::writer::ColSource;
@@ -6114,6 +6136,7 @@ impl MVCCEngine {
                 ));
             }
 
+            let _ = key_held_peak;
             if prepare_error.is_none() && !new_volumes.is_empty() {
                 for (_, vol) in volumes.iter() {
                     match vol.row_ids() {

@@ -268,6 +268,9 @@ pub struct CompressedBlockStore {
     /// Process-unique id, the key of this store's entries in the decoded
     /// group cache
     id: usize,
+    /// Groups decoded from this store's blocks, whatever kept them
+    #[cfg(test)]
+    decoded_groups: std::sync::atomic::AtomicU64,
 }
 
 /// Ids for block stores; the decoded group cache keys its entries by them
@@ -300,8 +303,18 @@ impl CompressedBlockStore {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "group index out of range")
         })?;
         super::group_cache::DECODED_GROUPS.get_or_decode((self.id, key_col, key_group), || {
+            #[cfg(test)]
+            self.decoded_groups
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.decompress_single_group(col_idx, group_idx)
         })
+    }
+
+    /// How many groups were decoded from this store's blocks so far
+    #[cfg(test)]
+    pub fn decoded_groups(&self) -> u64 {
+        self.decoded_groups
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Compress existing columns into per-group LZ4 blocks.
@@ -426,6 +439,8 @@ impl CompressedBlockStore {
             group_size,
             row_count,
             id: next_store_id(),
+            #[cfg(test)]
+            decoded_groups: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -458,6 +473,8 @@ impl CompressedBlockStore {
             group_size,
             row_count,
             id: next_store_id(),
+            #[cfg(test)]
+            decoded_groups: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -497,6 +514,8 @@ impl CompressedBlockStore {
             group_size,
             row_count,
             id: next_store_id(),
+            #[cfg(test)]
+            decoded_groups: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -3181,22 +3200,8 @@ impl FrozenVolume {
 
     /// Whether the rows are held in the order of `key`, compared cell by
     /// cell in place; an empty key orders nothing and is always satisfied
-    pub fn in_key_order(&self, key: &[usize]) -> std::io::Result<bool> {
-        let n = self.meta.row_count;
-        let mut columns = Vec::with_capacity(key.len());
-        for &c in key {
-            columns.push(self.columns.get(c)?);
-        }
-        for i in 1..n {
-            for col in &columns {
-                match col.compare_cells(i - 1, col, i) {
-                    std::cmp::Ordering::Less => break,
-                    std::cmp::Ordering::Equal => continue,
-                    std::cmp::Ordering::Greater => return Ok(false),
-                }
-            }
-        }
-        Ok(true)
+    pub fn in_key_order(&self, key: &[usize]) -> crate::core::Result<bool> {
+        super::merge::volume_in_key_order(self, key)
     }
 
     /// Carry the order decided for an earlier form of this volume over to
@@ -3757,33 +3762,27 @@ mod tests {
         // that let its groups go would decode them again row after row
         DECODED_GROUPS.set_budget_bytes(0);
         DECODED_GROUPS.set_budget_bytes(1);
-        // The miss count is process wide and other tests decode meanwhile:
-        // a reader that let its groups go decodes on every row, so one
-        // undisturbed attempt at exactly four is the proof
-        let mut misses = 0;
-        for _ in 0..5 {
-            let before = DECODED_GROUPS.stats().misses;
-            let mut reader = RowReader::new(Arc::clone(&warm));
-            for i in (0..rows as usize).step_by(97) {
-                let row = reader
-                    .row(
-                        i,
-                        &ColumnMapping {
-                            sources: Vec::new(),
-                            names: Vec::new(),
-                            is_identity: true,
-                        },
-                    )
-                    .unwrap();
-                assert_eq!(row[0], Value::Integer(i as i64));
-            }
-            misses = DECODED_GROUPS.stats().misses - before;
-            // Two groups, two columns: each decoded once
-            if misses == 4 {
-                return;
-            }
+        // Counted on this volume's own store, apart from what other tests
+        // decode meanwhile
+        let store = warm.columns.compressed_store().unwrap();
+        let before = store.decoded_groups();
+        let mut reader = RowReader::new(Arc::clone(&warm));
+        for i in (0..rows as usize).step_by(97) {
+            let row = reader
+                .row(
+                    i,
+                    &ColumnMapping {
+                        sources: Vec::new(),
+                        names: Vec::new(),
+                        is_identity: true,
+                    },
+                )
+                .unwrap();
+            assert_eq!(row[0], Value::Integer(i as i64));
         }
-        panic!("groups decoded {misses} times");
+        let decoded = store.decoded_groups() - before;
+        // Two groups, two columns: each decoded once
+        assert_eq!(decoded, 4, "groups decoded {decoded} times");
     }
 
     #[test]
