@@ -575,6 +575,36 @@ fn compute_visibility_bitmaps(
     }
 }
 
+/// A publication built outside the locks: the segments it was built on,
+/// their manifest order then, and the map to swap in
+struct PreparedPublication {
+    snapshot: Arc<FxHashMap<u64, ColdSegment>>,
+    order: Vec<u64>,
+    map: FxHashMap<u64, ColdSegment>,
+}
+
+/// The manifest order after `old` leave and `new` take the first one's place
+fn published_order(
+    order: &[u64],
+    new_volumes: &[(u64, Arc<FrozenVolume>, SegmentMeta)],
+    old: &[u64],
+) -> Vec<u64> {
+    let insert_pos = order
+        .iter()
+        .position(|id| old.contains(id))
+        .unwrap_or(order.len());
+    let mut kept: Vec<u64> = order
+        .iter()
+        .copied()
+        .filter(|id| !old.contains(id))
+        .collect();
+    let insert_pos = insert_pos.min(kept.len());
+    for (i, (id, _, _)) in new_volumes.iter().enumerate() {
+        kept.insert(insert_pos + i, *id);
+    }
+    kept
+}
+
 /// Per-table segment manager.
 ///
 /// The mapping a segment is published with: computed against `schema`
@@ -2669,48 +2699,11 @@ impl SegmentManager {
         old_segment_ids: &[u64],
         schema: Option<&crate::core::Schema>,
     ) {
-        // Atomic: manifest + segments updated under both write locks.
-        // Bitmap computation runs inside — safe because writers are serialized.
-        {
-            let mut manifest = self.manifest.write();
-            let insert_pos = manifest
-                .segments
-                .iter()
-                .position(|s| old_segment_ids.contains(&s.segment_id))
-                .unwrap_or(manifest.segments.len());
-            manifest.remove_segments(old_segment_ids);
-            if new_segment_id >= manifest.next_segment_id {
-                manifest.next_segment_id = new_segment_id + 1;
-            }
-            let insert_pos = insert_pos.min(manifest.segments.len());
-            let seg_schema_version = new_meta.schema_version;
-            manifest.segments.insert(insert_pos, new_meta);
-
-            let cold = ColdSegment {
-                mapping: mapping_for(&manifest, &new_volume, seg_schema_version, schema),
-                volume: new_volume,
-                schema_version: seg_schema_version,
-                visible: None,
-            };
-            let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
-            let mut segments = self.segments.write();
-            let mut new_map = (**segments).clone();
-            for &id in old_segment_ids {
-                new_map.remove(&id);
-            }
-            new_map.insert(new_segment_id, cold);
-            compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
-            if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
-                && !new_map.values().any(|cs| cs.volume.is_cold())
-            {
-                self.has_cold
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-            *segments = Arc::new(new_map);
-        }
-        self.forget_key_order(old_segment_ids);
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.replace_segments_atomic_multi(
+            vec![(new_segment_id, new_volume, new_meta)],
+            old_segment_ids,
+            schema,
+        );
     }
 
     /// Atomically replace old segments with multiple new ones.
@@ -2725,87 +2718,141 @@ impl SegmentManager {
             self.replace_segments_atomic_remove_only(old_segment_ids);
             return;
         }
-        if new_volumes.len() == 1 {
-            let (id, vol, meta) = new_volumes.into_iter().next().unwrap();
-            self.replace_segments_atomic(id, vol, meta, old_segment_ids, schema);
-            return;
-        }
-        {
-            let mut manifest = self.manifest.write();
-            let insert_pos = manifest
-                .segments
-                .iter()
-                .position(|s| old_segment_ids.contains(&s.segment_id))
-                .unwrap_or(manifest.segments.len());
-            manifest.remove_segments(old_segment_ids);
+        self.publish_with(new_volumes, old_segment_ids, schema, |_| {});
+    }
 
-            let mut segments = self.segments.write();
-            let mut new_map = (**segments).clone();
-            for &id in old_segment_ids {
-                new_map.remove(&id);
-            }
-
-            let insert_pos = insert_pos.min(manifest.segments.len());
-            for (i, (seg_id, vol, meta)) in new_volumes.into_iter().enumerate() {
-                if seg_id >= manifest.next_segment_id {
-                    manifest.next_segment_id = seg_id + 1;
-                }
-                let seg_schema_version = meta.schema_version;
-                manifest.segments.insert(insert_pos + i, meta);
-
-                let cold = ColdSegment {
-                    mapping: mapping_for(&manifest, &vol, seg_schema_version, schema),
-                    volume: vol,
-                    schema_version: seg_schema_version,
-                    visible: None,
-                };
-                new_map.insert(seg_id, cold);
-            }
-
-            let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
-            compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
-            if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
-                && !new_map.values().any(|cs| cs.volume.is_cold())
-            {
-                self.has_cold
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-            *segments = Arc::new(new_map);
-        }
-        self.has_segments_flag
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+    /// The publication in its two steps, `between` run after the first
+    /// and before the second; a test puts a seal there
+    fn publish_with(
+        &self,
+        new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
+        old_segment_ids: &[u64],
+        schema: Option<&crate::core::Schema>,
+        between: impl FnOnce(&Self),
+    ) -> bool {
+        let prepared = self.prepare_publication(&new_volumes, old_segment_ids);
+        between(self);
+        let fresh = self.commit_publication(prepared, new_volumes, old_segment_ids, schema);
         self.forget_key_order(old_segment_ids);
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        fresh
+    }
+
+    /// The segments as they will stand after a publication, with every
+    /// row's visibility decided, built outside the locks on a snapshot of
+    /// the segments; `commit_publication` checks the snapshot still
+    /// stands before it swaps the map in
+    fn prepare_publication(
+        &self,
+        new_volumes: &[(u64, Arc<FrozenVolume>, SegmentMeta)],
+        old_segment_ids: &[u64],
+    ) -> PreparedPublication {
+        let (snapshot, order, mut map) = {
+            let manifest = self.manifest.read();
+            let segments = self.segments.read();
+            let order: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
+            let mut map = (**segments).clone();
+            for &id in old_segment_ids {
+                map.remove(&id);
+            }
+            for (seg_id, vol, meta) in new_volumes {
+                map.insert(
+                    *seg_id,
+                    ColdSegment {
+                        mapping: mapping_for(&manifest, vol, meta.schema_version, None),
+                        volume: Arc::clone(vol),
+                        schema_version: meta.schema_version,
+                        visible: None,
+                    },
+                );
+            }
+            (Arc::clone(&*segments), order, map)
+        };
+        let new_order = published_order(&order, new_volumes, old_segment_ids);
+        compute_visibility_bitmaps(&new_order, &mut map, &mut self.visibility_seen.lock());
+        PreparedPublication {
+            snapshot,
+            order,
+            map,
+        }
+    }
+
+    /// Publishes what `prepare_publication` built when the segments are
+    /// still the snapshot it was built on; otherwise builds the map again
+    /// under the locks. True when the prepared map was used
+    fn commit_publication(
+        &self,
+        prepared: PreparedPublication,
+        new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
+        old_segment_ids: &[u64],
+        schema: Option<&crate::core::Schema>,
+    ) -> bool {
+        let mut manifest = self.manifest.write();
+        let mut segments = self.segments.write();
+        let current_order: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
+        let fresh = Arc::ptr_eq(&*segments, &prepared.snapshot) && current_order == prepared.order;
+        let mut map = if fresh {
+            prepared.map
+        } else {
+            let mut map = (**segments).clone();
+            for &id in old_segment_ids {
+                map.remove(&id);
+            }
+            map
+        };
+        let insert_pos = manifest
+            .segments
+            .iter()
+            .position(|s| old_segment_ids.contains(&s.segment_id))
+            .unwrap_or(manifest.segments.len());
+        manifest.remove_segments(old_segment_ids);
+        let insert_pos = insert_pos.min(manifest.segments.len());
+        for (i, (seg_id, vol, meta)) in new_volumes.into_iter().enumerate() {
+            if seg_id >= manifest.next_segment_id {
+                manifest.next_segment_id = seg_id + 1;
+            }
+            let seg_schema_version = meta.schema_version;
+            manifest.segments.insert(insert_pos + i, meta);
+            // The mapping reads the manifest's history as it is now
+            let mapping = mapping_for(&manifest, &vol, seg_schema_version, schema);
+            match map.get_mut(&seg_id) {
+                Some(cs) if fresh => cs.mapping = mapping,
+                _ => {
+                    map.insert(
+                        seg_id,
+                        ColdSegment {
+                            mapping,
+                            volume: vol,
+                            schema_version: seg_schema_version,
+                            visible: None,
+                        },
+                    );
+                }
+            }
+        }
+        if !fresh {
+            let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
+            compute_visibility_bitmaps(&seg_ids, &mut map, &mut self.visibility_seen.lock());
+        }
+        if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
+            && !map.values().any(|cs| cs.volume.is_cold())
+        {
+            self.has_cold
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        // Whether the table has segments is read from the map published,
+        // under the locks that publish it
+        self.has_segments_flag
+            .store(!map.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        *segments = Arc::new(map);
+        fresh
     }
 
     /// Atomically remove old segments without adding a replacement.
     /// Used when partial compaction finds all rows in merged volumes are tombstoned.
     pub fn replace_segments_atomic_remove_only(&self, old_segment_ids: &[u64]) {
-        {
-            let mut manifest = self.manifest.write();
-            manifest.remove_segments(old_segment_ids);
-            let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
-            let mut segments = self.segments.write();
-            let mut new_map = (**segments).clone();
-            for &id in old_segment_ids {
-                new_map.remove(&id);
-            }
-            let has_any = !new_map.is_empty();
-            compute_visibility_bitmaps(&seg_ids, &mut new_map, &mut self.visibility_seen.lock());
-            if self.has_cold.load(std::sync::atomic::Ordering::Relaxed)
-                && !new_map.values().any(|cs| cs.volume.is_cold())
-            {
-                self.has_cold
-                    .store(false, std::sync::atomic::Ordering::Relaxed);
-            }
-            *segments = Arc::new(new_map);
-            self.has_segments_flag
-                .store(has_any, std::sync::atomic::Ordering::Relaxed);
-        }
-        self.forget_key_order(old_segment_ids);
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        self.publish_with(Vec::new(), old_segment_ids, None, |_| {});
     }
 
     /// Get the manifest for reading (e.g., to iterate segment metadata).
@@ -3508,6 +3555,166 @@ mod tests {
     }
 
     static EVICTION_EPOCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A hot volume of `ids` with a compressed store attached
+    fn volume_of(ids: &[i64]) -> Arc<FrozenVolume> {
+        use crate::core::{DataType, Row, SchemaBuilder, Value};
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        let mut builder = super::super::writer::VolumeBuilder::new(&schema);
+        builder.allow_any_row_order();
+        for &id in ids {
+            builder.add_row(id, &Row::from_values(vec![Value::Integer(id)]));
+        }
+        let mut volume = builder.finish().unwrap();
+        let (_, store) = crate::storage::volume::io::serialize_v4_public(&volume).unwrap();
+        volume.columns.attach_compressed_store(store);
+        Arc::new(volume)
+    }
+
+    fn meta_for_ids(id: u64, ids: &[i64]) -> SegmentMeta {
+        SegmentMeta {
+            segment_id: id,
+            file_path: PathBuf::from(format!("{id}.vol")),
+            row_count: ids.len(),
+            min_row_id: *ids.iter().min().unwrap_or(&0),
+            max_row_id: *ids.iter().max().unwrap_or(&0),
+            creation_lsn: 0,
+            seal_seq: 0,
+            schema_version: 0,
+        }
+    }
+
+    /// The visibility every segment would get from a computation over the
+    /// manager's segments as they stand
+    fn reference_visibility(mgr: &SegmentManager) -> Vec<(u64, Option<Vec<u64>>)> {
+        let order: Vec<u64> = mgr
+            .manifest
+            .read()
+            .segments
+            .iter()
+            .map(|m| m.segment_id)
+            .collect();
+        let mut map = (*mgr.segments_raw()).clone();
+        let mut seen = FxHashSet::default();
+        compute_visibility_bitmaps(&order, &mut map, &mut seen);
+        order
+            .iter()
+            .map(|id| (*id, map[id].visible.as_ref().map(|v| (**v).clone())))
+            .collect()
+    }
+
+    fn published_visibility(mgr: &SegmentManager) -> Vec<(u64, Option<Vec<u64>>)> {
+        let order: Vec<u64> = mgr
+            .manifest
+            .read()
+            .segments
+            .iter()
+            .map(|m| m.segment_id)
+            .collect();
+        let map = mgr.segments_raw();
+        order
+            .iter()
+            .map(|id| (*id, map[id].visible.as_ref().map(|v| (**v).clone())))
+            .collect()
+    }
+
+    #[test]
+    fn a_publication_prepared_outside_the_locks_is_the_one_computed_under_them() {
+        let mgr = SegmentManager::new("publish", None);
+        let a: Vec<i64> = (1..=70).collect();
+        let b: Vec<i64> = (50..=120).collect();
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
+        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
+        // A is rewritten as C; C keeps A's place, and B still masks the ids
+        // it shares with C
+        let c: Vec<i64> = (1..=70).collect();
+        let prepared = mgr.prepare_publication(&[(3, volume_of(&c), meta_for_ids(3, &c))], &[1]);
+        assert!(mgr.commit_publication(
+            prepared,
+            vec![(3, volume_of(&c), meta_for_ids(3, &c))],
+            &[1],
+            None
+        ));
+        let order: Vec<u64> = mgr
+            .manifest
+            .read()
+            .segments
+            .iter()
+            .map(|m| m.segment_id)
+            .collect();
+        assert_eq!(order, vec![3, 2]);
+        assert_eq!(published_visibility(&mgr), reference_visibility(&mgr));
+        let c_visible = mgr.segments_raw()[&3]
+            .visible
+            .clone()
+            .expect("C overlaps B");
+        assert!(c_visible[0] & 1 == 1, "id 1 is C's alone");
+        let masked = (0..70)
+            .filter(|i| c_visible[i >> 6] & (1u64 << (i & 63)) == 0)
+            .count();
+        assert_eq!(masked, 21, "ids 50 to 70 are B's");
+    }
+
+    #[test]
+    fn a_publication_prepared_on_a_stale_snapshot_is_computed_under_the_locks() {
+        let mgr = SegmentManager::new("publish_stale", None);
+        let a: Vec<i64> = (1..=70).collect();
+        let b: Vec<i64> = (50..=120).collect();
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
+        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
+        let c: Vec<i64> = (1..=70).collect();
+        let prepared = mgr.prepare_publication(&[(3, volume_of(&c), meta_for_ids(3, &c))], &[1]);
+        // A seal lands in between: D takes ids 2 and 130 from everyone below
+        let d: Vec<i64> = vec![2, 130];
+        mgr.register_segment(4, volume_of(&d), meta_for_ids(4, &d), None);
+        assert!(!mgr.commit_publication(
+            prepared,
+            vec![(3, volume_of(&c), meta_for_ids(3, &c))],
+            &[1],
+            None
+        ));
+        let order: Vec<u64> = mgr
+            .manifest
+            .read()
+            .segments
+            .iter()
+            .map(|m| m.segment_id)
+            .collect();
+        assert_eq!(order, vec![3, 2, 4]);
+        assert_eq!(published_visibility(&mgr), reference_visibility(&mgr));
+        let c_visible = mgr.segments_raw()[&3]
+            .visible
+            .clone()
+            .expect("C overlaps B and D");
+        assert!(c_visible[0] & (1 << 1) == 0, "id 2 is D's");
+        assert!(c_visible[0] & 1 == 1, "id 1 is C's");
+    }
+
+    #[test]
+    fn a_publication_of_nothing_keeps_the_volume_a_seal_added_meanwhile_visible() {
+        let mgr = SegmentManager::new("publish_empty", None);
+        let a: Vec<i64> = (1..=10).collect();
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
+        // Every row of A is gone: the compaction publishes nothing, and a
+        // seal lands between its two steps
+        let b: Vec<i64> = vec![20, 21];
+        let fresh = mgr.publish_with(Vec::new(), &[1], None, |mgr| {
+            mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
+        });
+        assert!(!fresh);
+        assert!(mgr.has_segments(), "the sealed volume is there to read");
+        let order: Vec<u64> = mgr
+            .manifest
+            .read()
+            .segments
+            .iter()
+            .map(|m| m.segment_id)
+            .collect();
+        assert_eq!(order, vec![2]);
+        assert!(mgr.segments_raw().contains_key(&2));
+    }
 
     #[test]
     fn test_eviction_lifecycle() {
