@@ -728,3 +728,216 @@ fn test_wal_sync_failure_on_a_delete_keeps_the_row_everywhere() {
     assert!(ids("SELECT id FROM fp_del WHERE k = 'a' AND t = 150").is_empty());
     assert!(ids("SELECT id FROM fp_del WHERE t = 150").is_empty());
 }
+
+// ============================================================================
+// Checkpoint entry: the cut, the catalog copies and the recovery boundary
+// ============================================================================
+
+fn checkpoint_boundary(dir: &std::path::Path) -> u64 {
+    stoolap::storage::mvcc::wal_manager::CheckpointMetadata::read_from_file(
+        &dir.join("wal").join("checkpoint.meta"),
+    )
+    .expect("checkpoint.meta")
+    .lsn
+}
+
+fn index_names(db: &Database, table: &str) -> Vec<String> {
+    db.query(&format!("SHOW INDEXES FROM {}", table), ())
+        .expect("SHOW INDEXES")
+        .map(|row| row.unwrap().get(1).unwrap())
+        .collect()
+}
+
+fn catalog(db: &Database, table: &str) {
+    db.execute(
+        &format!(
+            "CREATE TABLE {} (id INTEGER PRIMARY KEY, k TEXT, c INTEGER, UNIQUE(k))",
+            table
+        ),
+        (),
+    )
+    .expect("CREATE TABLE");
+    db.execute(&format!("CREATE INDEX {}_c ON {}(c)", table, table), ())
+        .expect("CREATE INDEX");
+    db.execute(
+        &format!("CREATE VIEW {}_v AS SELECT id, k FROM {}", table, table),
+        (),
+    )
+    .expect("CREATE VIEW");
+}
+
+fn assert_catalog_restored(db: &Database, table: &str, rows: i64) {
+    let count: i64 = db
+        .query_one(&format!("SELECT COUNT(*) FROM {}", table), ())
+        .expect("COUNT");
+    assert_eq!(count, rows, "rows of {}", table);
+    let through_view: i64 = db
+        .query_one(&format!("SELECT COUNT(*) FROM {}_v", table), ())
+        .expect("the view is back");
+    assert_eq!(through_view, rows);
+    let names = index_names(db, table);
+    assert!(
+        names.iter().any(|n| n == &format!("{}_c", table)),
+        "the ordinary index is back: {:?}",
+        names
+    );
+    assert!(
+        db.execute(&format!("INSERT INTO {} VALUES (1000, 'k1', 1)", table), ())
+            .is_err(),
+        "the unique index is back"
+    );
+}
+
+#[test]
+fn a_commit_lands_while_the_checkpoint_syncs_its_wal() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let dsn = format!("file://{}", dir.path().display());
+    let db = Database::open(&dsn).expect("open");
+    db.execute("CREATE TABLE fp_cut (id INTEGER PRIMARY KEY, val TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO fp_cut VALUES (1, 'before')", ())
+        .unwrap();
+
+    // The checkpoint's WAL sync runs on this thread; the hook commits a
+    // row from another thread and waits for it, bounded: a commit held
+    // behind the sync by the fence would time out here
+    let landed = std::sync::Arc::new(AtomicBool::new(false));
+    let seen = std::sync::Arc::clone(&landed);
+    let writer = db.clone();
+    test_failpoints::before_wal_sync(move || {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = writer.execute("INSERT INTO fp_cut VALUES (2, 'during')", ());
+            let _ = tx.send(result.is_ok());
+        });
+        if let Ok(true) = rx.recv_timeout(std::time::Duration::from_secs(3)) {
+            seen.store(true, Ordering::Release);
+        }
+    });
+    db.execute("PRAGMA CHECKPOINT", ()).expect("checkpoint");
+    assert!(
+        landed.load(Ordering::Acquire),
+        "a commit must not wait behind the checkpoint's WAL sync"
+    );
+
+    let _ = db.close();
+    let db = Database::open(&dsn).expect("reopen");
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM fp_cut", ()).unwrap();
+    assert_eq!(count, 2, "the row committed after the cut survives");
+}
+
+#[test]
+fn a_failed_catalog_copy_leaves_the_recovery_boundary_where_it_was() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    // Full mode: every commit is synced, so the poison that follows the
+    // failed write cuts nothing acknowledged
+    let dsn = format!("file://{}?sync_mode=full", dir.path().display());
+    let db = Database::open(&dsn).expect("open");
+    catalog(&db, "fp_bound");
+    for i in 1..=3 {
+        db.execute(
+            &format!("INSERT INTO fp_bound VALUES ({}, 'k{}', {})", i, i, i),
+            (),
+        )
+        .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ())
+        .expect("first checkpoint");
+    let boundary = checkpoint_boundary(dir.path());
+    assert!(boundary > 0);
+
+    for i in 4..=6 {
+        db.execute(
+            &format!("INSERT INTO fp_bound VALUES ({}, 'k{}', {})", i, i, i),
+            (),
+        )
+        .unwrap();
+    }
+    test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
+    let _ = db.execute("PRAGMA CHECKPOINT", ());
+    test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
+    assert_eq!(
+        checkpoint_boundary(dir.path()),
+        boundary,
+        "the boundary must not move past catalog copies that never became durable"
+    );
+
+    let _ = db.close();
+    let db = Database::open(&dsn).expect("reopen");
+    assert_catalog_restored(&db, "fp_bound", 6);
+}
+
+#[test]
+fn the_catalog_copies_are_durable_when_the_truncation_returns_early() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    // Every record rotates the WAL, so the cut is the file's own LSN and
+    // the truncation returns before rewriting anything
+    let dsn = format!("file://{}?wal_max_size=1", dir.path().display());
+    let db = Database::open(&dsn).expect("open");
+    catalog(&db, "fp_rot");
+    for i in 1..=3 {
+        db.execute(
+            &format!("INSERT INTO fp_rot VALUES ({}, 'k{}', {})", i, i, i),
+            (),
+        )
+        .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).expect("checkpoint");
+
+    // A failed write poisons the WAL and cuts the file back to its synced
+    // length: whatever the checkpoint left unsynced is gone, as in a crash
+    test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
+    assert!(db
+        .execute("INSERT INTO fp_rot VALUES (4, 'k4', 4)", ())
+        .is_err());
+    test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
+
+    let _ = db.close();
+    let db = Database::open(&dsn).expect("reopen");
+    assert_catalog_restored(&db, "fp_rot", 3);
+}
+
+#[test]
+fn a_write_failing_before_the_checkpoint_sync_fails_the_sync() {
+    use stoolap::storage::mvcc::persistence::DDL_TXN_ID;
+    use stoolap::storage::mvcc::wal_manager::{WALEntry, WALManager, WALOperationType};
+    use stoolap::storage::SyncMode;
+
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let wal =
+        std::sync::Arc::new(WALManager::new(dir.path().join("wal"), SyncMode::Full).expect("wal"));
+    wal.append_entry(WALEntry::new(
+        1,
+        "t".to_string(),
+        1,
+        WALOperationType::Insert,
+        vec![],
+    ))
+    .unwrap();
+    wal.write_commit_marker(1).unwrap();
+    wal.append_catalog_entry(WALEntry::new(
+        DDL_TXN_ID,
+        "t".to_string(),
+        0,
+        WALOperationType::CreateTable,
+        vec![1, 2, 3],
+    ))
+    .unwrap();
+
+    // A commit fails right before the sync takes the lock: the WAL is
+    // poisoned and cut back to its synced length, the copy with it
+    let poisoner = std::sync::Arc::clone(&wal);
+    test_failpoints::before_wal_sync(move || {
+        test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
+        assert!(poisoner.write_commit_marker(2).is_err());
+        test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
+    });
+    assert!(
+        wal.sync_for_checkpoint().is_err(),
+        "the sync must not report the cut copy durable"
+    );
+}
