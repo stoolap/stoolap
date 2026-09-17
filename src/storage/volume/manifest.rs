@@ -479,14 +479,15 @@ impl TableManifest {
             f.write_all(&data).map_err(|e| {
                 crate::core::Error::internal(format!("failed to write manifest: {}", e))
             })?;
-            f.sync_all().map_err(|e| {
+            super::io::sync_ordered(&f).map_err(|e| {
                 crate::core::Error::internal(format!("failed to fsync manifest: {}", e))
             })?;
         }
         std::fs::rename(&tmp_path, path).map_err(|e| {
             crate::core::Error::internal(format!("failed to rename manifest: {}", e))
         })?;
-        // Fsync parent directory to ensure the rename is durable.
+        // The full sync of the directory makes the rename durable, and
+        // with it everything the publication ordered before this point.
         // Windows does not support opening directories for fsync;
         // NTFS metadata is flushed with the file's sync_all().
         #[cfg(not(windows))]

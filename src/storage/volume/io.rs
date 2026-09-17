@@ -36,6 +36,43 @@ pub(crate) const V4_MAGIC: [u8; 4] = *b"STV4";
 /// V4 format version. Bump when the metadata or block layout changes.
 pub(crate) const V4_VERSION: u32 = 1;
 
+/// Orders `file`'s writes before every write that follows, without
+/// waiting for the disk to make them durable: a publication's steps
+/// take this in turn, and the full sync of its last step, the manifest
+/// directory's, makes them all durable at once. On macOS this is an
+/// `F_BARRIERFSYNC` (a full sync when the file system has no barrier),
+/// where a full sync flushes the drive's cache; elsewhere `sync_data`
+pub(crate) fn sync_ordered(file: &std::fs::File) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_BARRIERFSYNC) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if !barrier_unsupported(error.raw_os_error()) {
+            return Err(error);
+        }
+        file.sync_all()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file.sync_data()
+    }
+}
+
+/// Whether a failed barrier means the file system has none, so that a
+/// full sync stands in: the kernel answers EINVAL or ENOTSUP, and an
+/// older kernel hands the request to a file system that does not know
+/// it, which answers ENOTTY; any other error is the write's own
+#[cfg(any(target_os = "macos", test))]
+fn barrier_unsupported(code: Option<i32>) -> bool {
+    matches!(
+        code,
+        Some(libc::EINVAL) | Some(libc::ENOTSUP) | Some(libc::ENOTTY)
+    )
+}
+
 /// Volume catalog filename
 const CATALOG_FILE: &str = "volumes.catalog";
 
@@ -83,7 +120,7 @@ pub fn write_volume_to_disk_opts(
         f.write_all(&data).map_err(|e| {
             crate::core::Error::internal(format!("failed to write volume file: {}", e))
         })?;
-        f.sync_all().map_err(|e| {
+        sync_ordered(&f).map_err(|e| {
             crate::core::Error::internal(format!("failed to fsync volume tmp file: {}", e))
         })?;
     }
@@ -95,7 +132,7 @@ pub fn write_volume_to_disk_opts(
 
     #[cfg(not(windows))]
     if let Ok(d) = std::fs::File::open(&table_dir) {
-        d.sync_all().map_err(|e| {
+        sync_ordered(&d).map_err(|e| {
             crate::core::Error::internal(format!("failed to fsync volume directory: {}", e))
         })?;
     }
@@ -1140,5 +1177,27 @@ mod tests {
         let row = loaded.get_row(0).unwrap();
         assert_eq!(row.get(0), Some(&Value::Integer(42)));
         assert_eq!(row.get(1), Some(&Value::text("test")));
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    #[test]
+    fn an_ordered_sync_takes_a_file_and_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"x").unwrap();
+        super::sync_ordered(&std::fs::File::open(&path).unwrap()).unwrap();
+        #[cfg(not(windows))]
+        super::sync_ordered(&std::fs::File::open(dir.path()).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_file_system_without_a_barrier_gets_a_full_sync_and_an_io_error_stands() {
+        assert!(super::barrier_unsupported(Some(libc::EINVAL)));
+        assert!(super::barrier_unsupported(Some(libc::ENOTSUP)));
+        assert!(super::barrier_unsupported(Some(libc::ENOTTY)));
+        assert!(!super::barrier_unsupported(Some(libc::EIO)));
+        assert!(!super::barrier_unsupported(None));
     }
 }

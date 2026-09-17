@@ -403,8 +403,7 @@ impl VolumeFileWriter {
                 .map_err(|e| io_error("failed to write volume file", e))?;
             out.flush()
                 .map_err(|e| io_error("failed to flush volume file", e))?;
-            out.get_ref()
-                .sync_all()
+            super::io::sync_ordered(out.get_ref())
                 .map_err(|e| io_error("failed to fsync volume tmp file", e))?;
         }
         drop(block_file);
@@ -440,7 +439,7 @@ impl VolumeFileWriter {
         #[cfg(not(windows))]
         if let Some(dir) = self.final_path.parent() {
             let d = File::open(dir).map_err(|e| io_error("failed to open volume directory", e))?;
-            d.sync_all()
+            super::io::sync_ordered(&d)
                 .map_err(|e| io_error("failed to fsync volume directory", e))?;
         }
         let blocks_start = 20 + lz4_meta_len(&self.final_path)? + col_count * num_groups * 16;
