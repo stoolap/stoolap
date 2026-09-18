@@ -38,11 +38,14 @@ fn get_dir_size(dir: &Path) -> u64 {
     if !dir.exists() {
         return 0;
     }
+    // Through a handle: a directory listing reports a stale length for a
+    // file that is open for writing on Windows
     fs::read_dir(dir)
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
-                .filter_map(|e| e.metadata().ok())
+                .filter_map(|e| fs::File::open(e.path()).ok())
+                .filter_map(|f| f.metadata().ok())
                 .map(|m| m.len())
                 .sum()
         })
@@ -96,8 +99,8 @@ fn get_wal_lsn(db_path: &Path) -> Option<u64> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with("wal-") && name.ends_with(".log") {
-                // Extract LSN from "wal-YYYYMMDD-HHMMSS-lsn-N.log"
+            if (name.starts_with("wal-") || name.starts_with("wal_")) && name.ends_with(".log") {
+                // Extract LSN from "...-lsn-N.log"
                 if let Some(lsn_start) = name.find("lsn-") {
                     if let Some(lsn_end) = name[lsn_start + 4..].find('.') {
                         return name[lsn_start + 4..lsn_start + 4 + lsn_end].parse().ok();

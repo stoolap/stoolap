@@ -65,7 +65,7 @@ pub(crate) fn sync_ordered(file: &std::fs::File) -> std::io::Result<()> {
 /// full sync stands in: the kernel answers EINVAL or ENOTSUP, and an
 /// older kernel hands the request to a file system that does not know
 /// it, which answers ENOTTY; any other error is the write's own
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn barrier_unsupported(code: Option<i32>) -> bool {
     matches!(
         code,
@@ -1187,11 +1187,15 @@ mod sync_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("f");
         std::fs::write(&path, b"x").unwrap();
-        super::sync_ordered(&std::fs::File::open(&path).unwrap()).unwrap();
+        // Opened for writing, as every caller's file is: Windows refuses
+        // to flush a read-only handle
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        super::sync_ordered(&f).unwrap();
         #[cfg(not(windows))]
         super::sync_ordered(&std::fs::File::open(dir.path()).unwrap()).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_file_system_without_a_barrier_gets_a_full_sync_and_an_io_error_stands() {
         assert!(super::barrier_unsupported(Some(libc::EINVAL)));

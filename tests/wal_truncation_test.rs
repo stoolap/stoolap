@@ -112,13 +112,16 @@ fn test_wal_truncates_under_continuous_writes() {
     stop.store(true, Ordering::Relaxed);
     let rows_inserted = writer.join().unwrap();
 
-    // Now run an explicit checkpoint to ensure WAL truncation happens
+    // Now run explicit checkpoints to ensure WAL truncation happens: the
+    // first starts a new file and leaves the old one, the second covers
+    // and removes it
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
     db.execute("PRAGMA CHECKPOINT", ()).unwrap();
 
-    // Check WAL directory size: after checkpoint the WAL should be bounded.
-    // With continuous writes producing potentially tens of thousands of rows,
-    // an unbounded WAL would be many megabytes. After truncation it should
-    // be well under 1 MB.
+    // Check WAL directory size: after the checkpoints the WAL should be
+    // bounded. With continuous writes producing potentially tens of
+    // thousands of rows, an unbounded WAL would be many megabytes. After
+    // truncation it should be well under 1 MB.
     let wal_size = wal_dir_total_size(&db_path);
     assert!(
         wal_size < 1_048_576,

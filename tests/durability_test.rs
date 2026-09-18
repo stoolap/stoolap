@@ -95,6 +95,21 @@ fn find_wal_files(db_path: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// The newest WAL file holding records: a checkpoint's truncation starts an
+/// empty file and leaves the old one until the next truncation covers it.
+fn newest_written_wal_file(wal_files: &[PathBuf]) -> &PathBuf {
+    wal_files
+        .iter()
+        .rev()
+        .find(|p| {
+            fs::File::open(p)
+                .and_then(|f| f.metadata())
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+        })
+        .unwrap_or(&wal_files[wal_files.len() - 1])
+}
+
 /// Find checkpoint.meta file
 fn find_checkpoint_file(db_path: &Path) -> Option<PathBuf> {
     let path = db_path.join("wal").join("checkpoint.meta");
@@ -366,7 +381,7 @@ fn torn_write_test(cut_into_last: usize) {
     assert!(!wal_files.is_empty(), "No WAL files found");
 
     // Read WAL data
-    let wal_path = &wal_files[wal_files.len() - 1]; // Use last WAL file
+    let wal_path = newest_written_wal_file(&wal_files); // Use last WAL file
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     assert!(
@@ -417,7 +432,7 @@ fn test_torn_write_partial_data() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     assert!(entries.len() >= 2);
@@ -439,7 +454,7 @@ fn test_torn_write_after_data_no_crc() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     assert!(entries.len() >= 2);
@@ -459,7 +474,7 @@ fn test_torn_write_partial_crc_1_byte() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     assert!(entries.len() >= 2);
@@ -479,7 +494,7 @@ fn test_torn_write_partial_crc_3_bytes() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     assert!(entries.len() >= 2);
@@ -504,7 +519,7 @@ fn test_sector_loss_first_page() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
 
     // Only corrupt if the file is large enough
@@ -541,7 +556,7 @@ fn test_sector_loss_middle_page() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let num_pages = data.len() / 4096;
 
@@ -563,7 +578,7 @@ fn test_sector_loss_last_page() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let num_pages = data.len() / 4096;
 
@@ -583,7 +598,7 @@ fn test_sector_loss_alternating_pages() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let num_pages = data.len() / 4096;
 
@@ -607,7 +622,7 @@ fn test_bit_flip_magic_bytes() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -629,7 +644,7 @@ fn test_bit_flip_crc() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -650,7 +665,7 @@ fn test_bit_flip_data_portion() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -673,7 +688,7 @@ fn test_bit_flip_entry_size() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -697,7 +712,7 @@ fn test_bit_flip_flags_compressed() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -827,7 +842,7 @@ fn test_first_data_entry_corrupt() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     let dml_entries = find_dml_data_entries(&entries);
@@ -851,7 +866,7 @@ fn test_last_entry_corrupt() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     assert!(!entries.is_empty());
@@ -871,7 +886,7 @@ fn test_middle_entry_corrupt() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -894,7 +909,7 @@ fn test_commit_marker_destroyed() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     let commit_entries = find_commit_entries(&entries);
@@ -919,7 +934,7 @@ fn test_data_entries_destroyed_commit_intact() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     let dml_entries = find_dml_data_entries(&entries);
@@ -1045,7 +1060,7 @@ fn test_lsn_gap_in_sequence() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -1073,7 +1088,7 @@ fn test_duplicate_entry_in_wal() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -1120,7 +1135,7 @@ fn test_corrupt_compressed_payload() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -1164,7 +1179,7 @@ fn test_force_compressed_flag_on_uncompressed() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -1197,7 +1212,7 @@ fn test_clear_compressed_flag_on_compressed() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -1232,7 +1247,7 @@ fn test_combined_torn_write_plus_bit_flip() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -1263,7 +1278,7 @@ fn test_many_transactions_last_commit_corrupt() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     let commit_entries = find_commit_entries(&entries);
@@ -1322,7 +1337,7 @@ fn test_recovery_then_new_data_then_recovery() {
     assert!(!wal_files.is_empty());
 
     // Corrupt: truncate last entry
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     if entries.len() >= 2 {
@@ -1465,7 +1480,7 @@ fn test_empty_wal_file() {
     assert!(!wal_files.is_empty());
 
     // Replace the WAL file with an empty file
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     fs::write(wal_path, []).unwrap();
 
     remove_lock_file(&fixture.db_path);
@@ -1483,7 +1498,7 @@ fn test_wal_file_with_only_header_garbage() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let garbage = vec![0xDE; 32];
     fs::write(wal_path, &garbage).unwrap();
 
@@ -1501,7 +1516,7 @@ fn test_wal_magic_at_very_end_of_file() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     assert!(!entries.is_empty());
@@ -1556,7 +1571,7 @@ fn test_all_commit_markers_destroyed() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     let commit_entries = find_commit_entries(&entries);
@@ -1592,7 +1607,7 @@ fn test_repeated_recovery_idempotent() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -1638,7 +1653,7 @@ fn test_concurrent_corruption_patterns() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -1670,7 +1685,7 @@ fn test_wal_with_garbage_appended() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
 
     // Append 1KB of non-magic garbage
@@ -1690,7 +1705,7 @@ fn test_wal_entry_size_zero() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -1718,7 +1733,7 @@ fn test_wal_entry_size_very_large() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -1823,7 +1838,7 @@ fn test_multi_table_corrupt_middle_entry() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -1879,7 +1894,7 @@ fn test_multi_table_one_tables_commit_destroyed() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     let commit_entries = find_commit_entries(&entries);
@@ -1920,7 +1935,7 @@ fn test_multi_table_first_page_zeroed() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
 
     if data.len() > 4096 {
@@ -1954,7 +1969,7 @@ fn test_multi_table_cross_table_join_after_recovery() {
     assert!(!wal_files.is_empty());
 
     // Truncate last entry (mild corruption)
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     if entries.len() >= 2 {
@@ -2041,7 +2056,7 @@ fn test_index_recovery_after_torn_write() {
     assert!(!wal_files.is_empty());
 
     // Truncate last entry
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     if entries.len() >= 2 {
@@ -2075,7 +2090,7 @@ fn test_index_recovery_after_bit_corruption() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -2116,7 +2131,7 @@ fn test_index_consistency_after_corruption() {
     assert!(!wal_files.is_empty());
 
     // Corrupt a middle entry
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -2172,7 +2187,7 @@ fn test_index_ddl_corrupt_but_data_intact() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     let dml_entries = find_dml_data_entries(&entries);
@@ -2254,7 +2269,7 @@ fn test_multi_column_index_recovery() {
     // Corrupt a middle entry
     let wal_files = find_wal_files(&db_path);
     assert!(!wal_files.is_empty());
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -2346,7 +2361,7 @@ fn test_explicit_txn_one_insert_corrupt() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     let dml_entries = find_dml_data_entries(&entries);
@@ -2387,7 +2402,7 @@ fn test_explicit_txn_commit_marker_corrupt() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     let commit_entries = find_commit_entries(&entries);
@@ -2437,7 +2452,7 @@ fn test_explicit_txn_all_inserts_in_one_txn_corrupt() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     let dml_entries = find_dml_data_entries(&entries);
@@ -2475,7 +2490,7 @@ fn test_explicit_txn_interleaved_corruption() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     let dml_entries = find_dml_data_entries(&entries);
@@ -2688,7 +2703,7 @@ fn test_volume_valid_wal_corrupt() {
     // Corrupt the WAL (post-checkpoint entries)
     let wal_files = find_wal_files(&fixture.db_path);
     if !wal_files.is_empty() {
-        let wal_path = &wal_files[wal_files.len() - 1];
+        let wal_path = newest_written_wal_file(&wal_files);
         let mut data = fs::read(wal_path).unwrap();
 
         if data.len() > 200 {
@@ -3422,17 +3437,14 @@ fn test_safe_truncation_table_created_between_snapshots() {
             )
             .unwrap();
         }
-        let wal_before_first = total_wal_size(&db_path);
+        let files_before_first = find_wal_files(&db_path).len();
         let _ = db.execute("PRAGMA CHECKPOINT", ());
-        let wal_after_first = total_wal_size(&db_path);
+        let files_after_first = find_wal_files(&db_path).len();
 
-        // WAL should be truncated after first checkpoint
-        assert!(
-            wal_after_first < wal_before_first,
-            "WAL should be truncated after first checkpoint: before={}, after={}",
-            wal_before_first,
-            wal_after_first
-        );
+        // The first checkpoint starts a new WAL file; the old one is
+        // reclaimed by the next checkpoint that covers it
+        assert_eq!(files_before_first, 1);
+        assert_eq!(files_after_first, 2);
 
         // Now create a new table AFTER the first checkpoint
         db.execute(
@@ -5092,7 +5104,7 @@ fn test_concurrent_writers_with_wal_corruption() {
     // Corrupt middle of WAL
     let wal_files = find_wal_files(&db_path);
     assert!(!wal_files.is_empty());
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     if entries.len() > 4 {
@@ -5325,9 +5337,18 @@ fn test_rotation_artifacts_bak_file_recovery() {
     }
     remove_lock_file(&db_path);
 
-    // Find the WAL file and rename it to .bak (simulating interrupted truncation)
+    // Find the WAL file and rename it to .bak (simulating interrupted truncation
+    // by an older binary, whose copy left a single file); the empty file the
+    // close's checkpoint started is dropped first
     let wal_files = find_wal_files(&db_path);
     assert!(!wal_files.is_empty(), "No WAL files found");
+    for empty in wal_files
+        .iter()
+        .filter(|p| fs::metadata(p).unwrap().len() == 0)
+    {
+        fs::remove_file(empty).unwrap();
+    }
+    let wal_files = find_wal_files(&db_path);
 
     let wal_path = &wal_files[0];
     let bak_path = wal_path.with_extension("log.bak");
@@ -5518,7 +5539,7 @@ fn test_power_loss_truncated_last_entry() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     assert!(entries.len() >= 2, "Need at least 2 entries");
@@ -5541,7 +5562,7 @@ fn test_power_loss_garbage_appended() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
 
     // Append 200 bytes of garbage (simulates partial write of next entry)
@@ -5561,7 +5582,7 @@ fn test_power_loss_last_page_zeroed() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let file_len = data.len();
 
@@ -5622,7 +5643,7 @@ fn test_power_loss_commit_marker_torn() {
     let wal_files = find_wal_files(&db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -5775,7 +5796,7 @@ fn test_large_row_recovery() {
     let wal_files = find_wal_files(&db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -5853,7 +5874,7 @@ fn test_many_small_rows_recovery() {
     let wal_files = find_wal_files(&db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
 
@@ -6161,7 +6182,7 @@ fn test_wal_truncation_then_corrupt_new_wal() {
     // Corrupt the post-truncation WAL file
     let wal_files = find_wal_files(&db_path);
     assert!(!wal_files.is_empty());
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     if data.len() > 64 {
         // Zero a big chunk of the WAL — destroys phase 3 data
@@ -6197,7 +6218,7 @@ fn test_wal_entry_size_exceeds_sanity_limit() {
     let wal_files = find_wal_files(&fixture.db_path);
     assert!(!wal_files.is_empty());
 
-    let wal_path = &wal_files[wal_files.len() - 1];
+    let wal_path = newest_written_wal_file(&wal_files);
     let mut data = fs::read(wal_path).unwrap();
     let entries = find_entry_boundaries(&data);
     assert!(entries.len() >= 2, "Need at least 2 entries");
@@ -7993,7 +8014,7 @@ fn test_multiple_crash_recovery_cycles() {
     // Corrupt: truncate last WAL entry
     let wal_files = find_wal_files(&db_path);
     if !wal_files.is_empty() {
-        let wal_path = &wal_files[wal_files.len() - 1];
+        let wal_path = newest_written_wal_file(&wal_files);
         let data = fs::read(wal_path).unwrap();
         let entries = find_entry_boundaries(&data);
         if entries.len() >= 2 {
@@ -8029,7 +8050,7 @@ fn test_multiple_crash_recovery_cycles() {
     // Corrupt again: flip a bit in the WAL
     let wal_files = find_wal_files(&db_path);
     if !wal_files.is_empty() {
-        let wal_path = &wal_files[wal_files.len() - 1];
+        let wal_path = newest_written_wal_file(&wal_files);
         let mut data = fs::read(wal_path).unwrap();
         let entries = find_entry_boundaries(&data);
         if entries.len() >= 3 {
@@ -8129,13 +8150,13 @@ fn test_crash_recovery_with_checkpoint_between_cycles() {
     // Corrupt WAL after checkpoint
     let wal_files = find_wal_files(&db_path);
     if !wal_files.is_empty() {
-        let wal_path = &wal_files[wal_files.len() - 1];
+        let wal_path = newest_written_wal_file(&wal_files);
         let mut data = fs::read(wal_path).unwrap();
-        // Zero last 4KB page
-        let file_len = data.len();
-        if file_len > 4096 {
-            let last_page = (file_len - 1) / 4096;
-            zero_page(&mut data, last_page);
+        // Zero the first 4KB page: sealed rows below the boundary. The
+        // checkpoint's catalog copies sit at the file's tail and are the
+        // schema's only WAL copy until the next checkpoint writes fresh ones
+        if data.len() > 4096 {
+            zero_page(&mut data, 0);
             fs::write(wal_path, &data).unwrap();
         }
     }
