@@ -941,3 +941,442 @@ fn a_write_failing_before_the_checkpoint_sync_fails_the_sync() {
         "the sync must not report the cut copy durable"
     );
 }
+
+// ============================================================================
+// WAL truncation by rotation: the swap and what races it
+// ============================================================================
+
+fn wal_file_sizes(dir: &std::path::Path) -> Vec<(String, u64)> {
+    let mut files: Vec<(String, u64)> = std::fs::read_dir(dir.join("wal"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            (name.starts_with("wal-") || name.starts_with("wal_")) && name.ends_with(".log")
+        })
+        .map(|e| {
+            // Through a handle: a directory listing reports a stale length
+            // for a file that is open for writing on Windows
+            let len = std::fs::File::open(e.path())
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .len();
+            (e.file_name().to_string_lossy().to_string(), len)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Commit `sql` from another thread while the hook's thread is inside the
+/// truncation, with a bounded wait; true when the commit went through.
+fn commit_from_another_thread(db: &Database, sql: &'static str) -> bool {
+    let writer = db.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(writer.execute(sql, ()).is_ok());
+    });
+    matches!(rx.recv_timeout(std::time::Duration::from_secs(3)), Ok(true))
+}
+
+#[test]
+fn rows_committed_while_the_truncation_prepares_its_file_survive() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    let db = Database::open(&dsn).expect("open");
+    db.execute("CREATE TABLE fp_swap (id INTEGER PRIMARY KEY, v TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO fp_swap VALUES (1, 'before')", ())
+        .unwrap();
+
+    // Between the new file's creation and the swap, two rows commit: they
+    // land in the old file above the boundary and nothing copies them
+    let landed = std::sync::Arc::new(AtomicBool::new(false));
+    let seen = std::sync::Arc::clone(&landed);
+    let writer = db.clone();
+    test_failpoints::before_wal_swap(move || {
+        let a = commit_from_another_thread(&writer, "INSERT INTO fp_swap VALUES (2, 'during')");
+        let b = commit_from_another_thread(&writer, "INSERT INTO fp_swap VALUES (3, 'during')");
+        seen.store(a && b, Ordering::Release);
+    });
+    db.execute("PRAGMA CHECKPOINT", ()).expect("checkpoint");
+    assert!(
+        landed.load(Ordering::Acquire),
+        "the commits must not wait on the truncation"
+    );
+    assert_eq!(wal_file_sizes(dir.path()).len(), 2);
+
+    let _ = db.close();
+    let db = Database::open(&dsn).expect("reopen");
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM fp_swap", ()).unwrap();
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn a_rotation_racing_the_truncation_leaves_no_third_file() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    // Every commit rotates, so the commit inside the hook starts a file of
+    // its own and the truncation's prepared file must go
+    let dsn = format!(
+        "file://{}?wal_max_size=1&checkpoint_on_close=off",
+        dir.path().display()
+    );
+    let db = Database::open(&dsn).expect("open");
+    db.execute("CREATE TABLE fp_race (id INTEGER PRIMARY KEY, v TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO fp_race VALUES (1, 'a')", ())
+        .unwrap();
+
+    let writer = db.clone();
+    let wal_dir = dir.path().to_path_buf();
+    let rotated = std::sync::Arc::new(AtomicBool::new(false));
+    let seen = std::sync::Arc::clone(&rotated);
+    test_failpoints::before_wal_swap(move || {
+        let before = wal_file_sizes(&wal_dir).len();
+        let ok = commit_from_another_thread(&writer, "INSERT INTO fp_race VALUES (2, 'b')");
+        let after = wal_file_sizes(&wal_dir).len();
+        seen.store(ok && after > before, Ordering::Release);
+    });
+    db.execute("PRAGMA CHECKPOINT", ()).expect("checkpoint");
+    assert!(
+        rotated.load(Ordering::Acquire),
+        "the commit inside the hook rotated"
+    );
+
+    let files = wal_file_sizes(dir.path());
+    let empty = files.iter().filter(|f| f.1 == 0).count();
+    assert!(empty <= 1, "at most the current file is empty: {:?}", files);
+
+    let _ = db.close();
+    let db = Database::open(&dsn).expect("reopen");
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM fp_race", ()).unwrap();
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn a_write_failing_before_the_swap_keeps_the_current_file() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?sync_mode=full&checkpoint_on_close=off",
+        dir.path().display()
+    );
+    let db = Database::open(&dsn).expect("open");
+    catalog(&db, "fp_noswap");
+    for i in 1..=3 {
+        db.execute(
+            &format!("INSERT INTO fp_noswap VALUES ({}, 'k{}', {})", i, i, i),
+            (),
+        )
+        .unwrap();
+    }
+    let before = wal_file_sizes(dir.path());
+    assert_eq!(before.len(), 1);
+
+    // A commit fails while the new file waits: the WAL is poisoned, the
+    // truncation must not swap, and the prepared file must not stay
+    let writer = db.clone();
+    test_failpoints::before_wal_swap(move || {
+        test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
+        assert!(!commit_from_another_thread(
+            &writer,
+            "INSERT INTO fp_noswap VALUES (4, 'k4', 4)"
+        ));
+        test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
+    });
+    let _ = db.execute("PRAGMA CHECKPOINT", ());
+    let after = wal_file_sizes(dir.path());
+    assert_eq!(
+        after.iter().map(|f| &f.0).collect::<Vec<_>>(),
+        before.iter().map(|f| &f.0).collect::<Vec<_>>(),
+        "no swap and no leftover: {:?}",
+        after
+    );
+
+    let _ = db.close();
+    let db = Database::open(&dsn).expect("reopen");
+    assert_catalog_restored(&db, "fp_noswap", 3);
+}
+
+#[test]
+fn a_commit_synced_before_the_swap_survives_a_poison_of_the_new_file() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?sync_mode=full&checkpoint_on_close=off",
+        dir.path().display()
+    );
+    let db = Database::open(&dsn).expect("open");
+    db.execute("CREATE TABLE fp_tail (id INTEGER PRIMARY KEY, v TEXT)", ())
+        .unwrap();
+    db.execute("INSERT INTO fp_tail VALUES (1, 'a')", ())
+        .unwrap();
+
+    let writer = db.clone();
+    let landed = std::sync::Arc::new(AtomicBool::new(false));
+    let seen = std::sync::Arc::clone(&landed);
+    test_failpoints::before_wal_swap(move || {
+        seen.store(
+            commit_from_another_thread(&writer, "INSERT INTO fp_tail VALUES (2, 'tail')"),
+            Ordering::Release,
+        );
+    });
+    db.execute("PRAGMA CHECKPOINT", ()).expect("checkpoint");
+    assert!(landed.load(Ordering::Acquire));
+
+    // The new file is cut back to its synced length by the poison; the
+    // old file, holding the row committed before the swap, is untouched
+    test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
+    assert!(db
+        .execute("INSERT INTO fp_tail VALUES (3, 'lost')", ())
+        .is_err());
+    test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
+
+    let _ = db.close();
+    let db = Database::open(&dsn).expect("reopen");
+    let ids: Vec<i64> = db
+        .query("SELECT id FROM fp_tail ORDER BY id", ())
+        .unwrap()
+        .map(|r| r.unwrap().get(0).unwrap())
+        .collect();
+    assert_eq!(ids, vec![1, 2]);
+}
+
+// ============================================================================
+// A file start's prepared file and the retired file's durability debt
+// ============================================================================
+
+fn wal_insert(wal: &stoolap::storage::mvcc::wal_manager::WALManager, id: i64) {
+    use stoolap::storage::mvcc::wal_manager::{WALEntry, WALOperationType};
+    wal.append_entry(WALEntry::new(
+        id,
+        "t".to_string(),
+        id,
+        WALOperationType::Insert,
+        vec![1, 2, 3],
+    ))
+    .unwrap();
+}
+
+fn replayed_inserts(dir: &std::path::Path, from: u64) -> Vec<i64> {
+    use stoolap::storage::mvcc::wal_manager::{WALManager, WALOperationType};
+    use stoolap::storage::SyncMode;
+    let reopened = WALManager::new(dir, SyncMode::Full).unwrap();
+    let mut rows = Vec::new();
+    reopened
+        .replay_two_phase(from, |entry| {
+            if entry.operation == WALOperationType::Insert {
+                rows.push(entry.row_id);
+            }
+            Ok(())
+        })
+        .unwrap();
+    rows
+}
+
+#[test]
+fn a_prepared_file_is_no_boundary_for_the_cleanup_of_a_live_file() {
+    use stoolap::storage::config::PersistenceConfig;
+    use stoolap::storage::mvcc::wal_manager::WALManager;
+    use stoolap::storage::SyncMode;
+
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let config = PersistenceConfig {
+        wal_max_size: 1,
+        ..PersistenceConfig::default()
+    };
+    let wal = std::sync::Arc::new(
+        WALManager::with_config(dir.path(), SyncMode::Full, Some(&config)).unwrap(),
+    );
+    wal_insert(&wal, 1);
+    let cut = wal.write_commit_marker(1).unwrap();
+    let old_name = wal.current_wal_file();
+    let old_path = dir.path().join(&old_name);
+
+    // While a rotation holds its prepared file, a commit lands above the
+    // cut in the old file, another rotation wins, and a truncation runs
+    // its cleanup: the prepared file must not pass for the old file's
+    // upper bound
+    let competing = std::sync::Arc::clone(&wal);
+    test_failpoints::before_wal_swap(move || {
+        wal_insert(&competing, 2);
+        assert!(competing.write_commit_marker(2).unwrap() > cut);
+        assert!(competing.maybe_rotate().unwrap());
+        competing.truncate_wal(cut).unwrap();
+        assert!(
+            old_path.exists(),
+            "the live old file must survive the cleanup"
+        );
+    });
+    wal.maybe_rotate().unwrap();
+    wal.close().unwrap();
+    assert_eq!(replayed_inserts(dir.path(), cut), vec![2]);
+}
+
+#[test]
+fn a_full_commit_into_the_new_file_waits_for_the_retired_file_to_be_durable() {
+    use stoolap::storage::mvcc::wal_manager::WALManager;
+    use stoolap::storage::SyncMode;
+
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let wal = std::sync::Arc::new(WALManager::new(dir.path(), SyncMode::Full).unwrap());
+    wal_insert(&wal, 1);
+    let cut = wal.write_commit_marker(1).unwrap();
+    // Buffered, then drained into the old file by the swap
+    wal_insert(&wal, 2);
+
+    // Right after the swap, before the retired file is settled, the
+    // transaction's commit marker goes into the new file: its sync must
+    // settle the retired file first, and here that settlement fails
+    let committer = std::sync::Arc::clone(&wal);
+    let acknowledged = std::sync::Arc::new(AtomicBool::new(true));
+    let seen = std::sync::Arc::clone(&acknowledged);
+    test_failpoints::after_wal_swap(move || {
+        test_failpoints::RETIRED_WAL_SYNC_FAIL.store(true, Ordering::Release);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(committer.write_commit_marker(2).is_ok());
+        });
+        let ok = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("the commit must return");
+        test_failpoints::RETIRED_WAL_SYNC_FAIL.store(false, Ordering::Release);
+        seen.store(ok, Ordering::Release);
+    });
+    let _ = wal.truncate_wal(cut);
+    assert!(
+        !acknowledged.load(Ordering::Acquire),
+        "a commit must not be acknowledged while its records' file is not durable"
+    );
+    assert!(wal.write_commit_marker(3).is_err(), "the WAL is poisoned");
+    drop(wal);
+    assert_eq!(replayed_inserts(dir.path(), 0), vec![1]);
+}
+
+#[test]
+fn a_full_commit_waiting_on_another_thread_s_settlement_inherits_its_failure() {
+    use stoolap::storage::mvcc::wal_manager::WALManager;
+    use stoolap::storage::SyncMode;
+
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let wal = std::sync::Arc::new(WALManager::new(dir.path(), SyncMode::Full).unwrap());
+    wal_insert(&wal, 1);
+    let cut = wal.write_commit_marker(1).unwrap();
+    wal_insert(&wal, 2);
+
+    // The truncation's thread holds the debt; a commit drains its marker
+    // into the new file and waits for the settlement, which then fails
+    let committer = std::sync::Arc::clone(&wal);
+    let (handle_tx, handle_rx) = std::sync::mpsc::channel();
+    test_failpoints::before_retired_settle(move || {
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            test_failpoints::before_retired_wait(move || waiting_tx.send(()).unwrap());
+            committer.write_commit_marker(2)
+        });
+        handle_tx.send(handle).unwrap();
+        waiting_rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("the commit must reach the wait");
+        test_failpoints::RETIRED_WAL_SYNC_FAIL.store(true, Ordering::Release);
+    });
+    let truncated = wal.truncate_wal(cut);
+    let committed = handle_rx.recv().unwrap().join().unwrap();
+    test_failpoints::RETIRED_WAL_SYNC_FAIL.store(false, Ordering::Release);
+    assert!(truncated.is_err());
+    assert!(
+        committed.is_err(),
+        "a commit that waited on the failed settlement must fail too"
+    );
+    assert!(wal.write_commit_marker(3).is_err(), "the WAL is poisoned");
+}
+
+#[test]
+fn a_full_commit_refused_after_a_failed_settlement_does_not_replay() {
+    use stoolap::storage::mvcc::wal_manager::WALManager;
+    use stoolap::storage::SyncMode;
+
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let wal = std::sync::Arc::new(WALManager::new(dir.path(), SyncMode::Full).unwrap());
+    wal_insert(&wal, 1);
+    let cut = wal.write_commit_marker(1).unwrap();
+    wal_insert(&wal, 2);
+
+    // The commit's marker is buffered; before its sync a truncation drains
+    // it and the records into the old file, and the settlement fails: the
+    // commit is refused, so the marker must not persist in the old file
+    let truncator = std::sync::Arc::clone(&wal);
+    test_failpoints::before_wal_sync(move || {
+        test_failpoints::RETIRED_WAL_SYNC_FAIL.store(true, Ordering::Release);
+        let truncated = truncator.truncate_wal(cut);
+        test_failpoints::RETIRED_WAL_SYNC_FAIL.store(false, Ordering::Release);
+        assert!(truncated.is_err());
+    });
+    assert!(wal.write_commit_marker(2).is_err());
+    drop(wal);
+    assert_eq!(replayed_inserts(dir.path(), 0), vec![1]);
+}
+
+/// The new name's directory entry is owed by every file start, whether or
+/// not the old file has an unsynced tail: the directory is synced before a
+/// Full commit into the new file is acknowledged.
+fn the_directory_is_synced_before_the_first_full_ack(unsynced_tail: bool, truncate: bool) {
+    use stoolap::storage::config::PersistenceConfig;
+    use stoolap::storage::mvcc::wal_manager::WALManager;
+    use stoolap::storage::SyncMode;
+
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let config = PersistenceConfig {
+        wal_max_size: 1,
+        ..PersistenceConfig::default()
+    };
+    let wal = WALManager::with_config(dir.path(), SyncMode::Full, Some(&config)).unwrap();
+    wal_insert(&wal, 1);
+    let cut = wal.write_commit_marker(1).unwrap();
+    let old_name = wal.current_wal_file();
+    if unsynced_tail {
+        wal_insert(&wal, 2);
+    }
+    let synced = std::sync::Arc::new(AtomicBool::new(false));
+    let seen = std::sync::Arc::clone(&synced);
+    test_failpoints::after_wal_swap(move || {
+        test_failpoints::on_wal_directory_sync(move || seen.store(true, Ordering::Release));
+    });
+    if truncate {
+        wal.truncate_wal(cut).unwrap();
+    } else {
+        assert!(wal.maybe_rotate().unwrap());
+    }
+    assert_ne!(wal.current_wal_file(), old_name);
+    if !unsynced_tail {
+        wal_insert(&wal, 2);
+    }
+    wal.write_commit_marker(2).unwrap();
+    assert!(
+        synced.load(Ordering::Acquire),
+        "the new name's directory sync must precede the commit's acknowledgement"
+    );
+}
+
+#[test]
+fn a_clean_rotation_syncs_the_new_name_before_a_full_commit_is_acknowledged() {
+    the_directory_is_synced_before_the_first_full_ack(false, false);
+}
+
+#[test]
+fn a_clean_truncation_syncs_the_new_name_before_a_full_commit_is_acknowledged() {
+    the_directory_is_synced_before_the_first_full_ack(false, true);
+}
+
+#[test]
+fn a_rotation_with_an_unsynced_tail_syncs_the_new_name_too() {
+    the_directory_is_synced_before_the_first_full_ack(true, false);
+}

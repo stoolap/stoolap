@@ -38,6 +38,9 @@ pub static SNAPSHOT_RENAME_FAIL: AtomicBool = AtomicBool::new(false);
 /// Fail checkpoint metadata write
 pub static CHECKPOINT_WRITE_FAIL: AtomicBool = AtomicBool::new(false);
 
+/// The sync of a WAL file retired by a file start fails.
+pub static RETIRED_WAL_SYNC_FAIL: AtomicBool = AtomicBool::new(false);
+
 /// Serializes failpoint tests so that only one can run at a time.
 /// Global AtomicBool flags are process-wide; concurrent tests would
 /// interfere with each other without this lock.
@@ -75,6 +78,87 @@ pub(crate) fn wal_sync_starting() {
     }
 }
 
+thread_local! {
+    static WAL_SWAP_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next WAL file start has the new file
+/// ready, before the swap takes the locks.
+pub fn before_wal_swap(hook: impl FnOnce() + 'static) {
+    WAL_SWAP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn wal_swap_starting() {
+    let hook = WAL_SWAP_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static WAL_SWAPPED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread right after its next WAL file swap releases the
+/// locks, before the retired file is settled.
+pub fn after_wal_swap(hook: impl FnOnce() + 'static) {
+    WAL_SWAPPED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn wal_swapped() {
+    let hook = WAL_SWAPPED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static RETIRED_SETTLING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    static RETIRED_AWAITED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next settlement of a retired WAL file
+/// has taken the debt, before its syncs.
+pub fn before_retired_settle(hook: impl FnOnce() + 'static) {
+    RETIRED_SETTLING_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn retired_settling() {
+    let hook = RETIRED_SETTLING_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Run once on this thread when its next WAL sync, under the file lock
+/// with its records drained, is about to wait for a retired file.
+pub fn before_retired_wait(hook: impl FnOnce() + 'static) {
+    RETIRED_AWAITED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn retired_awaited() {
+    let hook = RETIRED_AWAITED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static WAL_DIRECTORY_SYNC_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when it next syncs the WAL directory.
+pub fn on_wal_directory_sync(hook: impl FnOnce() + 'static) {
+    WAL_DIRECTORY_SYNC_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn wal_directory_syncing() {
+    let hook = WAL_DIRECTORY_SYNC_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Reset all failpoints to disabled state
 pub fn reset_all() {
     use std::sync::atomic::Ordering::Release;
@@ -84,8 +168,14 @@ pub fn reset_all() {
     SNAPSHOT_SYNC_FAIL.store(false, Release);
     SNAPSHOT_RENAME_FAIL.store(false, Release);
     CHECKPOINT_WRITE_FAIL.store(false, Release);
+    RETIRED_WAL_SYNC_FAIL.store(false, Release);
     VERSION_ROOT_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAL_SYNC_HOOK.with(|slot| *slot.borrow_mut() = None);
+    WAL_SWAP_HOOK.with(|slot| *slot.borrow_mut() = None);
+    WAL_SWAPPED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    RETIRED_SETTLING_HOOK.with(|slot| *slot.borrow_mut() = None);
+    RETIRED_AWAITED_HOOK.with(|slot| *slot.borrow_mut() = None);
+    WAL_DIRECTORY_SYNC_HOOK.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.

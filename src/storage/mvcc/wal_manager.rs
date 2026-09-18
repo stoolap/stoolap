@@ -943,6 +943,14 @@ impl CheckpointMetadata {
 }
 
 /// Write-Ahead Log Manager
+/// What a file start left owed: the new name's directory entry, and the
+/// old file's handle while its tail was unsynced, with the durable length
+/// a failed settlement cuts it back to.
+struct Retired {
+    file: Option<File>,
+    durable_len: u64,
+}
+
 pub struct WALManager {
     /// Base path for WAL files
     path: PathBuf,
@@ -950,10 +958,12 @@ pub struct WALManager {
     wal_file: Mutex<Option<File>>,
     /// Current WAL file name
     current_wal_file: Mutex<String>,
-    /// Held while checkpoint.meta is written, by a checkpoint's publication
-    /// and by a rotation, so the file it names is the one current at the
-    /// write. Taken before `wal_file`, never after it.
+    /// Held while a checkpoint's publication writes checkpoint.meta.
+    /// Taken before `wal_file`, never after it.
     checkpoint_meta: Mutex<()>,
+    /// What the last file start left owed; see `settle_retired`. Taken
+    /// after `wal_file` when both are held.
+    retired: Mutex<Option<Retired>>,
     /// Current Log Sequence Number
     current_lsn: AtomicU64,
     /// Previous LSN for entry chaining (enables backward traversal)
@@ -995,9 +1005,6 @@ pub struct WALManager {
     synced_position: AtomicU64,
     /// WAL file sequence number (for rotation)
     wal_sequence: AtomicU64,
-    /// Count of in-flight writes (entries taken from buffer but not yet written to disk)
-    /// Used to prevent race condition during checkpoint where LSN is read but data isn't on disk yet
-    in_flight_writes: AtomicU64,
 }
 
 impl WALManager {
@@ -1035,7 +1042,9 @@ impl WALManager {
 
             if name.ends_with(".log.bak") {
                 backup_files.push((name, path));
-            } else if name.starts_with("wal-temp-") && name.ends_with(".log") {
+            } else if (name.starts_with("wal-temp-") && name.ends_with(".log"))
+                || name.ends_with(".prep")
+            {
                 temp_files.push(path);
             } else if name.starts_with("wal-") && name.ends_with(".log") {
                 wal_files.push(name);
@@ -1118,22 +1127,15 @@ impl WALManager {
         let mut initial_lsn: u64 = 0;
         let mut wal_filename = String::new();
 
-        // Check if checkpoint exists
+        // checkpoint.meta carries the boundary; the current file is the
+        // newest by the LSN in its name, since a rotation or a truncation
+        // starts a file without rewriting checkpoint.meta
         let checkpoint_path = path.join("checkpoint.meta");
         if let Ok(checkpoint) = CheckpointMetadata::read_from_file(&checkpoint_path) {
-            if !checkpoint.wal_file.is_empty() {
-                wal_filename = checkpoint.wal_file.clone();
-                initial_lsn = checkpoint.lsn;
-
-                let wal_path = path.join(&checkpoint.wal_file);
-                if let Ok(file) = OpenOptions::new().read(true).append(true).open(&wal_path) {
-                    wal_file = Some(file);
-                }
-            }
+            initial_lsn = checkpoint.lsn;
         }
 
-        // If no checkpoint or couldn't open WAL file, look for existing WAL files
-        if wal_file.is_none() {
+        {
             let mut wal_files: Vec<String> = Vec::new();
 
             if let Ok(entries) = fs::read_dir(&path) {
@@ -1160,7 +1162,7 @@ impl WALManager {
                         if let Ok(lsn) =
                             wal_filename[lsn_start + 4..lsn_start + 4 + lsn_end].parse::<u64>()
                         {
-                            initial_lsn = lsn;
+                            initial_lsn = initial_lsn.max(lsn);
                         }
                     }
                 }
@@ -1233,6 +1235,7 @@ impl WALManager {
             wal_file: Mutex::new(wal_file),
             current_wal_file: Mutex::new(wal_filename),
             checkpoint_meta: Mutex::new(()),
+            retired: Mutex::new(None),
             current_lsn: AtomicU64::new(initial_lsn),
             previous_lsn: AtomicU64::new(initial_lsn),
             buffer: Mutex::new(Vec::with_capacity(buffer_size)),
@@ -1249,7 +1252,6 @@ impl WALManager {
             current_file_position: AtomicU64::new(initial_file_position),
             synced_position: AtomicU64::new(initial_file_position),
             wal_sequence: AtomicU64::new(initial_sequence),
-            in_flight_writes: AtomicU64::new(0),
         })
     }
 
@@ -1383,8 +1385,6 @@ impl WALManager {
         {
             let mut buffer = self.buffer.lock().unwrap();
             if !buffer.is_empty() {
-                // Signal checkpoint coordination for the duration of the write.
-                self.in_flight_writes.fetch_add(1, Ordering::SeqCst);
                 let write_result = (|| {
                     #[cfg(any(test, feature = "test-failpoints"))]
                     if crate::test_failpoints::WAL_WRITE_FAIL
@@ -1399,7 +1399,6 @@ impl WALManager {
                         None => Err(Error::WalFileClosed),
                     }
                 })();
-                self.in_flight_writes.fetch_sub(1, Ordering::SeqCst);
                 if let Err(e) = write_result {
                     return Err(self.poison_and_truncate(&mut wal_file, e));
                 }
@@ -1475,6 +1474,9 @@ impl WALManager {
             return Err(Error::internal("failpoint: WAL sync"));
         }
 
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::retired_awaited();
+        self.settle_retired()?;
         if let Some(file) = wal_file.as_ref() {
             file.sync_all()
                 .map_err(|e| Error::internal(format!("failed to sync WAL: {}", e)))?;
@@ -1509,95 +1511,9 @@ impl WALManager {
             return Ok(false);
         }
 
-        // Flush and sync before rotation
-        self.flush()?;
-        self.sync_locked()?;
-
-        // Perform rotation
-        self.rotate_wal()?;
-
+        let seen = self.current_wal_file.lock().unwrap().clone();
+        self.start_new_wal_file(&seen)?;
         Ok(true)
-    }
-
-    /// Rotate WAL to a new file
-    ///
-    /// This:
-    /// 1. Syncs and closes the current WAL file
-    /// 2. Creates a new WAL file with incremented sequence number
-    /// 3. Updates the checkpoint metadata with the new WAL reference
-    fn rotate_wal(&self) -> Result<()> {
-        let current_lsn = self.current_lsn.load(Ordering::Acquire);
-        let new_sequence = self.wal_sequence.fetch_add(1, Ordering::SeqCst) + 1;
-
-        // Generate new filename with sequence number and LSN
-        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-        let new_filename = format!(
-            "wal_{:08}-{}-lsn-{}.log",
-            new_sequence, timestamp, current_lsn
-        );
-        let new_path = self.path.join(&new_filename);
-
-        // Create new WAL file
-        let new_file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&new_path)
-            .map_err(|e| Error::internal(format!("failed to create rotated WAL file: {}", e)))?;
-
-        // Update current WAL file references
-        {
-            let _meta = self.checkpoint_meta.lock().unwrap();
-            let old_filename = {
-                let mut wal_file = self.wal_file.lock().unwrap();
-                let mut current_filename = self.current_wal_file.lock().unwrap();
-
-                // Get old filename for checkpoint update
-                let old_filename = current_filename.clone();
-
-                // Replace file handle
-                *wal_file = Some(new_file);
-                *current_filename = new_filename.clone();
-
-                // Reset position counters inside the same critical section:
-                // a commit interleaving between the swap and a late reset
-                // could write+fsync to the new file and then have its
-                // durable floor zeroed underneath it.
-                self.current_file_position.store(0, Ordering::Release);
-                self.synced_position.store(0, Ordering::Release);
-
-                old_filename
-            };
-
-            // Update checkpoint with new WAL file reference and previous WAL
-            // IMPORTANT: Preserve existing checkpoint LSN (which represents snapshot point)
-            // Only update the WAL file references during rotation
-            let checkpoint_path = self.path.join("checkpoint.meta");
-            let existing_lsn = match CheckpointMetadata::read_from_file(&checkpoint_path) {
-                Ok(c) => c.lsn,
-                Err(_) => {
-                    // No checkpoint.meta yet (fresh DB or first rotation).
-                    // LSN 0 means full WAL replay on recovery, which is correct.
-                    0
-                }
-            };
-
-            let checkpoint = CheckpointMetadata {
-                wal_file: new_filename,
-                previous_wal_file: Some(old_filename),
-                lsn: existing_lsn, // Preserve existing LSN, don't update to current_lsn
-                timestamp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0),
-                is_consistent: true,
-                active_transactions: vec![],
-                committed_transactions: vec![],
-            };
-            checkpoint.write_to_file(&checkpoint_path)?;
-        }
-
-        Ok(())
     }
 
     /// Get current WAL file size
@@ -1800,8 +1716,8 @@ impl WALManager {
                     continue;
                 }
 
-                // Skip entries before from_lsn
-                if lsn < from_lsn {
+                // Skip entries at or before from_lsn
+                if lsn <= from_lsn {
                     if file
                         .seek(SeekFrom::Current(total_data_size as i64))
                         .is_err()
@@ -1937,8 +1853,8 @@ impl WALManager {
                 continue;
             }
 
-            // Skip entries before from_lsn
-            if lsn < from_lsn {
+            // Skip entries at or before from_lsn
+            if lsn <= from_lsn {
                 if file
                     .seek(SeekFrom::Current(total_data_size as i64))
                     .is_err()
@@ -2036,56 +1952,6 @@ impl WALManager {
                 }
             }
         }
-    }
-
-    /// Wait for any in-flight writes to complete with a timeout
-    ///
-    /// This is critical for checkpoint and truncation safety. The race condition occurs when:
-    /// 1. Thread A takes buffer data, releases buffer lock, but hasn't written to disk yet
-    /// 2. Checkpoint thread calls flush() which sees empty buffer and returns
-    /// 3. Checkpoint reads current_lsn (which includes Thread A's LSN)
-    /// 4. Checkpoint/truncation uses that LSN, potentially losing Thread A's data
-    ///
-    /// By waiting for in_flight_writes to be 0, we ensure all data is on disk
-    /// before reading the LSN for checkpoint purposes.
-    ///
-    /// Returns Ok(()) if all writes completed, Err if timeout was reached.
-    /// Default timeout is 30 seconds which should be more than enough for any
-    /// reasonable write operation. If timeout is reached, it indicates a serious
-    /// problem (hung thread, deadlock, etc.)
-    fn wait_for_in_flight_writes(&self) -> Result<()> {
-        self.wait_for_in_flight_writes_timeout(std::time::Duration::from_secs(30))
-    }
-
-    /// Wait for any in-flight writes to complete with a custom timeout
-    ///
-    /// Uses exponential backoff to avoid busy-waiting while still being responsive.
-    fn wait_for_in_flight_writes_timeout(&self, timeout: std::time::Duration) -> Result<()> {
-        use crate::common::time_compat::Instant;
-
-        let deadline = Instant::now() + timeout;
-        #[cfg(not(target_arch = "wasm32"))]
-        let mut sleep_duration = std::time::Duration::from_micros(10);
-        #[cfg(not(target_arch = "wasm32"))]
-        const MAX_SLEEP: std::time::Duration = std::time::Duration::from_millis(10);
-
-        while self.in_flight_writes.load(Ordering::SeqCst) > 0 {
-            if Instant::now() > deadline {
-                return Err(Error::internal(format!(
-                    "timeout waiting for in-flight WAL writes to complete ({} still pending)",
-                    self.in_flight_writes.load(Ordering::SeqCst)
-                )));
-            }
-
-            // Exponential backoff with cap
-            #[cfg(not(target_arch = "wasm32"))]
-            {
-                std::thread::sleep(sleep_duration);
-                sleep_duration = std::cmp::min(sleep_duration * 2, MAX_SLEEP);
-            }
-        }
-
-        Ok(())
     }
 
     /// Create a checkpoint and return the LSN at the checkpoint point
@@ -2292,22 +2158,21 @@ impl WALManager {
         self.current_wal_file.lock().unwrap().clone()
     }
 
-    /// Truncate the WAL file to remove entries up to the given LSN
-    ///
-    /// This is used after a successful checkpoint/snapshot to reclaim disk space.
-    /// Only entries with LSN > up_to_lsn are kept.
+    /// Truncate the WAL up to the given LSN. The current file is left as
+    /// it is and a new one is started, so nothing is copied and no record
+    /// appended meanwhile can be missed. Files whose every record is at
+    /// or below the LSN are removed; the file left behind goes at the
+    /// next truncation that covers it. Recovery skips the records below
+    /// the boundary, which the caller publishes before this.
     pub fn truncate_wal(&self, up_to_lsn: u64) -> Result<()> {
-        // Skip if not running or if up_to_lsn is zero (no valid checkpoint)
         if !self.running.load(Ordering::Acquire) {
             return Err(Error::WalNotRunning);
         }
-        // A poisoned WAL must not rewrite files or drain its stale buffer.
         if self.poisoned.load(Ordering::Acquire) {
             return Err(Error::internal(
                 "WAL is poisoned after a write failure; reopen the database",
             ));
         }
-
         if up_to_lsn == 0 {
             return Err(Error::internal(format!(
                 "invalid LSN for WAL truncation: {}",
@@ -2315,339 +2180,195 @@ impl WALManager {
             )));
         }
 
-        // CRITICAL: Wait for any in-flight writes to complete before truncation
-        // This prevents the race condition where:
-        // 1. Thread A takes buffer data, releases buffer lock, but hasn't written to disk yet
-        // 2. truncate_wal() proceeds with truncation
-        // 3. Thread A's data targets the old file and gets lost
-        self.wait_for_in_flight_writes()?;
+        let current_wal_name = self.current_wal_file.lock().unwrap().clone();
+        Self::cleanup_old_wal_files(&self.path, &current_wal_name, up_to_lsn);
 
-        // Lock the WAL file for the entire operation
-        let mut wal_file_guard = self.wal_file.lock().unwrap();
-        let mut current_wal_name = self.current_wal_file.lock().unwrap();
+        // A file starting at or after the LSN holds nothing to leave behind
+        if let Some(current_file_lsn) = Self::extract_lsn_from_filename(&current_wal_name) {
+            if up_to_lsn <= current_file_lsn {
+                return Ok(());
+            }
+        }
 
-        // Re-check under the lock: a concurrent flush may have poisoned
-        // the WAL while we waited, and draining its stale buffer below
-        // would re-write a failed transaction's bytes.
+        self.start_new_wal_file(&current_wal_name).map(|_| ())
+    }
+
+    /// Start a new WAL file, for a rotation or a truncation. The file is
+    /// prepared under a name discovery, cleanup and replay ignore. Under
+    /// the locks, the buffer is drained into the old file, the prepared
+    /// file is renamed by the last LSN the old one holds, the handle is
+    /// swapped and the old file retired: its sync and the name's directory
+    /// sync are owed by the first sync that follows, `settle_retired`, so
+    /// no commit is acknowledged into the new file before both. Records
+    /// appended meanwhile land in the old file; nothing is copied. Returns
+    /// false when the current file is no longer `seen`: another start got
+    /// there first and the prepared file goes.
+    fn start_new_wal_file(&self, seen: &str) -> Result<bool> {
+        let sequence = self.wal_sequence.fetch_add(1, Ordering::SeqCst) + 1;
+        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
+        let prepared_path = self
+            .path
+            .join(format!("wal_{:08}-{}.prep", sequence, timestamp));
+        let new_file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .append(true)
+            .open(&prepared_path)
+            .map_err(|e| Error::internal(format!("failed to create WAL file: {}", e)))?;
+
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::wal_swap_starting();
+
+        {
+            let mut wal_file = self.wal_file.lock().unwrap();
+            let mut current_name = self.current_wal_file.lock().unwrap();
+            if *current_name != seen {
+                let _ = fs::remove_file(&prepared_path);
+                return Ok(false);
+            }
+            if self.poisoned.load(Ordering::Acquire) {
+                let _ = fs::remove_file(&prepared_path);
+                return Err(Error::internal(
+                    "WAL is poisoned after a write failure; reopen the database",
+                ));
+            }
+            if !self.running.load(Ordering::Acquire) || wal_file.is_none() {
+                let _ = fs::remove_file(&prepared_path);
+                return Err(Error::internal(
+                    "WAL manager is not running or file is closed",
+                ));
+            }
+            // A retirement still owed from a start racing this one is
+            // paid here, before the old file it belongs to is replaced
+            if let Err(e) = self.settle_retired() {
+                let _ = fs::remove_file(&prepared_path);
+                return Err(e);
+            }
+
+            // Drained under the buffer lock, so the LSN read after it is
+            // the last record the old file holds
+            let last_lsn = {
+                let mut buffer = self.buffer.lock().unwrap();
+                if !buffer.is_empty() {
+                    let write_result = match wal_file.as_mut() {
+                        Some(file) => file
+                            .write_all(&buffer)
+                            .map_err(|e| Error::internal(format!("failed to write to WAL: {}", e))),
+                        None => Err(Error::WalFileClosed),
+                    };
+                    if let Err(e) = write_result {
+                        let _ = fs::remove_file(&prepared_path);
+                        return Err(self.poison_and_truncate(&mut wal_file, e));
+                    }
+                    self.current_file_position
+                        .fetch_add(buffer.len() as u64, Ordering::Relaxed);
+                    buffer.clear();
+                }
+                self.current_lsn.load(Ordering::Acquire)
+            };
+
+            let new_name = format!("wal_{:08}-{}-lsn-{}.log", sequence, timestamp, last_lsn);
+            if let Err(e) = fs::rename(&prepared_path, self.path.join(&new_name)) {
+                let _ = fs::remove_file(&prepared_path);
+                return Err(Error::internal(format!(
+                    "failed to name the new WAL file: {}",
+                    e
+                )));
+            }
+
+            let durable_len = self.synced_position.load(Ordering::Acquire);
+            let unsynced = self.current_file_position.load(Ordering::Relaxed) != durable_len;
+            let old_file = wal_file.replace(new_file);
+            *current_name = new_name;
+            *self.retired.lock().unwrap() = Some(Retired {
+                file: old_file.filter(|_| unsynced),
+                durable_len,
+            });
+
+            // Reset position counters inside the same critical section:
+            // a commit interleaving between the swap and a late reset
+            // could write+fsync to the new file and then have its
+            // durable floor zeroed underneath it.
+            self.current_file_position.store(0, Ordering::Release);
+            self.synced_position.store(0, Ordering::Release);
+        }
+
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::wal_swapped();
+
+        self.settle_retired()?;
+        Ok(true)
+    }
+
+    /// Pay what a file start left owed: the retired file's unsynced tail,
+    /// Normal mode's interval, and the new name's directory entry. Held
+    /// across the syncs, so a sync of the current file that arrives
+    /// meanwhile waits for them: a commit's marker in the new file is
+    /// never durable before its records in the old one, and never before
+    /// the name. A failed sync leaves the old file's durability
+    /// unknowable, as for the current file: the WAL is poisoned.
+    fn settle_retired(&self) -> Result<()> {
+        let mut retired = self.retired.lock().unwrap();
+        // A settlement that failed while this one waited poisoned the WAL
+        // and left nothing to take: its failure is this caller's too
         if self.poisoned.load(Ordering::Acquire) {
             return Err(Error::internal(
                 "WAL is poisoned after a write failure; reopen the database",
             ));
         }
-
-        // Verify we're still running and have a file
-        if !self.running.load(Ordering::Acquire) || wal_file_guard.is_none() {
-            return Err(Error::internal(
-                "WAL manager is not running or file is closed",
-            ));
-        }
-
-        // Clean up old rotated WAL files covered by the snapshot.
-        // This runs before the early-return check because even if the current WAL file
-        // doesn't need truncation, previously-rotated files may be fully covered.
-        Self::cleanup_old_wal_files(&self.path, &current_wal_name, up_to_lsn);
-
-        // Extract LSN from current WAL filename to check if truncation is needed
-        // If upToLSN <= currentFileLSN, there's nothing to truncate
-        if let Some(lsn_start) = current_wal_name.find("lsn-") {
-            if let Some(lsn_end) = current_wal_name[lsn_start + 4..].find('.') {
-                if let Ok(current_file_lsn) =
-                    current_wal_name[lsn_start + 4..lsn_start + 4 + lsn_end].parse::<u64>()
-                {
-                    if up_to_lsn <= current_file_lsn {
-                        // All entries in this file are already newer than up_to_lsn
-                        return Ok(());
-                    }
-                }
-            }
-        }
-
-        // First, flush any pending data to make sure everything is on disk.
-        // Same invariant as flush_and_maybe_sync: a failed write must not
-        // drop the bytes (a later commit marker would then ack an
-        // incomplete transaction) - it poisons and truncates instead.
-        {
-            let mut buffer = self.buffer.lock().unwrap();
-            if !buffer.is_empty() {
-                let write_result = match wal_file_guard.as_mut() {
-                    Some(file) => file.write_all(&buffer).map_err(|e| {
-                        Error::internal(format!("failed to flush buffer during truncation: {}", e))
-                    }),
-                    None => Err(Error::WalFileClosed),
-                };
-                if let Err(e) = write_result {
-                    return Err(self.poison_and_truncate(&mut wal_file_guard, e));
-                }
-                self.current_file_position
-                    .fetch_add(buffer.len() as u64, Ordering::Relaxed);
-                buffer.clear();
-            }
-        }
-
-        // Sync file to ensure all data is persisted (advances the durable
-        // floor; poisons on failure like any commit-path sync).
-        if let Err(e) = self.sync_with_file(&wal_file_guard) {
-            return Err(self.poison_and_truncate(&mut wal_file_guard, e));
-        }
-
-        // Create a new file for the truncated WAL with LSN-based naming
-        let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S").to_string();
-        let new_wal_filename = format!("wal-{}-lsn-{}.log", timestamp, up_to_lsn);
-        let temp_wal_path = self.path.join(format!(
-            "wal-temp-{}.log",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
-
-        let mut temp_wal_file = File::create(&temp_wal_path)
-            .map_err(|e| Error::internal(format!("failed to create temporary WAL file: {}", e)))?;
-
-        // Reset the current WAL file position to beginning
-        let wal_file_path = self.path.join(&*current_wal_name);
-        if let Some(file) = wal_file_guard.as_mut() {
-            file.seek(SeekFrom::Start(0))
-                .map_err(|e| Error::internal(format!("failed to seek WAL file: {}", e)))?;
-        }
-
-        // Copy entries that are newer than up_to_lsn to the temp file
-        // 32-byte header: magic(4) + version(1) + flags(1) + header_size(2) + LSN(8) + prev_lsn(8) + entry_size(4) + reserved(4)
-        let mut header_buf = [0u8; 32];
-        let mut entries_copied = 0u64;
-        let mut last_copied_lsn: u64 = up_to_lsn; // Track last LSN for chain continuity
-        let mut new_file_size: u64 = 0; // Track new file size for position update
-
-        if let Some(file) = wal_file_guard.as_mut() {
-            loop {
-                // Try to read entry header (32 bytes)
-                match file.read_exact(&mut header_buf) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-                    Err(_) => break,
-                }
-
-                // Verify magic marker
-                let magic = u32::from_le_bytes(header_buf[0..4].try_into().unwrap());
-                if magic != WAL_ENTRY_MAGIC {
-                    // Corrupted entry, skip
-                    break;
-                }
-
-                // Parse header fields
-                let header_size = u16::from_le_bytes(header_buf[6..8].try_into().unwrap()) as usize;
-                let lsn = u64::from_le_bytes(header_buf[8..16].try_into().unwrap());
-                let entry_size =
-                    u32::from_le_bytes(header_buf[24..28].try_into().unwrap()) as usize;
-
-                // Calculate total size after header (including any extra header bytes for future extensibility)
-                let extra_header = header_size.saturating_sub(32);
-                let total_entry_size = extra_header + entry_size + 4; // extra_header + data + CRC
-
-                // If the entry's LSN is older than or equal to up_to_lsn, skip it
-                if lsn <= up_to_lsn {
-                    // Skip to next entry
-                    if file
-                        .seek(SeekFrom::Current(total_entry_size as i64))
-                        .is_err()
-                    {
-                        break;
-                    }
-                } else {
-                    // Write the header to the temp file
-                    temp_wal_file.write_all(&header_buf).map_err(|e| {
-                        Error::internal(format!("failed to write header to temp file: {}", e))
-                    })?;
-
-                    // Copy the rest of the entry (extra header + data + CRC)
-                    let mut data = vec![0u8; total_entry_size];
-                    file.read_exact(&mut data).map_err(|e| {
-                        Error::internal(format!("failed to read entry data: {}", e))
-                    })?;
-                    temp_wal_file.write_all(&data).map_err(|e| {
-                        Error::internal(format!("failed to write entry data to temp file: {}", e))
-                    })?;
-
-                    // Track the last copied LSN and accumulate file size
-                    last_copied_lsn = lsn;
-                    new_file_size += 32 + total_entry_size as u64;
-                    entries_copied += 1;
-                }
-            }
-        }
-
-        // If we didn't copy any entries (all entries were old), create a marker entry
-        // so the WAL file isn't empty and tracking continues correctly
-        //
-        // LSN CHAIN BREAK NOTE:
-        // The marker entry's previous_lsn points to up_to_lsn which no longer exists
-        // in the WAL (it was truncated). This is intentional and safe because:
-        // 1. Recovery uses checkpoint metadata to determine the starting point
-        // 2. The marker entry serves only to maintain LSN continuity for new entries
-        // 3. The snapshot_lsn in checkpoint metadata tracks what was persisted
-        // Use CHAIN_BREAK_MARKER (0) as previous_lsn to explicitly indicate this
-        if entries_copied == 0 {
-            // previous_lsn = 0 indicates a chain break point (truncation occurred)
-            // This is more explicit than pointing to a non-existent LSN
-            const CHAIN_BREAK_MARKER: u64 = 0;
-            let marker_entry = WALEntry {
-                lsn: up_to_lsn.saturating_add(1),
-                previous_lsn: CHAIN_BREAK_MARKER, // Explicit chain break marker
-                flags: WalFlags::NONE,
-                txn_id: MARKER_TXN_ID, // Special marker transaction
-                table_name: String::new(),
-                row_id: 0,
-                operation: WALOperationType::Commit,
-                data: Vec::new(),
-                timestamp: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as i64)
-                    .unwrap_or(0),
-            };
-            let encoded = marker_entry.encode();
-            temp_wal_file
-                .write_all(&encoded)
-                .map_err(|e| Error::internal(format!("failed to write marker entry: {}", e)))?;
-
-            // Track marker's LSN and size for chain continuity
-            last_copied_lsn = up_to_lsn.saturating_add(1);
-            new_file_size = encoded.len() as u64;
-        }
-
-        // Sync the temp file to ensure data is flushed to disk
-        temp_wal_file
-            .sync_all()
-            .map_err(|e| Error::internal(format!("failed to sync temp WAL file: {}", e)))?;
-
-        // ATOMIC WAL TRUNCATION STRATEGY:
-        // 1. Sync temp file to disk
-        // 2. Close current WAL file
-        // 3. Rename old WAL to .bak (backup)
-        // 4. Rename temp file to new WAL name
-        // 5. Open new WAL file
-        // 6. Delete .bak file (only after everything succeeded)
-        // On error at any step: restore from .bak if needed
-
-        // Close the current WAL file
-        *wal_file_guard = None;
-
-        // Close the temp file (drop it)
-        drop(temp_wal_file);
-
-        // Create paths for the operation
-        let new_wal_path = self.path.join(&new_wal_filename);
-        let backup_wal_path = wal_file_path.with_extension("log.bak");
-
-        // Step 1: Rename old WAL file to .bak (atomic backup)
-        if wal_file_path.exists() {
-            if let Err(e) = fs::rename(&wal_file_path, &backup_wal_path) {
-                // Recovery: reopen original file at the end
-                if let Ok(file) = OpenOptions::new()
-                    .read(true)
-                    .append(true)
-                    .open(&wal_file_path)
-                {
-                    *wal_file_guard = Some(file);
-                }
-                // Cleanup temp file
-                let _ = fs::remove_file(&temp_wal_path);
-                return Err(Error::internal(format!(
-                    "failed to backup old WAL file: {}",
-                    e
-                )));
-            }
-        }
-
-        // Step 2: Rename temp file to new WAL name
-        if let Err(e) = fs::rename(&temp_wal_path, &new_wal_path) {
-            // Recovery: restore from backup and reopen
-            if backup_wal_path.exists() {
-                let _ = fs::rename(&backup_wal_path, &wal_file_path);
-            }
-            if let Ok(file) = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .open(&wal_file_path)
-            {
-                *wal_file_guard = Some(file);
-            }
-            return Err(Error::internal(format!(
-                "failed to rename temp file to new WAL file: {}",
-                e
-            )));
-        }
-
-        // Step 3: Update current WAL file information
-        *current_wal_name = new_wal_filename;
-
-        // Step 4: Open the new WAL file
-        let new_file = match OpenOptions::new()
-            .read(true)
-            .append(true)
-            .open(&new_wal_path)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                // Critical error: try to restore from backup
-                // This is a serious situation but we try our best
-                if backup_wal_path.exists() && fs::rename(&backup_wal_path, &wal_file_path).is_ok()
-                {
-                    *current_wal_name = wal_file_path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|s| s.to_string())
-                        .unwrap_or_default();
-                    if let Ok(file) = OpenOptions::new()
-                        .read(true)
-                        .append(true)
-                        .open(&wal_file_path)
-                    {
-                        *wal_file_guard = Some(file);
-                    }
-                }
-                return Err(Error::internal(format!(
-                    "failed to reopen WAL file after truncation: {}",
-                    e
-                )));
-            }
+        let Some(Retired { file, durable_len }) = retired.take() else {
+            return Ok(());
         };
-
-        *wal_file_guard = Some(new_file);
-
-        // Step 5: Sync directory to ensure renames are durable.
-        // This is critical on filesystems like ext4 where rename durability
-        // requires directory sync. Without this, a crash after rename but
-        // before natural sync could result in the old filename persisting.
-        // Windows does not support opening directories for fsync.
-        #[cfg(not(windows))]
-        if let Ok(dir_file) = File::open(&self.path) {
-            let _ = dir_file.sync_all();
-        }
-
-        // Step 6: Delete backup file (only after everything succeeded)
-        // If this fails, it's just a warning - not critical
-        if backup_wal_path.exists() {
-            if let Err(e) = fs::remove_file(&backup_wal_path) {
-                eprintln!(
-                    "Warning: Could not remove backup WAL file {:?}: {}",
-                    backup_wal_path, e
-                );
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::retired_settling();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        let synced = if crate::test_failpoints::RETIRED_WAL_SYNC_FAIL
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            Err(Error::internal("failpoint: retired WAL sync"))
+        } else {
+            Self::sync_retired(file.as_ref(), &self.path)
+        };
+        #[cfg(not(any(test, feature = "test-failpoints")))]
+        let synced = Self::sync_retired(file.as_ref(), &self.path);
+        if let Err(e) = synced {
+            // As poison_and_truncate for the current file: the tail above
+            // the durable floor holds only records no commit was
+            // acknowledged for, and a failed one's marker must not
+            // persist and replay
+            self.poisoned.store(true, Ordering::Release);
+            if let Some(file) = file {
+                let _ = file.set_len(durable_len);
+                let _ = file.sync_all();
             }
+            return Err(e);
         }
+        Ok(())
+    }
 
-        // Step 7: Update WAL manager state to maintain chain continuity
-        // CRITICAL: Update previous_lsn to the last entry in the new WAL file
-        // This ensures the next append_entry() will correctly chain to the last
-        // entry we kept (or the marker entry if all were truncated).
-        // Without this, the backward chain would be broken after truncation.
-        self.previous_lsn.store(last_copied_lsn, Ordering::Release);
+    /// The old file's tail, when it has one, then the directory: the new
+    /// name is owed by every start, a clean old file or not.
+    fn sync_retired(file: Option<&File>, dir: &Path) -> Result<()> {
+        if let Some(file) = file {
+            file.sync_all()
+                .map_err(|e| Error::internal(format!("failed to sync WAL file: {}", e)))?;
+        }
+        Self::sync_directory(dir)
+    }
 
-        // Update file position to reflect the new WAL file size. The new
-        // file was fsynced above, so it is also the durable floor.
-        self.current_file_position
-            .store(new_file_size, Ordering::Release);
-        self.synced_position.store(new_file_size, Ordering::Release);
-
+    /// Make a directory's entries durable, ordered before later syncs.
+    fn sync_directory(dir: &Path) -> Result<()> {
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::wal_directory_syncing();
+        #[cfg(not(windows))]
+        {
+            let d = File::open(dir)
+                .map_err(|e| Error::internal(format!("failed to open WAL directory: {}", e)))?;
+            crate::storage::volume::io::sync_ordered(&d)
+                .map_err(|e| Error::internal(format!("failed to sync WAL directory: {}", e)))?;
+        }
+        #[cfg(windows)]
+        let _ = dir;
         Ok(())
     }
 }
@@ -3390,144 +3111,156 @@ mod tests {
         assert_eq!(last_lsn, 10);
     }
 
-    #[test]
-    fn test_wal_truncation() {
-        let dir = tempdir().unwrap();
-        let wal_path = dir.path().join("wal");
-
-        // Create WAL and add 10 entries
-        {
-            let wal = WALManager::new(&wal_path, SyncMode::Full).unwrap();
-
-            for i in 1..=10 {
-                let entry = WALEntry::new(
-                    i,
-                    "test_table".to_string(),
-                    i * 10,
-                    WALOperationType::Insert,
-                    vec![i as u8],
-                );
-                wal.append_entry(entry).unwrap();
-                // Commit each transaction
-                wal.write_commit_marker(i).unwrap();
-            }
-
-            // Get initial WAL file size
-            let wal_files: Vec<_> = fs::read_dir(&wal_path)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    name.starts_with("wal-") && name.ends_with(".log")
-                })
-                .collect();
-            assert_eq!(wal_files.len(), 1);
-            let initial_size = wal_files[0].metadata().unwrap().len();
-
-            // Truncate WAL at LSN 10 (keeps entries 11-20, i.e. LSN 11+ which are commit markers for txn 6-10)
-            // With commit markers, LSNs are: 1(insert), 2(commit), 3(insert), 4(commit), ...
-            // So truncating at LSN 10 keeps the commit markers and data for txn 6-10
-            wal.truncate_wal(10).unwrap();
-
-            // Check new WAL file exists with LSN in name
-            let new_wal_files: Vec<_> = fs::read_dir(&wal_path)
-                .unwrap()
-                .filter_map(|e| e.ok())
-                .filter(|e| {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    name.starts_with("wal-") && name.ends_with(".log")
-                })
-                .collect();
-            assert_eq!(new_wal_files.len(), 1);
-
-            // Check file has LSN-10 in name
-            let new_name = new_wal_files[0].file_name().to_string_lossy().to_string();
-            assert!(
-                new_name.contains("lsn-10"),
-                "Expected lsn-10 in filename, got: {}",
-                new_name
-            );
-
-            // Check that file is smaller (only entries 11-20 remain)
-            let truncated_size = new_wal_files[0].metadata().unwrap().len();
-            assert!(
-                truncated_size < initial_size,
-                "Truncated WAL should be smaller"
-            );
-
-            // Verify only entries with LSN > 10 can be replayed
-            let mut data_count = 0;
-            let mut commit_count = 0;
-            let mut min_lsn = u64::MAX;
-            wal.replay_two_phase(0, |entry| {
-                if entry.is_commit_marker() {
-                    commit_count += 1;
-                } else {
-                    data_count += 1;
-                }
-                if entry.lsn < min_lsn {
-                    min_lsn = entry.lsn;
-                }
-                Ok(())
-            })
-            .unwrap();
-
-            // Should have 5 data entries (txn 6-10 inserts, LSN 11, 13, 15, 17, 19)
-            assert_eq!(data_count, 5, "Expected 5 data entries after truncation");
-            assert_eq!(
-                commit_count, 5,
-                "Expected 5 commit markers after truncation"
-            );
-            assert!(min_lsn > 10, "Minimum LSN should be > 10");
-
-            wal.close().unwrap();
-        }
+    fn wal_file_names(wal_path: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(wal_path)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| (n.starts_with("wal-") || n.starts_with("wal_")) && n.ends_with(".log"))
+            .collect();
+        names.sort_by_key(|n| WALManager::extract_lsn_from_filename(n).unwrap_or(0));
+        names
     }
 
     #[test]
-    fn test_wal_truncation_all_entries() {
+    fn a_truncation_starts_a_new_file_and_the_old_one_goes_at_the_next_covering_one() {
         let dir = tempdir().unwrap();
         let wal_path = dir.path().join("wal");
-
-        // Create WAL and add entries with commit markers
-        {
-            let wal = WALManager::new(&wal_path, SyncMode::Full).unwrap();
-
-            for i in 1..=5 {
-                let entry = WALEntry::new(
-                    i,
-                    "test".to_string(),
-                    i * 10,
-                    WALOperationType::Insert,
-                    vec![],
-                );
-                wal.append_entry(entry).unwrap();
-                wal.write_commit_marker(i).unwrap();
-            }
-
-            // Truncate all entries (up to LSN 10, which covers all 5 inserts + 5 commits)
-            wal.truncate_wal(10).unwrap();
-
-            // Replay should return 0 entries because all data was truncated
-            let mut count = 0;
-            wal.replay_two_phase(0, |_entry| {
-                count += 1;
-                Ok(())
-            })
-            .unwrap();
-
-            // All entries were truncated
-            assert_eq!(count, 0, "Expected 0 entries after truncating all");
-
-            // But the WAL file should exist and the LSN should have advanced
-            let current_wal_file = wal.current_wal_file();
-            assert!(
-                current_wal_file.contains("lsn-10"),
-                "WAL file should have lsn-10 in name"
+        let wal = WALManager::new(&wal_path, SyncMode::Full).unwrap();
+        for i in 1..=10 {
+            let entry = WALEntry::new(
+                i,
+                "test_table".to_string(),
+                i * 10,
+                WALOperationType::Insert,
+                vec![i as u8],
             );
-
-            wal.close().unwrap();
+            wal.append_entry(entry).unwrap();
+            wal.write_commit_marker(i).unwrap();
         }
+        let first = wal_file_names(&wal_path);
+        assert_eq!(first.len(), 1);
+        let size_before = fs::metadata(wal_path.join(&first[0])).unwrap().len();
+
+        // The boundary is published first, as the checkpoint does; the
+        // truncation then leaves the old file whole and starts a new one
+        // named by the last record the old file holds
+        wal.publish_checkpoint(10, vec![]).unwrap();
+        wal.truncate_wal(10).unwrap();
+        let after = wal_file_names(&wal_path);
+        assert_eq!(after, vec![first[0].clone(), wal.current_wal_file()]);
+        assert!(
+            wal.current_wal_file().contains("-lsn-20."),
+            "the new file is named by the last record: {}",
+            wal.current_wal_file()
+        );
+        assert_eq!(
+            fs::metadata(wal_path.join(&first[0])).unwrap().len(),
+            size_before,
+            "the old file is not rewritten"
+        );
+        assert_eq!(fs::metadata(wal_path.join(&after[1])).unwrap().len(), 0);
+
+        // Recovery replays the old file's tail above the boundary only
+        let mut data_count = 0;
+        let mut commit_count = 0;
+        let mut min_lsn = u64::MAX;
+        wal.replay_two_phase(0, |entry| {
+            if entry.is_commit_marker() {
+                commit_count += 1;
+            } else {
+                data_count += 1;
+            }
+            min_lsn = min_lsn.min(entry.lsn);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(data_count, 5);
+        assert_eq!(commit_count, 5);
+        assert!(min_lsn > 10);
+
+        // A record after the truncation chains to the old file's last one
+        // and lands in the new file
+        wal.append_entry(WALEntry::new(
+            11,
+            "test_table".to_string(),
+            110,
+            WALOperationType::Insert,
+            vec![],
+        ))
+        .unwrap();
+        wal.write_commit_marker(11).unwrap();
+        assert!(fs::metadata(wal_path.join(&after[1])).unwrap().len() > 0);
+
+        // The next truncation covering the old file removes it, and a
+        // file starting at the boundary is left alone
+        wal.publish_checkpoint(20, vec![]).unwrap();
+        wal.truncate_wal(20).unwrap();
+        assert_eq!(wal_file_names(&wal_path), vec![after[1].clone()]);
+        assert_eq!(wal.current_wal_file(), after[1]);
+        wal.close().unwrap();
+    }
+
+    #[test]
+    fn a_truncation_covering_every_record_leaves_nothing_to_replay() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal");
+        let wal = WALManager::new(&wal_path, SyncMode::Full).unwrap();
+        for i in 1..=5 {
+            let entry = WALEntry::new(
+                i,
+                "test".to_string(),
+                i * 10,
+                WALOperationType::Insert,
+                vec![],
+            );
+            wal.append_entry(entry).unwrap();
+            wal.write_commit_marker(i).unwrap();
+        }
+        wal.publish_checkpoint(10, vec![]).unwrap();
+        wal.truncate_wal(10).unwrap();
+
+        let mut count = 0;
+        wal.replay_two_phase(0, |_entry| {
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(count, 0);
+        assert!(wal.current_wal_file().contains("-lsn-10."));
+        assert_eq!(wal.current_lsn(), 10);
+        wal.close().unwrap();
+    }
+
+    #[test]
+    fn a_record_buffered_before_the_swap_stays_in_the_old_file_and_is_synced_there() {
+        let dir = tempdir().unwrap();
+        let wal_path = dir.path().join("wal");
+        let wal = WALManager::new(&wal_path, SyncMode::Normal).unwrap();
+        // Normal mode: a lone record sits in the buffer, no sync of its own
+        wal.append_entry(WALEntry::new(
+            1,
+            "t".to_string(),
+            1,
+            WALOperationType::Insert,
+            vec![],
+        ))
+        .unwrap();
+        let old = wal.current_wal_file();
+        assert_eq!(fs::metadata(wal_path.join(&old)).unwrap().len(), 0);
+
+        wal.publish_checkpoint(1, vec![]).unwrap();
+        wal.truncate_wal(1).unwrap();
+        let old_len = fs::metadata(wal_path.join(&old)).unwrap().len();
+        assert!(old_len > 0, "the swap drains the buffer into the old file");
+        assert_eq!(
+            fs::metadata(wal_path.join(wal.current_wal_file()))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(wal.current_wal_file().contains("-lsn-1."));
+        wal.close().unwrap();
     }
 
     #[test]
