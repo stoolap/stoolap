@@ -183,6 +183,43 @@ fn write_i64_bulk(buf: &mut Vec<u8>, values: &[i64]) {
     }
 }
 
+/// Write i64 values as little-endian bytes to any writer, the slice's
+/// own bytes on a little-endian platform
+fn write_i64_le<W: Write>(w: &mut W, values: &[i64]) -> io::Result<()> {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: &[i64] is layout-compatible with &[u8] on LE platforms.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 8) };
+        w.write_all(bytes)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for v in values {
+            w.write_all(&v.to_le_bytes())?;
+        }
+        Ok(())
+    }
+}
+
+/// Write u64 values as little-endian bytes to any writer
+fn write_u64_le<W: Write>(w: &mut W, values: &[u64]) -> io::Result<()> {
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: &[u64] is layout-compatible with &[u8] on LE platforms.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 8) };
+        w.write_all(bytes)
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for v in values {
+            w.write_all(&v.to_le_bytes())?;
+        }
+        Ok(())
+    }
+}
+
 /// Write a slice of f64 values as little-endian bytes in bulk.
 #[inline]
 fn write_f64_bulk(buf: &mut Vec<u8>, values: &[f64]) {
@@ -359,32 +396,32 @@ fn read_bool_bulk(data: &[u8], pos: &mut usize, count: usize) -> io::Result<Vec<
 }
 
 /// Serialize a Value to the buffer with a type tag.
-fn write_value(buf: &mut Vec<u8>, value: &Value) -> io::Result<()> {
+fn write_value<W: Write>(buf: &mut W, value: &Value) -> io::Result<()> {
     match value {
         Value::Null(dt) => {
-            buf.push(0);
-            buf.push(*dt as u8);
+            buf.write_all(&[0])?;
+            buf.write_all(&[*dt as u8])?;
         }
         Value::Integer(i) => {
-            buf.push(1);
+            buf.write_all(&[1])?;
             buf.write_all(&i.to_le_bytes())?;
         }
         Value::Float(f) => {
-            buf.push(2);
+            buf.write_all(&[2])?;
             buf.write_all(&f.to_le_bytes())?;
         }
         Value::Text(s) => {
-            buf.push(3);
+            buf.write_all(&[3])?;
             let bytes = s.as_bytes();
             buf.write_all(&(bytes.len() as u32).to_le_bytes())?;
             buf.write_all(bytes)?;
         }
         Value::Boolean(b) => {
-            buf.push(4);
-            buf.push(if *b { 1 } else { 0 });
+            buf.write_all(&[4])?;
+            buf.write_all(&[if *b { 1 } else { 0 }])?;
         }
         Value::Timestamp(ts) => {
-            buf.push(5);
+            buf.write_all(&[5])?;
             let nanos = ts.timestamp_nanos_opt().unwrap_or_else(|| {
                 ts.timestamp()
                     .wrapping_mul(1_000_000_000)
@@ -393,7 +430,7 @@ fn write_value(buf: &mut Vec<u8>, value: &Value) -> io::Result<()> {
             buf.write_all(&nanos.to_le_bytes())?;
         }
         Value::Extension(data) => {
-            buf.push(6);
+            buf.write_all(&[6])?;
             buf.write_all(&(data.len() as u32).to_le_bytes())?;
             buf.write_all(data)?;
         }
@@ -1124,15 +1161,44 @@ pub(crate) fn serialize_volume_metadata(vol: &FrozenVolume) -> io::Result<Vec<u8
 /// The metadata section from its parts, for a producer that has no
 /// decoded columns: `kinds` is every column's (storage type tag, extension
 /// type tag), `dictionaries` the text columns' dictionaries in column order
+/// Serializes the metadata into a buffer of exactly its size: one pass
+/// counts the bytes, the second writes them, so the buffer never grows
+/// past what the file gets (the bloom filters alone outweigh the row ids).
 pub(crate) fn serialize_volume_metadata_parts(
     meta: &super::writer::VolumeMeta,
     kinds: &[(u8, u8)],
     dictionaries: &[&[SmartString]],
 ) -> io::Result<Vec<u8>> {
+    let mut counter = Counting(0);
+    write_volume_metadata_parts(&mut counter, meta, kinds, dictionaries)?;
+    let mut buf = Vec::with_capacity(counter.0);
+    write_volume_metadata_parts(&mut buf, meta, kinds, dictionaries)?;
+    debug_assert_eq!(buf.len(), counter.0);
+    Ok(buf)
+}
+
+/// A writer that only counts
+struct Counting(usize);
+
+impl Write for Counting {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn write_volume_metadata_parts<W: Write>(
+    buf: &mut W,
+    meta: &super::writer::VolumeMeta,
+    kinds: &[(u8, u8)],
+    dictionaries: &[&[SmartString]],
+) -> io::Result<()> {
     let col_count = kinds.len();
     let row_ids = &meta.row_ids;
-    let estimated = 12 + col_count * 6 + row_ids.len() * 8 + col_count * 40;
-    let mut buf = Vec::with_capacity(estimated);
 
     // Row count + col count
     buf.write_all(&(meta.row_count as u64).to_le_bytes())?;
@@ -1146,8 +1212,8 @@ pub(crate) fn serialize_volume_metadata_parts(
         } else {
             0
         };
-        buf.push(type_tag);
-        buf.push(sorted_flag);
+        buf.write_all(&[type_tag])?;
+        buf.write_all(&[sorted_flag])?;
         if type_tag == COL_DICTIONARY {
             let dictionary = dictionaries.get(dict_col_idx).ok_or_else(|| {
                 io::Error::new(
@@ -1174,12 +1240,12 @@ pub(crate) fn serialize_volume_metadata_parts(
     }
 
     // Row IDs (bulk — single memcpy on LE)
-    write_i64_bulk(&mut buf, row_ids);
+    write_i64_le(buf, row_ids)?;
 
     // Zone maps
     for zm in &meta.zone_maps {
-        write_value(&mut buf, &zm.min)?;
-        write_value(&mut buf, &zm.max)?;
+        write_value(buf, &zm.min)?;
+        write_value(buf, &zm.max)?;
         buf.write_all(&zm.null_count.to_le_bytes())?;
         buf.write_all(&zm.row_count.to_le_bytes())?;
     }
@@ -1188,9 +1254,8 @@ pub(crate) fn serialize_volume_metadata_parts(
     buf.write_all(&(meta.bloom_filters.len() as u32).to_le_bytes())?;
     for bf in &meta.bloom_filters {
         buf.write_all(&(bf.num_bits() as u64).to_le_bytes())?;
-        let data_bytes = bf.bits_as_bytes();
-        buf.write_all(&(data_bytes.len() as u32).to_le_bytes())?;
-        buf.write_all(&data_bytes)?;
+        buf.write_all(&((bf.bits().len() * 8) as u32).to_le_bytes())?;
+        write_u64_le(buf, bf.bits())?;
     }
 
     // Stats
@@ -1202,8 +1267,8 @@ pub(crate) fn serialize_volume_metadata_parts(
         buf.write_all(&cs.sum_float.to_le_bytes())?;
         buf.write_all(&cs.numeric_count.to_le_bytes())?;
         buf.write_all(&cs.non_null_count.to_le_bytes())?;
-        write_value(&mut buf, &cs.min)?;
-        write_value(&mut buf, &cs.max)?;
+        write_value(buf, &cs.min)?;
+        write_value(buf, &cs.max)?;
     }
 
     // Column names
@@ -1215,7 +1280,7 @@ pub(crate) fn serialize_volume_metadata_parts(
 
     // Column types
     for dt in &meta.column_types {
-        buf.push(*dt as u8);
+        buf.write_all(&[*dt as u8])?;
     }
 
     // Row groups
@@ -1224,14 +1289,14 @@ pub(crate) fn serialize_volume_metadata_parts(
         buf.write_all(&rg.start_idx.to_le_bytes())?;
         buf.write_all(&rg.end_idx.to_le_bytes())?;
         for zm in &rg.zone_maps {
-            write_value(&mut buf, &zm.min)?;
-            write_value(&mut buf, &zm.max)?;
+            write_value(buf, &zm.min)?;
+            write_value(buf, &zm.max)?;
             buf.write_all(&zm.null_count.to_le_bytes())?;
             buf.write_all(&zm.row_count.to_le_bytes())?;
         }
     }
 
-    Ok(buf)
+    Ok(())
 }
 
 fn check_metadata_count(data: &[u8], pos: usize, count: usize, width: usize) -> io::Result<()> {

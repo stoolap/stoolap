@@ -853,6 +853,11 @@ impl ColumnBloomFilter {
         self.num_bits
     }
 
+    /// The bitset's words
+    pub fn bits(&self) -> &[u64] {
+        &self.bits
+    }
+
     /// Serialize the bitset to bytes in little-endian format.
     pub fn bits_as_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.bits.len() * 8);
