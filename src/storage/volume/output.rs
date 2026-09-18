@@ -689,6 +689,29 @@ mod tests {
         (bytes, volume, path, dir)
     }
 
+    /// CRC32 of the metadata the serializer wrote for this fixture before
+    /// its buffer was counted; the bytes must not change
+    const METADATA_CRC: u32 = 0x2502_8372;
+
+    #[test]
+    fn the_metadata_buffer_is_counted_exactly_and_the_bytes_are_unchanged() {
+        let schema = schema();
+        // Bloom filters, a text dictionary, JSON and text min and max of
+        // varying length, three row groups
+        let (_, volume, _, _dir) = written(&schema, 2 * ROW_GROUP_SIZE as i64 + 5_000, 10_000);
+        let buf = super::super::format::serialize_volume_metadata(&volume).unwrap();
+        assert_eq!(
+            crc32fast::hash(&buf),
+            METADATA_CRC,
+            "the metadata bytes changed"
+        );
+        assert_eq!(
+            buf.capacity(),
+            buf.len(),
+            "the buffer was grown past its counted length"
+        );
+    }
+
     #[test]
     fn the_file_is_the_one_serialize_v4_writes_for_the_same_rows() {
         let schema = schema();
