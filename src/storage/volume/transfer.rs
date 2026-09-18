@@ -62,6 +62,12 @@ impl TypedSink for VolumeBuilder {
 /// and on the scratch buffers
 pub const TRANSFER_BATCH_ROWS: usize = 4096;
 
+/// The groups of one input a transfer keeps decoded beyond the ones the
+/// batch reads: a merge in key order walks each input's groups in turn,
+/// so two cover a group boundary; an order that jumps around an input
+/// gives up the group it used longest ago instead
+const HELD_GROUPS_PER_INPUT: usize = 2;
+
 /// A column of an input as one batch reads it
 enum Cell<'a> {
     /// Decoded in the input already; indexed by the input's row index
@@ -90,6 +96,8 @@ struct Handle<'a> {
     /// The decoded bytes the handle holds on its own, apart from the cache
     held_bytes: usize,
     used: bool,
+    /// The position of the last batch that read through it
+    last_used: usize,
 }
 
 /// Where an output column comes from in one input
@@ -261,6 +269,11 @@ pub struct Transfer<'a> {
     needed: Vec<Vec<bool>>,
     handles: Vec<Handle<'a>>,
     handle_of: FxHashMap<(u32, u32), usize>,
+    /// By (input, group): the position of its last reference, after
+    /// which its handle is let go
+    last_use: FxHashMap<(u32, u32), usize>,
+    /// References appended so far: the position the next batch starts at
+    position: usize,
     /// By reference in the batch: its handle
     ref_handle: Vec<u32>,
     /// By input, by output column: the input's dictionary id to the
@@ -282,6 +295,7 @@ impl<'a> Transfer<'a> {
         schema: &Schema,
         inputs: &'a [(u64, Arc<FrozenVolume>)],
         mappings: &[ColumnMapping],
+        refs: &[(i64, usize, usize)],
     ) -> Result<Self> {
         if mappings.len() != inputs.len() {
             return Err(Error::internal("one column mapping per compaction input"));
@@ -322,12 +336,18 @@ impl<'a> Transfer<'a> {
             plans.push(plan);
             needed.push(reads);
         }
+        let mut last_use: FxHashMap<(u32, u32), usize> = FxHashMap::default();
+        for (position, &(_, input, row)) in refs.iter().enumerate() {
+            last_use.insert((input as u32, (row / ROW_GROUP_SIZE) as u32), position);
+        }
         Ok(Self {
             inputs,
             plans,
             needed,
             handles: Vec::new(),
             handle_of: FxHashMap::default(),
+            last_use,
+            position: 0,
             ref_handle: Vec::new(),
             remaps: vec![vec![Vec::new(); columns]; inputs.len()],
             default_ids: vec![vec![None; columns]; inputs.len()],
@@ -358,8 +378,18 @@ impl<'a> Transfer<'a> {
         self.peak_held_bytes
     }
 
+    /// The (input, group) pairs whose handles are held, sorted
+    #[cfg(test)]
+    fn held_groups(&self) -> Vec<(usize, usize)> {
+        let mut held: Vec<(usize, usize)> =
+            self.handles.iter().map(|h| (h.input, h.group)).collect();
+        held.sort_unstable();
+        held
+    }
+
     /// Appends `refs` (row id, input, row index), in that order, to
-    /// `sink`; at most `TRANSFER_BATCH_ROWS` of them per call
+    /// `sink`; at most `TRANSFER_BATCH_ROWS` of them per call, and in
+    /// all the order `new` was given
     pub fn append(
         &mut self,
         refs: &[(i64, usize, usize)],
@@ -388,12 +418,16 @@ impl<'a> Transfer<'a> {
             )?;
         }
         let cells: Vec<TypedCells<'_>> = self.scratch.iter().map(Scratch::cells).collect();
+        self.position += refs.len();
         sink.append_typed(&self.row_ids, &cells)
     }
 
-    /// Holds a handle for every (input, group) the batch reads and lets
-    /// go of the ones it does not, before the new ones are taken
+    /// Holds a handle for every (input, group) the batch reads. Of the
+    /// others, one whose last reference has passed goes, and past
+    /// `HELD_GROUPS_PER_INPUT` for an input, the one used longest ago;
+    /// the rest stay for the batches still to read them.
     fn take_handles(&mut self, refs: &[(i64, usize, usize)]) -> Result<()> {
+        let position = self.position;
         for handle in &mut self.handles {
             handle.used = false;
         }
@@ -403,9 +437,10 @@ impl<'a> Transfer<'a> {
         for &(_, input, row) in refs {
             let key = (input as u32, (row / ROW_GROUP_SIZE) as u32);
             match self.handle_of.get(&key) {
-                Some(&position) => {
-                    self.handles[position].used = true;
-                    self.ref_handle.push(position as u32);
+                Some(&slot) => {
+                    self.handles[slot].used = true;
+                    self.handles[slot].last_used = position;
+                    self.ref_handle.push(slot as u32);
                 }
                 None => {
                     missing = true;
@@ -413,12 +448,37 @@ impl<'a> Transfer<'a> {
                 }
             }
         }
-        if self.handles.iter().any(|handle| !handle.used) {
+        let mut keep: Vec<bool> = self
+            .handles
+            .iter()
+            .map(|handle| {
+                handle.used
+                    || self
+                        .last_use
+                        .get(&(handle.input as u32, handle.group as u32))
+                        .is_some_and(|&last| last >= position)
+            })
+            .collect();
+        for input in 0..self.inputs.len() {
+            let mut idle: Vec<usize> = (0..self.handles.len())
+                .filter(|&slot| {
+                    keep[slot] && !self.handles[slot].used && self.handles[slot].input == input
+                })
+                .collect();
+            idle.sort_by_key(|&slot| self.handles[slot].last_used);
+            for &slot in idle
+                .iter()
+                .take(idle.len().saturating_sub(HELD_GROUPS_PER_INPUT))
+            {
+                keep[slot] = false;
+            }
+        }
+        if keep.iter().any(|&kept| !kept) {
             let mut kept = Vec::with_capacity(self.handles.len());
             let mut renumber: FxHashMap<usize, usize> = FxHashMap::default();
-            for (position, handle) in self.handles.drain(..).enumerate() {
-                if handle.used {
-                    renumber.insert(position, kept.len());
+            for (slot, handle) in self.handles.drain(..).enumerate() {
+                if keep[slot] {
+                    renumber.insert(slot, kept.len());
                     kept.push(handle);
                 } else {
                     self.held_bytes -= handle.held_bytes;
@@ -489,6 +549,7 @@ impl<'a> Transfer<'a> {
             columns,
             held_bytes,
             used: true,
+            last_used: self.position,
         })
     }
 }
@@ -758,7 +819,7 @@ mod tests {
         refs: &[(i64, usize, usize)],
         batch: usize,
     ) -> (FrozenVolume, usize) {
-        let mut transfer = Transfer::new(schema, inputs, mappings).unwrap();
+        let mut transfer = Transfer::new(schema, inputs, mappings, refs).unwrap();
         let mut builder = VolumeBuilder::new(schema);
         builder.allow_any_row_order();
         transfer.begin_output();
@@ -917,7 +978,7 @@ mod tests {
         let refs: Vec<(i64, usize, usize)> = (0..120usize)
             .flat_map(|i| [(1_000_000 + i as i64, 0, i), (2_000_000 + i as i64, 1, i)])
             .collect();
-        let mut transfer = Transfer::new(&schema, &inputs, &mappings).unwrap();
+        let mut transfer = Transfer::new(&schema, &inputs, &mappings, &refs).unwrap();
         let mut outputs = Vec::new();
         // The second output begins with the names of the second input, so
         // its ids differ from the first output's for the same strings
@@ -983,13 +1044,142 @@ mod tests {
         assert_same_volume(&got, &want);
     }
 
+    /// One warm input of `groups` row groups, two columns of 8 and 4
+    /// bytes a row plus a null flag each
+    fn warm_groups(schema: &Schema, groups: usize) -> (Vec<(u64, Arc<FrozenVolume>)>, usize) {
+        let rows = (groups - 1) * ROW_GROUP_SIZE + 3 * TRANSFER_BATCH_ROWS;
+        let mut builder = VolumeBuilder::new(schema);
+        for i in 0..rows as i64 {
+            builder.add_row(
+                i,
+                &Row::from_values(vec![Value::Integer(i), Value::text(format!("n{}", i % 3))]),
+            );
+        }
+        let mut volume = builder.finish().unwrap();
+        let (_, store) = serialize_v4_public(&volume).unwrap();
+        volume.columns.attach_compressed_store(store);
+        let one_group = ROW_GROUP_SIZE * (8 + 1) + ROW_GROUP_SIZE * (4 + 1);
+        (vec![(1, Arc::new(volume.to_warm().unwrap()))], one_group)
+    }
+
+    fn two_column_schema() -> Schema {
+        SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("name", DataType::Text, true, false)
+            .build()
+    }
+
+    fn batch_of(group: usize, offset: usize) -> impl Iterator<Item = (i64, usize, usize)> {
+        let first = group * ROW_GROUP_SIZE + offset;
+        (first..first + TRANSFER_BATCH_ROWS).map(|i| (i as i64, 0, i))
+    }
+
+    #[test]
+    fn a_group_a_later_batch_reads_stays_held_across_a_batch_without_it() {
+        let schema = two_column_schema();
+        let (inputs, one_group) = warm_groups(&schema, 2);
+        let mappings = vec![identity()];
+        // Group 0, then a batch of group 1 only, then group 0 again
+        let refs: Vec<(i64, usize, usize)> = batch_of(0, 0)
+            .chain(batch_of(1, 0))
+            .chain(batch_of(0, TRANSFER_BATCH_ROWS))
+            .collect();
+        // Held through the middle batch, so two groups are held at once;
+        // the shared cache may still hold a released group, so the hold
+        // is observed through the handles' peak, not the decode count
+        let (got, peak) = transferred(&schema, &inputs, &mappings, &refs, TRANSFER_BATCH_ROWS);
+        assert!(
+            peak > one_group && peak <= 2 * one_group,
+            "held {peak} bytes"
+        );
+        let want = reference(&schema, &inputs, &mappings, &refs);
+        assert_same_volume(&got, &want);
+    }
+
+    /// Runs `refs` batch by batch and returns the held groups after each
+    fn held_after_each_batch(
+        schema: &Schema,
+        inputs: &[(u64, Arc<FrozenVolume>)],
+        refs: &[(i64, usize, usize)],
+    ) -> (Vec<Vec<(usize, usize)>>, usize) {
+        let mappings = vec![identity()];
+        let mut transfer = Transfer::new(schema, inputs, &mappings, refs).unwrap();
+        let mut builder = VolumeBuilder::new(schema);
+        builder.allow_any_row_order();
+        transfer.begin_output();
+        let mut held = Vec::new();
+        for chunk in refs.chunks(TRANSFER_BATCH_ROWS) {
+            transfer.append(chunk, &mut builder).unwrap();
+            held.push(transfer.held_groups());
+        }
+        let got = builder.finish().unwrap();
+        let want = reference(schema, inputs, &mappings, refs);
+        assert_same_volume(&got, &want);
+        (held, transfer.peak_held_bytes())
+    }
+
+    #[test]
+    fn an_input_keeps_two_idle_groups_and_gives_up_the_one_used_longest_ago() {
+        let schema = two_column_schema();
+        let (inputs, one_group) = warm_groups(&schema, 4);
+        // Every group is read again, so the last-reference rule alone
+        // would hold all four: past two idle groups, the one used longest
+        // ago goes (0 at the fourth batch, 1 at the fifth), the batch's
+        // own group not counted; from the sixth on, each group's last
+        // reference passes and the last-reference rule takes over
+        let refs: Vec<(i64, usize, usize)> = batch_of(0, 0)
+            .chain(batch_of(1, 0))
+            .chain(batch_of(2, 0))
+            .chain(batch_of(3, 0))
+            .chain(batch_of(0, TRANSFER_BATCH_ROWS))
+            .chain(batch_of(1, TRANSFER_BATCH_ROWS))
+            .chain(batch_of(2, TRANSFER_BATCH_ROWS))
+            .chain(batch_of(3, TRANSFER_BATCH_ROWS))
+            .collect();
+        let (held, peak) = held_after_each_batch(&schema, &inputs, &refs);
+        assert_eq!(
+            held,
+            vec![
+                vec![(0, 0)],
+                vec![(0, 0), (0, 1)],
+                vec![(0, 0), (0, 1), (0, 2)],
+                vec![(0, 1), (0, 2), (0, 3)],
+                vec![(0, 0), (0, 2), (0, 3)],
+                vec![(0, 1), (0, 2), (0, 3)],
+                vec![(0, 2), (0, 3)],
+                vec![(0, 3)],
+            ]
+        );
+        assert!(
+            peak > 2 * one_group && peak <= 3 * one_group,
+            "held {peak} bytes"
+        );
+    }
+
+    #[test]
+    fn the_idle_limit_does_not_count_the_groups_the_batch_reads() {
+        let schema = two_column_schema();
+        let (inputs, _) = warm_groups(&schema, 3);
+        // A batch spanning groups 1 and 2 with group 0 idle and still to
+        // be read: one idle group is within the limit, whatever the
+        // batch itself holds
+        let refs: Vec<(i64, usize, usize)> = batch_of(0, 0)
+            .chain(batch_of(1, TRANSFER_BATCH_ROWS))
+            .chain(batch_of(2, TRANSFER_BATCH_ROWS))
+            .chain(batch_of(1, ROW_GROUP_SIZE - TRANSFER_BATCH_ROWS / 2))
+            .chain(batch_of(0, TRANSFER_BATCH_ROWS))
+            .collect();
+        let (held, _) = held_after_each_batch(&schema, &inputs, &refs);
+        assert_eq!(held[3], vec![(0, 0), (0, 1), (0, 2)]);
+    }
+
     #[test]
     fn an_input_without_column_data_fails_the_transfer() {
         let schema = schema();
         let inputs: Vec<(u64, Arc<FrozenVolume>)> =
             vec![(1, Arc::new(eager(&schema, 1, 10).to_cold()))];
         let mappings = vec![identity()];
-        let mut transfer = Transfer::new(&schema, &inputs, &mappings).unwrap();
+        let mut transfer = Transfer::new(&schema, &inputs, &mappings, &[(1, 0, 0)]).unwrap();
         let mut builder = VolumeBuilder::new(&schema);
         let error = transfer.append(&[(1, 0, 0)], &mut builder).unwrap_err();
         assert!(error.to_string().contains("no column data"), "{error}");
