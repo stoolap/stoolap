@@ -6109,8 +6109,12 @@ impl MVCCEngine {
             // The rows move column by column in bounded batches, each
             // input read through its mapping, a warm input one row group
             // at a time
-            let mut transfer =
-                crate::storage::volume::transfer::Transfer::new(&schema, &volumes, &vol_mappings)?;
+            let mut transfer = crate::storage::volume::transfer::Transfer::new(
+                &schema,
+                &volumes,
+                &vol_mappings,
+                &live_refs,
+            )?;
             // Each output goes to its file as the batches arrive: one row
             // group of typed buffers at a time, the unique indexes built
             // from the batches, the volume published over the file
