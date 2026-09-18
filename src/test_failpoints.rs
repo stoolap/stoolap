@@ -159,6 +159,23 @@ pub(crate) fn wal_directory_syncing() {
     }
 }
 
+thread_local! {
+    static INDEXES_PUBLISHED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next commit has updated the shared
+/// indexes and has not yet made its versions visible.
+pub fn after_indexes_published(hook: impl FnOnce() + 'static) {
+    INDEXES_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn indexes_published() {
+    let hook = INDEXES_PUBLISHED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// Reset all failpoints to disabled state
 pub fn reset_all() {
     use std::sync::atomic::Ordering::Release;
@@ -176,6 +193,7 @@ pub fn reset_all() {
     RETIRED_SETTLING_HOOK.with(|slot| *slot.borrow_mut() = None);
     RETIRED_AWAITED_HOOK.with(|slot| *slot.borrow_mut() = None);
     WAL_DIRECTORY_SYNC_HOOK.with(|slot| *slot.borrow_mut() = None);
+    INDEXES_PUBLISHED_HOOK.with(|slot| *slot.borrow_mut() = None);
 }
 
 /// RAII guard that serializes failpoint tests and resets all failpoints on drop.

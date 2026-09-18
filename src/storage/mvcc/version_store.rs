@@ -6267,6 +6267,8 @@ impl TransactionVersionStore {
 
         // Update indexes BEFORE committing versions
         self.update_indexes_on_commit()?;
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::indexes_published();
 
         // Commit local versions to parent store
         if let Some(local_versions) = self.local_versions.as_mut() {

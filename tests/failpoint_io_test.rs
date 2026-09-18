@@ -1380,3 +1380,69 @@ fn a_clean_truncation_syncs_the_new_name_before_a_full_commit_is_acknowledged() 
 fn a_rotation_with_an_unsynced_tail_syncs_the_new_name_too() {
     the_directory_is_synced_before_the_first_full_ack(true, false);
 }
+
+// ============================================================================
+// An empty index probe during a commit's publish window
+// ============================================================================
+
+/// A commit updates the shared indexes before its versions are visible.
+/// A read in that window finds the index without the old key and the
+/// visible version still with it: the empty probe must not be its answer.
+#[test]
+fn a_lookup_during_a_commit_s_publish_window_still_sees_the_old_key() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let dsn = format!("file://{}?checkpoint_on_close=off", dir.path().display());
+    let db = Database::open(&dsn).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER)", ())
+        .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k) USING BTREE", ())
+        .unwrap();
+    for i in 1..=200 {
+        db.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10), ())
+            .unwrap();
+    }
+    let ids = |h: &Database, key: i64| -> Vec<i64> {
+        let mut out: Vec<i64> = h
+            .query("SELECT id FROM t WHERE k = $1", (key,))
+            .unwrap()
+            .map(|r| r.unwrap().get(0).unwrap())
+            .collect();
+        out.sort_unstable();
+        out
+    };
+
+    // The committing thread stops after its index update; the main
+    // thread reads inside that window, then lets the commit finish
+    let (in_window_tx, in_window_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let writer = db.clone();
+    let committer = std::thread::spawn(move || {
+        test_failpoints::after_indexes_published(move || {
+            in_window_tx.send(()).unwrap();
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("released");
+        });
+        writer.execute("UPDATE t SET k = 555 WHERE id = 7", ())
+    });
+    in_window_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("the commit reached its publish window");
+    let during_old = ids(&db, 70);
+    let during_new = ids(&db, 555);
+    release_tx.send(()).unwrap();
+    committer.join().unwrap().unwrap();
+    assert_eq!(
+        during_old,
+        vec![7],
+        "the old key must still find the visible row"
+    );
+    assert_eq!(
+        during_new,
+        Vec::<i64>::new(),
+        "the new key's version is not visible yet"
+    );
+    assert_eq!(ids(&db, 70), Vec::<i64>::new());
+    assert_eq!(ids(&db, 555), vec![7]);
+}
