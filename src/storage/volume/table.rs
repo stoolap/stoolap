@@ -261,6 +261,32 @@ impl SegmentedTable {
         Some(f(&*self.hot))
     }
 
+    /// Runs `collect` over a hot store and a cold view that no seal moved
+    /// rows between. A seal registers its volume and removes the hot rows
+    /// under the write fence and moves the generation there, so the
+    /// generation read under the read fence before and after the collection
+    /// is the same only when no seal ran inside it; a changed one drops the
+    /// result and collects again, every attempt held to the same rule. The
+    /// fence is never held across a collection, so a read never delays a
+    /// seal; under seals landing faster than a collection runs, the read
+    /// keeps collecting until one is clear.
+    fn settled_across_seals<T>(&self, mut collect: impl FnMut() -> Result<T>) -> Result<T> {
+        loop {
+            let before = {
+                let _fence = self.segment_mgr.acquire_seal_read();
+                self.segment_mgr.seal_generation()
+            };
+            let collected = collect()?;
+            let after = {
+                let _fence = self.segment_mgr.acquire_seal_read();
+                self.segment_mgr.seal_generation()
+            };
+            if before == after {
+                return Ok(collected);
+            }
+        }
+    }
+
     /// Reload through the captured file owner even after segment retirement.
     fn load_volume_of_view(
         &self,
@@ -2488,110 +2514,115 @@ impl Table for SegmentedTable {
 
         let target = limit + offset;
 
-        // Lazy: no ensure_columns. Phase 1 uses metadata only; Phase 2
-        // loads cold volumes on demand after pruning.
-        self.segment_mgr
-            .check_schema_generation(self.schema_generation)?;
-        let view = self.segment_mgr.cold_snapshot();
-        self.segment_mgr
-            .check_schema_generation(self.schema_generation)?;
-        #[cfg(any(test, feature = "test-failpoints"))]
-        crate::test_failpoints::cold_volumes_taken();
-        if view.seg_ids.is_empty() {
-            return self.hot.collect_rows_with_limit(where_expr, limit, offset);
-        }
-
-        // Phase 1: Build authority map (row_id → volume index).
-        // Iterates cold row_ids newest-first so newer volumes win dedup.
-        // Collect hot row_ids from actual hot scan results to prevent the
-        // seal race (remove_sealed_rows between check and hot scan).
-        let tombstones_arc = &view.ts;
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
-        let total_cold_rows: usize = view.volumes().map(|(_, cs)| cs.volume.meta.row_count).sum();
-        let mut authority: FxHashMap<i64, usize> = FxHashMap::with_capacity_and_hasher(
-            total_cold_rows.min(500_000) * 8 / 7 + 16,
-            Default::default(),
-        );
-        for (nf_idx, seg_id) in view.seg_ids.iter().enumerate() {
-            let Some(cs) = view.segs.get(seg_id) else {
-                continue;
-            };
-            for &rid in cs.volume.row_ids()? {
-                if hot_skip.contains(&rid) || self.is_row_tombstoned(tombstones_arc, rid) {
-                    continue;
-                }
-                authority.entry(rid).or_insert(nf_idx);
-            }
-        }
-
-        // Phase 2: Iterate oldest-first, materialize only authoritative
-        // rows, stop as soon as we have `target` matches.
-        let mut cold_rows = RowVec::with_capacity(target.min(1024));
-
-        let comparisons = where_expr
-            .map(|e| e.collect_comparisons())
-            .unwrap_or_default();
-        let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-
-        'done: for (nf_idx, seg_id) in view.seg_ids.iter().enumerate().rev() {
-            let Some(cs) = view.segs.get(seg_id) else {
-                continue;
-            };
-            let vol = &cs.volume;
-            if !comparisons.is_empty() {
-                let (skip, _, _) =
-                    Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
-                if skip {
-                    continue;
-                }
+        // The cold view is taken before the hot rows are read, so a seal
+        // landing between them would leave its rows in neither
+        self.settled_across_seals(|| {
+            // Lazy: no ensure_columns. Phase 1 uses metadata only; Phase 2
+            // loads cold volumes on demand after pruning.
+            self.segment_mgr
+                .check_schema_generation(self.schema_generation)?;
+            let view = self.segment_mgr.cold_snapshot();
+            self.segment_mgr
+                .check_schema_generation(self.schema_generation)?;
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::cold_volumes_taken();
+            if view.seg_ids.is_empty() {
+                return self.hot.collect_rows_with_limit(where_expr, limit, offset);
             }
 
-            // Load cold volume on demand after pruning.
-            let loaded;
-            let vol: &Arc<FrozenVolume> = if vol.is_cold() {
-                loaded = match self.load_volume_of_view(&view, *seg_id)? {
-                    Some(v) => v,
-                    None => continue,
+            // Phase 1: Build authority map (row_id → volume index).
+            // Iterates cold row_ids newest-first so newer volumes win dedup.
+            // Collect hot row_ids from actual hot scan results to prevent the
+            // seal race (remove_sealed_rows between check and hot scan).
+            let tombstones_arc = &view.ts;
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
+
+            let total_cold_rows: usize =
+                view.volumes().map(|(_, cs)| cs.volume.meta.row_count).sum();
+            let mut authority: FxHashMap<i64, usize> = FxHashMap::with_capacity_and_hasher(
+                total_cold_rows.min(500_000) * 8 / 7 + 16,
+                Default::default(),
+            );
+            for (nf_idx, seg_id) in view.seg_ids.iter().enumerate() {
+                let Some(cs) = view.segs.get(seg_id) else {
+                    continue;
                 };
-                &loaded
-            } else {
-                vol.mark_accessed();
-                vol
-            };
-
-            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
-
-            for (i, &rid) in vol.row_ids()?.iter().enumerate() {
-                if authority.get(&rid) != Some(&nf_idx) {
-                    continue;
+                for &rid in cs.volume.row_ids()? {
+                    if hot_skip.contains(&rid) || self.is_row_tombstoned(tombstones_arc, rid) {
+                        continue;
+                    }
+                    authority.entry(rid).or_insert(nf_idx);
                 }
-                let row = reader.row(i, &cs.mapping)?;
-                if let Some(expr) = where_expr {
-                    if !expr.evaluate_fast(&row) {
+            }
+
+            // Phase 2: Iterate oldest-first, materialize only authoritative
+            // rows, stop as soon as we have `target` matches.
+            let mut cold_rows = RowVec::with_capacity(target.min(1024));
+
+            let comparisons = where_expr
+                .map(|e| e.collect_comparisons())
+                .unwrap_or_default();
+            let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
+
+            'done: for (nf_idx, seg_id) in view.seg_ids.iter().enumerate().rev() {
+                let Some(cs) = view.segs.get(seg_id) else {
+                    continue;
+                };
+                let vol = &cs.volume;
+                if !comparisons.is_empty() {
+                    let (skip, _, _) =
+                        Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
+                    if skip {
                         continue;
                     }
                 }
-                cold_rows.push((rid, row));
-                if cold_rows.len() >= target {
-                    break 'done;
+
+                // Load cold volume on demand after pruning.
+                let loaded;
+                let vol: &Arc<FrozenVolume> = if vol.is_cold() {
+                    loaded = match self.load_volume_of_view(&view, *seg_id)? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    &loaded
+                } else {
+                    vol.mark_accessed();
+                    vol
+                };
+
+                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+
+                for (i, &rid) in vol.row_ids()?.iter().enumerate() {
+                    if authority.get(&rid) != Some(&nf_idx) {
+                        continue;
+                    }
+                    let row = reader.row(i, &cs.mapping)?;
+                    if let Some(expr) = where_expr {
+                        if !expr.evaluate_fast(&row) {
+                            continue;
+                        }
+                    }
+                    cold_rows.push((rid, row));
+                    if cold_rows.len() >= target {
+                        break 'done;
+                    }
                 }
             }
-        }
 
-        // Phase 3: If cold didn't fill the target, materialize hot rows
-        // for the remainder only.
-        if cold_rows.len() < target {
-            let remaining = target - cold_rows.len();
-            let hot_rows = self.hot.collect_rows_with_limit(where_expr, remaining, 0)?;
-            cold_rows.extend(hot_rows);
-        }
+            // Phase 3: If cold didn't fill the target, materialize hot rows
+            // for the remainder only.
+            if cold_rows.len() < target {
+                let remaining = target - cold_rows.len();
+                let hot_rows = self.hot.collect_rows_with_limit(where_expr, remaining, 0)?;
+                cold_rows.extend(hot_rows);
+            }
 
-        Ok(cold_rows.into_iter().skip(offset).take(limit).collect())
+            Ok(cold_rows.into_iter().skip(offset).take(limit).collect())
+        })
     }
 
     fn collect_rows_with_limit_unordered(
@@ -2608,120 +2639,127 @@ impl Table for SegmentedTable {
 
         let target = limit + offset;
 
-        // Unordered: hot rows first with early termination.
-        // Only scan up to `target` hot rows — avoids O(hot_rows) for small LIMITs.
-        let hot_rows = self
-            .hot
-            .collect_rows_with_limit_unordered(where_expr, target, 0)?;
-        if hot_rows.len() >= target {
-            return Ok(hot_rows.into_iter().skip(offset).take(limit).collect());
-        }
-
-        // Need cold rows. Build hot_skip and scan with early termination.
-        // Optimization: avoid materializing rows that fall within the offset.
-        // Hot rows already collected cover some of the offset+limit range.
-        // For the cold scan, track a skip counter to avoid get_row() for offset rows.
-        let hot_count = hot_rows.len();
-        let cold_skip = offset.saturating_sub(hot_count);
-        let mut result: RowVec = if hot_count > offset {
-            hot_rows.into_iter().skip(offset).collect()
-        } else {
-            RowVec::new()
-        };
-        let remaining = limit.saturating_sub(result.len()) + cold_skip;
-
-        self.segment_mgr
-            .check_schema_generation(self.schema_generation)?;
-        let view = self.segment_mgr.cold_snapshot();
-        self.segment_mgr
-            .check_schema_generation(self.schema_generation)?;
-        #[cfg(any(test, feature = "test-failpoints"))]
-        crate::test_failpoints::cold_volumes_taken();
-        let tombstones_arc = &view.ts;
-        let mut hot_skip: FxHashSet<i64> =
-            FxHashSet::with_capacity_and_hasher(10_000, Default::default());
-        self.hot.collect_hot_row_ids_into(&mut hot_skip);
-        self.segment_mgr
-            .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
-
-        let mut collected = 0usize;
-        let mut cold_skipped = 0usize;
-
-        // Zone-map + bloom filter setup for pruning.
-        let comparisons = where_expr
-            .map(|e| e.collect_comparisons())
-            .unwrap_or_default();
-        let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-
-        'outer: for (seg_id, cs) in view.volumes() {
-            let vol = &cs.volume;
-            // Zone-map pruning: skip entire volume if no rows can match.
-            let pruned = if !comparisons.is_empty() {
-                let (skip, _, _) =
-                    Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
-                skip
-            } else {
-                false
-            };
-
-            if pruned {
-                continue;
+        // The hot rows are read before the cold view is taken, so a seal
+        // landing between them would show its rows twice
+        self.settled_across_seals(|| {
+            // Unordered: hot rows first with early termination.
+            // Only scan up to `target` hot rows — avoids O(hot_rows) for small LIMITs.
+            let hot_rows = self
+                .hot
+                .collect_rows_with_limit_unordered(where_expr, target, 0)?;
+            if hot_rows.len() >= target {
+                return Ok(hot_rows.into_iter().skip(offset).take(limit).collect());
             }
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::hot_rows_taken();
 
-            // Load cold volume on demand after pruning.
-            let loaded;
-            let vol: &Arc<FrozenVolume> = if vol.is_cold() {
-                loaded = match self.load_volume_of_view(&view, seg_id)? {
-                    Some(v) => v,
-                    None => continue,
-                };
-                &loaded
+            // Need cold rows. Build hot_skip and scan with early termination.
+            // Optimization: avoid materializing rows that fall within the offset.
+            // Hot rows already collected cover some of the offset+limit range.
+            // For the cold scan, track a skip counter to avoid get_row() for offset rows.
+            let hot_count = hot_rows.len();
+            let cold_skip = offset.saturating_sub(hot_count);
+            let mut result: RowVec = if hot_count > offset {
+                hot_rows.into_iter().skip(offset).collect()
             } else {
-                vol.mark_accessed();
-                vol
+                RowVec::new()
             };
+            let remaining = limit.saturating_sub(result.len()) + cold_skip;
 
-            let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+            self.segment_mgr
+                .check_schema_generation(self.schema_generation)?;
+            let view = self.segment_mgr.cold_snapshot();
+            self.segment_mgr
+                .check_schema_generation(self.schema_generation)?;
+            #[cfg(any(test, feature = "test-failpoints"))]
+            crate::test_failpoints::cold_volumes_taken();
+            let tombstones_arc = &view.ts;
+            let mut hot_skip: FxHashSet<i64> =
+                FxHashSet::with_capacity_and_hasher(10_000, Default::default());
+            self.hot.collect_hot_row_ids_into(&mut hot_skip);
+            self.segment_mgr
+                .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
-            for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
-                if !cs.is_visible(i) {
+            let mut collected = 0usize;
+            let mut cold_skipped = 0usize;
+
+            // Zone-map + bloom filter setup for pruning.
+            let comparisons = where_expr
+                .map(|e| e.collect_comparisons())
+                .unwrap_or_default();
+            let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
+
+            'outer: for (seg_id, cs) in view.volumes() {
+                let vol = &cs.volume;
+                // Zone-map pruning: skip entire volume if no rows can match.
+                let pruned = if !comparisons.is_empty() {
+                    let (skip, _, _) =
+                        Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
+                    skip
+                } else {
+                    false
+                };
+
+                if pruned {
                     continue;
                 }
-                if self.is_row_tombstoned(tombstones_arc, row_id) || hot_skip.contains(&row_id) {
-                    continue;
-                }
-                // For rows with a WHERE clause, we must evaluate the filter
-                // even during the skip phase to get correct offset counting.
-                if where_expr.is_some() {
-                    let row = reader.row(i, &cs.mapping)?;
-                    if let Some(expr) = where_expr {
-                        if !expr.evaluate_fast(&row) {
-                            continue;
+
+                // Load cold volume on demand after pruning.
+                let loaded;
+                let vol: &Arc<FrozenVolume> = if vol.is_cold() {
+                    loaded = match self.load_volume_of_view(&view, seg_id)? {
+                        Some(v) => v,
+                        None => continue,
+                    };
+                    &loaded
+                } else {
+                    vol.mark_accessed();
+                    vol
+                };
+
+                let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+
+                for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
+                    if !cs.is_visible(i) {
+                        continue;
+                    }
+                    if self.is_row_tombstoned(tombstones_arc, row_id) || hot_skip.contains(&row_id)
+                    {
+                        continue;
+                    }
+                    // For rows with a WHERE clause, we must evaluate the filter
+                    // even during the skip phase to get correct offset counting.
+                    if where_expr.is_some() {
+                        let row = reader.row(i, &cs.mapping)?;
+                        if let Some(expr) = where_expr {
+                            if !expr.evaluate_fast(&row) {
+                                continue;
+                            }
+                        }
+                        // Skip without storing if still in offset range
+                        if cold_skipped < cold_skip {
+                            cold_skipped += 1;
+                        } else {
+                            result.push((row_id, row));
+                        }
+                    } else {
+                        // No WHERE: skip without materializing the row
+                        if cold_skipped < cold_skip {
+                            cold_skipped += 1;
+                        } else {
+                            let row = reader.row(i, &cs.mapping)?;
+                            result.push((row_id, row));
                         }
                     }
-                    // Skip without storing if still in offset range
-                    if cold_skipped < cold_skip {
-                        cold_skipped += 1;
-                    } else {
-                        result.push((row_id, row));
+                    collected += 1;
+                    if collected >= remaining {
+                        break 'outer;
                     }
-                } else {
-                    // No WHERE: skip without materializing the row
-                    if cold_skipped < cold_skip {
-                        cold_skipped += 1;
-                    } else {
-                        let row = reader.row(i, &cs.mapping)?;
-                        result.push((row_id, row));
-                    }
-                }
-                collected += 1;
-                if collected >= remaining {
-                    break 'outer;
                 }
             }
-        }
 
-        Ok(result)
+            Ok(result)
+        })
     }
 
     fn has_row_id(&self, row_id: i64) -> Result<bool> {
