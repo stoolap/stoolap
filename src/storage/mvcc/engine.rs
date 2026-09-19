@@ -3735,6 +3735,18 @@ impl MVCCEngine {
         }
     }
 
+    pub(crate) fn restore_column_schema(
+        &self,
+        table_name: &str,
+        schema: CompactArc<Schema>,
+    ) -> Result<()> {
+        let store = self.get_version_store(table_name)?;
+        *store.schema_mut() = schema;
+        self.refresh_schema_cache(table_name)?;
+        self.refresh_column_mappings(table_name);
+        Ok(())
+    }
+
     /// Order a table's sealed rows by `key` from the next seal on; the
     /// volumes already sealed keep their order and are read all the same
     pub fn set_cluster_key(&self, table_name: &str, key: Vec<usize>) -> Result<()> {

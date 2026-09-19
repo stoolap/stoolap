@@ -37,40 +37,93 @@ fn failpoint_guard() -> test_failpoints::FailpointGuard {
 }
 
 #[test]
-fn a_failed_column_ddl_cannot_publish_an_old_mapping_as_settled() {
-    let _guard = failpoint_guard();
-    let dir = tempdir().unwrap();
-    let dsn = format!(
-        "file://{}?sync_mode=full&checkpoint_on_close=off&checkpoint_interval=0",
-        dir.path().display()
-    );
-    let db = Database::open(&dsn).unwrap();
-    db.execute(
-        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
-        (),
-    )
-    .unwrap();
-    db.execute("INSERT INTO t VALUES (1,10,20)", ()).unwrap();
-    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
-    test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
-    let altered = db.execute("ALTER TABLE t DROP COLUMN a", ());
-    test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
-    assert!(altered.is_err());
-    let error = db
-        .query_one::<i64, _>("SELECT b FROM t ORDER BY b", ())
-        .unwrap_err();
-    assert!(
-        matches!(error, stoolap::Error::SchemaChanged { .. }),
-        "{error}"
-    );
-    let _ = db.close();
-    let db = Database::open(&dsn).unwrap();
-    let value: i64 = db.query_one("SELECT b FROM t ORDER BY b", ()).unwrap();
-    assert_eq!(value, 20);
+fn a_failed_add_column_restores_the_readable_schema() {
+    assert_failed_column_ddl_restores_schema("ALTER TABLE t ADD COLUMN x INTEGER DEFAULT 4");
 }
 
 #[test]
-fn maintenance_does_not_rewrite_rows_after_a_failed_column_drop() {
+fn a_failed_drop_column_restores_the_readable_schema() {
+    assert_failed_column_ddl_restores_schema("ALTER TABLE t DROP COLUMN a");
+}
+
+#[test]
+fn a_failed_rename_column_restores_the_readable_schema() {
+    assert_failed_column_ddl_restores_schema("ALTER TABLE t RENAME COLUMN a TO z");
+}
+
+#[test]
+fn a_failed_modify_column_restores_the_readable_schema() {
+    assert_failed_column_ddl_restores_schema("ALTER TABLE t MODIFY COLUMN b TEXT");
+}
+
+fn assert_failed_column_ddl_restores_schema(ddl: &str) {
+    let _guard = failpoint_guard();
+    for failure in [
+        &test_failpoints::WAL_WRITE_FAIL,
+        &test_failpoints::WAL_SYNC_FAIL,
+    ] {
+        for sealed in [false, true] {
+            let dir = tempdir().unwrap();
+            let dsn = format!(
+                "file://{}?sync_mode=full&checkpoint_on_close=off&checkpoint_interval=0",
+                dir.path().display()
+            );
+            let db = Database::open(&dsn).unwrap();
+            db.execute(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+                (),
+            )
+            .unwrap();
+            db.execute("INSERT INTO t VALUES (1,10,20)", ()).unwrap();
+            if sealed {
+                db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            }
+            db.execute("INSERT INTO t VALUES (2,11,21)", ()).unwrap();
+            let columns = db
+                .engine()
+                .get_version_store("t")
+                .unwrap()
+                .schema()
+                .columns
+                .clone();
+            failure.store(true, Ordering::Release);
+            let altered = db.execute(ddl, ());
+            failure.store(false, Ordering::Release);
+            assert!(altered.is_err(), "{ddl}, sealed={sealed}");
+            let read = |db: &Database| {
+                assert_eq!(
+                    db.engine().get_version_store("t").unwrap().schema().columns,
+                    columns,
+                    "{ddl}, sealed={sealed}"
+                );
+                db.query("SELECT * FROM t ORDER BY id", ())
+                    .unwrap()
+                    .map(|row| {
+                        let row = row.unwrap();
+                        assert_eq!(row.len(), 3, "{ddl}, sealed={sealed}");
+                        (
+                            row.get::<i64>(0).unwrap(),
+                            row.get::<i64>(1).unwrap(),
+                            row.get::<i64>(2).unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(read(&db), vec![(1, 10, 20), (2, 11, 21)]);
+            let error = db
+                .execute("ALTER TABLE t ADD COLUMN a INTEGER", ())
+                .unwrap_err();
+            assert!(matches!(error, stoolap::Error::DuplicateColumn), "{error}");
+            assert!(db.execute("INSERT INTO t VALUES (3,12,22)", ()).is_err());
+            let _ = db.close();
+            let db = Database::open(&dsn).unwrap();
+            assert_eq!(read(&db), vec![(1, 10, 20), (2, 11, 21)]);
+        }
+    }
+}
+
+#[test]
+fn maintenance_uses_the_restored_schema_after_a_failed_column_drop() {
     let _guard = failpoint_guard();
     for sealed in [false, true] {
         let dir = tempdir().unwrap();
@@ -90,25 +143,30 @@ fn maintenance_does_not_rewrite_rows_after_a_failed_column_drop() {
                 db.execute("PRAGMA CHECKPOINT", ()).unwrap();
             }
         }
-        let mut before: Vec<_> = db.engine().volume_stats().iter().map(|v| v.1).collect();
-        before.sort_unstable();
-        assert_eq!(before.len(), if sealed { 3 } else { 0 });
+        assert_eq!(db.engine().volume_stats().len(), if sealed { 3 } else { 0 });
         db.execute("PRAGMA COMPACT_THRESHOLD = 2", ()).unwrap();
         test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
         let altered = db.execute("ALTER TABLE t DROP COLUMN a", ());
         test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
         assert!(altered.is_err());
         let _ = db.execute("PRAGMA CHECKPOINT", ());
-        let mut after: Vec<_> = db.engine().volume_stats().iter().map(|v| v.1).collect();
-        after.sort_unstable();
-        assert_eq!(
-            after, before,
-            "maintenance changed files with sealed={sealed}"
-        );
+        let read = |db: &Database| {
+            db.query("SELECT id, a, b FROM t ORDER BY id", ())
+                .unwrap()
+                .map(|row| {
+                    let row = row.unwrap();
+                    (
+                        row.get::<i64>(0).unwrap(),
+                        row.get::<i64>(1).unwrap(),
+                        row.get::<i64>(2).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(read(&db), vec![(1, 10, 20), (2, 10, 20), (3, 10, 20)]);
         let _ = db.close();
         let db = Database::open(&dsn).unwrap();
-        let value: i64 = db.query_one("SELECT SUM(b) FROM t", ()).unwrap();
-        assert_eq!(value, 60, "sealed={sealed}");
+        assert_eq!(read(&db), vec![(1, 10, 20), (2, 10, 20), (3, 10, 20)]);
     }
 }
 
