@@ -251,13 +251,10 @@ impl SegmentedTable {
         Some(f(&*self.hot))
     }
 
-    /// The contents of a cold volume a reader's view named. The view holds
-    /// the file, so a segment the manifest has since dropped still reads
-    /// through it, and a real read error surfaces instead of becoming a
-    /// volume the caller quietly walks past.
+    /// Reload through the captured file owner even after segment retirement.
     fn load_volume_of_view(
         &self,
-        view: &super::manifest::PinnedColdView,
+        view: &super::manifest::ColdSnapshot,
         seg_id: u64,
     ) -> Result<Option<Arc<super::writer::FrozenVolume>>> {
         match view.file(seg_id) {
@@ -1293,11 +1290,8 @@ impl SegmentedTable {
             .map(|e| e.collect_comparisons())
             .unwrap_or_default();
 
-        // Lazy: no ensure_columns upfront. Zone-map/bloom prune runs on
-        // metadata (available on cold volumes). Only surviving volumes
-        // are loaded on demand.
-        // One view: split captures let a compaction between them cost rows
-        let view = self.segment_mgr.pinned_cold_view();
+        // Capture once; load only volumes that survive metadata pruning.
+        let view = self.segment_mgr.cold_snapshot();
         let volumes = view.volumes();
 
         if volumes.is_empty() {
@@ -1400,10 +1394,8 @@ impl SegmentedTable {
             .map(|e| e.collect_comparisons())
             .unwrap_or_default();
 
-        // Lazy: no ensure_columns upfront. Prune on metadata first,
-        // load cold volumes on demand after pruning.
-        // One view: split captures let a compaction between them cost rows
-        let view = self.segment_mgr.pinned_cold_view();
+        // Capture once; load only volumes that survive metadata pruning.
+        let view = self.segment_mgr.cold_snapshot();
         let volumes = view.volumes();
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::cold_volumes_taken();

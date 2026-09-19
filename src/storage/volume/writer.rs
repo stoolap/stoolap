@@ -480,12 +480,8 @@ impl CompressedBlockStore {
         }
     }
 
-    /// A store whose blocks stay in the volume's file: `offsets` and
-    /// `compressed_lens` locate every (column, group) block, read by position
-    /// when a group is decoded, the file opened for the read. Nothing of the
-    /// blocks is in RAM and no descriptor is held. The store takes the
-    /// caller's handle of the file, so a file a reader pinned outlives the
-    /// store only as long as that reader holds the same handle.
+    /// Keep compressed blocks on disk and acquire their shared file owner.
+    /// Offsets and lengths locate each block; each read opens its own descriptor.
     #[allow(clippy::too_many_arguments)]
     pub fn from_file(
         path: std::path::PathBuf,
@@ -516,8 +512,7 @@ impl CompressedBlockStore {
         )
     }
 
-    /// The same, for a caller that already holds the file's handle: the store
-    /// takes that owner rather than minting a second one for the same path.
+    /// Keep compressed blocks on disk using an existing shared file owner.
     #[allow(clippy::too_many_arguments)]
     pub fn from_shared_file(
         file: std::sync::Arc<VolumeFile>,

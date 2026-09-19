@@ -132,6 +132,22 @@ pub(crate) fn rename_directory_moved() {
 }
 
 thread_local! {
+    static VOLUME_PATH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once after resolving a volume path, before acquiring its file owner.
+pub fn after_volume_file_path(hook: impl FnOnce() + 'static) {
+    VOLUME_PATH_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn volume_file_path_resolved() {
+    let hook = VOLUME_PATH_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static WAL_SWAPPED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

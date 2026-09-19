@@ -229,14 +229,8 @@ fn serialize_v4_opts(
     Ok((buf, store))
 }
 
-/// Read a V4 volume via streaming I/O. Never holds the full file in memory.
-/// CRC32 is computed incrementally as sections are read.
-/// Blocks are read one at a time into a reusable buffer and decompressed
-/// directly into final column vectors. No intermediate compressed storage.
-/// Reads a V4 volume from a file the caller already opened, and hands the
-/// store the caller's handle of it. `path` names the file in errors only.
-/// The magic check below is the format check, so no caller has to open the
-/// file once more to make it.
+/// Verify V4 magic and CRC through the opened file.
+/// The deferred block store retains `handle`; `path` is only for errors.
 fn read_volume_v4(
     file: std::fs::File,
     handle: std::sync::Arc<super::writer::VolumeFile>,
