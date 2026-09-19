@@ -11276,6 +11276,12 @@ impl Executor {
             _ => return Ok(None),
         };
 
+        // The walk reads the shared index, and the index holds the rows of
+        // every committed transaction, not this statement's view of them
+        let Some(index_epoch) = table.index_view_epoch() else {
+            return Ok(None);
+        };
+
         // Check for B-tree or primary key index on GROUP BY column
         let btree_index = match table.lookup_index_on_column(&group_col_name) {
             Some(idx)
@@ -11603,6 +11609,13 @@ impl Executor {
             Some(Ok(())) => {}
             Some(Err(e)) => return Err(e),
             None => return Ok(None), // Fall back to regular GROUP BY
+        }
+
+        // A commit publishes its index update before its versions become
+        // visible, so one that ran during the walk may have moved a key the
+        // groups above were built from
+        if table.index_view_epoch() != Some(index_epoch) {
+            return Ok(None);
         }
 
         if let Some(keep) = limit_for_early_exit {
