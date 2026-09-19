@@ -76,6 +76,32 @@ pub struct ColdSnapshot {
     pub ts: Arc<FxHashMap<i64, u64>>,
 }
 
+/// A reader's cold view. It holds what `ColdSnapshot` holds and, taken under
+/// the same locks, the handle of every volume's file: a compaction that
+/// retires one of those files cannot take it from this reader, and the read
+/// that follows goes through the handle rather than the path.
+pub struct PinnedColdView {
+    pub seg_ids: smallvec::SmallVec<[u64; 4]>,
+    pub segs: Arc<FxHashMap<u64, ColdSegment>>,
+    pub ts: Arc<FxHashMap<i64, u64>>,
+    files: FxHashMap<u64, Arc<super::writer::VolumeFile>>,
+}
+
+impl PinnedColdView {
+    /// The handle of the file the volume `seg_id` reads from.
+    pub fn file(&self, seg_id: u64) -> Option<&Arc<super::writer::VolumeFile>> {
+        self.files.get(&seg_id)
+    }
+
+    /// The volumes, newest first, as the reads below want them.
+    pub fn volumes(&self) -> Vec<(u64, ColdSegment)> {
+        self.seg_ids
+            .iter()
+            .filter_map(|&id| self.segs.get(&id).map(|cs| (id, cs.clone())))
+            .collect()
+    }
+}
+
 // Manifest file magic: "STMF" (SToolap ManiFest)
 const MANIFEST_MAGIC: [u8; 4] = *b"STMF";
 const MANIFEST_VERSION: u32 = 6;
@@ -1018,6 +1044,74 @@ impl SegmentManager {
         let ts = Arc::clone(&*self.tombstones.read());
         drop(manifest);
         ColdSnapshot { seg_ids, segs, ts }
+    }
+
+    /// Loads the volume a reader pinned, through the handle it holds. The
+    /// segment may have left the manifest since; the handle still reads it.
+    /// A failed read is reported the way `ensure_volume` reports one, so a
+    /// caller has a single contract for a volume that will not load.
+    pub fn load_pinned_volume(
+        &self,
+        seg_id: u64,
+        handle: &Arc<super::writer::VolumeFile>,
+    ) -> crate::core::Result<Option<Arc<super::writer::FrozenVolume>>> {
+        match super::io::read_volume_from_handle(handle) {
+            Ok(volume) => Ok(Some(Arc::new(volume))),
+            Err(e) => Err(crate::core::Error::Internal {
+                message: format!(
+                    "table '{}': failed to reload cold volume seg={}: {}; \
+                     refusing to serve partial data",
+                    self.table_name.read(),
+                    seg_id,
+                    e
+                ),
+            }),
+        }
+    }
+
+    /// A reader's cold view with the files taken too. The order matters: the
+    /// reload guard keeps a rename's directory move out, the manifest hold
+    /// keeps the segment set still, and only then is a path turned into a
+    /// handle, so no handle is minted for a path being moved away from.
+    /// Reading the file is left to the caller, after the locks are released.
+    pub fn pinned_cold_view(&self) -> PinnedColdView {
+        let _reloading = self.reloading.lock();
+        let manifest = self.manifest.read();
+        let seg_ids: smallvec::SmallVec<[u64; 4]> = manifest
+            .segments
+            .iter()
+            .rev()
+            .map(|m| m.segment_id)
+            .collect();
+        let segs = Arc::clone(&*self.segments.read());
+        let ts = Arc::clone(&*self.tombstones.read());
+        let files = self.pin_volume_files(&seg_ids);
+        drop(manifest);
+        PinnedColdView {
+            seg_ids,
+            segs,
+            ts,
+            files,
+        }
+    }
+
+    /// The handle of each segment's file, resolved the way `ensure_volume`
+    /// resolves it: the volume directory, the table's current name and the
+    /// segment id. A record's own `file_path` is not kept current.
+    fn pin_volume_files(&self, seg_ids: &[u64]) -> FxHashMap<u64, Arc<super::writer::VolumeFile>> {
+        let Some(dir) = self.volume_dir.as_ref() else {
+            return FxHashMap::default();
+        };
+        let table = self.table_name.read().clone();
+        seg_ids
+            .iter()
+            .map(|&id| {
+                let path = dir
+                    .join(table.as_str())
+                    .join(format!("vol_{:016x}.vol", id));
+                (id, super::writer::VolumeFile::shared(&path))
+            })
+            .collect()
     }
 
     /// Check if a value exists using a pre-captured snapshot (no lock acquisition).

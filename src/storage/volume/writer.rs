@@ -104,7 +104,9 @@ impl VolumeFile {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    fn open(&self) -> std::io::Result<std::fs::File> {
+    /// Opens the file at the path it is now, holding the path lock across
+    /// the open so a rename cannot land between the two
+    pub(super) fn open(&self) -> std::io::Result<std::fs::File> {
         std::fs::File::open(&*self.path.read())
     }
 
@@ -478,13 +480,15 @@ impl CompressedBlockStore {
         }
     }
 
-    /// A store whose blocks stay in the volume's file at `path`: `offsets`
-    /// and `compressed_lens` locate every (column, group) block, read by
-    /// position when a group is decoded, the file opened for the read.
-    /// Nothing of the blocks is in RAM and no descriptor is held
+    /// A store whose blocks stay in the volume's file: `offsets` and
+    /// `compressed_lens` locate every (column, group) block, read by position
+    /// when a group is decoded, the file opened for the read. Nothing of the
+    /// blocks is in RAM and no descriptor is held. The store takes the
+    /// caller's handle of the file, so a file a reader pinned outlives the
+    /// store only as long as that reader holds the same handle.
     #[allow(clippy::too_many_arguments)]
     pub fn from_file(
-        path: std::path::PathBuf,
+        file: std::sync::Arc<VolumeFile>,
         offsets: Vec<Vec<u64>>,
         compressed_lens: Vec<Vec<usize>>,
         decompressed_lens: Vec<Vec<usize>>,
@@ -502,7 +506,7 @@ impl CompressedBlockStore {
             .collect();
         Self {
             source: BlockSource::File {
-                file: VolumeFile::shared(&path),
+                file,
                 offsets,
                 lens: compressed_lens,
             },
@@ -3630,6 +3634,27 @@ mod tests {
     /// The decoded-group cache is process global: a test that sets its
     /// budget holds this and puts the default back
     static CACHE_BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A retirement is not a deletion: the file goes when its last holder
+    /// lets go, so a reader that pinned it reads on past the compaction that
+    /// retired it. This is the route the engine's cleanup takes for a volume
+    /// whose blocks are in RAM rather than in its file.
+    #[test]
+    fn a_retired_file_goes_when_its_last_holder_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.vol");
+        std::fs::write(&path, b"x").unwrap();
+
+        let reader = VolumeFile::shared(&path);
+        VolumeFile::shared(&path).retire();
+        assert!(
+            path.exists(),
+            "a holder keeps the file after the compaction retires it"
+        );
+
+        drop(reader);
+        assert!(!path.exists(), "the last holder's drop removes it");
+    }
 
     #[test]
     fn a_read_during_a_move_waits_for_it() {

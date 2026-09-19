@@ -251,6 +251,21 @@ impl SegmentedTable {
         Some(f(&*self.hot))
     }
 
+    /// The contents of a cold volume a reader's view named. The view holds
+    /// the file, so a segment the manifest has since dropped still reads
+    /// through it, and a real read error surfaces instead of becoming a
+    /// volume the caller quietly walks past.
+    fn load_volume_of_view(
+        &self,
+        view: &super::manifest::PinnedColdView,
+        seg_id: u64,
+    ) -> Result<Option<Arc<super::writer::FrozenVolume>>> {
+        match view.file(seg_id) {
+            Some(handle) => self.segment_mgr.load_pinned_volume(seg_id, handle),
+            None => self.segment_mgr.ensure_volume(seg_id),
+        }
+    }
+
     /// Groups of `index` in key order, up to `max_rows` rows and `max_bytes`
     /// of keys and ids. A group that does not fit is left out whole, so what
     /// comes back is a prefix of the index. None when the index is closed.
@@ -1280,15 +1295,17 @@ impl SegmentedTable {
 
         // Lazy: no ensure_columns upfront. Zone-map/bloom prune runs on
         // metadata (available on cold volumes). Only surviving volumes
-        // are loaded on demand via ensure_volume.
-        let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
+        // are loaded on demand.
+        // One view: split captures let a compaction between them cost rows
+        let view = self.segment_mgr.pinned_cold_view();
+        let volumes = view.volumes();
 
         if volumes.is_empty() {
             return Ok(Vec::new());
         }
 
         // Committed tombstones are kept as a shared Arc (no clone).
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+        let tombstones_arc = Arc::clone(&view.ts);
 
         // hot_skip is shared across all scanners via Arc — no clone per volume.
         let hot_skip_arc = Arc::new(hot_skip);
@@ -1307,7 +1324,7 @@ impl SegmentedTable {
             // Re-prune to get binary-search range narrowing on sorted columns.
             let loaded;
             let (vol, start, end) = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
+                loaded = match self.load_volume_of_view(&view, *seg_id)? {
                     Some(v) => v,
                     None => continue,
                 };
@@ -1336,8 +1353,9 @@ impl SegmentedTable {
             scanner.set_visibility_bitmap(cs.visible.clone());
             scanner.snapshot_seq = self.snapshot_seq;
             let current_schema = self.hot.schema();
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
-            scanner.set_column_mapping(mapping);
+            // From the captured segment: a retired volume's mapping is no
+            // longer in the live map, which answers with an identity one
+            scanner.set_column_mapping(cs.mapping.clone());
             if let Some(needed) = needed {
                 scanner.set_needed_cols(needed);
             }
@@ -1384,20 +1402,13 @@ impl SegmentedTable {
 
         // Lazy: no ensure_columns upfront. Prune on metadata first,
         // load cold volumes on demand after pruning.
-        // One view for the whole read: the volume order, the segment map and
-        // the committed tombstones come from the same manifest hold. Taken
-        // separately, a compaction landing in between consumes the tombstones
-        // of the rows it merged and the reader goes on without them.
-        let snapshot = self.segment_mgr.cold_snapshot();
-        let volumes: Vec<(u64, super::manifest::ColdSegment)> = snapshot
-            .seg_ids
-            .iter()
-            .filter_map(|&id| snapshot.segs.get(&id).map(|cs| (id, cs.clone())))
-            .collect();
+        // One view: split captures let a compaction between them cost rows
+        let view = self.segment_mgr.pinned_cold_view();
+        let volumes = view.volumes();
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::cold_volumes_taken();
 
-        let tombstones_arc = Arc::clone(&snapshot.ts);
+        let tombstones_arc = Arc::clone(&view.ts);
 
         let total: usize = volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
         let mut rows = RowVec::with_capacity(total.min(64_000));
@@ -1434,7 +1445,7 @@ impl SegmentedTable {
                 // Load cold volume on demand after zone-map/bloom pruning.
                 let loaded;
                 let (vol, start, end) = if vol.is_cold() {
-                    loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
+                    loaded = match self.load_volume_of_view(&view, *seg_id)? {
                         Some(v) => v,
                         None => return Ok(None),
                     };
@@ -1477,8 +1488,8 @@ impl SegmentedTable {
                     return Ok(None);
                 }
 
-                let current_schema = self.hot.schema();
-                let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
+                // From the captured segment, not the live map
+                let mapping = cs.mapping.clone();
 
                 // The rows that pass the dictionary filters, found in one pass
                 // over the raw ids; None walks the whole range

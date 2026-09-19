@@ -48,6 +48,21 @@ fn expected() -> Vec<(i64, i64)> {
     (DELETED_UP_TO + 1..=ROWS).map(|id| (id, id % 7)).collect()
 }
 
+/// The volume files the table has on disk.
+fn vol_files(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
+    let mut names = std::collections::BTreeSet::new();
+    if let Ok(entries) = std::fs::read_dir(dir.join("volumes").join("t")) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name.ends_with(".vol") {
+                    names.insert(name.to_string());
+                }
+            }
+        }
+    }
+    names
+}
+
 fn fixture(dir: &std::path::Path) -> Database {
     let db = Database::open(&format!(
         "file://{}?sync_mode=none&checkpoint_on_close=off",
@@ -152,13 +167,22 @@ fn a_compaction_during_a_cold_read_does_not_lose_a_live_row() {
     assert_eq!(volumes, 3, "the fixture sealed three volumes");
     assert_eq!(cold, 3, "all three are metadata-only before the read");
 
+    let before = vol_files(dir.path());
+    assert_eq!(before.len(), 3, "the fixture's volumes are on disk");
+
     let retired = Arc::new(AtomicUsize::new(usize::MAX));
+    let held = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&retired);
+    let kept = Arc::clone(&held);
+    let table_dir = dir.path().to_path_buf();
     let other = db.clone();
     stoolap::test_failpoints::after_cold_volumes_taken(move || {
         other.execute(&batch(3_001, 1_000), ()).unwrap();
         other.execute("PRAGMA CHECKPOINT", ()).unwrap();
         seen.store(other.engine().volume_stats().len(), Ordering::Relaxed);
+        // The reader holds this view, so the files it names must still be
+        // there: the merged volume is on top of them, not in place of them
+        kept.store(vol_files(&table_dir).len(), Ordering::Relaxed);
     });
 
     let mut tx = db.engine().begin_transaction().unwrap();
@@ -172,6 +196,19 @@ fn a_compaction_during_a_cold_read_does_not_lose_a_live_row() {
         retired.load(Ordering::Relaxed) < 3,
         "the compaction must retire the captured volumes for this test to guard anything"
     );
+    assert!(
+        held.load(Ordering::Relaxed) > before.len(),
+        "the files the reader holds survive the compaction that retired them"
+    );
+    // The reader is the last holder of the files it pinned, so the retired
+    // ones go now that it has let go
+    let after = vol_files(dir.path());
+    for name in &before {
+        assert!(
+            !after.contains(name),
+            "{name} is cleaned up once its last holder lets go"
+        );
+    }
 
     // The row the hook inserts commits after this statement's view, so the
     // reader's answer is the three captured volumes and nothing else

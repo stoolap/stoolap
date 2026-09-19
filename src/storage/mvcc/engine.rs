@@ -6008,7 +6008,9 @@ impl MVCCEngine {
                         let path = entry.path();
                         if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
                             if old_filenames.contains(fname) {
-                                let _ = std::fs::remove_file(&path);
+                                // Through the registry, so a reader that
+                                // pinned this file keeps it until it lets go
+                                crate::storage::volume::writer::VolumeFile::shared(&path).retire();
                             }
                         }
                     }
@@ -6291,7 +6293,9 @@ impl MVCCEngine {
                     } else if ext == Some("vol") {
                         if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
                             if old_filenames.contains(fname) {
-                                let _ = std::fs::remove_file(&path);
+                                // Through the registry, so a reader that
+                                // pinned this file keeps it until it lets go
+                                crate::storage::volume::writer::VolumeFile::shared(&path).retire();
                             }
                         }
                     }

@@ -233,13 +233,19 @@ fn serialize_v4_opts(
 /// CRC32 is computed incrementally as sections are read.
 /// Blocks are read one at a time into a reusable buffer and decompressed
 /// directly into final column vectors. No intermediate compressed storage.
-fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
+/// Reads a V4 volume from a file the caller already opened, and hands the
+/// store the caller's handle of it. `path` names the file in errors only.
+/// The magic check below is the format check, so no caller has to open the
+/// file once more to make it.
+fn read_volume_v4(
+    file: std::fs::File,
+    handle: std::sync::Arc<super::writer::VolumeFile>,
+    path: &Path,
+) -> Result<FrozenVolume> {
     use std::io::Read;
 
     let inv = |msg: &str| crate::core::Error::internal(format!("V4: {}", msg));
 
-    let file = std::fs::File::open(path)
-        .map_err(|e| crate::core::Error::internal(format!("V4 open {:?}: {}", path, e)))?;
     let file_len = usize::try_from(
         file.metadata()
             .map_err(|e| crate::core::Error::internal(format!("V4 stat {:?}: {}", path, e)))?
@@ -426,7 +432,7 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
         ranges
     };
     let store = CompressedBlockStore::from_file(
-        path.to_path_buf(),
+        handle,
         all_offsets,
         all_comp_lens,
         all_decomp_lens,
@@ -466,26 +472,23 @@ fn read_volume_v4(path: &Path) -> Result<FrozenVolume> {
 
 /// Read a frozen volume from disk. Only V4 (STV4) format is supported.
 pub fn read_volume_from_disk(path: &Path) -> Result<FrozenVolume> {
-    use std::io::Read;
+    // The V4 reader checks the format itself, so this opens the file once
+    // and the store comes back holding the handle every later read shares
+    let handle = super::writer::VolumeFile::shared(path);
+    read_volume_from_handle(&handle)
+}
 
-    let mut magic = [0u8; 4];
-    {
-        let mut f = std::fs::File::open(path).map_err(|e| {
-            crate::core::Error::internal(format!("failed to open volume {:?}: {}", path, e))
-        })?;
-        f.read_exact(&mut magic).map_err(|e| {
-            crate::core::Error::internal(format!("failed to read magic {:?}: {}", path, e))
-        })?;
-    }
-
-    if magic == V4_MAGIC {
-        read_volume_v4(path)
-    } else {
-        Err(crate::core::Error::internal(format!(
-            "unsupported volume format {:?}: expected STV4 magic, got {:?}",
-            path, magic
-        )))
-    }
+/// Reads the volume a handle names, through that same handle. A compaction
+/// that retires the file cannot take it from a holder, and the store that
+/// comes back keeps it alive with it, so a reader that pinned the file can
+/// still read a volume the manifest no longer lists.
+pub fn read_volume_from_handle(
+    handle: &std::sync::Arc<super::writer::VolumeFile>,
+) -> Result<FrozenVolume> {
+    let file = handle.open().map_err(|e| {
+        crate::core::Error::internal(format!("failed to open volume {:?}: {}", handle.path(), e))
+    })?;
+    read_volume_v4(file, std::sync::Arc::clone(handle), &handle.path())
 }
 
 /// List all volume files for a table, sorted by volume ID (oldest first).
