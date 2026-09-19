@@ -5462,6 +5462,33 @@ impl MVCCEngine {
     /// Evict idle volume data to save memory. Volumes not accessed since the
     /// last epoch transition: hot → warm (drop decompressed) → cold (drop compressed).
     #[cfg(not(target_arch = "wasm32"))]
+    /// Marks one table's volumes idle and evicts them to metadata-only, so a
+    /// test can read through the reload path. The epochs are local: the
+    /// global eviction epoch does not move, and nothing else in the process
+    /// sees these volumes as idle. Returns (volumes, cold).
+    #[cfg(feature = "test-failpoints")]
+    pub fn cold_volumes_for_test(&self, table: &str) -> (usize, usize) {
+        let mgr = self
+            .segment_managers
+            .read()
+            .unwrap()
+            .get(&table.to_lowercase())
+            .cloned();
+        let Some(mgr) = mgr else {
+            return (0, 0);
+        };
+        // A tier falls per call, and a volume has to be idle for three local
+        // cycles before it moves, so the epochs step by that much
+        for epoch in [0_u64, 3, 6, 9, 12] {
+            mgr.evict_idle_volumes(epoch);
+        }
+        let segs = mgr.segments_raw();
+        (
+            segs.len(),
+            segs.values().filter(|cs| cs.volume.is_cold()).count(),
+        )
+    }
+
     fn evict_idle_volumes(&self) {
         let epoch = self.eviction_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         // Publish to global so scanners stamp volumes with the correct epoch.

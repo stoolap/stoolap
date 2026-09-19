@@ -1385,6 +1385,8 @@ impl SegmentedTable {
         // Lazy: no ensure_columns upfront. Prune on metadata first,
         // load cold volumes on demand after pruning.
         let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::cold_volumes_taken();
 
         let tombstones_arc = self.segment_mgr.tombstone_set_arc();
 

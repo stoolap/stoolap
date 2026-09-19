@@ -96,6 +96,24 @@ pub(crate) fn wal_swap_starting() {
 }
 
 thread_local! {
+    static COLD_VOLUMES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread immediately after its next cold volume list is
+/// taken, so a test can compact or retire a segment inside that reader's own
+/// window.
+pub fn after_cold_volumes_taken(hook: impl FnOnce() + 'static) {
+    COLD_VOLUMES_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_volumes_taken() {
+    let hook = COLD_VOLUMES_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static WAL_SWAPPED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
