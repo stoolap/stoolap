@@ -2490,8 +2490,14 @@ impl Table for SegmentedTable {
 
         // Lazy: no ensure_columns. Phase 1 uses metadata only; Phase 2
         // loads cold volumes on demand after pruning.
-        let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
-        if volumes.is_empty() {
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)?;
+        let view = self.segment_mgr.cold_snapshot();
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)?;
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::cold_volumes_taken();
+        if view.seg_ids.is_empty() {
             return self.hot.collect_rows_with_limit(where_expr, limit, offset);
         }
 
@@ -2499,21 +2505,24 @@ impl Table for SegmentedTable {
         // Iterates cold row_ids newest-first so newer volumes win dedup.
         // Collect hot row_ids from actual hot scan results to prevent the
         // seal race (remove_sealed_rows between check and hot scan).
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+        let tombstones_arc = &view.ts;
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
-        let total_cold_rows: usize = volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
+        let total_cold_rows: usize = view.volumes().map(|(_, cs)| cs.volume.meta.row_count).sum();
         let mut authority: FxHashMap<i64, usize> = FxHashMap::with_capacity_and_hasher(
             total_cold_rows.min(500_000) * 8 / 7 + 16,
             Default::default(),
         );
-        for (nf_idx, (_seg_id, cs)) in volumes.iter().enumerate() {
+        for (nf_idx, seg_id) in view.seg_ids.iter().enumerate() {
+            let Some(cs) = view.segs.get(seg_id) else {
+                continue;
+            };
             for &rid in cs.volume.row_ids()? {
-                if hot_skip.contains(&rid) || self.is_row_tombstoned(&tombstones_arc, rid) {
+                if hot_skip.contains(&rid) || self.is_row_tombstoned(tombstones_arc, rid) {
                     continue;
                 }
                 authority.entry(rid).or_insert(nf_idx);
@@ -2523,14 +2532,16 @@ impl Table for SegmentedTable {
         // Phase 2: Iterate oldest-first, materialize only authoritative
         // rows, stop as soon as we have `target` matches.
         let mut cold_rows = RowVec::with_capacity(target.min(1024));
-        let current_schema = self.hot.schema();
 
         let comparisons = where_expr
             .map(|e| e.collect_comparisons())
             .unwrap_or_default();
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
 
-        'done: for (nf_idx, (seg_id, cs)) in volumes.iter().enumerate().rev() {
+        'done: for (nf_idx, seg_id) in view.seg_ids.iter().enumerate().rev() {
+            let Some(cs) = view.segs.get(seg_id) else {
+                continue;
+            };
             let vol = &cs.volume;
             if !comparisons.is_empty() {
                 let (skip, _, _) =
@@ -2543,7 +2554,7 @@ impl Table for SegmentedTable {
             // Load cold volume on demand after pruning.
             let loaded;
             let vol: &Arc<FrozenVolume> = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
+                loaded = match self.load_volume_of_view(&view, *seg_id)? {
                     Some(v) => v,
                     None => continue,
                 };
@@ -2553,14 +2564,13 @@ impl Table for SegmentedTable {
                 vol
             };
 
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
             let mut reader = super::writer::RowReader::new(Arc::clone(vol));
 
             for (i, &rid) in vol.row_ids()?.iter().enumerate() {
                 if authority.get(&rid) != Some(&nf_idx) {
                     continue;
                 }
-                let row = reader.row(i, &mapping)?;
+                let row = reader.row(i, &cs.mapping)?;
                 if let Some(expr) = where_expr {
                     if !expr.evaluate_fast(&row) {
                         continue;
@@ -2620,16 +2630,20 @@ impl Table for SegmentedTable {
         };
         let remaining = limit.saturating_sub(result.len()) + cold_skip;
 
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)?;
+        let view = self.segment_mgr.cold_snapshot();
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)?;
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::cold_volumes_taken();
+        let tombstones_arc = &view.ts;
         let mut hot_skip: FxHashSet<i64> =
             FxHashSet::with_capacity_and_hasher(10_000, Default::default());
         self.hot.collect_hot_row_ids_into(&mut hot_skip);
         self.segment_mgr
             .insert_pending_tombstones_into(self.txn_id(), &mut hot_skip);
 
-        // Lazy: load cold volumes on demand after pruning.
-        let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
-        let current_schema = self.hot.schema();
         let mut collected = 0usize;
         let mut cold_skipped = 0usize;
 
@@ -2639,7 +2653,7 @@ impl Table for SegmentedTable {
             .unwrap_or_default();
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
 
-        'outer: for (seg_id, cs) in volumes.iter() {
+        'outer: for (seg_id, cs) in view.volumes() {
             let vol = &cs.volume;
             // Zone-map pruning: skip entire volume if no rows can match.
             let pruned = if !comparisons.is_empty() {
@@ -2657,7 +2671,7 @@ impl Table for SegmentedTable {
             // Load cold volume on demand after pruning.
             let loaded;
             let vol: &Arc<FrozenVolume> = if vol.is_cold() {
-                loaded = match self.segment_mgr.ensure_volume(*seg_id)? {
+                loaded = match self.load_volume_of_view(&view, seg_id)? {
                     Some(v) => v,
                     None => continue,
                 };
@@ -2667,20 +2681,19 @@ impl Table for SegmentedTable {
                 vol
             };
 
-            let mapping = self.segment_mgr.get_volume_mapping(*seg_id, current_schema);
             let mut reader = super::writer::RowReader::new(Arc::clone(vol));
 
             for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
                 if !cs.is_visible(i) {
                     continue;
                 }
-                if self.is_row_tombstoned(&tombstones_arc, row_id) || hot_skip.contains(&row_id) {
+                if self.is_row_tombstoned(tombstones_arc, row_id) || hot_skip.contains(&row_id) {
                     continue;
                 }
                 // For rows with a WHERE clause, we must evaluate the filter
                 // even during the skip phase to get correct offset counting.
                 if where_expr.is_some() {
-                    let row = reader.row(i, &mapping)?;
+                    let row = reader.row(i, &cs.mapping)?;
                     if let Some(expr) = where_expr {
                         if !expr.evaluate_fast(&row) {
                             continue;
@@ -2697,7 +2710,7 @@ impl Table for SegmentedTable {
                     if cold_skipped < cold_skip {
                         cold_skipped += 1;
                     } else {
-                        let row = reader.row(i, &mapping)?;
+                        let row = reader.row(i, &cs.mapping)?;
                         result.push((row_id, row));
                     }
                 }
