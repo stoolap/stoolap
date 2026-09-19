@@ -3137,6 +3137,15 @@ impl Table for MVCCTable {
         self.txn_versions.read().unwrap().has_local_changes()
     }
 
+    fn index_view_epoch(&self) -> Option<u64> {
+        if self.txn_versions.read().unwrap().has_local_changes()
+            || self.version_store.needs_snapshot_isolation(self.txn_id)
+        {
+            return None;
+        }
+        self.version_store.publish_epoch_if_quiet()
+    }
+
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
         let txn_versions = self.txn_versions.read().unwrap();
         txn_versions

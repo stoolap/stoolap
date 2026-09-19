@@ -575,6 +575,19 @@ pub trait Table: Send + Sync {
     /// protocol needs to be executed.
     fn has_local_changes(&self) -> bool;
 
+    /// The publish epoch of the shared indexes, when this statement may read
+    /// them as the whole truth of what it sees: no local changes (they join
+    /// the indexes at commit), no snapshot older than the keys they hold (a
+    /// commit moves a key out of them while the snapshot still sees the row
+    /// under the old one), and no commit publishing right now (it updates the
+    /// indexes before its versions are visible).
+    ///
+    /// A caller that walks an index on this answer asks again before it
+    /// returns: a changed epoch means the walk may have missed a moved key.
+    fn index_view_epoch(&self) -> Option<u64> {
+        None
+    }
+
     /// Returns the pending versions to be committed for WAL logging
     ///
     /// Returns a list of (row_id, row_data, is_deleted, txn_id) tuples representing
