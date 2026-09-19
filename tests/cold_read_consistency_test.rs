@@ -253,6 +253,76 @@ fn a_rename_during_a_cold_read_does_not_break_the_reload() {
     );
 }
 
+/// A reader that takes its view while a rename has moved the directory but
+/// not yet the name reads the volume it took. The view carries the handles
+/// its segments were registered with, so no path is resolved from a name
+/// that is mid-change.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_rename_in_flight_does_not_break_the_view_a_reader_takes() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, v REAL NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1,1,10.0),(2,1,20.0),(3,2,30.0)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let (volumes, cold) = db.engine().cold_volumes_for_test("t");
+    assert_eq!((volumes, cold), (1, 1), "the volume is metadata-only");
+
+    let (moved, moved_rx) = std::sync::mpsc::channel();
+    let (taken, taken_rx) = std::sync::mpsc::channel();
+    let (done, done_rx) = std::sync::mpsc::channel();
+
+    let rename = {
+        let other = db.clone();
+        std::thread::spawn(move || {
+            stoolap::test_failpoints::in_rename_after_the_move(move || {
+                moved.send(()).unwrap();
+                taken_rx.recv().unwrap();
+            });
+            other.execute("ALTER TABLE t RENAME TO t2", ()).unwrap();
+            done.send(()).unwrap();
+        })
+    };
+
+    let reader = {
+        let db = db.clone();
+        std::thread::spawn(move || {
+            moved_rx.recv().unwrap();
+            stoolap::test_failpoints::after_cold_volumes_taken(move || {
+                taken.send(()).unwrap();
+            });
+            // Mid-rename: the engine knows the new name, the manager's
+            // directory has moved and its name has not
+            let mut tx = db.engine().begin_transaction().unwrap();
+            let table = tx.get_table("t2").unwrap();
+            let rows = table.collect_all_rows(None).unwrap();
+            tx.rollback().unwrap();
+            ids_and_keys(&rows)
+        })
+    };
+
+    let seen = reader.join().unwrap();
+    rename.join().unwrap();
+    done_rx.recv().unwrap();
+    assert_eq!(
+        seen,
+        vec![(1, 1), (2, 1), (3, 2)],
+        "the reader reads the volume its view carries"
+    );
+}
+
 /// A metadata-only volume read twice. The first read installs what it loaded,
 /// so the second shares that volume rather than reading the file again, and
 /// the groups the first decoded come back from the cache instead of the disk.

@@ -87,6 +87,7 @@ impl Fixture {
                     schema_version: 0,
                 },
                 Some(&schema),
+                None,
             );
         }
         manager.persist().unwrap();

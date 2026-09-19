@@ -3175,12 +3175,19 @@ impl MVCCEngine {
         volume: Arc<crate::storage::volume::writer::FrozenVolume>,
         seg_id: u64,
     ) {
+        // A file-backed volume carries the handle it was opened with; only
+        // a memory-backed one has to resolve a path here
+        let file = volume.file_owner().or_else(|| {
+            self.get_or_create_segment_manager(table_name)
+                .file_of(seg_id)
+        });
         self.register_volume_with_id_and_seal_seq(
             table_name,
             volume,
             seg_id,
             0,
             self.schema_epoch.load(Ordering::Acquire),
+            file,
         );
     }
 
@@ -3191,6 +3198,7 @@ impl MVCCEngine {
         seg_id: u64,
         seal_seq: u64,
         schema_version: u64,
+        file: Option<Arc<crate::storage::volume::writer::VolumeFile>>,
     ) {
         use crate::storage::volume::manifest::SegmentMeta;
         let mgr = self.get_or_create_segment_manager(table_name);
@@ -3218,6 +3226,7 @@ impl MVCCEngine {
                 schema_version,
             },
             schema,
+            file,
         );
         drop(schemas);
     }
@@ -6502,6 +6511,17 @@ impl MVCCEngine {
                 compress,
                 target_volume_rows,
             )?;
+            // Each sealed volume's owner, before the fence: the registry
+            // lock is global and must not be waited on under it
+            let sealed_files: Vec<Option<Arc<crate::storage::volume::writer::VolumeFile>>> =
+                sealed_volumes
+                    .iter()
+                    .map(|(volume, path, _)| {
+                        Some(volume.file_owner().unwrap_or_else(|| {
+                            crate::storage::volume::writer::VolumeFile::shared(path)
+                        }))
+                    })
+                    .collect();
             // Pre-build unique hash indices BEFORE registration so the
             // first INSERT after seal doesn't pay a ~60ms stall scanning
             // all rows. Safe: volumes are not yet visible to other threads.
@@ -6533,13 +6553,16 @@ impl MVCCEngine {
                 let current_seal_seq = per_table_cutoff
                     .map(|s| s as u64)
                     .unwrap_or_else(|| self.registry.get_current_sequence() as u64);
-                for (volume, _path, volume_id) in &sealed_volumes {
+                for ((volume, _path, volume_id), file) in
+                    sealed_volumes.iter().zip(sealed_files.iter())
+                {
                     self.register_volume_with_id_and_seal_seq(
                         &table_name,
                         Arc::clone(volume),
                         *volume_id,
                         current_seal_seq,
                         sealed_schema_version,
+                        file.clone(),
                     );
                 }
 

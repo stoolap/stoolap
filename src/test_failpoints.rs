@@ -114,6 +114,24 @@ pub(crate) fn cold_volumes_taken() {
 }
 
 thread_local! {
+    static RENAME_MOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next table rename has moved the
+/// directory, before the table takes its new name: the window in which the
+/// old name and the new directory disagree
+pub fn in_rename_after_the_move(hook: impl FnOnce() + 'static) {
+    RENAME_MOVED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn rename_directory_moved() {
+    let hook = RENAME_MOVED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static WAL_SWAPPED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

@@ -560,6 +560,15 @@ impl CompressedBlockStore {
         matches!(self.source, BlockSource::File { .. })
     }
 
+    /// The handle of the file the blocks are read from, when they are in one
+    /// rather than in RAM.
+    pub fn file_owner(&self) -> Option<Arc<VolumeFile>> {
+        match &self.source {
+            BlockSource::File { file, .. } => Some(Arc::clone(file)),
+            BlockSource::Memory(_) => None,
+        }
+    }
+
     /// Removes the volume's file once its last holder lets go, whichever
     /// store holds it; false when the blocks are not in a file
     pub fn retire_file(&self) -> bool {
@@ -3208,6 +3217,13 @@ pub fn compute_column_mapping_with_drops(
 }
 
 impl FrozenVolume {
+    /// The handle of the file this volume's blocks are read from, when they
+    /// are in a file rather than in RAM: a volume frozen in memory, or one
+    /// whose blocks were dropped to metadata, carries none.
+    pub fn file_owner(&self) -> Option<Arc<VolumeFile>> {
+        self.columns.compressed_store()?.file_owner()
+    }
+
     /// Borrow the resident physical row IDs.
     #[inline]
     pub fn row_ids(&self) -> std::io::Result<&[i64]> {

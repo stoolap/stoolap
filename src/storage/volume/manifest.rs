@@ -1067,9 +1067,9 @@ impl SegmentManager {
 
     /// The handle of a segment's file, resolved the way `ensure_volume`
     /// resolves it: the volume directory, the table's current name and the
-    /// segment id. A record's own `file_path` is not kept current. Taken
-    /// once, when the segment is registered.
-    fn file_of(&self, seg_id: u64) -> Option<Arc<super::writer::VolumeFile>> {
+    /// segment id. Only a memory-backed volume needs this; a file-backed one
+    /// is registered with the handle it was opened with.
+    pub(crate) fn file_of(&self, seg_id: u64) -> Option<Arc<super::writer::VolumeFile>> {
         let dir = self.volume_dir.as_ref()?;
         let path = dir
             .join(self.table_name.read().as_str())
@@ -1816,8 +1816,9 @@ impl SegmentManager {
         volume: Arc<FrozenVolume>,
         meta: SegmentMeta,
         schema: Option<&crate::core::Schema>,
+        file: Option<Arc<super::writer::VolumeFile>>,
     ) {
-        self.register_segment_inner(segment_id, volume, meta, schema);
+        self.register_segment_inner(segment_id, volume, meta, schema, file);
     }
 
     fn register_segment_inner(
@@ -1826,6 +1827,7 @@ impl SegmentManager {
         volume: Arc<FrozenVolume>,
         meta: SegmentMeta,
         schema: Option<&crate::core::Schema>,
+        file: Option<Arc<super::writer::VolumeFile>>,
     ) {
         // Both manifest and segments must be updated atomically under write locks.
         // The bitmap computation runs inside the critical section — this is safe
@@ -1844,7 +1846,7 @@ impl SegmentManager {
                 mapping,
                 schema_version: seg_schema_version,
                 visible: None,
-                file: self.file_of(segment_id),
+                file,
             };
             let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
             let mut segments = self.segments.write();
@@ -1882,6 +1884,9 @@ impl SegmentManager {
         drop(manifest);
 
         if let Some(schema_version) = seg_schema_version {
+            // A file-backed volume carries the handle it was opened with;
+            // only a memory-backed one has to resolve a path here
+            let file = volume.file_owner().or_else(|| self.file_of(segment_id));
             let cold = ColdSegment {
                 mapping: super::writer::ColumnMapping {
                     sources: (0..volume.columns.len())
@@ -1893,7 +1898,7 @@ impl SegmentManager {
                 volume,
                 schema_version,
                 visible: None,
-                file: self.file_of(segment_id),
+                file,
             };
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
@@ -1927,6 +1932,8 @@ impl SegmentManager {
     ) -> std::io::Result<()> {
         let _reload = self.reloading.lock();
         move_dir()?;
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::rename_directory_moved();
         self.rename(new_name);
         Ok(())
     }
@@ -2834,13 +2841,28 @@ impl SegmentManager {
         schema: Option<&crate::core::Schema>,
         between: impl FnOnce(&Self),
     ) -> bool {
-        let prepared = self.prepare_publication(&new_volumes, old_segment_ids);
+        let owners = self.output_owners(&new_volumes);
+        let prepared = self.prepare_publication(&new_volumes, old_segment_ids, &owners);
         between(self);
-        let fresh = self.commit_publication(prepared, new_volumes, old_segment_ids, schema);
+        let fresh =
+            self.commit_publication(prepared, new_volumes, old_segment_ids, schema, &owners);
         self.forget_key_order(old_segment_ids);
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         fresh
+    }
+
+    /// The handle of each output's file, taken once before the publication
+    /// locks: `file_of` takes the process-wide registry lock, which a writer
+    /// holding the seal fence must not wait on
+    fn output_owners(
+        &self,
+        new_volumes: &[(u64, Arc<FrozenVolume>, SegmentMeta)],
+    ) -> Vec<Option<Arc<super::writer::VolumeFile>>> {
+        new_volumes
+            .iter()
+            .map(|(seg_id, volume, _)| volume.file_owner().or_else(|| self.file_of(*seg_id)))
+            .collect()
     }
 
     /// The segments as they will stand after a publication, with every
@@ -2851,6 +2873,7 @@ impl SegmentManager {
         &self,
         new_volumes: &[(u64, Arc<FrozenVolume>, SegmentMeta)],
         old_segment_ids: &[u64],
+        owners: &[Option<Arc<super::writer::VolumeFile>>],
     ) -> PreparedPublication {
         let (snapshot, order, mut map) = {
             let manifest = self.manifest.read();
@@ -2860,7 +2883,7 @@ impl SegmentManager {
             for &id in old_segment_ids {
                 map.remove(&id);
             }
-            for (seg_id, vol, meta) in new_volumes {
+            for ((seg_id, vol, meta), owner) in new_volumes.iter().zip(owners) {
                 map.insert(
                     *seg_id,
                     ColdSegment {
@@ -2868,7 +2891,7 @@ impl SegmentManager {
                         volume: Arc::clone(vol),
                         schema_version: meta.schema_version,
                         visible: None,
-                        file: self.file_of(*seg_id),
+                        file: owner.clone(),
                     },
                 );
             }
@@ -2892,6 +2915,7 @@ impl SegmentManager {
         new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
         old_segment_ids: &[u64],
         schema: Option<&crate::core::Schema>,
+        owners: &[Option<Arc<super::writer::VolumeFile>>],
     ) -> bool {
         let mut manifest = self.manifest.write();
         let mut segments = self.segments.write();
@@ -2914,6 +2938,7 @@ impl SegmentManager {
         manifest.remove_segments(old_segment_ids);
         let insert_pos = insert_pos.min(manifest.segments.len());
         for (i, (seg_id, vol, meta)) in new_volumes.into_iter().enumerate() {
+            let owner = owners[i].clone();
             if seg_id >= manifest.next_segment_id {
                 manifest.next_segment_id = seg_id + 1;
             }
@@ -2931,7 +2956,7 @@ impl SegmentManager {
                             volume: vol,
                             schema_version: seg_schema_version,
                             visible: None,
-                            file: self.file_of(seg_id),
+                            file: owner,
                         },
                     );
                 }
@@ -3451,7 +3476,7 @@ mod tests {
             seal_seq: 0,
             schema_version: 0,
         };
-        mgr.register_segment(1, volume, meta, None);
+        mgr.register_segment(1, volume, meta, None, None);
 
         assert_eq!(mgr.segment_count(), 1);
         assert_eq!(mgr.total_row_count(), 10);
@@ -3487,6 +3512,7 @@ mod tests {
                 seal_seq: 0,
                 schema_version: 0,
             },
+            None,
             None,
         );
 
@@ -3535,6 +3561,7 @@ mod tests {
                     seal_seq: 0,
                     schema_version: 0,
                 },
+                None,
                 None,
             );
         }
@@ -3619,6 +3646,7 @@ mod tests {
             descending_k_volume(&sealed_with, 8),
             meta_of(1, 8),
             Some(&current),
+            None,
         );
         assert_eq!(mgr.known_key_order(1, &[1]), None);
         assert!(
@@ -3662,7 +3690,7 @@ mod tests {
         }
         let volume = Arc::new(builder.finish().unwrap());
         let mgr = SegmentManager::new("t", None);
-        mgr.register_segment(1, volume, meta_of(1, 4), Some(&sealed_with));
+        mgr.register_segment(1, volume, meta_of(1, 4), Some(&sealed_with), None);
         // The drop completes before the writer records the order it wrote:
         // the schema's positions have moved, the volume's have not
         let current = SchemaBuilder::new("t")
@@ -3701,6 +3729,7 @@ mod tests {
                 descending_k_volume(&schema, 4),
                 meta_of(seg_id, 4),
                 Some(&schema),
+                None,
             );
             assert!(!mgr.decide_key_order(seg_id, &[2]).unwrap());
         }
@@ -3820,18 +3849,15 @@ mod tests {
         let mgr = SegmentManager::new("publish", None);
         let a: Vec<i64> = (1..=70).collect();
         let b: Vec<i64> = (50..=120).collect();
-        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
-        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None, None);
+        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None, None);
         // A is rewritten as C; C keeps A's place, and B still masks the ids
         // it shares with C
         let c: Vec<i64> = (1..=70).collect();
-        let prepared = mgr.prepare_publication(&[(3, volume_of(&c), meta_for_ids(3, &c))], &[1]);
-        assert!(mgr.commit_publication(
-            prepared,
-            vec![(3, volume_of(&c), meta_for_ids(3, &c))],
-            &[1],
-            None
-        ));
+        let outputs = vec![(3, volume_of(&c), meta_for_ids(3, &c))];
+        let owners = mgr.output_owners(&outputs);
+        let prepared = mgr.prepare_publication(&outputs, &[1], &owners);
+        assert!(mgr.commit_publication(prepared, outputs, &[1], None, &owners));
         let order: Vec<u64> = mgr
             .manifest
             .read()
@@ -3857,19 +3883,16 @@ mod tests {
         let mgr = SegmentManager::new("publish_stale", None);
         let a: Vec<i64> = (1..=70).collect();
         let b: Vec<i64> = (50..=120).collect();
-        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
-        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None, None);
+        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None, None);
         let c: Vec<i64> = (1..=70).collect();
-        let prepared = mgr.prepare_publication(&[(3, volume_of(&c), meta_for_ids(3, &c))], &[1]);
+        let outputs = vec![(3, volume_of(&c), meta_for_ids(3, &c))];
+        let owners = mgr.output_owners(&outputs);
+        let prepared = mgr.prepare_publication(&outputs, &[1], &owners);
         // A seal lands in between: D takes ids 2 and 130 from everyone below
         let d: Vec<i64> = vec![2, 130];
-        mgr.register_segment(4, volume_of(&d), meta_for_ids(4, &d), None);
-        assert!(!mgr.commit_publication(
-            prepared,
-            vec![(3, volume_of(&c), meta_for_ids(3, &c))],
-            &[1],
-            None
-        ));
+        mgr.register_segment(4, volume_of(&d), meta_for_ids(4, &d), None, None);
+        assert!(!mgr.commit_publication(prepared, outputs, &[1], None, &owners));
         let order: Vec<u64> = mgr
             .manifest
             .read()
@@ -3891,12 +3914,12 @@ mod tests {
     fn a_publication_of_nothing_keeps_the_volume_a_seal_added_meanwhile_visible() {
         let mgr = SegmentManager::new("publish_empty", None);
         let a: Vec<i64> = (1..=10).collect();
-        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None, None);
         // Every row of A is gone: the compaction publishes nothing, and a
         // seal lands between its two steps
         let b: Vec<i64> = vec![20, 21];
         let fresh = mgr.publish_with(Vec::new(), &[1], None, |mgr| {
-            mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
+            mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None, None);
         });
         assert!(!fresh);
         assert!(mgr.has_segments(), "the sealed volume is there to read");
@@ -3949,6 +3972,7 @@ mod tests {
                 seal_seq: 0,
                 schema_version: 0,
             },
+            None,
             None,
         );
 
@@ -4111,6 +4135,7 @@ mod tests {
                 schema_version: 0,
             },
             None,
+            None,
         );
         assert!(mgr.segments_raw().get(&1).unwrap().volume.is_warm());
         // A reader holds the volume across the move; while the files move
@@ -4173,6 +4198,7 @@ mod tests {
                 seal_seq: 0,
                 schema_version: 0,
             },
+            None,
             None,
         );
 
@@ -4243,6 +4269,7 @@ mod tests {
                 schema_version: 0,
             },
             None,
+            None,
         );
 
         let snap = mgr.statement_snapshot().unwrap();
@@ -4303,6 +4330,7 @@ mod tests {
                 seal_seq: 0,
                 schema_version: 0,
             },
+            None,
             None,
         );
 

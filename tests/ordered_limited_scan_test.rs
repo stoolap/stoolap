@@ -405,6 +405,7 @@ fn test_top_k_reports_a_block_it_cannot_decode_instead_of_an_empty_answer() {
             seal_seq: 0,
         },
         Some(&schema),
+        None,
     );
     let table = SegmentedTable::new(hot, mgr);
     let filter = ComparisonExpr::new("t", Operator::Lt, Value::Integer(15));

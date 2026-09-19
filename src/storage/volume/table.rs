@@ -6803,6 +6803,7 @@ mod tests {
                 seal_seq: 0,
             },
             None,
+            None,
         );
         mgr
     }
@@ -7266,6 +7267,7 @@ mod tests {
                 creation_lsn: 0,
                 seal_seq: 0,
             },
+            None,
             None,
         );
         let hot = MockHotTable::new(schema.clone(), vec![]);
