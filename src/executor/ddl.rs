@@ -1002,6 +1002,7 @@ impl Executor {
                         None
                     };
 
+                    let mut change = self.engine.begin_column_change(table_name)?;
                     table.create_column_with_default_value(
                         &col_def.name.value,
                         data_type,
@@ -1009,6 +1010,7 @@ impl Executor {
                         default_expr.clone(),
                         default_value,
                     )?;
+                    change.mark_changed();
 
                     // Refresh engine's schema cache from version store
                     // The table modified the version_store schema, but engine has a separate cache
@@ -1028,6 +1030,7 @@ impl Executor {
                         default_expr.as_deref(),
                         vector_dimensions,
                     )?;
+                    change.finish();
                 } else {
                     return Err(Error::InvalidArgument(
                         "ADD COLUMN requires column definition".to_string(),
@@ -1036,7 +1039,9 @@ impl Executor {
             }
             AlterTableOperation::DropColumn => {
                 if let Some(ref col_name) = stmt.column_name {
+                    let mut change = self.engine.begin_column_change(table_name)?;
                     table.drop_column(&col_name.value)?;
+                    change.mark_changed();
 
                     // Refresh schema cache FIRST so invalidate_mappings sees the post-drop schema
                     self.engine.refresh_schema_cache(table_name)?;
@@ -1049,6 +1054,7 @@ impl Executor {
                     // Record column drop in manifest and recompute cold volume mappings
                     self.engine
                         .propagate_column_drop(table_name, &col_name.value);
+                    change.finish();
                 } else {
                     return Err(Error::InvalidArgument(
                         "DROP COLUMN requires column name".to_string(),
@@ -1057,7 +1063,9 @@ impl Executor {
             }
             AlterTableOperation::RenameColumn => match (&stmt.column_name, &stmt.new_column_name) {
                 (Some(old_name), Some(new_name)) => {
+                    let mut change = self.engine.begin_column_change(table_name)?;
                     table.rename_column(&old_name.value, &new_name.value)?;
+                    change.mark_changed();
 
                     // Refresh schema cache FIRST so invalidate_mappings sees the renamed schema
                     self.engine.refresh_schema_cache(table_name)?;
@@ -1076,6 +1084,7 @@ impl Executor {
                         &new_name.value,
                         &old_name.value,
                     );
+                    change.finish();
                 }
                 _ => {
                     return Err(Error::InvalidArgument(
@@ -1112,7 +1121,9 @@ impl Executor {
                         }
                     }
 
+                    let mut change = self.engine.begin_column_change(table_name)?;
                     table.modify_column(&col_def.name.value, data_type, nullable)?;
+                    change.mark_changed();
 
                     // Refresh engine's schema cache from version store
                     self.engine.refresh_schema_cache(table_name)?;
@@ -1130,6 +1141,7 @@ impl Executor {
                         nullable,
                         vector_dimensions,
                     )?;
+                    change.finish();
                 } else {
                     return Err(Error::InvalidArgument(
                         "MODIFY COLUMN requires column definition".to_string(),

@@ -36,6 +36,82 @@ fn failpoint_guard() -> test_failpoints::FailpointGuard {
     test_failpoints::FailpointGuard::new()
 }
 
+#[test]
+fn a_failed_column_ddl_cannot_publish_an_old_mapping_as_settled() {
+    let _guard = failpoint_guard();
+    let dir = tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?sync_mode=full&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    );
+    let db = Database::open(&dsn).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1,10,20)", ()).unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
+    let altered = db.execute("ALTER TABLE t DROP COLUMN a", ());
+    test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
+    assert!(altered.is_err());
+    let error = db
+        .query_one::<i64, _>("SELECT b FROM t ORDER BY b", ())
+        .unwrap_err();
+    assert!(
+        matches!(error, stoolap::Error::SchemaChanged { .. }),
+        "{error}"
+    );
+    let _ = db.close();
+    let db = Database::open(&dsn).unwrap();
+    let value: i64 = db.query_one("SELECT b FROM t ORDER BY b", ()).unwrap();
+    assert_eq!(value, 20);
+}
+
+#[test]
+fn maintenance_does_not_rewrite_rows_after_a_failed_column_drop() {
+    let _guard = failpoint_guard();
+    for sealed in [false, true] {
+        let dir = tempdir().unwrap();
+        let dsn = format!(
+            "file://{}?sync_mode=full&checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=100",
+            dir.path().display()
+        );
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+            (),
+        )
+        .unwrap();
+        for id in 1..=3 {
+            db.execute("INSERT INTO t VALUES (?,10,20)", (id,)).unwrap();
+            if sealed {
+                db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+            }
+        }
+        let mut before: Vec<_> = db.engine().volume_stats().iter().map(|v| v.1).collect();
+        before.sort_unstable();
+        assert_eq!(before.len(), if sealed { 3 } else { 0 });
+        db.execute("PRAGMA COMPACT_THRESHOLD = 2", ()).unwrap();
+        test_failpoints::WAL_WRITE_FAIL.store(true, Ordering::Release);
+        let altered = db.execute("ALTER TABLE t DROP COLUMN a", ());
+        test_failpoints::WAL_WRITE_FAIL.store(false, Ordering::Release);
+        assert!(altered.is_err());
+        let _ = db.execute("PRAGMA CHECKPOINT", ());
+        let mut after: Vec<_> = db.engine().volume_stats().iter().map(|v| v.1).collect();
+        after.sort_unstable();
+        assert_eq!(
+            after, before,
+            "maintenance changed files with sealed={sealed}"
+        );
+        let _ = db.close();
+        let db = Database::open(&dsn).unwrap();
+        let value: i64 = db.query_one("SELECT SUM(b) FROM t", ()).unwrap();
+        assert_eq!(value, 60, "sealed={sealed}");
+    }
+}
+
 // ============================================================================
 // WAL Write Failpoint Tests
 // ============================================================================
