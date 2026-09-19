@@ -11274,6 +11274,10 @@ impl Executor {
         if stmt.group_by.columns.len() != 1 {
             return Ok(None);
         }
+        // ROLLUP, CUBE and GROUPING SETS add rows the walk has no state for
+        if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None {
+            return Ok(None);
+        }
 
         // Check if GROUP BY is a simple column reference
         let group_col_name: String = match &stmt.group_by.columns[0] {
@@ -11360,9 +11364,17 @@ impl Executor {
                     let agg_idx = match infix.left.as_ref() {
                         Expression::FunctionCall(fc) => {
                             let func_upper = fc.function.to_uppercase();
-                            aggregations
-                                .iter()
-                                .position(|(name, _, _)| name == func_upper.as_str())
+                            // The argument decides which aggregate this is:
+                            // SUM(v) and SUM(w) share a name, and binding by
+                            // the name alone would test the wrong one
+                            let arg = match fc.arguments.first() {
+                                Some(Expression::Star(_)) => "*".to_string(),
+                                Some(Expression::Identifier(id)) => id.value_lower.to_string(),
+                                _ => return Ok(None),
+                            };
+                            aggregations.iter().position(|(name, col, _)| {
+                                name == func_upper.as_str() && col == arg.as_str()
+                            })
                         }
                         _ => None,
                     };

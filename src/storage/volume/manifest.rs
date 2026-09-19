@@ -2352,7 +2352,9 @@ impl SegmentManager {
         self.seal_fence.write()
     }
 
-    /// Current seal generation. Incremented on every register_segment.
+    /// Current generation of the segment set. Incremented when a segment is
+    /// registered and when the set is cleared, so a reader that took it before
+    /// sees every change that can take a row away.
     #[inline]
     pub fn seal_generation(&self) -> u64 {
         self.seal_generation
@@ -2650,6 +2652,10 @@ impl SegmentManager {
             .store(false, std::sync::atomic::Ordering::Relaxed);
         self.has_cold
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // Clearing takes rows away as much as a seal does, so a reader that
+        // took the generation before it must see the change after
+        self.seal_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// Remove specific segments after compaction.

@@ -644,7 +644,12 @@ pub trait Table: Send + Sync {
     ///
     /// `max_rows` and `max_bytes` bound what a table holding volumes captures
     /// under the index lock; a table holding none walks its own index and
-    /// ignores both.
+    /// ignores both. The bounds count payload, not the capacity the capture's
+    /// buffers reserve, so the index lock covers a bounded amount of work but
+    /// not a bounded allocation.
+    ///
+    /// What `f` builds is speculative: a None return means the walk cannot
+    /// answer for this statement and the caller must discard it.
     fn walk_btree_groups(
         &self,
         column: &str,

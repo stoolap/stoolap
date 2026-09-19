@@ -4666,7 +4666,9 @@ impl Table for SegmentedTable {
         let Some(index) = self.hot.get_index_on_column(column) else {
             return Ok(None);
         };
-        if index.index_type() != IndexType::BTree && index.index_type() != IndexType::PrimaryKey {
+        // A primary-key index collects its overflow ids, and sorts them, before
+        // its first callback, so the capture's bounds would not bound that work
+        if index.index_type() != IndexType::BTree {
             return Ok(None);
         }
 
