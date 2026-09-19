@@ -53,6 +53,9 @@ pub struct ColdSegment {
     /// only segment (all rows visible) or when there is no overlap.
     /// Arc so ColdSegment::clone() is O(1) — scanners share the same bitmap.
     pub visible: Option<Arc<Vec<u64>>>,
+    /// Keeps the file alive for captured readers and follows table renames.
+    /// Acquired before registration; absent for a database without files.
+    pub file: Option<Arc<super::writer::VolumeFile>>,
 }
 
 impl ColdSegment {
@@ -67,13 +70,26 @@ impl ColdSegment {
     }
 }
 
-/// Atomic snapshot of cold segment state for batch constraint checking.
-/// Captures manifest seg_ids + segments Arc + tombstones Arc once,
-/// eliminating 3 lock reads per row in batch INSERT/upsert.
+/// Consistent segment order, visibility and tombstones for cold reads.
+/// Captured segments keep their file owners alive across compaction.
 pub struct ColdSnapshot {
     pub seg_ids: smallvec::SmallVec<[u64; 4]>,
     pub segs: Arc<FxHashMap<u64, ColdSegment>>,
     pub ts: Arc<FxHashMap<i64, u64>>,
+}
+
+impl ColdSnapshot {
+    pub(super) fn file(&self, seg_id: u64) -> Option<Arc<super::writer::VolumeFile>> {
+        self.segs.get(&seg_id)?.file.clone()
+    }
+
+    /// Captured volumes, newest first.
+    pub(super) fn volumes(&self) -> Vec<(u64, ColdSegment)> {
+        self.seg_ids
+            .iter()
+            .filter_map(|&id| self.segs.get(&id).map(|cs| (id, cs.clone())))
+            .collect()
+    }
 }
 
 // Manifest file magic: "STMF" (SToolap ManiFest)
@@ -1000,13 +1016,9 @@ impl SegmentManager {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Capture an atomic snapshot of segment state for batch constraint checking.
-    /// Acquires manifest + segments + tombstones locks once. All per-row checks
-    /// within the batch reuse this snapshot with zero lock overhead.
+    /// Capture segment order, visibility, file owners and tombstones together.
+    /// Reuses the segment map and tombstone set without loading volume data.
     pub fn cold_snapshot(&self) -> ColdSnapshot {
-        // No ensure_columns — zone-map/bloom pruning uses metadata (available
-        // on cold volumes). Only volumes that pass pruning get loaded on demand
-        // via ensure_volume in check_value_exists_impl/find_row_id_by_values_impl.
         let manifest = self.manifest.read();
         let seg_ids: smallvec::SmallVec<[u64; 4]> = manifest
             .segments
@@ -1018,6 +1030,18 @@ impl SegmentManager {
         let ts = Arc::clone(&*self.tombstones.read());
         drop(manifest);
         ColdSnapshot { seg_ids, segs, ts }
+    }
+
+    /// Resolve a file owner while table renames are excluded.
+    pub(crate) fn file_of(&self, seg_id: u64) -> Option<Arc<super::writer::VolumeFile>> {
+        let dir = self.volume_dir.as_ref()?;
+        let _reload = self.reloading.lock();
+        let path = dir
+            .join(self.table_name.read().as_str())
+            .join(format!("vol_{:016x}.vol", seg_id));
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::volume_file_path_resolved();
+        Some(super::writer::VolumeFile::shared(&path))
     }
 
     /// Check if a value exists using a pre-captured snapshot (no lock acquisition).
@@ -1749,10 +1773,7 @@ impl SegmentManager {
             .any(|s| s.segment_id == segment_id)
     }
 
-    /// Register a new segment (after seal, compaction, or load).
-    /// When `invalidate_cache` is false (compaction), the unique lookup cache is
-    /// preserved. Compaction doesn't change row_ids or values, just which volume
-    /// they live in. The cache's `row_exists()` filter handles stale entries.
+    /// Register a new segment, acquiring its file owner before publication.
     pub fn register_segment(
         &self,
         segment_id: u64,
@@ -1760,15 +1781,18 @@ impl SegmentManager {
         meta: SegmentMeta,
         schema: Option<&crate::core::Schema>,
     ) {
-        self.register_segment_inner(segment_id, volume, meta, schema);
+        let file = volume.file_owner().or_else(|| self.file_of(segment_id));
+        self.register_segment_with_owner(segment_id, volume, meta, schema, file);
     }
 
-    fn register_segment_inner(
+    /// Register with a prepared file owner; no path or registry lookup occurs.
+    pub(crate) fn register_segment_with_owner(
         &self,
         segment_id: u64,
         volume: Arc<FrozenVolume>,
         meta: SegmentMeta,
         schema: Option<&crate::core::Schema>,
+        file: Option<Arc<super::writer::VolumeFile>>,
     ) {
         // Both manifest and segments must be updated atomically under write locks.
         // The bitmap computation runs inside the critical section — this is safe
@@ -1787,6 +1811,7 @@ impl SegmentManager {
                 mapping,
                 schema_version: seg_schema_version,
                 visible: None,
+                file,
             };
             let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
             let mut segments = self.segments.write();
@@ -1824,6 +1849,9 @@ impl SegmentManager {
         drop(manifest);
 
         if let Some(schema_version) = seg_schema_version {
+            // A file-backed volume carries the handle it was opened with;
+            // only a memory-backed one has to resolve a path here
+            let file = volume.file_owner().or_else(|| self.file_of(segment_id));
             let cold = ColdSegment {
                 mapping: super::writer::ColumnMapping {
                     sources: (0..volume.columns.len())
@@ -1835,6 +1863,7 @@ impl SegmentManager {
                 volume,
                 schema_version,
                 visible: None,
+                file,
             };
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
@@ -1868,6 +1897,8 @@ impl SegmentManager {
     ) -> std::io::Result<()> {
         let _reload = self.reloading.lock();
         move_dir()?;
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::rename_directory_moved();
         self.rename(new_name);
         Ok(())
     }
@@ -2775,13 +2806,28 @@ impl SegmentManager {
         schema: Option<&crate::core::Schema>,
         between: impl FnOnce(&Self),
     ) -> bool {
-        let prepared = self.prepare_publication(&new_volumes, old_segment_ids);
+        let owners = self.output_owners(&new_volumes);
+        let prepared = self.prepare_publication(&new_volumes, old_segment_ids, &owners);
         between(self);
-        let fresh = self.commit_publication(prepared, new_volumes, old_segment_ids, schema);
+        let fresh =
+            self.commit_publication(prepared, new_volumes, old_segment_ids, schema, &owners);
         self.forget_key_order(old_segment_ids);
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
         fresh
+    }
+
+    /// The handle of each output's file, taken once before the publication
+    /// locks: `file_of` takes the process-wide registry lock, which a writer
+    /// holding the seal fence must not wait on
+    fn output_owners(
+        &self,
+        new_volumes: &[(u64, Arc<FrozenVolume>, SegmentMeta)],
+    ) -> Vec<Option<Arc<super::writer::VolumeFile>>> {
+        new_volumes
+            .iter()
+            .map(|(seg_id, volume, _)| volume.file_owner().or_else(|| self.file_of(*seg_id)))
+            .collect()
     }
 
     /// The segments as they will stand after a publication, with every
@@ -2792,6 +2838,7 @@ impl SegmentManager {
         &self,
         new_volumes: &[(u64, Arc<FrozenVolume>, SegmentMeta)],
         old_segment_ids: &[u64],
+        owners: &[Option<Arc<super::writer::VolumeFile>>],
     ) -> PreparedPublication {
         let (snapshot, order, mut map) = {
             let manifest = self.manifest.read();
@@ -2801,7 +2848,7 @@ impl SegmentManager {
             for &id in old_segment_ids {
                 map.remove(&id);
             }
-            for (seg_id, vol, meta) in new_volumes {
+            for ((seg_id, vol, meta), owner) in new_volumes.iter().zip(owners) {
                 map.insert(
                     *seg_id,
                     ColdSegment {
@@ -2809,6 +2856,7 @@ impl SegmentManager {
                         volume: Arc::clone(vol),
                         schema_version: meta.schema_version,
                         visible: None,
+                        file: owner.clone(),
                     },
                 );
             }
@@ -2832,6 +2880,7 @@ impl SegmentManager {
         new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
         old_segment_ids: &[u64],
         schema: Option<&crate::core::Schema>,
+        owners: &[Option<Arc<super::writer::VolumeFile>>],
     ) -> bool {
         let mut manifest = self.manifest.write();
         let mut segments = self.segments.write();
@@ -2854,6 +2903,7 @@ impl SegmentManager {
         manifest.remove_segments(old_segment_ids);
         let insert_pos = insert_pos.min(manifest.segments.len());
         for (i, (seg_id, vol, meta)) in new_volumes.into_iter().enumerate() {
+            let owner = owners[i].clone();
             if seg_id >= manifest.next_segment_id {
                 manifest.next_segment_id = seg_id + 1;
             }
@@ -2871,6 +2921,7 @@ impl SegmentManager {
                             volume: vol,
                             schema_version: seg_schema_version,
                             visible: None,
+                            file: owner,
                         },
                     );
                 }
@@ -2950,64 +3001,129 @@ impl SegmentManager {
     /// `Err` means the cold volume could not be reloaded and the caller
     /// must fail closed rather than serve partial data.
     pub fn ensure_volume(&self, seg_id: u64) -> crate::core::Result<Option<Arc<FrozenVolume>>> {
-        // Fast path: already loaded (or another thread just loaded it)
-        {
-            let segs = self.segments.read();
-            match segs.get(&seg_id) {
-                None => return Ok(None),
-                Some(cs) if !cs.volume.is_cold() => {
-                    cs.volume.mark_accessed();
-                    return Ok(Some(Arc::clone(&cs.volume)));
-                }
-                Some(_) => {}
-            }
-        }
-        // Serialize reloads — prevents concurrent stampede on the same volume.
-        // Second thread re-checks the fast path after acquiring the guard.
-        let _guard = self.reloading.lock();
-        {
-            let segs = self.segments.read();
-            match segs.get(&seg_id) {
-                None => return Ok(None),
-                Some(cs) if !cs.volume.is_cold() => {
-                    cs.volume.mark_accessed();
-                    return Ok(Some(Arc::clone(&cs.volume)));
-                }
-                Some(_) => {}
-            }
-        }
-        let vol_dir = self
-            .volume_dir
-            .as_ref()
-            .ok_or_else(|| crate::core::Error::Internal {
-                message: format!(
-                    "table '{}': cold segment {} has no volume directory to reload from",
-                    self.table_name.read(),
-                    seg_id
-                ),
-            })?;
-        let filename = format!("vol_{:016x}.vol", seg_id);
-        let full_path = vol_dir.join(self.table_name.read().as_str()).join(filename);
-        let volume = match crate::storage::volume::io::read_volume_from_disk(&full_path) {
-            Ok(v) => Arc::new(v),
-            Err(e) => {
-                return Err(crate::core::Error::Internal {
-                    message: format!(
-                        "table '{}': failed to reload cold volume seg={}: {}; \
-                         refusing to serve partial data",
-                        self.table_name.read(),
-                        seg_id,
-                        e
-                    ),
-                });
+        self.ensure_volume_inner(seg_id, None)
+    }
+
+    /// The same reload for a reader that pinned the segment's file. The
+    /// reader's handle is what reads it, so a segment the manifest has since
+    /// dropped still loads; that segment is not put back in the map, and the
+    /// next plain reload still finds it gone.
+    pub fn ensure_pinned_volume(
+        &self,
+        seg_id: u64,
+        handle: &Arc<super::writer::VolumeFile>,
+    ) -> crate::core::Result<Option<Arc<FrozenVolume>>> {
+        self.ensure_volume_inner(seg_id, Some(handle))
+    }
+
+    /// The volume's bytes: through the reader's handle when it has one, and
+    /// from the segment's own path otherwise.
+    fn read_volume_for(
+        &self,
+        seg_id: u64,
+        pinned: Option<&Arc<super::writer::VolumeFile>>,
+    ) -> crate::core::Result<Arc<FrozenVolume>> {
+        let volume = match pinned {
+            Some(handle) => super::io::read_volume_from_handle(handle)?,
+            None => {
+                let vol_dir =
+                    self.volume_dir
+                        .as_ref()
+                        .ok_or_else(|| crate::core::Error::Internal {
+                            message: format!(
+                            "table '{}': cold segment {} has no volume directory to reload from",
+                            self.table_name.read(),
+                            seg_id
+                        ),
+                        })?;
+                let filename = format!("vol_{:016x}.vol", seg_id);
+                let full_path = vol_dir.join(self.table_name.read().as_str()).join(filename);
+                super::io::read_volume_from_disk(&full_path)?
             }
         };
+        Ok(Arc::new(volume))
+    }
+
+    fn reload_error(&self, seg_id: u64, e: crate::core::Error) -> crate::core::Error {
+        crate::core::Error::Internal {
+            message: format!(
+                "table '{}': failed to reload cold volume seg={}: {}; \
+                 refusing to serve partial data",
+                self.table_name.read(),
+                seg_id,
+                e
+            ),
+        }
+    }
+
+    fn ensure_volume_inner(
+        &self,
+        seg_id: u64,
+        pinned: Option<&Arc<super::writer::VolumeFile>>,
+    ) -> crate::core::Result<Option<Arc<FrozenVolume>>> {
+        // A segment the manifest has dropped is still readable through a
+        // pinned handle, and stays out of the map
+        let load_dropped = |this: &Self| -> crate::core::Result<Option<Arc<FrozenVolume>>> {
+            let Some(handle) = pinned else {
+                return Ok(None);
+            };
+            let volume = this
+                .read_volume_for(seg_id, Some(handle))
+                .map_err(|e| this.reload_error(seg_id, e))?;
+            volume.mark_accessed();
+            Ok(Some(volume))
+        };
+
+        // Where the segment stands, read without a guard outliving the look:
+        // a file read under the segments lock would hold it across every
+        // block of the volume
+        enum Stands {
+            Loaded(Arc<FrozenVolume>),
+            Cold,
+            Gone,
+        }
+        let look = |this: &Self| -> Stands {
+            let segs = this.segments.read();
+            match segs.get(&seg_id) {
+                None => Stands::Gone,
+                Some(cs) if !cs.volume.is_cold() => {
+                    cs.volume.mark_accessed();
+                    Stands::Loaded(Arc::clone(&cs.volume))
+                }
+                Some(_) => Stands::Cold,
+            }
+        };
+
+        // Fast path: already loaded (or another thread just loaded it)
+        match look(self) {
+            Stands::Loaded(volume) => return Ok(Some(volume)),
+            Stands::Gone => return load_dropped(self),
+            Stands::Cold => {}
+        }
+        // Serialize reloads to prevent a concurrent stampede on one volume.
+        // Second thread re-checks the fast path after acquiring the guard.
+        let _guard = self.reloading.lock();
+        match look(self) {
+            Stands::Loaded(volume) => return Ok(Some(volume)),
+            // The reload of a segment no longer in the map touches nothing
+            // the guard protects, so it goes without it
+            Stands::Gone => {
+                drop(_guard);
+                return load_dropped(self);
+            }
+            Stands::Cold => {}
+        }
+        let volume = self
+            .read_volume_for(seg_id, pinned)
+            .map_err(|e| self.reload_error(seg_id, e))?;
         volume.mark_accessed();
         let mut segments = self.segments.write();
         let mut new_map = (**segments).clone();
-        // Re-check: concurrent compaction may have removed the segment while
-        // we were reading from disk; the row then lives in a newer volume.
+        // A segment that left the manifest while the file was read: a pinned
+        // reader keeps what it read, and without one the caller is told, since
+        // the rows live in a newer volume now
         let cs = match new_map.get_mut(&seg_id) {
+            None if pinned.is_some() => return Ok(Some(volume)),
             None => return Ok(None),
             Some(cs) => cs,
         };
@@ -3015,6 +3131,9 @@ impl SegmentManager {
             *volume.unique_indices.write() = std::mem::take(&mut *cs.volume.unique_indices.write());
         }
         volume.inherit_row_order(&cs.volume);
+        // Put it back for everyone: the entry keeps its mapping and its
+        // visibility bitmap, and the next read shares this volume instead of
+        // reading the file again
         cs.volume = Arc::clone(&volume);
         let still_cold = new_map.values().any(|cs| cs.volume.is_cold());
         *segments = Arc::new(new_map);
@@ -3696,13 +3815,10 @@ mod tests {
         // A is rewritten as C; C keeps A's place, and B still masks the ids
         // it shares with C
         let c: Vec<i64> = (1..=70).collect();
-        let prepared = mgr.prepare_publication(&[(3, volume_of(&c), meta_for_ids(3, &c))], &[1]);
-        assert!(mgr.commit_publication(
-            prepared,
-            vec![(3, volume_of(&c), meta_for_ids(3, &c))],
-            &[1],
-            None
-        ));
+        let outputs = vec![(3, volume_of(&c), meta_for_ids(3, &c))];
+        let owners = mgr.output_owners(&outputs);
+        let prepared = mgr.prepare_publication(&outputs, &[1], &owners);
+        assert!(mgr.commit_publication(prepared, outputs, &[1], None, &owners));
         let order: Vec<u64> = mgr
             .manifest
             .read()
@@ -3731,16 +3847,13 @@ mod tests {
         mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
         mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
         let c: Vec<i64> = (1..=70).collect();
-        let prepared = mgr.prepare_publication(&[(3, volume_of(&c), meta_for_ids(3, &c))], &[1]);
+        let outputs = vec![(3, volume_of(&c), meta_for_ids(3, &c))];
+        let owners = mgr.output_owners(&outputs);
+        let prepared = mgr.prepare_publication(&outputs, &[1], &owners);
         // A seal lands in between: D takes ids 2 and 130 from everyone below
         let d: Vec<i64> = vec![2, 130];
         mgr.register_segment(4, volume_of(&d), meta_for_ids(4, &d), None);
-        assert!(!mgr.commit_publication(
-            prepared,
-            vec![(3, volume_of(&c), meta_for_ids(3, &c))],
-            &[1],
-            None
-        ));
+        assert!(!mgr.commit_publication(prepared, outputs, &[1], None, &owners));
         let order: Vec<u64> = mgr
             .manifest
             .read()
@@ -4011,6 +4124,63 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.to_string(), "no move");
         assert_eq!(mgr.table_name(), "after");
+    }
+
+    #[test]
+    fn a_registration_keeps_its_file_when_a_rename_attempts_to_split_owner_acquisition() {
+        use super::super::writer::VolumeFile;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let volume = volume_of(&[1, 2]);
+        assert!(volume.file_owner().is_none());
+        crate::storage::volume::io::write_volume_to_disk(dir.path(), "before", 1, &volume).unwrap();
+        let mgr = Arc::new(SegmentManager::new(
+            "before",
+            Some(dir.path().to_path_buf()),
+        ));
+        let moved = Arc::new(AtomicBool::new(false));
+        let move_table = {
+            let mgr = Arc::clone(&mgr);
+            let moved = Arc::clone(&moved);
+            let before = dir.path().join("before");
+            let after = dir.path().join("after");
+            move || {
+                mgr.rename_with("after", || {
+                    VolumeFile::relocate(&before, &after, || std::fs::rename(&before, &after))
+                })
+                .unwrap();
+                moved.store(true, Ordering::Relaxed);
+            }
+        };
+        crate::test_failpoints::after_volume_file_path({
+            let mgr = Arc::clone(&mgr);
+            let move_table = move_table.clone();
+            move || {
+                let rename_can_start = mgr.reloading.try_lock().is_some();
+                if rename_can_start {
+                    move_table();
+                }
+            }
+        });
+        mgr.register_segment(
+            1,
+            Arc::new(volume.to_cold()),
+            meta_for_ids(1, &[1, 2]),
+            None,
+        );
+        if !moved.load(Ordering::Relaxed) {
+            move_table();
+        }
+
+        let view = mgr.cold_snapshot();
+        let file = view.segs[&1].file.as_ref().unwrap();
+        assert!(
+            file.path().exists(),
+            "the captured owner must follow the file"
+        );
+        let loaded = mgr.ensure_pinned_volume(1, file).unwrap().unwrap();
+        assert_eq!(loaded.get_row(1).unwrap()[0], Value::Integer(2));
     }
 
     #[test]

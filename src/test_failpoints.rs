@@ -96,6 +96,58 @@ pub(crate) fn wal_swap_starting() {
 }
 
 thread_local! {
+    static COLD_VOLUMES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread immediately after its next cold volume list is
+/// taken, so a test can compact or retire a segment inside that reader's own
+/// window.
+pub fn after_cold_volumes_taken(hook: impl FnOnce() + 'static) {
+    COLD_VOLUMES_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn cold_volumes_taken() {
+    let hook = COLD_VOLUMES_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static RENAME_MOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next table rename has moved the
+/// directory, before the table takes its new name: the window in which the
+/// old name and the new directory disagree
+pub fn in_rename_after_the_move(hook: impl FnOnce() + 'static) {
+    RENAME_MOVED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn rename_directory_moved() {
+    let hook = RENAME_MOVED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static VOLUME_PATH_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once after resolving a volume path, before acquiring its file owner.
+pub fn after_volume_file_path(hook: impl FnOnce() + 'static) {
+    VOLUME_PATH_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn volume_file_path_resolved() {
+    let hook = VOLUME_PATH_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static WAL_SWAPPED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

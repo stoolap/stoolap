@@ -104,7 +104,9 @@ impl VolumeFile {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    fn open(&self) -> std::io::Result<std::fs::File> {
+    /// Opens the file at the path it is now, holding the path lock across
+    /// the open so a rename cannot land between the two
+    pub(super) fn open(&self) -> std::io::Result<std::fs::File> {
         std::fs::File::open(&*self.path.read())
     }
 
@@ -478,13 +480,42 @@ impl CompressedBlockStore {
         }
     }
 
-    /// A store whose blocks stay in the volume's file at `path`: `offsets`
-    /// and `compressed_lens` locate every (column, group) block, read by
-    /// position when a group is decoded, the file opened for the read.
-    /// Nothing of the blocks is in RAM and no descriptor is held
+    /// Keep compressed blocks on disk and acquire their shared file owner.
+    /// Offsets and lengths locate each block; each read opens its own descriptor.
     #[allow(clippy::too_many_arguments)]
     pub fn from_file(
         path: std::path::PathBuf,
+        offsets: Vec<Vec<u64>>,
+        compressed_lens: Vec<Vec<usize>>,
+        decompressed_lens: Vec<Vec<usize>>,
+        col_type_tags: Vec<u8>,
+        col_data_types: Vec<DataType>,
+        col_ext_types: Vec<u8>,
+        shared_dict: Vec<SmartString>,
+        dict_ranges: Vec<(usize, usize, usize)>,
+        group_size: usize,
+        row_count: usize,
+    ) -> Self {
+        let file = VolumeFile::shared(&path);
+        Self::from_shared_file(
+            file,
+            offsets,
+            compressed_lens,
+            decompressed_lens,
+            col_type_tags,
+            col_data_types,
+            col_ext_types,
+            shared_dict,
+            dict_ranges,
+            group_size,
+            row_count,
+        )
+    }
+
+    /// Keep compressed blocks on disk using an existing shared file owner.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_shared_file(
+        file: std::sync::Arc<VolumeFile>,
         offsets: Vec<Vec<u64>>,
         compressed_lens: Vec<Vec<usize>>,
         decompressed_lens: Vec<Vec<usize>>,
@@ -502,7 +533,7 @@ impl CompressedBlockStore {
             .collect();
         Self {
             source: BlockSource::File {
-                file: VolumeFile::shared(&path),
+                file,
                 offsets,
                 lens: compressed_lens,
             },
@@ -522,6 +553,15 @@ impl CompressedBlockStore {
     /// Whether the blocks live in the volume's file rather than in RAM
     pub fn is_file_backed(&self) -> bool {
         matches!(self.source, BlockSource::File { .. })
+    }
+
+    /// The handle of the file the blocks are read from, when they are in one
+    /// rather than in RAM.
+    pub fn file_owner(&self) -> Option<Arc<VolumeFile>> {
+        match &self.source {
+            BlockSource::File { file, .. } => Some(Arc::clone(file)),
+            BlockSource::Memory(_) => None,
+        }
     }
 
     /// Removes the volume's file once its last holder lets go, whichever
@@ -3172,6 +3212,13 @@ pub fn compute_column_mapping_with_drops(
 }
 
 impl FrozenVolume {
+    /// The handle of the file this volume's blocks are read from, when they
+    /// are in a file rather than in RAM: a volume frozen in memory, or one
+    /// whose blocks were dropped to metadata, carries none.
+    pub fn file_owner(&self) -> Option<Arc<VolumeFile>> {
+        self.columns.compressed_store()?.file_owner()
+    }
+
     /// Borrow the resident physical row IDs.
     #[inline]
     pub fn row_ids(&self) -> std::io::Result<&[i64]> {
@@ -3630,6 +3677,27 @@ mod tests {
     /// The decoded-group cache is process global: a test that sets its
     /// budget holds this and puts the default back
     static CACHE_BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A retirement is not a deletion: the file goes when its last holder
+    /// lets go, so a reader that pinned it reads on past the compaction that
+    /// retired it. This is the route the engine's cleanup takes for a volume
+    /// whose blocks are in RAM rather than in its file.
+    #[test]
+    fn a_retired_file_goes_when_its_last_holder_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.vol");
+        std::fs::write(&path, b"x").unwrap();
+
+        let reader = VolumeFile::shared(&path);
+        VolumeFile::shared(&path).retire();
+        assert!(
+            path.exists(),
+            "a holder keeps the file after the compaction retires it"
+        );
+
+        drop(reader);
+        assert!(!path.exists(), "the last holder's drop removes it");
+    }
 
     #[test]
     fn a_read_during_a_move_waits_for_it() {

@@ -3175,12 +3175,19 @@ impl MVCCEngine {
         volume: Arc<crate::storage::volume::writer::FrozenVolume>,
         seg_id: u64,
     ) {
+        // A file-backed volume carries the handle it was opened with; only
+        // a memory-backed one has to resolve a path here
+        let file = volume.file_owner().or_else(|| {
+            self.get_or_create_segment_manager(table_name)
+                .file_of(seg_id)
+        });
         self.register_volume_with_id_and_seal_seq(
             table_name,
             volume,
             seg_id,
             0,
             self.schema_epoch.load(Ordering::Acquire),
+            file,
         );
     }
 
@@ -3191,6 +3198,7 @@ impl MVCCEngine {
         seg_id: u64,
         seal_seq: u64,
         schema_version: u64,
+        file: Option<Arc<crate::storage::volume::writer::VolumeFile>>,
     ) {
         use crate::storage::volume::manifest::SegmentMeta;
         let mgr = self.get_or_create_segment_manager(table_name);
@@ -3204,7 +3212,7 @@ impl MVCCEngine {
         // after it
         let schemas = self.schemas.read().unwrap();
         let schema = schemas.get(&table_name.to_lowercase()).map(|s| &**s);
-        mgr.register_segment(
+        mgr.register_segment_with_owner(
             seg_id,
             volume,
             SegmentMeta {
@@ -3218,6 +3226,7 @@ impl MVCCEngine {
                 schema_version,
             },
             schema,
+            file,
         );
         drop(schemas);
     }
@@ -5459,6 +5468,33 @@ impl MVCCEngine {
         self.compact_volumes()
     }
 
+    /// Marks one table's volumes idle and evicts them to metadata-only, so a
+    /// test can read through the reload path. The epochs are local: the
+    /// global eviction epoch does not move, and nothing else in the process
+    /// sees these volumes as idle. Returns (volumes, cold).
+    #[cfg(feature = "test-failpoints")]
+    pub fn cold_volumes_for_test(&self, table: &str) -> (usize, usize) {
+        let mgr = self
+            .segment_managers
+            .read()
+            .unwrap()
+            .get(&table.to_lowercase())
+            .cloned();
+        let Some(mgr) = mgr else {
+            return (0, 0);
+        };
+        // A tier falls per call, and a volume has to be idle for three local
+        // cycles before it moves, so the epochs step by that much
+        for epoch in [0_u64, 3, 6, 9, 12] {
+            mgr.evict_idle_volumes(epoch);
+        }
+        let segs = mgr.segments_raw();
+        (
+            segs.len(),
+            segs.values().filter(|cs| cs.volume.is_cold()).count(),
+        )
+    }
+
     /// Evict idle volume data to save memory. Volumes not accessed since the
     /// last epoch transition: hot → warm (drop decompressed) → cold (drop compressed).
     #[cfg(not(target_arch = "wasm32"))]
@@ -5981,7 +6017,9 @@ impl MVCCEngine {
                         let path = entry.path();
                         if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
                             if old_filenames.contains(fname) {
-                                let _ = std::fs::remove_file(&path);
+                                // Through the registry, so a reader that
+                                // pinned this file keeps it until it lets go
+                                crate::storage::volume::writer::VolumeFile::shared(&path).retire();
                             }
                         }
                     }
@@ -6264,7 +6302,9 @@ impl MVCCEngine {
                     } else if ext == Some("vol") {
                         if let Some(fname) = path.file_name().and_then(|n| n.to_str()) {
                             if old_filenames.contains(fname) {
-                                let _ = std::fs::remove_file(&path);
+                                // Through the registry, so a reader that
+                                // pinned this file keeps it until it lets go
+                                crate::storage::volume::writer::VolumeFile::shared(&path).retire();
                             }
                         }
                     }
@@ -6471,6 +6511,17 @@ impl MVCCEngine {
                 compress,
                 target_volume_rows,
             )?;
+            // Each sealed volume's owner, before the fence: the registry
+            // lock is global and must not be waited on under it
+            let sealed_files: Vec<Option<Arc<crate::storage::volume::writer::VolumeFile>>> =
+                sealed_volumes
+                    .iter()
+                    .map(|(volume, path, _)| {
+                        Some(volume.file_owner().unwrap_or_else(|| {
+                            crate::storage::volume::writer::VolumeFile::shared(path)
+                        }))
+                    })
+                    .collect();
             // Pre-build unique hash indices BEFORE registration so the
             // first INSERT after seal doesn't pay a ~60ms stall scanning
             // all rows. Safe: volumes are not yet visible to other threads.
@@ -6502,13 +6553,16 @@ impl MVCCEngine {
                 let current_seal_seq = per_table_cutoff
                     .map(|s| s as u64)
                     .unwrap_or_else(|| self.registry.get_current_sequence() as u64);
-                for (volume, _path, volume_id) in &sealed_volumes {
+                for ((volume, _path, volume_id), file) in
+                    sealed_volumes.iter().zip(sealed_files.iter())
+                {
                     self.register_volume_with_id_and_seal_seq(
                         &table_name,
                         Arc::clone(volume),
                         *volume_id,
                         current_seal_seq,
                         sealed_schema_version,
+                        file.clone(),
                     );
                 }
 
