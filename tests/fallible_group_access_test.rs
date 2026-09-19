@@ -1149,7 +1149,6 @@ fn warm_table(
             schema_version: 0,
         },
         Some(&schema),
-        None,
     );
     let store = Arc::new(VersionStore::new(schema.table_name.clone(), schema));
     let local = TransactionVersionStore::new(Arc::clone(&store), 1);
@@ -1338,7 +1337,6 @@ fn late_compaction_failure_removes_output_and_preserves_original_volumes() {
                 schema_version: 0,
             },
             Some(&schema),
-            None,
         );
     }
     manager.persist().unwrap();

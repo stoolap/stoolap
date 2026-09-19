@@ -70,7 +70,6 @@ fn cold_table_with_index(dir: &Path, snapshot: bool, indexed: bool) -> (Segmente
             schema_version: 0,
         },
         Some(&schema),
-        Some(stoolap::storage::volume::writer::VolumeFile::shared(&path)),
     );
     manager.evict_idle_volumes(0);
     manager.evict_idle_volumes(3);

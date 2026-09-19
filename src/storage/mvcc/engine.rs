@@ -3212,7 +3212,7 @@ impl MVCCEngine {
         // after it
         let schemas = self.schemas.read().unwrap();
         let schema = schemas.get(&table_name.to_lowercase()).map(|s| &**s);
-        mgr.register_segment(
+        mgr.register_segment_with_owner(
             seg_id,
             volume,
             SegmentMeta {

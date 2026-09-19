@@ -1816,6 +1816,19 @@ impl SegmentManager {
         volume: Arc<FrozenVolume>,
         meta: SegmentMeta,
         schema: Option<&crate::core::Schema>,
+    ) {
+        let file = volume.file_owner().or_else(|| self.file_of(segment_id));
+        self.register_segment_inner(segment_id, volume, meta, schema, file);
+    }
+
+    /// The same registration for a caller that already holds the volume's
+    /// file handle, so nothing is resolved for it
+    pub(crate) fn register_segment_with_owner(
+        &self,
+        segment_id: u64,
+        volume: Arc<FrozenVolume>,
+        meta: SegmentMeta,
+        schema: Option<&crate::core::Schema>,
         file: Option<Arc<super::writer::VolumeFile>>,
     ) {
         self.register_segment_inner(segment_id, volume, meta, schema, file);
@@ -3476,7 +3489,7 @@ mod tests {
             seal_seq: 0,
             schema_version: 0,
         };
-        mgr.register_segment(1, volume, meta, None, None);
+        mgr.register_segment(1, volume, meta, None);
 
         assert_eq!(mgr.segment_count(), 1);
         assert_eq!(mgr.total_row_count(), 10);
@@ -3512,7 +3525,6 @@ mod tests {
                 seal_seq: 0,
                 schema_version: 0,
             },
-            None,
             None,
         );
 
@@ -3561,7 +3573,6 @@ mod tests {
                     seal_seq: 0,
                     schema_version: 0,
                 },
-                None,
                 None,
             );
         }
@@ -3646,7 +3657,6 @@ mod tests {
             descending_k_volume(&sealed_with, 8),
             meta_of(1, 8),
             Some(&current),
-            None,
         );
         assert_eq!(mgr.known_key_order(1, &[1]), None);
         assert!(
@@ -3690,7 +3700,7 @@ mod tests {
         }
         let volume = Arc::new(builder.finish().unwrap());
         let mgr = SegmentManager::new("t", None);
-        mgr.register_segment(1, volume, meta_of(1, 4), Some(&sealed_with), None);
+        mgr.register_segment(1, volume, meta_of(1, 4), Some(&sealed_with));
         // The drop completes before the writer records the order it wrote:
         // the schema's positions have moved, the volume's have not
         let current = SchemaBuilder::new("t")
@@ -3729,7 +3739,6 @@ mod tests {
                 descending_k_volume(&schema, 4),
                 meta_of(seg_id, 4),
                 Some(&schema),
-                None,
             );
             assert!(!mgr.decide_key_order(seg_id, &[2]).unwrap());
         }
@@ -3849,8 +3858,8 @@ mod tests {
         let mgr = SegmentManager::new("publish", None);
         let a: Vec<i64> = (1..=70).collect();
         let b: Vec<i64> = (50..=120).collect();
-        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None, None);
-        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None, None);
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
+        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
         // A is rewritten as C; C keeps A's place, and B still masks the ids
         // it shares with C
         let c: Vec<i64> = (1..=70).collect();
@@ -3883,15 +3892,15 @@ mod tests {
         let mgr = SegmentManager::new("publish_stale", None);
         let a: Vec<i64> = (1..=70).collect();
         let b: Vec<i64> = (50..=120).collect();
-        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None, None);
-        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None, None);
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
+        mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
         let c: Vec<i64> = (1..=70).collect();
         let outputs = vec![(3, volume_of(&c), meta_for_ids(3, &c))];
         let owners = mgr.output_owners(&outputs);
         let prepared = mgr.prepare_publication(&outputs, &[1], &owners);
         // A seal lands in between: D takes ids 2 and 130 from everyone below
         let d: Vec<i64> = vec![2, 130];
-        mgr.register_segment(4, volume_of(&d), meta_for_ids(4, &d), None, None);
+        mgr.register_segment(4, volume_of(&d), meta_for_ids(4, &d), None);
         assert!(!mgr.commit_publication(prepared, outputs, &[1], None, &owners));
         let order: Vec<u64> = mgr
             .manifest
@@ -3914,12 +3923,12 @@ mod tests {
     fn a_publication_of_nothing_keeps_the_volume_a_seal_added_meanwhile_visible() {
         let mgr = SegmentManager::new("publish_empty", None);
         let a: Vec<i64> = (1..=10).collect();
-        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None, None);
+        mgr.register_segment(1, volume_of(&a), meta_for_ids(1, &a), None);
         // Every row of A is gone: the compaction publishes nothing, and a
         // seal lands between its two steps
         let b: Vec<i64> = vec![20, 21];
         let fresh = mgr.publish_with(Vec::new(), &[1], None, |mgr| {
-            mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None, None);
+            mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
         });
         assert!(!fresh);
         assert!(mgr.has_segments(), "the sealed volume is there to read");
@@ -3972,7 +3981,6 @@ mod tests {
                 seal_seq: 0,
                 schema_version: 0,
             },
-            None,
             None,
         );
 
@@ -4135,7 +4143,6 @@ mod tests {
                 schema_version: 0,
             },
             None,
-            None,
         );
         assert!(mgr.segments_raw().get(&1).unwrap().volume.is_warm());
         // A reader holds the volume across the move; while the files move
@@ -4198,7 +4205,6 @@ mod tests {
                 seal_seq: 0,
                 schema_version: 0,
             },
-            None,
             None,
         );
 
@@ -4269,7 +4275,6 @@ mod tests {
                 schema_version: 0,
             },
             None,
-            None,
         );
 
         let snap = mgr.statement_snapshot().unwrap();
@@ -4330,7 +4335,6 @@ mod tests {
                 seal_seq: 0,
                 schema_version: 0,
             },
-            None,
             None,
         );
 
