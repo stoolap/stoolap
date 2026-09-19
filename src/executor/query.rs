@@ -11259,7 +11259,12 @@ impl Executor {
         all_columns: &[String],
         ctx: &ExecutionContext,
     ) -> Result<Option<(Box<dyn QueryResult>, CompactArc<Vec<String>>)>> {
-        use crate::core::IndexType;
+        // Rows a table that holds volumes may capture under the index lock,
+        // and the bytes its keys and ids may take. Either bound stops the
+        // capture, and a capture that stopped before the end of the index
+        // answers only when the caller stopped on its own count.
+        const CAPTURE_ROWS: usize = 4096;
+        const CAPTURE_BYTES: usize = 1024 * 1024;
 
         if Self::aggregates_hold_subquery(stmt) {
             return Ok(None);
@@ -11269,27 +11274,14 @@ impl Executor {
         if stmt.group_by.columns.len() != 1 {
             return Ok(None);
         }
+        // ROLLUP, CUBE and GROUPING SETS add rows the walk has no state for
+        if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None {
+            return Ok(None);
+        }
 
         // Check if GROUP BY is a simple column reference
         let group_col_name: String = match &stmt.group_by.columns[0] {
             Expression::Identifier(id) => id.value_lower.to_string(),
-            _ => return Ok(None),
-        };
-
-        // The walk reads the shared index, and the index holds the rows of
-        // every committed transaction, not this statement's view of them
-        let Some(index_epoch) = table.index_view_epoch() else {
-            return Ok(None);
-        };
-
-        // Check for B-tree or primary key index on GROUP BY column
-        let btree_index = match table.lookup_index_on_column(&group_col_name) {
-            Some(idx)
-                if idx.index_type() == IndexType::BTree
-                    || idx.index_type() == IndexType::PrimaryKey =>
-            {
-                idx
-            }
             _ => return Ok(None),
         };
 
@@ -11371,10 +11363,24 @@ impl Executor {
                     // Left side should be an aggregate function
                     let agg_idx = match infix.left.as_ref() {
                         Expression::FunctionCall(fc) => {
+                            // The walk keeps no distinct state, so an
+                            // aggregate the clause asks to deduplicate before
+                            // it aggregates is not one this walk can evaluate
+                            if fc.is_distinct {
+                                return Ok(None);
+                            }
                             let func_upper = fc.function.to_uppercase();
-                            aggregations
-                                .iter()
-                                .position(|(name, _, _)| name == func_upper.as_str())
+                            // The argument decides which aggregate this is:
+                            // SUM(v) and SUM(w) share a name, and binding by
+                            // the name alone would test the wrong one
+                            let arg = match fc.arguments.first() {
+                                Some(Expression::Star(_)) => "*".to_string(),
+                                Some(Expression::Identifier(id)) => id.value_lower.to_string(),
+                                _ => return Ok(None),
+                            };
+                            aggregations.iter().position(|(name, col, _)| {
+                                name == func_upper.as_str() && col == arg.as_str()
+                            })
                         }
                         _ => None,
                     };
@@ -11431,190 +11437,191 @@ impl Executor {
         use crate::storage::expression::logical::ConstBoolExpr;
         let true_expr = ConstBoolExpr::true_expr();
 
-        let iteration_result =
-            btree_index.for_each_group(&mut |group_value: &Value, row_ids: &[i64]| {
-                // Aggregate state: sums for SUM/AVG, min/max values, counts
-                let mut agg_sums = vec![0.0f64; num_aggs];
-                let mut agg_mins = vec![f64::MAX; num_aggs];
-                let mut agg_maxs = vec![f64::MIN; num_aggs];
-                let mut agg_has_value = vec![false; num_aggs];
-                let mut counts = vec![0i64; num_aggs];
+        let mut aggregate = |group_value: &Value, row_ids: &[i64]| -> Result<bool> {
+            // Aggregate state: sums for SUM/AVG, min/max values, counts
+            let mut agg_sums = vec![0.0f64; num_aggs];
+            let mut agg_mins = vec![f64::MAX; num_aggs];
+            let mut agg_maxs = vec![f64::MIN; num_aggs];
+            let mut agg_has_value = vec![false; num_aggs];
+            let mut counts = vec![0i64; num_aggs];
 
-                // Optimization: For COUNT-only aggregates, use row_ids.len() directly
-                let row_count = row_ids.len() as i64;
+            // Optimization: For COUNT-only aggregates, use row_ids.len() directly
+            let row_count = row_ids.len() as i64;
 
-                if needs_row_fetch {
-                    // Use the reusable buffer for row fetching
-                    row_buffer.clear();
-                    table.fetch_rows_by_ids_into(row_ids, &true_expr, &mut row_buffer)?;
+            if needs_row_fetch {
+                // Use the reusable buffer for row fetching
+                row_buffer.clear();
+                table.fetch_rows_by_ids_into(row_ids, &true_expr, &mut row_buffer)?;
 
-                    for (_row_id, row) in &row_buffer {
-                        for (i, agg) in simple_aggs.iter().enumerate() {
-                            match agg {
-                                StreamingAgg::Count => {
-                                    counts[i] += 1;
-                                }
-                                StreamingAgg::Sum(col_idx) | StreamingAgg::Avg(col_idx) => {
-                                    if let Some(value) = row.get(*col_idx) {
-                                        // A boolean counts as one or nought,
-                                        // as the aggregate itself reads it
-                                        let numeric = match value {
-                                            Value::Integer(v) => Some(*v as f64),
-                                            Value::Float(v) => Some(*v),
-                                            Value::Boolean(b) => Some(*b as i64 as f64),
-                                            _ => None,
-                                        };
-                                        if let Some(v) = numeric {
-                                            agg_sums[i] += v;
-                                            counts[i] += 1;
-                                            agg_has_value[i] = true;
-                                        }
-                                    }
-                                }
-                                StreamingAgg::Min(col_idx) => {
-                                    if let Some(value) = row.get(*col_idx) {
-                                        let v = match value {
-                                            Value::Integer(v) => Some(*v as f64),
-                                            Value::Float(v) => Some(*v),
-                                            _ => None,
-                                        };
-                                        if let Some(v) = v {
-                                            if v < agg_mins[i] {
-                                                agg_mins[i] = v;
-                                            }
-                                            agg_has_value[i] = true;
-                                        }
-                                    }
-                                }
-                                StreamingAgg::Max(col_idx) => {
-                                    if let Some(value) = row.get(*col_idx) {
-                                        let v = match value {
-                                            Value::Integer(v) => Some(*v as f64),
-                                            Value::Float(v) => Some(*v),
-                                            _ => None,
-                                        };
-                                        if let Some(v) = v {
-                                            if v > agg_maxs[i] {
-                                                agg_maxs[i] = v;
-                                            }
-                                            agg_has_value[i] = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Fast path: All aggregates are COUNT, no row fetch needed
+                for (_row_id, row) in &row_buffer {
                     for (i, agg) in simple_aggs.iter().enumerate() {
-                        if matches!(agg, StreamingAgg::Count) {
-                            counts[i] = row_count;
-                        }
-                    }
-                }
-
-                // Apply HAVING filter
-                if let Some((agg_idx, threshold, inclusive)) = having_filter {
-                    let agg_val = match simple_aggs[agg_idx] {
-                        StreamingAgg::Count => counts[agg_idx] as f64,
-                        StreamingAgg::Sum(_) | StreamingAgg::Avg(_) => {
-                            if agg_has_value[agg_idx] {
-                                match simple_aggs[agg_idx] {
-                                    StreamingAgg::Avg(_) if counts[agg_idx] > 0 => {
-                                        agg_sums[agg_idx] / counts[agg_idx] as f64
+                        match agg {
+                            StreamingAgg::Count => {
+                                counts[i] += 1;
+                            }
+                            StreamingAgg::Sum(col_idx) | StreamingAgg::Avg(col_idx) => {
+                                if let Some(value) = row.get(*col_idx) {
+                                    // A boolean counts as one or nought,
+                                    // as the aggregate itself reads it
+                                    let numeric = match value {
+                                        Value::Integer(v) => Some(*v as f64),
+                                        Value::Float(v) => Some(*v),
+                                        Value::Boolean(b) => Some(*b as i64 as f64),
+                                        _ => None,
+                                    };
+                                    if let Some(v) = numeric {
+                                        agg_sums[i] += v;
+                                        counts[i] += 1;
+                                        agg_has_value[i] = true;
                                     }
-                                    _ => agg_sums[agg_idx],
                                 }
-                            } else {
-                                return Ok(true); // NULL doesn't pass HAVING, continue to next group
+                            }
+                            StreamingAgg::Min(col_idx) => {
+                                if let Some(value) = row.get(*col_idx) {
+                                    let v = match value {
+                                        Value::Integer(v) => Some(*v as f64),
+                                        Value::Float(v) => Some(*v),
+                                        _ => None,
+                                    };
+                                    if let Some(v) = v {
+                                        if v < agg_mins[i] {
+                                            agg_mins[i] = v;
+                                        }
+                                        agg_has_value[i] = true;
+                                    }
+                                }
+                            }
+                            StreamingAgg::Max(col_idx) => {
+                                if let Some(value) = row.get(*col_idx) {
+                                    let v = match value {
+                                        Value::Integer(v) => Some(*v as f64),
+                                        Value::Float(v) => Some(*v),
+                                        _ => None,
+                                    };
+                                    if let Some(v) = v {
+                                        if v > agg_maxs[i] {
+                                            agg_maxs[i] = v;
+                                        }
+                                        agg_has_value[i] = true;
+                                    }
+                                }
                             }
                         }
-                        StreamingAgg::Min(_) => {
-                            if agg_has_value[agg_idx] {
-                                agg_mins[agg_idx]
-                            } else {
-                                return Ok(true); // Continue to next group
-                            }
-                        }
-                        StreamingAgg::Max(_) => {
-                            if agg_has_value[agg_idx] {
-                                agg_maxs[agg_idx]
-                            } else {
-                                return Ok(true); // Continue to next group
-                            }
-                        }
-                    };
-                    let passes = if inclusive {
-                        agg_val >= threshold
-                    } else {
-                        agg_val > threshold
-                    };
-                    if !passes {
-                        return Ok(true); // Continue to next group
                     }
                 }
-
-                // Build result row - only clone group_value when we need to keep it
-                let mut values = Vec::with_capacity(1 + num_aggs);
-                values.push(group_value.clone());
+            } else {
+                // Fast path: All aggregates are COUNT, no row fetch needed
                 for (i, agg) in simple_aggs.iter().enumerate() {
-                    let value = match agg {
-                        StreamingAgg::Count => Value::Integer(counts[i]),
-                        StreamingAgg::Sum(_) => {
-                            if agg_has_value[i] {
-                                Value::Float(agg_sums[i])
-                            } else {
-                                Value::null_unknown()
-                            }
-                        }
-                        StreamingAgg::Avg(_) => {
-                            if agg_has_value[i] && counts[i] > 0 {
-                                Value::Float(agg_sums[i] / counts[i] as f64)
-                            } else {
-                                Value::null_unknown()
-                            }
-                        }
-                        StreamingAgg::Min(_) => {
-                            if agg_has_value[i] {
-                                Value::Float(agg_mins[i])
-                            } else {
-                                Value::null_unknown()
-                            }
-                        }
-                        StreamingAgg::Max(_) => {
-                            if agg_has_value[i] {
-                                Value::Float(agg_maxs[i])
-                            } else {
-                                Value::null_unknown()
-                            }
-                        }
-                    };
-                    values.push(value);
-                }
-                result_rows.push((result_row_id, Row::from_values(values)));
-                result_row_id += 1;
-
-                // Early termination: stop once we have LIMIT groups that passed HAVING
-                if let Some(limit) = limit_for_early_exit {
-                    if result_rows.len() >= limit {
-                        return Ok(false); // Stop iteration
+                    if matches!(agg, StreamingAgg::Count) {
+                        counts[i] = row_count;
                     }
                 }
+            }
 
-                Ok(true) // Continue to next group
-            });
+            // Apply HAVING filter
+            if let Some((agg_idx, threshold, inclusive)) = having_filter {
+                let agg_val = match simple_aggs[agg_idx] {
+                    StreamingAgg::Count => counts[agg_idx] as f64,
+                    StreamingAgg::Sum(_) | StreamingAgg::Avg(_) => {
+                        if agg_has_value[agg_idx] {
+                            match simple_aggs[agg_idx] {
+                                StreamingAgg::Avg(_) if counts[agg_idx] > 0 => {
+                                    agg_sums[agg_idx] / counts[agg_idx] as f64
+                                }
+                                _ => agg_sums[agg_idx],
+                            }
+                        } else {
+                            return Ok(true); // NULL doesn't pass HAVING, continue to next group
+                        }
+                    }
+                    StreamingAgg::Min(_) => {
+                        if agg_has_value[agg_idx] {
+                            agg_mins[agg_idx]
+                        } else {
+                            return Ok(true); // Continue to next group
+                        }
+                    }
+                    StreamingAgg::Max(_) => {
+                        if agg_has_value[agg_idx] {
+                            agg_maxs[agg_idx]
+                        } else {
+                            return Ok(true); // Continue to next group
+                        }
+                    }
+                };
+                let passes = if inclusive {
+                    agg_val >= threshold
+                } else {
+                    agg_val > threshold
+                };
+                if !passes {
+                    return Ok(true); // Continue to next group
+                }
+            }
 
-        // Check if iteration was supported and succeeded
-        match iteration_result {
-            Some(Ok(())) => {}
-            Some(Err(e)) => return Err(e),
-            None => return Ok(None), // Fall back to regular GROUP BY
-        }
+            // Build result row - only clone group_value when we need to keep it
+            let mut values = Vec::with_capacity(1 + num_aggs);
+            values.push(group_value.clone());
+            for (i, agg) in simple_aggs.iter().enumerate() {
+                let value = match agg {
+                    StreamingAgg::Count => Value::Integer(counts[i]),
+                    StreamingAgg::Sum(_) => {
+                        if agg_has_value[i] {
+                            Value::Float(agg_sums[i])
+                        } else {
+                            Value::null_unknown()
+                        }
+                    }
+                    StreamingAgg::Avg(_) => {
+                        if agg_has_value[i] && counts[i] > 0 {
+                            Value::Float(agg_sums[i] / counts[i] as f64)
+                        } else {
+                            Value::null_unknown()
+                        }
+                    }
+                    StreamingAgg::Min(_) => {
+                        if agg_has_value[i] {
+                            Value::Float(agg_mins[i])
+                        } else {
+                            Value::null_unknown()
+                        }
+                    }
+                    StreamingAgg::Max(_) => {
+                        if agg_has_value[i] {
+                            Value::Float(agg_maxs[i])
+                        } else {
+                            Value::null_unknown()
+                        }
+                    }
+                };
+                values.push(value);
+            }
+            result_rows.push((result_row_id, Row::from_values(values)));
+            result_row_id += 1;
 
-        // A commit publishes its index update before its versions become
-        // visible, so one that ran during the walk may have moved a key the
-        // groups above were built from
-        if table.index_view_epoch() != Some(index_epoch) {
+            // Early termination: stop once we have LIMIT groups that passed HAVING
+            if let Some(limit) = limit_for_early_exit {
+                if result_rows.len() >= limit {
+                    return Ok(false); // Stop iteration
+                }
+            }
+
+            Ok(true) // Continue to next group
+        };
+
+        // The table owns whether its index can answer for this statement's
+        // rows, and for how long it holds the index lock: a memory table
+        // walks the index under that lock, a table holding volumes captures
+        // a prefix of it first and releases the lock before the fetch above
+        let walked = table.walk_btree_groups(
+            &group_col_name,
+            CAPTURE_ROWS,
+            CAPTURE_BYTES,
+            &mut aggregate,
+        )?;
+        // Nothing to walk, or the walk cannot answer for the statement's
+        // rows: fall back to the regular GROUP BY
+        if walked.is_none() {
             return Ok(None);
         }
 

@@ -235,6 +235,55 @@ impl fmt::Display for ScanPlan {
 ///     println!("{:?}", scanner.row());
 /// }
 /// ```
+/// Groups of an index taken while the table could answer for every visible
+/// row: keys in index order, each with the row ids it holds.
+///
+/// A table that holds volumes takes the capture under the index's own lock
+/// and the caller reads it after that lock is released, so the rows fetched
+/// from the ids never wait on the index lock and the seal never waits on a
+/// reader that is fetching.
+pub struct CapturedGroups {
+    keys: Vec<Value>,
+    /// Row ids in group order; `ranges[i]` slices the ids of `keys[i]`.
+    ids: Vec<i64>,
+    ranges: Vec<(usize, usize)>,
+    /// The walk reached the end of the index.
+    complete: bool,
+}
+
+impl CapturedGroups {
+    pub(crate) fn new(keys: Vec<Value>, ids: Vec<i64>, ranges: Vec<(usize, usize)>) -> Self {
+        Self {
+            keys,
+            ids,
+            ranges,
+            complete: false,
+        }
+    }
+
+    /// Each key with its row ids, in index order.
+    pub fn groups(&self) -> impl Iterator<Item = (&Value, &[i64])> {
+        self.keys
+            .iter()
+            .zip(&self.ranges)
+            .map(|(key, (start, end))| (key, &self.ids[*start..*end]))
+    }
+
+    /// The rows captured, which bounds the group prefix the caller may use.
+    pub fn rows(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// Whether the capture holds every group the index held.
+    pub fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(crate) fn mark_complete(&mut self) {
+        self.complete = true;
+    }
+}
+
 pub trait Table: Send + Sync {
     /// Returns the name of the table
     fn name(&self) -> &str;
@@ -586,6 +635,30 @@ pub trait Table: Send + Sync {
     /// returns: a changed epoch means the walk may have missed a moved key.
     fn index_view_epoch(&self) -> Option<u64> {
         None
+    }
+
+    /// Runs `f` over the groups of a B-tree or primary-key index on
+    /// `column`, in key order, while the table can answer for every visible
+    /// row. None when there is no such index or the table cannot answer that
+    /// way, and the caller scans instead.
+    ///
+    /// `max_rows` and `max_bytes` bound what a table holding volumes captures
+    /// under the index lock; a table holding none walks its own index and
+    /// ignores both. The bounds count payload, not the capacity the capture's
+    /// buffers reserve, so the index lock covers a bounded amount of work but
+    /// not a bounded allocation.
+    ///
+    /// What `f` builds is speculative: a None return means the walk cannot
+    /// answer for this statement and the caller must discard it.
+    fn walk_btree_groups(
+        &self,
+        column: &str,
+        max_rows: usize,
+        max_bytes: usize,
+        f: &mut dyn FnMut(&Value, &[i64]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        let _ = (column, max_rows, max_bytes, f);
+        Ok(None)
     }
 
     /// Returns the pending versions to be committed for WAL logging
