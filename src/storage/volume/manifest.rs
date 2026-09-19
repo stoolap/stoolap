@@ -664,6 +664,20 @@ impl StatementSnapshot {
     }
 }
 
+/// Keeps a destructive publication marked for as long as it runs, including
+/// on the error path.
+pub struct Destruction<'a> {
+    mgr: &'a SegmentManager,
+}
+
+impl Drop for Destruction<'_> {
+    fn drop(&mut self) {
+        self.mgr
+            .destruction_count
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 pub struct SegmentManager {
     /// Table name; a rename changes it under every open handle
     table_name: RwLock<SmartString>,
@@ -735,6 +749,10 @@ pub struct SegmentManager {
     /// Set to N before register_segment, cleared after remove_sealed_rows.
     /// Subtracted from row_count() to prevent double-counting during the seal window.
     seal_overlap_count: std::sync::atomic::AtomicUsize,
+    /// Destructive publications in flight. Unlike the overlap count, this
+    /// says nothing about how many rows moved: it marks the interval in which
+    /// rows are leaving, so a reader that captured inside it is not answered.
+    destruction_count: std::sync::atomic::AtomicUsize,
 }
 
 impl SegmentManager {
@@ -760,6 +778,7 @@ impl SegmentManager {
             seal_generation: std::sync::atomic::AtomicU64::new(0),
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
+            destruction_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -787,6 +806,7 @@ impl SegmentManager {
             seal_generation: std::sync::atomic::AtomicU64::new(0),
             txn_seal_gens: parking_lot::Mutex::new(rustc_hash::FxHashMap::default()),
             seal_overlap_count: std::sync::atomic::AtomicUsize::new(0),
+            destruction_count: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -2556,6 +2576,23 @@ impl SegmentManager {
             .load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Mark the start of an interval in which rows are leaving the table, and
+    /// the end of it when the returned guard drops. A reader that took its
+    /// view inside the interval cannot be answered from it: the rows it names
+    /// may already be gone while the generation still reads the same.
+    pub fn begin_destruction(&self) -> Destruction<'_> {
+        self.destruction_count
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Destruction { mgr: self }
+    }
+
+    /// Whether a destructive publication is in flight.
+    pub fn is_destruction_in_progress(&self) -> bool {
+        self.destruction_count
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    }
+
     /// Persist the manifest to disk (includes tombstones).
     pub fn persist(&self) -> Result<()> {
         self.persist_manifest_only()
@@ -2638,6 +2675,7 @@ impl SegmentManager {
 
     /// Remove all segments and tombstones (for DROP TABLE / TRUNCATE).
     pub fn clear(&self) {
+        let _destruction = self.begin_destruction();
         {
             let mut manifest = self.manifest.write();
             manifest.segments.clear();
@@ -3236,6 +3274,27 @@ mod tests {
         assert_eq!(loaded.table_name.as_str(), "disk_test");
         assert_eq!(loaded.segments.len(), 1);
         assert_eq!(loaded.tombstones, vec![(5, 0), (10, 0)]);
+    }
+
+    /// The guard marks the whole interval in which rows are leaving, so a
+    /// reader that consults it is told so until the outermost one drops.
+    #[test]
+    fn test_destruction_guard_marks_the_interval() {
+        let mgr = SegmentManager::new("test", None);
+        assert!(!mgr.is_destruction_in_progress());
+        {
+            let _outer = mgr.begin_destruction();
+            assert!(mgr.is_destruction_in_progress());
+            {
+                let _inner = mgr.begin_destruction();
+                assert!(mgr.is_destruction_in_progress());
+            }
+            assert!(
+                mgr.is_destruction_in_progress(),
+                "the outer guard still holds the interval open"
+            );
+        }
+        assert!(!mgr.is_destruction_in_progress());
     }
 
     #[test]

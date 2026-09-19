@@ -2262,6 +2262,9 @@ impl Table for SegmentedTable {
 
     fn truncate(&mut self) -> Result<i32> {
         let _seal_guard = self.segment_mgr.acquire_seal_read();
+        // The hot rows leave after the segment set is cleared, and a reader
+        // that starts in between must not be answered: mark the whole interval
+        let _destruction = self.segment_mgr.begin_destruction();
         let seg_rows = self.segment_mgr.total_row_count() as i32;
         // Clear pending tombstones for this txn (segments are being dropped)
         self.segment_mgr.rollback_pending_tombstones(self.txn_id());
@@ -4660,6 +4663,12 @@ impl Table for SegmentedTable {
         if self.segment_mgr.has_segments() {
             return Ok(None);
         }
+        // A publication that takes rows away runs across more than one step,
+        // and the generation only moves at one of them: a capture that starts
+        // inside the interval may read the index against rows already gone
+        if self.segment_mgr.is_destruction_in_progress() {
+            return Ok(None);
+        }
         let Some(epoch) = self.hot.index_view_epoch() else {
             return Ok(None);
         };
@@ -4690,7 +4699,10 @@ impl Table for SegmentedTable {
             }
         }
 
-        if self.segment_mgr.seal_generation() != generation || self.segment_mgr.has_segments() {
+        if self.segment_mgr.is_destruction_in_progress()
+            || self.segment_mgr.seal_generation() != generation
+            || self.segment_mgr.has_segments()
+        {
             return Ok(None);
         }
         if self.hot.index_view_epoch() != Some(epoch) {

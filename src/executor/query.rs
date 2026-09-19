@@ -11363,6 +11363,12 @@ impl Executor {
                     // Left side should be an aggregate function
                     let agg_idx = match infix.left.as_ref() {
                         Expression::FunctionCall(fc) => {
+                            // The walk keeps no distinct state, so an
+                            // aggregate the clause asks to deduplicate before
+                            // it aggregates is not one this walk can evaluate
+                            if fc.is_distinct {
+                                return Ok(None);
+                            }
                             let func_upper = fc.function.to_uppercase();
                             // The argument decides which aggregate this is:
                             // SUM(v) and SUM(w) share a name, and binding by

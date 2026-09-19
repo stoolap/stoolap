@@ -239,6 +239,27 @@ fn a_rollup_group_by_keeps_its_total_row() {
     );
 }
 
+/// The walk keeps no distinct state, so a HAVING that asks for one must not
+/// be answered by it: SUM(DISTINCT v) is not SUM(v).
+#[test]
+fn a_having_on_a_distinct_aggregate_falls_back() {
+    let db = Database::open("memory://having_distinct").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, v REAL NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1,1,10),(2,1,10),(3,2,30)", ())
+        .unwrap();
+
+    let sums = groups(
+        &db,
+        "SELECT k, SUM(v) FROM t GROUP BY k HAVING SUM(DISTINCT v) > 15 LIMIT 10",
+    );
+    assert_eq!(sums, vec![(2, 30.0)], "group 1 has a distinct sum of 10");
+}
+
 /// A primary-key index collects and sorts its overflow ids before it calls
 /// back, so the capture's bounds would not bound that work.
 #[test]
