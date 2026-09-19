@@ -79,16 +79,15 @@ pub struct ColdSnapshot {
 }
 
 impl ColdSnapshot {
-    pub(super) fn file(&self, seg_id: u64) -> Option<Arc<super::writer::VolumeFile>> {
-        self.segs.get(&seg_id)?.file.clone()
+    pub(super) fn file(&self, seg_id: u64) -> Option<&Arc<super::writer::VolumeFile>> {
+        self.segs.get(&seg_id)?.file.as_ref()
     }
 
     /// Captured volumes, newest first.
-    pub(super) fn volumes(&self) -> Vec<(u64, ColdSegment)> {
+    pub(super) fn volumes(&self) -> impl Iterator<Item = (u64, &ColdSegment)> {
         self.seg_ids
             .iter()
-            .filter_map(|&id| self.segs.get(&id).map(|cs| (id, cs.clone())))
-            .collect()
+            .filter_map(|&id| self.segs.get(&id).map(|cs| (id, cs)))
     }
 }
 
@@ -694,6 +693,39 @@ impl Drop for Destruction<'_> {
     }
 }
 
+pub(crate) struct ColumnSchemaChange {
+    mgr: Option<Arc<SegmentManager>>,
+    changed: bool,
+}
+
+impl ColumnSchemaChange {
+    pub(crate) fn hot_only() -> Self {
+        Self {
+            mgr: None,
+            changed: false,
+        }
+    }
+
+    pub(crate) fn mark_changed(&mut self) {
+        self.changed = true;
+    }
+
+    pub(crate) fn finish(mut self) {
+        self.changed = false;
+    }
+}
+
+impl Drop for ColumnSchemaChange {
+    fn drop(&mut self) {
+        if !self.changed {
+            if let Some(mgr) = &self.mgr {
+                mgr.schema_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+}
+
 pub struct SegmentManager {
     /// Table name; a rename changes it under every open handle
     table_name: RwLock<SmartString>,
@@ -769,6 +801,8 @@ pub struct SegmentManager {
     /// says nothing about how many rows moved: it marks the interval in which
     /// rows are leaving, so a reader that captured inside it is not answered.
     destruction_count: std::sync::atomic::AtomicUsize,
+    /// Even when column schema and mappings agree, odd during or after failed DDL.
+    schema_generation: std::sync::atomic::AtomicU64,
 }
 
 impl SegmentManager {
@@ -787,6 +821,7 @@ impl SegmentManager {
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(FxHashMap::default())),
+            schema_generation: std::sync::atomic::AtomicU64::new(0),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_fence: RwLock::new(()),
@@ -815,6 +850,7 @@ impl SegmentManager {
             current_eviction_epoch: std::sync::atomic::AtomicU64::new(0),
             reloading: parking_lot::Mutex::new(()),
             tombstones: RwLock::new(Arc::new(tombstone_map)),
+            schema_generation: std::sync::atomic::AtomicU64::new(0),
             pending_txn_tombstones: RwLock::new(FxHashMap::default()),
             cached_deduped_count: std::sync::atomic::AtomicU64::new(u64::MAX),
             seal_fence: RwLock::new(()),
@@ -829,6 +865,43 @@ impl SegmentManager {
     /// Get the table name.
     pub fn table_name(&self) -> SmartString {
         self.table_name.read().clone()
+    }
+
+    pub(crate) fn schema_generation(&self) -> u64 {
+        self.schema_generation
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn begin_column_change(self: &Arc<Self>) -> Result<ColumnSchemaChange> {
+        let generation = self.schema_generation();
+        if generation & 1 != 0
+            || self
+                .schema_generation
+                .compare_exchange(
+                    generation,
+                    generation + 1,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_err()
+        {
+            return Err(crate::core::Error::SchemaChanged {
+                table: self.table_name().to_string(),
+            });
+        }
+        Ok(ColumnSchemaChange {
+            mgr: Some(Arc::clone(self)),
+            changed: false,
+        })
+    }
+
+    pub(crate) fn check_schema_generation(&self, generation: u64) -> Result<()> {
+        if generation & 1 != 0 || self.schema_generation() != generation {
+            return Err(crate::core::Error::SchemaChanged {
+                table: self.table_name().to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Ensure all volumes have column data before column access.
@@ -1561,19 +1634,40 @@ impl SegmentManager {
         // volume that ensure_columns' has_cold check just missed.
         let _reload_guard = self.reloading.lock();
 
+        let warming: Vec<_> = {
+            let segments = self.segments.read();
+            targets
+                .iter()
+                .filter_map(|&(id, hot, _)| {
+                    let cs = segments.get(&id)?;
+                    hot.then(|| (id, Arc::clone(&cs.volume), cs.file.clone()))
+                })
+                .collect()
+        };
+        let warmed: Vec<_> = warming
+            .into_iter()
+            .filter_map(|(id, old, file)| {
+                let warm = Arc::new(old.to_warm()?);
+                if let Some(file) = file {
+                    file.remember(&warm);
+                }
+                Some((id, old, warm))
+            })
+            .collect();
+
         // Apply transitions under write lock. Arc<VolumeMetadata> is shared
         // (zero-copy), only LazyColumns is replaced.
         let mut segments = self.segments.write();
         let mut new_map = (**segments).clone();
-        for &(seg_id, is_hot, is_warm) in &targets {
-            if is_hot {
-                // Hot → Warm: drop decompressed columns, keep compressed in RAM
-                if let Some(cs) = new_map.get_mut(&seg_id) {
-                    if let Some(warm) = cs.volume.to_warm() {
-                        cs.volume = Arc::new(warm);
-                    }
+        for (id, old, warm) in warmed {
+            if let Some(cs) = new_map.get_mut(&id) {
+                if Arc::ptr_eq(&old, &cs.volume) {
+                    cs.volume = warm;
                 }
-            } else if is_warm {
+            }
+        }
+        for &(seg_id, _, is_warm) in &targets {
+            if is_warm {
                 // Warm → Cold: drop compressed blocks, keep metadata in map.
                 // Zone maps, stats, row_ids stay available for fast paths.
                 // Only column access triggers disk reload via ensure_loaded.
@@ -1591,18 +1685,15 @@ impl SegmentManager {
     /// Reload cold volumes (metadata-only, in segments map) from disk.
     /// Replaces them in-place with full deferred volumes.
     fn reload_cold_volumes(&self, ids: Vec<u64>) {
-        let vol_dir = match &self.volume_dir {
-            Some(d) => d,
-            None => return,
-        };
+        if self.volume_dir.is_none() {
+            return;
+        }
         let mut reloaded = Vec::new();
         let mut failed = Vec::new();
         for &id in &ids {
-            let filename = format!("vol_{:016x}.vol", id);
-            let full_path = vol_dir.join(self.table_name.read().as_str()).join(filename);
-            match crate::storage::volume::io::read_volume_from_disk(&full_path) {
+            match self.read_volume_for(id, None) {
                 Ok(volume) => {
-                    reloaded.push((id, Arc::new(volume)));
+                    reloaded.push((id, volume));
                 }
                 Err(e) => {
                     eprintln!(
@@ -1625,7 +1716,9 @@ impl SegmentManager {
         let mut new_map = (**segments).clone();
         for (id, volume) in reloaded {
             if let Some(cs) = new_map.get_mut(&id) {
-                if !cs.volume.unique_indices.read().is_empty() {
+                if !Arc::ptr_eq(&volume.unique_indices, &cs.volume.unique_indices)
+                    && !cs.volume.unique_indices.read().is_empty()
+                {
                     *volume.unique_indices.write() =
                         std::mem::take(&mut *cs.volume.unique_indices.write());
                 }
@@ -1782,6 +1875,9 @@ impl SegmentManager {
         schema: Option<&crate::core::Schema>,
     ) {
         let file = volume.file_owner().or_else(|| self.file_of(segment_id));
+        if let Some(file) = &file {
+            file.remember(&volume);
+        }
         self.register_segment_with_owner(segment_id, volume, meta, schema, file);
     }
 
@@ -1852,6 +1948,9 @@ impl SegmentManager {
             // A file-backed volume carries the handle it was opened with;
             // only a memory-backed one has to resolve a path here
             let file = volume.file_owner().or_else(|| self.file_of(segment_id));
+            if let Some(file) = &file {
+                file.remember(&volume);
+            }
             let cold = ColdSegment {
                 mapping: super::writer::ColumnMapping {
                     sources: (0..volume.columns.len())
@@ -2826,7 +2925,13 @@ impl SegmentManager {
     ) -> Vec<Option<Arc<super::writer::VolumeFile>>> {
         new_volumes
             .iter()
-            .map(|(seg_id, volume, _)| volume.file_owner().or_else(|| self.file_of(*seg_id)))
+            .map(|(seg_id, volume, _)| {
+                let file = volume.file_owner().or_else(|| self.file_of(*seg_id));
+                if let Some(file) = &file {
+                    file.remember(volume);
+                }
+                file
+            })
             .collect()
     }
 
@@ -2903,7 +3008,6 @@ impl SegmentManager {
         manifest.remove_segments(old_segment_ids);
         let insert_pos = insert_pos.min(manifest.segments.len());
         for (i, (seg_id, vol, meta)) in new_volumes.into_iter().enumerate() {
-            let owner = owners[i].clone();
             if seg_id >= manifest.next_segment_id {
                 manifest.next_segment_id = seg_id + 1;
             }
@@ -2921,7 +3025,7 @@ impl SegmentManager {
                             volume: vol,
                             schema_version: seg_schema_version,
                             visible: None,
-                            file: owner,
+                            file: owners[i].clone(),
                         },
                     );
                 }
@@ -3023,9 +3127,17 @@ impl SegmentManager {
         seg_id: u64,
         pinned: Option<&Arc<super::writer::VolumeFile>>,
     ) -> crate::core::Result<Arc<FrozenVolume>> {
-        let volume = match pinned {
-            Some(handle) => super::io::read_volume_from_handle(handle)?,
+        match pinned {
+            Some(handle) => handle.load(),
             None => {
+                let owner = self
+                    .segments
+                    .read()
+                    .get(&seg_id)
+                    .and_then(|cs| cs.file.clone());
+                if let Some(owner) = owner {
+                    return owner.load();
+                }
                 let vol_dir =
                     self.volume_dir
                         .as_ref()
@@ -3038,10 +3150,9 @@ impl SegmentManager {
                         })?;
                 let filename = format!("vol_{:016x}.vol", seg_id);
                 let full_path = vol_dir.join(self.table_name.read().as_str()).join(filename);
-                super::io::read_volume_from_disk(&full_path)?
+                super::writer::VolumeFile::shared(&full_path).load()
             }
-        };
-        Ok(Arc::new(volume))
+        }
     }
 
     fn reload_error(&self, seg_id: u64, e: crate::core::Error) -> crate::core::Error {
@@ -3127,7 +3238,9 @@ impl SegmentManager {
             None => return Ok(None),
             Some(cs) => cs,
         };
-        if !cs.volume.unique_indices.read().is_empty() {
+        if !Arc::ptr_eq(&volume.unique_indices, &cs.volume.unique_indices)
+            && !cs.volume.unique_indices.read().is_empty()
+        {
             *volume.unique_indices.write() = std::mem::take(&mut *cs.volume.unique_indices.write());
         }
         volume.inherit_row_order(&cs.volume);

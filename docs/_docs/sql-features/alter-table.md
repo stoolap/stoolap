@@ -77,6 +77,14 @@ All ALTER TABLE operations are recorded in the WAL and survive crash recovery:
 
 This means ALTER TABLE changes persist correctly even if the database crashes immediately after the operation.
 
+If recording an ADD, DROP, RENAME, or MODIFY COLUMN operation in the WAL fails, the engine restores the previous schema and frozen-volume mappings. Reads can continue against that schema. A WAL write or sync failure still requires closing and reopening the database before further writes.
+
+## Concurrent statements
+
+In a file database, a statement can return `SchemaChanged` if column DDL overlaps its capture of the schema and frozen-volume mappings. The engine rejects the mixed view instead of waiting for the ALTER to finish. A new statement can proceed after the ALTER completes.
+
+`SchemaChanged` is a public Rust error variant. The C API and drivers report it as a database error and do not automatically retry statements. Applications should coordinate column DDL with concurrent work and handle this error explicitly.
+
 ## Limitations
 
 - ALTER TABLE operations may temporarily block concurrent writes

@@ -2923,13 +2923,17 @@ impl MVCCEngine {
         self.record_ddl(name, WALOperationType::DropTable, &[])?;
 
         // Clear in-memory segment state
-        {
-            let mut mgrs = self.segment_managers.write().unwrap();
-            if let Some(mgr) = mgrs.get(&table_name) {
-                mgr.clear();
-            }
-            mgrs.remove(&table_name);
+        let mgr = self
+            .segment_managers
+            .read()
+            .unwrap()
+            .get(&table_name)
+            .cloned();
+        if let Some(mgr) = mgr {
+            mgr.clear();
+            mgr.persist()?;
         }
+        self.segment_managers.write().unwrap().remove(&table_name);
         // Delete volume files from disk
         if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
@@ -2972,6 +2976,7 @@ impl MVCCEngine {
         }
 
         let table_name_lower = table_name.to_lowercase();
+        let mut change = self.begin_column_change(table_name)?;
 
         // Validate under read lock first
         {
@@ -3001,6 +3006,7 @@ impl MVCCEngine {
                 vs_schema.add_column(col)?;
             }
         }
+        change.mark_changed();
 
         // Sync engine schema cache from version store
         {
@@ -3017,6 +3023,8 @@ impl MVCCEngine {
             }
         }
 
+        self.refresh_column_mappings(table_name);
+        change.finish();
         Ok(())
     }
 
@@ -3035,6 +3043,7 @@ impl MVCCEngine {
         }
 
         let table_name_lower = table_name.to_lowercase();
+        let mut change = self.begin_column_change(table_name)?;
 
         // Validate under read lock first
         {
@@ -3066,6 +3075,7 @@ impl MVCCEngine {
                 vs_schema.add_column(col)?;
             }
         }
+        change.mark_changed();
 
         // Sync engine schema cache from version store
         {
@@ -3082,6 +3092,8 @@ impl MVCCEngine {
             }
         }
 
+        self.refresh_column_mappings(table_name);
+        change.finish();
         Ok(())
     }
 
@@ -3181,6 +3193,9 @@ impl MVCCEngine {
             self.get_or_create_segment_manager(table_name)
                 .file_of(seg_id)
         });
+        if let Some(file) = &file {
+            file.remember(&volume);
+        }
         self.register_volume_with_id_and_seal_seq(
             table_name,
             volume,
@@ -3538,6 +3553,7 @@ impl MVCCEngine {
         }
 
         let table_name_lower = table_name.to_lowercase();
+        let mut change = self.begin_column_change(table_name)?;
 
         // Validate under read lock first
         {
@@ -3562,6 +3578,7 @@ impl MVCCEngine {
                 CompactArc::make_mut(&mut *vs_schema_guard).remove_column(column_name)?;
             }
         }
+        change.mark_changed();
 
         // Sync engine schema cache from version store
         {
@@ -3582,7 +3599,7 @@ impl MVCCEngine {
         // mask stale data. Same as the live DDL path in ddl.rs. Without this,
         // crash recovery (WAL replay) loses dropped_columns metadata.
         self.propagate_column_drop_inner(table_name, column_name, replayed_lsn);
-
+        change.finish();
         Ok(())
     }
 
@@ -3615,6 +3632,7 @@ impl MVCCEngine {
         }
 
         let table_name_lower = table_name.to_lowercase();
+        let mut change = self.begin_column_change(table_name)?;
 
         // Validate under read lock first
         {
@@ -3638,6 +3656,7 @@ impl MVCCEngine {
                 CompactArc::make_mut(&mut *vs_schema_guard).rename_column(old_name, new_name)?;
             }
         }
+        change.mark_changed();
 
         // Sync engine schema cache from version store
         {
@@ -3675,6 +3694,7 @@ impl MVCCEngine {
             }
         }
 
+        change.finish();
         Ok(())
     }
 
@@ -3683,6 +3703,48 @@ impl MVCCEngine {
     /// catalog, so replay applies the changes in the order they were made
     pub fn ddl_guard(&self) -> parking_lot::MutexGuard<'_, ()> {
         self.ddl_serial.lock()
+    }
+
+    pub(crate) fn begin_column_change(
+        &self,
+        table_name: &str,
+    ) -> Result<crate::storage::volume::manifest::ColumnSchemaChange> {
+        let name = to_lowercase_cow(table_name);
+        let mgr = if self.persistence.is_some() {
+            Some(self.get_or_create_segment_manager(name.as_ref()))
+        } else {
+            self.segment_managers
+                .read()
+                .map_err(|_| Error::internal("segment managers lock poisoned"))?
+                .get(name.as_ref())
+                .cloned()
+        };
+        match mgr {
+            Some(mgr) => mgr.begin_column_change(),
+            None => Ok(crate::storage::volume::manifest::ColumnSchemaChange::hot_only()),
+        }
+    }
+
+    pub(crate) fn refresh_column_mappings(&self, table_name: &str) {
+        let name = to_lowercase_cow(table_name);
+        let schema = self.schemas.read().unwrap().get(name.as_ref()).cloned();
+        if let Some(schema) = schema {
+            if let Some(mgr) = self.segment_managers.read().unwrap().get(name.as_ref()) {
+                mgr.invalidate_mappings(&schema);
+            }
+        }
+    }
+
+    pub(crate) fn restore_column_schema(
+        &self,
+        table_name: &str,
+        schema: CompactArc<Schema>,
+    ) -> Result<()> {
+        let store = self.get_version_store(table_name)?;
+        *store.schema_mut() = schema;
+        self.refresh_schema_cache(table_name)?;
+        self.refresh_column_mappings(table_name);
+        Ok(())
     }
 
     /// Order a table's sealed rows by `key` from the next seal on; the
@@ -3795,6 +3857,7 @@ impl MVCCEngine {
         }
 
         let table_name_lower = table_name.to_lowercase();
+        let mut change = self.begin_column_change(table_name)?;
 
         // Validate under read lock first
         {
@@ -3820,6 +3883,7 @@ impl MVCCEngine {
             }
         }
 
+        change.mark_changed();
         // Sync engine schema cache from version store
         {
             let vs_schema = {
@@ -3835,6 +3899,7 @@ impl MVCCEngine {
             }
         }
 
+        change.finish();
         Ok(())
     }
 
@@ -3853,6 +3918,7 @@ impl MVCCEngine {
         }
 
         let table_name_lower = table_name.to_lowercase();
+        let mut change = self.begin_column_change(table_name)?;
 
         // Validate under read lock first
         {
@@ -3879,6 +3945,7 @@ impl MVCCEngine {
             }
         }
 
+        change.mark_changed();
         // Sync engine schema cache from version store
         {
             let vs_schema = {
@@ -3894,6 +3961,7 @@ impl MVCCEngine {
             }
         }
 
+        change.finish();
         Ok(())
     }
 
@@ -5702,6 +5770,10 @@ impl MVCCEngine {
 
         for table_name in &tables_to_compact {
             let mgr = self.get_or_create_segment_manager(table_name);
+            let generation = mgr.schema_generation();
+            if generation & 1 != 0 {
+                continue;
+            }
             // The request is read before the schema: a key set between the
             // two opens a newer request, which this cycle cannot close
             let recluster_request = mgr.recluster_request();
@@ -5712,6 +5784,9 @@ impl MVCCEngine {
                     None => continue,
                 }
             };
+
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::maintenance_schema_taken();
 
             // Per-table snapshot gating: capture the current min snapshot begin_seq
             // for each table to close the TOCTOU window. A snapshot starting between
@@ -5933,6 +6008,23 @@ impl MVCCEngine {
                 (old_ids, Arc::new(vols), ts)
             };
 
+            let vol_mappings: Vec<_> = volumes
+                .iter()
+                .map(|(seg_id, _)| mgr.get_volume_mapping(*seg_id, &schema))
+                .collect();
+            let store = self
+                .version_stores
+                .read()
+                .map_err(|_| Error::internal("version stores lock poisoned"))?
+                .get(table_name)
+                .cloned();
+            let unique_columns = store
+                .map(|store| store.get_unique_non_pk_index_columns())
+                .unwrap_or_default();
+            if mgr.check_schema_generation(generation).is_err() {
+                continue;
+            }
+
             // Streaming compaction: iterate volumes newest-first, dedup by row_id,
             // collect only (row_id, volume_index, row_index) references, then sort
             // and stream into VolumeBuilder. This avoids materializing all Row objects
@@ -6036,12 +6128,6 @@ impl MVCCEngine {
                 .map(|c| c.persistence.volume_compression)
                 .unwrap_or(true);
 
-            // Precompute column mapping per volume (once each, not per row).
-            let vol_mappings: Vec<crate::storage::volume::writer::ColumnMapping> = volumes
-                .iter()
-                .map(|(seg_id, _vol)| mgr.get_volume_mapping(*seg_id, &schema))
-                .collect();
-
             // The merged volumes hold their rows in row id order, or in key
             // order for a clustered table, read through each volume's mapping
             // Inputs in the key's order merge, one row group of key columns
@@ -6134,15 +6220,6 @@ impl MVCCEngine {
                 crate::storage::volume::manifest::SegmentMeta,
             )> = Vec::new();
             let mut prepare_error: Option<Error> = None;
-            let store = self
-                .version_stores
-                .read()
-                .map_err(|_| Error::internal("version stores lock poisoned"))?
-                .get(table_name)
-                .cloned();
-            let unique_columns = store
-                .map(|store| store.get_unique_non_pk_index_columns())
-                .unwrap_or_default();
 
             // The rows move column by column in bounded batches, each
             // input read through its mapping, a warm input one row group
@@ -6420,25 +6497,26 @@ impl MVCCEngine {
                 .collect()
         };
 
-        // Step 3: Look up schemas (separate lock acquisition). The schema
-        // version is read under the same lock, so a volume built from
-        // these schemas carries the version they had, not a later one
-        let schemas = self.schemas.read().unwrap();
-        let sealed_schema_version = self.schema_epoch.load(Ordering::Acquire);
-        let table_names: Vec<(String, CompactArc<Schema>, Arc<VersionStore>, bool)> = candidates
-            .into_iter()
-            .filter_map(|(table_name, store, has_seg)| {
-                let schema = schemas.get(&table_name)?.clone();
-                Some((table_name, schema, store, has_seg))
-            })
-            .collect();
-        drop(schemas);
-
         // Batch size for hot removal only. Volume is built once per table.
         // Smaller batches = shorter write lock hold time per batch.
         const REMOVE_BATCH_SIZE: usize = 50_000;
 
-        for (table_name, schema, store, has_segments) in table_names {
+        for (table_name, store, has_segments) in candidates {
+            let mgr = self.get_or_create_segment_manager(&table_name);
+            let generation = mgr.schema_generation();
+            if generation & 1 != 0 {
+                continue;
+            }
+            let (schema, sealed_schema_version) = {
+                let schemas = self.schemas.read().unwrap();
+                match schemas.get(&table_name) {
+                    Some(schema) => (schema.clone(), self.schema_epoch.load(Ordering::Acquire)),
+                    None => continue,
+                }
+            };
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::maintenance_schema_taken();
+
             // Extract rows AND a CowBTree snapshot (O(1) Arc clone).
             // The snapshot records each row's txn_id at extraction time.
             // remove_sealed_rows compares against it to detect concurrent
@@ -6453,6 +6531,10 @@ impl MVCCEngine {
                 let read_txn_id = INVALID_TRANSACTION_ID + 1;
                 store.extract_for_seal(read_txn_id)
             };
+            let unique_columns = store.get_unique_non_pk_index_columns();
+            if mgr.check_schema_generation(generation).is_err() {
+                continue;
+            }
             // On close (force_seal_all), seal ALL rows regardless of threshold.
             if !self.force_seal_all.load(Ordering::Acquire) {
                 let threshold = if has_segments {
@@ -6513,19 +6595,21 @@ impl MVCCEngine {
             )?;
             // Each sealed volume's owner, before the fence: the registry
             // lock is global and must not be waited on under it
-            let sealed_files: Vec<Option<Arc<crate::storage::volume::writer::VolumeFile>>> =
+            let mut sealed_files: Vec<Option<Arc<crate::storage::volume::writer::VolumeFile>>> =
                 sealed_volumes
                     .iter()
                     .map(|(volume, path, _)| {
-                        Some(volume.file_owner().unwrap_or_else(|| {
+                        let file = volume.file_owner().unwrap_or_else(|| {
                             crate::storage::volume::writer::VolumeFile::shared(path)
-                        }))
+                        });
+                        file.remember(volume);
+                        Some(file)
                     })
                     .collect();
             // Pre-build unique hash indices BEFORE registration so the
             // first INSERT after seal doesn't pay a ~60ms stall scanning
             // all rows. Safe: volumes are not yet visible to other threads.
-            for (col_indices, _) in store.get_unique_non_pk_index_columns() {
+            for (col_indices, _) in unique_columns {
                 for (vol, _, _) in &sealed_volumes {
                     if let Err(error) = vol.prebuild_unique_index(&col_indices) {
                         for (_, path, _) in &sealed_volumes {
@@ -6535,8 +6619,6 @@ impl MVCCEngine {
                     }
                 }
             }
-            let mgr = self.get_or_create_segment_manager(&table_name);
-
             // Seal critical section under exclusive fence: register cold
             // segments + remove hot rows + remove hot index entries.
             // DML operations hold the shared fence, so they cannot race
@@ -6554,7 +6636,7 @@ impl MVCCEngine {
                     .map(|s| s as u64)
                     .unwrap_or_else(|| self.registry.get_current_sequence() as u64);
                 for ((volume, _path, volume_id), file) in
-                    sealed_volumes.iter().zip(sealed_files.iter())
+                    sealed_volumes.iter().zip(sealed_files.iter_mut())
                 {
                     self.register_volume_with_id_and_seal_seq(
                         &table_name,
@@ -6562,7 +6644,7 @@ impl MVCCEngine {
                         *volume_id,
                         current_seal_seq,
                         sealed_schema_version,
-                        file.clone(),
+                        file.take(),
                     );
                 }
 
@@ -6935,15 +7017,7 @@ impl Engine for MVCCEngine {
         // Recompute cold mappings with the post-add schema.
         // dropped_columns stays permanent — old volumes have stale data under
         // the dropped name, new volumes get the re-added column at a new position.
-        {
-            let schema = self.schemas.read().unwrap().get(table_name).cloned();
-            let mgrs = self.segment_managers.read().unwrap();
-            if let Some(mgr) = mgrs.get(table_name) {
-                if let Some(ref s) = schema {
-                    mgr.invalidate_mappings(s);
-                }
-            }
-        }
+        self.refresh_column_mappings(table_name);
 
         self.record_ddl(table_name, WALOperationType::AlterTable, &data)
     }
@@ -7684,8 +7758,6 @@ impl TransactionEngineOperations for EngineOperations {
             }
         };
 
-        let table = MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
-
         // A persistent database may seal rows at any moment, so its tables
         // always go through the segment-aware wrapper, even before the first
         // seal. Elsewhere the wrapper is only needed once segments exist.
@@ -7702,21 +7774,28 @@ impl TransactionEngineOperations for EngineOperations {
             let mgrs = self.segment_managers.read().unwrap();
             match mgrs.get(&*table_name_lower) {
                 Some(mgr) if mgr.has_segments() => Arc::clone(mgr),
-                _ => return Ok(Box::new(table)),
+                _ => {
+                    return Ok(Box::new(MVCCTable::new_with_shared_store(
+                        txn_id,
+                        version_store,
+                        txn_versions,
+                    )))
+                }
             }
         };
-        if self.registry.get_isolation_level(txn_id) == crate::IsolationLevel::SnapshotIsolation {
-            let begin_seq = self.registry.get_transaction_begin_sequence(txn_id) as u64;
-            return Ok(Box::new(
-                crate::storage::volume::table::SegmentedTable::with_snapshot_seq(
-                    Box::new(table),
-                    mgr,
-                    begin_seq,
-                ),
-            ));
-        }
+        let schema_generation = mgr.schema_generation();
+        let table = MVCCTable::new_with_shared_store(txn_id, version_store, txn_versions);
+        mgr.check_schema_generation(schema_generation)?;
+        let snapshot_seq = (self.registry.get_isolation_level(txn_id)
+            == crate::IsolationLevel::SnapshotIsolation)
+            .then(|| self.registry.get_transaction_begin_sequence(txn_id) as u64);
         Ok(Box::new(
-            crate::storage::volume::table::SegmentedTable::new(Box::new(table), mgr),
+            crate::storage::volume::table::SegmentedTable::from_captured_schema(
+                Box::new(table),
+                mgr,
+                snapshot_seq,
+                schema_generation,
+            ),
         ))
     }
 
@@ -7779,19 +7858,26 @@ impl TransactionEngineOperations for EngineOperations {
         if !self.should_skip_wal() {
             if let Some(ref pm) = *self.persistence() {
                 if pm.is_enabled() {
-                    let _ = pm.record_ddl_operation(name, WALOperationType::DropTable, &[]);
+                    pm.record_ddl_operation(name, WALOperationType::DropTable, &[])?;
                 }
             }
         }
 
         // Clear in-memory segment state (prevents phantom rows on re-create)
-        {
-            let mut mgrs = self.segment_managers.write().unwrap();
-            if let Some(mgr) = mgrs.get(&table_name_lower) {
-                mgr.clear();
-            }
-            mgrs.remove(&table_name_lower);
+        let mgr = self
+            .segment_managers
+            .read()
+            .unwrap()
+            .get(&table_name_lower)
+            .cloned();
+        if let Some(mgr) = mgr {
+            mgr.clear();
+            mgr.persist()?;
         }
+        self.segment_managers
+            .write()
+            .unwrap()
+            .remove(&table_name_lower);
 
         // Delete volume files from disk
         if let Some(ref pm) = *self.persistence() {
@@ -8953,6 +9039,28 @@ mod tests {
         let engine = MVCCEngine::in_memory();
         assert!(!engine.is_open());
         assert_eq!(engine.get_path(), "memory://");
+    }
+
+    #[test]
+    fn column_ddl_only_uses_an_existing_memory_segment_manager() {
+        let engine = MVCCEngine::in_memory();
+        engine.open_engine().unwrap();
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .build();
+        engine.create_table(schema).unwrap();
+        engine
+            .create_column("t", "v", DataType::Integer, true)
+            .unwrap();
+        assert!(engine.segment_managers.read().unwrap().is_empty());
+
+        let mgr = engine.get_or_create_segment_manager("t");
+        let before = mgr.schema_generation();
+        engine
+            .create_column("t", "w", DataType::Integer, true)
+            .unwrap();
+        assert_eq!(mgr.schema_generation(), before + 2);
+        engine.close_engine().unwrap();
     }
 
     #[test]

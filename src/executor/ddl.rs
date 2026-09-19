@@ -1002,6 +1002,8 @@ impl Executor {
                         None
                     };
 
+                    let mut change = self.engine.begin_column_change(table_name)?;
+                    let previous_schema = self.engine.get_table_schema(table_name)?;
                     table.create_column_with_default_value(
                         &col_def.name.value,
                         data_type,
@@ -1009,6 +1011,7 @@ impl Executor {
                         default_expr.clone(),
                         default_value,
                     )?;
+                    change.mark_changed();
 
                     // Refresh engine's schema cache from version store
                     // The table modified the version_store schema, but engine has a separate cache
@@ -1020,14 +1023,20 @@ impl Executor {
                     } else {
                         0
                     };
-                    self.engine.record_alter_table_add_column(
+                    if let Err(error) = self.engine.record_alter_table_add_column(
                         table_name,
                         &col_def.name.value,
                         data_type,
                         nullable,
                         default_expr.as_deref(),
                         vector_dimensions,
-                    )?;
+                    ) {
+                        self.engine
+                            .restore_column_schema(table_name, previous_schema)?;
+                        change.finish();
+                        return Err(error);
+                    }
+                    change.finish();
                 } else {
                     return Err(Error::InvalidArgument(
                         "ADD COLUMN requires column definition".to_string(),
@@ -1036,19 +1045,30 @@ impl Executor {
             }
             AlterTableOperation::DropColumn => {
                 if let Some(ref col_name) = stmt.column_name {
+                    let mut change = self.engine.begin_column_change(table_name)?;
+                    let previous_schema = self.engine.get_table_schema(table_name)?;
                     table.drop_column(&col_name.value)?;
+                    change.mark_changed();
 
                     // Refresh schema cache FIRST so invalidate_mappings sees the post-drop schema
                     self.engine.refresh_schema_cache(table_name)?;
 
                     // Record ALTER TABLE DROP COLUMN to WAL for persistence,
                     // before the manifest takes the drop with its log position
-                    self.engine
-                        .record_alter_table_drop_column(table_name, &col_name.value)?;
+                    if let Err(error) = self
+                        .engine
+                        .record_alter_table_drop_column(table_name, &col_name.value)
+                    {
+                        self.engine
+                            .restore_column_schema(table_name, previous_schema)?;
+                        change.finish();
+                        return Err(error);
+                    }
 
                     // Record column drop in manifest and recompute cold volume mappings
                     self.engine
                         .propagate_column_drop(table_name, &col_name.value);
+                    change.finish();
                 } else {
                     return Err(Error::InvalidArgument(
                         "DROP COLUMN requires column name".to_string(),
@@ -1057,18 +1077,26 @@ impl Executor {
             }
             AlterTableOperation::RenameColumn => match (&stmt.column_name, &stmt.new_column_name) {
                 (Some(old_name), Some(new_name)) => {
+                    let mut change = self.engine.begin_column_change(table_name)?;
+                    let previous_schema = self.engine.get_table_schema(table_name)?;
                     table.rename_column(&old_name.value, &new_name.value)?;
+                    change.mark_changed();
 
                     // Refresh schema cache FIRST so invalidate_mappings sees the renamed schema
                     self.engine.refresh_schema_cache(table_name)?;
 
                     // Record ALTER TABLE RENAME COLUMN to WAL for persistence,
                     // before the manifest takes the rename with its log position
-                    self.engine.record_alter_table_rename_column(
+                    if let Err(error) = self.engine.record_alter_table_rename_column(
                         table_name,
                         &old_name.value,
                         &new_name.value,
-                    )?;
+                    ) {
+                        self.engine
+                            .restore_column_schema(table_name, previous_schema)?;
+                        change.finish();
+                        return Err(error);
+                    }
 
                     // Propagate rename alias to cold volumes
                     self.engine.propagate_column_alias(
@@ -1076,6 +1104,7 @@ impl Executor {
                         &new_name.value,
                         &old_name.value,
                     );
+                    change.finish();
                 }
                 _ => {
                     return Err(Error::InvalidArgument(
@@ -1112,7 +1141,10 @@ impl Executor {
                         }
                     }
 
+                    let mut change = self.engine.begin_column_change(table_name)?;
+                    let previous_schema = self.engine.get_table_schema(table_name)?;
                     table.modify_column(&col_def.name.value, data_type, nullable)?;
+                    change.mark_changed();
 
                     // Refresh engine's schema cache from version store
                     self.engine.refresh_schema_cache(table_name)?;
@@ -1123,13 +1155,19 @@ impl Executor {
                     } else {
                         0
                     };
-                    self.engine.record_alter_table_modify_column(
+                    if let Err(error) = self.engine.record_alter_table_modify_column(
                         table_name,
                         &col_def.name.value,
                         data_type,
                         nullable,
                         vector_dimensions,
-                    )?;
+                    ) {
+                        self.engine
+                            .restore_column_schema(table_name, previous_schema)?;
+                        change.finish();
+                        return Err(error);
+                    }
+                    change.finish();
                 } else {
                     return Err(Error::InvalidArgument(
                         "MODIFY COLUMN requires column definition".to_string(),

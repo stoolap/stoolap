@@ -96,6 +96,22 @@ pub(crate) fn wal_swap_starting() {
 }
 
 thread_local! {
+    static MAINTENANCE_SCHEMA_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once after seal or compaction captures a table schema on this thread.
+pub fn after_maintenance_schema_taken(hook: impl FnOnce() + 'static) {
+    MAINTENANCE_SCHEMA_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn maintenance_schema_taken() {
+    let hook = MAINTENANCE_SCHEMA_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static COLD_VOLUMES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

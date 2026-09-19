@@ -42,6 +42,10 @@ pub enum Error {
     #[error("table closed")]
     TableClosed,
 
+    /// A read cannot combine schemas from different column DDL operations.
+    #[error("table '{table}' schema changed; retry the statement")]
+    SchemaChanged { table: String },
+
     /// Table column count mismatch
     #[error("table columns don't match, expected {expected}, got {got}")]
     TableColumnsNotMatch { expected: usize, got: usize },

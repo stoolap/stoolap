@@ -204,16 +204,14 @@ pub struct SegmentedTable {
     /// preserving the snapshot's point-in-time view of cold data.
     /// None for auto-commit transactions (all tombstones visible).
     snapshot_seq: Option<u64>,
+    schema_generation: u64,
 }
 
 impl SegmentedTable {
     /// Create a segmented table from a hot buffer and a segment manager.
     pub fn new(hot: Box<dyn Table>, segment_mgr: Arc<SegmentManager>) -> Self {
-        Self {
-            hot,
-            segment_mgr,
-            snapshot_seq: None,
-        }
+        let schema_generation = segment_mgr.schema_generation();
+        Self::from_captured_schema(hot, segment_mgr, None, schema_generation)
     }
 
     /// Create a segmented table with a snapshot sequence for snapshot isolation.
@@ -223,10 +221,21 @@ impl SegmentedTable {
         segment_mgr: Arc<SegmentManager>,
         snapshot_seq: u64,
     ) -> Self {
+        let schema_generation = segment_mgr.schema_generation();
+        Self::from_captured_schema(hot, segment_mgr, Some(snapshot_seq), schema_generation)
+    }
+
+    pub(crate) fn from_captured_schema(
+        hot: Box<dyn Table>,
+        segment_mgr: Arc<SegmentManager>,
+        snapshot_seq: Option<u64>,
+        schema_generation: u64,
+    ) -> Self {
         Self {
             hot,
             segment_mgr,
-            snapshot_seq: Some(snapshot_seq),
+            snapshot_seq,
+            schema_generation,
         }
     }
 
@@ -236,6 +245,7 @@ impl SegmentedTable {
             segment_mgr: Arc::new(SegmentManager::new("", None)),
             hot,
             snapshot_seq: None,
+            schema_generation: 0,
         }
     }
 
@@ -258,7 +268,7 @@ impl SegmentedTable {
         seg_id: u64,
     ) -> Result<Option<Arc<super::writer::FrozenVolume>>> {
         match view.file(seg_id) {
-            Some(handle) => self.segment_mgr.ensure_pinned_volume(seg_id, &handle),
+            Some(handle) => self.segment_mgr.ensure_pinned_volume(seg_id, handle),
             None => self.segment_mgr.ensure_volume(seg_id),
         }
     }
@@ -1290,24 +1300,26 @@ impl SegmentedTable {
             .map(|e| e.collect_comparisons())
             .unwrap_or_default();
 
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)?;
         // Capture once; load only volumes that survive metadata pruning.
         let view = self.segment_mgr.cold_snapshot();
-        let volumes = view.volumes();
-
-        if volumes.is_empty() {
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)?;
+        if view.seg_ids.is_empty() {
             return Ok(Vec::new());
         }
 
         // Committed tombstones are kept as a shared Arc (no clone).
-        let tombstones_arc = Arc::clone(&view.ts);
+        let tombstones_arc = &view.ts;
 
         // hot_skip is shared across all scanners via Arc — no clone per volume.
         let hot_skip_arc = Arc::new(hot_skip);
 
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-        let mut scanners_reverse: Vec<Box<dyn Scanner>> = Vec::with_capacity(volumes.len());
+        let mut scanners_reverse: Vec<Box<dyn Scanner>> = Vec::with_capacity(view.seg_ids.len());
 
-        for (seg_id, cs) in volumes.iter() {
+        for (seg_id, cs) in view.volumes() {
             let vol = &cs.volume;
             let (should_skip, start, end) =
                 Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
@@ -1318,7 +1330,7 @@ impl SegmentedTable {
             // Re-prune to get binary-search range narrowing on sorted columns.
             let loaded;
             let (vol, start, end) = if vol.is_cold() {
-                loaded = match self.load_volume_of_view(&view, *seg_id)? {
+                loaded = match self.load_volume_of_view(&view, seg_id)? {
                     Some(v) => v,
                     None => continue,
                 };
@@ -1343,13 +1355,15 @@ impl SegmentedTable {
             }?;
             // Each scanner gets the same small hot_skip Arc (no clone of hot IDs).
             // Inter-volume dedup is handled by the per-volume visibility bitmap.
-            scanner.set_skip_sets(Arc::clone(&tombstones_arc), Arc::clone(&hot_skip_arc));
+            scanner.set_skip_sets(Arc::clone(tombstones_arc), Arc::clone(&hot_skip_arc));
             scanner.set_visibility_bitmap(cs.visible.clone());
             scanner.snapshot_seq = self.snapshot_seq;
             let current_schema = self.hot.schema();
             // From the captured segment: a retired volume's mapping is no
             // longer in the live map, which answers with an identity one
-            scanner.set_column_mapping(cs.mapping.clone());
+            if !cs.mapping.is_identity || !cs.mapping.names.is_empty() {
+                scanner.set_column_mapping(cs.mapping.clone());
+            }
             if let Some(needed) = needed {
                 scanner.set_needed_cols(needed);
             }
@@ -1382,6 +1396,8 @@ impl SegmentedTable {
         where_expr: Option<&dyn Expression>,
         hot_skip: FxHashSet<i64>,
     ) -> Result<RowVec> {
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)?;
         // A filter evaluates by column position and rejects every row until
         // it is prepared for the schema; callers hand it over as written
         let prepared = where_expr.map(|expr| {
@@ -1396,20 +1412,21 @@ impl SegmentedTable {
 
         // Capture once; load only volumes that survive metadata pruning.
         let view = self.segment_mgr.cold_snapshot();
-        let volumes = view.volumes();
+        self.segment_mgr
+            .check_schema_generation(self.schema_generation)?;
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::cold_volumes_taken();
 
-        let tombstones_arc = Arc::clone(&view.ts);
+        let tombstones_arc = &view.ts;
 
-        let total: usize = volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
+        let total: usize = view.volumes().map(|(_, cs)| cs.volume.meta.row_count).sum();
         let mut rows = RowVec::with_capacity(total.min(64_000));
 
         // Pre-filter volumes using zone-map metadata BEFORE parallel dispatch.
         // This avoids rayon scheduling overhead for volumes that would be pruned.
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-        let mut pruned_volumes = Vec::with_capacity(volumes.len());
-        for volume in volumes.iter() {
+        let mut pruned_volumes = Vec::with_capacity(view.seg_ids.len());
+        for volume in view.volumes() {
             if comparisons.is_empty()
                 || !Self::prune_volume(
                     &volume.1.volume,
@@ -1423,11 +1440,11 @@ impl SegmentedTable {
             }
         }
         let hot_skip_ref = &hot_skip;
-        let tombstones_ref = &tombstones_arc;
+        let tombstones_ref = tombstones_arc;
 
         // Per-volume row collection closure. Returns Some(vol_rows) or None if pruned.
         let process_volume =
-            |(seg_id, cs): &(u64, super::manifest::ColdSegment)| -> Result<Option<RowVec>> {
+            |(seg_id, cs): &(u64, &super::manifest::ColdSegment)| -> Result<Option<RowVec>> {
                 let vol = &cs.volume;
                 let (should_skip, start, end) =
                     Self::prune_volume(vol, &cs.mapping, &comparisons, &bloom_hashes)?;
@@ -1481,7 +1498,7 @@ impl SegmentedTable {
                 }
 
                 // From the captured segment, not the live map
-                let mapping = cs.mapping.clone();
+                let mapping = &cs.mapping;
 
                 // The rows that pass the dictionary filters, found in one pass
                 // over the raw ids; None walks the whole range
@@ -1543,7 +1560,7 @@ impl SegmentedTable {
                         }
                     }
 
-                    let row = reader.row(i, &mapping)?;
+                    let row = reader.row(i, mapping)?;
                     if let Some(expr) = where_expr {
                         if !expr.evaluate_fast(&row) {
                             continue;
@@ -1566,18 +1583,18 @@ impl SegmentedTable {
                 use rayon::prelude::*;
                 pruned_volumes
                     .par_iter()
-                    .map(|v| process_volume(v))
+                    .map(&process_volume)
                     .collect::<Result<_>>()?
             } else {
                 pruned_volumes
                     .iter()
-                    .map(|v| process_volume(v))
+                    .map(process_volume)
                     .collect::<Result<_>>()?
             };
         #[cfg(not(feature = "parallel"))]
         let per_volume_rows: Vec<Option<RowVec>> = pruned_volumes
             .iter()
-            .map(|v| process_volume(v))
+            .map(process_volume)
             .collect::<Result<_>>()?;
 
         for vol_rows in per_volume_rows.into_iter().rev().flatten() {

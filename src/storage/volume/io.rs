@@ -518,7 +518,7 @@ pub fn load_all_volumes(dir: &Path, table_name: &str) -> Result<Vec<Arc<FrozenVo
 
 /// Delete a specific volume file from disk.
 pub fn delete_volume(path: &Path) -> Result<()> {
-    std::fs::remove_file(path).map_err(|e| {
+    super::writer::VolumeFile::retire_path(path).map_err(|e| {
         crate::core::Error::internal(format!("failed to delete volume {:?}: {}", path, e))
     })
 }

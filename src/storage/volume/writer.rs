@@ -56,6 +56,7 @@ pub struct VolumeFile {
     id: u64,
     path: parking_lot::RwLock<std::path::PathBuf>,
     retired: std::sync::atomic::AtomicBool,
+    loaded: parking_lot::Mutex<std::sync::Weak<FrozenVolume>>,
 }
 
 static NEXT_FILE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -70,22 +71,29 @@ struct VolumeFiles {
 
 static VOLUME_FILES: std::sync::LazyLock<parking_lot::Mutex<VolumeFiles>> =
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(VolumeFiles::default()));
+static FILE_CLEANED: parking_lot::Condvar = parking_lot::Condvar::new();
 
 impl VolumeFile {
     /// The handle of the file at `path`, the one every holder shares
     pub fn shared(path: &std::path::Path) -> Arc<VolumeFile> {
-        let mut registry = VOLUME_FILES.lock();
-        if let Some(file) = registry
-            .files
-            .get(path)
-            .and_then(|(_, file)| file.upgrade())
-        {
-            return file;
+        Self::shared_in(path, &mut VOLUME_FILES.lock())
+    }
+
+    fn shared_in(
+        path: &std::path::Path,
+        registry: &mut parking_lot::MutexGuard<'_, VolumeFiles>,
+    ) -> Arc<VolumeFile> {
+        while let Some((_, weak)) = registry.files.get(path) {
+            if let Some(file) = weak.upgrade() {
+                return file;
+            }
+            FILE_CLEANED.wait(registry);
         }
         let file = Arc::new(VolumeFile {
             id: NEXT_FILE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             path: parking_lot::RwLock::new(path.to_path_buf()),
             retired: std::sync::atomic::AtomicBool::new(false),
+            loaded: parking_lot::Mutex::new(std::sync::Weak::new()),
         });
         registry
             .files
@@ -102,6 +110,36 @@ impl VolumeFile {
     pub fn retire(&self) {
         self.retired
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn retire_path(path: &std::path::Path) -> std::io::Result<()> {
+        let mut registry = VOLUME_FILES.lock();
+        while let Some((_, weak)) = registry.files.get(path) {
+            if let Some(file) = weak.upgrade() {
+                file.retire();
+                drop(registry);
+                drop(file);
+                return Ok(());
+            }
+            FILE_CLEANED.wait(&mut registry);
+        }
+        std::fs::remove_file(path)
+    }
+
+    pub(crate) fn load(self: &Arc<Self>) -> Result<Arc<FrozenVolume>> {
+        let mut loaded = self.loaded.lock();
+        if let Some(volume) = loaded.upgrade() {
+            return Ok(volume);
+        }
+        let volume = Arc::new(super::io::read_volume_from_handle(self)?);
+        *loaded = Arc::downgrade(&volume);
+        Ok(volume)
+    }
+
+    pub(crate) fn remember(&self, volume: &Arc<FrozenVolume>) {
+        if !volume.is_cold() {
+            *self.loaded.lock() = Arc::downgrade(volume);
+        }
     }
 
     /// Opens the file at the path it is now, holding the path lock across
@@ -194,6 +232,7 @@ impl Drop for VolumeFile {
         if self.retired.load(std::sync::atomic::Ordering::Acquire) {
             let _ = std::fs::remove_file(&path);
         }
+        FILE_CLEANED.notify_all();
         drop(registry);
     }
 }
@@ -3697,6 +3736,33 @@ mod tests {
 
         drop(reader);
         assert!(!path.exists(), "the last holder's drop removes it");
+    }
+
+    #[test]
+    fn a_new_file_owner_waits_for_the_previous_owners_cleanup() {
+        for retired in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("v.vol");
+            std::fs::write(&path, b"old").unwrap();
+            let old = VolumeFile::shared(&path);
+            if retired {
+                old.retire();
+            }
+            let weak = Arc::downgrade(&old);
+            let mut registry = VOLUME_FILES.lock();
+            let dropping = std::thread::spawn(move || drop(old));
+            while weak.strong_count() != 0 {
+                std::thread::yield_now();
+            }
+            let new = VolumeFile::shared_in(&path, &mut registry);
+            let exists = path.exists();
+            std::fs::write(&path, b"new").unwrap();
+            drop(registry);
+            dropping.join().unwrap();
+            assert_eq!(exists, !retired);
+            assert_eq!(std::fs::read(&path).unwrap(), b"new");
+            drop(new);
+        }
     }
 
     #[test]
