@@ -48,6 +48,16 @@ fn expected() -> Vec<(i64, i64)> {
     (DELETED_UP_TO + 1..=ROWS).map(|id| (id, id % 7)).collect()
 }
 
+/// The decode cache is process-wide, so the tests here that read it, and the
+/// tests whose reads fill it, run one at a time whatever the runner does.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    SERIAL
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The volume files the table has on disk.
 fn vol_files(dir: &std::path::Path) -> std::collections::BTreeSet<String> {
     let mut names = std::collections::BTreeSet::new();
@@ -102,6 +112,7 @@ fn fixture(dir: &std::path::Path) -> Database {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_compaction_during_a_cold_read_does_not_restore_a_deleted_row() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = fixture(dir.path());
 
@@ -122,12 +133,133 @@ fn a_compaction_during_a_cold_read_does_not_restore_a_deleted_row() {
     );
 }
 
+/// A volume whose blocks are in RAM has no file-backed store to carry its
+/// file's lifetime, so the cleanup that retires it takes the branch that
+/// removes the file outright rather than the one a holder defers. A reader
+/// that pinned the file keeps it anyway, which is what the routing is for.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_retirement_of_a_memory_backed_volume_keeps_the_file_a_reader_holds() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=3",
+        dir.path().display()
+    );
+    let batch = |from: i64, count: i64| {
+        let mut values = String::new();
+        for id in from..from + count {
+            values.push_str(&format!("({id},{},1.0),", id % 7));
+        }
+        values.pop();
+        format!("INSERT INTO t (id, k, v) VALUES {values}")
+    };
+    let db = Database::open(&dsn).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, v REAL NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    // Resident volumes: nothing is evicted, so their blocks are in RAM when
+    // the compaction replaces them
+    for b in 0..3 {
+        db.execute(&batch(b * 1_000 + 1, 1_000), ()).unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+
+    let before = vol_files(dir.path());
+    assert_eq!(before.len(), 3, "the fixture's volumes are on disk");
+
+    let held = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
+    let kept = Arc::clone(&held);
+    let table_dir = dir.path().to_path_buf();
+    let other = db.clone();
+    stoolap::test_failpoints::after_cold_volumes_taken(move || {
+        other.execute(&batch(3_001, 1_000), ()).unwrap();
+        other.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        *kept.lock().unwrap() = vol_files(&table_dir);
+    });
+
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let table = tx.get_table("t").unwrap();
+    let rows = table.collect_all_rows(None).unwrap();
+    tx.rollback().unwrap();
+
+    assert_eq!(
+        rows.len(),
+        3_000,
+        "the reader answers its own three volumes"
+    );
+    let during = held.lock().unwrap().clone();
+    for name in &before {
+        assert!(
+            during.contains(name),
+            "{name} survives the cleanup that removes files outright"
+        );
+    }
+    assert!(
+        during.len() > before.len(),
+        "the compaction merged the volumes the reader holds"
+    );
+}
+
+/// A rename between the capture and the reload moves the directory the
+/// volume's file lives in. The reader reads through the handle it pinned,
+/// which moves with the directory.
+///
+/// This is a control, not a guard: it passes with the pin bypassed too,
+/// because the path a reader would resolve on its own is built from the
+/// manager's current table name and the rename updates that. What the pin
+/// adds is the window between resolving a path and opening it, which no test
+/// here can place a rename inside.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_rename_during_a_cold_read_does_not_break_the_reload() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, v REAL NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1,1,10.0),(2,1,20.0),(3,2,30.0)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let (volumes, cold) = db.engine().cold_volumes_for_test("t");
+    assert_eq!((volumes, cold), (1, 1), "the volume is metadata-only");
+
+    let other = db.clone();
+    stoolap::test_failpoints::after_cold_volumes_taken(move || {
+        other.execute("ALTER TABLE t RENAME TO t2", ()).unwrap();
+    });
+
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let table = tx.get_table("t").unwrap();
+    let rows = table.collect_all_rows(None).unwrap();
+    tx.rollback().unwrap();
+
+    assert_eq!(
+        ids_and_keys(&rows),
+        vec![(1, 1), (2, 1), (3, 2)],
+        "the reader reloads the volume the rename moved"
+    );
+}
+
 /// A metadata-only volume read twice. The first read installs what it loaded,
 /// so the second shares that volume rather than reading the file again, and
 /// the groups the first decoded come back from the cache instead of the disk.
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_second_read_of_a_metadata_only_volume_reuses_the_first() {
+    let _serial = serial();
     use stoolap::storage::volume::group_cache::DECODED_GROUPS;
 
     let dir = tempfile::tempdir().unwrap();
@@ -176,6 +308,7 @@ fn a_second_read_of_a_metadata_only_volume_reuses_the_first() {
 #[cfg(feature = "test-failpoints")]
 #[test]
 fn a_compaction_during_a_cold_read_does_not_lose_a_live_row() {
+    let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let dsn = format!(
         "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=3",

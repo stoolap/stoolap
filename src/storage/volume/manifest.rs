@@ -3094,31 +3094,44 @@ impl SegmentManager {
             Ok(Some(volume))
         };
 
-        // Fast path: already loaded (or another thread just loaded it)
-        {
-            let segs = self.segments.read();
+        // Where the segment stands, read without a guard outliving the look:
+        // a file read under the segments lock would hold it across every
+        // block of the volume
+        enum Stands {
+            Loaded(Arc<FrozenVolume>),
+            Cold,
+            Gone,
+        }
+        let look = |this: &Self| -> Stands {
+            let segs = this.segments.read();
             match segs.get(&seg_id) {
-                None => return load_dropped(self),
+                None => Stands::Gone,
                 Some(cs) if !cs.volume.is_cold() => {
                     cs.volume.mark_accessed();
-                    return Ok(Some(Arc::clone(&cs.volume)));
+                    Stands::Loaded(Arc::clone(&cs.volume))
                 }
-                Some(_) => {}
+                Some(_) => Stands::Cold,
             }
+        };
+
+        // Fast path: already loaded (or another thread just loaded it)
+        match look(self) {
+            Stands::Loaded(volume) => return Ok(Some(volume)),
+            Stands::Gone => return load_dropped(self),
+            Stands::Cold => {}
         }
         // Serialize reloads to prevent a concurrent stampede on one volume.
         // Second thread re-checks the fast path after acquiring the guard.
         let _guard = self.reloading.lock();
-        {
-            let segs = self.segments.read();
-            match segs.get(&seg_id) {
-                None => return load_dropped(self),
-                Some(cs) if !cs.volume.is_cold() => {
-                    cs.volume.mark_accessed();
-                    return Ok(Some(Arc::clone(&cs.volume)));
-                }
-                Some(_) => {}
+        match look(self) {
+            Stands::Loaded(volume) => return Ok(Some(volume)),
+            // The reload of a segment no longer in the map touches nothing
+            // the guard protects, so it goes without it
+            Stands::Gone => {
+                drop(_guard);
+                return load_dropped(self);
             }
+            Stands::Cold => {}
         }
         let volume = self
             .read_volume_for(seg_id, pinned)
