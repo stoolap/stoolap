@@ -33,7 +33,7 @@ pub mod transaction;
 
 // Re-export main traits
 pub use engine::Engine;
-pub use index_trait::Index;
+pub use index_trait::{CappedEqual, Index};
 pub use result::{EmptyResult, MemoryResult, QueryResult};
 pub use scanner::{EmptyScanner, Scanner, VecScanner};
 pub use table::{CapturedGroups, ScanPlan, Table};

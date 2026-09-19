@@ -19,6 +19,18 @@ use crate::common::I64Map;
 use crate::core::{DataType, IndexEntry, IndexType, Operator, Result, RowIdVec, Value};
 use crate::storage::expression::Expression;
 
+/// What a capped equality probe found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CappedEqual {
+    /// The index holds at most `max` row ids for the key, and they are in the
+    /// buffer. A key the index does not hold also lands here, with nothing
+    /// appended: an absent key is a complete answer.
+    Copied,
+    /// The index holds more than `max` row ids for the key, and nothing was
+    /// appended. A prefix is not an answer.
+    OverCap,
+}
+
 /// Index represents an abstract index for a column or set of columns
 ///
 /// This trait defines the interface for index operations including
@@ -211,6 +223,23 @@ pub trait Index: Send + Sync {
                 buffer.push(entry.row_id);
             }
         }
+    }
+
+    /// Appends row IDs for `values` when the index holds at most `max` of
+    /// them, and reports `OverCap` without appending anything when it holds
+    /// more. An absent key is a complete answer with nothing appended.
+    ///
+    /// `None` from an index that cannot answer a capped probe: the default
+    /// collects the whole entry list through `find`, which is the work the cap
+    /// exists to avoid.
+    fn get_row_ids_equal_capped_into(
+        &self,
+        values: &[Value],
+        max: usize,
+        buffer: &mut Vec<i64>,
+    ) -> Option<CappedEqual> {
+        let _ = (values, max, buffer);
+        None
     }
 
     /// Returns row IDs with values in the given range (convenience method)
