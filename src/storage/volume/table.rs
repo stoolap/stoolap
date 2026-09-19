@@ -1384,11 +1384,20 @@ impl SegmentedTable {
 
         // Lazy: no ensure_columns upfront. Prune on metadata first,
         // load cold volumes on demand after pruning.
-        let volumes = self.segment_mgr.get_volumes_newest_first_lazy();
+        // One view for the whole read: the volume order, the segment map and
+        // the committed tombstones come from the same manifest hold. Taken
+        // separately, a compaction landing in between consumes the tombstones
+        // of the rows it merged and the reader goes on without them.
+        let snapshot = self.segment_mgr.cold_snapshot();
+        let volumes: Vec<(u64, super::manifest::ColdSegment)> = snapshot
+            .seg_ids
+            .iter()
+            .filter_map(|&id| snapshot.segs.get(&id).map(|cs| (id, cs.clone())))
+            .collect();
         #[cfg(any(test, feature = "test-failpoints"))]
         crate::test_failpoints::cold_volumes_taken();
 
-        let tombstones_arc = self.segment_mgr.tombstone_set_arc();
+        let tombstones_arc = Arc::clone(&snapshot.ts);
 
         let total: usize = volumes.iter().map(|(_, cs)| cs.volume.meta.row_count).sum();
         let mut rows = RowVec::with_capacity(total.min(64_000));
