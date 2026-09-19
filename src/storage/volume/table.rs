@@ -34,7 +34,7 @@ use crate::core::{DataType, IndexType, Result, Row, RowVec, Schema, Value, Value
 use crate::storage::expression::Expression;
 use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
 use crate::storage::traits::table::ScanPlan;
-use crate::storage::traits::{Index, QueryResult, Scanner, Table};
+use crate::storage::traits::{CapturedGroups, Index, QueryResult, Scanner, Table};
 
 use super::manifest::SegmentManager;
 use super::scanner::{RowVecScanner, VolumeScanner};
@@ -249,6 +249,53 @@ impl SegmentedTable {
             return None;
         }
         Some(f(&*self.hot))
+    }
+
+    /// Groups of `index` in key order, up to `max_rows` rows and `max_bytes`
+    /// of keys and ids. A group that does not fit is left out whole, so what
+    /// comes back is a prefix of the index. None when the index is closed.
+    fn capture_groups(
+        index: &dyn Index,
+        max_rows: usize,
+        max_bytes: usize,
+    ) -> Result<Option<CapturedGroups>> {
+        let mut keys: Vec<Value> = Vec::new();
+        let mut ids: Vec<i64> = Vec::new();
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut bytes = 0usize;
+        let mut full = false;
+        let walked = index.for_each_group(&mut |key: &Value, row_ids: &[i64]| {
+            let cost = Self::capture_cost(key, row_ids.len());
+            if ids.len() + row_ids.len() > max_rows || bytes + cost > max_bytes {
+                full = true;
+                return Ok(false);
+            }
+            let start = ids.len();
+            ids.extend_from_slice(row_ids);
+            ranges.push((start, ids.len()));
+            keys.push(key.clone());
+            bytes += cost;
+            Ok(true)
+        });
+        match walked {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(e),
+            None => return Ok(None),
+        }
+        let mut capture = CapturedGroups::new(keys, ids, ranges);
+        if !full {
+            capture.mark_complete();
+        }
+        Ok(Some(capture))
+    }
+
+    /// What a group costs the capture: its key, and eight bytes per row id.
+    fn capture_cost(key: &Value, rows: usize) -> usize {
+        let key_bytes = match key {
+            Value::Text(text) => text.len(),
+            _ => std::mem::size_of::<Value>(),
+        };
+        key_bytes + rows * std::mem::size_of::<i64>()
     }
 
     /// Get the transaction ID for per-txn tombstone tracking.
@@ -4596,6 +4643,63 @@ impl Table for SegmentedTable {
     /// can move rows out of it at any moment, so it is never probed directly.
     fn lookup_index_on_column(&self, _column_name: &str) -> Option<Arc<dyn Index>> {
         None
+    }
+
+    fn walk_btree_groups(
+        &self,
+        column: &str,
+        max_rows: usize,
+        max_bytes: usize,
+        f: &mut dyn FnMut(&Value, &[i64]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        if self.snapshot_seq.is_some() {
+            return Ok(None);
+        }
+        // A volume would hold rows the hot index does not, so the capture
+        // stands only while the table holds none
+        if self.segment_mgr.has_segments() {
+            return Ok(None);
+        }
+        let Some(epoch) = self.hot.index_view_epoch() else {
+            return Ok(None);
+        };
+        let Some(index) = self.hot.get_index_on_column(column) else {
+            return Ok(None);
+        };
+        if index.index_type() != IndexType::BTree && index.index_type() != IndexType::PrimaryKey {
+            return Ok(None);
+        }
+
+        // No seal fence: a seal registers its volume before it removes a hot
+        // row, so a capture taken while the generation held saw every row hot,
+        // and one taken while it moved is dropped at the check below.
+        let generation = self.segment_mgr.seal_generation();
+        let Some(capture) = Self::capture_groups(&*index, max_rows, max_bytes)? else {
+            return Ok(None);
+        };
+
+        // The index lock is released before the caller fetches a row, so the
+        // walk waits on no seal and the seal waits on no walk
+        let mut stopped = false;
+        for (key, ids) in capture.groups() {
+            if !f(key, ids)? {
+                stopped = true;
+                break;
+            }
+        }
+
+        if self.segment_mgr.seal_generation() != generation || self.segment_mgr.has_segments() {
+            return Ok(None);
+        }
+        if self.hot.index_view_epoch() != Some(epoch) {
+            return Ok(None);
+        }
+        // A capture that ran out of room before the end of the index holds a
+        // prefix of it, which answers only if the caller stopped on its own
+        if !stopped && !capture.is_complete() {
+            return Ok(None);
+        }
+        Ok(Some(()))
     }
 
     fn get_index(&self, name: &str) -> Option<Arc<dyn Index>> {

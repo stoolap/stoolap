@@ -3175,6 +3175,37 @@ impl Table for MVCCTable {
         self.version_store.publish_epoch_if_quiet()
     }
 
+    fn walk_btree_groups(
+        &self,
+        column: &str,
+        _max_rows: usize,
+        _max_bytes: usize,
+        f: &mut dyn FnMut(&Value, &[i64]) -> Result<bool>,
+    ) -> Result<Option<()>> {
+        let Some(epoch) = self.index_view_epoch() else {
+            return Ok(None);
+        };
+        let Some(index) = self.get_index_on_column(column) else {
+            return Ok(None);
+        };
+        if index.index_type() != IndexType::BTree && index.index_type() != IndexType::PrimaryKey {
+            return Ok(None);
+        }
+        // No volume can ever move a row out of this table's index, so the walk
+        // reads it directly and the callback runs under the index lock
+        match index.for_each_group(f) {
+            Some(Ok(())) => {}
+            Some(Err(e)) => return Err(e),
+            None => return Ok(None),
+        }
+        // A commit publishes its index update before its versions become
+        // visible, so one that ran during the walk may have moved a key
+        if self.index_view_epoch() != Some(epoch) {
+            return Ok(None);
+        }
+        Ok(Some(()))
+    }
+
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
         let txn_versions = self.txn_versions.read().unwrap();
         txn_versions

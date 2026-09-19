@@ -134,6 +134,65 @@ fn a_snapshot_keeps_the_group_key_it_read() {
     db.execute("ROLLBACK", ()).unwrap();
 }
 
+/// Under `test-filedb` a `memory://` DSN is a file database, whose tables go
+/// through the segment wrapper. That wrapper cannot hand out its index, so it
+/// captures a prefix of it, and the answer must not change when a seal turns
+/// the rows that prefix described into volumes.
+#[cfg(feature = "test-filedb")]
+#[test]
+fn a_group_by_answers_the_same_before_and_after_a_seal() {
+    let db = seeded("seal_transition");
+    let before = groups(&db, "SELECT k, SUM(v) FROM t GROUP BY k LIMIT 10");
+    assert_eq!(value_for(&before, 1), 30.0);
+    assert_eq!(value_for(&before, 2), 30.0);
+
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let after = groups(&db, "SELECT k, SUM(v) FROM t GROUP BY k LIMIT 10");
+    assert_eq!(value_for(&after, 1), 30.0, "a sealed row is still grouped");
+    assert_eq!(value_for(&after, 2), 30.0);
+    let counts = groups(&db, "SELECT k, COUNT(*) FROM t GROUP BY k");
+    assert_eq!(value_for(&counts, 1), 2.0);
+    assert_eq!(value_for(&counts, 2), 1.0);
+}
+
+/// A table holding volumes captures a prefix of its index while the lock is
+/// held. A query that needs more groups than the prefix holds must fall back
+/// and still answer every group.
+///
+/// The HAVING clause is what puts the query on the streaming path: without
+/// one, storage-level aggregation answers it before this walk is reached.
+#[test]
+fn a_group_by_past_the_capture_bound_answers_every_group() {
+    let db = Database::open("memory://capture_bound").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, v REAL NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+
+    // 6,000 single-row groups: more groups than a capture holds rows, so the
+    // prefix runs out before the end of the index
+    for chunk in 0..10 {
+        let mut values = String::new();
+        for i in 0..600 {
+            let id = chunk * 600 + i + 1;
+            values.push_str(&format!("({id}, {id}, 1.0),"));
+        }
+        values.pop();
+        db.execute(&format!("INSERT INTO t (id, k, v) VALUES {values}"), ())
+            .unwrap();
+    }
+
+    let sums = groups(
+        &db,
+        "SELECT k, SUM(v) FROM t GROUP BY k HAVING SUM(v) > 0 LIMIT 100000",
+    );
+    assert_eq!(sums.len(), 6000, "every group is answered");
+    assert!(sums.iter().all(|(_, total)| *total == 1.0));
+}
+
 /// Without a local view to reconcile, the committed answer is unchanged.
 #[test]
 fn a_committed_group_by_counts_every_row() {
