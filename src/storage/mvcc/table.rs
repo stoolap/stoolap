@@ -42,6 +42,9 @@ pub struct MVCCTable {
     txn_versions: Arc<RwLock<TransactionVersionStore>>,
     /// Cached schema for returning references (Arc clone from version_store - O(1) instead of cloning)
     cached_schema: CompactArc<Schema>,
+    /// Scans that fell through to the full visible-row walk
+    #[cfg(test)]
+    full_scans: std::sync::atomic::AtomicU64,
 }
 
 /// Where a WHERE conjunction sits on a multi-column index: equalities on the
@@ -106,6 +109,8 @@ impl MVCCTable {
             txn_id,
             version_store,
             txn_versions: Arc::new(RwLock::new(txn_versions)),
+            #[cfg(test)]
+            full_scans: std::sync::atomic::AtomicU64::new(0),
             cached_schema,
         }
     }
@@ -123,6 +128,8 @@ impl MVCCTable {
             txn_id,
             version_store,
             txn_versions,
+            #[cfg(test)]
+            full_scans: std::sync::atomic::AtomicU64::new(0),
             cached_schema,
         }
     }
@@ -1006,12 +1013,23 @@ impl MVCCTable {
 
         match operator {
             Operator::Eq => {
+                let quiet = self.version_store.publish_epoch_if_quiet();
                 let row_ids = index.get_row_ids_equal(std::slice::from_ref(value));
-                if row_ids.is_empty() {
-                    None
-                } else {
-                    Some(row_ids)
+                if !row_ids.is_empty() {
+                    return Some(row_ids);
                 }
+                // An empty probe answers "no row" only while the index carries
+                // every key this statement can see: no local writes (they join
+                // the index at commit), no snapshot older than the keys the
+                // index holds (a commit moves a key out of it while the
+                // snapshot still sees the row under the old one), and no
+                // commit publishing meanwhile (it updates the index before
+                // its versions are visible). Otherwise the scan decides.
+                let settled = quiet.is_some()
+                    && self.version_store.publish_epoch_if_quiet() == quiet
+                    && !self.txn_versions.read().unwrap().has_local_changes()
+                    && !self.version_store.needs_snapshot_isolation(self.txn_id);
+                settled.then_some(row_ids)
             }
             Operator::Gt | Operator::Gte | Operator::Lt | Operator::Lte => {
                 // Use find_with_operator for range queries
@@ -1961,6 +1979,14 @@ impl MVCCTable {
         // when there are local changes
         drop(txn_versions);
         self.collect_visible_rows_with_limit(filter, limit, offset)
+    }
+}
+
+#[cfg(test)]
+impl MVCCTable {
+    /// Scans that walked every visible row instead of probing an index
+    pub(crate) fn full_scans(&self) -> u64 {
+        self.full_scans.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -2974,6 +3000,9 @@ impl Table for MVCCTable {
         }
 
         // Fall back to full scan - use MVCCScanner with RowVec for cache reuse
+        #[cfg(test)]
+        self.full_scans
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let rows = self.collect_visible_rows(where_expr);
         let scanner = MVCCScanner::from_rows(rows, schema, column_indices.to_vec());
         Ok(Box::new(scanner))
@@ -4736,6 +4765,91 @@ mod tests {
 
         assert!(!scanner.next());
         scanner.close().unwrap();
+    }
+
+    /// A table of `rows` committed rows with an index on `k`, read by a
+    /// later transaction of the same registry
+    fn indexed_table(rows: i64) -> (Arc<VersionStore>, MVCCTable) {
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("k", DataType::Integer, true, false)
+            .build();
+        let registry = Arc::new(crate::storage::mvcc::registry::TransactionRegistry::new());
+        let version_store = Arc::new(VersionStore::with_visibility_checker(
+            "t".to_string(),
+            schema,
+            Arc::clone(&registry)
+                as Arc<dyn crate::storage::mvcc::version_store::VisibilityChecker>,
+        ));
+        let (writer_txn, _) = registry.begin_transaction();
+        let mut writer = MVCCTable::new(
+            writer_txn,
+            Arc::clone(&version_store),
+            TransactionVersionStore::new(Arc::clone(&version_store), writer_txn),
+        );
+        writer.create_index("idx_k", &["k"], false).unwrap();
+        for i in 1..=rows {
+            writer
+                .insert(Row::from_values(vec![
+                    Value::Integer(i),
+                    Value::Integer(i * 10),
+                ]))
+                .unwrap();
+        }
+        writer.commit().unwrap();
+        registry.commit_transaction(writer_txn);
+        let (reader_txn, _) = registry.begin_transaction();
+        let reader = MVCCTable::new(
+            reader_txn,
+            Arc::clone(&version_store),
+            TransactionVersionStore::new(Arc::clone(&version_store), reader_txn),
+        );
+        (version_store, reader)
+    }
+
+    fn equals(table: &MVCCTable, k: i64) -> crate::storage::expression::ComparisonExpr {
+        let mut expr = crate::storage::expression::ComparisonExpr::new(
+            "k",
+            crate::core::Operator::Eq,
+            Value::Integer(k),
+        );
+        expr.prepare_for_schema(table.schema());
+        expr
+    }
+
+    #[test]
+    fn an_absent_key_is_answered_by_the_index_without_a_scan() {
+        let (_store, table) = indexed_table(100);
+        let mut scanner = table.scan(&[0, 1], Some(&equals(&table, 555))).unwrap();
+        assert!(!scanner.next());
+        assert_eq!(
+            table.full_scans(),
+            0,
+            "an empty probe must not fall through to a scan"
+        );
+        let mut scanner = table.scan(&[0, 1], Some(&equals(&table, 70))).unwrap();
+        assert!(scanner.next());
+        assert_eq!(scanner.row().get(0), Some(&Value::Integer(7)));
+        assert!(!scanner.next());
+        assert_eq!(table.full_scans(), 0);
+    }
+
+    #[test]
+    fn a_transaction_with_local_writes_scans_for_an_absent_key() {
+        let (_store, mut table) = indexed_table(100);
+        // A local row with the key the index lacks: the probe is not the
+        // whole truth, the scan finds the local row
+        table
+            .insert(Row::from_values(vec![
+                Value::Integer(1000),
+                Value::Integer(555),
+            ]))
+            .unwrap();
+        let mut scanner = table.scan(&[0, 1], Some(&equals(&table, 555))).unwrap();
+        assert!(scanner.next());
+        assert_eq!(scanner.row().get(0), Some(&Value::Integer(1000)));
+        assert!(!scanner.next());
+        assert_eq!(table.full_scans(), 1);
     }
 
     #[test]
