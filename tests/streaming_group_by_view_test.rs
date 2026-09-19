@@ -260,6 +260,92 @@ fn a_having_on_a_distinct_aggregate_falls_back() {
     assert_eq!(sums, vec![(2, 30.0)], "group 1 has a distinct sum of 10");
 }
 
+/// A truncate takes rows away in more than one step, and the generation only
+/// moves at the first of them. A walk that starts inside the interval reads
+/// the generation after that move and captures an index whose rows the
+/// truncate has already removed, so it must not answer.
+#[test]
+fn a_walk_started_inside_a_truncate_does_not_answer() {
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    use stoolap::storage::traits::Engine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!("file://{}?sync_mode=none", dir.path().display())).unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, v REAL NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1,1,10.0),(2,1,20.0),(3,2,30.0)", ())
+        .unwrap();
+
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let table = tx.get_table("t").unwrap();
+
+    // Hold every index the truncate will clear, so it stalls on whichever it
+    // reaches first instead of finishing: the order is not ours to assume
+    let mut releases = Vec::new();
+    let mut entered = Vec::new();
+    let mut blockers = Vec::new();
+    for column in ["id", "k"] {
+        let index = table.get_index_on_column(column).expect("an index");
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        releases.push(release_tx);
+        entered.push(entered_rx);
+        blockers.push(std::thread::spawn(move || {
+            index
+                .for_each_group(&mut |_, _| {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(false)
+                })
+                .expect("the index is open")
+                .expect("the index walk does not fail");
+        }));
+    }
+    for rx in &entered {
+        rx.recv().expect("the blocker holds its index");
+    }
+
+    let other = db.clone();
+    let truncator = std::thread::spawn(move || {
+        other.execute("TRUNCATE TABLE t", ()).unwrap();
+    });
+
+    // The row storage empties before the indexes do, so this is the state the
+    // walk must refuse to answer from
+    let store = db.engine().get_version_store("t").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while store.committed_row_count() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the truncate never cleared the row storage"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(store.committed_row_count(), 0);
+
+    let captured = table
+        .walk_btree_groups("k", 4096, 1024 * 1024, &mut |_, _| Ok(true))
+        .unwrap();
+    assert!(
+        captured.is_none(),
+        "a walk inside a truncate is not an answer"
+    );
+
+    for release in releases {
+        let _ = release.send(());
+    }
+    for blocker in blockers {
+        blocker.join().unwrap();
+    }
+    truncator.join().unwrap();
+    tx.rollback().unwrap();
+}
+
 /// A primary-key index collects and sorts its overflow ids before it calls
 /// back, so the capture's bounds would not bound that work.
 #[test]

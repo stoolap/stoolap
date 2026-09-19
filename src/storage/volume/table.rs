@@ -4658,6 +4658,11 @@ impl Table for SegmentedTable {
         if self.snapshot_seq.is_some() {
             return Ok(None);
         }
+        // Sampled before either check below. A publication that starts and
+        // finishes between them would move the generation and leave the
+        // counter at zero, so a capture read in that gap would be accepted
+        // afterwards at the generation it took.
+        let generation = self.segment_mgr.seal_generation();
         // A volume would hold rows the hot index does not, so the capture
         // stands only while the table holds none
         if self.segment_mgr.has_segments() {
@@ -4684,7 +4689,6 @@ impl Table for SegmentedTable {
         // No seal fence: a seal registers its volume before it removes a hot
         // row, so a capture taken while the generation held saw every row hot,
         // and one taken while it moved is dropped at the check below.
-        let generation = self.segment_mgr.seal_generation();
         let Some(capture) = Self::capture_groups(&*index, max_rows, max_bytes)? else {
             return Ok(None);
         };
