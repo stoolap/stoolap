@@ -130,6 +130,24 @@ pub(crate) fn cold_volumes_taken() {
 }
 
 thread_local! {
+    static HOT_ROWS_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread when its next unordered LIMIT read has taken its
+/// hot rows and not yet its cold volume list, so a test can seal inside that
+/// window.
+pub fn after_hot_rows_taken(hook: impl FnOnce() + 'static) {
+    HOT_ROWS_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn hot_rows_taken() {
+    let hook = HOT_ROWS_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static RENAME_MOVED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 
