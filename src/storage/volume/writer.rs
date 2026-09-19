@@ -488,6 +488,38 @@ impl CompressedBlockStore {
     /// store only as long as that reader holds the same handle.
     #[allow(clippy::too_many_arguments)]
     pub fn from_file(
+        path: std::path::PathBuf,
+        offsets: Vec<Vec<u64>>,
+        compressed_lens: Vec<Vec<usize>>,
+        decompressed_lens: Vec<Vec<usize>>,
+        col_type_tags: Vec<u8>,
+        col_data_types: Vec<DataType>,
+        col_ext_types: Vec<u8>,
+        shared_dict: Vec<SmartString>,
+        dict_ranges: Vec<(usize, usize, usize)>,
+        group_size: usize,
+        row_count: usize,
+    ) -> Self {
+        let file = VolumeFile::shared(&path);
+        Self::from_shared_file(
+            file,
+            offsets,
+            compressed_lens,
+            decompressed_lens,
+            col_type_tags,
+            col_data_types,
+            col_ext_types,
+            shared_dict,
+            dict_ranges,
+            group_size,
+            row_count,
+        )
+    }
+
+    /// The same, for a caller that already holds the file's handle: the store
+    /// takes that owner rather than minting a second one for the same path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_shared_file(
         file: std::sync::Arc<VolumeFile>,
         offsets: Vec<Vec<u64>>,
         compressed_lens: Vec<Vec<usize>>,

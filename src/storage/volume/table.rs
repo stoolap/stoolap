@@ -261,7 +261,7 @@ impl SegmentedTable {
         seg_id: u64,
     ) -> Result<Option<Arc<super::writer::FrozenVolume>>> {
         match view.file(seg_id) {
-            Some(handle) => self.segment_mgr.load_pinned_volume(seg_id, handle),
+            Some(handle) => self.segment_mgr.ensure_pinned_volume(seg_id, handle),
             None => self.segment_mgr.ensure_volume(seg_id),
         }
     }

@@ -474,7 +474,7 @@ impl VolumeFileWriter {
         }
         let column_types = meta.column_types.clone();
         let store = CompressedBlockStore::from_file(
-            super::writer::VolumeFile::shared(&self.final_path),
+            self.final_path.clone(),
             offsets,
             comp_lens,
             decomp_lens,

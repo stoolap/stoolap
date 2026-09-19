@@ -122,6 +122,50 @@ fn a_compaction_during_a_cold_read_does_not_restore_a_deleted_row() {
     );
 }
 
+/// A metadata-only volume read twice. The first read installs what it loaded,
+/// so the second shares that volume rather than reading the file again, and
+/// the groups the first decoded come back from the cache instead of the disk.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_second_read_of_a_metadata_only_volume_reuses_the_first() {
+    use stoolap::storage::volume::group_cache::DECODED_GROUPS;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0",
+        dir.path().display()
+    ))
+    .unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, v REAL NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    db.execute("INSERT INTO t VALUES (1,1,1.0),(2,2,2.0),(3,3,3.0)", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+
+    let (volumes, cold) = db.engine().cold_volumes_for_test("t");
+    assert_eq!((volumes, cold), (1, 1), "the volume is metadata-only");
+
+    let mut tx = db.engine().begin_transaction().unwrap();
+    let table = tx.get_table("t").unwrap();
+    let first = table.collect_all_rows(None).unwrap().len();
+    let after_first = DECODED_GROUPS.stats().misses;
+    let second = table.collect_all_rows(None).unwrap().len();
+    let after_second = DECODED_GROUPS.stats().misses;
+    tx.rollback().unwrap();
+
+    assert_eq!(first, 3, "the first read answers every row");
+    assert_eq!(second, 3, "and so does the second");
+    assert!(after_first > 0, "the first read decodes the volume");
+    assert_eq!(
+        after_second, after_first,
+        "the second read decodes nothing the first already had"
+    );
+}
+
 /// A compaction that retires a captured volume must not take its live rows
 /// with it. The volumes are metadata-only when the reader takes them, so they
 /// have to be reloaded from disk to be read at all, and that reload must not
@@ -171,7 +215,7 @@ fn a_compaction_during_a_cold_read_does_not_lose_a_live_row() {
     assert_eq!(before.len(), 3, "the fixture's volumes are on disk");
 
     let retired = Arc::new(AtomicUsize::new(usize::MAX));
-    let held = Arc::new(AtomicUsize::new(0));
+    let held = Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new()));
     let seen = Arc::clone(&retired);
     let kept = Arc::clone(&held);
     let table_dir = dir.path().to_path_buf();
@@ -180,9 +224,9 @@ fn a_compaction_during_a_cold_read_does_not_lose_a_live_row() {
         other.execute(&batch(3_001, 1_000), ()).unwrap();
         other.execute("PRAGMA CHECKPOINT", ()).unwrap();
         seen.store(other.engine().volume_stats().len(), Ordering::Relaxed);
-        // The reader holds this view, so the files it names must still be
-        // there: the merged volume is on top of them, not in place of them
-        kept.store(vol_files(&table_dir).len(), Ordering::Relaxed);
+        // The reader holds this view, so every file it names must still be
+        // there: the merged volume is added on top of them, not in place
+        *kept.lock().unwrap() = vol_files(&table_dir);
     });
 
     let mut tx = db.engine().begin_transaction().unwrap();
@@ -196,10 +240,13 @@ fn a_compaction_during_a_cold_read_does_not_lose_a_live_row() {
         retired.load(Ordering::Relaxed) < 3,
         "the compaction must retire the captured volumes for this test to guard anything"
     );
-    assert!(
-        held.load(Ordering::Relaxed) > before.len(),
-        "the files the reader holds survive the compaction that retired them"
-    );
+    let during = held.lock().unwrap().clone();
+    for name in &before {
+        assert!(
+            during.contains(name),
+            "{name} is the reader's to read until it lets go"
+        );
+    }
     // The reader is the last holder of the files it pinned, so the retired
     // ones go now that it has let go
     let after = vol_files(dir.path());

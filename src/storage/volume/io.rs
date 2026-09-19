@@ -431,7 +431,7 @@ fn read_volume_v4(
         }
         ranges
     };
-    let store = CompressedBlockStore::from_file(
+    let store = CompressedBlockStore::from_shared_file(
         handle,
         all_offsets,
         all_comp_lens,

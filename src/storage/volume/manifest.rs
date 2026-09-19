@@ -1046,29 +1046,6 @@ impl SegmentManager {
         ColdSnapshot { seg_ids, segs, ts }
     }
 
-    /// Loads the volume a reader pinned, through the handle it holds. The
-    /// segment may have left the manifest since; the handle still reads it.
-    /// A failed read is reported the way `ensure_volume` reports one, so a
-    /// caller has a single contract for a volume that will not load.
-    pub fn load_pinned_volume(
-        &self,
-        seg_id: u64,
-        handle: &Arc<super::writer::VolumeFile>,
-    ) -> crate::core::Result<Option<Arc<super::writer::FrozenVolume>>> {
-        match super::io::read_volume_from_handle(handle) {
-            Ok(volume) => Ok(Some(Arc::new(volume))),
-            Err(e) => Err(crate::core::Error::Internal {
-                message: format!(
-                    "table '{}': failed to reload cold volume seg={}: {}; \
-                     refusing to serve partial data",
-                    self.table_name.read(),
-                    seg_id,
-                    e
-                ),
-            }),
-        }
-    }
-
     /// A reader's cold view with the files taken too. The order matters: the
     /// reload guard keeps a rename's directory move out, the manifest hold
     /// keeps the segment set still, and only then is a path turned into a
@@ -3044,11 +3021,84 @@ impl SegmentManager {
     /// `Err` means the cold volume could not be reloaded and the caller
     /// must fail closed rather than serve partial data.
     pub fn ensure_volume(&self, seg_id: u64) -> crate::core::Result<Option<Arc<FrozenVolume>>> {
+        self.ensure_volume_inner(seg_id, None)
+    }
+
+    /// The same reload for a reader that pinned the segment's file. The
+    /// reader's handle is what reads it, so a segment the manifest has since
+    /// dropped still loads; that segment is not put back in the map, and the
+    /// next plain reload still finds it gone.
+    pub fn ensure_pinned_volume(
+        &self,
+        seg_id: u64,
+        handle: &Arc<super::writer::VolumeFile>,
+    ) -> crate::core::Result<Option<Arc<FrozenVolume>>> {
+        self.ensure_volume_inner(seg_id, Some(handle))
+    }
+
+    /// The volume's bytes: through the reader's handle when it has one, and
+    /// from the segment's own path otherwise.
+    fn read_volume_for(
+        &self,
+        seg_id: u64,
+        pinned: Option<&Arc<super::writer::VolumeFile>>,
+    ) -> crate::core::Result<Arc<FrozenVolume>> {
+        let volume = match pinned {
+            Some(handle) => super::io::read_volume_from_handle(handle)?,
+            None => {
+                let vol_dir =
+                    self.volume_dir
+                        .as_ref()
+                        .ok_or_else(|| crate::core::Error::Internal {
+                            message: format!(
+                            "table '{}': cold segment {} has no volume directory to reload from",
+                            self.table_name.read(),
+                            seg_id
+                        ),
+                        })?;
+                let filename = format!("vol_{:016x}.vol", seg_id);
+                let full_path = vol_dir.join(self.table_name.read().as_str()).join(filename);
+                super::io::read_volume_from_disk(&full_path)?
+            }
+        };
+        Ok(Arc::new(volume))
+    }
+
+    fn reload_error(&self, seg_id: u64, e: crate::core::Error) -> crate::core::Error {
+        crate::core::Error::Internal {
+            message: format!(
+                "table '{}': failed to reload cold volume seg={}: {}; \
+                 refusing to serve partial data",
+                self.table_name.read(),
+                seg_id,
+                e
+            ),
+        }
+    }
+
+    fn ensure_volume_inner(
+        &self,
+        seg_id: u64,
+        pinned: Option<&Arc<super::writer::VolumeFile>>,
+    ) -> crate::core::Result<Option<Arc<FrozenVolume>>> {
+        // A segment the manifest has dropped is still readable through a
+        // pinned handle, and stays out of the map
+        let load_dropped = |this: &Self| -> crate::core::Result<Option<Arc<FrozenVolume>>> {
+            let Some(handle) = pinned else {
+                return Ok(None);
+            };
+            let volume = this
+                .read_volume_for(seg_id, Some(handle))
+                .map_err(|e| this.reload_error(seg_id, e))?;
+            volume.mark_accessed();
+            Ok(Some(volume))
+        };
+
         // Fast path: already loaded (or another thread just loaded it)
         {
             let segs = self.segments.read();
             match segs.get(&seg_id) {
-                None => return Ok(None),
+                None => return load_dropped(self),
                 Some(cs) if !cs.volume.is_cold() => {
                     cs.volume.mark_accessed();
                     return Ok(Some(Arc::clone(&cs.volume)));
@@ -3056,13 +3106,13 @@ impl SegmentManager {
                 Some(_) => {}
             }
         }
-        // Serialize reloads — prevents concurrent stampede on the same volume.
+        // Serialize reloads to prevent a concurrent stampede on one volume.
         // Second thread re-checks the fast path after acquiring the guard.
         let _guard = self.reloading.lock();
         {
             let segs = self.segments.read();
             match segs.get(&seg_id) {
-                None => return Ok(None),
+                None => return load_dropped(self),
                 Some(cs) if !cs.volume.is_cold() => {
                     cs.volume.mark_accessed();
                     return Ok(Some(Arc::clone(&cs.volume)));
@@ -3070,38 +3120,17 @@ impl SegmentManager {
                 Some(_) => {}
             }
         }
-        let vol_dir = self
-            .volume_dir
-            .as_ref()
-            .ok_or_else(|| crate::core::Error::Internal {
-                message: format!(
-                    "table '{}': cold segment {} has no volume directory to reload from",
-                    self.table_name.read(),
-                    seg_id
-                ),
-            })?;
-        let filename = format!("vol_{:016x}.vol", seg_id);
-        let full_path = vol_dir.join(self.table_name.read().as_str()).join(filename);
-        let volume = match crate::storage::volume::io::read_volume_from_disk(&full_path) {
-            Ok(v) => Arc::new(v),
-            Err(e) => {
-                return Err(crate::core::Error::Internal {
-                    message: format!(
-                        "table '{}': failed to reload cold volume seg={}: {}; \
-                         refusing to serve partial data",
-                        self.table_name.read(),
-                        seg_id,
-                        e
-                    ),
-                });
-            }
-        };
+        let volume = self
+            .read_volume_for(seg_id, pinned)
+            .map_err(|e| self.reload_error(seg_id, e))?;
         volume.mark_accessed();
         let mut segments = self.segments.write();
         let mut new_map = (**segments).clone();
-        // Re-check: concurrent compaction may have removed the segment while
-        // we were reading from disk; the row then lives in a newer volume.
+        // A segment that left the manifest while the file was read: a pinned
+        // reader keeps what it read, and without one the caller is told, since
+        // the rows live in a newer volume now
         let cs = match new_map.get_mut(&seg_id) {
+            None if pinned.is_some() => return Ok(Some(volume)),
             None => return Ok(None),
             Some(cs) => cs,
         };
@@ -3109,6 +3138,9 @@ impl SegmentManager {
             *volume.unique_indices.write() = std::mem::take(&mut *cs.volume.unique_indices.write());
         }
         volume.inherit_row_order(&cs.volume);
+        // Put it back for everyone: the entry keeps its mapping and its
+        // visibility bitmap, and the next read shares this volume instead of
+        // reading the file again
         cs.volume = Arc::clone(&volume);
         let still_cold = new_map.values().any(|cs| cs.volume.is_cold());
         *segments = Arc::new(new_map);
