@@ -5459,9 +5459,6 @@ impl MVCCEngine {
         self.compact_volumes()
     }
 
-    /// Evict idle volume data to save memory. Volumes not accessed since the
-    /// last epoch transition: hot → warm (drop decompressed) → cold (drop compressed).
-    #[cfg(not(target_arch = "wasm32"))]
     /// Marks one table's volumes idle and evicts them to metadata-only, so a
     /// test can read through the reload path. The epochs are local: the
     /// global eviction epoch does not move, and nothing else in the process
@@ -5489,6 +5486,9 @@ impl MVCCEngine {
         )
     }
 
+    /// Evict idle volume data to save memory. Volumes not accessed since the
+    /// last epoch transition: hot → warm (drop decompressed) → cold (drop compressed).
+    #[cfg(not(target_arch = "wasm32"))]
     fn evict_idle_volumes(&self) {
         let epoch = self.eviction_epoch.fetch_add(1, Ordering::Relaxed) + 1;
         // Publish to global so scanners stamp volumes with the correct epoch.

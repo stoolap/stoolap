@@ -53,6 +53,13 @@ pub struct ColdSegment {
     /// only segment (all rows visible) or when there is no overlap.
     /// Arc so ColdSegment::clone() is O(1) — scanners share the same bitmap.
     pub visible: Option<Arc<Vec<u64>>>,
+    /// The handle of this volume's file, taken when the segment is
+    /// registered. A reader holds it with the segment, so a compaction that
+    /// retires the file cannot take it from the reader, and reading goes
+    /// through the handle rather than a path resolved per statement. The
+    /// registry moves the path inside it on a rename. None without a
+    /// volume directory, where there are no files.
+    pub file: Option<Arc<super::writer::VolumeFile>>,
 }
 
 impl ColdSegment {
@@ -84,13 +91,13 @@ pub struct PinnedColdView {
     pub seg_ids: smallvec::SmallVec<[u64; 4]>,
     pub segs: Arc<FxHashMap<u64, ColdSegment>>,
     pub ts: Arc<FxHashMap<i64, u64>>,
-    files: FxHashMap<u64, Arc<super::writer::VolumeFile>>,
 }
 
 impl PinnedColdView {
-    /// The handle of the file the volume `seg_id` reads from.
-    pub fn file(&self, seg_id: u64) -> Option<&Arc<super::writer::VolumeFile>> {
-        self.files.get(&seg_id)
+    /// The handle of the file the volume `seg_id` reads from. The captured
+    /// segment holds it, so it lives as long as this view does.
+    pub fn file(&self, seg_id: u64) -> Option<Arc<super::writer::VolumeFile>> {
+        self.segs.get(&seg_id)?.file.clone()
     }
 
     /// The volumes, newest first, as the reads below want them.
@@ -1046,49 +1053,28 @@ impl SegmentManager {
         ColdSnapshot { seg_ids, segs, ts }
     }
 
-    /// A reader's cold view with the files taken too. The order matters: the
-    /// reload guard keeps a rename's directory move out, the manifest hold
-    /// keeps the segment set still, and only then is a path turned into a
-    /// handle, so no handle is minted for a path being moved away from.
-    /// Reading the file is left to the caller, after the locks are released.
+    /// A reader's cold view: the one-hold snapshot, whose segments carry the
+    /// handles of their files. A read resolves nothing here, so it costs no
+    /// path building, no registry lookup and no reload guard.
     pub fn pinned_cold_view(&self) -> PinnedColdView {
-        let _reloading = self.reloading.lock();
-        let manifest = self.manifest.read();
-        let seg_ids: smallvec::SmallVec<[u64; 4]> = manifest
-            .segments
-            .iter()
-            .rev()
-            .map(|m| m.segment_id)
-            .collect();
-        let segs = Arc::clone(&*self.segments.read());
-        let ts = Arc::clone(&*self.tombstones.read());
-        let files = self.pin_volume_files(&seg_ids);
-        drop(manifest);
+        let snapshot = self.cold_snapshot();
         PinnedColdView {
-            seg_ids,
-            segs,
-            ts,
-            files,
+            seg_ids: snapshot.seg_ids,
+            segs: snapshot.segs,
+            ts: snapshot.ts,
         }
     }
 
-    /// The handle of each segment's file, resolved the way `ensure_volume`
+    /// The handle of a segment's file, resolved the way `ensure_volume`
     /// resolves it: the volume directory, the table's current name and the
-    /// segment id. A record's own `file_path` is not kept current.
-    fn pin_volume_files(&self, seg_ids: &[u64]) -> FxHashMap<u64, Arc<super::writer::VolumeFile>> {
-        let Some(dir) = self.volume_dir.as_ref() else {
-            return FxHashMap::default();
-        };
-        let table = self.table_name.read().clone();
-        seg_ids
-            .iter()
-            .map(|&id| {
-                let path = dir
-                    .join(table.as_str())
-                    .join(format!("vol_{:016x}.vol", id));
-                (id, super::writer::VolumeFile::shared(&path))
-            })
-            .collect()
+    /// segment id. A record's own `file_path` is not kept current. Taken
+    /// once, when the segment is registered.
+    fn file_of(&self, seg_id: u64) -> Option<Arc<super::writer::VolumeFile>> {
+        let dir = self.volume_dir.as_ref()?;
+        let path = dir
+            .join(self.table_name.read().as_str())
+            .join(format!("vol_{:016x}.vol", seg_id));
+        Some(super::writer::VolumeFile::shared(&path))
     }
 
     /// Check if a value exists using a pre-captured snapshot (no lock acquisition).
@@ -1858,6 +1844,7 @@ impl SegmentManager {
                 mapping,
                 schema_version: seg_schema_version,
                 visible: None,
+                file: self.file_of(segment_id),
             };
             let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
             let mut segments = self.segments.write();
@@ -1906,6 +1893,7 @@ impl SegmentManager {
                 volume,
                 schema_version,
                 visible: None,
+                file: self.file_of(segment_id),
             };
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
@@ -2880,6 +2868,7 @@ impl SegmentManager {
                         volume: Arc::clone(vol),
                         schema_version: meta.schema_version,
                         visible: None,
+                        file: self.file_of(*seg_id),
                     },
                 );
             }
@@ -2942,6 +2931,7 @@ impl SegmentManager {
                             volume: vol,
                             schema_version: seg_schema_version,
                             visible: None,
+                            file: self.file_of(seg_id),
                         },
                     );
                 }
