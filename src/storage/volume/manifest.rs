@@ -56,6 +56,10 @@ pub struct ColdSegment {
     /// Keeps the file alive for captured readers and follows table renames.
     /// Acquired before registration; absent for a database without files.
     pub file: Option<Arc<super::writer::VolumeFile>>,
+    /// The volume's secondary index side file, opened before registration
+    /// and released with the segment's last holder; absent for an
+    /// uncovered volume
+    pub side: Option<Arc<super::secondary::IndexFile>>,
 }
 
 impl ColdSegment {
@@ -590,6 +594,13 @@ fn compute_visibility_bitmaps(
         reusable_seen.clear();
     }
 }
+
+/// What an output owns before it is published: its file's handle and its
+/// side file
+type Owners = (
+    Option<Arc<super::writer::VolumeFile>>,
+    Option<Arc<super::secondary::IndexFile>>,
+);
 
 /// A publication built outside the locks: the segments it was built on,
 /// their manifest order then, and the map to swap in
@@ -1878,10 +1889,11 @@ impl SegmentManager {
         if let Some(file) = &file {
             file.remember(&volume);
         }
-        self.register_segment_with_owner(segment_id, volume, meta, schema, file);
+        self.register_segment_with_owner(segment_id, volume, meta, schema, file, None);
     }
 
-    /// Register with a prepared file owner; no path or registry lookup occurs.
+    /// Register with a prepared file owner and side file; no path or
+    /// registry lookup occurs.
     pub(crate) fn register_segment_with_owner(
         &self,
         segment_id: u64,
@@ -1889,6 +1901,7 @@ impl SegmentManager {
         meta: SegmentMeta,
         schema: Option<&crate::core::Schema>,
         file: Option<Arc<super::writer::VolumeFile>>,
+        side: Option<Arc<super::secondary::IndexFile>>,
     ) {
         // Both manifest and segments must be updated atomically under write locks.
         // The bitmap computation runs inside the critical section — this is safe
@@ -1908,6 +1921,7 @@ impl SegmentManager {
                 schema_version: seg_schema_version,
                 visible: None,
                 file,
+                side,
             };
             let seg_ids: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
             let mut segments = self.segments.write();
@@ -1933,6 +1947,7 @@ impl SegmentManager {
         &self,
         segment_id: u64,
         volume: Arc<FrozenVolume>,
+        side: Option<Arc<super::secondary::IndexFile>>,
     ) -> bool {
         let manifest = self.manifest.read();
         let seg_schema_version = manifest
@@ -1963,6 +1978,7 @@ impl SegmentManager {
                 schema_version,
                 visible: None,
                 file,
+                side,
             };
             let mut segments = self.segments.write();
             let mut new_map = (**segments).clone();
@@ -2878,22 +2894,25 @@ impl SegmentManager {
             vec![(new_segment_id, new_volume, new_meta)],
             old_segment_ids,
             schema,
+            Vec::new(),
         );
     }
 
-    /// Atomically replace old segments with multiple new ones.
+    /// Atomically replace old segments with multiple new ones, `sides`
+    /// the outputs' side files in their order, opened before this call.
     /// Used by compaction-with-split when the merged output exceeds target_volume_rows.
     pub fn replace_segments_atomic_multi(
         &self,
         new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
         old_segment_ids: &[u64],
         schema: Option<&crate::core::Schema>,
+        sides: Vec<Option<Arc<super::secondary::IndexFile>>>,
     ) {
         if new_volumes.is_empty() {
             self.replace_segments_atomic_remove_only(old_segment_ids);
             return;
         }
-        self.publish_with(new_volumes, old_segment_ids, schema, |_| {});
+        self.publish_with(new_volumes, old_segment_ids, schema, sides, |_| {});
     }
 
     /// The publication in its two steps, `between` run after the first
@@ -2903,9 +2922,10 @@ impl SegmentManager {
         new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
         old_segment_ids: &[u64],
         schema: Option<&crate::core::Schema>,
+        sides: Vec<Option<Arc<super::secondary::IndexFile>>>,
         between: impl FnOnce(&Self),
     ) -> bool {
-        let owners = self.output_owners(&new_volumes);
+        let owners = self.output_owners(&new_volumes, sides);
         let prepared = self.prepare_publication(&new_volumes, old_segment_ids, &owners);
         between(self);
         let fresh =
@@ -2917,12 +2937,14 @@ impl SegmentManager {
     }
 
     /// The handle of each output's file, taken once before the publication
-    /// locks: `file_of` takes the process-wide registry lock, which a writer
-    /// holding the seal fence must not wait on
+    /// locks, and its side file: `file_of` takes the process-wide registry
+    /// lock, which a writer holding the seal fence must not wait on
     fn output_owners(
         &self,
         new_volumes: &[(u64, Arc<FrozenVolume>, SegmentMeta)],
-    ) -> Vec<Option<Arc<super::writer::VolumeFile>>> {
+        sides: Vec<Option<Arc<super::secondary::IndexFile>>>,
+    ) -> Vec<Owners> {
+        let mut sides = sides.into_iter();
         new_volumes
             .iter()
             .map(|(seg_id, volume, _)| {
@@ -2930,7 +2952,7 @@ impl SegmentManager {
                 if let Some(file) = &file {
                     file.remember(volume);
                 }
-                file
+                (file, sides.next().flatten())
             })
             .collect()
     }
@@ -2943,7 +2965,7 @@ impl SegmentManager {
         &self,
         new_volumes: &[(u64, Arc<FrozenVolume>, SegmentMeta)],
         old_segment_ids: &[u64],
-        owners: &[Option<Arc<super::writer::VolumeFile>>],
+        owners: &[Owners],
     ) -> PreparedPublication {
         let (snapshot, order, mut map) = {
             let manifest = self.manifest.read();
@@ -2961,7 +2983,8 @@ impl SegmentManager {
                         volume: Arc::clone(vol),
                         schema_version: meta.schema_version,
                         visible: None,
-                        file: owner.clone(),
+                        file: owner.0.clone(),
+                        side: owner.1.clone(),
                     },
                 );
             }
@@ -2985,7 +3008,7 @@ impl SegmentManager {
         new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
         old_segment_ids: &[u64],
         schema: Option<&crate::core::Schema>,
-        owners: &[Option<Arc<super::writer::VolumeFile>>],
+        owners: &[Owners],
     ) -> bool {
         let mut manifest = self.manifest.write();
         let mut segments = self.segments.write();
@@ -3025,7 +3048,8 @@ impl SegmentManager {
                             volume: vol,
                             schema_version: seg_schema_version,
                             visible: None,
-                            file: owners[i].clone(),
+                            file: owners[i].0.clone(),
+                            side: owners[i].1.clone(),
                         },
                     );
                 }
@@ -3052,7 +3076,7 @@ impl SegmentManager {
     /// Atomically remove old segments without adding a replacement.
     /// Used when partial compaction finds all rows in merged volumes are tombstoned.
     pub fn replace_segments_atomic_remove_only(&self, old_segment_ids: &[u64]) {
-        self.publish_with(Vec::new(), old_segment_ids, None, |_| {});
+        self.publish_with(Vec::new(), old_segment_ids, None, Vec::new(), |_| {});
     }
 
     /// Get the manifest for reading (e.g., to iterate segment metadata).
@@ -3929,7 +3953,7 @@ mod tests {
         // it shares with C
         let c: Vec<i64> = (1..=70).collect();
         let outputs = vec![(3, volume_of(&c), meta_for_ids(3, &c))];
-        let owners = mgr.output_owners(&outputs);
+        let owners = mgr.output_owners(&outputs, Vec::new());
         let prepared = mgr.prepare_publication(&outputs, &[1], &owners);
         assert!(mgr.commit_publication(prepared, outputs, &[1], None, &owners));
         let order: Vec<u64> = mgr
@@ -3961,7 +3985,7 @@ mod tests {
         mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
         let c: Vec<i64> = (1..=70).collect();
         let outputs = vec![(3, volume_of(&c), meta_for_ids(3, &c))];
-        let owners = mgr.output_owners(&outputs);
+        let owners = mgr.output_owners(&outputs, Vec::new());
         let prepared = mgr.prepare_publication(&outputs, &[1], &owners);
         // A seal lands in between: D takes ids 2 and 130 from everyone below
         let d: Vec<i64> = vec![2, 130];
@@ -3992,7 +4016,7 @@ mod tests {
         // Every row of A is gone: the compaction publishes nothing, and a
         // seal lands between its two steps
         let b: Vec<i64> = vec![20, 21];
-        let fresh = mgr.publish_with(Vec::new(), &[1], None, |mgr| {
+        let fresh = mgr.publish_with(Vec::new(), &[1], None, Vec::new(), |mgr| {
             mgr.register_segment(2, volume_of(&b), meta_for_ids(2, &b), None);
         });
         assert!(!fresh);

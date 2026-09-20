@@ -54,14 +54,17 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
+use super::writer::VolumeFile;
+use crate::core::types::IndexType;
+
 const MAGIC: [u8; 4] = *b"STSX";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 const KEY_I64: u8 = 1;
 const HEADER_LEN: u64 = 16;
 const FOOTER_LEN: u64 = 20;
 const KEY_DIR_ENTRY: usize = 44;
 const POS_DIR_ENTRY: usize = 20;
-const COLUMN_ENTRY: usize = 29;
+const COLUMN_ENTRY: usize = 37;
 pub const SIDE_EXT: &str = "sidx";
 
 /// The byte bound of one page, header and checksum included.
@@ -104,11 +107,164 @@ fn invalid(msg: &str) -> std::io::Error {
     )
 }
 
+/// The error a refused reservation gives; `is_refused` names it. A caller
+/// answers it with its fallback, not as a failure.
+fn refused(what: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!("side index: the budget refused {what}"),
+    )
+}
+
+/// Whether an error is a budget's refusal
+pub fn is_refused(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+}
+
+/// The identity of an index definition a side file column is built under:
+/// the column's name, the index type and uniqueness, hashed the same way
+/// in every process. A column whose definition changed is not covered by
+/// a file built under the old one.
+pub fn definition_of(column_name: &str, index_type: IndexType, unique: bool) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut mix = |byte: u8| {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    };
+    for byte in column_name.bytes() {
+        mix(byte.to_ascii_lowercase());
+    }
+    mix(0);
+    mix(match index_type {
+        IndexType::Bitmap => 1,
+        IndexType::BTree => 2,
+        IndexType::Hash => 3,
+        IndexType::MultiColumn => 4,
+        IndexType::PrimaryKey => 5,
+        IndexType::Hnsw => 6,
+    });
+    mix(unique as u8);
+    hash
+}
+
 // =============================================================================
-// Accounting: one ledger for every byte the index holds
+// Accounting: three ledgers, pages, builds and directories
 // =============================================================================
 
-/// The process-wide ledger of index bytes and the page cache over it. The
+/// A process-wide ledger of bytes: atomics only, charged before the bytes
+/// are allocated and released when their owner drops.
+pub struct Ledger {
+    charged: AtomicUsize,
+    budget: AtomicU64,
+    /// The most bytes charged at once since the last reset
+    peak: AtomicUsize,
+    refused: AtomicU64,
+}
+
+/// A ledger's state, for `PRAGMA MEMORY_STATS`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LedgerStats {
+    pub budget_bytes: u64,
+    pub charged_bytes: usize,
+    pub peak_bytes: usize,
+    /// Charges refused by `try_charge`
+    pub refused: u64,
+}
+
+impl Ledger {
+    const fn new(budget: u64) -> Self {
+        Self {
+            charged: AtomicUsize::new(0),
+            budget: AtomicU64::new(budget),
+            peak: AtomicUsize::new(0),
+            refused: AtomicU64::new(0),
+        }
+    }
+
+    pub fn set_budget_bytes(&self, bytes: u64) {
+        self.budget.store(bytes, Ordering::Release);
+    }
+
+    pub fn stats(&self) -> LedgerStats {
+        LedgerStats {
+            budget_bytes: self.budget.load(Ordering::Acquire),
+            charged_bytes: self.charged.load(Ordering::Acquire),
+            peak_bytes: self.peak.load(Ordering::Acquire),
+            refused: self.refused.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn reset_peak(&self) {
+        self.peak
+            .store(self.charged.load(Ordering::Acquire), Ordering::Release);
+    }
+
+    /// Charges `bytes` whatever the budget: the ledger reports them
+    pub fn charge(&'static self, bytes: usize) -> Held {
+        let after = self.charged.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        self.peak.fetch_max(after, Ordering::AcqRel);
+        Held {
+            ledger: self,
+            bytes,
+        }
+    }
+
+    /// Charges `bytes` only if the budget takes them, else counts the
+    /// refusal; lowering the budget later never revokes what was granted
+    pub fn try_charge(&'static self, bytes: usize) -> Option<Held> {
+        let budget = self.budget.load(Ordering::Acquire);
+        let mut current = self.charged.load(Ordering::Acquire);
+        loop {
+            if (current + bytes) as u64 > budget {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            match self.charged.compare_exchange_weak(
+                current,
+                current + bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.peak.fetch_max(current + bytes, Ordering::AcqRel);
+                    return Some(Held {
+                        ledger: self,
+                        bytes,
+                    });
+                }
+                Err(now) => current = now,
+            }
+        }
+    }
+}
+
+/// Bytes charged to a ledger, released on drop.
+pub struct Held {
+    ledger: &'static Ledger,
+    bytes: usize,
+}
+
+impl Held {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.ledger.charged.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// The workspaces of the builds in flight: a build is admitted only when
+/// its whole workspace fits beside the others', else refused
+pub static INDEX_BUILDS: Ledger = Ledger::new(DEFAULT_BUILD_BUDGET_BYTES);
+
+/// The resident directories of every open side file: reported, never
+/// refused, since a directory is what makes a file usable at all
+pub static INDEX_DIRECTORIES: Ledger = Ledger::new(0);
+
+/// The process-wide ledger of page bytes and the page cache over it. The
 /// ledger is atomics; the one lock guards the cache's map and order, and
 /// nothing is dropped or reserved while it is held.
 pub struct IndexPages {
@@ -122,6 +278,7 @@ pub struct IndexPages {
     /// The most bytes charged at once since the last reset: a high-water
     /// mark taken at every charge, not a sample between calls
     peak: AtomicUsize,
+    refused: AtomicU64,
 }
 
 #[derive(Default)]
@@ -131,6 +288,7 @@ struct PageCache {
 }
 
 const DEFAULT_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_BUILD_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 
 pub static INDEX_PAGES: LazyLock<IndexPages> = LazyLock::new(|| IndexPages {
     charged: AtomicUsize::new(0),
@@ -141,6 +299,7 @@ pub static INDEX_PAGES: LazyLock<IndexPages> = LazyLock::new(|| IndexPages {
     hits: AtomicU64::new(0),
     evictions: AtomicU64::new(0),
     peak: AtomicUsize::new(0),
+    refused: AtomicU64::new(0),
 });
 
 /// A reservation of bytes in the ledger, released on drop. It grows when
@@ -188,6 +347,9 @@ pub struct IndexStats {
     pub over_budget: u64,
     /// The most bytes charged at once since `reset_peak`
     pub peak_bytes: usize,
+    /// Reservations refused by `try_reserve`: the budget could not take
+    /// them after every unheld page was evicted
+    pub refused: u64,
 }
 
 impl IndexPages {
@@ -214,6 +376,7 @@ impl IndexPages {
             evictions: self.evictions.load(Ordering::Relaxed),
             over_budget: self.over_budget.load(Ordering::Relaxed),
             peak_bytes: self.peak.load(Ordering::Acquire),
+            refused: self.refused.load(Ordering::Relaxed),
         }
     }
 
@@ -254,6 +417,34 @@ impl IndexPages {
         self.make_room(bytes);
         self.charge(bytes);
         Reservation { bytes }
+    }
+
+    /// Reserves `bytes` only if the budget takes them after every unheld
+    /// page was evicted, else counts the refusal. The read paths reserve
+    /// this way: a refused page or window sends the reader to its
+    /// fallback, and lowering the budget never revokes a holder.
+    pub fn try_reserve(&self, bytes: usize) -> Option<Reservation> {
+        self.make_room(bytes);
+        let budget = self.budget.load(Ordering::Acquire);
+        let mut current = self.charged.load(Ordering::Acquire);
+        loop {
+            if (current + bytes) as u64 > budget {
+                self.refused.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            match self.charged.compare_exchange_weak(
+                current,
+                current + bytes,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.peak.fetch_max(current + bytes, Ordering::AcqRel);
+                    return Some(Reservation { bytes });
+                }
+                Err(now) => current = now,
+            }
+        }
     }
 
     fn charge(&self, bytes: usize) {
@@ -387,7 +578,9 @@ impl Page {
     /// and released after the parse; the parsed vectors are reserved at
     /// their capacity before they are allocated and stay with the page.
     fn read(file: &IndexFile, kind: PageKind, offset: u64, len: u32) -> std::io::Result<Self> {
-        let raw_reservation = INDEX_PAGES.reserve(len as usize);
+        let raw_reservation = INDEX_PAGES
+            .try_reserve(len as usize)
+            .ok_or_else(|| refused("a page's raw bytes"))?;
         let raw = file.read_page(offset, len)?;
         if raw.len() < PAGE_OVERHEAD {
             return Err(invalid("page shorter than its header"));
@@ -405,7 +598,9 @@ impl Page {
                     return Err(invalid("key page length does not match its count"));
                 }
                 let bytes = n * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>());
-                let reservation = INDEX_PAGES.reserve(bytes);
+                let reservation = INDEX_PAGES
+                    .try_reserve(bytes)
+                    .ok_or_else(|| refused("a key page"))?;
                 let mut keys = Vec::with_capacity(n);
                 let mut ends = Vec::with_capacity(n);
                 for entry in entries.as_chunks::<KEY_ENTRY>().0 {
@@ -422,7 +617,9 @@ impl Page {
                     return Err(invalid("position page length does not match its count"));
                 }
                 let bytes = n * std::mem::size_of::<u32>();
-                let reservation = INDEX_PAGES.reserve(bytes);
+                let reservation = INDEX_PAGES
+                    .try_reserve(bytes)
+                    .ok_or_else(|| refused("a position page"))?;
                 let mut positions = Vec::with_capacity(n);
                 positions.extend(
                     entries
@@ -480,6 +677,8 @@ pub struct PosPageMeta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDirectory {
     pub column: u32,
+    /// The index definition the column was built under, `definition_of`
+    pub definition: u64,
     pub n_keys: u64,
     pub n_positions: u64,
     pub key_pages: Vec<KeyPageMeta>,
@@ -540,6 +739,7 @@ impl Directory {
         for c in &self.columns {
             out.extend_from_slice(&c.column.to_le_bytes());
             out.push(KEY_I64);
+            out.extend_from_slice(&c.definition.to_le_bytes());
             out.extend_from_slice(&c.n_keys.to_le_bytes());
             out.extend_from_slice(&c.n_positions.to_le_bytes());
             out.extend_from_slice(&(c.key_pages.len() as u32).to_le_bytes());
@@ -560,21 +760,17 @@ impl Directory {
         }
     }
 
-    /// Decodes the directory, reserving each column's vectors at their
-    /// capacity before they are allocated; the reservations come back
-    /// with it.
-    fn decode(
-        generation: u64,
-        data: &[u8],
-        file_len: u64,
-    ) -> std::io::Result<(Self, Vec<Reservation>)> {
+    /// Decodes the directory, charging each column's vectors at their
+    /// capacity to the directories ledger before they are allocated; the
+    /// charges come back with it.
+    fn decode(generation: u64, data: &[u8], file_len: u64) -> std::io::Result<(Self, Vec<Held>)> {
         let mut pos = 0usize;
         let count = read_u32(data, &mut pos)? as usize;
         if count > 4096 {
             return Err(invalid("too many columns"));
         }
-        let mut reservations = Vec::with_capacity(count + 1);
-        reservations.push(INDEX_PAGES.reserve(count * std::mem::size_of::<ColumnDirectory>()));
+        let mut charges = Vec::with_capacity(count + 1);
+        charges.push(INDEX_DIRECTORIES.charge(count * std::mem::size_of::<ColumnDirectory>()));
         let mut columns = Vec::with_capacity(count);
         for _ in 0..count {
             if data.len() < pos + COLUMN_ENTRY {
@@ -586,6 +782,7 @@ impl Directory {
             if tag != KEY_I64 {
                 return Err(invalid("key type unsupported"));
             }
+            let definition = read_u64(data, &mut pos)?;
             let n_keys = read_u64(data, &mut pos)?;
             let n_positions = read_u64(data, &mut pos)?;
             let key_pages = read_u32(data, &mut pos)? as usize;
@@ -593,7 +790,7 @@ impl Directory {
             if data.len() < pos + key_pages * KEY_DIR_ENTRY + pos_pages * POS_DIR_ENTRY {
                 return Err(invalid("directory shorter than its page counts"));
             }
-            reservations.push(INDEX_PAGES.reserve(
+            charges.push(INDEX_DIRECTORIES.charge(
                 key_pages * std::mem::size_of::<KeyPageMeta>()
                     + pos_pages * std::mem::size_of::<PosPageMeta>(),
             ));
@@ -643,6 +840,7 @@ impl Directory {
             }
             columns.push(ColumnDirectory {
                 column,
+                definition,
                 n_keys,
                 n_positions,
                 key_pages: kp,
@@ -657,7 +855,7 @@ impl Directory {
                 generation,
                 columns,
             },
-            reservations,
+            charges,
         ))
     }
 }
@@ -681,14 +879,15 @@ fn read_u32(data: &[u8], pos: &mut usize) -> std::io::Result<u32> {
 // =============================================================================
 
 /// A side file opened at one generation: its directory, resident and
-/// charged to the ledger for the file's life, and the path its pages are
-/// read from. No descriptor is held between reads; every page read checks
-/// the header's generation against the one the directory was read at.
+/// charged to the directories ledger for the file's life, and the handle
+/// its pages are read through. No descriptor is held between reads; every
+/// page read checks the header's generation against the one the directory
+/// was read at.
 pub struct IndexFile {
-    path: PathBuf,
+    file: Arc<VolumeFile>,
     file_id: u64,
     directory: Directory,
-    _reservations: Vec<Reservation>,
+    _charges: Vec<Held>,
 }
 
 /// An error a caller answers by reopening the file.
@@ -698,11 +897,20 @@ pub fn is_generation_changed(error: &std::io::Error) -> bool {
 }
 
 impl IndexFile {
-    /// Opens `path`, reading its header, footer and directory, and checks
-    /// their consistency. `file_id` distinguishes files in the page cache;
-    /// the volume file's owner id is the natural choice.
+    /// Opens `path` through the process's handle of it. `file_id`
+    /// distinguishes files in the page cache; the segment id is the
+    /// natural choice.
     pub fn open(path: &Path, file_id: u64) -> std::io::Result<Self> {
-        let mut file = std::fs::File::open(path)?;
+        Self::open_through(&VolumeFile::shared(path), file_id)
+    }
+
+    /// Opens the file through its handle, whose open holds the path lock
+    /// so a rename cannot land between the two, and reads the header,
+    /// footer and directory, checking their consistency. The file keeps
+    /// the handle: a page read opens through it, and the file on disk
+    /// goes with the last holder once retired.
+    pub fn open_through(handle: &Arc<VolumeFile>, file_id: u64) -> std::io::Result<Self> {
+        let mut file = handle.open()?;
         let file_len = file.metadata()?.len();
         if file_len < HEADER_LEN + FOOTER_LEN {
             return Err(invalid("file shorter than header and footer"));
@@ -729,20 +937,20 @@ impl IndexFile {
             return Err(invalid("directory location out of bounds"));
         }
         // The raw directory is charged while it is read and parsed
-        let raw_reservation = INDEX_PAGES.reserve(dir_len as usize);
+        let raw_charge = INDEX_DIRECTORIES.charge(dir_len as usize);
         let mut dir = vec![0u8; dir_len as usize];
         read_exact_at(&file, &mut dir, dir_offset)?;
         if crc32fast::hash(&dir) != dir_crc {
             return Err(invalid("directory checksum mismatch"));
         }
-        let (directory, reservations) = Directory::decode(generation, &dir, dir_offset)?;
+        let (directory, charges) = Directory::decode(generation, &dir, dir_offset)?;
         drop(dir);
-        drop(raw_reservation);
+        drop(raw_charge);
         Ok(Self {
-            path: path.to_path_buf(),
+            file: Arc::clone(handle),
             file_id,
             directory,
-            _reservations: reservations,
+            _charges: charges,
         })
     }
 
@@ -754,8 +962,20 @@ impl IndexFile {
         self.directory.generation
     }
 
+    /// The handle the pages are read through
+    pub fn handle(&self) -> &Arc<VolumeFile> {
+        &self.file
+    }
+
+    /// Whether the file indexes `column` under `definition`
+    pub fn covers(&self, column: usize, definition: u64) -> bool {
+        self.directory
+            .column(column)
+            .is_some_and(|c| c.definition == definition)
+    }
+
     fn read_page(&self, offset: u64, len: u32) -> std::io::Result<Vec<u8>> {
-        let file = std::fs::File::open(&self.path)?;
+        let file = self.file.open()?;
         let mut header = [0u8; HEADER_LEN as usize];
         read_exact_at(&file, &mut header, 0)?;
         if header[..4] != MAGIC {
@@ -878,10 +1098,17 @@ impl IndexFile {
     /// `column`, yielding them in windows of at most `window` positions,
     /// each window sorted ascending; the window is the cursor's whole
     /// workspace, reserved before it is allocated, for the cursor's life.
-    pub fn cursor(&self, column: usize, range: (u64, u64), window: usize) -> Cursor<'_> {
+    pub fn cursor(
+        &self,
+        column: usize,
+        range: (u64, u64),
+        window: usize,
+    ) -> std::io::Result<Cursor<'_>> {
         let window = window.max(1);
-        let reservation = INDEX_PAGES.reserve(window * POS_ENTRY);
-        Cursor {
+        let reservation = INDEX_PAGES
+            .try_reserve(window * POS_ENTRY)
+            .ok_or_else(|| refused("a cursor window"))?;
+        Ok(Cursor {
             file: self,
             column,
             next: range.0,
@@ -889,7 +1116,7 @@ impl IndexFile {
             window,
             buffer: Vec::with_capacity(window),
             _reservation: reservation,
-        }
+        })
     }
 }
 
@@ -1004,6 +1231,8 @@ pub struct BuildReport {
 /// build, and a hint avoids the failure.
 pub struct ColumnInput<'a> {
     pub column: u32,
+    /// The index definition the column is built under, `definition_of`
+    pub definition: u64,
     pub pairs: Box<dyn Iterator<Item = (u32, i64)> + 'a>,
 }
 
@@ -1075,9 +1304,9 @@ fn workspace_exceeded(what: &str, bytes: usize, used: usize, workspace: usize) -
 }
 
 /// The build's own ledger over its workspace: every byte the build holds
-/// is taken here before it is allocated and mirrored in the process
-/// ledger, and a take the workspace cannot hold fails the build. This is
-/// the build's bound; the process ledger is accounting.
+/// is taken here before it is allocated, and a take the workspace cannot
+/// hold fails the build. The workspace itself is admitted whole to the
+/// builds ledger before the build starts.
 struct Budget {
     workspace: usize,
     used: std::cell::Cell<usize>,
@@ -1107,7 +1336,6 @@ impl Budget {
         Ok(Charge {
             bytes,
             budget: self,
-            global: INDEX_PAGES.reserve(bytes),
         })
     }
 }
@@ -1116,7 +1344,6 @@ impl Budget {
 struct Charge<'b> {
     bytes: usize,
     budget: &'b Budget,
-    global: Reservation,
 }
 
 impl Charge<'_> {
@@ -1129,7 +1356,6 @@ impl Charge<'_> {
         self.budget
             .peak
             .set(self.budget.peak.get().max(used + more));
-        self.global.grow(more);
         self.bytes += more;
         Ok(())
     }
@@ -1346,7 +1572,9 @@ impl<'t> Runs<'t> {
 /// merged upward as they accumulate, in a fan-in the workspace and a
 /// descriptor ceiling bound. Written whole to a temporary file and renamed
 /// into place, with its generation in the header; a failure at any step
-/// removes the files the build created and keeps what was published.
+/// removes the files the build created and keeps what was published. The
+/// workspace is admitted whole to the builds ledger first, and a build
+/// the ledger refuses (`is_refused`) creates nothing.
 pub fn build_side_file(
     path: &Path,
     generation: u64,
@@ -1361,6 +1589,9 @@ pub fn build_side_file(
             ),
         ));
     }
+    let _admitted = INDEX_BUILDS
+        .try_charge(workspace_bytes)
+        .ok_or_else(|| refused("a build workspace"))?;
     let started = std::time::Instant::now();
     let budget = Budget::new(workspace_bytes);
     let mut report = BuildReport::default();
@@ -1444,7 +1675,7 @@ pub fn build_side_file(
             pairs.push((key, pos));
         }
         pairs.sort_unstable();
-        let mut writer = PageWriter::new(&mut out, offset, input.column, &budget);
+        let mut writer = PageWriter::new(&mut out, offset, input.column, input.definition, &budget);
         if runs.live == 0 {
             for &(key, pos) in &pairs {
                 writer.push(key, pos)?;
@@ -1496,8 +1727,10 @@ pub fn build_side_file(
     drop(file);
     std::fs::rename(&tmp, path)?;
     temps.finished();
+    // Each owner before the charge that backs it
     drop(dir);
     drop(dir_charge);
+    drop(directory);
     drop(meta_charges);
     drop(per_column);
     drop(fixed);
@@ -1618,6 +1851,7 @@ struct PageWriter<'a, 'b, W: Write> {
     out: &'a mut W,
     offset: u64,
     column: u32,
+    definition: u64,
     key_page: Vec<(i64, u64)>,
     key_page_first_key_index: u64,
     key_page_pos_start: u64,
@@ -1633,11 +1867,12 @@ struct PageWriter<'a, 'b, W: Write> {
 }
 
 impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
-    fn new(out: &'a mut W, offset: u64, column: u32, budget: &'b Budget) -> Self {
+    fn new(out: &'a mut W, offset: u64, column: u32, definition: u64, budget: &'b Budget) -> Self {
         Self {
             out,
             offset,
             column,
+            definition,
             key_page: Vec::with_capacity(KEYS_PER_PAGE),
             key_page_first_key_index: 0,
             key_page_pos_start: 0,
@@ -1646,11 +1881,7 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
             body: Vec::with_capacity(PAGE_BYTES),
             key_pages: Vec::new(),
             pos_pages: Vec::new(),
-            metas: Charge {
-                bytes: 0,
-                budget,
-                global: INDEX_PAGES.reserve(0),
-            },
+            metas: Charge { bytes: 0, budget },
             current: None,
             n_keys: 0,
             n_positions: 0,
@@ -1775,22 +2006,255 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
         self.flush_key_page()?;
         let column = ColumnDirectory {
             column: self.column,
+            definition: self.definition,
             n_keys: self.n_keys,
             n_positions: self.n_positions,
             key_pages: std::mem::take(&mut self.key_pages),
             pos_pages: std::mem::take(&mut self.pos_pages),
         };
         let budget = self.metas.budget;
-        let metas = std::mem::replace(
-            &mut self.metas,
-            Charge {
-                bytes: 0,
-                budget,
-                global: INDEX_PAGES.reserve(0),
-            },
-        );
+        let metas = std::mem::replace(&mut self.metas, Charge { bytes: 0, budget });
         Ok((column, self.offset, metas))
     }
+}
+
+// =============================================================================
+// The engine's side files: built with a volume, opened with it, retired
+// with it
+// =============================================================================
+
+/// Builds that failed with an I/O error, apart from those the budget refused
+pub static BUILDS_FAILED: AtomicU64 = AtomicU64::new(0);
+/// Side files built and then discarded because the index definitions
+/// changed before the volume was published
+pub static SIDES_DISCARDED: AtomicU64 = AtomicU64::new(0);
+
+/// The share of the builds budget one build of the engine takes at most
+const BUILD_SHARE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The workspace one build of the engine takes: its share of the builds
+/// budget, and at least what `rows` rows of `columns` columns need
+pub fn workspace_for(rows: usize, columns: usize) -> usize {
+    let least = MIN_WORKSPACE_BYTES + columns * (metadata_allowance(rows) + COLUMN_SLOT_BYTES);
+    let share = (INDEX_BUILDS.stats().budget_bytes as usize).min(BUILD_SHARE_BYTES);
+    share.max(least)
+}
+
+fn integer_keys(data: &super::column::ColumnData) -> Option<(&[i64], &[bool])> {
+    match data {
+        super::column::ColumnData::Int64 { values, nulls }
+        | super::column::ColumnData::TimestampNanos { values, nulls } => Some((values, nulls)),
+        _ => None,
+    }
+}
+
+/// The `(position, key)` pairs of an integer or timestamp column of
+/// `volume`, null rows left out: a column already decoded is read in
+/// place, else one row group at a time through the group cache. A decode
+/// or type error ends the pairs and is left in `failure`, so the build's
+/// caller can tell a short input from a complete one.
+fn volume_pairs<'a>(
+    volume: &'a super::writer::FrozenVolume,
+    column: usize,
+    failure: &'a std::cell::Cell<Option<std::io::Error>>,
+) -> impl Iterator<Item = (u32, i64)> + 'a {
+    let rows = volume.meta.row_count;
+    let fail = move |what: &str| {
+        failure.set(Some(invalid(what)));
+        None
+    };
+    let pairs: Box<dyn Iterator<Item = (u32, i64)> + 'a> = match volume.columns.resident(column) {
+        Some(data) => match integer_keys(data) {
+            Some((values, nulls)) => Box::new(
+                (0..rows.min(values.len()))
+                    .filter(move |&i| !nulls.get(i).copied().unwrap_or(false))
+                    .map(move |i| (i as u32, values[i])),
+            ),
+            None => Box::new(std::iter::from_fn(move || fail("column is not indexable"))),
+        },
+        None => match volume.columns.compressed_store() {
+            None => Box::new(std::iter::from_fn(move || {
+                fail("column data is not loaded")
+            })),
+            Some(store) => Box::new(GroupPairs {
+                store,
+                column,
+                rows,
+                group_size: store.group_size().max(1),
+                current: None,
+                next: 0,
+                failure,
+            }),
+        },
+    };
+    Bounded { pairs, rows }
+}
+
+/// The pairs of a column still in its compressed form, holding one
+/// decoded group at a time
+struct GroupPairs<'a> {
+    store: &'a super::writer::CompressedBlockStore,
+    column: usize,
+    rows: usize,
+    group_size: usize,
+    current: Option<(usize, Arc<super::column::ColumnData>)>,
+    next: usize,
+    failure: &'a std::cell::Cell<Option<std::io::Error>>,
+}
+
+impl Iterator for GroupPairs<'_> {
+    type Item = (u32, i64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.next < self.rows {
+            let group = self.next / self.group_size;
+            if self.current.as_ref().is_none_or(|(g, _)| *g != group) {
+                match self.store.group_column(self.column, group) {
+                    Ok(decoded) => self.current = Some((group, decoded)),
+                    Err(error) => {
+                        self.failure.set(Some(error));
+                        self.next = self.rows;
+                        return None;
+                    }
+                }
+            }
+            let position = self.next;
+            self.next += 1;
+            let decoded = &self.current.as_ref()?.1;
+            let Some((values, nulls)) = integer_keys(decoded) else {
+                self.failure.set(Some(invalid("column is not indexable")));
+                self.next = self.rows;
+                return None;
+            };
+            let i = position - group * self.group_size;
+            if nulls.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let Some(&key) = values.get(i) else {
+                self.failure
+                    .set(Some(invalid("row group shorter than its rows")));
+                self.next = self.rows;
+                return None;
+            };
+            return Some((position as u32, key));
+        }
+        None
+    }
+}
+
+/// An iterator with the volume's row count as its upper size bound, so a
+/// build reserves the page metadata it needs rather than a quarter of its
+/// workspace
+struct Bounded<'a> {
+    pairs: Box<dyn Iterator<Item = (u32, i64)> + 'a>,
+    rows: usize,
+}
+
+impl Iterator for Bounded<'_> {
+    type Item = (u32, i64);
+    fn next(&mut self) -> Option<Self::Item> {
+        self.pairs.next()
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.rows))
+    }
+}
+
+/// Builds the side file of the volume at `volume_path` for `definitions`,
+/// each a physical column and the definition it is indexed under, and
+/// opens it. None leaves the volume uncovered: no definitions, a build
+/// the budget refused (counted by the ledger), or a build that failed
+/// (counted in `BUILDS_FAILED`); every outcome but the first is logged,
+/// and a failed build leaves no file.
+pub fn build_side_for(
+    volume: &super::writer::FrozenVolume,
+    volume_path: &Path,
+    file_id: u64,
+    definitions: &[(usize, u64)],
+) -> Option<Arc<IndexFile>> {
+    if definitions.is_empty() {
+        return None;
+    }
+    let side = side_path(volume_path);
+    let failure = std::cell::Cell::new(None);
+    let columns = definitions
+        .iter()
+        .map(|&(column, definition)| ColumnInput {
+            column: column as u32,
+            definition,
+            pairs: Box::new(volume_pairs(volume, column, &failure)),
+        })
+        .collect();
+    let workspace = workspace_for(volume.meta.row_count, definitions.len());
+    let built = build_side_file(&side, next_generation(), columns, workspace);
+    let outcome = match (built, failure.take()) {
+        (Ok(_), None) => Ok(()),
+        (Ok(_), Some(error)) | (Err(error), _) => Err(error),
+    };
+    if let Err(error) = outcome {
+        if is_refused(&error) {
+            eprintln!("Warning: side index {:?} not built: {error}", side);
+        } else {
+            BUILDS_FAILED.fetch_add(1, Ordering::Relaxed);
+            eprintln!("Warning: side index {:?} failed: {error}", side);
+            retire_side_of(volume_path);
+        }
+        return None;
+    }
+    let handle = VolumeFile::shared(&side);
+    match IndexFile::open_through(&handle, file_id) {
+        Ok(file) => Some(Arc::new(file)),
+        Err(error) => {
+            BUILDS_FAILED.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "Warning: side index {:?} unreadable after its build: {error}",
+                side
+            );
+            handle.retire();
+            None
+        }
+    }
+}
+
+/// The side file beside `volume_path` at reopen, if there is one it can
+/// read; one it cannot read is removed and logged, and the volume is
+/// uncovered until a compaction rewrites it
+pub fn open_side_for(volume_path: &Path, file_id: u64) -> Option<Arc<IndexFile>> {
+    let side = side_path(volume_path);
+    if !side.exists() {
+        return None;
+    }
+    let handle = VolumeFile::shared(&side);
+    match IndexFile::open_through(&handle, file_id) {
+        Ok(file) => Some(Arc::new(file)),
+        Err(error) => {
+            eprintln!(
+                "Warning: side index {:?} unreadable, removed: {error}",
+                side
+            );
+            handle.retire();
+            None
+        }
+    }
+}
+
+/// Retires the side file beside `volume_path`, if any: it goes once its
+/// last holder lets go
+pub fn retire_side_of(volume_path: &Path) {
+    let side = side_path(volume_path);
+    match VolumeFile::retire_path(&side) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!("Warning: side index {:?} not retired: {error}", side),
+    }
+}
+
+/// Discards a side file built for a volume whose index definitions
+/// changed before it was published: the volume is uncovered
+pub fn discard_side(side: Arc<IndexFile>) {
+    SIDES_DISCARDED.fetch_add(1, Ordering::Relaxed);
+    side.handle().retire();
+    drop(side);
 }
 
 #[cfg(test)]
@@ -1859,6 +2323,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
+                definition: 0,
                 pairs: Box::new(pairs.into_iter()),
             }],
             workspace,
@@ -1867,7 +2332,7 @@ mod tests {
     }
 
     fn all_positions(file: &IndexFile, range: (u64, u64), window: usize) -> Vec<u32> {
-        let mut cursor = file.cursor(1, range, window);
+        let mut cursor = file.cursor(1, range, window).unwrap();
         let mut out = Vec::new();
         while let Some(w) = cursor.next_window().unwrap() {
             assert!(w.windows(2).all(|p| p[0] <= p[1]), "a window is sorted");
@@ -1973,7 +2438,7 @@ mod tests {
         INDEX_PAGES.set_budget_bytes(budget as u64);
         INDEX_PAGES.reset_peak();
         let over_before = INDEX_PAGES.stats().over_budget;
-        let mut cursor = file.cursor(1, range, 4096);
+        let mut cursor = file.cursor(1, range, 4096).unwrap();
         let mut seen = 0u64;
         while let Some(w) = cursor.next_window().unwrap() {
             assert_eq!(w[0] as u64, seen);
@@ -2004,9 +2469,14 @@ mod tests {
         build(&path, pairs, WORKSPACE);
         INDEX_PAGES.clear();
         let baseline = INDEX_PAGES.stats().charged_bytes;
+        let directories = INDEX_DIRECTORIES.stats().charged_bytes;
         let file = IndexFile::open(&path, 7).unwrap();
-        let directory_bytes = INDEX_PAGES.stats().charged_bytes - baseline;
-        assert_eq!(directory_bytes, file.directory().bytes());
+        assert_eq!(
+            INDEX_DIRECTORIES.stats().charged_bytes - directories,
+            file.directory().bytes(),
+            "the directory is charged to its own ledger"
+        );
+        assert_eq!(INDEX_PAGES.stats().charged_bytes, baseline);
         INDEX_PAGES.reset_peak();
         let key_page = INDEX_PAGES.load(&file, 1, PageKind::Keys, 0).unwrap();
         let PageContent::Keys { keys, ends } = key_page.content() else {
@@ -2020,12 +2490,12 @@ mod tests {
         );
         assert_eq!(
             INDEX_PAGES.stats().charged_bytes,
-            baseline + directory_bytes + key_page.bytes(),
+            baseline + key_page.bytes(),
             "the raw bytes were released after the parse"
         );
         assert_eq!(
             INDEX_PAGES.stats().peak_bytes,
-            baseline + directory_bytes + key_page.bytes() + PAGE_BYTES,
+            baseline + key_page.bytes() + PAGE_BYTES,
             "the raw page was charged while it was parsed"
         );
         let pos_page = INDEX_PAGES.load(&file, 1, PageKind::Positions, 0).unwrap();
@@ -2078,6 +2548,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
+                definition: 0,
                 pairs: Box::new(std::iter::empty()),
             }],
             MIN_WORKSPACE_BYTES - 1,
@@ -2104,6 +2575,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
+                definition: 0,
                 pairs: Box::new(scattered(1_200_000, 1_200_001)),
             }],
             workspace,
@@ -2145,6 +2617,7 @@ mod tests {
             (1..=3)
                 .map(|c| ColumnInput {
                     column: c,
+                    definition: 0,
                     pairs: Box::new(scattered(400_000, 65_521 + c as u64)),
                 })
                 .collect(),
@@ -2183,6 +2656,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
+                definition: 0,
                 pairs: Box::new(Unbounded(scattered(4_194_304, 4_194_301))),
             }],
             MIN_WORKSPACE_BYTES,
@@ -2214,6 +2688,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
+                definition: 0,
                 pairs: Box::new(scattered(4_194_304, 4_194_301)),
             }],
             MIN_WORKSPACE_BYTES + metadata_allowance(4_194_304),
@@ -2244,6 +2719,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
+                definition: 0,
                 pairs: Box::new(scattered(100_000, 100_003)),
             }],
             MIN_WORKSPACE_BYTES + metadata_allowance(100_000),
@@ -2282,6 +2758,7 @@ mod tests {
             generation,
             vec![ColumnInput {
                 column: 1,
+                definition: 0,
                 pairs: Box::new(std::iter::empty()),
             }],
             WORKSPACE,
@@ -2303,6 +2780,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
+                definition: 0,
                 pairs: Box::new(Unbounded(scattered(4_194_304, 4_194_301))),
             }],
             MIN_WORKSPACE_BYTES,
@@ -2337,6 +2815,7 @@ mod tests {
             (1..=2000u32)
                 .map(|c| ColumnInput {
                     column: c,
+                    definition: 0,
                     pairs: Box::new(std::iter::empty()),
                 })
                 .collect::<Vec<_>>()
@@ -2421,6 +2900,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
+                definition: 0,
                 pairs: Box::new(pairs.clone().into_iter()),
             }],
             MIN_WORKSPACE_BYTES + metadata_allowance(300_000),
@@ -2446,6 +2926,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
+                definition: 0,
                 pairs: Box::new(pairs.into_iter()),
             }],
             WORKSPACE,
@@ -2481,7 +2962,7 @@ mod tests {
             "the first page is intact"
         );
         let range = file.equal(1, 1366).unwrap().unwrap();
-        let mut cursor = file.cursor(1, range, 100);
+        let mut cursor = file.cursor(1, range, 100).unwrap();
         let first = cursor.next_window().map(|w| w.map(|w| w.len()));
         let err = first.unwrap_err();
         assert!(err.to_string().contains("checksum"), "{err}");
@@ -2533,11 +3014,8 @@ mod tests {
         INDEX_PAGES.clear();
         let baseline = INDEX_PAGES.stats();
         let file = IndexFile::open(&path, 5).unwrap();
-        let directory_bytes = INDEX_PAGES.stats().charged_bytes - baseline.charged_bytes;
-        assert!(directory_bytes > 0);
         // A budget of three pages above the baseline
-        INDEX_PAGES
-            .set_budget_bytes((baseline.charged_bytes + directory_bytes + 3 * PAGE_BYTES) as u64);
+        INDEX_PAGES.set_budget_bytes((baseline.charged_bytes + 3 * PAGE_BYTES) as u64);
         let held = INDEX_PAGES.load(&file, 1, PageKind::Positions, 0).unwrap();
         let held_bytes = held.bytes();
         let before = INDEX_PAGES.stats();
@@ -2558,21 +3036,32 @@ mod tests {
             after.budget_bytes
         );
         assert!(
-            after.charged_bytes >= directory_bytes + held_bytes,
+            after.charged_bytes >= baseline.charged_bytes + held_bytes,
             "the held page's bytes are still charged"
         );
-        let over_before = after.over_budget;
-        INDEX_PAGES.set_budget_bytes((baseline.charged_bytes + directory_bytes) as u64);
+        // Lowering the budget under the held page revokes nothing; a load
+        // that cannot fit beside it is refused and counted, and answered
+        // again once the budget allows
+        let refused_before = after.refused;
+        INDEX_PAGES.set_budget_bytes(baseline.charged_bytes as u64);
         let stats = INDEX_PAGES.stats();
         assert!(
-            stats.charged_bytes >= directory_bytes + held_bytes,
+            stats.charged_bytes >= baseline.charged_bytes + held_bytes,
             "a held page cannot be evicted"
         );
-        INDEX_PAGES.load(&file, 1, PageKind::Positions, 20).unwrap();
-        assert!(
-            INDEX_PAGES.stats().over_budget > over_before,
-            "a load with nothing to evict is counted as over budget"
+        let err = match INDEX_PAGES.load(&file, 1, PageKind::Positions, 20) {
+            Err(err) => err,
+            Ok(_) => panic!("a load over the budget with nothing to evict was granted"),
+        };
+        assert!(is_refused(&err), "{err}");
+        assert_eq!(INDEX_PAGES.stats().refused, refused_before + 1);
+        assert_eq!(
+            INDEX_PAGES.stats().charged_bytes,
+            stats.charged_bytes,
+            "a refused load charged nothing"
         );
+        INDEX_PAGES.set_budget_bytes((baseline.charged_bytes + 3 * PAGE_BYTES) as u64);
+        INDEX_PAGES.load(&file, 1, PageKind::Positions, 20).unwrap();
         drop(held);
         drop(file);
         INDEX_PAGES.clear();
@@ -2609,9 +3098,8 @@ mod tests {
                         }
                         _ => {
                             let page = (i * 7 + w) % 12;
-                            let _ = INDEX_PAGES
-                                .load(&file, 1, PageKind::Positions, page)
-                                .unwrap();
+                            // Refused under the two-page budget at times
+                            let _ = INDEX_PAGES.load(&file, 1, PageKind::Positions, page);
                             if i.is_multiple_of(50) {
                                 INDEX_PAGES.clear();
                             }
@@ -2637,6 +3125,73 @@ mod tests {
         drop(file);
         INDEX_PAGES.clear();
         INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn a_build_is_refused_while_the_others_hold_the_builds_budget() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let baseline = INDEX_BUILDS.stats();
+        INDEX_BUILDS.set_budget_bytes((baseline.charged_bytes + WORKSPACE) as u64);
+        // Another build holds one byte of the budget: this one does not fit
+        // whole, creates nothing and is counted
+        let other = INDEX_BUILDS.try_charge(1).unwrap();
+        let err = build_side_file(
+            &path,
+            next_generation(),
+            vec![ColumnInput {
+                column: 1,
+                definition: 0,
+                pairs: Box::new(scattered(1000, 97)),
+            }],
+            WORKSPACE,
+        )
+        .unwrap_err();
+        assert!(is_refused(&err), "{err}");
+        assert!(!path.exists());
+        assert!(leftovers(dir.path()).is_empty());
+        assert_eq!(INDEX_BUILDS.stats().refused, baseline.refused + 1);
+        drop(other);
+        // With the budget free it builds, holding its whole workspace
+        // meanwhile and releasing it after
+        INDEX_BUILDS.reset_peak();
+        build(&path, scattered(1000, 97).collect(), WORKSPACE);
+        assert_eq!(
+            INDEX_BUILDS.stats().peak_bytes,
+            baseline.charged_bytes + WORKSPACE
+        );
+        assert_eq!(INDEX_BUILDS.stats().charged_bytes, baseline.charged_bytes);
+        INDEX_BUILDS.set_budget_bytes(DEFAULT_BUILD_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn a_column_records_the_definition_it_was_built_under() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let definition = definition_of("Ts", IndexType::BTree, false);
+        assert_eq!(definition, definition_of("ts", IndexType::BTree, false));
+        assert_ne!(definition, definition_of("ts", IndexType::BTree, true));
+        assert_ne!(definition, definition_of("ts", IndexType::Hash, false));
+        build_side_file(
+            &path,
+            next_generation(),
+            vec![ColumnInput {
+                column: 1,
+                definition,
+                pairs: Box::new(scattered(1000, 97)),
+            }],
+            WORKSPACE,
+        )
+        .unwrap();
+        let file = IndexFile::open(&path, 15).unwrap();
+        assert!(file.covers(1, definition));
+        assert!(!file.covers(1, definition_of("ts", IndexType::BTree, true)));
+        assert!(!file.covers(2, definition));
+        // Every open of the same path reads through the one handle
+        let again = IndexFile::open(&path, 15).unwrap();
+        assert!(Arc::ptr_eq(file.handle(), again.handle()));
     }
 
     #[test]

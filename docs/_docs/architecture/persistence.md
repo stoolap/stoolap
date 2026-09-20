@@ -191,10 +191,19 @@ Frozen volumes store data column by column with multiple query acceleration tech
   volumes/
     table_name/
       vol_00064d50e5946141.vol    # Sealed cold segment
+      vol_00064d50e5946141.sidx   # Secondary index side file of that segment
       manifest.bin                # Segment metadata (volumes, tombstones, checkpoint LSN)
 ```
 
 Volume files include a trailing CRC32 checksum for corruption detection. Bloom filters are serialized alongside the volume data (no rebuild on load).
+
+### Secondary Index Side Files
+
+A volume of a table with a single-column B-tree index on an INTEGER or TIMESTAMP column gets a side file beside it, `vol_<id>.sidx`, written when the volume is sealed or compacted and removed with it. The side file holds, per indexed column, the column's distinct keys in order and the row positions of each key, in pages of 32 KiB with their own checksums. It is a sorted, paged copy of the index for that one immutable volume: a reader opens its directory once and fetches pages on demand, so a lookup touches a few pages rather than the column. This release builds and maintains the side files; queries do not use them yet.
+
+Side files are built under two process-wide budgets, set with `PRAGMA INDEX_CACHE_MB` (the pages readers hold, default 16) and `PRAGMA INDEX_BUILD_MB` (the workspaces of the builds in flight, default 64). A build that does not fit beside the others is refused and the volume is published without a side file, uncovered, with the refusal counted and logged; a build that fails with an I/O error is counted apart. Lowering a budget never revokes what a reader or a build already holds. A side file whose index definitions changed before its volume was published (an index created or dropped meanwhile) is discarded and the volume published uncovered. An uncovered volume is covered again when a compaction rewrites it. `PRAGMA INDEX_STATS` reports the three ledgers (cache, builds, resident directories), their refusals, and the builds failed and side files discarded since the process started.
+
+A table rename moves side files with their volumes; DROP TABLE, TRUNCATE and compaction retire them with their volumes, each removed once its last reader lets go. On reopen a side file is attached to its volume when it reads correctly, and removed otherwise.
 
 ### Checkpoint Cycle
 
@@ -374,6 +383,8 @@ file:///path/to/database?sync_mode=2&checkpoint_interval=60&compact_threshold=4&
 | keep_snapshots | Backup snapshots to retain per table | 3 | PRAGMA |
 | hot_max_rows | Committed hot rows per table that request an early seal (0 = off) | 262144 | PRAGMA |
 | hot_max_bytes | Hot row bytes per table above which commits wait for a seal (0 = off) | 0 | PRAGMA |
+| index_cache_mb | Budget of the secondary index pages readers hold, in MB | 16 | PRAGMA |
+| index_build_mb | Budget of the secondary index builds in flight, in MB | 64 | PRAGMA |
 | checkpoint_on_close | Seal all hot rows on clean shutdown | on | DSN only |
 
 Legacy parameter names are accepted for backward compatibility:

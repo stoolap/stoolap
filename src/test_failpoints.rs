@@ -112,6 +112,23 @@ pub(crate) fn maintenance_schema_taken() {
 }
 
 thread_local! {
+    static SIDE_FILES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once after a seal or compaction on this thread built its side
+/// files, before it checks the index definitions and publishes.
+pub fn after_side_files_built(hook: impl FnOnce() + 'static) {
+    SIDE_FILES_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn side_files_built() {
+    let hook = SIDE_FILES_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static COLD_VOLUMES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

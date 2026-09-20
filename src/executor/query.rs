@@ -10030,6 +10030,133 @@ impl Executor {
                 ));
                 Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
+            "INDEX_CACHE_MB" | "INDEX_BUILD_MB" => {
+                // Budgets of the secondary index side files, in megabytes:
+                // the pages readers hold and cache, and the workspaces of
+                // the builds in flight; a request over a budget is refused
+                use crate::storage::volume::secondary::{INDEX_BUILDS, INDEX_PAGES};
+                let columns: Vec<String> = vec![pragma_name.to_lowercase().into()];
+                let pages = pragma_name == "INDEX_CACHE_MB";
+                if let Some(ref value) = stmt.value {
+                    let mb = self.extract_pragma_int_value(value)?;
+                    if mb < 0 {
+                        return Err(Error::internal(format!(
+                            "{} must not be negative",
+                            pragma_name.to_lowercase()
+                        )));
+                    }
+                    let bytes = (mb as u64).saturating_mul(1024 * 1024);
+                    if pages {
+                        INDEX_PAGES.set_budget_bytes(bytes);
+                    } else {
+                        INDEX_BUILDS.set_budget_bytes(bytes);
+                    }
+                }
+                let budget = if pages {
+                    INDEX_PAGES.stats().budget_bytes
+                } else {
+                    INDEX_BUILDS.stats().budget_bytes
+                };
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![Value::Integer((budget / (1024 * 1024)) as i64)]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
+            "INDEX_STATS" => {
+                // One row per ledger of the secondary index side files
+                use crate::storage::volume::secondary::{
+                    BUILDS_FAILED, INDEX_BUILDS, INDEX_DIRECTORIES, INDEX_PAGES, SIDES_DISCARDED,
+                };
+                if stmt.value.is_some() {
+                    return Err(Error::internal("PRAGMA INDEX_STATS does not accept values"));
+                }
+                let columns = vec![
+                    "ledger".to_string(),
+                    "budget_bytes".to_string(),
+                    "charged_bytes".to_string(),
+                    "peak_bytes".to_string(),
+                    "refused".to_string(),
+                    "cached_pages".to_string(),
+                    "loads".to_string(),
+                    "hits".to_string(),
+                    "evictions".to_string(),
+                    "over_budget".to_string(),
+                    "builds_failed".to_string(),
+                    "sides_discarded".to_string(),
+                ];
+                let pages = INDEX_PAGES.stats();
+                let builds = INDEX_BUILDS.stats();
+                let directories = INDEX_DIRECTORIES.stats();
+                let ledger = |name: &str,
+                              budget: u64,
+                              charged: usize,
+                              peak: usize,
+                              refused: u64,
+                              rest: [i64; 7]| {
+                    let mut values = vec![
+                        Value::text(name),
+                        Value::Integer(budget as i64),
+                        Value::Integer(charged as i64),
+                        Value::Integer(peak as i64),
+                        Value::Integer(refused as i64),
+                    ];
+                    values.extend(rest.into_iter().map(Value::Integer));
+                    Row::from_values(values)
+                };
+                let mut rows = RowVec::with_capacity(3);
+                rows.push((
+                    0,
+                    ledger(
+                        "index_cache",
+                        pages.budget_bytes,
+                        pages.charged_bytes,
+                        pages.peak_bytes,
+                        pages.refused,
+                        [
+                            pages.cached_pages as i64,
+                            pages.loads as i64,
+                            pages.hits as i64,
+                            pages.evictions as i64,
+                            pages.over_budget as i64,
+                            0,
+                            0,
+                        ],
+                    ),
+                ));
+                rows.push((
+                    1,
+                    ledger(
+                        "index_builds",
+                        builds.budget_bytes,
+                        builds.charged_bytes,
+                        builds.peak_bytes,
+                        builds.refused,
+                        [
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            BUILDS_FAILED.load(std::sync::atomic::Ordering::Relaxed) as i64,
+                            SIDES_DISCARDED.load(std::sync::atomic::Ordering::Relaxed) as i64,
+                        ],
+                    ),
+                ));
+                rows.push((
+                    2,
+                    ledger(
+                        "index_directories",
+                        directories.budget_bytes,
+                        directories.charged_bytes,
+                        directories.peak_bytes,
+                        directories.refused,
+                        [0; 7],
+                    ),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
             "GROUP_CACHE_STATS" => {
                 if stmt.value.is_some() {
                     return Err(Error::internal(
