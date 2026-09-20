@@ -1,0 +1,2660 @@
+// Copyright 2025 Stoolap Contributors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! A paged secondary index over one integer column of a sealed volume.
+//!
+//! The side file holds, per indexed column, the distinct keys in order and
+//! for each key the ascending row positions that hold it, in pages bounded
+//! in bytes: a key page carries keys with the position index each key ends
+//! at, a position page carries positions. A small directory names the pages
+//! and stays resident with the volume; pages are read on demand into a
+//! process-wide cache with a byte budget.
+//!
+//! Every allocation the index makes is charged to one ledger before it is
+//! made, at the capacity it takes, and released when its last owner lets
+//! go: a directory for its file's life, a page for as long as any holder
+//! keeps it, the raw bytes of a page or a directory while they are parsed,
+//! a build's sort run, page buffers, output buffer and merge readers, and a
+//! cursor's window. The ledger is accounting with best-effort eviction: a
+//! reservation that finds nothing unheld to evict is still granted and
+//! counted as over budget. Admission, the rule that refuses or delays an
+//! allocation the budget cannot take, is not here; it is a prerequisite of
+//! the query integration and is decided there.
+//!
+//! Layout of `vol_<id>.sidx`:
+//!
+//! ```text
+//! [magic "STSX"][version u32][generation u64]        16 bytes
+//! pages, each [n u32][entries][crc32 u32]
+//! directory: [column count u32] then per column
+//!   [col u32][key tag u8][n_keys u64][n_positions u64][key pages u32][pos pages u32]
+//!   key pages: [first_key i64][last_key i64][offset u64][len u32][key_start u64][pos_start u64]
+//!   pos pages: [offset u64][len u32][pos_start u64]
+//! footer: [directory offset u64][directory len u32][directory crc32 u32][magic]
+//! ```
+//!
+//! The generation in the header is immutable for the file; a page read
+//! checks it, and a cache key carries it, so a file replaced under a
+//! reader never mixes the reader's directory with the new file's pages.
+
+use std::collections::{HashMap, VecDeque};
+use std::io::{BufRead, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
+
+const MAGIC: [u8; 4] = *b"STSX";
+const VERSION: u32 = 2;
+const KEY_I64: u8 = 1;
+const HEADER_LEN: u64 = 16;
+const FOOTER_LEN: u64 = 20;
+const KEY_DIR_ENTRY: usize = 44;
+const POS_DIR_ENTRY: usize = 20;
+const COLUMN_ENTRY: usize = 29;
+pub const SIDE_EXT: &str = "sidx";
+
+/// The byte bound of one page, header and checksum included.
+pub const PAGE_BYTES: usize = 32 * 1024;
+const PAGE_OVERHEAD: usize = 8;
+/// A key and the position index it ends at, which fits u32 since a
+/// volume's positions do
+const KEY_ENTRY: usize = 12;
+const POS_ENTRY: usize = 4;
+/// Keys one key page holds at most, and positions one position page holds
+pub const KEYS_PER_PAGE: usize = (PAGE_BYTES - PAGE_OVERHEAD) / KEY_ENTRY;
+pub const POSITIONS_PER_PAGE: usize = (PAGE_BYTES - PAGE_OVERHEAD) / POS_ENTRY;
+
+/// The side file next to a volume file.
+pub fn side_path(volume_path: &Path) -> PathBuf {
+    volume_path.with_extension(SIDE_EXT)
+}
+
+static NEXT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// A generation no earlier side file of this process carries, and none of
+/// an earlier process with a probability the clock gives.
+pub fn next_generation() -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    NEXT_GENERATION
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |last| {
+            Some(now.max(last + 1))
+        })
+        .map(|last| now.max(last + 1))
+        .unwrap_or(now)
+}
+
+fn invalid(msg: &str) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        format!("side index: {msg}"),
+    )
+}
+
+// =============================================================================
+// Accounting: one ledger for every byte the index holds
+// =============================================================================
+
+/// The process-wide ledger of index bytes and the page cache over it. The
+/// ledger is atomics; the one lock guards the cache's map and order, and
+/// nothing is dropped or reserved while it is held.
+pub struct IndexPages {
+    charged: AtomicUsize,
+    over_budget: AtomicU64,
+    budget: AtomicU64,
+    cache: Mutex<PageCache>,
+    loads: AtomicU64,
+    hits: AtomicU64,
+    evictions: AtomicU64,
+    /// The most bytes charged at once since the last reset: a high-water
+    /// mark taken at every charge, not a sample between calls
+    peak: AtomicUsize,
+}
+
+#[derive(Default)]
+struct PageCache {
+    pages: HashMap<PageKey, Arc<Page>>,
+    order: VecDeque<PageKey>,
+}
+
+const DEFAULT_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
+
+pub static INDEX_PAGES: LazyLock<IndexPages> = LazyLock::new(|| IndexPages {
+    charged: AtomicUsize::new(0),
+    over_budget: AtomicU64::new(0),
+    budget: AtomicU64::new(DEFAULT_BUDGET_BYTES),
+    cache: Mutex::new(PageCache::default()),
+    loads: AtomicU64::new(0),
+    hits: AtomicU64::new(0),
+    evictions: AtomicU64::new(0),
+    peak: AtomicUsize::new(0),
+});
+
+/// A reservation of bytes in the ledger, released on drop. It grows when
+/// its owner's allocation grows.
+pub struct Reservation {
+    bytes: usize,
+}
+
+impl Reservation {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Reserves `more` bytes on top, for an owner whose allocation grew
+    pub fn grow(&mut self, more: usize) {
+        if more == 0 {
+            return;
+        }
+        INDEX_PAGES.charge(more);
+        self.bytes += more;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        INDEX_PAGES.charged.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+/// The ledger's state, for `PRAGMA MEMORY_STATS` and the measurements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexStats {
+    pub budget_bytes: u64,
+    /// Every byte reserved right now: pages held or cached, directories,
+    /// workspaces, raw bytes being parsed
+    pub charged_bytes: usize,
+    /// Bytes of pages the cache holds (a held page counts here too)
+    pub cached_bytes: usize,
+    pub cached_pages: usize,
+    pub loads: u64,
+    pub hits: u64,
+    pub evictions: u64,
+    /// Reservations granted while the ledger was over budget with nothing
+    /// unheld left to evict
+    pub over_budget: u64,
+    /// The most bytes charged at once since `reset_peak`
+    pub peak_bytes: usize,
+}
+
+impl IndexPages {
+    pub fn set_budget_bytes(&self, bytes: u64) {
+        self.budget.store(bytes, Ordering::Release);
+        self.make_room(0);
+    }
+
+    pub fn stats(&self) -> IndexStats {
+        let (cached_bytes, cached_pages) = {
+            let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                cache.pages.values().map(|p| p.bytes).sum(),
+                cache.pages.len(),
+            )
+        };
+        IndexStats {
+            budget_bytes: self.budget.load(Ordering::Acquire),
+            charged_bytes: self.charged.load(Ordering::Acquire),
+            cached_bytes,
+            cached_pages,
+            loads: self.loads.load(Ordering::Relaxed),
+            hits: self.hits.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            over_budget: self.over_budget.load(Ordering::Relaxed),
+            peak_bytes: self.peak.load(Ordering::Acquire),
+        }
+    }
+
+    /// Starts the high-water mark again from what is charged now
+    pub fn reset_peak(&self) {
+        self.peak
+            .store(self.charged.load(Ordering::Acquire), Ordering::Release);
+    }
+
+    /// Drops every cached page nobody holds; held pages stay charged.
+    pub fn clear(&self) {
+        let dropped: Vec<Arc<Page>> = {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            let PageCache { pages, order } = &mut *cache;
+            let mut dropped = Vec::new();
+            pages.retain(|_, page| {
+                if Arc::strong_count(page) > 1 {
+                    true
+                } else {
+                    dropped.push(Arc::clone(page));
+                    false
+                }
+            });
+            order.retain(|k| pages.contains_key(k));
+            dropped
+        };
+        self.evictions
+            .fetch_add(dropped.len() as u64, Ordering::Relaxed);
+        // Dropped outside the lock: a page's drop releases its reservation
+        drop(dropped);
+    }
+
+    /// Reserves `bytes` before they are allocated: unheld cached pages are
+    /// evicted first while the ledger would go over budget; when nothing
+    /// unheld is left the reservation is still granted and counted as over
+    /// budget. This is accounting, not admission: nothing is refused here.
+    pub fn reserve(&self, bytes: usize) -> Reservation {
+        self.make_room(bytes);
+        self.charge(bytes);
+        Reservation { bytes }
+    }
+
+    fn charge(&self, bytes: usize) {
+        let after = self.charged.fetch_add(bytes, Ordering::AcqRel) + bytes;
+        self.peak.fetch_max(after, Ordering::AcqRel);
+        if after as u64 > self.budget.load(Ordering::Acquire) {
+            self.over_budget.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn make_room(&self, incoming: usize) {
+        let budget = self.budget.load(Ordering::Acquire);
+        loop {
+            if (self.charged.load(Ordering::Acquire) + incoming) as u64 <= budget {
+                return;
+            }
+            // The oldest page nobody holds, dropped outside the lock
+            let victim = {
+                let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+                let at = cache.order.iter().position(|k| {
+                    cache
+                        .pages
+                        .get(k)
+                        .is_some_and(|p| Arc::strong_count(p) == 1)
+                });
+                let Some(at) = at else {
+                    return;
+                };
+                let key = cache
+                    .order
+                    .remove(at)
+                    .expect("position came from the deque");
+                cache.pages.remove(&key)
+            };
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+            drop(victim);
+        }
+    }
+
+    /// The page `kind`/`number` of `column` in `file`, from the cache or
+    /// read through the file's handle and checked against its generation.
+    pub fn load(
+        &self,
+        file: &IndexFile,
+        column: usize,
+        kind: PageKind,
+        number: usize,
+    ) -> std::io::Result<Arc<Page>> {
+        let key = PageKey {
+            file_id: file.file_id,
+            generation: file.directory.generation,
+            column: column as u32,
+            kind,
+            number: number as u32,
+        };
+        {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(page) = cache.pages.get(&key) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                let page = Arc::clone(page);
+                if let Some(at) = cache.order.iter().position(|k| *k == key) {
+                    cache.order.remove(at);
+                    cache.order.push_back(key);
+                }
+                return Ok(page);
+            }
+        }
+        let (offset, len) = file.directory.page_location(column, kind, number)?;
+        let page = Arc::new(Page::read(file, kind, offset, len)?);
+        self.loads.fetch_add(1, Ordering::Relaxed);
+        let replaced = {
+            let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = cache.pages.get(&key) {
+                // Another reader loaded it meanwhile; ours goes, and its
+                // reservation with it, outside the lock
+                Err(Arc::clone(existing))
+            } else {
+                cache.pages.insert(key, Arc::clone(&page));
+                cache.order.push_back(key);
+                Ok(())
+            }
+        };
+        match replaced {
+            Ok(()) => Ok(page),
+            Err(existing) => {
+                drop(page);
+                Ok(existing)
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Pages
+// =============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PageKind {
+    Keys,
+    Positions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PageKey {
+    file_id: u64,
+    generation: u64,
+    column: u32,
+    kind: PageKind,
+    number: u32,
+}
+
+/// One page as parsed from the file. The reservation it carries is the
+/// capacity of its vectors, released when the last holder drops it.
+pub struct Page {
+    content: PageContent,
+    bytes: usize,
+    _reservation: Reservation,
+}
+
+pub enum PageContent {
+    /// Keys in order, and for each the position index it ends at
+    Keys {
+        keys: Vec<i64>,
+        ends: Vec<u64>,
+    },
+    Positions(Vec<u32>),
+}
+
+impl Page {
+    /// Reads and parses one page: the raw bytes are reserved for the read
+    /// and released after the parse; the parsed vectors are reserved at
+    /// their capacity before they are allocated and stay with the page.
+    fn read(file: &IndexFile, kind: PageKind, offset: u64, len: u32) -> std::io::Result<Self> {
+        let raw_reservation = INDEX_PAGES.reserve(len as usize);
+        let raw = file.read_page(offset, len)?;
+        if raw.len() < PAGE_OVERHEAD {
+            return Err(invalid("page shorter than its header"));
+        }
+        let body = &raw[..raw.len() - 4];
+        let stored = u32::from_le_bytes(raw[raw.len() - 4..].try_into().expect("4 bytes"));
+        if crc32fast::hash(body) != stored {
+            return Err(invalid("page checksum mismatch"));
+        }
+        let n = u32::from_le_bytes(body[..4].try_into().expect("4 bytes")) as usize;
+        let entries = &body[4..];
+        let (content, bytes, reservation) = match kind {
+            PageKind::Keys => {
+                if entries.len() != n * KEY_ENTRY {
+                    return Err(invalid("key page length does not match its count"));
+                }
+                let bytes = n * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>());
+                let reservation = INDEX_PAGES.reserve(bytes);
+                let mut keys = Vec::with_capacity(n);
+                let mut ends = Vec::with_capacity(n);
+                for entry in entries.as_chunks::<KEY_ENTRY>().0 {
+                    keys.push(i64::from_le_bytes(entry[..8].try_into().expect("8 bytes")));
+                    ends.push(u32::from_le_bytes(entry[8..].try_into().expect("4 bytes")) as u64);
+                }
+                if keys.windows(2).any(|w| w[0] >= w[1]) || ends.windows(2).any(|w| w[0] >= w[1]) {
+                    return Err(invalid("key page is not in order"));
+                }
+                (PageContent::Keys { keys, ends }, bytes, reservation)
+            }
+            PageKind::Positions => {
+                if entries.len() != n * POS_ENTRY {
+                    return Err(invalid("position page length does not match its count"));
+                }
+                let bytes = n * std::mem::size_of::<u32>();
+                let reservation = INDEX_PAGES.reserve(bytes);
+                let mut positions = Vec::with_capacity(n);
+                positions.extend(
+                    entries
+                        .as_chunks::<POS_ENTRY>()
+                        .0
+                        .iter()
+                        .map(|e| u32::from_le_bytes(*e)),
+                );
+                (PageContent::Positions(positions), bytes, reservation)
+            }
+        };
+        drop(raw);
+        drop(raw_reservation);
+        Ok(Self {
+            content,
+            bytes,
+            _reservation: reservation,
+        })
+    }
+
+    pub fn content(&self) -> &PageContent {
+        &self.content
+    }
+
+    /// The capacity the page's vectors hold, as charged
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+// =============================================================================
+// Directory
+// =============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyPageMeta {
+    pub first_key: i64,
+    pub last_key: i64,
+    offset: u64,
+    len: u32,
+    /// Index of the page's first key among the column's keys
+    pub key_start: u64,
+    /// Position index the page's first key starts at
+    pub pos_start: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PosPageMeta {
+    offset: u64,
+    len: u32,
+    /// Position index of the page's first entry
+    pub pos_start: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnDirectory {
+    pub column: u32,
+    pub n_keys: u64,
+    pub n_positions: u64,
+    pub key_pages: Vec<KeyPageMeta>,
+    pub pos_pages: Vec<PosPageMeta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Directory {
+    pub generation: u64,
+    pub columns: Vec<ColumnDirectory>,
+}
+
+impl Directory {
+    pub fn column(&self, column: usize) -> Option<&ColumnDirectory> {
+        self.columns.iter().find(|c| c.column as usize == column)
+    }
+
+    fn page_location(
+        &self,
+        column: usize,
+        kind: PageKind,
+        number: usize,
+    ) -> std::io::Result<(u64, u32)> {
+        let col = self
+            .column(column)
+            .ok_or_else(|| invalid("column has no index"))?;
+        match kind {
+            PageKind::Keys => col.key_pages.get(number).map(|p| (p.offset, p.len)),
+            PageKind::Positions => col.pos_pages.get(number).map(|p| (p.offset, p.len)),
+        }
+        .ok_or_else(|| invalid("page number out of range"))
+    }
+
+    /// Bytes the directory's vectors take resident
+    pub fn bytes(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|c| {
+                c.key_pages.capacity() * std::mem::size_of::<KeyPageMeta>()
+                    + c.pos_pages.capacity() * std::mem::size_of::<PosPageMeta>()
+            })
+            .sum::<usize>()
+            + self.columns.capacity() * std::mem::size_of::<ColumnDirectory>()
+    }
+
+    fn encoded_len(&self) -> usize {
+        4 + self
+            .columns
+            .iter()
+            .map(|c| {
+                COLUMN_ENTRY + c.key_pages.len() * KEY_DIR_ENTRY + c.pos_pages.len() * POS_DIR_ENTRY
+            })
+            .sum::<usize>()
+    }
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
+        for c in &self.columns {
+            out.extend_from_slice(&c.column.to_le_bytes());
+            out.push(KEY_I64);
+            out.extend_from_slice(&c.n_keys.to_le_bytes());
+            out.extend_from_slice(&c.n_positions.to_le_bytes());
+            out.extend_from_slice(&(c.key_pages.len() as u32).to_le_bytes());
+            out.extend_from_slice(&(c.pos_pages.len() as u32).to_le_bytes());
+            for p in &c.key_pages {
+                out.extend_from_slice(&p.first_key.to_le_bytes());
+                out.extend_from_slice(&p.last_key.to_le_bytes());
+                out.extend_from_slice(&p.offset.to_le_bytes());
+                out.extend_from_slice(&p.len.to_le_bytes());
+                out.extend_from_slice(&p.key_start.to_le_bytes());
+                out.extend_from_slice(&p.pos_start.to_le_bytes());
+            }
+            for p in &c.pos_pages {
+                out.extend_from_slice(&p.offset.to_le_bytes());
+                out.extend_from_slice(&p.len.to_le_bytes());
+                out.extend_from_slice(&p.pos_start.to_le_bytes());
+            }
+        }
+    }
+
+    /// Decodes the directory, reserving each column's vectors at their
+    /// capacity before they are allocated; the reservations come back
+    /// with it.
+    fn decode(
+        generation: u64,
+        data: &[u8],
+        file_len: u64,
+    ) -> std::io::Result<(Self, Vec<Reservation>)> {
+        let mut pos = 0usize;
+        let count = read_u32(data, &mut pos)? as usize;
+        if count > 4096 {
+            return Err(invalid("too many columns"));
+        }
+        let mut reservations = Vec::with_capacity(count + 1);
+        reservations.push(INDEX_PAGES.reserve(count * std::mem::size_of::<ColumnDirectory>()));
+        let mut columns = Vec::with_capacity(count);
+        for _ in 0..count {
+            if data.len() < pos + COLUMN_ENTRY {
+                return Err(invalid("directory truncated"));
+            }
+            let column = read_u32(data, &mut pos)?;
+            let tag = data[pos];
+            pos += 1;
+            if tag != KEY_I64 {
+                return Err(invalid("key type unsupported"));
+            }
+            let n_keys = read_u64(data, &mut pos)?;
+            let n_positions = read_u64(data, &mut pos)?;
+            let key_pages = read_u32(data, &mut pos)? as usize;
+            let pos_pages = read_u32(data, &mut pos)? as usize;
+            if data.len() < pos + key_pages * KEY_DIR_ENTRY + pos_pages * POS_DIR_ENTRY {
+                return Err(invalid("directory shorter than its page counts"));
+            }
+            reservations.push(INDEX_PAGES.reserve(
+                key_pages * std::mem::size_of::<KeyPageMeta>()
+                    + pos_pages * std::mem::size_of::<PosPageMeta>(),
+            ));
+            let mut kp = Vec::with_capacity(key_pages);
+            for _ in 0..key_pages {
+                let first_key = read_u64(data, &mut pos)? as i64;
+                let last_key = read_u64(data, &mut pos)? as i64;
+                let offset = read_u64(data, &mut pos)?;
+                let len = read_u32(data, &mut pos)?;
+                let key_start = read_u64(data, &mut pos)?;
+                let pos_start = read_u64(data, &mut pos)?;
+                if first_key > last_key
+                    || offset + len as u64 > file_len
+                    || len as usize > PAGE_BYTES
+                {
+                    return Err(invalid("key page entry out of bounds"));
+                }
+                kp.push(KeyPageMeta {
+                    first_key,
+                    last_key,
+                    offset,
+                    len,
+                    key_start,
+                    pos_start,
+                });
+            }
+            let mut pp = Vec::with_capacity(pos_pages);
+            for _ in 0..pos_pages {
+                let offset = read_u64(data, &mut pos)?;
+                let len = read_u32(data, &mut pos)?;
+                let pos_start = read_u64(data, &mut pos)?;
+                if offset + len as u64 > file_len || len as usize > PAGE_BYTES {
+                    return Err(invalid("position page entry out of bounds"));
+                }
+                pp.push(PosPageMeta {
+                    offset,
+                    len,
+                    pos_start,
+                });
+            }
+            if kp
+                .windows(2)
+                .any(|w| w[0].last_key >= w[1].first_key || w[0].pos_start > w[1].pos_start)
+                || pp.windows(2).any(|w| w[0].pos_start >= w[1].pos_start)
+            {
+                return Err(invalid("directory pages are not in order"));
+            }
+            columns.push(ColumnDirectory {
+                column,
+                n_keys,
+                n_positions,
+                key_pages: kp,
+                pos_pages: pp,
+            });
+        }
+        if pos != data.len() {
+            return Err(invalid("directory has trailing bytes"));
+        }
+        Ok((
+            Self {
+                generation,
+                columns,
+            },
+            reservations,
+        ))
+    }
+}
+
+fn read_u64(data: &[u8], pos: &mut usize) -> std::io::Result<u64> {
+    let end = *pos + 8;
+    let bytes = data.get(*pos..end).ok_or_else(|| invalid("truncated"))?;
+    *pos = end;
+    Ok(u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+}
+
+fn read_u32(data: &[u8], pos: &mut usize) -> std::io::Result<u32> {
+    let end = *pos + 4;
+    let bytes = data.get(*pos..end).ok_or_else(|| invalid("truncated"))?;
+    *pos = end;
+    Ok(u32::from_le_bytes(bytes.try_into().expect("4 bytes")))
+}
+
+// =============================================================================
+// The open file: directory resident, pages on demand
+// =============================================================================
+
+/// A side file opened at one generation: its directory, resident and
+/// charged to the ledger for the file's life, and the path its pages are
+/// read from. No descriptor is held between reads; every page read checks
+/// the header's generation against the one the directory was read at.
+pub struct IndexFile {
+    path: PathBuf,
+    file_id: u64,
+    directory: Directory,
+    _reservations: Vec<Reservation>,
+}
+
+/// An error a caller answers by reopening the file.
+pub fn is_generation_changed(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::InvalidData
+        && error.to_string().contains("generation changed")
+}
+
+impl IndexFile {
+    /// Opens `path`, reading its header, footer and directory, and checks
+    /// their consistency. `file_id` distinguishes files in the page cache;
+    /// the volume file's owner id is the natural choice.
+    pub fn open(path: &Path, file_id: u64) -> std::io::Result<Self> {
+        let mut file = std::fs::File::open(path)?;
+        let file_len = file.metadata()?.len();
+        if file_len < HEADER_LEN + FOOTER_LEN {
+            return Err(invalid("file shorter than header and footer"));
+        }
+        let mut header = [0u8; HEADER_LEN as usize];
+        file.read_exact(&mut header)?;
+        if header[..4] != MAGIC {
+            return Err(invalid("bad magic"));
+        }
+        let version = u32::from_le_bytes(header[4..8].try_into().expect("4 bytes"));
+        if version != VERSION {
+            return Err(invalid("version unsupported"));
+        }
+        let generation = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
+        let mut footer = [0u8; FOOTER_LEN as usize];
+        read_exact_at(&file, &mut footer, file_len - FOOTER_LEN)?;
+        if footer[16..] != MAGIC {
+            return Err(invalid("bad footer magic"));
+        }
+        let dir_offset = u64::from_le_bytes(footer[..8].try_into().expect("8 bytes"));
+        let dir_len = u32::from_le_bytes(footer[8..12].try_into().expect("4 bytes")) as u64;
+        let dir_crc = u32::from_le_bytes(footer[12..16].try_into().expect("4 bytes"));
+        if dir_offset < HEADER_LEN || dir_offset + dir_len != file_len - FOOTER_LEN {
+            return Err(invalid("directory location out of bounds"));
+        }
+        // The raw directory is charged while it is read and parsed
+        let raw_reservation = INDEX_PAGES.reserve(dir_len as usize);
+        let mut dir = vec![0u8; dir_len as usize];
+        read_exact_at(&file, &mut dir, dir_offset)?;
+        if crc32fast::hash(&dir) != dir_crc {
+            return Err(invalid("directory checksum mismatch"));
+        }
+        let (directory, reservations) = Directory::decode(generation, &dir, dir_offset)?;
+        drop(dir);
+        drop(raw_reservation);
+        Ok(Self {
+            path: path.to_path_buf(),
+            file_id,
+            directory,
+            _reservations: reservations,
+        })
+    }
+
+    pub fn directory(&self) -> &Directory {
+        &self.directory
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.directory.generation
+    }
+
+    fn read_page(&self, offset: u64, len: u32) -> std::io::Result<Vec<u8>> {
+        let file = std::fs::File::open(&self.path)?;
+        let mut header = [0u8; HEADER_LEN as usize];
+        read_exact_at(&file, &mut header, 0)?;
+        if header[..4] != MAGIC {
+            return Err(invalid("bad magic"));
+        }
+        let generation = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
+        if generation != self.directory.generation {
+            return Err(invalid("generation changed"));
+        }
+        let mut raw = vec![0u8; len as usize];
+        read_exact_at(&file, &mut raw, offset)?;
+        Ok(raw)
+    }
+
+    /// The position index range `[start, end)` of `key` in `column`, or
+    /// None when the key is absent; reads at most one key page.
+    pub fn equal(&self, column: usize, key: i64) -> std::io::Result<Option<(u64, u64)>> {
+        let col = self
+            .directory
+            .column(column)
+            .ok_or_else(|| invalid("column has no index"))?;
+        let page_no = col.key_pages.partition_point(|p| p.last_key < key);
+        let Some(meta) = col.key_pages.get(page_no) else {
+            return Ok(None);
+        };
+        if key < meta.first_key {
+            return Ok(None);
+        }
+        let page = INDEX_PAGES.load(self, column, PageKind::Keys, page_no)?;
+        let PageContent::Keys { keys, ends } = page.content() else {
+            return Err(invalid("expected a key page"));
+        };
+        let Ok(i) = keys.binary_search(&key) else {
+            return Ok(None);
+        };
+        let start = if i == 0 { meta.pos_start } else { ends[i - 1] };
+        Ok(Some((start, ends[i])))
+    }
+
+    /// The upper bound the directory alone gives on the positions of keys
+    /// in `[low, high]`: every position of every key page the range
+    /// touches, boundary pages whole.
+    pub fn candidate_bound(&self, column: usize, low: i64, high: i64) -> std::io::Result<u64> {
+        let col = self
+            .directory
+            .column(column)
+            .ok_or_else(|| invalid("column has no index"))?;
+        if low > high {
+            return Ok(0);
+        }
+        let first = col.key_pages.partition_point(|p| p.last_key < low);
+        let last = col.key_pages.partition_point(|p| p.first_key <= high);
+        if first >= last {
+            return Ok(0);
+        }
+        let start = col.key_pages[first].pos_start;
+        let end = col
+            .key_pages
+            .get(last)
+            .map_or(col.n_positions, |p| p.pos_start);
+        Ok(end - start)
+    }
+
+    /// The exact position index range of keys in `[low, high]`; reads the
+    /// boundary key pages.
+    pub fn range(&self, column: usize, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
+        let col = self
+            .directory
+            .column(column)
+            .ok_or_else(|| invalid("column has no index"))?;
+        if low > high {
+            return Ok((0, 0));
+        }
+        let first = col.key_pages.partition_point(|p| p.last_key < low);
+        let last = col.key_pages.partition_point(|p| p.first_key <= high);
+        if first >= last {
+            return Ok((0, 0));
+        }
+        let start = {
+            let meta = &col.key_pages[first];
+            if low <= meta.first_key {
+                meta.pos_start
+            } else {
+                let page = INDEX_PAGES.load(self, column, PageKind::Keys, first)?;
+                let PageContent::Keys { keys, ends } = page.content() else {
+                    return Err(invalid("expected a key page"));
+                };
+                let i = keys.partition_point(|&k| k < low);
+                if i == 0 {
+                    meta.pos_start
+                } else {
+                    ends[i - 1]
+                }
+            }
+        };
+        let end = {
+            let last_page = last - 1;
+            let meta = &col.key_pages[last_page];
+            if high >= meta.last_key {
+                col.key_pages
+                    .get(last)
+                    .map_or(col.n_positions, |p| p.pos_start)
+            } else {
+                let page = INDEX_PAGES.load(self, column, PageKind::Keys, last_page)?;
+                let PageContent::Keys { keys, ends } = page.content() else {
+                    return Err(invalid("expected a key page"));
+                };
+                let i = keys.partition_point(|&k| k <= high);
+                if i == 0 {
+                    meta.pos_start
+                } else {
+                    ends[i - 1]
+                }
+            }
+        };
+        Ok((start, end.max(start)))
+    }
+
+    /// A cursor over the positions at index range `[start, end)` of
+    /// `column`, yielding them in windows of at most `window` positions,
+    /// each window sorted ascending; the window is the cursor's whole
+    /// workspace, reserved before it is allocated, for the cursor's life.
+    pub fn cursor(&self, column: usize, range: (u64, u64), window: usize) -> Cursor<'_> {
+        let window = window.max(1);
+        let reservation = INDEX_PAGES.reserve(window * POS_ENTRY);
+        Cursor {
+            file: self,
+            column,
+            next: range.0,
+            end: range.1,
+            window,
+            buffer: Vec::with_capacity(window),
+            _reservation: reservation,
+        }
+    }
+}
+
+fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "side index file ends inside a page",
+                ));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+/// Positions of one key or one range, a bounded window at a time.
+pub struct Cursor<'a> {
+    file: &'a IndexFile,
+    column: usize,
+    next: u64,
+    end: u64,
+    window: usize,
+    buffer: Vec<u32>,
+    _reservation: Reservation,
+}
+
+impl Cursor<'_> {
+    /// Positions left to yield, including the current window
+    pub fn remaining(&self) -> u64 {
+        self.end - self.next
+    }
+
+    /// The next window, sorted ascending, or None at the end. Pages the
+    /// window spans are loaded one at a time and released as the window
+    /// moves on.
+    pub fn next_window(&mut self) -> std::io::Result<Option<&[u32]>> {
+        if self.next >= self.end {
+            return Ok(None);
+        }
+        self.buffer.clear();
+        let col = self
+            .file
+            .directory
+            .column(self.column)
+            .ok_or_else(|| invalid("column has no index"))?;
+        let stop = (self.next + self.window as u64).min(self.end);
+        while self.next < stop {
+            let page_no = col
+                .pos_pages
+                .partition_point(|p| p.pos_start <= self.next)
+                .checked_sub(1)
+                .ok_or_else(|| invalid("position index before the first page"))?;
+            let page = INDEX_PAGES.load(self.file, self.column, PageKind::Positions, page_no)?;
+            let PageContent::Positions(positions) = page.content() else {
+                return Err(invalid("expected a position page"));
+            };
+            let page_start = col.pos_pages[page_no].pos_start;
+            let from = (self.next - page_start) as usize;
+            let to = ((stop - page_start) as usize).min(positions.len());
+            if from >= to {
+                return Err(invalid("position page does not cover its index"));
+            }
+            self.buffer.extend_from_slice(&positions[from..to]);
+            self.next = page_start + to as u64;
+        }
+        self.buffer.sort_unstable();
+        Ok(Some(&self.buffer))
+    }
+}
+
+// =============================================================================
+// Building
+// =============================================================================
+
+/// What a build did, for the measurements.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct BuildReport {
+    pub keys: u64,
+    pub positions: u64,
+    pub key_pages: usize,
+    pub pos_pages: usize,
+    pub file_bytes: u64,
+    /// Sorted runs spilled to disk because the pairs exceeded the workspace
+    pub runs_spilled: usize,
+    /// Merges of runs into runs, before the merge into pages
+    pub merge_passes: usize,
+    /// The most runs merged at once
+    pub max_fan_in: usize,
+    /// The most run files alive at once
+    pub max_live_runs: usize,
+    /// The most bytes this build held at once in its own ledger
+    pub workspace_peak: usize,
+    pub build_ns: u64,
+}
+
+/// A column to index: its physical index and its `(position, key)` pairs,
+/// null rows left out, in any order. An iterator without an upper size
+/// bound is accepted, with a quarter of the remaining workspace kept for
+/// its page metadata; a column whose metadata outgrows that fails the
+/// build, and a hint avoids the failure.
+pub struct ColumnInput<'a> {
+    pub column: u32,
+    pub pairs: Box<dyn Iterator<Item = (u32, i64)> + 'a>,
+}
+
+const PAIR_BYTES: usize = std::mem::size_of::<(i64, u32)>();
+/// Each merge input reads through a buffer of this size
+pub const MERGE_READ_BYTES: usize = 16 * 1024;
+/// Runs merged at once at most, whatever the workspace: a ceiling on open
+/// descriptors
+pub const MAX_FAN_IN: usize = 32;
+const MIN_FAN_IN: usize = 2;
+const MIN_RUN_PAIRS: usize = 1024;
+/// The output buffer of the side file and of a spilled run
+const OUT_BUFFER_BYTES: usize = 64 * 1024;
+/// What the page writer holds whatever the input: a key page, a position
+/// page and the encoded body of the page being written
+const WRITER_BYTES: usize = KEYS_PER_PAGE * std::mem::size_of::<(i64, u64)>()
+    + POSITIONS_PER_PAGE * std::mem::size_of::<u32>()
+    + PAGE_BYTES;
+/// One entry of the merge heap
+const MERGE_HEAP_ENTRY: usize = std::mem::size_of::<std::cmp::Reverse<((i64, u32), usize)>>();
+/// What one merge input costs beside its read buffer: its reader, its heap
+/// entry and its path
+const MERGE_INPUT_BYTES: usize = std::mem::size_of::<RunReader>()
+    + MERGE_HEAP_ENTRY
+    + std::mem::size_of::<PathBuf>()
+    + RUN_NAME_BYTES;
+/// A run's path fits this
+const RUN_NAME_BYTES: usize = 256;
+/// The least workspace a build accepts: the writer's buffers, the output
+/// buffer, the buffer of a run being spilled or merged into, two merge
+/// inputs with their read buffers, and a run of `MIN_RUN_PAIRS`; the page
+/// metadata an input needs comes on top and is checked per input
+pub const MIN_WORKSPACE_BYTES: usize = WRITER_BYTES
+    + 2 * OUT_BUFFER_BYTES
+    + MIN_FAN_IN * (MERGE_READ_BYTES + MERGE_INPUT_BYTES)
+    + MIN_RUN_PAIRS * PAIR_BYTES
+    + COLUMN_SLOT_BYTES;
+
+/// What one input column costs the build beside its pages: its directory
+/// entry and the charge of its page metadata; the minimum covers one, and
+/// every further column adds its own
+pub const COLUMN_SLOT_BYTES: usize =
+    std::mem::size_of::<ColumnDirectory>() + std::mem::size_of::<Charge<'static>>();
+
+/// The page metadata `rows` rows produce at most, at the doubling
+/// capacities the writer's vectors grow by
+pub fn metadata_allowance(rows: usize) -> usize {
+    let key_pages = rows
+        .div_ceil(KEYS_PER_PAGE)
+        .max(1)
+        .next_power_of_two()
+        .max(4);
+    let pos_pages = rows
+        .div_ceil(POSITIONS_PER_PAGE)
+        .max(1)
+        .next_power_of_two()
+        .max(4);
+    key_pages * std::mem::size_of::<KeyPageMeta>() + pos_pages * std::mem::size_of::<PosPageMeta>()
+}
+
+fn workspace_exceeded(what: &str, bytes: usize, used: usize, workspace: usize) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "side index build: {bytes} bytes for {what} would take the build to {} bytes, over its workspace of {workspace}",
+            used + bytes
+        ),
+    )
+}
+
+/// The build's own ledger over its workspace: every byte the build holds
+/// is taken here before it is allocated and mirrored in the process
+/// ledger, and a take the workspace cannot hold fails the build. This is
+/// the build's bound; the process ledger is accounting.
+struct Budget {
+    workspace: usize,
+    used: std::cell::Cell<usize>,
+    peak: std::cell::Cell<usize>,
+}
+
+impl Budget {
+    fn new(workspace: usize) -> Self {
+        Self {
+            workspace,
+            used: std::cell::Cell::new(0),
+            peak: std::cell::Cell::new(0),
+        }
+    }
+
+    fn left(&self) -> usize {
+        self.workspace - self.used.get()
+    }
+
+    fn take(&self, bytes: usize, what: &str) -> std::io::Result<Charge<'_>> {
+        let used = self.used.get();
+        if used + bytes > self.workspace {
+            return Err(workspace_exceeded(what, bytes, used, self.workspace));
+        }
+        self.used.set(used + bytes);
+        self.peak.set(self.peak.get().max(used + bytes));
+        Ok(Charge {
+            bytes,
+            budget: self,
+            global: INDEX_PAGES.reserve(bytes),
+        })
+    }
+}
+
+/// Bytes taken from a build's budget, given back on drop.
+struct Charge<'b> {
+    bytes: usize,
+    budget: &'b Budget,
+    global: Reservation,
+}
+
+impl Charge<'_> {
+    fn grow(&mut self, more: usize, what: &str) -> std::io::Result<()> {
+        let used = self.budget.used.get();
+        if used + more > self.budget.workspace {
+            return Err(workspace_exceeded(what, more, used, self.budget.workspace));
+        }
+        self.budget.used.set(used + more);
+        self.budget
+            .peak
+            .set(self.budget.peak.get().max(used + more));
+        self.global.grow(more);
+        self.bytes += more;
+        Ok(())
+    }
+}
+
+impl Drop for Charge<'_> {
+    fn drop(&mut self) {
+        self.budget
+            .used
+            .set(self.budget.used.get().saturating_sub(self.bytes));
+    }
+}
+
+/// A build's own directory beside its target, `<name>.build-<pid>-<generation>`,
+/// created by the build and refused if it already exists, so that every
+/// file in it is the build's: the temporary output and the runs. On a
+/// failure the directory goes with everything in it; on success the
+/// output is renamed out of it and the empty directory is removed. Nothing
+/// outside it is ever touched, and a relative target without a parent
+/// builds beside itself in the current directory.
+struct TempFiles {
+    build_dir: PathBuf,
+    keep: bool,
+}
+
+impl TempFiles {
+    fn new(path: &Path, generation: u64) -> std::io::Result<Self> {
+        let dir = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| invalid("side file path has no name"))?;
+        let build_dir = dir.join(format!(
+            "{name}.build-{}-{generation:x}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&build_dir)?;
+        Ok(Self {
+            build_dir,
+            keep: false,
+        })
+    }
+
+    fn tmp_path(&self) -> PathBuf {
+        self.build_dir.join("out")
+    }
+
+    fn run_path(&self, column: usize, level: usize, number: usize) -> PathBuf {
+        self.build_dir
+            .join(format!("run{column}-L{level}-{number}"))
+    }
+
+    /// The output was renamed out; the directory is empty and goes
+    fn finished(mut self) {
+        self.keep = true;
+        let _ = std::fs::remove_dir(&self.build_dir);
+    }
+}
+
+impl Drop for TempFiles {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_dir_all(&self.build_dir);
+        }
+    }
+}
+
+/// The sorted runs of one column on disk: at most `fan_in - 1` queued at
+/// each level, a level's runs merged into one run of the next level as
+/// soon as there are `fan_in` of them, so the files alive and the names
+/// held are bounded by the fan-in and the levels, not by the input. A run
+/// is named by its level and a number the level hands out in order.
+struct Runs<'t> {
+    temps: &'t TempFiles,
+    column: usize,
+    fan_in: usize,
+    levels: Vec<Level>,
+    live: usize,
+}
+
+#[derive(Default)]
+struct Level {
+    /// The number the level's next run takes
+    next: usize,
+    /// The runs of the level not yet merged, oldest first
+    queued: VecDeque<usize>,
+}
+
+impl<'t> Runs<'t> {
+    fn new(temps: &'t TempFiles, column: usize, fan_in: usize) -> Self {
+        Self {
+            temps,
+            column,
+            fan_in,
+            levels: Vec::new(),
+            live: 0,
+        }
+    }
+
+    fn path(&self, level: usize, number: usize) -> PathBuf {
+        self.temps.run_path(self.column, level, number)
+    }
+
+    /// The path the next run of `level` takes; `added` records it once
+    /// it is written
+    fn next_path(&mut self, level: usize) -> PathBuf {
+        if self.levels.len() <= level {
+            self.levels.resize_with(level + 1, Level::default);
+        }
+        self.path(level, self.levels[level].next)
+    }
+
+    /// The run at `next_path(level)` was written; merges the level
+    /// upward while it is full.
+    fn added(
+        &mut self,
+        level: usize,
+        budget: &Budget,
+        report: &mut BuildReport,
+    ) -> std::io::Result<()> {
+        let mut level = level;
+        loop {
+            let number = self.levels[level].next;
+            self.levels[level].next += 1;
+            self.levels[level].queued.push_back(number);
+            self.live += 1;
+            report.max_live_runs = report.max_live_runs.max(self.live);
+            if self.levels[level].queued.len() < self.fan_in {
+                return Ok(());
+            }
+            let inputs: Vec<PathBuf> = self.levels[level]
+                .queued
+                .iter()
+                .map(|&n| self.path(level, n))
+                .collect();
+            let target = self.next_path(level + 1);
+            self.merge_into(&inputs, &target, budget, report)?;
+            self.levels[level].queued.clear();
+            self.live -= inputs.len();
+            level += 1;
+        }
+    }
+
+    fn merge_into(
+        &mut self,
+        inputs: &[PathBuf],
+        target: &Path,
+        budget: &Budget,
+        report: &mut BuildReport,
+    ) -> std::io::Result<()> {
+        let names = budget.take(
+            inputs.iter().map(|p| p.capacity()).sum::<usize>() + std::mem::size_of_val(inputs),
+            "run names",
+        )?;
+        let sink_buffer = budget.take(OUT_BUFFER_BYTES, "merge output buffer")?;
+        let mut sink = RunSink::create(target)?;
+        merge_runs(inputs, budget, report, |key, pos| sink.push(key, pos))?;
+        sink.finish()?;
+        drop(sink_buffer);
+        drop(names);
+        for input in inputs {
+            std::fs::remove_file(input)?;
+        }
+        report.merge_passes += 1;
+        Ok(())
+    }
+
+    /// Every run alive as `(level, number)`, oldest level first
+    fn all(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (level, l) in self.levels.iter().enumerate() {
+            for &n in &l.queued {
+                out.push((level, n));
+            }
+        }
+        out
+    }
+
+    /// Merges runs together until at most `fan_in` are left, and returns
+    /// their paths
+    fn settle(
+        &mut self,
+        budget: &Budget,
+        report: &mut BuildReport,
+    ) -> std::io::Result<Vec<PathBuf>> {
+        loop {
+            let all = self.all();
+            if all.len() <= self.fan_in {
+                return Ok(all.iter().map(|&(l, n)| self.path(l, n)).collect());
+            }
+            // The oldest `fan_in` runs go into a new run at the top level
+            let taken: Vec<(usize, usize)> = all.into_iter().take(self.fan_in).collect();
+            let inputs: Vec<PathBuf> = taken.iter().map(|&(l, n)| self.path(l, n)).collect();
+            let top = self.levels.len();
+            let target = self.next_path(top);
+            self.merge_into(&inputs, &target, budget, report)?;
+            for (l, n) in taken {
+                self.levels[l].queued.retain(|&q| q != n);
+            }
+            self.live -= inputs.len();
+            self.added(top, budget, report)?;
+        }
+    }
+}
+
+/// Writes the side file at `path` for `columns`, under `workspace_bytes`
+/// of memory for everything the build holds at once: the sort run, the
+/// page writer, the output buffer, the spilled runs' names, merge readers
+/// and heap, and the page metadata of every column built so far. Pairs
+/// are sorted in runs that fit, runs are spilled next to the file and
+/// merged upward as they accumulate, in a fan-in the workspace and a
+/// descriptor ceiling bound. Written whole to a temporary file and renamed
+/// into place, with its generation in the header; a failure at any step
+/// removes the files the build created and keeps what was published.
+pub fn build_side_file(
+    path: &Path,
+    generation: u64,
+    columns: Vec<ColumnInput<'_>>,
+    workspace_bytes: usize,
+) -> std::io::Result<BuildReport> {
+    if workspace_bytes < MIN_WORKSPACE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "side index build needs at least {MIN_WORKSPACE_BYTES} bytes of workspace, {workspace_bytes} given"
+            ),
+        ));
+    }
+    let started = std::time::Instant::now();
+    let budget = Budget::new(workspace_bytes);
+    let mut report = BuildReport::default();
+    // The output buffer and the writer's page buffers live for the build,
+    // and so do the directory's columns and their metadata charges, one
+    // slot per input column, taken before either vector is allocated
+    let fixed = budget.take(OUT_BUFFER_BYTES + WRITER_BYTES, "output and page buffers")?;
+    let per_column = budget.take(columns.len() * COLUMN_SLOT_BYTES, "the directory's columns")?;
+    let temps = TempFiles::new(path, generation)?;
+    let tmp = temps.tmp_path();
+    let mut out = BufWriter::with_capacity(OUT_BUFFER_BYTES, std::fs::File::create(&tmp)?);
+    out.write_all(&MAGIC)?;
+    out.write_all(&VERSION.to_le_bytes())?;
+    out.write_all(&generation.to_le_bytes())?;
+    let mut offset = HEADER_LEN;
+    let mut directory = Directory {
+        generation,
+        columns: Vec::with_capacity(columns.len()),
+    };
+    // The reservations of the columns' page metadata, kept while the
+    // directory is
+    let mut meta_charges: Vec<Charge<'_>> = Vec::with_capacity(columns.len());
+    for (ci, input) in columns.into_iter().enumerate() {
+        // What this column may spend: the workspace less what earlier
+        // columns still hold, less a merge's fixed costs, less the page
+        // metadata this column will need (a quarter of the rest when the
+        // input gives no bound)
+        let hint = input.pairs.size_hint().1;
+        let left = budget.left();
+        let after_sink = left.checked_sub(OUT_BUFFER_BYTES).ok_or_else(|| {
+            workspace_exceeded(
+                "a merge output buffer",
+                OUT_BUFFER_BYTES,
+                budget.used.get(),
+                workspace_bytes,
+            )
+        })?;
+        let allowance = match hint {
+            Some(rows) => metadata_allowance(rows),
+            None => after_sink / 4,
+        };
+        let for_runs = after_sink.checked_sub(allowance).ok_or_else(|| {
+            workspace_exceeded(
+                "page metadata",
+                allowance,
+                budget.used.get(),
+                workspace_bytes,
+            )
+        })?;
+        // The sort run and a cascade merge's inputs are alive together, so
+        // the merge inputs take at most half of what is left and the run
+        // the rest
+        let per_input = MERGE_READ_BYTES + MERGE_INPUT_BYTES;
+        let fan_in = ((for_runs / 2) / per_input).clamp(MIN_FAN_IN, MAX_FAN_IN);
+        let free = for_runs.saturating_sub(fan_in * per_input);
+        let run_capacity = free / PAIR_BYTES;
+        if run_capacity < MIN_RUN_PAIRS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "side index build: {left} bytes of workspace left for column {} cannot hold {fan_in} merge inputs and a sort run of {MIN_RUN_PAIRS} pairs beside its page metadata of {allowance} bytes",
+                    input.column
+                ),
+            ));
+        }
+        // A run holds what the workspace allows, or fewer when the input
+        // says it is smaller, so a small column reserves what it needs
+        let run_len = run_capacity.min(hint.unwrap_or(run_capacity).max(MIN_RUN_PAIRS));
+        let run_charge = budget.take(run_len * PAIR_BYTES, "a sort run")?;
+        let mut pairs: Vec<(i64, u32)> = Vec::with_capacity(run_len);
+        let mut runs = Runs::new(&temps, ci, fan_in);
+        for (pos, key) in input.pairs {
+            if pairs.len() == run_len {
+                pairs.sort_unstable();
+                let run = runs.next_path(0);
+                spill(&run, &pairs, &budget)?;
+                report.runs_spilled += 1;
+                runs.added(0, &budget, &mut report)?;
+                pairs.clear();
+            }
+            pairs.push((key, pos));
+        }
+        pairs.sort_unstable();
+        let mut writer = PageWriter::new(&mut out, offset, input.column, &budget);
+        if runs.live == 0 {
+            for &(key, pos) in &pairs {
+                writer.push(key, pos)?;
+            }
+            drop(pairs);
+            drop(run_charge);
+        } else {
+            let run = runs.next_path(0);
+            spill(&run, &pairs, &budget)?;
+            report.runs_spilled += 1;
+            runs.added(0, &budget, &mut report)?;
+            drop(pairs);
+            drop(run_charge);
+            let inputs = runs.settle(&budget, &mut report)?;
+            let names = budget.take(
+                inputs.iter().map(|p| p.capacity()).sum::<usize>()
+                    + inputs.capacity() * std::mem::size_of::<PathBuf>(),
+                "run names",
+            )?;
+            merge_runs(&inputs, &budget, &mut report, |key, pos| {
+                writer.push(key, pos)
+            })?;
+            drop(names);
+            for input in &inputs {
+                std::fs::remove_file(input)?;
+            }
+        }
+        let (column_dir, next_offset, metas) = writer.finish()?;
+        meta_charges.push(metas);
+        report.keys += column_dir.n_keys;
+        report.positions += column_dir.n_positions;
+        report.key_pages += column_dir.key_pages.len();
+        report.pos_pages += column_dir.pos_pages.len();
+        directory.columns.push(column_dir);
+        offset = next_offset;
+    }
+    let dir_len = directory.encoded_len();
+    let dir_charge = budget.take(dir_len, "the encoded directory")?;
+    let mut dir = Vec::with_capacity(dir_len);
+    directory.encode_into(&mut dir);
+    out.write_all(&dir)?;
+    out.write_all(&offset.to_le_bytes())?;
+    out.write_all(&(dir.len() as u32).to_le_bytes())?;
+    out.write_all(&crc32fast::hash(&dir).to_le_bytes())?;
+    out.write_all(&MAGIC)?;
+    out.flush()?;
+    let file = out.into_inner().map_err(|e| e.into_error())?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    temps.finished();
+    drop(dir);
+    drop(dir_charge);
+    drop(meta_charges);
+    drop(per_column);
+    drop(fixed);
+    report.file_bytes = offset + dir_len as u64 + FOOTER_LEN;
+    report.workspace_peak = budget.peak.get();
+    report.build_ns = started.elapsed().as_nanos() as u64;
+    Ok(report)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test fails the spill with this number (from one) on its thread
+    static FAIL_SPILL: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    static SPILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn spill(run: &Path, pairs: &[(i64, u32)], budget: &Budget) -> std::io::Result<()> {
+    let _buffer = budget.take(OUT_BUFFER_BYTES, "a spill buffer")?;
+    #[cfg(test)]
+    {
+        let number = SPILLS.with(|s| {
+            s.set(s.get() + 1);
+            s.get()
+        });
+        if FAIL_SPILL.with(|f| f.get()) == Some(number) {
+            return Err(std::io::Error::other("spill failed by the test"));
+        }
+    }
+    let mut sink = RunSink::create(run)?;
+    for &(key, pos) in pairs {
+        sink.push(key, pos)?;
+    }
+    sink.finish()
+}
+
+/// Merges `runs` in key order into `emit`, one reader per run; the
+/// readers, their buffers and the heap are taken from the budget for the
+/// merge's life.
+fn merge_runs(
+    runs: &[PathBuf],
+    budget: &Budget,
+    report: &mut BuildReport,
+    mut emit: impl FnMut(i64, u32) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let _inputs = budget.take(
+        runs.len() * (MERGE_READ_BYTES + std::mem::size_of::<RunReader>() + MERGE_HEAP_ENTRY),
+        "merge inputs",
+    )?;
+    report.max_fan_in = report.max_fan_in.max(runs.len());
+    let mut readers: Vec<RunReader> = Vec::with_capacity(runs.len());
+    for run in runs {
+        readers.push(RunReader::open(run)?);
+    }
+    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<((i64, u32), usize)>> =
+        std::collections::BinaryHeap::with_capacity(runs.len());
+    for (i, reader) in readers.iter_mut().enumerate() {
+        if let Some(pair) = reader.next_pair()? {
+            heap.push(std::cmp::Reverse((pair, i)));
+        }
+    }
+    while let Some(std::cmp::Reverse(((key, pos), i))) = heap.pop() {
+        emit(key, pos)?;
+        if let Some(pair) = readers[i].next_pair()? {
+            heap.push(std::cmp::Reverse((pair, i)));
+        }
+    }
+    Ok(())
+}
+
+struct RunSink {
+    out: BufWriter<std::fs::File>,
+}
+
+impl RunSink {
+    fn create(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            out: BufWriter::with_capacity(OUT_BUFFER_BYTES, std::fs::File::create(path)?),
+        })
+    }
+
+    fn push(&mut self, key: i64, pos: u32) -> std::io::Result<()> {
+        self.out.write_all(&key.to_le_bytes())?;
+        self.out.write_all(&pos.to_le_bytes())
+    }
+
+    fn finish(mut self) -> std::io::Result<()> {
+        self.out.flush()
+    }
+}
+
+struct RunReader {
+    reader: std::io::BufReader<std::fs::File>,
+}
+
+impl RunReader {
+    fn open(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            reader: std::io::BufReader::with_capacity(MERGE_READ_BYTES, std::fs::File::open(path)?),
+        })
+    }
+
+    fn next_pair(&mut self) -> std::io::Result<Option<(i64, u32)>> {
+        if self.reader.fill_buf()?.is_empty() {
+            return Ok(None);
+        }
+        let mut key = [0u8; 8];
+        let mut pos = [0u8; 4];
+        self.reader.read_exact(&mut key)?;
+        self.reader.read_exact(&mut pos)?;
+        Ok(Some((i64::from_le_bytes(key), u32::from_le_bytes(pos))))
+    }
+}
+
+/// Streams `(key, position)` pairs in order into key and position pages.
+/// Its page buffers are part of the build's fixed charge; the page
+/// metadata it collects is taken from the budget as it grows.
+struct PageWriter<'a, 'b, W: Write> {
+    out: &'a mut W,
+    offset: u64,
+    column: u32,
+    key_page: Vec<(i64, u64)>,
+    key_page_first_key_index: u64,
+    key_page_pos_start: u64,
+    pos_page: Vec<u32>,
+    pos_page_start: u64,
+    body: Vec<u8>,
+    key_pages: Vec<KeyPageMeta>,
+    pos_pages: Vec<PosPageMeta>,
+    metas: Charge<'b>,
+    current: Option<i64>,
+    n_keys: u64,
+    n_positions: u64,
+}
+
+impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
+    fn new(out: &'a mut W, offset: u64, column: u32, budget: &'b Budget) -> Self {
+        Self {
+            out,
+            offset,
+            column,
+            key_page: Vec::with_capacity(KEYS_PER_PAGE),
+            key_page_first_key_index: 0,
+            key_page_pos_start: 0,
+            pos_page: Vec::with_capacity(POSITIONS_PER_PAGE),
+            pos_page_start: 0,
+            body: Vec::with_capacity(PAGE_BYTES),
+            key_pages: Vec::new(),
+            pos_pages: Vec::new(),
+            metas: Charge {
+                bytes: 0,
+                budget,
+                global: INDEX_PAGES.reserve(0),
+            },
+            current: None,
+            n_keys: 0,
+            n_positions: 0,
+        }
+    }
+
+    fn push(&mut self, key: i64, pos: u32) -> std::io::Result<()> {
+        match self.current {
+            Some(k) if k == key => {}
+            Some(k) => {
+                if k > key {
+                    return Err(invalid("pairs out of order"));
+                }
+                self.close_key(k)?;
+                self.current = Some(key);
+            }
+            None => self.current = Some(key),
+        }
+        if self.pos_page.len() == POSITIONS_PER_PAGE {
+            self.flush_pos_page()?;
+        }
+        self.pos_page.push(pos);
+        self.n_positions += 1;
+        Ok(())
+    }
+
+    fn close_key(&mut self, key: i64) -> std::io::Result<()> {
+        if self.n_positions > u32::MAX as u64 {
+            return Err(invalid("more positions than a volume can hold"));
+        }
+        if self.key_page.len() == KEYS_PER_PAGE {
+            self.flush_key_page()?;
+        }
+        self.key_page.push((key, self.n_positions));
+        self.n_keys += 1;
+        Ok(())
+    }
+
+    fn write_page(&mut self) -> std::io::Result<(u64, u32)> {
+        let crc = crc32fast::hash(&self.body);
+        self.out.write_all(&self.body)?;
+        self.out.write_all(&crc.to_le_bytes())?;
+        let at = self.offset;
+        let len = (self.body.len() + 4) as u32;
+        self.offset += len as u64;
+        Ok((at, len))
+    }
+
+    /// Takes the growth of a metadata vector from the budget before it
+    /// is pushed to
+    fn reserve_meta<T>(metas: &mut Charge<'_>, vec: &mut Vec<T>) -> std::io::Result<()> {
+        if vec.len() == vec.capacity() {
+            let grown = vec.capacity().max(4) * 2;
+            metas.grow(
+                (grown - vec.capacity()) * std::mem::size_of::<T>(),
+                "page metadata",
+            )?;
+            vec.reserve_exact(grown - vec.len());
+        }
+        Ok(())
+    }
+
+    fn flush_key_page(&mut self) -> std::io::Result<()> {
+        if self.key_page.is_empty() {
+            return Ok(());
+        }
+        self.body.clear();
+        self.body
+            .extend_from_slice(&(self.key_page.len() as u32).to_le_bytes());
+        for (key, end) in &self.key_page {
+            self.body.extend_from_slice(&key.to_le_bytes());
+            self.body.extend_from_slice(&(*end as u32).to_le_bytes());
+        }
+        let (offset, len) = self.write_page()?;
+        let first_key = self.key_page[0].0;
+        let last = self.key_page[self.key_page.len() - 1];
+        Self::reserve_meta(&mut self.metas, &mut self.key_pages)?;
+        self.key_pages.push(KeyPageMeta {
+            first_key,
+            last_key: last.0,
+            offset,
+            len,
+            key_start: self.key_page_first_key_index,
+            pos_start: self.key_page_pos_start,
+        });
+        self.key_page_first_key_index += self.key_page.len() as u64;
+        self.key_page_pos_start = last.1;
+        self.key_page.clear();
+        Ok(())
+    }
+
+    fn flush_pos_page(&mut self) -> std::io::Result<()> {
+        if self.pos_page.is_empty() {
+            return Ok(());
+        }
+        self.body.clear();
+        self.body
+            .extend_from_slice(&(self.pos_page.len() as u32).to_le_bytes());
+        for pos in &self.pos_page {
+            self.body.extend_from_slice(&pos.to_le_bytes());
+        }
+        let (offset, len) = self.write_page()?;
+        Self::reserve_meta(&mut self.metas, &mut self.pos_pages)?;
+        self.pos_pages.push(PosPageMeta {
+            offset,
+            len,
+            pos_start: self.pos_page_start,
+        });
+        self.pos_page_start += self.pos_page.len() as u64;
+        self.pos_page.clear();
+        Ok(())
+    }
+
+    /// The column's directory, the offset after its pages, and the charge
+    /// of the directory's vectors, which the caller keeps for as long as
+    /// it keeps them
+    fn finish(mut self) -> std::io::Result<(ColumnDirectory, u64, Charge<'b>)> {
+        if let Some(key) = self.current.take() {
+            self.close_key(key)?;
+        }
+        self.flush_pos_page()?;
+        self.flush_key_page()?;
+        let column = ColumnDirectory {
+            column: self.column,
+            n_keys: self.n_keys,
+            n_positions: self.n_positions,
+            key_pages: std::mem::take(&mut self.key_pages),
+            pos_pages: std::mem::take(&mut self.pos_pages),
+        };
+        let budget = self.metas.budget;
+        let metas = std::mem::replace(
+            &mut self.metas,
+            Charge {
+                bytes: 0,
+                budget,
+                global: INDEX_PAGES.reserve(0),
+            },
+        );
+        Ok((column, self.offset, metas))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    /// A counting allocator for the tests of this binary: live and peak
+    /// bytes per thread, so a build's or a lookup's allocations are
+    /// measured on the thread that makes them, whatever other tests do
+    #[cfg(not(feature = "mimalloc"))]
+    mod counting {
+        use std::alloc::{GlobalAlloc, Layout, System};
+        use std::cell::Cell;
+
+        pub struct Counting;
+
+        thread_local! {
+            static LIVE: Cell<usize> = const { Cell::new(0) };
+            static PEAK: Cell<usize> = const { Cell::new(0) };
+        }
+
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                let _ = LIVE.try_with(|live| {
+                    let now = live.get() + layout.size();
+                    live.set(now);
+                    let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+                });
+                unsafe { System.alloc(layout) }
+            }
+
+            unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+                let _ = LIVE.try_with(|live| live.set(live.get().saturating_sub(layout.size())));
+                unsafe { System.dealloc(ptr, layout) }
+            }
+        }
+
+        #[global_allocator]
+        static COUNTING: Counting = Counting;
+
+        /// Starts the thread's peak from its live bytes now
+        pub fn mark() -> usize {
+            LIVE.with(|live| {
+                let now = live.get();
+                PEAK.with(|peak| peak.set(now));
+                now
+            })
+        }
+
+        /// The most bytes live on this thread since `mark`, above it
+        pub fn peak_since(mark: usize) -> usize {
+            PEAK.with(|peak| peak.get().saturating_sub(mark))
+        }
+    }
+
+    /// Bytes a build or a lookup may allocate beyond its ledger: the
+    /// strings of file names and open calls, and the iterator's box
+    #[cfg(not(feature = "mimalloc"))]
+    const ALLOC_SLACK: usize = 32 * 1024;
+
+    fn build(path: &Path, pairs: Vec<(u32, i64)>, workspace: usize) -> BuildReport {
+        build_side_file(
+            path,
+            next_generation(),
+            vec![ColumnInput {
+                column: 1,
+                pairs: Box::new(pairs.into_iter()),
+            }],
+            workspace,
+        )
+        .unwrap()
+    }
+
+    fn all_positions(file: &IndexFile, range: (u64, u64), window: usize) -> Vec<u32> {
+        let mut cursor = file.cursor(1, range, window);
+        let mut out = Vec::new();
+        while let Some(w) = cursor.next_window().unwrap() {
+            assert!(w.windows(2).all(|p| p[0] <= p[1]), "a window is sorted");
+            assert!(w.len() <= window);
+            out.extend_from_slice(w);
+        }
+        out
+    }
+
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".build-") || n.ends_with(".tmp"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Positions `0..rows` with scattered keys, as a streaming iterator
+    fn scattered(rows: u32, modulus: u64) -> impl Iterator<Item = (u32, i64)> {
+        (0..rows).map(move |p| (p, ((p as u64 * 104_729) % modulus) as i64))
+    }
+
+    /// The same, without an upper size bound
+    struct Unbounded<I: Iterator>(I);
+
+    impl<I: Iterator> Iterator for Unbounded<I> {
+        type Item = I::Item;
+        fn next(&mut self) -> Option<Self::Item> {
+            self.0.next()
+        }
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            (0, None)
+        }
+    }
+
+    const WORKSPACE: usize = 64 * 1024 * 1024;
+
+    #[test]
+    fn keys_map_to_their_positions_through_pages() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        // 50,000 rows, key = row % 977 so every key has about 51 positions
+        let pairs: Vec<(u32, i64)> = (0..50_000u32).map(|p| (p, (p % 977) as i64)).collect();
+        let report = build(&path, pairs.clone(), WORKSPACE);
+        assert_eq!(report.keys, 977);
+        assert_eq!(report.positions, 50_000);
+        assert_eq!(report.runs_spilled, 0);
+        assert!(report.pos_pages >= 50_000 / POSITIONS_PER_PAGE);
+        let file = IndexFile::open(&path, 1).unwrap();
+        for key in [0i64, 1, 500, 976] {
+            let range = file.equal(1, key).unwrap().unwrap();
+            let want: Vec<u32> = pairs
+                .iter()
+                .filter(|(_, k)| *k == key)
+                .map(|(p, _)| *p)
+                .collect();
+            assert_eq!(all_positions(&file, range, 7), want, "key {key}");
+        }
+        assert_eq!(file.equal(1, 977).unwrap(), None);
+        assert_eq!(file.equal(1, -1).unwrap(), None);
+        let range = file.range(1, 100, 103).unwrap();
+        let mut want: Vec<u32> = pairs
+            .iter()
+            .filter(|(_, k)| (100..=103).contains(k))
+            .map(|(p, _)| *p)
+            .collect();
+        want.sort_unstable();
+        let mut got = all_positions(&file, range, 1000);
+        got.sort_unstable();
+        assert_eq!(got, want);
+        assert!(file.candidate_bound(1, 100, 103).unwrap() >= want.len() as u64);
+        assert_eq!(file.range(1, 2000, 3000).unwrap(), (0, 0));
+        assert_eq!(file.candidate_bound(1, 2000, 3000).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_key_with_a_million_positions_spans_pages_and_a_window_holds_a_bounded_slice() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let n = 1_000_000u32;
+        let pairs: Vec<(u32, i64)> = (0..n).map(|p| (p, 42)).chain([(n, 43)]).collect();
+        let report = build(&path, pairs, WORKSPACE);
+        assert_eq!(report.keys, 2);
+        assert!(
+            report.pos_pages > 100,
+            "{} position pages",
+            report.pos_pages
+        );
+        INDEX_PAGES.clear();
+        let baseline = INDEX_PAGES.stats().charged_bytes;
+        let file = IndexFile::open(&path, 2).unwrap();
+        let range = file.equal(1, 42).unwrap().unwrap();
+        assert_eq!(range, (0, n as u64));
+        // Eight pages of budget over the directory: the walk over 4 MB of
+        // positions must fit in it, holding one page and one window at a
+        // time; the high-water mark sees every charge, not the state
+        // between calls
+        let budget = INDEX_PAGES.stats().charged_bytes + 8 * PAGE_BYTES;
+        INDEX_PAGES.set_budget_bytes(budget as u64);
+        INDEX_PAGES.reset_peak();
+        let over_before = INDEX_PAGES.stats().over_budget;
+        let mut cursor = file.cursor(1, range, 4096);
+        let mut seen = 0u64;
+        while let Some(w) = cursor.next_window().unwrap() {
+            assert_eq!(w[0] as u64, seen);
+            seen += w.len() as u64;
+        }
+        assert_eq!(seen, n as u64);
+        let peak = INDEX_PAGES.stats().peak_bytes;
+        assert!(peak <= budget, "peak charged {peak} within budget {budget}");
+        assert_eq!(
+            INDEX_PAGES.stats().over_budget,
+            over_before,
+            "no load went over budget"
+        );
+        assert_eq!(file.equal(1, 43).unwrap(), Some((n as u64, n as u64 + 1)));
+        drop(cursor);
+        drop(file);
+        INDEX_PAGES.clear();
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+        assert_eq!(INDEX_PAGES.stats().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn a_page_is_charged_at_the_capacity_of_its_vectors_and_its_raw_bytes_only_while_parsed() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let pairs: Vec<(u32, i64)> = (0..100_000u32).map(|p| (p, p as i64)).collect();
+        build(&path, pairs, WORKSPACE);
+        INDEX_PAGES.clear();
+        let baseline = INDEX_PAGES.stats().charged_bytes;
+        let file = IndexFile::open(&path, 7).unwrap();
+        let directory_bytes = INDEX_PAGES.stats().charged_bytes - baseline;
+        assert_eq!(directory_bytes, file.directory().bytes());
+        INDEX_PAGES.reset_peak();
+        let key_page = INDEX_PAGES.load(&file, 1, PageKind::Keys, 0).unwrap();
+        let PageContent::Keys { keys, ends } = key_page.content() else {
+            panic!("key page")
+        };
+        assert_eq!(keys.len(), KEYS_PER_PAGE, "a full key page");
+        assert_eq!(
+            key_page.bytes(),
+            keys.capacity() * 8 + ends.capacity() * 8,
+            "charged at the vectors' capacity, not the encoded length"
+        );
+        assert_eq!(
+            INDEX_PAGES.stats().charged_bytes,
+            baseline + directory_bytes + key_page.bytes(),
+            "the raw bytes were released after the parse"
+        );
+        assert_eq!(
+            INDEX_PAGES.stats().peak_bytes,
+            baseline + directory_bytes + key_page.bytes() + PAGE_BYTES,
+            "the raw page was charged while it was parsed"
+        );
+        let pos_page = INDEX_PAGES.load(&file, 1, PageKind::Positions, 0).unwrap();
+        let PageContent::Positions(positions) = pos_page.content() else {
+            panic!("position page")
+        };
+        assert_eq!(pos_page.bytes(), positions.capacity() * 4);
+        drop(key_page);
+        drop(pos_page);
+        drop(file);
+        INDEX_PAGES.clear();
+        assert_eq!(INDEX_PAGES.stats().charged_bytes, baseline);
+    }
+
+    #[test]
+    fn a_build_beyond_its_workspace_spills_runs_merges_them_upward_and_answers_the_same() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small.sidx");
+        let large = dir.path().join("large.sidx");
+        let pairs: Vec<(u32, i64)> = scattered(400_000, 20_011).collect();
+        // The minimum plus this input's page metadata
+        let workspace = MIN_WORKSPACE_BYTES + metadata_allowance(400_000);
+        let a = build(&small, pairs.clone(), workspace);
+        let b = build(&large, pairs, WORKSPACE);
+        assert!(a.runs_spilled > MAX_FAN_IN, "{} runs", a.runs_spilled);
+        assert!(a.merge_passes >= 2, "{} passes", a.merge_passes);
+        assert!(a.max_fan_in <= MAX_FAN_IN);
+        assert!(
+            a.max_live_runs <= a.max_fan_in * 12,
+            "{} runs alive at once with a fan-in of {}",
+            a.max_live_runs,
+            a.max_fan_in
+        );
+        assert!(
+            a.workspace_peak <= workspace,
+            "peak {} within the workspace {}",
+            a.workspace_peak,
+            workspace
+        );
+        assert_eq!(b.runs_spilled, 0);
+        assert_eq!(b.merge_passes, 0);
+        assert_eq!(
+            std::fs::read(&small).unwrap()[HEADER_LEN as usize..],
+            std::fs::read(&large).unwrap()[HEADER_LEN as usize..]
+        );
+        assert!(leftovers(dir.path()).is_empty());
+        let err = build_side_file(
+            &dir.path().join("tiny.sidx"),
+            next_generation(),
+            vec![ColumnInput {
+                column: 1,
+                pairs: Box::new(std::iter::empty()),
+            }],
+            MIN_WORKSPACE_BYTES - 1,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    /// The three shapes the review measured over the workspace, held to it
+    /// by the build's own ledger and checked against the allocator.
+    #[test]
+    fn a_workspace_bounds_the_whole_build_for_every_input_shape() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. One column of 1.2 million unique keys under the minimum: more
+        //    than a thousand runs, merged upward as they come
+        let path = dir.path().join("many-runs.sidx");
+        let workspace = MIN_WORKSPACE_BYTES + metadata_allowance(1_200_000);
+        #[cfg(not(feature = "mimalloc"))]
+        let mark = counting::mark();
+        let report = build_side_file(
+            &path,
+            next_generation(),
+            vec![ColumnInput {
+                column: 1,
+                pairs: Box::new(scattered(1_200_000, 1_200_001)),
+            }],
+            workspace,
+        )
+        .unwrap();
+        #[cfg(not(feature = "mimalloc"))]
+        {
+            let peak = counting::peak_since(mark);
+            assert!(
+                peak <= workspace + ALLOC_SLACK,
+                "many runs: allocator peak {peak} within {workspace} plus slack"
+            );
+        }
+        assert!(report.runs_spilled > 1000, "{} runs", report.runs_spilled);
+        assert!(report.workspace_peak <= workspace);
+        assert!(
+            report.max_live_runs <= report.max_fan_in * 12,
+            "{} runs alive with fan-in {}",
+            report.max_live_runs,
+            report.max_fan_in
+        );
+        let file = IndexFile::open(&path, 10).unwrap();
+        assert_eq!(
+            file.equal(1, ((777u64 * 104_729) % 1_200_001) as i64)
+                .unwrap()
+                .map(|(s, e)| e - s),
+            Some(1)
+        );
+
+        // 2. Three columns of 400,000 rows under 512 KiB: earlier columns'
+        //    metadata counts against the later ones
+        let path = dir.path().join("three.sidx");
+        let workspace = 512 * 1024;
+        #[cfg(not(feature = "mimalloc"))]
+        let mark = counting::mark();
+        let report = build_side_file(
+            &path,
+            next_generation(),
+            (1..=3)
+                .map(|c| ColumnInput {
+                    column: c,
+                    pairs: Box::new(scattered(400_000, 65_521 + c as u64)),
+                })
+                .collect(),
+            workspace,
+        )
+        .unwrap();
+        #[cfg(not(feature = "mimalloc"))]
+        {
+            let peak = counting::peak_since(mark);
+            assert!(
+                peak <= workspace + ALLOC_SLACK,
+                "three columns: allocator peak {peak} within {workspace} plus slack"
+            );
+        }
+        assert!(
+            report.workspace_peak <= workspace,
+            "{}",
+            report.workspace_peak
+        );
+        let file = IndexFile::open(&path, 11).unwrap();
+        for c in 1..=3usize {
+            assert!(file
+                .equal(c, ((5u64 * 104_729) % (65_521 + c as u64)) as i64)
+                .unwrap()
+                .is_some());
+        }
+
+        // 3. An input without a size bound: a quarter of the workspace is
+        //    kept for its metadata; the build either fits or refuses, and
+        //    never allocates past the workspace
+        let path = dir.path().join("unbounded.sidx");
+        #[cfg(not(feature = "mimalloc"))]
+        let mark = counting::mark();
+        let result = build_side_file(
+            &path,
+            next_generation(),
+            vec![ColumnInput {
+                column: 1,
+                pairs: Box::new(Unbounded(scattered(4_194_304, 4_194_301))),
+            }],
+            MIN_WORKSPACE_BYTES,
+        );
+        #[cfg(not(feature = "mimalloc"))]
+        {
+            let peak = counting::peak_since(mark);
+            assert!(
+                peak <= MIN_WORKSPACE_BYTES + ALLOC_SLACK,
+                "unbounded: allocator peak {peak} within {MIN_WORKSPACE_BYTES} plus slack"
+            );
+        }
+        match result {
+            Ok(report) => assert!(report.workspace_peak <= MIN_WORKSPACE_BYTES),
+            Err(err) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+                assert!(!path.exists(), "nothing was published");
+            }
+        }
+        assert!(
+            leftovers(dir.path()).is_empty(),
+            "{:?}",
+            leftovers(dir.path())
+        );
+        // The same input with its bound given builds under a workspace that
+        // holds its metadata
+        let hinted = build_side_file(
+            &path,
+            next_generation(),
+            vec![ColumnInput {
+                column: 1,
+                pairs: Box::new(scattered(4_194_304, 4_194_301)),
+            }],
+            MIN_WORKSPACE_BYTES + metadata_allowance(4_194_304),
+        )
+        .unwrap();
+        assert!(hinted.workspace_peak <= MIN_WORKSPACE_BYTES + metadata_allowance(4_194_304));
+    }
+
+    #[test]
+    fn a_failed_build_touches_nothing_but_its_own_directory() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha.sidx");
+        // A published file whose name looks like a build's leftovers, and
+        // a stray file with the target's name as a prefix
+        let lookalike = dir.path().join("alpha.sidx.run-backup.sidx");
+        build(
+            &lookalike,
+            (0..500u32).map(|p| (p, p as i64)).collect(),
+            WORKSPACE,
+        );
+        let stray = dir.path().join("alpha.sidx.tmp");
+        std::fs::write(&stray, b"not ours").unwrap();
+        SPILLS.with(|c| c.set(0));
+        FAIL_SPILL.with(|f| f.set(Some(1)));
+        let result = build_side_file(
+            &path,
+            next_generation(),
+            vec![ColumnInput {
+                column: 1,
+                pairs: Box::new(scattered(100_000, 100_003)),
+            }],
+            MIN_WORKSPACE_BYTES + metadata_allowance(100_000),
+        );
+        FAIL_SPILL.with(|f| f.set(None));
+        assert!(result.is_err());
+        assert!(!path.exists());
+        assert!(
+            IndexFile::open(&lookalike, 12)
+                .unwrap()
+                .equal(1, 7)
+                .unwrap()
+                .is_some(),
+            "the published lookalike still answers"
+        );
+        assert_eq!(std::fs::read(&stray).unwrap(), b"not ours");
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|e| !e
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".build-")),
+            "the build's own directory is gone"
+        );
+        // A directory already standing where the build's would be is not
+        // the build's: the build refuses and leaves it
+        let generation = next_generation();
+        let taken = dir.path().join(format!(
+            "alpha.sidx.build-{}-{generation:x}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&taken).unwrap();
+        std::fs::write(taken.join("out"), b"someone else's").unwrap();
+        let err = build_side_file(
+            &path,
+            generation,
+            vec![ColumnInput {
+                column: 1,
+                pairs: Box::new(std::iter::empty()),
+            }],
+            WORKSPACE,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(taken.join("out")).unwrap(), b"someone else's");
+    }
+
+    #[test]
+    fn a_relative_target_without_a_parent_builds_beside_itself_and_cleans_up() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // A bare name resolves to the current directory; the build is
+        // refused after its directory was created, and nothing stays
+        let name = format!("relative-{}.sidx", std::process::id());
+        let path = Path::new(&name);
+        let result = build_side_file(
+            path,
+            next_generation(),
+            vec![ColumnInput {
+                column: 1,
+                pairs: Box::new(Unbounded(scattered(4_194_304, 4_194_301))),
+            }],
+            MIN_WORKSPACE_BYTES,
+        );
+        assert!(result.is_err(), "refused for its metadata");
+        let stale: Vec<String> = std::fs::read_dir(".")
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(&name))
+            .collect();
+        assert!(stale.is_empty(), "{stale:?}");
+        // And a bare name builds and is found where it was asked for
+        build(
+            path,
+            (0..100u32).map(|p| (p, p as i64)).collect(),
+            WORKSPACE,
+        );
+        assert!(IndexFile::open(path, 13)
+            .unwrap()
+            .equal(1, 7)
+            .unwrap()
+            .is_some());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn the_directory_s_columns_are_taken_from_the_budget_before_they_are_allocated() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many-columns.sidx");
+        let empty = || {
+            (1..=2000u32)
+                .map(|c| ColumnInput {
+                    column: c,
+                    pairs: Box::new(std::iter::empty()),
+                })
+                .collect::<Vec<_>>()
+        };
+        // Under the minimum the 2,000 slots do not fit beside the buffers:
+        // refused before anything is allocated or created
+        #[cfg(not(feature = "mimalloc"))]
+        let mark = counting::mark();
+        let err =
+            build_side_file(&path, next_generation(), empty(), MIN_WORKSPACE_BYTES).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{err}");
+        #[cfg(not(feature = "mimalloc"))]
+        assert!(
+            counting::peak_since(mark)
+                <= 2000 * std::mem::size_of::<ColumnInput<'_>>() + ALLOC_SLACK,
+            "nothing beyond the inputs was allocated"
+        );
+        assert!(leftovers(dir.path()).is_empty());
+        // With room for the slots they build within the budget
+        let slots = 2000 * COLUMN_SLOT_BYTES;
+        let workspace = MIN_WORKSPACE_BYTES + slots + 2000 * metadata_allowance(0);
+        #[cfg(not(feature = "mimalloc"))]
+        let mark = counting::mark();
+        let report = build_side_file(&path, next_generation(), empty(), workspace).unwrap();
+        #[cfg(not(feature = "mimalloc"))]
+        {
+            let peak = counting::peak_since(mark);
+            assert!(
+                peak <= workspace + 2000 * std::mem::size_of::<ColumnInput<'_>>() + ALLOC_SLACK,
+                "many columns: allocator peak {peak} within {workspace} plus the inputs and slack"
+            );
+        }
+        assert!(report.workspace_peak <= workspace);
+        let file = IndexFile::open(&path, 14).unwrap();
+        assert_eq!(file.directory().columns.len(), 2000);
+    }
+
+    #[test]
+    fn a_fixed_workspace_holds_while_the_input_grows() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = 512 * 1024;
+        for rows in [50_000u32, 200_000, 800_000] {
+            let path = dir.path().join(format!("{rows}.sidx"));
+            let report = build(&path, scattered(rows, 65_521).collect(), workspace);
+            assert!(
+                report.workspace_peak <= workspace,
+                "{rows} rows: peak {} within {workspace}",
+                report.workspace_peak
+            );
+            assert!(report.max_fan_in <= MAX_FAN_IN);
+            let file = IndexFile::open(&path, 8).unwrap();
+            let probe_key = (12_345u64 * 104_729) % 65_521;
+            let (start, end) = file.equal(1, probe_key as i64).unwrap().unwrap();
+            assert_eq!(
+                (end - start) as usize,
+                (0..rows)
+                    .filter(|p| (*p as u64 * 104_729) % 65_521 == probe_key)
+                    .count()
+            );
+        }
+        assert!(leftovers(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_failed_spill_and_a_failed_finish_leave_no_temporary_file() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        build(
+            &path,
+            (0..1000u32).map(|p| (p, p as i64)).collect(),
+            WORKSPACE,
+        );
+        let published = std::fs::read(&path).unwrap();
+        // The second spill fails after the first succeeded
+        SPILLS.with(|c| c.set(0));
+        FAIL_SPILL.with(|f| f.set(Some(2)));
+        let pairs: Vec<(u32, i64)> = (0..300_000u32).map(|p| (p, (p % 1000) as i64)).collect();
+        let result = build_side_file(
+            &path,
+            next_generation(),
+            vec![ColumnInput {
+                column: 1,
+                pairs: Box::new(pairs.clone().into_iter()),
+            }],
+            MIN_WORKSPACE_BYTES + metadata_allowance(300_000),
+        );
+        FAIL_SPILL.with(|f| f.set(None));
+        assert!(result.is_err(), "the second spill fails");
+        assert!(
+            leftovers(dir.path()).is_empty(),
+            "{:?}",
+            leftovers(dir.path())
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            published,
+            "the published file is untouched"
+        );
+
+        // The final rename fails: the destination is a directory
+        let blocked = dir.path().join("blocked.sidx");
+        std::fs::create_dir(&blocked).unwrap();
+        let result = build_side_file(
+            &blocked,
+            next_generation(),
+            vec![ColumnInput {
+                column: 1,
+                pairs: Box::new(pairs.into_iter()),
+            }],
+            WORKSPACE,
+        );
+        assert!(result.is_err());
+        assert!(
+            leftovers(dir.path()).is_empty(),
+            "{:?}",
+            leftovers(dir.path())
+        );
+        INDEX_PAGES.clear();
+    }
+
+    #[test]
+    fn a_corrupt_page_fails_alone_and_a_corrupt_directory_fails_the_open() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let pairs: Vec<(u32, i64)> = (0..30_000u32).map(|p| (p, (p % 5000) as i64)).collect();
+        build(&path, pairs, WORKSPACE);
+        let good = std::fs::read(&path).unwrap();
+        let file = IndexFile::open(&path, 3).unwrap();
+        let second_pos_page = file.directory().column(1).unwrap().pos_pages[1].offset as usize + 10;
+        let mut bad = good.clone();
+        bad[second_pos_page] ^= 0xff;
+        std::fs::write(&path, &bad).unwrap();
+        INDEX_PAGES.clear();
+        // Key 1 lives in the first position page, key 1366 in the second
+        let range = file.equal(1, 1).unwrap().unwrap();
+        assert_eq!(
+            all_positions(&file, range, 100).len(),
+            6,
+            "the first page is intact"
+        );
+        let range = file.equal(1, 1366).unwrap().unwrap();
+        let mut cursor = file.cursor(1, range, 100);
+        let first = cursor.next_window().map(|w| w.map(|w| w.len()));
+        let err = first.unwrap_err();
+        assert!(err.to_string().contains("checksum"), "{err}");
+        let mut bad_dir = good.clone();
+        let len = bad_dir.len();
+        bad_dir[len - FOOTER_LEN as usize - 3] ^= 0x01;
+        std::fs::write(&path, &bad_dir).unwrap();
+        let err = match IndexFile::open(&path, 3) {
+            Err(err) => err,
+            Ok(_) => panic!("a corrupt directory opened"),
+        };
+        assert!(err.to_string().contains("directory checksum"), "{err}");
+        std::fs::write(&path, &good[..good.len() - 5]).unwrap();
+        assert!(IndexFile::open(&path, 3).is_err());
+    }
+
+    #[test]
+    fn a_page_read_after_the_file_was_replaced_reports_the_generation() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        build(
+            &path,
+            (0..1000u32).map(|p| (p, p as i64)).collect(),
+            WORKSPACE,
+        );
+        let old = IndexFile::open(&path, 4).unwrap();
+        build(
+            &path,
+            (0..1000u32).map(|p| (p, (p * 2) as i64)).collect(),
+            WORKSPACE,
+        );
+        INDEX_PAGES.clear();
+        let err = old.equal(1, 5).unwrap_err();
+        assert!(is_generation_changed(&err), "{err}");
+        let new = IndexFile::open(&path, 4).unwrap();
+        assert_ne!(new.generation(), old.generation());
+        assert_eq!(new.equal(1, 5).unwrap(), None);
+        assert!(new.equal(1, 10).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_held_page_stays_charged_after_its_eviction_and_the_budget_is_honoured_otherwise() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let pairs: Vec<(u32, i64)> = (0..200_000u32).map(|p| (p, (p % 40_000) as i64)).collect();
+        build(&path, pairs, WORKSPACE);
+        INDEX_PAGES.clear();
+        let baseline = INDEX_PAGES.stats();
+        let file = IndexFile::open(&path, 5).unwrap();
+        let directory_bytes = INDEX_PAGES.stats().charged_bytes - baseline.charged_bytes;
+        assert!(directory_bytes > 0);
+        // A budget of three pages above the baseline
+        INDEX_PAGES
+            .set_budget_bytes((baseline.charged_bytes + directory_bytes + 3 * PAGE_BYTES) as u64);
+        let held = INDEX_PAGES.load(&file, 1, PageKind::Positions, 0).unwrap();
+        let held_bytes = held.bytes();
+        let before = INDEX_PAGES.stats();
+        for page in 1..12 {
+            INDEX_PAGES
+                .load(&file, 1, PageKind::Positions, page)
+                .unwrap();
+        }
+        let after = INDEX_PAGES.stats();
+        assert!(
+            after.evictions > before.evictions,
+            "pages were evicted to stay in budget"
+        );
+        assert!(
+            after.charged_bytes as u64 <= after.budget_bytes,
+            "charged {} within budget {}",
+            after.charged_bytes,
+            after.budget_bytes
+        );
+        assert!(
+            after.charged_bytes >= directory_bytes + held_bytes,
+            "the held page's bytes are still charged"
+        );
+        let over_before = after.over_budget;
+        INDEX_PAGES.set_budget_bytes((baseline.charged_bytes + directory_bytes) as u64);
+        let stats = INDEX_PAGES.stats();
+        assert!(
+            stats.charged_bytes >= directory_bytes + held_bytes,
+            "a held page cannot be evicted"
+        );
+        INDEX_PAGES.load(&file, 1, PageKind::Positions, 20).unwrap();
+        assert!(
+            INDEX_PAGES.stats().over_budget > over_before,
+            "a load with nothing to evict is counted as over budget"
+        );
+        drop(held);
+        drop(file);
+        INDEX_PAGES.clear();
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+        assert_eq!(
+            INDEX_PAGES.stats().charged_bytes,
+            baseline.charged_bytes,
+            "everything released"
+        );
+    }
+
+    #[test]
+    fn statistics_reservations_and_evictions_do_not_wait_on_each_other() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let pairs: Vec<(u32, i64)> = (0..200_000u32).map(|p| (p, (p % 40_000) as i64)).collect();
+        build(&path, pairs, WORKSPACE);
+        INDEX_PAGES.clear();
+        let file = Arc::new(IndexFile::open(&path, 9).unwrap());
+        INDEX_PAGES.set_budget_bytes((INDEX_PAGES.stats().charged_bytes + 2 * PAGE_BYTES) as u64);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut workers = Vec::new();
+        for w in 0..4usize {
+            let file = Arc::clone(&file);
+            let done = Arc::clone(&done);
+            workers.push(std::thread::spawn(move || {
+                let mut i = 0usize;
+                while !done.load(Ordering::Relaxed) {
+                    match w % 2 {
+                        0 => {
+                            let _ = INDEX_PAGES.stats();
+                            let _ = INDEX_PAGES.reserve(1);
+                        }
+                        _ => {
+                            let page = (i * 7 + w) % 12;
+                            let _ = INDEX_PAGES
+                                .load(&file, 1, PageKind::Positions, page)
+                                .unwrap();
+                            if i.is_multiple_of(50) {
+                                INDEX_PAGES.clear();
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        done.store(true, Ordering::Relaxed);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for worker in workers {
+            while !worker.is_finished() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a worker is still blocked after the stop: statistics, reservations and evictions wait on each other"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            worker.join().unwrap();
+        }
+        drop(file);
+        INDEX_PAGES.clear();
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn a_range_bound_from_the_directory_is_never_below_the_exact_count() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let pairs: Vec<(u32, i64)> = (0..100_000u32).map(|p| (p, (p % 30_000) as i64)).collect();
+        build(&path, pairs.clone(), WORKSPACE);
+        let file = IndexFile::open(&path, 6).unwrap();
+        for (low, high) in [(0, 0), (10, 2050), (2040, 2050), (29_990, 40_000), (-5, 3)] {
+            let (start, end) = file.range(1, low, high).unwrap();
+            let exact = pairs
+                .iter()
+                .filter(|(_, k)| (low..=high).contains(k))
+                .count() as u64;
+            assert_eq!(end - start, exact, "range {low}..={high}");
+            assert!(file.candidate_bound(1, low, high).unwrap() >= exact);
+        }
+    }
+}
