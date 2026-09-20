@@ -55,6 +55,9 @@ Stoolap currently supports the following PRAGMA commands:
 | `hot_max_bytes` | Hot row bytes per table above which commits wait for a seal (0 = off) | 0 |
 | `group_cache_mb` | Budget of the decoded row group cache in MB (0 = bypass) | 64 |
 | `group_cache_stats` | Show the decoded row group cache's budget, size and hit counts | - |
+| `index_cache_mb` | Budget of the secondary index side file pages readers hold, in MB | 16 |
+| `index_build_mb` | Budget of the secondary index side file builds in flight, in MB | 64 |
+| `index_stats` | Show the secondary index ledgers, their refusals and build outcomes | - |
 | `memory_stats` | Show per-table hot and cold memory figures | - |
 
 #### checkpoint_interval
@@ -163,6 +166,33 @@ Returns one row with the cache's budget, current size, entry count and hit and m
 ```sql
 PRAGMA group_cache_stats;
 -- budget_bytes | bytes | entries | hits | misses
+```
+
+#### index_cache_mb
+
+Sets the budget of the secondary index side file pages readers hold and cache, process-wide. A page or cursor window the budget cannot take after evicting every unheld page is refused and counted; what a reader already holds is never revoked. Default: 16.
+
+```sql
+PRAGMA index_cache_mb = 64;
+PRAGMA index_cache_mb;              -- read current value in MB
+```
+
+#### index_build_mb
+
+Sets the budget shared by the side file builds in flight: a seal or compaction admits each build's whole workspace against it, and a build that does not fit is refused, leaving its volume without a side file until a compaction rewrites it. Default: 64.
+
+```sql
+PRAGMA index_build_mb = 128;
+PRAGMA index_build_mb;              -- read current value in MB
+```
+
+#### index_stats
+
+Returns one row per ledger of the secondary index side files: the page cache, the builds in flight and the resident directories, each with its budget, bytes charged now, the most charged at once, and how many requests it refused. The cache row carries its page counters; the builds row carries the builds that failed with an I/O error and the side files discarded because an index was created or dropped before their volume was published.
+
+```sql
+PRAGMA index_stats;
+-- ledger | budget_bytes | charged_bytes | peak_bytes | refused | cached_pages | loads | hits | evictions | over_budget | builds_failed | sides_discarded
 ```
 
 #### memory_stats

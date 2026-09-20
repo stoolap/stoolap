@@ -3203,9 +3203,11 @@ impl MVCCEngine {
             0,
             self.schema_epoch.load(Ordering::Acquire),
             file,
+            None,
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn register_volume_with_id_and_seal_seq(
         &self,
         table_name: &str,
@@ -3214,6 +3216,7 @@ impl MVCCEngine {
         seal_seq: u64,
         schema_version: u64,
         file: Option<Arc<crate::storage::volume::writer::VolumeFile>>,
+        side: Option<Arc<crate::storage::volume::secondary::IndexFile>>,
     ) {
         use crate::storage::volume::manifest::SegmentMeta;
         let mgr = self.get_or_create_segment_manager(table_name);
@@ -3242,6 +3245,7 @@ impl MVCCEngine {
             },
             schema,
             file,
+            side,
         );
         drop(schemas);
     }
@@ -3371,8 +3375,13 @@ impl MVCCEngine {
                 continue;
             }
 
-            let mut standalone: Vec<(u64, Arc<crate::storage::volume::writer::FrozenVolume>)> =
-                Vec::new();
+            // Each volume with its side file, opened with it
+            #[allow(clippy::type_complexity)]
+            let mut standalone: Vec<(
+                u64,
+                Arc<crate::storage::volume::writer::FrozenVolume>,
+                Option<Arc<crate::storage::volume::secondary::IndexFile>>,
+            )> = Vec::new();
 
             for path in paths {
                 let volume_id = parse_volume_id(&path);
@@ -3388,7 +3397,8 @@ impl MVCCEngine {
                 };
 
                 let stable_id = volume_id.unwrap_or(0);
-                standalone.push((stable_id, volume));
+                let side = crate::storage::volume::secondary::open_side_for(&path, stable_id);
+                standalone.push((stable_id, volume, side));
             }
 
             if standalone.is_empty() {
@@ -3398,13 +3408,13 @@ impl MVCCEngine {
             // Load volumes that are listed in the manifest. Orphan files
             // (not in manifest) are cleaned up.
             let mgr = self.get_or_create_segment_manager(&table_name);
-            for (stable_id, vol) in standalone {
+            for (stable_id, vol, side) in standalone {
                 if stable_id > 0 {
                     if mgr.has_segment(stable_id) {
                         continue;
                     }
                     // Only load if manifest lists this segment_id.
-                    if !mgr.load_volume_for_existing_segment(stable_id, Arc::clone(&vol)) {
+                    if !mgr.load_volume_for_existing_segment(stable_id, Arc::clone(&vol), side) {
                         // Orphan — not in manifest. Skip (file cleanup handled elsewhere).
                     }
                 }
@@ -3467,6 +3477,7 @@ impl MVCCEngine {
                 // without being deserialized.
                 if stable_id == 0 {
                     let _ = std::fs::remove_file(&path);
+                    crate::storage::volume::secondary::retire_side_of(&path);
                     continue;
                 }
                 if mgr.has_segment(stable_id) {
@@ -3474,6 +3485,7 @@ impl MVCCEngine {
                 }
                 if !mgr.manifest_has_segment(stable_id) {
                     let _ = std::fs::remove_file(&path);
+                    crate::storage::volume::secondary::retire_side_of(&path);
                     continue;
                 }
 
@@ -3488,7 +3500,8 @@ impl MVCCEngine {
                         continue;
                     }
                 };
-                mgr.load_volume_for_existing_segment(stable_id, volume);
+                let side = crate::storage::volume::secondary::open_side_for(&path, stable_id);
+                mgr.load_volume_for_existing_segment(stable_id, volume, side);
             }
             // Recompute visibility bitmaps after all volumes for this table are loaded.
             mgr.recompute_visibility();
@@ -6019,7 +6032,12 @@ impl MVCCEngine {
                 .get(table_name)
                 .cloned();
             let unique_columns = store
+                .as_ref()
                 .map(|store| store.get_unique_non_pk_index_columns())
+                .unwrap_or_default();
+            let definitions = store
+                .as_ref()
+                .map(|store| store.secondary_index_definitions())
                 .unwrap_or_default();
             if mgr.check_schema_generation(generation).is_err() {
                 continue;
@@ -6115,6 +6133,11 @@ impl MVCCEngine {
                             }
                         }
                     }
+                }
+                for (id, _) in volumes.iter() {
+                    crate::storage::volume::secondary::retire_side_of(
+                        &vol_table_dir.join(format!("vol_{:016x}.vol", id)),
+                    );
                 }
                 continue;
             }
@@ -6219,6 +6242,9 @@ impl MVCCEngine {
                 Arc<crate::storage::volume::writer::FrozenVolume>,
                 crate::storage::volume::manifest::SegmentMeta,
             )> = Vec::new();
+            // Each output's side file, built and opened with it
+            let mut new_sides: Vec<Option<Arc<crate::storage::volume::secondary::IndexFile>>> =
+                Vec::new();
             let mut prepare_error: Option<Error> = None;
 
             // The rows move column by column in bounded batches, each
@@ -6265,13 +6291,27 @@ impl MVCCEngine {
                         break 'prepare;
                     }
                 }
-                let compacted = match writer.finish() {
-                    Ok((volume, _path)) => volume,
+                let (compacted, compacted_path) = match writer.finish() {
+                    Ok(output) => output,
                     Err(error) => {
                         prepare_error = Some(error);
                         break 'prepare;
                     }
                 };
+                // An output that cannot be read back fails the rewrite
+                match crate::storage::volume::secondary::build_side_for(
+                    &compacted,
+                    &compacted_path,
+                    compact_vol_id,
+                    &definitions,
+                ) {
+                    Ok(side) => new_sides.push(side),
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&compacted_path);
+                        prepare_error = Some(error.into());
+                        break 'prepare;
+                    }
+                }
                 let (min_id, max_id) = compacted.id_bounds().unwrap_or((0, 0));
                 new_volumes.push((
                     compact_vol_id,
@@ -6307,16 +6347,33 @@ impl MVCCEngine {
             }
 
             if prepare_error.is_some() || new_volumes.is_empty() {
-                // Clean up any volumes we did write before failure
+                // Clean up any volumes we did write before failure, and
+                // their side files
                 let vol_table_dir = vol_dir.join(table_name);
+                drop(new_sides);
                 for (vid, _, _) in &new_volumes {
                     let fname = format!("vol_{:016x}.vol", vid);
-                    let _ = std::fs::remove_file(vol_table_dir.join(fname));
+                    let path = vol_table_dir.join(fname);
+                    let _ = std::fs::remove_file(&path);
+                    crate::storage::volume::secondary::retire_side_of(&path);
                 }
                 if let Some(error) = prepare_error {
                     return Err(error);
                 }
                 continue;
+            }
+
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::side_files_built();
+            // Index DDL since the definitions were captured makes the side
+            // files stale: the outputs are published uncovered
+            if store
+                .as_ref()
+                .is_some_and(|store| store.secondary_index_definitions() != definitions)
+            {
+                for side in new_sides.iter_mut().filter_map(Option::take) {
+                    crate::storage::volume::secondary::discard_side(side);
+                }
             }
 
             // Atomically register all new volumes and remove old segments.
@@ -6332,6 +6389,7 @@ impl MVCCEngine {
                     new_volumes,
                     &old_ids,
                     schemas.get(table_name).map(|s| &**s),
+                    new_sides,
                 );
             }
             // The volumes just written are in the key's order. They were
@@ -6386,6 +6444,13 @@ impl MVCCEngine {
                         }
                     }
                 }
+            }
+            // The inputs' side files go with them, each once its last
+            // holder lets go
+            for (id, _) in volumes.iter() {
+                crate::storage::volume::secondary::retire_side_of(
+                    &vol_table_dir.join(format!("vol_{:016x}.vol", id)),
+                );
             }
         }
 
@@ -6532,6 +6597,7 @@ impl MVCCEngine {
                 store.extract_for_seal(read_txn_id)
             };
             let unique_columns = store.get_unique_non_pk_index_columns();
+            let definitions = store.secondary_index_definitions();
             if mgr.check_schema_generation(generation).is_err() {
                 continue;
             }
@@ -6619,12 +6685,49 @@ impl MVCCEngine {
                     }
                 }
             }
+            // Each volume's secondary index side file, built and opened
+            // before the fence under the builds budget; a refused or
+            // failed build leaves its volume uncovered, and a volume that
+            // cannot be read back fails the seal as the prebuild does
+            let mut sealed_sides: Vec<Option<Arc<crate::storage::volume::secondary::IndexFile>>> =
+                Vec::with_capacity(sealed_volumes.len());
+            for (volume, path, volume_id) in &sealed_volumes {
+                match crate::storage::volume::secondary::build_side_for(
+                    volume,
+                    path,
+                    *volume_id,
+                    &definitions,
+                ) {
+                    Ok(side) => sealed_sides.push(side),
+                    Err(error) => {
+                        drop(sealed_sides);
+                        for (_, path, _) in &sealed_volumes {
+                            let _ = std::fs::remove_file(path);
+                            crate::storage::volume::secondary::retire_side_of(path);
+                        }
+                        return Err(error.into());
+                    }
+                }
+            }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::side_files_built();
+            // Side files found stale under the fence, discarded after it:
+            // their removal takes the file registry and the disk, and the
+            // room to hold them is taken here rather than under the fence
+            let mut stale_sides: Vec<Arc<crate::storage::volume::secondary::IndexFile>> =
+                Vec::with_capacity(sealed_sides.len());
             // Seal critical section under exclusive fence: register cold
             // segments + remove hot rows + remove hot index entries.
             // DML operations hold the shared fence, so they cannot race
             // between cold constraint checks and hot publication.
             {
                 let _seal_guard = mgr.acquire_seal_write();
+
+                // Index DDL since the definitions were captured makes the
+                // side files stale: the volumes are published uncovered
+                if store.secondary_index_definitions() != definitions {
+                    stale_sides.extend(sealed_sides.iter_mut().filter_map(Option::take));
+                }
 
                 mgr.set_seal_overlap(total_rows);
 
@@ -6635,8 +6738,10 @@ impl MVCCEngine {
                 let current_seal_seq = per_table_cutoff
                     .map(|s| s as u64)
                     .unwrap_or_else(|| self.registry.get_current_sequence() as u64);
-                for ((volume, _path, volume_id), file) in
-                    sealed_volumes.iter().zip(sealed_files.iter_mut())
+                for (((volume, _path, volume_id), file), side) in sealed_volumes
+                    .iter()
+                    .zip(sealed_files.iter_mut())
+                    .zip(sealed_sides.iter_mut())
                 {
                     self.register_volume_with_id_and_seal_seq(
                         &table_name,
@@ -6645,6 +6750,7 @@ impl MVCCEngine {
                         current_seal_seq,
                         sealed_schema_version,
                         file.take(),
+                        side.take(),
                     );
                 }
 
@@ -6697,6 +6803,9 @@ impl MVCCEngine {
                 }
 
                 // _seal_guard dropped here — DML unblocked
+            }
+            for side in stale_sides {
+                crate::storage::volume::secondary::discard_side(side);
             }
         }
 

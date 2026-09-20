@@ -4024,6 +4024,49 @@ impl VersionStore {
         result
     }
 
+    /// The columns a volume's side file indexes: each single-column
+    /// B-tree index on an INTEGER or TIMESTAMP column other than the
+    /// primary key, as the column's index and the index definition's
+    /// identity, in column order
+    pub fn secondary_index_definitions(&self) -> Vec<(usize, u64)> {
+        use crate::core::types::{DataType, IndexType};
+        let schema = self.schema();
+        let pk = schema.pk_column_index();
+        let indexes = self.indexes.read();
+        let mut result: Vec<(usize, u64)> = Vec::new();
+        for idx in indexes.values() {
+            if idx.index_type() != IndexType::BTree || idx.column_names().len() != 1 {
+                continue;
+            }
+            let name = &idx.column_names()[0];
+            let Some(column) = schema
+                .columns
+                .iter()
+                .position(|c| c.name_lower.eq_ignore_ascii_case(name))
+            else {
+                continue;
+            };
+            if pk == Some(column)
+                || !matches!(
+                    schema.columns[column].data_type,
+                    DataType::Integer | DataType::Timestamp
+                )
+            {
+                continue;
+            }
+            let definition = crate::storage::volume::secondary::definition_of(
+                name,
+                IndexType::BTree,
+                idx.is_unique(),
+            );
+            if !result.iter().any(|(c, _)| *c == column) {
+                result.push((column, definition));
+            }
+        }
+        result.sort_unstable();
+        result
+    }
+
     // =========================================================================
     // Zone Map Operations (Statistics for Segment Pruning)
     // =========================================================================
