@@ -496,6 +496,7 @@ impl VolumeFileWriter {
             unique_indices.insert(columns, Arc::new(entries));
         }
         Ok(FrozenVolume {
+            secondary: Arc::default(),
             columns: LazyColumns::deferred(store, column_types),
             meta: Arc::new(meta),
             unique_indices: Arc::new(parking_lot::RwLock::new(unique_indices)),

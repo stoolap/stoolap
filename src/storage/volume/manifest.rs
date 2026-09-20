@@ -1722,6 +1722,17 @@ impl SegmentManager {
                     *volume.unique_indices.write() =
                         std::mem::take(&mut *cs.volume.unique_indices.write());
                 }
+                // Prototype: the reloaded volume shares the entry's secondary indexes
+                if !Arc::ptr_eq(&volume.secondary, &cs.volume.secondary) {
+                    let held = cs.volume.secondary.indexes.read();
+                    if !held.is_empty() {
+                        volume
+                            .secondary
+                            .indexes
+                            .write()
+                            .extend(held.iter().map(|(col, index)| (*col, Arc::clone(index))));
+                    }
+                }
                 volume.inherit_row_order(&cs.volume);
                 volume.mark_accessed();
                 cs.volume = volume;
@@ -3242,6 +3253,17 @@ impl SegmentManager {
             && !cs.volume.unique_indices.read().is_empty()
         {
             *volume.unique_indices.write() = std::mem::take(&mut *cs.volume.unique_indices.write());
+        }
+        // Prototype: the reloaded volume shares the entry's secondary indexes
+        if !Arc::ptr_eq(&volume.secondary, &cs.volume.secondary) {
+            let held = cs.volume.secondary.indexes.read();
+            if !held.is_empty() {
+                volume
+                    .secondary
+                    .indexes
+                    .write()
+                    .extend(held.iter().map(|(col, index)| (*col, Arc::clone(index))));
+            }
         }
         volume.inherit_row_order(&cs.volume);
         // Put it back for everyone: the entry keeps its mapping and its

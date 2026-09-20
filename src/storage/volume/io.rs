@@ -441,6 +441,7 @@ fn read_volume_v4(
     let columns = LazyColumns::deferred(store, col_data_types);
 
     Ok(FrozenVolume {
+        secondary: std::sync::Arc::default(),
         columns,
         meta: Arc::new(super::writer::VolumeMeta {
             zone_maps: meta.zone_maps,
@@ -518,6 +519,8 @@ pub fn load_all_volumes(dir: &Path, table_name: &str) -> Result<Vec<Arc<FrozenVo
 
 /// Delete a specific volume file from disk.
 pub fn delete_volume(path: &Path) -> Result<()> {
+    // Prototype: the side index goes with the volume
+    let _ = std::fs::remove_file(super::secondary::side_path(path));
     super::writer::VolumeFile::retire_path(path).map_err(|e| {
         crate::core::Error::internal(format!("failed to delete volume {:?}: {}", path, e))
     })

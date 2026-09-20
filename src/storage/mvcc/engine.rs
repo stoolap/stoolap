@@ -528,6 +528,20 @@ impl Drop for AtomicBoolGuard<'_> {
 }
 
 /// Parse a volume ID from a `.vol` filename (e.g., `vol_00065f1a2b3c4d5e.vol` -> `0x00065f1a2b3c4d5e`).
+/// Prototype: adds the time from its creation to its drop to the seal
+/// fence counters
+struct FenceTimer(std::time::Instant);
+
+impl Drop for FenceTimer {
+    fn drop(&mut self) {
+        let counters = &crate::storage::volume::secondary::COUNTERS;
+        counters
+            .seal_fence_ns
+            .fetch_add(self.0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        counters.seal_fences.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn parse_volume_id(path: &std::path::Path) -> Option<u64> {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -6019,7 +6033,12 @@ impl MVCCEngine {
                 .get(table_name)
                 .cloned();
             let unique_columns = store
+                .as_ref()
                 .map(|store| store.get_unique_non_pk_index_columns())
+                .unwrap_or_default();
+            let secondary_columns = store
+                .as_ref()
+                .map(|store| store.get_secondary_index_columns())
                 .unwrap_or_default();
             if mgr.check_schema_generation(generation).is_err() {
                 continue;
@@ -6112,6 +6131,10 @@ impl MVCCEngine {
                                 // Through the registry, so a reader that
                                 // pinned this file keeps it until it lets go
                                 crate::storage::volume::writer::VolumeFile::shared(&path).retire();
+                                // Prototype: the side index goes with it
+                                let _ = std::fs::remove_file(
+                                    crate::storage::volume::secondary::side_path(&path),
+                                );
                             }
                         }
                     }
@@ -6266,7 +6289,19 @@ impl MVCCEngine {
                     }
                 }
                 let compacted = match writer.finish() {
-                    Ok((volume, _path)) => volume,
+                    Ok((volume, path)) => {
+                        // Prototype: the output's secondary indexes, beside it
+                        if let Err(error) =
+                            volume.build_secondary_indexes(&secondary_columns, &path)
+                        {
+                            prepare_error = Some(Error::internal(format!(
+                                "secondary index build for {:?} failed: {}",
+                                path, error
+                            )));
+                            break 'prepare;
+                        }
+                        volume
+                    }
                     Err(error) => {
                         prepare_error = Some(error);
                         break 'prepare;
@@ -6382,6 +6417,10 @@ impl MVCCEngine {
                                 // Through the registry, so a reader that
                                 // pinned this file keeps it until it lets go
                                 crate::storage::volume::writer::VolumeFile::shared(&path).retire();
+                                // Prototype: the side index goes with it
+                                let _ = std::fs::remove_file(
+                                    crate::storage::volume::secondary::side_path(&path),
+                                );
                             }
                         }
                     }
@@ -6593,6 +6632,17 @@ impl MVCCEngine {
                 compress,
                 target_volume_rows,
             )?;
+            // Prototype: the secondary indexes of each sealed volume, built
+            // from its columns and written beside it, before the fence
+            let secondary_columns = store.get_secondary_index_columns();
+            for (volume, path, _) in &sealed_volumes {
+                if let Err(error) = volume.build_secondary_indexes(&secondary_columns, path) {
+                    return Err(Error::internal(format!(
+                        "secondary index build for {:?} failed: {}",
+                        path, error
+                    )));
+                }
+            }
             // Each sealed volume's owner, before the fence: the registry
             // lock is global and must not be waited on under it
             let mut sealed_files: Vec<Option<Arc<crate::storage::volume::writer::VolumeFile>>> =
@@ -6625,6 +6675,9 @@ impl MVCCEngine {
             // between cold constraint checks and hot publication.
             {
                 let _seal_guard = mgr.acquire_seal_write();
+                // Prototype: how long the fence is held
+                let fence_started = std::time::Instant::now();
+                let _fence_timer = FenceTimer(fence_started);
 
                 mgr.set_seal_overlap(total_rows);
 

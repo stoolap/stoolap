@@ -3994,6 +3994,32 @@ impl VersionStore {
 
     /// Get column indices and names for all non-PK unique indexes.
     /// Used by commit-time cold revalidation.
+    /// Prototype: the columns carrying a single-column B-tree index other
+    /// than the primary key, whose values are integers or timestamps, in
+    /// schema order; the cold side indexes these at seal.
+    pub fn get_secondary_index_columns(&self) -> Vec<usize> {
+        let schema = self.schema();
+        let indexes = self.indexes.read();
+        let mut cols: Vec<usize> = indexes
+            .values()
+            .filter(|idx| idx.index_type() == crate::core::IndexType::BTree)
+            .filter_map(|idx| match idx.column_names() {
+                [name] => schema.columns.iter().position(|c| c.name_lower == *name),
+                _ => None,
+            })
+            .filter(|&ci| {
+                !schema.columns[ci].primary_key
+                    && matches!(
+                        schema.columns[ci].data_type,
+                        crate::core::DataType::Integer | crate::core::DataType::Timestamp
+                    )
+            })
+            .collect();
+        cols.sort_unstable();
+        cols.dedup();
+        cols
+    }
+
     pub fn get_unique_non_pk_index_columns(&self) -> Vec<(Vec<usize>, Vec<String>)> {
         let schema = self.schema();
         let pk_col = schema

@@ -1694,8 +1694,24 @@ pub struct FrozenVolume {
     #[allow(clippy::type_complexity)]
     pub unique_indices:
         Arc<parking_lot::RwLock<rustc_hash::FxHashMap<Vec<usize>, Arc<Vec<(u64, u32)>>>>>,
+    /// Prototype: the volume's secondary column indexes and the side file
+    /// they load from, shared across the volume's tiers
+    pub secondary: Arc<SecondaryState>,
     /// Access epoch counter. Bumped per scan for eviction tracking.
     pub last_access_epoch: std::sync::atomic::AtomicU64,
+}
+
+/// Prototype: what a volume knows about its secondary indexes. The map fills
+/// at build or at the first probe after a reopen; the path names the side
+/// file for a volume whose blocks are in RAM and has no file handle yet.
+#[derive(Default)]
+pub struct SecondaryState {
+    pub indexes:
+        parking_lot::RwLock<rustc_hash::FxHashMap<usize, Arc<super::secondary::ColdColumnIndex>>>,
+    pub path: parking_lot::Mutex<Option<std::path::PathBuf>>,
+    /// Set once the side file was looked for and found absent, so a volume
+    /// without indexes is not asked again
+    pub absent: std::sync::atomic::AtomicBool,
 }
 
 /// Builder that accumulates rows and produces a FrozenVolume.
@@ -2932,6 +2948,7 @@ impl VolumeBuilder {
         };
 
         Ok(FrozenVolume {
+            secondary: Arc::default(),
             columns: LazyColumns::eager(columns, column_types.clone()),
             meta: Arc::new(VolumeMeta {
                 zone_maps: self.zone_maps,
@@ -3675,6 +3692,7 @@ impl FrozenVolume {
             columns: LazyColumns::deferred_shared(store, self.meta.column_types.clone()),
             meta: Arc::clone(&self.meta),
             unique_indices: Arc::clone(&self.unique_indices),
+            secondary: Arc::clone(&self.secondary),
             // Start at current epoch so warm gets MIN_IDLE_CYCLES before cold.
             last_access_epoch: std::sync::atomic::AtomicU64::new(
                 GLOBAL_EVICTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
@@ -3685,11 +3703,83 @@ impl FrozenVolume {
     /// Create a cold-tier volume: shares metadata via Arc (zero copy),
     /// drops both decompressed columns AND compressed blocks.
     /// Must reload from disk to scan.
+    /// Prototype: the volume's index for `col_idx`, loaded from the side
+    /// file on first use; None when the volume has no index for it.
+    pub fn secondary_index(
+        &self,
+        col_idx: usize,
+    ) -> std::io::Result<Option<Arc<super::secondary::ColdColumnIndex>>> {
+        if let Some(index) = self.secondary.indexes.read().get(&col_idx) {
+            return Ok(Some(Arc::clone(index)));
+        }
+        if self
+            .secondary
+            .absent
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(None);
+        }
+        let path = match self.secondary_side_path() {
+            Some(path) if path.exists() => path,
+            _ => {
+                self.secondary
+                    .absent
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Ok(None);
+            }
+        };
+        let loaded = super::secondary::read_side_file(&path)?;
+        let mut indexes = self.secondary.indexes.write();
+        for (col, index) in loaded {
+            indexes.entry(col).or_insert_with(|| Arc::new(index));
+        }
+        Ok(indexes.get(&col_idx).cloned())
+    }
+
+    /// Where this volume's side file is: next to the file its blocks are
+    /// read from, or the path recorded at seal for a volume still in RAM.
+    pub fn secondary_side_path(&self) -> Option<std::path::PathBuf> {
+        if let Some(file) = self.file_owner() {
+            return Some(super::secondary::side_path(&file.path()));
+        }
+        self.secondary.path.lock().clone()
+    }
+
+    /// Prototype: builds the indexes of `col_indices` from this volume's
+    /// columns and writes them to the side file of `volume_path`.
+    pub fn build_secondary_indexes(
+        &self,
+        col_indices: &[usize],
+        volume_path: &std::path::Path,
+    ) -> std::io::Result<()> {
+        if col_indices.is_empty() {
+            return Ok(());
+        }
+        let built: Vec<(usize, Arc<super::secondary::ColdColumnIndex>)> = col_indices
+            .iter()
+            .map(|&col| {
+                super::secondary::ColdColumnIndex::build_from_volume(self, col)
+                    .map(|index| (col, Arc::new(index)))
+            })
+            .collect::<std::io::Result<_>>()?;
+        let side = super::secondary::side_path(volume_path);
+        let refs: Vec<(usize, &super::secondary::ColdColumnIndex)> =
+            built.iter().map(|(col, index)| (*col, &**index)).collect();
+        super::secondary::write_side_file(&side, &refs)?;
+        *self.secondary.path.lock() = Some(side);
+        let mut indexes = self.secondary.indexes.write();
+        for (col, index) in built {
+            indexes.insert(col, index);
+        }
+        Ok(())
+    }
+
     pub fn to_cold(&self) -> FrozenVolume {
         FrozenVolume {
             columns: LazyColumns::metadata_only(self.meta.column_types.clone()),
             meta: Arc::clone(&self.meta),
             unique_indices: Arc::clone(&self.unique_indices),
+            secondary: Arc::clone(&self.secondary),
             // Start at current epoch so cold gets MIN_IDLE_CYCLES before
             // being considered for reload/re-eviction.
             last_access_epoch: std::sync::atomic::AtomicU64::new(

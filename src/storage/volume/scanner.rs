@@ -477,6 +477,7 @@ impl VolumeScanner {
     pub fn empty() -> Self {
         Self {
             volume: Arc::new(FrozenVolume {
+                secondary: Arc::default(),
                 columns: super::writer::LazyColumns::empty(),
                 meta: Arc::new(super::writer::VolumeMeta {
                     zone_maps: Vec::new(),

@@ -1150,6 +1150,152 @@ impl SegmentedTable {
     /// Zone map pruning + binary search narrowing on a single volume.
     /// Returns (should_skip, start, end).
     /// `bloom_hashes` are pre-computed per-comparison to avoid redundant hashing.
+    /// Prototype: the positions a volume's secondary index answers for the
+    /// statement's comparisons, one equality or a lower and an upper bound on
+    /// a column the hot table indexes, ascending. None sends the volume to
+    /// the scan: no such bound set, no index on the column, or a volume
+    /// sealed without one.
+    fn indexed_positions(
+        &self,
+        vol: &FrozenVolume,
+        mapping: &super::writer::ColumnMapping,
+        comparisons: &[(&str, crate::core::Operator, &Value)],
+    ) -> Result<Option<Vec<usize>>> {
+        use crate::core::Operator;
+        use std::sync::atomic::Ordering;
+        let counters = &super::secondary::COUNTERS;
+        let key = |value: &Value| match value {
+            Value::Integer(i) => Some(*i),
+            Value::Timestamp(ts) => Some(
+                ts.timestamp_nanos_opt()
+                    .unwrap_or(ts.timestamp() * 1_000_000_000),
+            ),
+            _ => None,
+        };
+        for &(col_name, _, _) in comparisons {
+            let (mut eq, mut low, mut high) = (None, None, None);
+            for &(name, op, value) in comparisons {
+                if !name.eq_ignore_ascii_case(col_name) {
+                    continue;
+                }
+                let Some(k) = key(value) else {
+                    return Ok(None);
+                };
+                match op {
+                    Operator::Eq => eq = Some(k),
+                    Operator::Gt => {
+                        low = Some(
+                            low.map_or(k.saturating_add(1), |l: i64| l.max(k.saturating_add(1))),
+                        )
+                    }
+                    Operator::Gte => low = Some(low.map_or(k, |l: i64| l.max(k))),
+                    Operator::Lt => {
+                        high = Some(
+                            high.map_or(k.saturating_sub(1), |h: i64| h.min(k.saturating_sub(1))),
+                        )
+                    }
+                    Operator::Lte => high = Some(high.map_or(k, |h: i64| h.min(k))),
+                    _ => {}
+                }
+            }
+            let (low, high) = match (eq, low, high) {
+                (Some(k), _, _) => (k, k),
+                (None, Some(l), Some(h)) => (l, h),
+                _ => continue,
+            };
+            if self.hot.get_index_on_column(col_name).is_none() {
+                continue;
+            }
+            let Some(col_idx) = mapping.volume_column(vol, col_name) else {
+                continue;
+            };
+            counters.volumes_examined.fetch_add(1, Ordering::Relaxed);
+            let Some(index) = vol.secondary_index(col_idx)? else {
+                counters.unindexed_volumes.fetch_add(1, Ordering::Relaxed);
+                return Ok(None);
+            };
+            counters.probes.fetch_add(1, Ordering::Relaxed);
+            let positions = if low == high {
+                index.equal(low)
+            } else {
+                index.range(low, high)
+            };
+            let mut out: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
+            if low != high {
+                out.sort_unstable();
+            }
+            counters
+                .candidates
+                .fetch_add(out.len() as u64, Ordering::Relaxed);
+            let mut groups = 0u64;
+            let mut last = usize::MAX;
+            for &p in &out {
+                let group = p / super::column::ROW_GROUP_SIZE;
+                if group != last {
+                    groups += 1;
+                    last = group;
+                }
+            }
+            counters.groups_fetched.fetch_add(groups, Ordering::Relaxed);
+            return Ok(Some(out));
+        }
+        Ok(None)
+    }
+
+    /// Prototype: the visible rows at `positions` of one volume, each read
+    /// from its group, the residual predicate applied, projected to
+    /// `column_indices` (all columns when empty).
+    #[allow(clippy::too_many_arguments)]
+    fn fetch_indexed_rows(
+        &self,
+        vol: &Arc<FrozenVolume>,
+        cs: &super::manifest::ColdSegment,
+        positions: &[usize],
+        tombstones: &FxHashMap<i64, u64>,
+        hot_skip: &FxHashSet<i64>,
+        where_expr: Option<&dyn Expression>,
+        column_indices: &[usize],
+    ) -> Result<RowVec> {
+        let prepared = where_expr.map(|expr| {
+            let mut prepared = expr.with_aliases(&Default::default());
+            prepared.prepare_for_schema(self.hot.schema());
+            prepared
+        });
+        let row_ids = vol.row_ids()?;
+        let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+        let mut rows = RowVec::with_capacity(positions.len().min(1024));
+        for &i in positions {
+            if !cs.is_visible(i) {
+                continue;
+            }
+            let row_id = row_ids[i];
+            if self.is_row_tombstoned(tombstones, row_id) || hot_skip.contains(&row_id) {
+                continue;
+            }
+            let row = reader.row(i, &cs.mapping)?;
+            if let Some(expr) = &prepared {
+                if !expr.evaluate_fast(&row) {
+                    continue;
+                }
+            }
+            super::secondary::COUNTERS
+                .visible
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let row = if column_indices.is_empty() {
+                row
+            } else {
+                Row::from_values(
+                    column_indices
+                        .iter()
+                        .map(|&c| row.get(c).cloned().unwrap_or_else(Value::null_unknown))
+                        .collect(),
+                )
+            };
+            rows.push((row_id, row));
+        }
+        Ok(rows)
+    }
+
     fn prune_volume(
         vol: &FrozenVolume,
         mapping: &super::writer::ColumnMapping,
@@ -1367,6 +1513,22 @@ impl SegmentedTable {
                 (vol, start, end)
             };
 
+            // Prototype: the secondary index names the candidates, and the
+            // rows come from their groups alone
+            if let Some(positions) = self.indexed_positions(vol, &cs.mapping, &comparisons)? {
+                let rows = self.fetch_indexed_rows(
+                    vol,
+                    cs,
+                    &positions,
+                    tombstones_arc,
+                    &hot_skip_arc,
+                    where_expr,
+                    column_indices,
+                )?;
+                scanners_reverse.push(Box::new(super::scanner::RowVecScanner::new(rows)));
+                continue;
+            }
+
             // VolumeScanner constructor calls mark_accessed.
             let mut scanner = if start > 0 || end < vol.meta.row_count {
                 VolumeScanner::with_range(
@@ -1535,13 +1697,23 @@ impl SegmentedTable {
                         vol.columns.get(col_idx).map(|col| (col, start, expected))
                     })
                     .collect::<std::io::Result<_>>()?;
-                let prefiltered = !filters.is_empty()
-                    && super::column::ColumnData::dict_matching_offsets(
-                        &filters,
-                        end - start,
-                        &mut candidates,
-                    )
-                    .is_some();
+                // Prototype: the secondary index names the candidates, as
+                // absolute positions
+                let (start, indexed) = match self.indexed_positions(vol, mapping, &comparisons)? {
+                    Some(positions) => {
+                        candidates = positions;
+                        (0, true)
+                    }
+                    None => (start, false),
+                };
+                let prefiltered = indexed
+                    || (!filters.is_empty()
+                        && super::column::ColumnData::dict_matching_offsets(
+                            &filters,
+                            end - start,
+                            &mut candidates,
+                        )
+                        .is_some());
                 let mut reader = super::writer::RowReader::new(Arc::clone(vol));
                 let mut next_row = {
                     let mut pos = 0usize;
@@ -1591,6 +1763,11 @@ impl SegmentedTable {
                         if !expr.evaluate_fast(&row) {
                             continue;
                         }
+                    }
+                    if indexed {
+                        super::secondary::COUNTERS
+                            .visible
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
                     vol_rows.push((row_id, row));
                 }
