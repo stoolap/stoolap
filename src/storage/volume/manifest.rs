@@ -63,6 +63,26 @@ pub struct ColdSegment {
 }
 
 impl ColdSegment {
+    /// The side file and the physical column that may serve schema column
+    /// `column` for the index definition with `identity`: the column is
+    /// resolved through this segment's captured mapping alone, and the
+    /// attached side file must cover that physical column under that
+    /// identity. None sends the volume through the scan.
+    pub fn side_for(
+        &self,
+        column: usize,
+        identity: u64,
+    ) -> Option<(&Arc<super::secondary::IndexFile>, usize)> {
+        let side = self.side.as_ref()?;
+        let physical = match self.mapping.sources.get(column) {
+            Some(super::writer::ColSource::Volume(physical)) => *physical,
+            Some(super::writer::ColSource::Default(_)) => return None,
+            None if self.mapping.is_identity && column < self.volume.columns.len() => column,
+            None => return None,
+        };
+        side.covers(physical, identity).then_some((side, physical))
+    }
+
     /// Check whether row at position `idx` in this volume is the authoritative
     /// (newest) copy across all overlapping volumes.
     #[inline]
@@ -601,6 +621,55 @@ type Owners = (
     Option<Arc<super::writer::VolumeFile>>,
     Option<Arc<super::secondary::IndexFile>>,
 );
+
+/// What a replacement is prepared from: the outputs, the inputs' ids and
+/// the outputs' side files
+pub type ReplacementParts = (
+    Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
+    Vec<u64>,
+    Vec<Option<Arc<super::secondary::IndexFile>>>,
+);
+
+/// A replacement prepared outside the caller's DDL coordination and
+/// committed under it (`SegmentManager::prepare_replacement`,
+/// `commit_replacement`)
+pub struct PreparedReplacement {
+    new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
+    old_segment_ids: Vec<u64>,
+    owners: Vec<Owners>,
+    prepared: PreparedPublication,
+}
+
+impl PreparedReplacement {
+    /// The outputs' side files, by segment id
+    pub fn sides(&self) -> impl Iterator<Item = (u64, &Arc<super::secondary::IndexFile>)> {
+        self.new_volumes
+            .iter()
+            .zip(&self.owners)
+            .filter_map(|((id, _, _), owner)| owner.1.as_ref().map(|side| (*id, side)))
+    }
+
+    /// What a stale replacement was prepared from, to prepare it again:
+    /// the outputs, the inputs' ids and the outputs' side files still in
+    pub fn into_parts(self) -> ReplacementParts {
+        let sides = self.owners.into_iter().map(|(_, side)| side).collect();
+        (self.new_volumes, self.old_segment_ids, sides)
+    }
+
+    /// Takes output `segment_id`'s side file out of the publication: the
+    /// segment is published uncovered, and the file is the caller's to
+    /// discard
+    pub fn uncover(&mut self, segment_id: u64) -> Option<Arc<super::secondary::IndexFile>> {
+        let at = self
+            .new_volumes
+            .iter()
+            .position(|(id, _, _)| *id == segment_id)?;
+        if let Some(segment) = self.prepared.map.get_mut(&segment_id) {
+            segment.side = None;
+        }
+        self.owners[at].1.take()
+    }
+}
 
 /// A publication built outside the locks: the segments it was built on,
 /// their manifest order then, and the map to swap in
@@ -2915,6 +2984,66 @@ impl SegmentManager {
         self.publish_with(new_volumes, old_segment_ids, schema, sides, |_| {});
     }
 
+    /// A replacement prepared outside the caller's DDL coordination: the
+    /// outputs' owners taken, every row's visibility decided. The caller
+    /// may take a side file out before it commits (`uncover`), and commits
+    /// with `commit_replacement`.
+    pub fn prepare_replacement(
+        &self,
+        new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
+        old_segment_ids: &[u64],
+        sides: Vec<Option<Arc<super::secondary::IndexFile>>>,
+    ) -> PreparedReplacement {
+        let owners = self.output_owners(&new_volumes, sides);
+        let prepared = self.prepare_publication(&new_volumes, old_segment_ids, &owners);
+        PreparedReplacement {
+            new_volumes,
+            old_segment_ids: old_segment_ids.to_vec(),
+            owners,
+            prepared,
+        }
+    }
+
+    /// Commits a prepared replacement whose preparation still stands. The
+    /// decision is made under the publication's own write locks, before
+    /// anything changes: a preparation the segments moved under since (a
+    /// seal, a column change, a reload or an eviction) is handed back
+    /// untouched, and the caller prepares again outside its locks
+    /// (`into_parts`).
+    pub fn commit_replacement(
+        &self,
+        replacement: PreparedReplacement,
+        schema: Option<&crate::core::Schema>,
+    ) -> std::result::Result<(), Box<PreparedReplacement>> {
+        let PreparedReplacement {
+            new_volumes,
+            old_segment_ids,
+            owners,
+            prepared,
+        } = replacement;
+        match self.commit_publication(
+            prepared,
+            &new_volumes,
+            &old_segment_ids,
+            schema,
+            &owners,
+            false,
+        ) {
+            Ok(_) => {
+                self.forget_key_order(&old_segment_ids);
+                self.cached_deduped_count
+                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(prepared) => Err(Box::new(PreparedReplacement {
+                new_volumes,
+                old_segment_ids,
+                owners,
+                prepared,
+            })),
+        }
+    }
+
     /// The publication in its two steps, `between` run after the first
     /// and before the second; a test puts a seal there
     fn publish_with(
@@ -2928,8 +3057,16 @@ impl SegmentManager {
         let owners = self.output_owners(&new_volumes, sides);
         let prepared = self.prepare_publication(&new_volumes, old_segment_ids, &owners);
         between(self);
-        let fresh =
-            self.commit_publication(prepared, new_volumes, old_segment_ids, schema, &owners);
+        let fresh = self
+            .commit_publication(
+                prepared,
+                &new_volumes,
+                old_segment_ids,
+                schema,
+                &owners,
+                true,
+            )
+            .unwrap_or(false);
         self.forget_key_order(old_segment_ids);
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
@@ -3005,15 +3142,23 @@ impl SegmentManager {
     fn commit_publication(
         &self,
         prepared: PreparedPublication,
-        new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
+        new_volumes: &[(u64, Arc<FrozenVolume>, SegmentMeta)],
         old_segment_ids: &[u64],
         schema: Option<&crate::core::Schema>,
         owners: &[Owners],
-    ) -> bool {
+        rebuild: bool,
+    ) -> std::result::Result<bool, PreparedPublication> {
         let mut manifest = self.manifest.write();
         let mut segments = self.segments.write();
         let current_order: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
         let fresh = Arc::ptr_eq(&*segments, &prepared.snapshot) && current_order == prepared.order;
+        // The decision is made under the locks the publication uses, before
+        // anything is changed: a stale preparation goes back to a caller
+        // that prepares again outside its own locks, unless it asked for
+        // the rebuild here
+        if !fresh && !rebuild {
+            return Err(prepared);
+        }
         let mut map = if fresh {
             prepared.map
         } else {
@@ -3030,14 +3175,15 @@ impl SegmentManager {
             .unwrap_or(manifest.segments.len());
         manifest.remove_segments(old_segment_ids);
         let insert_pos = insert_pos.min(manifest.segments.len());
-        for (i, (seg_id, vol, meta)) in new_volumes.into_iter().enumerate() {
+        for (i, (seg_id, vol, meta)) in new_volumes.iter().enumerate() {
+            let seg_id = *seg_id;
             if seg_id >= manifest.next_segment_id {
                 manifest.next_segment_id = seg_id + 1;
             }
             let seg_schema_version = meta.schema_version;
-            manifest.segments.insert(insert_pos + i, meta);
+            manifest.segments.insert(insert_pos + i, meta.clone());
             // The mapping reads the manifest's history as it is now
-            let mapping = mapping_for(&manifest, &vol, seg_schema_version, schema);
+            let mapping = mapping_for(&manifest, vol, seg_schema_version, schema);
             match map.get_mut(&seg_id) {
                 Some(cs) if fresh => cs.mapping = mapping,
                 _ => {
@@ -3045,7 +3191,7 @@ impl SegmentManager {
                         seg_id,
                         ColdSegment {
                             mapping,
-                            volume: vol,
+                            volume: Arc::clone(vol),
                             schema_version: seg_schema_version,
                             visible: None,
                             file: owners[i].0.clone(),
@@ -3070,7 +3216,7 @@ impl SegmentManager {
         self.has_segments_flag
             .store(!map.is_empty(), std::sync::atomic::Ordering::Relaxed);
         *segments = Arc::new(map);
-        fresh
+        Ok(fresh)
     }
 
     /// Atomically remove old segments without adding a replacement.
@@ -3955,7 +4101,9 @@ mod tests {
         let outputs = vec![(3, volume_of(&c), meta_for_ids(3, &c))];
         let owners = mgr.output_owners(&outputs, Vec::new());
         let prepared = mgr.prepare_publication(&outputs, &[1], &owners);
-        assert!(mgr.commit_publication(prepared, outputs, &[1], None, &owners));
+        assert!(mgr
+            .commit_publication(prepared, &outputs, &[1], None, &owners, true)
+            .is_ok_and(|fresh| fresh));
         let order: Vec<u64> = mgr
             .manifest
             .read()
@@ -3990,7 +4138,9 @@ mod tests {
         // A seal lands in between: D takes ids 2 and 130 from everyone below
         let d: Vec<i64> = vec![2, 130];
         mgr.register_segment(4, volume_of(&d), meta_for_ids(4, &d), None);
-        assert!(!mgr.commit_publication(prepared, outputs, &[1], None, &owners));
+        assert!(mgr
+            .commit_publication(prepared, &outputs, &[1], None, &owners, true)
+            .is_ok_and(|fresh| !fresh));
         let order: Vec<u64> = mgr
             .manifest
             .read()

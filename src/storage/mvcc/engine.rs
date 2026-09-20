@@ -444,6 +444,13 @@ pub struct MemoryStat {
     pub admission_waits: u64,
 }
 
+/// Index definition identities of an engine without a WAL: a process
+/// number, since no side file ever meets them
+fn next_memory_index_identity() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// MVCC Storage Engine
 ///
 /// Provides multi-version concurrency control with snapshot isolation.
@@ -1748,6 +1755,12 @@ impl MVCCEngine {
                             true,
                             hnsw_graph_path.as_deref(),
                         );
+                        // An explicit identity is kept; a record without one
+                        // means its own LSN
+                        store.set_index_identity(
+                            &index_meta.name,
+                            index_meta.identity.unwrap_or(entry.lsn),
+                        );
                     }
                 }
             }
@@ -2633,34 +2646,46 @@ impl MVCCEngine {
 
     /// Record a DDL operation to WAL
     fn record_ddl(&self, table_name: &str, op: WALOperationType, schema_data: &[u8]) -> Result<()> {
+        self.record_ddl_lsn(table_name, op, schema_data).map(|_| ())
+    }
+
+    /// Record a DDL operation to WAL and say where: the record's LSN, or
+    /// None when nothing was written (loading from disk, no persistence)
+    fn record_ddl_lsn(
+        &self,
+        table_name: &str,
+        op: WALOperationType,
+        schema_data: &[u8],
+    ) -> Result<Option<u64>> {
         if self.should_skip_wal() {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
-                pm.record_ddl_operation(table_name, op, schema_data)?;
+                return pm.record_ddl_operation(table_name, op, schema_data);
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// A checkpoint's copy of a catalog record: no sync of its own, the
-    /// batch is synced once by `rerecord_ddl_to_wal`.
+    /// batch is synced once by `rerecord_ddl_to_wal`. The copy's LSN, or
+    /// None when nothing was written.
     fn record_catalog_copy(
         &self,
         table_name: &str,
         op: WALOperationType,
         schema_data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         if self.should_skip_wal() {
-            return Ok(());
+            return Ok(None);
         }
         if let Some(ref pm) = *self.persistence {
             if pm.is_enabled() {
-                pm.record_catalog_copy(table_name, op, schema_data)?;
+                return pm.record_catalog_copy(table_name, op, schema_data);
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Serialize a schema to binary format for WAL
@@ -4645,6 +4670,7 @@ impl MVCCEngine {
                         hnsw_ef_construction: index.hnsw_ef_construction(),
                         hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
                         hnsw_distance_metric: index.hnsw_distance_metric(),
+                        identity: store.index_identity(index.name()),
                     };
                     index_entries.push(meta.serialize());
                     Ok(())
@@ -4852,12 +4878,18 @@ impl MVCCEngine {
             if let Ok(meta) = super::persistence::IndexMetadata::deserialize(entry_data) {
                 let table_lower = meta.table_name.to_lowercase();
                 if let Some(store) = stores.get(&table_lower) {
-                    if let Err(e) = store.create_index_from_metadata_with_graph(&meta, false, None)
-                    {
-                        eprintln!(
+                    match store.create_index_from_metadata_with_graph(&meta, false, None) {
+                        Err(e) => eprintln!(
                             "Warning: Failed to recreate index '{}' on '{}': {}",
                             meta.name, meta.table_name, e
-                        );
+                        ),
+                        // The resolved identity is kept; one from before
+                        // identities is issued by the catalog copy that follows
+                        Ok(()) => {
+                            if let Some(identity) = meta.identity {
+                                store.set_index_identity(&meta.name, identity);
+                            }
+                        }
                     }
                 }
             }
@@ -5153,6 +5185,7 @@ impl MVCCEngine {
                             hnsw_ef_construction: index.hnsw_ef_construction(),
                             hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
                             hnsw_distance_metric: index.hnsw_distance_metric(),
+                            identity: store.index_identity(index.name()),
                         },
                     ));
                     Ok(())
@@ -5288,13 +5321,16 @@ impl MVCCEngine {
             let stores = self.version_stores.read().unwrap();
             for (table_name, index_meta) in &saved_indexes {
                 if let Some(store) = stores.get(table_name.as_str()) {
-                    if let Err(e) =
-                        store.create_index_from_metadata_with_graph(index_meta, false, None)
-                    {
-                        eprintln!(
+                    match store.create_index_from_metadata_with_graph(index_meta, false, None) {
+                        Err(e) => eprintln!(
                             "Warning: Failed to recreate index '{}' on '{}': {}",
                             index_meta.name, table_name, e
-                        );
+                        ),
+                        Ok(()) => {
+                            if let Some(identity) = index_meta.identity {
+                                store.set_index_identity(&index_meta.name, identity);
+                            }
+                        }
                     }
                 }
             }
@@ -5549,6 +5585,14 @@ impl MVCCEngine {
         self.compact_volumes()
     }
 
+    /// The identity the catalog issued to `index` on `table`, None when
+    /// the table or the index is unknown or the index has none yet
+    pub fn index_identity(&self, table: &str, index: &str) -> Option<u64> {
+        self.get_version_store(&table.to_lowercase())
+            .ok()
+            .and_then(|store| store.index_identity(index))
+    }
+
     /// Marks one table's volumes idle and evicts them to metadata-only, so a
     /// test can read through the reload path. The epochs are local: the
     /// global eviction epoch does not move, and nothing else in the process
@@ -5658,7 +5702,7 @@ impl MVCCEngine {
         };
 
         // Collect CreateIndex entries under version_stores lock, then drop
-        let index_entries: Vec<(String, Vec<u8>)> = {
+        let index_entries: Vec<(String, String, Vec<u8>)> = {
             let stores = self.version_stores.read().unwrap();
             let mut entries = Vec::new();
             for table_name in &table_names_for_indexes {
@@ -5680,8 +5724,13 @@ impl MVCCEngine {
                             hnsw_ef_construction: index.hnsw_ef_construction(),
                             hnsw_ef_search: index.default_ef_search().map(|v| v as u16),
                             hnsw_distance_metric: index.hnsw_distance_metric(),
+                            identity: store.index_identity(index.name()),
                         };
-                        entries.push((table_name.clone(), index_meta.serialize()));
+                        entries.push((
+                            table_name.clone(),
+                            index.name().to_string(),
+                            index_meta.serialize(),
+                        ));
                         Ok(())
                     });
                 }
@@ -5703,8 +5752,18 @@ impl MVCCEngine {
             self.record_catalog_copy(table_name, WALOperationType::CreateTable, data)?;
         }
 
-        for (table_name, data) in &index_entries {
-            self.record_catalog_copy(table_name, WALOperationType::CreateIndex, data)?;
+        for (table_name, index_name, data) in &index_entries {
+            let lsn = self.record_catalog_copy(table_name, WALOperationType::CreateIndex, data)?;
+            // An index that reached here without an identity (a record or
+            // a restore from before identities) takes its copy's LSN, the
+            // copy being the first record that stands for it
+            if let Some(lsn) = lsn {
+                if let Ok(store) = self.get_version_store(table_name) {
+                    if store.index_identity(index_name).is_none() {
+                        store.set_index_identity(index_name, lsn);
+                    }
+                }
+            }
         }
 
         for (view_name, data) in &view_entries {
@@ -6035,9 +6094,14 @@ impl MVCCEngine {
                 .as_ref()
                 .map(|store| store.get_unique_non_pk_index_columns())
                 .unwrap_or_default();
-            let definitions = store
+            // The identities of the indexes to cover, read under the DDL
+            // guard the index DDL runs under
+            let identities = store
                 .as_ref()
-                .map(|store| store.secondary_index_definitions())
+                .map(|store| {
+                    let _ddl = self.ddl_guard();
+                    store.secondary_index_identities()
+                })
                 .unwrap_or_default();
             if mgr.check_schema_generation(generation).is_err() {
                 continue;
@@ -6303,7 +6367,7 @@ impl MVCCEngine {
                     &compacted,
                     &compacted_path,
                     compact_vol_id,
-                    &definitions,
+                    &identities,
                 ) {
                     Ok(side) => new_sides.push(side),
                     Err(error) => {
@@ -6363,34 +6427,59 @@ impl MVCCEngine {
                 continue;
             }
 
-            #[cfg(feature = "test-failpoints")]
-            crate::test_failpoints::side_files_built();
-            // Index DDL since the definitions were captured makes the side
-            // files stale: the outputs are published uncovered
-            if store
-                .as_ref()
-                .is_some_and(|store| store.secondary_index_definitions() != definitions)
-            {
-                for side in new_sides.iter_mut().filter_map(Option::take) {
-                    crate::storage::volume::secondary::discard_side(side);
-                }
-            }
-
             // Atomically register all new volumes and remove old segments.
             let new_ids: Vec<u64> = new_volumes.iter().map(|entry| entry.0).collect();
-            // The outputs' mappings are computed against the schema current
-            // now, under the schema cache's read lock held until they are
-            // visible, as a seal's registration does: a change completing
-            // during the rewrite is then either before this publication,
-            // and its propagation covers the outputs, or after it
-            {
+            // The publication is prepared outside the DDL guard (owners
+            // taken, visibility decided), then decided and committed under
+            // it: an output's side file none of whose columns still stands
+            // for a current index is taken out and discarded after the
+            // guard, since its removal takes the file registry and the disk
+            let mut prepared = mgr.prepare_replacement(new_volumes, &old_ids, new_sides);
+            let mut stale_sides: Vec<Arc<crate::storage::volume::secondary::IndexFile>> =
+                Vec::new();
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::side_files_built();
+            // A preparation the segments moved under (a seal registered
+            // between the preparation and the guard) comes back from the
+            // commit and is prepared again outside the guard, the
+            // identities compared again before the next commit
+            loop {
+                let ddl = self.ddl_guard();
+                if let Some(store) = store.as_ref() {
+                    let current = store.secondary_index_identities();
+                    let stale: Vec<u64> = prepared
+                        .sides()
+                        .filter(|(_, side)| {
+                            !crate::storage::volume::secondary::still_covers(side, &current)
+                        })
+                        .map(|(id, _)| id)
+                        .collect();
+                    for id in stale {
+                        stale_sides.extend(prepared.uncover(id));
+                    }
+                }
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::side_files_compared();
+                // The outputs' mappings are computed against the schema current
+                // now, under the schema cache's read lock held until they are
+                // visible, as a seal's registration does: a change completing
+                // during the rewrite is then either before this publication,
+                // and its propagation covers the outputs, or after it
                 let schemas = self.schemas.read().unwrap();
-                mgr.replace_segments_atomic_multi(
-                    new_volumes,
-                    &old_ids,
-                    schemas.get(table_name).map(|s| &**s),
-                    new_sides,
-                );
+                let outcome =
+                    mgr.commit_replacement(prepared, schemas.get(table_name).map(|s| &**s));
+                drop(schemas);
+                drop(ddl);
+                match outcome {
+                    Ok(()) => break,
+                    Err(stale) => {
+                        let (volumes, ids, sides) = (*stale).into_parts();
+                        prepared = mgr.prepare_replacement(volumes, &ids, sides);
+                    }
+                }
+            }
+            for side in stale_sides {
+                crate::storage::volume::secondary::discard_side(side);
             }
             // The volumes just written are in the key's order. They were
             // built in the rewrite schema's column order, so the key's
@@ -6597,7 +6686,12 @@ impl MVCCEngine {
                 store.extract_for_seal(read_txn_id)
             };
             let unique_columns = store.get_unique_non_pk_index_columns();
-            let definitions = store.secondary_index_definitions();
+            // The identities of the indexes to cover, read under the DDL
+            // guard the index DDL runs under
+            let identities = {
+                let _ddl = self.ddl_guard();
+                store.secondary_index_identities()
+            };
             if mgr.check_schema_generation(generation).is_err() {
                 continue;
             }
@@ -6696,7 +6790,7 @@ impl MVCCEngine {
                     volume,
                     path,
                     *volume_id,
-                    &definitions,
+                    &identities,
                 ) {
                     Ok(side) => sealed_sides.push(side),
                     Err(error) => {
@@ -6709,25 +6803,38 @@ impl MVCCEngine {
                     }
                 }
             }
+            // The publication is decided under the DDL guard the index DDL
+            // runs under, taken before the fence: a side file none of
+            // whose columns still stands for a current index is set aside
+            // and discarded after the fence and the guard, since its
+            // removal takes the file registry and the disk. The guard is
+            // held to the end of the seal's hot cleanup: released earlier,
+            // a CREATE INDEX could copy the rows being sealed into its new
+            // index after the cleanup took its list of indexes. Index and
+            // column DDL wait for the whole fence section meanwhile.
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::side_files_built();
-            // Side files found stale under the fence, discarded after it:
-            // their removal takes the file registry and the disk, and the
-            // room to hold them is taken here rather than under the fence
+            let ddl = self.ddl_guard();
             let mut stale_sides: Vec<Arc<crate::storage::volume::secondary::IndexFile>> =
                 Vec::with_capacity(sealed_sides.len());
+            {
+                let current = store.secondary_index_identities();
+                for side in sealed_sides.iter_mut() {
+                    if side.as_ref().is_some_and(|s| {
+                        !crate::storage::volume::secondary::still_covers(s, &current)
+                    }) {
+                        stale_sides.extend(side.take());
+                    }
+                }
+            }
+            #[cfg(feature = "test-failpoints")]
+            crate::test_failpoints::side_files_compared();
             // Seal critical section under exclusive fence: register cold
             // segments + remove hot rows + remove hot index entries.
             // DML operations hold the shared fence, so they cannot race
             // between cold constraint checks and hot publication.
             {
                 let _seal_guard = mgr.acquire_seal_write();
-
-                // Index DDL since the definitions were captured makes the
-                // side files stale: the volumes are published uncovered
-                if store.secondary_index_definitions() != definitions {
-                    stale_sides.extend(sealed_sides.iter_mut().filter_map(Option::take));
-                }
 
                 mgr.set_seal_overlap(total_rows);
 
@@ -6804,6 +6911,7 @@ impl MVCCEngine {
 
                 // _seal_guard dropped here — DML unblocked
             }
+            drop(ddl);
             for side in stale_sides {
                 crate::storage::volume::secondary::discard_side(side);
             }
@@ -7059,11 +7167,19 @@ impl Engine for MVCCEngine {
             hnsw_ef_construction,
             hnsw_ef_search,
             hnsw_distance_metric,
+            // The first write carries no identity: the record's own LSN is it
+            identity: None,
         };
 
-        // Serialize and record to WAL
+        // Serialize and record to WAL; the record's LSN becomes the index
+        // definition's identity, or a process number without a WAL
         let data = index_meta.serialize();
-        self.record_ddl(table_name, WALOperationType::CreateIndex, &data)
+        let lsn = self.record_ddl_lsn(table_name, WALOperationType::CreateIndex, &data)?;
+        let identity = lsn.unwrap_or_else(next_memory_index_identity);
+        if let Ok(store) = self.get_version_store(&table_name.to_lowercase()) {
+            store.set_index_identity(index_name, identity);
+        }
+        Ok(())
     }
 
     fn record_drop_index(&self, table_name: &str, index_name: &str) -> Result<()> {

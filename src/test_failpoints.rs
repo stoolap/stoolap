@@ -116,13 +116,31 @@ thread_local! {
 }
 
 /// Run once after a seal or compaction on this thread built its side
-/// files, before it checks the index definitions and publishes.
+/// files, before it takes the DDL guard to compare them with the catalog.
 pub fn after_side_files_built(hook: impl FnOnce() + 'static) {
     SIDE_FILES_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
 pub(crate) fn side_files_built() {
     let hook = SIDE_FILES_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static SIDE_FILES_COMPARED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once after a seal or compaction on this thread compared its side
+/// files' identities with the catalog under the DDL guard, before it
+/// publishes: DDL run from the hook on another thread waits for the guard.
+pub fn after_side_files_compared(hook: impl FnOnce() + 'static) {
+    SIDE_FILES_COMPARED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn side_files_compared() {
+    let hook = SIDE_FILES_COMPARED_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }
