@@ -3914,26 +3914,22 @@ impl VersionStore {
         let mut indexes = self.indexes.write();
         let removed = indexes.remove(name);
         drop(indexes);
-        self.index_identities
-            .write()
-            .remove(name.to_lowercase().as_str());
+        self.index_identities.write().remove(name);
         removed
     }
 
-    /// Records the identity the catalog issued to `name`'s definition
+    /// Records the identity the catalog issued to `name`'s definition,
+    /// under the name exactly as the index map keys it
     pub fn set_index_identity(&self, name: &str, identity: u64) {
         self.index_identities
             .write()
-            .insert(name.to_lowercase(), identity);
+            .insert(name.to_string(), identity);
     }
 
     /// The identity of `name`'s definition, None for an index the catalog
     /// has not issued one to yet
     pub fn index_identity(&self, name: &str) -> Option<u64> {
-        self.index_identities
-            .read()
-            .get(name.to_lowercase().as_str())
-            .copied()
+        self.index_identities.read().get(name).copied()
     }
 
     /// Get an index by name
@@ -4067,7 +4063,7 @@ impl VersionStore {
             if idx.index_type() != IndexType::BTree || idx.column_names().len() != 1 {
                 continue;
             }
-            let Some(&identity) = identities.get(index_name.to_lowercase().as_str()) else {
+            let Some(&identity) = identities.get(index_name.as_str()) else {
                 continue;
             };
             let name = &idx.column_names()[0];

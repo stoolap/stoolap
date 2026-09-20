@@ -502,6 +502,31 @@ fn an_index_recreated_with_the_same_definition_gets_a_new_identity_and_the_old_s
     db.close().unwrap();
 }
 
+/// Index names are keyed as the catalog keys them: two indexes whose names
+/// differ in case are two definitions with two identities, and dropping
+/// one leaves the other's.
+#[test]
+fn index_names_that_differ_in_case_keep_their_own_identities() {
+    let db = Database::open("memory://secondary_side_file_test_name_case").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX Mixed ON t(k)", ()).unwrap();
+    db.execute("CREATE INDEX mixed ON t(v)", ()).unwrap();
+    let upper = identity(&db, "Mixed");
+    let lower = identity(&db, "mixed");
+    assert_ne!(upper, lower, "two definitions, two identities");
+    db.execute("DROP INDEX Mixed ON t", ()).unwrap();
+    assert!(db.engine().index_identity("t", "Mixed").is_none());
+    assert_eq!(
+        identity(&db, "mixed"),
+        lower,
+        "the other index keeps its identity"
+    );
+}
+
 /// A memory engine issues distinct identities from its own counter.
 #[test]
 fn a_memory_engine_issues_distinct_identities() {
@@ -687,6 +712,54 @@ fn index_ddl_between_the_comparison_and_the_binding_does_not_bind_stale_coverage
         assert_eq!(count, if compaction { 6_000 } else { 1 });
         db.close().unwrap();
     }
+}
+
+/// A change that replaces the segments between a compaction's preparation
+/// and its commit (a column added, which rebuilds every mapping) makes the
+/// preparation stale: the commit hands it back, the compaction prepares
+/// again outside the guard, and the published table holds the output with
+/// its side file, every row once, the new column on every row.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_compaction_whose_preparation_went_stale_prepares_again_and_publishes_whole() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "&compact_threshold=100");
+    create(&db);
+    seal_rows(&db, 1, 2_000);
+    seal_rows(&db, 2_001, 2_000);
+    seal_rows(&db, 4_001, 2_000);
+    db.execute("PRAGMA COMPACT_THRESHOLD = 2", ()).unwrap();
+    let other = db.clone();
+    stoolap::test_failpoints::after_side_files_built(move || {
+        // Outputs built and the publication prepared: the column change
+        // lands from another thread before the compaction takes the guard
+        std::thread::spawn(move || {
+            other
+                .execute("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 5", ())
+                .unwrap();
+        })
+        .join()
+        .unwrap();
+    });
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let volumes = files(dir.path(), "t", "vol");
+    assert_eq!(volumes.len(), 1, "the compaction's output");
+    assert_eq!(files(dir.path(), "t", "sidx"), volumes);
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(count, 6_000);
+    let with_key: i64 = db
+        .query_one("SELECT COUNT(*) FROM t WHERE k = 3", ())
+        .unwrap();
+    assert_eq!(
+        with_key,
+        (1..=6_000i64).filter(|i| i % 7 == 3).count() as i64
+    );
+    let with_extra: i64 = db
+        .query_one("SELECT COUNT(*) FROM t WHERE extra = 5", ())
+        .unwrap();
+    assert_eq!(with_extra, 6_000, "the added column reaches every row");
+    db.close().unwrap();
 }
 
 /// A CREATE INDEX that arrives while a seal is between its registration and

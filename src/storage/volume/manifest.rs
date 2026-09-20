@@ -622,6 +622,14 @@ type Owners = (
     Option<Arc<super::secondary::IndexFile>>,
 );
 
+/// What a replacement is prepared from: the outputs, the inputs' ids and
+/// the outputs' side files
+pub type ReplacementParts = (
+    Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
+    Vec<u64>,
+    Vec<Option<Arc<super::secondary::IndexFile>>>,
+);
+
 /// A replacement prepared outside the caller's DDL coordination and
 /// committed under it (`SegmentManager::prepare_replacement`,
 /// `commit_replacement`)
@@ -639,6 +647,13 @@ impl PreparedReplacement {
             .iter()
             .zip(&self.owners)
             .filter_map(|((id, _, _), owner)| owner.1.as_ref().map(|side| (*id, side)))
+    }
+
+    /// What a stale replacement was prepared from, to prepare it again:
+    /// the outputs, the inputs' ids and the outputs' side files still in
+    pub fn into_parts(self) -> ReplacementParts {
+        let sides = self.owners.into_iter().map(|(_, side)| side).collect();
+        (self.new_volumes, self.old_segment_ids, sides)
     }
 
     /// Takes output `segment_id`'s side file out of the publication: the
@@ -2989,24 +3004,36 @@ impl SegmentManager {
         }
     }
 
-    /// Commits a prepared replacement; true when the prepared map was used
+    /// Commits a prepared replacement whose preparation still stands. A
+    /// preparation the segments moved under since (a seal registered) is
+    /// handed back untouched instead of being rebuilt under the caller's
+    /// locks: the caller prepares again outside them (`into_parts`).
     pub fn commit_replacement(
         &self,
         replacement: PreparedReplacement,
         schema: Option<&crate::core::Schema>,
-    ) -> bool {
+    ) -> std::result::Result<(), Box<PreparedReplacement>> {
+        {
+            let manifest = self.manifest.read();
+            let segments = self.segments.read();
+            let order: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
+            if !Arc::ptr_eq(&*segments, &replacement.prepared.snapshot)
+                || order != replacement.prepared.order
+            {
+                return Err(Box::new(replacement));
+            }
+        }
         let PreparedReplacement {
             new_volumes,
             old_segment_ids,
             owners,
             prepared,
         } = replacement;
-        let fresh =
-            self.commit_publication(prepared, new_volumes, &old_segment_ids, schema, &owners);
+        self.commit_publication(prepared, new_volumes, &old_segment_ids, schema, &owners);
         self.forget_key_order(&old_segment_ids);
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
-        fresh
+        Ok(())
     }
 
     /// The publication in its two steps, `between` run after the first

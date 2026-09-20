@@ -991,28 +991,10 @@ impl IndexFile {
     }
 
     /// The position index range `[start, end)` of `key` in `column`, or
-    /// None when the key is absent; reads at most one key page.
+    /// None when the key is absent; reads at most one key page, through
+    /// the cache alone: a page the cache refuses is this call's error.
     pub fn equal(&self, column: usize, key: i64) -> std::io::Result<Option<(u64, u64)>> {
-        let col = self
-            .directory
-            .column(column)
-            .ok_or_else(|| invalid("column has no index"))?;
-        let page_no = col.key_pages.partition_point(|p| p.last_key < key);
-        let Some(meta) = col.key_pages.get(page_no) else {
-            return Ok(None);
-        };
-        if key < meta.first_key {
-            return Ok(None);
-        }
-        let page = INDEX_PAGES.load(self, column, PageKind::Keys, page_no)?;
-        let PageContent::Keys { keys, ends } = page.content() else {
-            return Err(invalid("expected a key page"));
-        };
-        let Ok(i) = keys.binary_search(&key) else {
-            return Ok(None);
-        };
-        let start = if i == 0 { meta.pos_start } else { ends[i - 1] };
-        Ok(Some((start, ends[i])))
+        equal_with(&mut Cached { file: self, column }, key)
     }
 
     /// The upper bound the directory alone gives on the positions of keys
@@ -1040,58 +1022,9 @@ impl IndexFile {
     }
 
     /// The exact position index range of keys in `[low, high]`; reads the
-    /// boundary key pages.
+    /// boundary key pages through the cache alone.
     pub fn range(&self, column: usize, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
-        let col = self
-            .directory
-            .column(column)
-            .ok_or_else(|| invalid("column has no index"))?;
-        if low > high {
-            return Ok((0, 0));
-        }
-        let first = col.key_pages.partition_point(|p| p.last_key < low);
-        let last = col.key_pages.partition_point(|p| p.first_key <= high);
-        if first >= last {
-            return Ok((0, 0));
-        }
-        let start = {
-            let meta = &col.key_pages[first];
-            if low <= meta.first_key {
-                meta.pos_start
-            } else {
-                let page = INDEX_PAGES.load(self, column, PageKind::Keys, first)?;
-                let PageContent::Keys { keys, ends } = page.content() else {
-                    return Err(invalid("expected a key page"));
-                };
-                let i = keys.partition_point(|&k| k < low);
-                if i == 0 {
-                    meta.pos_start
-                } else {
-                    ends[i - 1]
-                }
-            }
-        };
-        let end = {
-            let last_page = last - 1;
-            let meta = &col.key_pages[last_page];
-            if high >= meta.last_key {
-                col.key_pages
-                    .get(last)
-                    .map_or(col.n_positions, |p| p.pos_start)
-            } else {
-                let page = INDEX_PAGES.load(self, column, PageKind::Keys, last_page)?;
-                let PageContent::Keys { keys, ends } = page.content() else {
-                    return Err(invalid("expected a key page"));
-                };
-                let i = keys.partition_point(|&k| k <= high);
-                if i == 0 {
-                    meta.pos_start
-                } else {
-                    ends[i - 1]
-                }
-            }
-        };
-        Ok((start, end.max(start)))
+        range_with(&mut Cached { file: self, column }, low, high)
     }
 
     /// A cursor over the positions at index range `[start, end)` of
@@ -1109,8 +1042,7 @@ impl IndexFile {
             .try_reserve(window * POS_ENTRY)
             .ok_or_else(|| refused("a cursor window"))?;
         Ok(Cursor {
-            file: self,
-            column,
+            pages: Cached { file: self, column },
             next: range.0,
             end: range.1,
             window,
@@ -1178,9 +1110,58 @@ impl Reader<'_> {
         self.own_pages
     }
 
-    /// Runs `f` on page `kind`/`number` of the column: from the cache when
-    /// it admits the page, else read and parsed into the reader's own
-    /// buffers. A real read or checksum error is the walk's error.
+    /// The position index range `[start, end)` of `key`, or None when the
+    /// key is absent; reads at most one key page.
+    pub fn equal(&mut self, key: i64) -> std::io::Result<Option<(u64, u64)>> {
+        equal_with(self, key)
+    }
+
+    /// The exact position index range of keys in `[low, high]`; reads the
+    /// boundary key pages.
+    pub fn range(&mut self, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
+        range_with(self, low, high)
+    }
+
+    /// Starts a walk over the position index range `[start, end)`
+    pub fn walk(&mut self, range: (u64, u64)) {
+        self.next = range.0;
+        self.end = range.1;
+    }
+
+    /// Positions left to yield, including the current window
+    pub fn remaining(&self) -> u64 {
+        self.end.saturating_sub(self.next)
+    }
+
+    /// The next window of the walk, sorted ascending, or None at the end.
+    /// A page that fails to read leaves the walk where the window began.
+    pub fn next_window(&mut self) -> std::io::Result<Option<&[u32]>> {
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let (next, end, window) = (self.next, self.end, self.window);
+        let filled = next_window_with(self, next, end, window, &mut buffer);
+        self.buffer = buffer;
+        match filled? {
+            Some(advanced) => {
+                self.next = advanced;
+                Ok(Some(&self.buffer))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+impl<'a> Pages<'a> for Reader<'a> {
+    fn file(&self) -> &'a IndexFile {
+        self.file
+    }
+
+    fn column(&self) -> usize {
+        self.column
+    }
+
+    /// From the cache when it admits the page, else read and parsed into
+    /// the reader's own buffers. A real read or checksum error is the
+    /// walk's error.
     fn with_page<R>(
         &mut self,
         kind: PageKind,
@@ -1238,154 +1219,172 @@ impl Reader<'_> {
         self.own_pages += 1;
         Ok(f(own))
     }
+}
 
-    /// The position index range `[start, end)` of `key`, or None when the
-    /// key is absent; reads at most one key page.
-    pub fn equal(&mut self, key: i64) -> std::io::Result<Option<(u64, u64)>> {
-        let col = self
-            .file
-            .directory
-            .column(self.column)
-            .ok_or_else(|| invalid("column has no index"))?;
-        let page_no = col.key_pages.partition_point(|p| p.last_key < key);
-        let Some(meta) = col.key_pages.get(page_no) else {
+/// Where a search or a walk gets its pages: the file, the column, and
+/// one page at a time, however it is held. The search and the walk are
+/// written once over this.
+trait Pages<'a> {
+    fn file(&self) -> &'a IndexFile;
+    fn column(&self) -> usize;
+    fn with_page<R>(
+        &mut self,
+        kind: PageKind,
+        number: usize,
+        f: impl FnOnce(&PageContent) -> R,
+    ) -> std::io::Result<R>;
+}
+
+/// Pages through the cache alone: a page the cache refuses is an error
+struct Cached<'a> {
+    file: &'a IndexFile,
+    column: usize,
+}
+
+impl<'a> Pages<'a> for Cached<'a> {
+    fn file(&self) -> &'a IndexFile {
+        self.file
+    }
+
+    fn column(&self) -> usize {
+        self.column
+    }
+
+    fn with_page<R>(
+        &mut self,
+        kind: PageKind,
+        number: usize,
+        f: impl FnOnce(&PageContent) -> R,
+    ) -> std::io::Result<R> {
+        let page = INDEX_PAGES.load(self.file, self.column, kind, number)?;
+        Ok(f(page.content()))
+    }
+}
+
+fn column_of<'a>(pages: &impl Pages<'a>) -> std::io::Result<&'a ColumnDirectory> {
+    pages
+        .file()
+        .directory
+        .column(pages.column())
+        .ok_or_else(|| invalid("column has no index"))
+}
+
+/// The position index range `[start, end)` of `key`, or None when the
+/// key is absent; reads at most one key page.
+fn equal_with<'a>(pages: &mut impl Pages<'a>, key: i64) -> std::io::Result<Option<(u64, u64)>> {
+    let col = column_of(pages)?;
+    let page_no = col.key_pages.partition_point(|p| p.last_key < key);
+    let Some(meta) = col.key_pages.get(page_no) else {
+        return Ok(None);
+    };
+    if key < meta.first_key {
+        return Ok(None);
+    }
+    let pos_start = meta.pos_start;
+    pages.with_page(PageKind::Keys, page_no, |content| {
+        let PageContent::Keys { keys, ends } = content else {
+            return Err(invalid("expected a key page"));
+        };
+        let Ok(i) = keys.binary_search(&key) else {
             return Ok(None);
         };
-        if key < meta.first_key {
-            return Ok(None);
-        }
-        let pos_start = meta.pos_start;
-        self.with_page(PageKind::Keys, page_no, |content| {
+        let start = if i == 0 { pos_start } else { ends[i - 1] };
+        Ok(Some((start, ends[i])))
+    })?
+}
+
+/// The exact position index range of keys in `[low, high]`; reads the
+/// boundary key pages.
+fn range_with<'a>(pages: &mut impl Pages<'a>, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
+    let col = column_of(pages)?;
+    if low > high {
+        return Ok((0, 0));
+    }
+    let first = col.key_pages.partition_point(|p| p.last_key < low);
+    let last = col.key_pages.partition_point(|p| p.first_key <= high);
+    if first >= last {
+        return Ok((0, 0));
+    }
+    let first_meta = col.key_pages[first].clone();
+    let last_meta = col.key_pages[last - 1].clone();
+    let after_last = col
+        .key_pages
+        .get(last)
+        .map_or(col.n_positions, |p| p.pos_start);
+    let start = if low <= first_meta.first_key {
+        first_meta.pos_start
+    } else {
+        pages.with_page(PageKind::Keys, first, |content| {
             let PageContent::Keys { keys, ends } = content else {
                 return Err(invalid("expected a key page"));
             };
-            let Ok(i) = keys.binary_search(&key) else {
-                return Ok(None);
+            let i = keys.partition_point(|&k| k < low);
+            Ok(if i == 0 {
+                first_meta.pos_start
+            } else {
+                ends[i - 1]
+            })
+        })??
+    };
+    let end = if high >= last_meta.last_key {
+        after_last
+    } else {
+        pages.with_page(PageKind::Keys, last - 1, |content| {
+            let PageContent::Keys { keys, ends } = content else {
+                return Err(invalid("expected a key page"));
             };
-            let start = if i == 0 { pos_start } else { ends[i - 1] };
-            Ok(Some((start, ends[i])))
-        })?
-    }
+            let i = keys.partition_point(|&k| k <= high);
+            Ok(if i == 0 {
+                last_meta.pos_start
+            } else {
+                ends[i - 1]
+            })
+        })??
+    };
+    Ok((start, end.max(start)))
+}
 
-    /// The exact position index range of keys in `[low, high]`; reads the
-    /// boundary key pages.
-    pub fn range(&mut self, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
-        let col = self
-            .file
-            .directory
-            .column(self.column)
-            .ok_or_else(|| invalid("column has no index"))?;
-        if low > high {
-            return Ok((0, 0));
-        }
-        let first = col.key_pages.partition_point(|p| p.last_key < low);
-        let last = col.key_pages.partition_point(|p| p.first_key <= high);
-        if first >= last {
-            return Ok((0, 0));
-        }
-        let first_meta = col.key_pages[first].clone();
-        let last_meta = col.key_pages[last - 1].clone();
-        let after_last = col
-            .key_pages
-            .get(last)
-            .map_or(col.n_positions, |p| p.pos_start);
-        let start = if low <= first_meta.first_key {
-            first_meta.pos_start
-        } else {
-            self.with_page(PageKind::Keys, first, |content| {
-                let PageContent::Keys { keys, ends } = content else {
-                    return Err(invalid("expected a key page"));
-                };
-                let i = keys.partition_point(|&k| k < low);
-                Ok(if i == 0 {
-                    first_meta.pos_start
-                } else {
-                    ends[i - 1]
-                })
-            })??
-        };
-        let end = if high >= last_meta.last_key {
-            after_last
-        } else {
-            self.with_page(PageKind::Keys, last - 1, |content| {
-                let PageContent::Keys { keys, ends } = content else {
-                    return Err(invalid("expected a key page"));
-                };
-                let i = keys.partition_point(|&k| k <= high);
-                Ok(if i == 0 {
-                    last_meta.pos_start
-                } else {
-                    ends[i - 1]
-                })
-            })??
-        };
-        Ok((start, end.max(start)))
+/// Fills `buffer` with the next window of at most `window` positions of
+/// the walk at `next` towards `end`, sorted ascending, and returns where
+/// the walk stands after it; None at the end. Progress is reported only
+/// for a window filled whole: a page that failed leaves the walk where
+/// the window began.
+fn next_window_with<'a>(
+    pages: &mut impl Pages<'a>,
+    next: u64,
+    end: u64,
+    window: usize,
+    buffer: &mut Vec<u32>,
+) -> std::io::Result<Option<u64>> {
+    if next >= end {
+        return Ok(None);
     }
-
-    /// Starts a walk over the position index range `[start, end)`
-    pub fn walk(&mut self, range: (u64, u64)) {
-        self.next = range.0;
-        self.end = range.1;
-    }
-
-    /// Positions left to yield, including the current window
-    pub fn remaining(&self) -> u64 {
-        self.end.saturating_sub(self.next)
-    }
-
-    /// The next window of the walk, sorted ascending, or None at the end.
-    /// A page that fails to read is not advanced past.
-    pub fn next_window(&mut self) -> std::io::Result<Option<&[u32]>> {
-        if self.next >= self.end {
-            return Ok(None);
-        }
-        // The window is filled inside the page closures, so it is taken
-        // out for the walk and put back after
-        let mut buffer = std::mem::take(&mut self.buffer);
-        buffer.clear();
-        let stop = (self.next + self.window as u64).min(self.end);
-        let file = self.file;
-        let col = file
-            .directory
-            .column(self.column)
-            .ok_or_else(|| invalid("column has no index"))?;
-        let mut result = Ok(());
-        while self.next < stop {
-            let Some(page_no) = col
-                .pos_pages
-                .partition_point(|p| p.pos_start <= self.next)
-                .checked_sub(1)
-            else {
-                result = Err(invalid("position index before the first page"));
-                break;
+    buffer.clear();
+    let stop = (next + window as u64).min(end);
+    let col = column_of(pages)?;
+    let mut cursor = next;
+    while cursor < stop {
+        let page_no = col
+            .pos_pages
+            .partition_point(|p| p.pos_start <= cursor)
+            .checked_sub(1)
+            .ok_or_else(|| invalid("position index before the first page"))?;
+        let page_start = col.pos_pages[page_no].pos_start;
+        cursor = pages.with_page(PageKind::Positions, page_no, |content| {
+            let PageContent::Positions(positions) = content else {
+                return Err(invalid("expected a position page"));
             };
-            let page_start = col.pos_pages[page_no].pos_start;
-            let next = self.next;
-            let advanced = self.with_page(PageKind::Positions, page_no, |content| {
-                let PageContent::Positions(positions) = content else {
-                    return Err(invalid("expected a position page"));
-                };
-                let from = (next - page_start) as usize;
-                let to = ((stop - page_start) as usize).min(positions.len());
-                if from >= to {
-                    return Err(invalid("position page does not cover its index"));
-                }
-                buffer.extend_from_slice(&positions[from..to]);
-                Ok(page_start + to as u64)
-            });
-            match advanced {
-                Ok(Ok(advanced)) => self.next = advanced,
-                Ok(Err(error)) | Err(error) => {
-                    result = Err(error);
-                    break;
-                }
+            let from = (cursor - page_start) as usize;
+            let to = ((stop - page_start) as usize).min(positions.len());
+            if from >= to {
+                return Err(invalid("position page does not cover its index"));
             }
-        }
-        buffer.sort_unstable();
-        self.buffer = buffer;
-        result?;
-        Ok(Some(&self.buffer))
+            buffer.extend_from_slice(&positions[from..to]);
+            Ok(page_start + to as u64)
+        })??;
     }
+    buffer.sort_unstable();
+    Ok(Some(cursor))
 }
 
 fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
@@ -1412,10 +1411,10 @@ fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::
     }
 }
 
-/// Positions of one key or one range, a bounded window at a time.
+/// Positions of one key or one range, a bounded window at a time, the
+/// pages through the cache alone.
 pub struct Cursor<'a> {
-    file: &'a IndexFile,
-    column: usize,
+    pages: Cached<'a>,
     next: u64,
     end: u64,
     window: usize,
@@ -1433,37 +1432,17 @@ impl Cursor<'_> {
     /// window spans are loaded one at a time and released as the window
     /// moves on.
     pub fn next_window(&mut self) -> std::io::Result<Option<&[u32]>> {
-        if self.next >= self.end {
-            return Ok(None);
-        }
-        self.buffer.clear();
-        let col = self
-            .file
-            .directory
-            .column(self.column)
-            .ok_or_else(|| invalid("column has no index"))?;
-        let stop = (self.next + self.window as u64).min(self.end);
-        while self.next < stop {
-            let page_no = col
-                .pos_pages
-                .partition_point(|p| p.pos_start <= self.next)
-                .checked_sub(1)
-                .ok_or_else(|| invalid("position index before the first page"))?;
-            let page = INDEX_PAGES.load(self.file, self.column, PageKind::Positions, page_no)?;
-            let PageContent::Positions(positions) = page.content() else {
-                return Err(invalid("expected a position page"));
-            };
-            let page_start = col.pos_pages[page_no].pos_start;
-            let from = (self.next - page_start) as usize;
-            let to = ((stop - page_start) as usize).min(positions.len());
-            if from >= to {
-                return Err(invalid("position page does not cover its index"));
+        let mut buffer = std::mem::take(&mut self.buffer);
+        let (next, end, window) = (self.next, self.end, self.window);
+        let filled = next_window_with(&mut self.pages, next, end, window, &mut buffer);
+        self.buffer = buffer;
+        match filled? {
+            Some(advanced) => {
+                self.next = advanced;
+                Ok(Some(&self.buffer))
             }
-            self.buffer.extend_from_slice(&positions[from..to]);
-            self.next = page_start + to as u64;
+            None => Ok(None),
         }
-        self.buffer.sort_unstable();
-        Ok(Some(&self.buffer))
     }
 }
 
@@ -3767,6 +3746,47 @@ mod tests {
         std::fs::write(&path, &good).unwrap();
         INDEX_PAGES.clear();
         assert_eq!(reader.next_window().unwrap().map(|w| w.len()), Some(4));
+    }
+
+    #[test]
+    fn a_window_that_fails_on_its_second_page_returns_nothing_and_keeps_its_place() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        // One key over three position pages
+        build(&path, (0..20_000u32).map(|p| (p, 42)).collect(), WORKSPACE);
+        let good = std::fs::read(&path).unwrap();
+        let file = IndexFile::open(&path, 19).unwrap();
+        let second = file.directory().column(1).unwrap().pos_pages[1].offset as usize + 10;
+        let mut bad = good.clone();
+        bad[second] ^= 0xff;
+        std::fs::write(&path, &bad).unwrap();
+        INDEX_PAGES.clear();
+        // A window wider than a page: its first page reads, its second
+        // fails, and the walk reports nothing and stays where it began
+        let mut reader = file.reader(1, 8_192).unwrap();
+        let range = reader.equal(42).unwrap().unwrap();
+        reader.walk(range);
+        assert_eq!(reader.remaining(), 20_000);
+        assert!(reader.next_window().is_err());
+        assert_eq!(
+            reader.remaining(),
+            20_000,
+            "no progress for a window not returned"
+        );
+        // Repaired, the same window comes whole from the start
+        std::fs::write(&path, &good).unwrap();
+        INDEX_PAGES.clear();
+        let window = reader.next_window().unwrap().unwrap();
+        assert_eq!(window.len(), 8_192);
+        assert_eq!(window[0], 0);
+        assert_eq!(reader.remaining(), 20_000 - 8_192);
+        // The cache-only cursor keeps its place the same way
+        std::fs::write(&path, &bad).unwrap();
+        INDEX_PAGES.clear();
+        let mut cursor = file.cursor(1, range, 8_192).unwrap();
+        assert!(cursor.next_window().is_err());
+        assert_eq!(cursor.remaining(), 20_000);
     }
 
     #[test]

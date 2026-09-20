@@ -6439,7 +6439,11 @@ impl MVCCEngine {
                 Vec::new();
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::side_files_built();
-            {
+            // A preparation the segments moved under (a seal registered
+            // between the preparation and the guard) comes back from the
+            // commit and is prepared again outside the guard, the
+            // identities compared again before the next commit
+            loop {
                 let ddl = self.ddl_guard();
                 if let Some(store) = store.as_ref() {
                     let current = store.secondary_index_identities();
@@ -6462,9 +6466,17 @@ impl MVCCEngine {
                 // during the rewrite is then either before this publication,
                 // and its propagation covers the outputs, or after it
                 let schemas = self.schemas.read().unwrap();
-                mgr.commit_replacement(prepared, schemas.get(table_name).map(|s| &**s));
+                let outcome =
+                    mgr.commit_replacement(prepared, schemas.get(table_name).map(|s| &**s));
                 drop(schemas);
                 drop(ddl);
+                match outcome {
+                    Ok(()) => break,
+                    Err(stale) => {
+                        let (volumes, ids, sides) = (*stale).into_parts();
+                        prepared = mgr.prepare_replacement(volumes, &ids, sides);
+                    }
+                }
             }
             for side in stale_sides {
                 crate::storage::volume::secondary::discard_side(side);
