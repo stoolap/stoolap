@@ -122,6 +122,9 @@ pub struct VolumeScanner {
     matching_indices: Option<Vec<usize>>,
     /// Current position in matching_indices.
     match_idx: usize,
+    /// The positions a side file names for this volume, pulled window by
+    /// window; set, the scanner reads those rows alone
+    side_walk: Option<super::secondary::SideWalk>,
     /// Pre-computed inter-volume visibility bitmap.
     /// Bit i is set (1) if row at index i is visible (not overridden by a newer volume).
     /// Stored as packed u64 words: word w covers rows [w*64 .. w*64+63].
@@ -358,6 +361,7 @@ impl VolumeScanner {
             column_mapping: None,
             dict_filters: Vec::new(),
             matching_indices: None,
+            side_walk: None,
             match_idx: 0,
             visibility_bitmap: None,
             pending_cold_deletes: None,
@@ -417,6 +421,7 @@ impl VolumeScanner {
             column_mapping: None,
             dict_filters: Vec::new(),
             matching_indices: None,
+            side_walk: None,
             match_idx: 0,
             visibility_bitmap: None,
             pending_cold_deletes: None,
@@ -508,6 +513,7 @@ impl VolumeScanner {
             column_mapping: None,
             dict_filters: Vec::new(),
             matching_indices: None,
+            side_walk: None,
             match_idx: 0,
             visibility_bitmap: None,
             pending_cold_deletes: None,
@@ -946,6 +952,14 @@ impl VolumeScanner {
     /// position: the rest of a row comes back as typed NULLs. Set after
     /// the mapping, before the filter, whose columns are added to it
     /// when it can name them
+    /// Reads the rows a side file's walk names, in the walk's order, with
+    /// every skip rule and the filter applied to each; the range and the
+    /// dictionary pre-filter are set aside
+    pub fn set_side_walk(&mut self, walk: super::secondary::SideWalk) {
+        self.side_walk = Some(walk);
+        self.matching_indices = None;
+    }
+
     pub fn set_needed_cols(&mut self, needed: &[bool]) {
         let len = needed
             .len()
@@ -1244,17 +1258,33 @@ impl VolumeScanner {
         if !use_group_cache_fast && self.group_cache.is_some() {
             self.group_cache = None;
         }
-        if self.matching_indices.is_some() {
+        if self.matching_indices.is_some() || self.side_walk.is_some() {
             loop {
-                let idx = match self.matching_indices.as_ref() {
-                    Some(indices) if self.match_idx < indices.len() => {
-                        let i = indices[self.match_idx];
-                        self.match_idx += 1;
-                        i
+                let idx = if let Some(walk) = self.side_walk.as_mut() {
+                    match walk.next_position() {
+                        Ok(Some(i)) => i,
+                        Ok(None) => {
+                            self.has_current = false;
+                            return Ok(false);
+                        }
+                        Err(error) => {
+                            self.has_current = false;
+                            return Err(crate::core::Error::internal(format!(
+                                "side index read failed: {error}"
+                            )));
+                        }
                     }
-                    _ => {
-                        self.has_current = false;
-                        return Ok(false);
+                } else {
+                    match self.matching_indices.as_ref() {
+                        Some(indices) if self.match_idx < indices.len() => {
+                            let i = indices[self.match_idx];
+                            self.match_idx += 1;
+                            i
+                        }
+                        _ => {
+                            self.has_current = false;
+                            return Ok(false);
+                        }
                     }
                 };
 
@@ -1282,6 +1312,9 @@ impl VolumeScanner {
                     continue;
                 }
 
+                if self.side_walk.is_some() {
+                    super::secondary::READS.count(&super::secondary::READS.rows, 1);
+                }
                 self.current_rid = self.volume.meta.row_ids[idx];
                 self.has_current = true;
                 return Ok(true);

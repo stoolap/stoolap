@@ -10064,6 +10064,29 @@ impl Executor {
                 ));
                 Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
+            "INDEX_READ_STATS" => {
+                // One row: what the reads through side files did since the
+                // process started
+                if stmt.value.is_some() {
+                    return Err(Error::internal(
+                        "PRAGMA INDEX_READ_STATS does not accept values",
+                    ));
+                }
+                let snapshot = crate::storage::volume::secondary::READS.snapshot();
+                let columns: Vec<String> =
+                    snapshot.iter().map(|(name, _)| name.to_string()).collect();
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(
+                        snapshot
+                            .iter()
+                            .map(|(_, value)| Value::Integer(*value as i64))
+                            .collect(),
+                    ),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
             "INDEX_STATS" => {
                 // One row per ledger of the secondary index side files
                 use crate::storage::volume::secondary::{

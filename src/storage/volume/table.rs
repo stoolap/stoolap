@@ -40,6 +40,20 @@ use super::manifest::SegmentManager;
 use super::scanner::{RowVecScanner, VolumeScanner};
 use super::writer::FrozenVolume;
 
+/// What a volume's side file decided for a read: the volume goes through
+/// the scan, has no candidate at all, or is read at the walk's positions
+enum SideDecision {
+    Scan,
+    Empty,
+    Walk(Box<super::secondary::SideWalk>),
+}
+
+/// Positions a side file walk yields per window
+const SIDE_WINDOW: usize = 4096;
+/// The index serves a volume when the candidates are at most this share
+/// of its rows: one in twenty to start, to be measured
+const SIDE_SCAN_SHARE: u64 = 20;
+
 /// One row held by [`TopK`]: ordered so that the worst row of the k is the
 /// greatest, which puts it on top of a max-heap.
 struct Ranked {
@@ -1150,6 +1164,120 @@ impl SegmentedTable {
     /// Zone map pruning + binary search narrowing on a single volume.
     /// Returns (should_skip, start, end).
     /// `bloom_hashes` are pre-computed per-comparison to avoid redundant hashing.
+    /// Whether a volume's side file serves the statement's comparisons, decided
+    /// before the volume's data is touched, on the captured segment alone:
+    /// the comparisons must bound one column the catalog indexes (one
+    /// equality, or a lower and an upper bound), the segment's side file must
+    /// cover that column under the index's current identity, a reader's
+    /// working reservation must be admitted, and the exact candidate count
+    /// from the boundary pages must be a small share of the volume's rows.
+    /// Everything else sends the volume through the scan, counted by why.
+    fn side_decision(
+        &self,
+        cs: &super::manifest::ColdSegment,
+        comparisons: &[(&str, crate::core::Operator, &Value)],
+        identities: &[(usize, u64)],
+    ) -> Result<SideDecision> {
+        use super::secondary::{is_refused, SideWalk, READS};
+        use crate::core::Operator;
+        if identities.is_empty() || comparisons.is_empty() {
+            return Ok(SideDecision::Scan);
+        }
+        let key = |value: &Value| match value {
+            Value::Integer(i) => Some(*i),
+            Value::Timestamp(ts) => Some(
+                ts.timestamp_nanos_opt()
+                    .unwrap_or(ts.timestamp() * 1_000_000_000),
+            ),
+            _ => None,
+        };
+        let side_error = |error: std::io::Error| {
+            crate::core::Error::internal(format!("side index read failed: {error}"))
+        };
+        let schema = self.hot.schema();
+        for &(column, identity) in identities {
+            let Some(name) = schema.columns.get(column).map(|c| c.name_lower.as_str()) else {
+                continue;
+            };
+            let (mut eq, mut low, mut high) = (None, None, None);
+            let mut bounded = false;
+            for &(col_name, op, value) in comparisons {
+                if !col_name.eq_ignore_ascii_case(name) {
+                    continue;
+                }
+                let Some(k) = key(value) else {
+                    continue;
+                };
+                bounded = true;
+                match op {
+                    Operator::Eq => eq = Some(k),
+                    Operator::Gt => {
+                        low = Some(
+                            low.map_or(k.saturating_add(1), |l: i64| l.max(k.saturating_add(1))),
+                        )
+                    }
+                    Operator::Gte => low = Some(low.map_or(k, |l: i64| l.max(k))),
+                    Operator::Lt => {
+                        high = Some(
+                            high.map_or(k.saturating_sub(1), |h: i64| h.min(k.saturating_sub(1))),
+                        )
+                    }
+                    Operator::Lte => high = Some(high.map_or(k, |h: i64| h.min(k))),
+                    _ => {}
+                }
+            }
+            if !bounded {
+                continue;
+            }
+            let (low, high) = match (eq, low, high) {
+                (Some(k), _, _) => (k, k),
+                (None, Some(l), Some(h)) => (l, h),
+                (None, Some(l), None) => (l, i64::MAX),
+                (None, None, Some(h)) => (i64::MIN, h),
+                (None, None, None) => continue,
+            };
+            let Some((side, physical)) = cs.side_for(column, identity) else {
+                READS.count(&READS.ineligible, 1);
+                return Ok(SideDecision::Scan);
+            };
+            let reader = match side.reader(physical, SIDE_WINDOW) {
+                Ok(reader) => reader,
+                Err(error) if is_refused(&error) => {
+                    READS.count(&READS.refused, 1);
+                    return Ok(SideDecision::Scan);
+                }
+                Err(error) => return Err(side_error(error)),
+            };
+            READS.count(&READS.probes, 1);
+            let range = if low == high {
+                reader.equal(low).map_err(side_error)?.unwrap_or((0, 0))
+            } else if low > high {
+                (0, 0)
+            } else {
+                reader.range(low, high).map_err(side_error)?
+            };
+            let count = range.1 - range.0;
+            if count == 0 {
+                READS.count(&READS.misses, 1);
+                return Ok(SideDecision::Empty);
+            }
+            let rows = cs.volume.meta.row_count as u64;
+            if count * SIDE_SCAN_SHARE > rows.max(1) {
+                READS.count(&READS.cost_scans, 1);
+                return Ok(SideDecision::Scan);
+            }
+            READS.count(&READS.candidates, count);
+            return Ok(SideDecision::Walk(Box::new(SideWalk::new(reader, range))));
+        }
+        Ok(SideDecision::Scan)
+    }
+
+    /// The identities of the indexes the side files may serve, taken once
+    /// per read with the cold view
+    fn side_identities(&self) -> Vec<(usize, u64)> {
+        self.hot.secondary_index_identities()
+    }
+
     fn prune_volume(
         vol: &FrozenVolume,
         mapping: &super::writer::ColumnMapping,
@@ -1343,6 +1471,7 @@ impl SegmentedTable {
         let hot_skip_arc = Arc::new(hot_skip);
 
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
+        let identities = self.side_identities();
         let mut scanners_reverse: Vec<Box<dyn Scanner>> = Vec::with_capacity(view.seg_ids.len());
 
         for (seg_id, cs) in view.volumes() {
@@ -1352,23 +1481,37 @@ impl SegmentedTable {
             if should_skip {
                 continue;
             }
+            // The side file is probed before the volume's data is touched:
+            // an empty answer skips the volume without a reload
+            let walk = match self.side_decision(cs, &comparisons, &identities)? {
+                SideDecision::Empty => continue,
+                SideDecision::Walk(walk) => Some(walk),
+                SideDecision::Scan => None,
+            };
             // Load cold volume on demand after zone-map/bloom pruning.
             // Re-prune to get binary-search range narrowing on sorted columns.
             let loaded;
             let (vol, start, end) = if vol.is_cold() {
+                if walk.is_some() {
+                    super::secondary::READS.count(&super::secondary::READS.reloads, 1);
+                }
                 loaded = match self.load_volume_of_view(&view, seg_id)? {
                     Some(v) => v,
                     None => continue,
                 };
-                let (_, s, e) =
-                    Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
-                (&loaded, s, e)
+                if walk.is_some() {
+                    (&loaded, 0, loaded.meta.row_count)
+                } else {
+                    let (_, s, e) =
+                        Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
+                    (&loaded, s, e)
+                }
             } else {
                 (vol, start, end)
             };
 
             // VolumeScanner constructor calls mark_accessed.
-            let mut scanner = if start > 0 || end < vol.meta.row_count {
+            let mut scanner = if walk.is_none() && (start > 0 || end < vol.meta.row_count) {
                 VolumeScanner::with_range(
                     Arc::clone(vol),
                     column_indices.to_vec(),
@@ -1399,6 +1542,11 @@ impl SegmentedTable {
                 let mut prepared = filter;
                 prepared.prepare_for_schema(current_schema);
                 scanner.set_filter(prepared);
+            }
+            // The walk's positions replace the range and the pre-filter the
+            // filter set up; the filter itself still runs on every row
+            if let Some(walk) = walk {
+                scanner.set_side_walk(*walk);
             }
             scanners_reverse.push(Box::new(scanner) as Box<dyn Scanner>);
         }
@@ -1469,6 +1617,7 @@ impl SegmentedTable {
         let tombstones_ref = tombstones_arc;
 
         // Per-volume row collection closure. Returns Some(vol_rows) or None if pruned.
+        let identities = self.side_identities();
         let process_volume =
             |(seg_id, cs): &(u64, &super::manifest::ColdSegment)| -> Result<Option<RowVec>> {
                 let vol = &cs.volume;
@@ -1477,16 +1626,29 @@ impl SegmentedTable {
                 if should_skip {
                     return Ok(None);
                 }
+                // The side file is probed before the volume's data is touched
+                let mut walk = match self.side_decision(cs, &comparisons, &identities)? {
+                    SideDecision::Empty => return Ok(None),
+                    SideDecision::Walk(walk) => Some(walk),
+                    SideDecision::Scan => None,
+                };
                 // Load cold volume on demand after zone-map/bloom pruning.
                 let loaded;
                 let (vol, start, end) = if vol.is_cold() {
+                    if walk.is_some() {
+                        super::secondary::READS.count(&super::secondary::READS.reloads, 1);
+                    }
                     loaded = match self.load_volume_of_view(&view, *seg_id)? {
                         Some(v) => v,
                         None => return Ok(None),
                     };
-                    let (_, s, e) =
-                        Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
-                    (&loaded, s, e)
+                    if walk.is_some() {
+                        (&loaded, 0, loaded.meta.row_count)
+                    } else {
+                        let (_, s, e) =
+                            Self::prune_volume(&loaded, &cs.mapping, &comparisons, &bloom_hashes)?;
+                        (&loaded, s, e)
+                    }
                 } else {
                     vol.mark_accessed();
                     (vol, start, end)
@@ -1535,34 +1697,44 @@ impl SegmentedTable {
                         vol.columns.get(col_idx).map(|col| (col, start, expected))
                     })
                     .collect::<std::io::Result<_>>()?;
-                let prefiltered = !filters.is_empty()
+                let prefiltered = walk.is_none()
+                    && !filters.is_empty()
                     && super::column::ColumnData::dict_matching_offsets(
                         &filters,
                         end - start,
                         &mut candidates,
                     )
                     .is_some();
+                let indexed = walk.is_some();
                 let mut reader = super::writer::RowReader::new(Arc::clone(vol));
                 let mut next_row = {
                     let mut pos = 0usize;
                     let mut plain = start;
-                    move || -> Option<usize> {
-                        if prefiltered {
-                            let i = start + *candidates.get(pos)?;
+                    move || -> Result<Option<usize>> {
+                        if let Some(walk) = walk.as_mut() {
+                            walk.next_position().map_err(|error| {
+                                crate::core::Error::internal(format!(
+                                    "side index read failed: {error}"
+                                ))
+                            })
+                        } else if prefiltered {
+                            let Some(offset) = candidates.get(pos) else {
+                                return Ok(None);
+                            };
                             pos += 1;
-                            Some(i)
+                            Ok(Some(start + *offset))
                         } else if plain < end {
                             plain += 1;
-                            Some(plain - 1)
+                            Ok(Some(plain - 1))
                         } else {
-                            None
+                            Ok(None)
                         }
                     }
                 };
 
                 let row_ids = vol.row_ids()?;
                 let mut vol_rows = RowVec::new();
-                while let Some(i) = next_row() {
+                while let Some(i) = next_row()? {
                     if !cs.is_visible(i) {
                         continue;
                     }
@@ -1591,6 +1763,9 @@ impl SegmentedTable {
                         if !expr.evaluate_fast(&row) {
                             continue;
                         }
+                    }
+                    if indexed {
+                        super::secondary::READS.count(&super::secondary::READS.rows, 1);
                     }
                     vol_rows.push((row_id, row));
                 }
@@ -2688,6 +2863,7 @@ impl Table for SegmentedTable {
                 .map(|e| e.collect_comparisons())
                 .unwrap_or_default();
             let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
+            let identities = self.side_identities();
 
             'outer: for (seg_id, cs) in view.volumes() {
                 let vol = &cs.volume;
@@ -2703,10 +2879,19 @@ impl Table for SegmentedTable {
                 if pruned {
                     continue;
                 }
+                // The side file is probed before the volume's data is touched
+                let mut walk = match self.side_decision(cs, &comparisons, &identities)? {
+                    SideDecision::Empty => continue,
+                    SideDecision::Walk(walk) => Some(walk),
+                    SideDecision::Scan => None,
+                };
 
                 // Load cold volume on demand after pruning.
                 let loaded;
                 let vol: &Arc<FrozenVolume> = if vol.is_cold() {
+                    if walk.is_some() {
+                        super::secondary::READS.count(&super::secondary::READS.reloads, 1);
+                    }
                     loaded = match self.load_volume_of_view(&view, seg_id)? {
                         Some(v) => v,
                         None => continue,
@@ -2718,8 +2903,25 @@ impl Table for SegmentedTable {
                 };
 
                 let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+                let row_ids = vol.row_ids()?;
+                let indexed = walk.is_some();
+                let mut plain = 0usize;
+                // The walk names the positions; else every position in turn
+                let mut next_position = move || -> Result<Option<usize>> {
+                    if let Some(walk) = walk.as_mut() {
+                        walk.next_position().map_err(|error| {
+                            crate::core::Error::internal(format!("side index read failed: {error}"))
+                        })
+                    } else if plain < row_ids.len() {
+                        plain += 1;
+                        Ok(Some(plain - 1))
+                    } else {
+                        Ok(None)
+                    }
+                };
 
-                for (i, &row_id) in vol.row_ids()?.iter().enumerate() {
+                while let Some(i) = next_position()? {
+                    let row_id = row_ids[i];
                     if !cs.is_visible(i) {
                         continue;
                     }
@@ -2750,6 +2952,9 @@ impl Table for SegmentedTable {
                             let row = reader.row(i, &cs.mapping)?;
                             result.push((row_id, row));
                         }
+                    }
+                    if indexed {
+                        super::secondary::READS.count(&super::secondary::READS.rows, 1);
                     }
                     collected += 1;
                     if collected >= remaining {

@@ -58,6 +58,7 @@ Stoolap currently supports the following PRAGMA commands:
 | `index_cache_mb` | Budget of the secondary index side file pages readers hold, in MB | 16 |
 | `index_build_mb` | Budget of the secondary index side file builds in flight, in MB | 64 |
 | `index_stats` | Show the secondary index ledgers, their refusals and build outcomes | - |
+| `index_read_stats` | Show what the reads through side files did: probes, candidates, rows, refusals, scans | - |
 | `memory_stats` | Show per-table hot and cold memory figures | - |
 
 #### checkpoint_interval
@@ -193,6 +194,15 @@ Returns one row per ledger of the secondary index side files: the page cache, th
 ```sql
 PRAGMA index_stats;
 -- ledger | budget_bytes | charged_bytes | peak_bytes | refused | cached_pages | loads | hits | evictions | over_budget | builds_failed | sides_discarded
+```
+
+#### index_read_stats
+
+Returns one row of counters for the reads that went through side files since the process started: volumes probed, probes with an empty answer (the volume was not read), candidate positions named, rows produced from candidates, windows walked, volumes sent to the scan because the working reservation was refused, because no side file column stands for the index, or because the candidates were too many, and metadata-only volumes reloaded after a probe with candidates.
+
+```sql
+PRAGMA index_read_stats;
+-- probes | misses | candidates | rows | windows | refused | ineligible | cost_scans | reloads
 ```
 
 #### memory_stats
