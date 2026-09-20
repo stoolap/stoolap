@@ -3713,10 +3713,6 @@ mod tests {
             .build()
     }
 
-    /// The decoded-group cache is process global: a test that sets its
-    /// budget holds this and puts the default back
-    static CACHE_BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// A retirement is not a deletion: the file goes when its last holder
     /// lets go, so a reader that pinned it reads on past the compaction that
     /// retired it. This is the route the engine's cleanup takes for a volume
@@ -3866,16 +3862,9 @@ mod tests {
 
     #[test]
     fn a_row_reader_decodes_each_group_once_for_a_loop() {
-        use crate::storage::volume::group_cache::{DECODED_GROUPS, DEFAULT_BUDGET_BYTES};
-        let _serial = CACHE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
-        struct Restore;
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                DECODED_GROUPS.set_budget_bytes(0);
-                DECODED_GROUPS.set_budget_bytes(DEFAULT_BUDGET_BYTES);
-            }
-        }
-        let _restore = Restore;
+        // A cache too small for both groups of both columns, so a reader
+        // that let its groups go would decode them again row after row
+        let _budget = crate::storage::volume::group_cache::test_budget::hold(1);
         let schema = SchemaBuilder::new("t")
             .column("id", DataType::Integer, false, true)
             .column("name", DataType::Text, true, false)
@@ -3892,10 +3881,6 @@ mod tests {
         let (_, store) = crate::storage::volume::io::serialize_v4_public(&volume).unwrap();
         volume.columns.attach_compressed_store(store);
         let warm = Arc::new(volume.to_warm().unwrap());
-        // A cache too small for both groups of both columns, so a reader
-        // that let its groups go would decode them again row after row
-        DECODED_GROUPS.set_budget_bytes(0);
-        DECODED_GROUPS.set_budget_bytes(1);
         // Counted on this volume's own store, apart from what other tests
         // decode meanwhile
         let store = warm.columns.compressed_store().unwrap();

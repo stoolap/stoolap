@@ -238,3 +238,29 @@ impl DecodedGroupCache {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
+
+/// The cache is process global: a test that sets its budget holds the
+/// one lock through `hold`, and the default comes back when the guard
+/// drops, on a panic too.
+#[cfg(test)]
+pub(crate) mod test_budget {
+    static CACHE_BUDGET: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) struct BudgetHeld {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn hold(bytes: usize) -> BudgetHeld {
+        let lock = CACHE_BUDGET.lock().unwrap_or_else(|e| e.into_inner());
+        super::DECODED_GROUPS.set_budget_bytes(0);
+        super::DECODED_GROUPS.set_budget_bytes(bytes);
+        BudgetHeld { _lock: lock }
+    }
+
+    impl Drop for BudgetHeld {
+        fn drop(&mut self) {
+            super::DECODED_GROUPS.set_budget_bytes(0);
+            super::DECODED_GROUPS.set_budget_bytes(super::DEFAULT_BUDGET_BYTES);
+        }
+    }
+}

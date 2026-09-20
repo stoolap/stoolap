@@ -3280,9 +3280,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (volume, path) = file_backed(dir.path(), 131_072);
         let definition = definition_of("k", IndexType::BTree, false);
-        let groups = super::super::group_cache::DECODED_GROUPS.budget_bytes();
-        // No group cache: every decode is the build's own allocation
-        super::super::group_cache::DECODED_GROUPS.set_budget_bytes(0);
+        // No group cache: every decode is the build's own allocation. The
+        // cache is process global; the guard holds its lock and puts the
+        // default back, on a panic too
+        let _cache = super::super::group_cache::test_budget::hold(0);
         let baseline = INDEX_BUILDS.stats();
         // A budget under the input's decode: refused before anything is
         // decoded or written
@@ -3328,7 +3329,6 @@ mod tests {
             "workspace and input released"
         );
         drop(side);
-        super::super::group_cache::DECODED_GROUPS.set_budget_bytes(groups);
         INDEX_BUILDS.set_budget_bytes(DEFAULT_BUILD_BUDGET_BYTES);
     }
 

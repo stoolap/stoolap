@@ -6712,9 +6712,10 @@ impl MVCCEngine {
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::side_files_built();
             // Side files found stale under the fence, discarded after it:
-            // their removal takes the file registry and the disk
+            // their removal takes the file registry and the disk, and the
+            // room to hold them is taken here rather than under the fence
             let mut stale_sides: Vec<Arc<crate::storage::volume::secondary::IndexFile>> =
-                Vec::new();
+                Vec::with_capacity(sealed_sides.len());
             // Seal critical section under exclusive fence: register cold
             // segments + remove hot rows + remove hot index entries.
             // DML operations hold the shared fence, so they cannot race
