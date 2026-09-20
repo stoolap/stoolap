@@ -1147,6 +1147,12 @@ impl Reader {
         self.end.saturating_sub(self.next)
     }
 
+    /// The window last returned by `next_window`, in the reader's own
+    /// reserved space
+    pub fn window(&self) -> &[u32] {
+        &self.buffer
+    }
+
     /// The next window of the walk, sorted ascending, or None at the end.
     /// A page that fails to read leaves the walk where the window began.
     pub fn next_window(&mut self) -> std::io::Result<Option<&[u32]>> {
@@ -2625,51 +2631,72 @@ impl ReadCounters {
     }
 }
 
+/// Positions a side file walk yields per window
+pub const SIDE_WINDOW: usize = 4096;
+
+/// A walk decided for a volume: the side file, the physical column and the
+/// position index range the probe found. The reader and its working
+/// reservation are taken when the walk starts (`walk`), not when the
+/// decision is made, so volumes waiting their turn hold nothing.
+pub struct SidePlan {
+    file: Arc<IndexFile>,
+    column: usize,
+    range: (u64, u64),
+}
+
+impl SidePlan {
+    pub fn new(file: Arc<IndexFile>, column: usize, range: (u64, u64)) -> Self {
+        Self {
+            file,
+            column,
+            range,
+        }
+    }
+
+    /// Candidates the walk will name
+    pub fn candidates(&self) -> u64 {
+        self.range.1 - self.range.0
+    }
+
+    /// Starts the walk: takes the reader's working reservation now. Refused
+    /// (`is_refused`), the volume goes through the scan.
+    pub fn walk(&self, window: usize) -> std::io::Result<SideWalk> {
+        let mut reader = self.file.reader(self.column, window)?;
+        reader.walk(self.range);
+        Ok(SideWalk { reader, at: 0 })
+    }
+}
+
 /// The positions a reader's walk names, taken one at a time by a scanner
-/// or a collect loop: windows are pulled as they are consumed, so a LIMIT
-/// that is satisfied early leaves the later windows unread.
+/// or a collect loop from the reader's own window: windows are pulled as
+/// they are consumed, so a LIMIT that is satisfied early leaves the later
+/// windows unread, and nothing is copied out of the reservation.
 pub struct SideWalk {
     reader: Reader,
-    window: Vec<u32>,
     at: usize,
 }
 
 impl SideWalk {
-    /// A walk over `range` of the reader's column
-    pub fn new(mut reader: Reader, range: (u64, u64)) -> Self {
-        reader.walk(range);
-        Self {
-            reader,
-            window: Vec::new(),
-            at: 0,
-        }
-    }
-
     /// The next candidate position, None at the end; a page that fails to
     /// read is the walk's error and the walk stays where it was
     pub fn next_position(&mut self) -> std::io::Result<Option<usize>> {
-        if self.at >= self.window.len() {
+        if self.at >= self.reader.window().len() {
             match self.reader.next_window()? {
-                Some(window) => {
-                    self.window.clear();
-                    self.window.extend_from_slice(window);
+                Some(window) if !window.is_empty() => {
                     self.at = 0;
                     READS.count(&READS.windows, 1);
                 }
-                None => return Ok(None),
-            }
-            if self.window.is_empty() {
-                return Ok(None);
+                _ => return Ok(None),
             }
         }
-        let position = self.window[self.at] as usize;
+        let position = self.reader.window()[self.at] as usize;
         self.at += 1;
         Ok(Some(position))
     }
 
     /// Candidates left, including the current window's rest
     pub fn remaining(&self) -> u64 {
-        self.reader.remaining() + (self.window.len() - self.at) as u64
+        self.reader.remaining() + (self.reader.window().len() - self.at) as u64
     }
 }
 

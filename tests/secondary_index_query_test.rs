@@ -22,6 +22,10 @@
 //! file send the volume through the scan with the same answer.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "test-failpoints")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "test-failpoints")]
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use stoolap::api::Transaction;
@@ -82,6 +86,7 @@ fn insert(db: &Database, from: i64, to: i64) {
 
 fn ids_db(db: &Database, sql: &str, params: &[i64]) -> Vec<i64> {
     let mut out: Vec<i64> = match params {
+        [] => db.query(sql, ()).unwrap(),
         [a] => db.query(sql, (*a,)).unwrap(),
         [a, b] => db.query(sql, (*a, *b)).unwrap(),
         _ => unreachable!(),
@@ -532,14 +537,14 @@ fn a_compaction_inside_the_lookup_window_does_not_change_the_answer_and_the_outp
     assert_eq!(db.engine().volume_stats().len(), 4);
 
     let other = db.clone();
+    let fired = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&fired);
     stoolap::test_failpoints::after_cold_volumes_taken(move || {
+        if seen.swap(true, Ordering::Relaxed) {
+            return;
+        }
         other.execute("PRAGMA COMPACT_THRESHOLD = 2", ()).unwrap();
         other.execute("PRAGMA CHECKPOINT", ()).unwrap();
-        assert_eq!(
-            other.engine().volume_stats().len(),
-            1,
-            "the compaction merged the volumes"
-        );
     });
     let mut tx = db.begin().unwrap();
     assert_eq!(
@@ -548,6 +553,15 @@ fn a_compaction_inside_the_lookup_window_does_not_change_the_answer_and_the_outp
     );
     tx.rollback().unwrap();
     stoolap::test_failpoints::after_cold_volumes_taken(|| {});
+    assert!(
+        fired.load(Ordering::Relaxed),
+        "the compaction ran inside the read's window"
+    );
+    assert_eq!(
+        db.engine().volume_stats().len(),
+        1,
+        "the compaction merged the volumes"
+    );
 
     let before = reads(&db);
     check_all(&db, "compacted");
@@ -574,9 +588,13 @@ fn a_seal_inside_the_lookup_window_answers_every_row_once() {
     insert(&db, ROWS / 2 + 1, ROWS);
 
     let other = db.clone();
+    let fired = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&fired);
     stoolap::test_failpoints::after_cold_volumes_taken(move || {
+        if seen.swap(true, Ordering::Relaxed) {
+            return;
+        }
         other.execute("PRAGMA CHECKPOINT", ()).unwrap();
-        assert_eq!(other.engine().volume_stats().len(), 2, "the seal landed");
     });
     let mut tx = db.begin().unwrap();
     assert_eq!(
@@ -585,6 +603,11 @@ fn a_seal_inside_the_lookup_window_answers_every_row_once() {
     );
     tx.rollback().unwrap();
     stoolap::test_failpoints::after_cold_volumes_taken(|| {});
+    assert!(
+        fired.load(Ordering::Relaxed),
+        "the seal ran inside the read's window"
+    );
+    assert_eq!(db.engine().volume_stats().len(), 2, "the seal landed");
     check_all(&db, "after the seal");
 }
 
@@ -605,4 +628,199 @@ fn sixteen_volumes_answer_every_shape_through_their_side_files() {
     let after = reads(&db);
     assert_eq!(delta(&after, &before, "ineligible"), 0);
     assert!(delta(&after, &before, "probes") >= 16);
+}
+
+/// A TIMESTAMP bound outside the range nanoseconds hold (a year 3000) has
+/// no exact key: the column goes to the scan and the answer is right; a
+/// bound inside the range is served by the side file.
+#[test]
+fn a_timestamp_bound_outside_the_nanosecond_range_goes_to_the_scan() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, ts TIMESTAMP NOT NULL, v INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_ts ON t(ts)", ()).unwrap();
+    let values = (1..=600)
+        .map(|i| {
+            format!(
+                "({i}, '2020-01-{:02} {:02}:00:00', {i})",
+                1 + (i / 24) % 28,
+                i % 24
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    db.execute(&format!("INSERT INTO t VALUES {values}"), ())
+        .unwrap();
+    let count = |sql: &str| -> usize { db.query(sql, ()).unwrap().count() };
+    const PAST_THE_RANGE: &str = "SELECT id FROM t WHERE ts < '3000-01-01 00:00:00'";
+    const BEFORE_THE_RANGE: &str = "SELECT id FROM t WHERE ts > '1000-01-01 00:00:00'";
+    assert_eq!(count(PAST_THE_RANGE), 600);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let before = reads(&db);
+    assert_eq!(count(PAST_THE_RANGE), 600);
+    assert_eq!(count(BEFORE_THE_RANGE), 600);
+    let after = reads(&db);
+    assert_eq!(
+        delta(&after, &before, "probes"),
+        0,
+        "no exact key, no probe"
+    );
+    let before = reads(&db);
+    assert_eq!(
+        count("SELECT id FROM t WHERE ts = '2020-01-01 02:00:00'"),
+        1
+    );
+    assert_eq!(
+        count("SELECT id FROM t WHERE ts >= '2020-01-01 01:00:00' AND ts < '2020-01-01 03:00:00'"),
+        2
+    );
+    let after = reads(&db);
+    assert_eq!(delta(&after, &before, "probes"), 2, "exact keys are probed");
+    assert_eq!(delta(&after, &before, "rows"), 3);
+}
+
+/// A residual predicate beside the indexed comparison, with a LIMIT, still
+/// takes the side file: the ordered collector probes and the residual runs
+/// on the candidates alone.
+#[test]
+fn a_residual_filter_with_a_limit_still_takes_the_side_file() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    insert(&db, 1, ROWS);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let before = reads(&db);
+    let rows: Vec<i64> = db
+        .query(
+            "SELECT id FROM t WHERE k = 1234 AND ABS(id + 1) > 0 LIMIT 3",
+            (),
+        )
+        .unwrap()
+        .map(|r| r.unwrap().get(0).unwrap())
+        .collect();
+    let after = reads(&db);
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|id| expected_eq(1234).contains(id)));
+    assert!(
+        delta(&after, &before, "probes") > 0,
+        "the volume was probed"
+    );
+    assert!(
+        delta(&after, &before, "rows") <= 8,
+        "at most the key's candidates were read"
+    );
+}
+
+/// Readers take their reservation when their volume's turn comes and let
+/// it go when the walk ends, so a budget that holds one reader serves
+/// every volume of a sixteen-volume table in turn.
+#[test]
+fn a_budget_for_one_reader_serves_sixteen_volumes_in_turn() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    for batch in 0..16 {
+        insert(&db, batch * (ROWS / 16) + 1, (batch + 1) * (ROWS / 16));
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    db.execute("PRAGMA INDEX_CACHE_MB = 1", ()).unwrap();
+    let before = reads(&db);
+    check_all(&db, "one megabyte");
+    let after = reads(&db);
+    db.execute("PRAGMA INDEX_CACHE_MB = 16", ()).unwrap();
+    assert_eq!(
+        delta(&after, &before, "refused"),
+        0,
+        "no reader was refused"
+    );
+    assert!(delta(&after, &before, "probes") >= 16);
+}
+
+/// The decoded groups of `PRAGMA GROUP_CACHE_STATS`, by column name
+fn group_cache(db: &Database) -> BTreeMap<String, i64> {
+    let rows = db.query("PRAGMA GROUP_CACHE_STATS", ()).unwrap();
+    let columns: Vec<String> = rows.columns().to_vec();
+    let row = rows.into_iter().next().unwrap().unwrap();
+    columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.clone(), row.get::<i64>(i).unwrap()))
+        .collect()
+}
+
+/// A text equality beside the indexed key decodes the text column for the
+/// candidates' groups alone: the dictionary prescan over every group of the
+/// volume is left out when the side file names the candidates.
+#[test]
+fn a_text_equality_beside_the_key_decodes_only_the_candidates_groups() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL, name TEXT NOT NULL, emb VECTOR(2))",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    // Four row groups whose key ranges all overlap, so no zone map prunes
+    // one; a key's rows still sit together in a single group
+    const GROUPS: i64 = 4;
+    const TOTAL: i64 = GROUPS * 65_536;
+    let key_of = |id: i64| (id % 1000) * 4 + (id - 1) / 65_536;
+    for chunk_start in (1..=TOTAL).step_by(4096) {
+        let chunk_end = (chunk_start + 4095).min(TOTAL);
+        let values = (chunk_start..=chunk_end)
+            .map(|id| format!("({id},{},'n{}','[{},0]')", key_of(id), id % 7, id % 3))
+            .collect::<Vec<_>>()
+            .join(",");
+        db.execute(&format!("INSERT INTO t VALUES {values}"), ())
+            .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(db.engine().volume_stats().len(), 1);
+    let db = {
+        drop(db);
+        open(dir.path(), "")
+    };
+    let want: Vec<i64> = (1..=TOTAL)
+        .filter(|&id| key_of(id) == 2000 && id % 7 == 3)
+        .collect();
+    assert!(
+        want.iter().all(|&id| id <= 65_536),
+        "one group holds the key"
+    );
+    // The scanner path, and the collection path the vector order takes;
+    // a column loaded whole would show in the volume's resident bytes
+    let resident = |db: &Database| db.engine().volume_stats()[0].4;
+    for sql in [
+        "SELECT id FROM t WHERE k = 2000 AND name = 'n3'",
+        "SELECT id FROM t WHERE k = 2000 AND name = 'n3' ORDER BY VEC_DISTANCE_L2(emb, '[0,0]') LIMIT 100",
+    ] {
+        db.execute("PRAGMA GROUP_CACHE_MB = 0", ()).unwrap();
+        db.execute("PRAGMA GROUP_CACHE_MB = 64", ()).unwrap();
+        let cache_before = group_cache(&db);
+        let before = reads(&db);
+        let resident_before = resident(&db);
+        assert_eq!(ids_db(&db, sql, &[]), want, "{sql}");
+        let after = reads(&db);
+        let cache_after = group_cache(&db);
+        assert_eq!(delta(&after, &before, "probes"), 1, "{sql}");
+        // One group of each column read, four columns at most; the prescan
+        // would add the text column's other groups
+        assert!(
+            delta(&cache_after, &cache_before, "misses") <= 4,
+            "only the candidates' group was decoded: {} groups: {sql}",
+            delta(&cache_after, &cache_before, "misses")
+        );
+        assert_eq!(resident(&db), resident_before, "no column loaded whole: {sql}");
+    }
 }

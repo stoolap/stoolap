@@ -45,14 +45,28 @@ use super::writer::FrozenVolume;
 enum SideDecision {
     Scan,
     Empty,
-    Walk(Box<super::secondary::SideWalk>),
+    Walk(Box<super::secondary::SidePlan>),
 }
 
-/// Positions a side file walk yields per window
-const SIDE_WINDOW: usize = 4096;
 /// The index serves a volume when the candidates are at most this share
 /// of its rows: one in twenty to start, to be measured
 const SIDE_SCAN_SHARE: u64 = 20;
+
+/// Starts a decided walk for a loop that reads the volume now; refused,
+/// the volume goes through the scan, counted
+fn start_walk(plan: &super::secondary::SidePlan) -> Result<Option<super::secondary::SideWalk>> {
+    use super::secondary::{is_refused, READS, SIDE_WINDOW};
+    match plan.walk(SIDE_WINDOW) {
+        Ok(walk) => Ok(Some(walk)),
+        Err(error) if is_refused(&error) => {
+            READS.count(&READS.refused, 1);
+            Ok(None)
+        }
+        Err(error) => Err(crate::core::Error::internal(format!(
+            "side index read failed: {error}"
+        ))),
+    }
+}
 
 /// One row held by [`TopK`]: ordered so that the worst row of the k is the
 /// greatest, which puts it on top of a max-heap.
@@ -1178,17 +1192,16 @@ impl SegmentedTable {
         comparisons: &[(&str, crate::core::Operator, &Value)],
         identities: &[(usize, u64)],
     ) -> Result<SideDecision> {
-        use super::secondary::{is_refused, SideWalk, READS};
+        use super::secondary::{is_refused, SidePlan, READS};
         use crate::core::Operator;
         if identities.is_empty() || comparisons.is_empty() {
             return Ok(SideDecision::Scan);
         }
+        // A bound that has no exact key (a timestamp outside the range
+        // nanoseconds hold) leaves the column to the scan
         let key = |value: &Value| match value {
-            Value::Integer(i) => Some(*i),
-            Value::Timestamp(ts) => Some(
-                ts.timestamp_nanos_opt()
-                    .unwrap_or(ts.timestamp() * 1_000_000_000),
-            ),
+            Value::Integer(i) => Some(Some(*i)),
+            Value::Timestamp(ts) => Some(ts.timestamp_nanos_opt()),
             _ => None,
         };
         let side_error = |error: std::io::Error| {
@@ -1205,8 +1218,10 @@ impl SegmentedTable {
                 if !col_name.eq_ignore_ascii_case(name) {
                     continue;
                 }
-                let Some(k) = key(value) else {
-                    continue;
+                let k = match key(value) {
+                    Some(Some(k)) => k,
+                    Some(None) => return Ok(SideDecision::Scan),
+                    None => continue,
                 };
                 bounded = true;
                 match op {
@@ -1240,7 +1255,10 @@ impl SegmentedTable {
                 READS.count(&READS.ineligible, 1);
                 return Ok(SideDecision::Scan);
             };
-            let reader = match side.reader(physical, SIDE_WINDOW) {
+            // The probe reads the boundary pages through a reader of its own,
+            // let go before the decision is handed on: the walk takes its
+            // reservation when it starts
+            let reader = match side.reader(physical, 1) {
                 Ok(reader) => reader,
                 Err(error) if is_refused(&error) => {
                     READS.count(&READS.refused, 1);
@@ -1267,7 +1285,12 @@ impl SegmentedTable {
                 return Ok(SideDecision::Scan);
             }
             READS.count(&READS.candidates, count);
-            return Ok(SideDecision::Walk(Box::new(SideWalk::new(reader, range))));
+            drop(reader);
+            return Ok(SideDecision::Walk(Box::new(SidePlan::new(
+                Arc::clone(side),
+                physical,
+                range,
+            ))));
         }
         Ok(SideDecision::Scan)
     }
@@ -1320,10 +1343,7 @@ impl SegmentedTable {
                 if vol.is_sorted(col_idx) && !vol.is_cold() {
                     let target = match value {
                         Value::Integer(i) => Some(*i),
-                        Value::Timestamp(ts) => Some(
-                            ts.timestamp_nanos_opt()
-                                .unwrap_or(ts.timestamp() * 1_000_000_000),
-                        ),
+                        Value::Timestamp(ts) => Some(super::scanner::bound_nanos(ts)),
                         _ => None,
                     };
                     if let Some(target) = target {
@@ -1460,6 +1480,8 @@ impl SegmentedTable {
         let view = self.segment_mgr.cold_snapshot();
         self.segment_mgr
             .check_schema_generation(self.schema_generation)?;
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::cold_volumes_taken();
         if view.seg_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -1471,7 +1493,11 @@ impl SegmentedTable {
         let hot_skip_arc = Arc::new(hot_skip);
 
         let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-        let identities = self.side_identities();
+        let identities = if comparisons.is_empty() {
+            Vec::new()
+        } else {
+            self.side_identities()
+        };
         let mut scanners_reverse: Vec<Box<dyn Scanner>> = Vec::with_capacity(view.seg_ids.len());
 
         for (seg_id, cs) in view.volumes() {
@@ -1483,11 +1509,12 @@ impl SegmentedTable {
             }
             // The side file is probed before the volume's data is touched:
             // an empty answer skips the volume without a reload
-            let walk = match self.side_decision(cs, &comparisons, &identities)? {
+            let plan = match self.side_decision(cs, &comparisons, &identities)? {
                 SideDecision::Empty => continue,
-                SideDecision::Walk(walk) => Some(walk),
+                SideDecision::Walk(plan) => Some(plan),
                 SideDecision::Scan => None,
             };
+            let walk = &plan;
             // Load cold volume on demand after zone-map/bloom pruning.
             // Re-prune to get binary-search range narrowing on sorted columns.
             let loaded;
@@ -1536,17 +1563,18 @@ impl SegmentedTable {
             if let Some(needed) = needed {
                 scanner.set_needed_cols(needed);
             }
+            // The walk's positions replace the range and the filter's
+            // dictionary pre-scan, which is why it is set first; the filter
+            // itself still runs on every row
+            if let Some(plan) = plan {
+                scanner.set_side_plan(*plan);
+            }
 
             if let Some(expr) = where_expr {
                 let filter = expr.with_aliases(&Default::default());
                 let mut prepared = filter;
                 prepared.prepare_for_schema(current_schema);
                 scanner.set_filter(prepared);
-            }
-            // The walk's positions replace the range and the pre-filter the
-            // filter set up; the filter itself still runs on every row
-            if let Some(walk) = walk {
-                scanner.set_side_walk(*walk);
             }
             scanners_reverse.push(Box::new(scanner) as Box<dyn Scanner>);
         }
@@ -1617,7 +1645,11 @@ impl SegmentedTable {
         let tombstones_ref = tombstones_arc;
 
         // Per-volume row collection closure. Returns Some(vol_rows) or None if pruned.
-        let identities = self.side_identities();
+        let identities = if comparisons.is_empty() {
+            Vec::new()
+        } else {
+            self.side_identities()
+        };
         let process_volume =
             |(seg_id, cs): &(u64, &super::manifest::ColdSegment)| -> Result<Option<RowVec>> {
                 let vol = &cs.volume;
@@ -1629,7 +1661,7 @@ impl SegmentedTable {
                 // The side file is probed before the volume's data is touched
                 let mut walk = match self.side_decision(cs, &comparisons, &identities)? {
                     SideDecision::Empty => return Ok(None),
-                    SideDecision::Walk(walk) => Some(walk),
+                    SideDecision::Walk(plan) => start_walk(&plan)?,
                     SideDecision::Scan => None,
                 };
                 // Load cold volume on demand after zone-map/bloom pruning.
@@ -1691,12 +1723,19 @@ impl SegmentedTable {
                 // The rows that pass the dictionary filters, found in one pass
                 // over the raw ids; None walks the whole range
                 let mut candidates: Vec<usize> = Vec::new();
-                let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> = dict_filters
-                    .iter()
-                    .map(|&(col_idx, expected)| {
-                        vol.columns.get(col_idx).map(|col| (col, start, expected))
-                    })
-                    .collect::<std::io::Result<_>>()?;
+                // The walk names the rows; the dictionary filters, which would
+                // load their columns whole, are left to the row filter then
+                let filters: smallvec::SmallVec<[super::column::DictFilter<'_>; 4]> =
+                    if walk.is_some() {
+                        smallvec::SmallVec::new()
+                    } else {
+                        dict_filters
+                            .iter()
+                            .map(|&(col_idx, expected)| {
+                                vol.columns.get(col_idx).map(|col| (col, start, expected))
+                            })
+                            .collect::<std::io::Result<_>>()?
+                    };
                 let prefiltered = walk.is_none()
                     && !filters.is_empty()
                     && super::column::ColumnData::dict_matching_offsets(
@@ -1764,10 +1803,11 @@ impl SegmentedTable {
                             continue;
                         }
                     }
-                    if indexed {
-                        super::secondary::READS.count(&super::secondary::READS.rows, 1);
-                    }
                     vol_rows.push((row_id, row));
+                }
+                if indexed {
+                    super::secondary::READS
+                        .count(&super::secondary::READS.rows, vol_rows.len() as u64);
                 }
                 Ok(Some(vol_rows))
             };
@@ -2742,6 +2782,11 @@ impl Table for SegmentedTable {
                 .map(|e| e.collect_comparisons())
                 .unwrap_or_default();
             let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
+            let identities = if comparisons.is_empty() {
+                Vec::new()
+            } else {
+                self.side_identities()
+            };
 
             'done: for (nf_idx, seg_id) in view.seg_ids.iter().enumerate().rev() {
                 let Some(cs) = view.segs.get(seg_id) else {
@@ -2755,10 +2800,20 @@ impl Table for SegmentedTable {
                         continue;
                     }
                 }
+                // The side file is probed before the volume's data is touched;
+                // the authority map keeps deciding which copy of a row is read
+                let mut walk = match self.side_decision(cs, &comparisons, &identities)? {
+                    SideDecision::Empty => continue,
+                    SideDecision::Walk(plan) => start_walk(&plan)?,
+                    SideDecision::Scan => None,
+                };
 
                 // Load cold volume on demand after pruning.
                 let loaded;
                 let vol: &Arc<FrozenVolume> = if vol.is_cold() {
+                    if walk.is_some() {
+                        super::secondary::READS.count(&super::secondary::READS.reloads, 1);
+                    }
                     loaded = match self.load_volume_of_view(&view, *seg_id)? {
                         Some(v) => v,
                         None => continue,
@@ -2770,8 +2825,25 @@ impl Table for SegmentedTable {
                 };
 
                 let mut reader = super::writer::RowReader::new(Arc::clone(vol));
+                let row_ids = vol.row_ids()?;
+                let indexed = walk.is_some();
+                let mut served = 0u64;
+                let mut plain = 0usize;
+                let mut next_position = move || -> Result<Option<usize>> {
+                    if let Some(walk) = walk.as_mut() {
+                        walk.next_position().map_err(|error| {
+                            crate::core::Error::internal(format!("side index read failed: {error}"))
+                        })
+                    } else if plain < row_ids.len() {
+                        plain += 1;
+                        Ok(Some(plain - 1))
+                    } else {
+                        Ok(None)
+                    }
+                };
 
-                for (i, &rid) in vol.row_ids()?.iter().enumerate() {
+                while let Some(i) = next_position()? {
+                    let rid = row_ids[i];
                     if authority.get(&rid) != Some(&nf_idx) {
                         continue;
                     }
@@ -2781,11 +2853,16 @@ impl Table for SegmentedTable {
                             continue;
                         }
                     }
+                    if indexed {
+                        served += 1;
+                    }
                     cold_rows.push((rid, row));
                     if cold_rows.len() >= target {
+                        super::secondary::READS.count(&super::secondary::READS.rows, served);
                         break 'done;
                     }
                 }
+                super::secondary::READS.count(&super::secondary::READS.rows, served);
             }
 
             // Phase 3: If cold didn't fill the target, materialize hot rows
@@ -2863,7 +2940,11 @@ impl Table for SegmentedTable {
                 .map(|e| e.collect_comparisons())
                 .unwrap_or_default();
             let bloom_hashes = Self::precompute_bloom_hashes(&comparisons);
-            let identities = self.side_identities();
+            let identities = if comparisons.is_empty() {
+                Vec::new()
+            } else {
+                self.side_identities()
+            };
 
             'outer: for (seg_id, cs) in view.volumes() {
                 let vol = &cs.volume;
@@ -2882,7 +2963,7 @@ impl Table for SegmentedTable {
                 // The side file is probed before the volume's data is touched
                 let mut walk = match self.side_decision(cs, &comparisons, &identities)? {
                     SideDecision::Empty => continue,
-                    SideDecision::Walk(walk) => Some(walk),
+                    SideDecision::Walk(plan) => start_walk(&plan)?,
                     SideDecision::Scan => None,
                 };
 
@@ -2905,6 +2986,7 @@ impl Table for SegmentedTable {
                 let mut reader = super::writer::RowReader::new(Arc::clone(vol));
                 let row_ids = vol.row_ids()?;
                 let indexed = walk.is_some();
+                let mut served = 0u64;
                 let mut plain = 0usize;
                 // The walk names the positions; else every position in turn
                 let mut next_position = move || -> Result<Option<usize>> {
@@ -2954,13 +3036,15 @@ impl Table for SegmentedTable {
                         }
                     }
                     if indexed {
-                        super::secondary::READS.count(&super::secondary::READS.rows, 1);
+                        served += 1;
                     }
                     collected += 1;
                     if collected >= remaining {
+                        super::secondary::READS.count(&super::secondary::READS.rows, served);
                         break 'outer;
                     }
                 }
+                super::secondary::READS.count(&super::secondary::READS.rows, served);
             }
 
             Ok(result)
@@ -5391,7 +5475,7 @@ impl Table for SegmentedTable {
                     TypedTarget::Int64(*f as i64)
                 }
                 (DataType::Timestamp, Value::Timestamp(t)) => {
-                    TypedTarget::Int64(t.timestamp_nanos_opt().unwrap_or(0))
+                    TypedTarget::Int64(super::scanner::bound_nanos(t))
                 }
                 (DataType::Timestamp, Value::Integer(i)) => TypedTarget::Int64(*i),
                 (DataType::Float, Value::Float(f)) => TypedTarget::Float64(*f),
