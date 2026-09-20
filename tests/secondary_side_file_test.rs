@@ -762,6 +762,45 @@ fn a_compaction_whose_preparation_went_stale_prepares_again_and_publishes_whole(
     db.close().unwrap();
 }
 
+/// An eviction that replaces the segments after the comparison under the
+/// guard and before the commit takes no DDL guard: the commit finds the
+/// preparation stale under its own write locks and hands it back before
+/// changing anything, and the compaction prepares again and publishes
+/// whole.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn an_eviction_between_the_comparison_and_the_commit_hands_the_preparation_back() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "&compact_threshold=100");
+    create(&db);
+    seal_rows(&db, 1, 2_000);
+    seal_rows(&db, 2_001, 2_000);
+    seal_rows(&db, 4_001, 2_000);
+    db.execute("PRAGMA COMPACT_THRESHOLD = 2", ()).unwrap();
+    let other = db.clone();
+    stoolap::test_failpoints::after_side_files_compared(move || {
+        // The inputs are evicted to metadata-only, which publishes a new
+        // segments map without any DDL coordination
+        let (volumes, cold) = other.engine().cold_volumes_for_test("t");
+        assert_eq!((volumes, cold), (3, 3), "the inputs were evicted");
+    });
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let volumes = files(dir.path(), "t", "vol");
+    assert_eq!(volumes.len(), 1, "the compaction's output");
+    assert_eq!(files(dir.path(), "t", "sidx"), volumes);
+    let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+    assert_eq!(count, 6_000);
+    let with_key: i64 = db
+        .query_one("SELECT COUNT(*) FROM t WHERE k = 3", ())
+        .unwrap();
+    assert_eq!(
+        with_key,
+        (1..=6_000i64).filter(|i| i % 7 == 3).count() as i64
+    );
+    db.close().unwrap();
+}
+
 /// A CREATE INDEX that arrives while a seal is between its registration and
 /// its hot cleanup waits for the guard: the new index holds no entry for a
 /// sealed row, and answers the rows from the cold side.

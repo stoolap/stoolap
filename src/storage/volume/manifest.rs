@@ -3004,36 +3004,44 @@ impl SegmentManager {
         }
     }
 
-    /// Commits a prepared replacement whose preparation still stands. A
-    /// preparation the segments moved under since (a seal registered) is
-    /// handed back untouched instead of being rebuilt under the caller's
-    /// locks: the caller prepares again outside them (`into_parts`).
+    /// Commits a prepared replacement whose preparation still stands. The
+    /// decision is made under the publication's own write locks, before
+    /// anything changes: a preparation the segments moved under since (a
+    /// seal, a column change, a reload or an eviction) is handed back
+    /// untouched, and the caller prepares again outside its locks
+    /// (`into_parts`).
     pub fn commit_replacement(
         &self,
         replacement: PreparedReplacement,
         schema: Option<&crate::core::Schema>,
     ) -> std::result::Result<(), Box<PreparedReplacement>> {
-        {
-            let manifest = self.manifest.read();
-            let segments = self.segments.read();
-            let order: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
-            if !Arc::ptr_eq(&*segments, &replacement.prepared.snapshot)
-                || order != replacement.prepared.order
-            {
-                return Err(Box::new(replacement));
-            }
-        }
         let PreparedReplacement {
             new_volumes,
             old_segment_ids,
             owners,
             prepared,
         } = replacement;
-        self.commit_publication(prepared, new_volumes, &old_segment_ids, schema, &owners);
-        self.forget_key_order(&old_segment_ids);
-        self.cached_deduped_count
-            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        match self.commit_publication(
+            prepared,
+            &new_volumes,
+            &old_segment_ids,
+            schema,
+            &owners,
+            false,
+        ) {
+            Ok(_) => {
+                self.forget_key_order(&old_segment_ids);
+                self.cached_deduped_count
+                    .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(prepared) => Err(Box::new(PreparedReplacement {
+                new_volumes,
+                old_segment_ids,
+                owners,
+                prepared,
+            })),
+        }
     }
 
     /// The publication in its two steps, `between` run after the first
@@ -3049,8 +3057,16 @@ impl SegmentManager {
         let owners = self.output_owners(&new_volumes, sides);
         let prepared = self.prepare_publication(&new_volumes, old_segment_ids, &owners);
         between(self);
-        let fresh =
-            self.commit_publication(prepared, new_volumes, old_segment_ids, schema, &owners);
+        let fresh = self
+            .commit_publication(
+                prepared,
+                &new_volumes,
+                old_segment_ids,
+                schema,
+                &owners,
+                true,
+            )
+            .unwrap_or(false);
         self.forget_key_order(old_segment_ids);
         self.cached_deduped_count
             .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
@@ -3126,15 +3142,23 @@ impl SegmentManager {
     fn commit_publication(
         &self,
         prepared: PreparedPublication,
-        new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
+        new_volumes: &[(u64, Arc<FrozenVolume>, SegmentMeta)],
         old_segment_ids: &[u64],
         schema: Option<&crate::core::Schema>,
         owners: &[Owners],
-    ) -> bool {
+        rebuild: bool,
+    ) -> std::result::Result<bool, PreparedPublication> {
         let mut manifest = self.manifest.write();
         let mut segments = self.segments.write();
         let current_order: Vec<u64> = manifest.segments.iter().map(|m| m.segment_id).collect();
         let fresh = Arc::ptr_eq(&*segments, &prepared.snapshot) && current_order == prepared.order;
+        // The decision is made under the locks the publication uses, before
+        // anything is changed: a stale preparation goes back to a caller
+        // that prepares again outside its own locks, unless it asked for
+        // the rebuild here
+        if !fresh && !rebuild {
+            return Err(prepared);
+        }
         let mut map = if fresh {
             prepared.map
         } else {
@@ -3151,14 +3175,15 @@ impl SegmentManager {
             .unwrap_or(manifest.segments.len());
         manifest.remove_segments(old_segment_ids);
         let insert_pos = insert_pos.min(manifest.segments.len());
-        for (i, (seg_id, vol, meta)) in new_volumes.into_iter().enumerate() {
+        for (i, (seg_id, vol, meta)) in new_volumes.iter().enumerate() {
+            let seg_id = *seg_id;
             if seg_id >= manifest.next_segment_id {
                 manifest.next_segment_id = seg_id + 1;
             }
             let seg_schema_version = meta.schema_version;
-            manifest.segments.insert(insert_pos + i, meta);
+            manifest.segments.insert(insert_pos + i, meta.clone());
             // The mapping reads the manifest's history as it is now
-            let mapping = mapping_for(&manifest, &vol, seg_schema_version, schema);
+            let mapping = mapping_for(&manifest, vol, seg_schema_version, schema);
             match map.get_mut(&seg_id) {
                 Some(cs) if fresh => cs.mapping = mapping,
                 _ => {
@@ -3166,7 +3191,7 @@ impl SegmentManager {
                         seg_id,
                         ColdSegment {
                             mapping,
-                            volume: vol,
+                            volume: Arc::clone(vol),
                             schema_version: seg_schema_version,
                             visible: None,
                             file: owners[i].0.clone(),
@@ -3191,7 +3216,7 @@ impl SegmentManager {
         self.has_segments_flag
             .store(!map.is_empty(), std::sync::atomic::Ordering::Relaxed);
         *segments = Arc::new(map);
-        fresh
+        Ok(fresh)
     }
 
     /// Atomically remove old segments without adding a replacement.
@@ -4076,7 +4101,9 @@ mod tests {
         let outputs = vec![(3, volume_of(&c), meta_for_ids(3, &c))];
         let owners = mgr.output_owners(&outputs, Vec::new());
         let prepared = mgr.prepare_publication(&outputs, &[1], &owners);
-        assert!(mgr.commit_publication(prepared, outputs, &[1], None, &owners));
+        assert!(mgr
+            .commit_publication(prepared, &outputs, &[1], None, &owners, true)
+            .is_ok_and(|fresh| fresh));
         let order: Vec<u64> = mgr
             .manifest
             .read()
@@ -4111,7 +4138,9 @@ mod tests {
         // A seal lands in between: D takes ids 2 and 130 from everyone below
         let d: Vec<i64> = vec![2, 130];
         mgr.register_segment(4, volume_of(&d), meta_for_ids(4, &d), None);
-        assert!(!mgr.commit_publication(prepared, outputs, &[1], None, &owners));
+        assert!(mgr
+            .commit_publication(prepared, &outputs, &[1], None, &owners, true)
+            .is_ok_and(|fresh| !fresh));
         let order: Vec<u64> = mgr
             .manifest
             .read()
