@@ -1021,6 +1021,50 @@ impl IndexFile {
         Ok(end - start)
     }
 
+    /// What the directory alone says of the positions of keys in
+    /// `[low, high]`, without reading a page: None when no key page touches
+    /// the range; else the positions of the pages inside the range exactly
+    /// and of the boundary pages by key interpolation, one at least
+    pub fn candidate_estimate(
+        &self,
+        column: usize,
+        low: i64,
+        high: i64,
+    ) -> std::io::Result<Option<u64>> {
+        let col = self
+            .directory
+            .column(column)
+            .ok_or_else(|| invalid("column has no index"))?;
+        if low > high {
+            return Ok(None);
+        }
+        let first = col.key_pages.partition_point(|p| p.last_key < low);
+        let last = col.key_pages.partition_point(|p| p.first_key <= high);
+        if first >= last {
+            return Ok(None);
+        }
+        let positions_of = |page: usize| -> u64 {
+            let start = col.key_pages[page].pos_start;
+            col.key_pages
+                .get(page + 1)
+                .map_or(col.n_positions, |p| p.pos_start)
+                - start
+        };
+        let share_of = |page: usize| -> u64 {
+            let p = &col.key_pages[page];
+            let span = (p.last_key as i128 - p.first_key as i128 + 1) as u128;
+            let overlap = (high.min(p.last_key) as i128 - low.max(p.first_key) as i128 + 1) as u128;
+            (positions_of(page) as u128 * overlap / span) as u64
+        };
+        let estimate = if last - first == 1 {
+            share_of(first)
+        } else {
+            let interior = col.key_pages[last - 1].pos_start - col.key_pages[first + 1].pos_start;
+            share_of(first) + interior + share_of(last - 1)
+        };
+        Ok(Some(estimate.max(1)))
+    }
+
     /// The exact position index range of keys in `[low, high]`; reads the
     /// boundary key pages through the cache alone.
     pub fn range(&self, column: usize, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
@@ -1158,6 +1202,10 @@ impl Reader {
     pub fn next_window(&mut self) -> std::io::Result<Option<&[u32]>> {
         let mut buffer = std::mem::take(&mut self.buffer);
         let filled = next_window_with(self, self.next, self.end, self.window, &mut buffer);
+        if filled.is_err() {
+            // A failed window is no window: the walk stays where it began
+            buffer.clear();
+        }
         self.buffer = buffer;
         match filled? {
             Some(advanced) => {
@@ -1456,6 +1504,9 @@ impl Cursor<'_> {
         let mut buffer = std::mem::take(&mut self.buffer);
         let (next, end, window) = (self.next, self.end, self.window);
         let filled = next_window_with(&self.pages, next, end, window, &mut buffer);
+        if filled.is_err() {
+            buffer.clear();
+        }
         self.buffer = buffer;
         match filled? {
             Some(advanced) => {
@@ -3428,6 +3479,49 @@ mod tests {
         assert!(err.to_string().contains("directory checksum"), "{err}");
         std::fs::write(&path, &good[..good.len() - 5]).unwrap();
         assert!(IndexFile::open(&path, 3).is_err());
+    }
+
+    /// A window that fails to read is no window: the walk stays where it
+    /// began, reports the same remainder, and once the file is repaired
+    /// the same walk yields every position once
+    #[test]
+    fn a_failed_window_is_retried_without_repeating_positions() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        build(
+            &path,
+            (0..20_000u32).map(|p| (p, 1i64)).collect(),
+            WORKSPACE,
+        );
+        let file = Arc::new(IndexFile::open(&path, 3).unwrap());
+        let good = std::fs::read(&path).unwrap();
+        let mut bad = good.clone();
+        let second_page = file.directory().column(1).unwrap().pos_pages[1].offset as usize + 10;
+        bad[second_page] ^= 0xff;
+        std::fs::write(&path, &bad).unwrap();
+        INDEX_PAGES.clear();
+        let mut walk = SidePlan::new(Arc::clone(&file), 1, (4096, 10_000))
+            .walk(4096)
+            .unwrap();
+        // The pages come through the reader's own buffers, not the cache
+        let charged = INDEX_PAGES.stats().charged_bytes;
+        INDEX_PAGES.set_budget_bytes(charged as u64);
+        let err = walk.next_position().unwrap_err();
+        assert!(err.to_string().contains("checksum"), "{err}");
+        assert_eq!(walk.remaining(), 5904, "the walk stayed where it began");
+        std::fs::write(&path, &good).unwrap();
+        let mut got = Vec::new();
+        while let Some(position) = walk.next_position().unwrap() {
+            got.push(position);
+        }
+        drop(walk);
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+        INDEX_PAGES.clear();
+        assert_eq!(got.len(), 5904);
+        let unique: std::collections::BTreeSet<usize> = got.iter().copied().collect();
+        assert_eq!(unique.len(), 5904, "every position once");
+        assert_eq!(got[0], 4096);
     }
 
     #[test]

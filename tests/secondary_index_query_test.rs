@@ -456,7 +456,13 @@ fn a_refused_reservation_and_an_ineligible_side_file_answer_through_the_scan() {
         (ROWS + 1..ROWS + 101).collect::<Vec<_>>()
     );
     let after = reads(&db);
-    assert!(delta(&after, &before, "probes") > 0, "the new volume");
+    // Every row of the new volume carries the key, so its directory sends
+    // it to the scan without a page read: the side file decided
+    assert!(
+        delta(&after, &before, "cost_scans") > 0,
+        "the new volume's side file decided"
+    );
+    assert_eq!(delta(&after, &before, "probes"), 0);
     assert_eq!(
         delta(&after, &before, "ineligible"),
         0,
@@ -487,6 +493,11 @@ fn a_wide_range_goes_to_the_scan_and_a_narrow_one_to_the_index() {
         "the cost decision chose the scan"
     );
     assert_eq!(delta(&after, &before, "candidates"), 0);
+    assert_eq!(
+        delta(&after, &before, "probes"),
+        0,
+        "the directory decided, no page was read"
+    );
     let before = reads(&db);
     assert_eq!(ids_db(&db, RANGE, &[100, 103]), expected_range(100, 103));
     let after = reads(&db);
@@ -823,4 +834,103 @@ fn a_text_equality_beside_the_key_decodes_only_the_candidates_groups() {
         );
         assert_eq!(resident(&db), resident_before, "no column loaded whole: {sql}");
     }
+}
+
+/// Timestamps at the ends of what nanoseconds hold, and bounds outside
+/// them: an equality with such a bound matches nothing, a strict bound
+/// keeps the end rows, hot and sealed, through SELECT and COUNT alike.
+#[test]
+fn a_timestamp_bound_outside_the_range_compares_as_a_timestamp() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, ts TIMESTAMP)", ())
+        .unwrap();
+    db.execute("CREATE INDEX idx_t_ts ON t(ts)", ()).unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, '2262-04-11 23:47:16.854775807'), (2, '1677-09-21 00:12:43.145224192'), (3, '2020-01-01')",
+        (),
+    )
+    .unwrap();
+    let cases: [(&str, &[i64]); 6] = [
+        ("ts = '3000-01-01'", &[]),
+        ("ts = '1000-01-01'", &[]),
+        ("ts < '3000-01-01'", &[1, 2, 3]),
+        ("ts <= '3000-01-01'", &[1, 2, 3]),
+        ("ts > '1000-01-01'", &[1, 2, 3]),
+        ("ts > '1000-01-01 00:00:00.500'", &[1, 2, 3]),
+    ];
+    for sealed in [false, true] {
+        if sealed {
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        for (predicate, want) in cases {
+            let sql = format!("SELECT id FROM t WHERE {predicate}");
+            assert_eq!(ids_db(&db, &sql, &[]), want, "{sql}, sealed {sealed}");
+            let count: i64 = db
+                .query_one(&format!("SELECT COUNT(*) FROM t WHERE {predicate}"), ())
+                .unwrap();
+            assert_eq!(
+                count as usize,
+                want.len(),
+                "count of {predicate}, sealed {sealed}"
+            );
+        }
+    }
+}
+
+/// The executor fetches a residual LIMIT in batches, calling the ordered
+/// collector again with a larger offset; when the budget is refused
+/// between two batches, the second batch's scan must follow the same
+/// order as the first batch's walk, or a row comes twice.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn a_residual_limit_keeps_its_order_when_the_budget_changes_between_batches() {
+    use stoolap::storage::volume::secondary::INDEX_PAGES;
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER NOT NULL)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    // Keys out of the row order: the rows of key 1 come first, key 0 next
+    for lo in (1..=100_000).step_by(1000) {
+        let values = (lo..lo + 1000)
+            .map(|id| {
+                let k = if id <= 903 {
+                    1
+                } else if id <= 5000 {
+                    0
+                } else {
+                    100
+                };
+                format!("({id},{k})")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        db.execute(&format!("INSERT INTO t VALUES {values}"), ())
+            .unwrap();
+    }
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let first = Arc::clone(&calls);
+    let second = Arc::clone(&calls);
+    // The hook runs once: the first batch walks the side file and arms the
+    // second batch, whose reservation is refused
+    stoolap::test_failpoints::after_cold_volumes_taken(move || {
+        first.fetch_add(1, Ordering::SeqCst);
+        stoolap::test_failpoints::after_cold_volumes_taken(move || {
+            second.fetch_add(1, Ordering::SeqCst);
+            INDEX_PAGES.set_budget_bytes(0);
+        });
+    });
+    let sql = "SELECT id FROM t WHERE k >= 0 AND k <= 1 AND ABS(id - 904) = 0 LIMIT 2";
+    let rows = ids_db(&db, sql, &[]);
+    stoolap::test_failpoints::after_cold_volumes_taken(|| {});
+    db.execute("PRAGMA INDEX_CACHE_MB = 16", ()).unwrap();
+    assert!(calls.load(Ordering::SeqCst) > 1, "more than one batch");
+    assert_eq!(rows, vec![904]);
 }

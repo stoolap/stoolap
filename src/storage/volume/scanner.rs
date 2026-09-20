@@ -105,17 +105,6 @@ impl Drop for SideState {
     }
 }
 
-/// A timestamp bound as the nanoseconds a column stores; one outside the
-/// range nanoseconds hold saturates, so it still orders every stored value
-/// the right way
-pub(crate) fn bound_nanos(dt: &chrono::DateTime<chrono::Utc>) -> i64 {
-    dt.timestamp_nanos_opt().unwrap_or_else(|| {
-        dt.timestamp()
-            .saturating_mul(1_000_000_000)
-            .saturating_add(dt.timestamp_subsec_nanos() as i64)
-    })
-}
-
 pub struct VolumeScanner {
     /// Shared reference to the frozen volume
     volume: Arc<FrozenVolume>,
@@ -221,7 +210,12 @@ impl VolumeScanner {
     pub fn set_stop_key(&mut self, col_idx: usize, bound: &Value, ascending: bool) {
         let target = match (bound, self.volume.columns.data_type(col_idx)) {
             (Value::Integer(v), crate::core::DataType::Integer) => *v,
-            (Value::Timestamp(dt), crate::core::DataType::Timestamp) => bound_nanos(dt),
+            (Value::Timestamp(dt), crate::core::DataType::Timestamp) => {
+                match dt.timestamp_nanos_opt() {
+                    Some(nanos) => nanos,
+                    None => return,
+                }
+            }
             _ => return,
         };
         self.stop_key = Some((col_idx, target, ascending));
@@ -803,8 +797,12 @@ impl VolumeScanner {
                 (Value::Integer(v), crate::core::DataType::Integer) => TypedTarget::Int64(*v),
                 (Value::Float(v), crate::core::DataType::Float) => TypedTarget::Float64(*v),
                 (Value::Boolean(v), crate::core::DataType::Boolean) => TypedTarget::Bool(*v),
+                // A bound nanoseconds cannot hold is left to the filter
                 (Value::Timestamp(dt), crate::core::DataType::Timestamp) => {
-                    TypedTarget::Int64(bound_nanos(dt))
+                    match dt.timestamp_nanos_opt() {
+                        Some(nanos) => TypedTarget::Int64(nanos),
+                        None => continue,
+                    }
                 }
                 // Only lossless integers: `i as f64` rounds above 2^53 and
                 // the pre-filter must never reject rows the full filter
@@ -1463,6 +1461,8 @@ impl Scanner for VolumeScanner {
 
     fn close(&mut self) -> Result<()> {
         self.has_current = false;
+        // The side walk's reader and reservation go with the scanner's use
+        self.side = None;
         Ok(())
     }
 

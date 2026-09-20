@@ -851,3 +851,59 @@ fn create_index_racing_the_seal_s_cleanup_holds_no_entry_for_a_sealed_row() {
     assert_eq!(count, (1..=5_000i64).filter(|i| i % 11 == 3).count() as i64);
     db.close().unwrap();
 }
+
+/// Closing a scanner lets its side walk's reader and reservation go, as
+/// dropping it does.
+#[test]
+fn closing_a_scanner_releases_its_side_reader() {
+    use stoolap::core::{DataType, Row, SchemaBuilder, Value};
+    use stoolap::storage::traits::Scanner;
+    use stoolap::storage::volume::secondary::{
+        build_side_file, next_generation, ColumnInput, SidePlan, INDEX_PAGES,
+    };
+    use stoolap::storage::volume::{scanner::VolumeScanner, writer::VolumeBuilder};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("v.sidx");
+    build_side_file(
+        &path,
+        next_generation(),
+        vec![ColumnInput {
+            column: 1,
+            identity: 77,
+            pairs: Box::new((0..20_000u32).map(|p| (p, 1i64))),
+        }],
+        4 * 1024 * 1024,
+    )
+    .unwrap();
+    let file = std::sync::Arc::new(IndexFile::open(&path, 20_803).unwrap());
+    let schema = SchemaBuilder::new("t")
+        .column("id", DataType::Integer, false, true)
+        .column("k", DataType::Integer, false, false)
+        .build();
+    let mut builder = VolumeBuilder::new(&schema);
+    for id in 0..20_000 {
+        builder.add_row(
+            id,
+            &Row::from_values(vec![Value::Integer(id), Value::Integer(1)]),
+        );
+    }
+    let volume = std::sync::Arc::new(builder.finish().unwrap());
+    INDEX_PAGES.clear();
+    let idle = INDEX_PAGES.stats().charged_bytes;
+    let mut scanner = VolumeScanner::new(volume, Vec::new(), None).unwrap();
+    scanner.set_side_plan(SidePlan::new(std::sync::Arc::clone(&file), 1, (0, 20_000)));
+    assert!(scanner.next());
+    assert!(
+        INDEX_PAGES.stats().charged_bytes > idle,
+        "the walk's reader holds its reservation"
+    );
+    scanner.close().unwrap();
+    INDEX_PAGES.clear();
+    assert_eq!(
+        INDEX_PAGES.stats().charged_bytes,
+        idle,
+        "close let the reservation go"
+    );
+    drop(scanner);
+}

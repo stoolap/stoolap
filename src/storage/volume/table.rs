@@ -1255,6 +1255,21 @@ impl SegmentedTable {
                 READS.count(&READS.ineligible, 1);
                 return Ok(SideDecision::Scan);
             };
+            let rows = cs.volume.meta.row_count as u64;
+            // The directory decides what it can before any page is read or
+            // any reservation taken: no page in the range, or an estimate
+            // the scan share rules out
+            let Some(estimate) = side
+                .candidate_estimate(physical, low, high)
+                .map_err(side_error)?
+            else {
+                READS.count(&READS.misses, 1);
+                return Ok(SideDecision::Empty);
+            };
+            if estimate * SIDE_SCAN_SHARE > rows.max(1) {
+                READS.count(&READS.cost_scans, 1);
+                return Ok(SideDecision::Scan);
+            }
             // The probe reads the boundary pages through a reader of its own,
             // let go before the decision is handed on: the walk takes its
             // reservation when it starts
@@ -1279,7 +1294,6 @@ impl SegmentedTable {
                 READS.count(&READS.misses, 1);
                 return Ok(SideDecision::Empty);
             }
-            let rows = cs.volume.meta.row_count as u64;
             if count * SIDE_SCAN_SHARE > rows.max(1) {
                 READS.count(&READS.cost_scans, 1);
                 return Ok(SideDecision::Scan);
@@ -1343,7 +1357,7 @@ impl SegmentedTable {
                 if vol.is_sorted(col_idx) && !vol.is_cold() {
                     let target = match value {
                         Value::Integer(i) => Some(*i),
-                        Value::Timestamp(ts) => Some(super::scanner::bound_nanos(ts)),
+                        Value::Timestamp(ts) => ts.timestamp_nanos_opt(),
                         _ => None,
                     };
                     if let Some(target) = target {
@@ -2801,17 +2815,35 @@ impl Table for SegmentedTable {
                     }
                 }
                 // The side file is probed before the volume's data is touched;
-                // the authority map keeps deciding which copy of a row is read
-                let mut walk = match self.side_decision(cs, &comparisons, &identities)? {
-                    SideDecision::Empty => continue,
-                    SideDecision::Walk(plan) => start_walk(&plan)?,
-                    SideDecision::Scan => None,
-                };
+                // the authority map keeps deciding which copy of a row is read.
+                // The executor calls again with a larger offset, so the walk's
+                // positions are sorted first: the order is the scan's whatever
+                // the admission decides per call
+                let candidates: Option<Vec<u32>> =
+                    match self.side_decision(cs, &comparisons, &identities)? {
+                        SideDecision::Empty => continue,
+                        SideDecision::Walk(plan) => match start_walk(&plan)? {
+                            Some(mut walk) => {
+                                let mut positions = Vec::with_capacity(plan.candidates() as usize);
+                                while let Some(i) = walk.next_position().map_err(|error| {
+                                    crate::core::Error::internal(format!(
+                                        "side index read failed: {error}"
+                                    ))
+                                })? {
+                                    positions.push(i as u32);
+                                }
+                                positions.sort_unstable();
+                                Some(positions)
+                            }
+                            None => None,
+                        },
+                        SideDecision::Scan => None,
+                    };
 
                 // Load cold volume on demand after pruning.
                 let loaded;
                 let vol: &Arc<FrozenVolume> = if vol.is_cold() {
-                    if walk.is_some() {
+                    if candidates.is_some() {
                         super::secondary::READS.count(&super::secondary::READS.reloads, 1);
                     }
                     loaded = match self.load_volume_of_view(&view, *seg_id)? {
@@ -2826,23 +2858,19 @@ impl Table for SegmentedTable {
 
                 let mut reader = super::writer::RowReader::new(Arc::clone(vol));
                 let row_ids = vol.row_ids()?;
-                let indexed = walk.is_some();
+                let indexed = candidates.is_some();
                 let mut served = 0u64;
-                let mut plain = 0usize;
-                let mut next_position = move || -> Result<Option<usize>> {
-                    if let Some(walk) = walk.as_mut() {
-                        walk.next_position().map_err(|error| {
-                            crate::core::Error::internal(format!("side index read failed: {error}"))
-                        })
-                    } else if plain < row_ids.len() {
-                        plain += 1;
-                        Ok(Some(plain - 1))
-                    } else {
-                        Ok(None)
-                    }
+                let mut at = 0usize;
+                let mut next_position = move || -> Option<usize> {
+                    let position = match candidates.as_ref() {
+                        Some(positions) => positions.get(at).map(|&p| p as usize),
+                        None => (at < row_ids.len()).then_some(at),
+                    };
+                    at += 1;
+                    position
                 };
 
-                while let Some(i) = next_position()? {
+                while let Some(i) = next_position() {
                     let rid = row_ids[i];
                     if authority.get(&rid) != Some(&nf_idx) {
                         continue;
@@ -5474,9 +5502,11 @@ impl Table for SegmentedTable {
                 {
                     TypedTarget::Int64(*f as i64)
                 }
-                (DataType::Timestamp, Value::Timestamp(t)) => {
-                    TypedTarget::Int64(super::scanner::bound_nanos(t))
-                }
+                // A bound nanoseconds cannot hold is left to the general path
+                (DataType::Timestamp, Value::Timestamp(t)) => match t.timestamp_nanos_opt() {
+                    Some(nanos) => TypedTarget::Int64(nanos),
+                    None => return Ok(None),
+                },
                 (DataType::Timestamp, Value::Integer(i)) => TypedTarget::Int64(*i),
                 (DataType::Float, Value::Float(f)) => TypedTarget::Float64(*f),
                 (DataType::Float, Value::Integer(i)) => TypedTarget::Float64(*i as f64),
