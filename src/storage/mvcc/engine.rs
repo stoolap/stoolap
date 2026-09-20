@@ -6298,12 +6298,20 @@ impl MVCCEngine {
                         break 'prepare;
                     }
                 };
-                new_sides.push(crate::storage::volume::secondary::build_side_for(
+                // An output that cannot be read back fails the rewrite
+                match crate::storage::volume::secondary::build_side_for(
                     &compacted,
                     &compacted_path,
                     compact_vol_id,
                     &definitions,
-                ));
+                ) {
+                    Ok(side) => new_sides.push(side),
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&compacted_path);
+                        prepare_error = Some(error.into());
+                        break 'prepare;
+                    }
+                }
                 let (min_id, max_id) = compacted.id_bounds().unwrap_or((0, 0));
                 new_volumes.push((
                     compact_vol_id,
@@ -6679,21 +6687,34 @@ impl MVCCEngine {
             }
             // Each volume's secondary index side file, built and opened
             // before the fence under the builds budget; a refused or
-            // failed build leaves its volume uncovered
+            // failed build leaves its volume uncovered, and a volume that
+            // cannot be read back fails the seal as the prebuild does
             let mut sealed_sides: Vec<Option<Arc<crate::storage::volume::secondary::IndexFile>>> =
-                sealed_volumes
-                    .iter()
-                    .map(|(volume, path, volume_id)| {
-                        crate::storage::volume::secondary::build_side_for(
-                            volume,
-                            path,
-                            *volume_id,
-                            &definitions,
-                        )
-                    })
-                    .collect();
+                Vec::with_capacity(sealed_volumes.len());
+            for (volume, path, volume_id) in &sealed_volumes {
+                match crate::storage::volume::secondary::build_side_for(
+                    volume,
+                    path,
+                    *volume_id,
+                    &definitions,
+                ) {
+                    Ok(side) => sealed_sides.push(side),
+                    Err(error) => {
+                        drop(sealed_sides);
+                        for (_, path, _) in &sealed_volumes {
+                            let _ = std::fs::remove_file(path);
+                            crate::storage::volume::secondary::retire_side_of(path);
+                        }
+                        return Err(error.into());
+                    }
+                }
+            }
             #[cfg(feature = "test-failpoints")]
             crate::test_failpoints::side_files_built();
+            // Side files found stale under the fence, discarded after it:
+            // their removal takes the file registry and the disk
+            let mut stale_sides: Vec<Arc<crate::storage::volume::secondary::IndexFile>> =
+                Vec::new();
             // Seal critical section under exclusive fence: register cold
             // segments + remove hot rows + remove hot index entries.
             // DML operations hold the shared fence, so they cannot race
@@ -6704,9 +6725,7 @@ impl MVCCEngine {
                 // Index DDL since the definitions were captured makes the
                 // side files stale: the volumes are published uncovered
                 if store.secondary_index_definitions() != definitions {
-                    for side in sealed_sides.iter_mut().filter_map(Option::take) {
-                        crate::storage::volume::secondary::discard_side(side);
-                    }
+                    stale_sides.extend(sealed_sides.iter_mut().filter_map(Option::take));
                 }
 
                 mgr.set_seal_overlap(total_rows);
@@ -6783,6 +6802,9 @@ impl MVCCEngine {
                 }
 
                 // _seal_guard dropped here — DML unblocked
+            }
+            for side in stale_sides {
+                crate::storage::volume::secondary::discard_side(side);
             }
         }
 

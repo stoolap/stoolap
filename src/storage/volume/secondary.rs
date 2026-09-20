@@ -2033,11 +2033,12 @@ pub static SIDES_DISCARDED: AtomicU64 = AtomicU64::new(0);
 const BUILD_SHARE_BYTES: usize = 16 * 1024 * 1024;
 
 /// The workspace one build of the engine takes: its share of the builds
-/// budget, and at least what `rows` rows of `columns` columns need
-pub fn workspace_for(rows: usize, columns: usize) -> usize {
+/// budget less the `input` decode admitted beside it, and at least what
+/// `rows` rows of `columns` columns need
+pub fn workspace_for(rows: usize, columns: usize, input: usize) -> usize {
     let least = MIN_WORKSPACE_BYTES + columns * (metadata_allowance(rows) + COLUMN_SLOT_BYTES);
     let share = (INDEX_BUILDS.stats().budget_bytes as usize).min(BUILD_SHARE_BYTES);
-    share.max(least)
+    share.saturating_sub(input).max(least)
 }
 
 fn integer_keys(data: &super::column::ColumnData) -> Option<(&[i64], &[bool])> {
@@ -2109,6 +2110,9 @@ impl Iterator for GroupPairs<'_> {
         while self.next < self.rows {
             let group = self.next / self.group_size;
             if self.current.as_ref().is_none_or(|(g, _)| *g != group) {
+                // The group done with goes before the next is decoded, so
+                // one group's decode is what the input holds at most
+                self.current = None;
                 match self.store.group_column(self.column, group) {
                     Ok(decoded) => self.current = Some((group, decoded)),
                     Err(error) => {
@@ -2138,8 +2142,32 @@ impl Iterator for GroupPairs<'_> {
             };
             return Some((position as u32, key));
         }
+        self.current = None;
         None
     }
+}
+
+/// What decoding one row group of `column` allocates at most, beyond the
+/// build's own workspace: the compressed block read, its decompressed
+/// bytes and the decoded column, one group at a time. Nothing for a
+/// column already decoded.
+fn decode_allowance(volume: &super::writer::FrozenVolume, column: usize) -> usize {
+    if volume.columns.resident(column).is_some() {
+        return 0;
+    }
+    let Some(store) = volume.columns.compressed_store() else {
+        return 0;
+    };
+    let decompressed = store
+        .decompressed_lens()
+        .get(column)
+        .and_then(|groups| groups.iter().max().copied())
+        .unwrap_or(0);
+    // The compressed block is at most the LZ4 bound of its bytes
+    let compressed = decompressed + decompressed / 255 + 16;
+    compressed
+        + decompressed
+        + store.group_size() * (std::mem::size_of::<i64>() + std::mem::size_of::<bool>())
 }
 
 /// An iterator with the volume's row count as its upper size bound, so a
@@ -2162,20 +2190,35 @@ impl Iterator for Bounded<'_> {
 
 /// Builds the side file of the volume at `volume_path` for `definitions`,
 /// each a physical column and the definition it is indexed under, and
-/// opens it. None leaves the volume uncovered: no definitions, a build
-/// the budget refused (counted by the ledger), or a build that failed
-/// (counted in `BUILDS_FAILED`); every outcome but the first is logged,
-/// and a failed build leaves no file.
+/// opens it. The build's workspace and the decode of its input are
+/// admitted together against the builds budget. `Ok(None)` leaves the
+/// volume uncovered: no definitions, an admission the budget refused
+/// (counted by the ledger), or a side file that could not be written or
+/// read back (counted in `BUILDS_FAILED`); each is logged and leaves no
+/// file. An error reading the volume itself is the caller's failure, not
+/// the side file's, and comes back as `Err`.
 pub fn build_side_for(
     volume: &super::writer::FrozenVolume,
     volume_path: &Path,
     file_id: u64,
     definitions: &[(usize, u64)],
-) -> Option<Arc<IndexFile>> {
+) -> std::io::Result<Option<Arc<IndexFile>>> {
     if definitions.is_empty() {
-        return None;
+        return Ok(None);
     }
     let side = side_path(volume_path);
+    let input = definitions
+        .iter()
+        .map(|&(column, _)| decode_allowance(volume, column))
+        .max()
+        .unwrap_or(0);
+    let Some(_input_admitted) = INDEX_BUILDS.try_charge(input) else {
+        eprintln!(
+            "Warning: side index {:?} not built: the budget refused its input's decode",
+            side
+        );
+        return Ok(None);
+    };
     let failure = std::cell::Cell::new(None);
     let columns = definitions
         .iter()
@@ -2185,13 +2228,14 @@ pub fn build_side_for(
             pairs: Box::new(volume_pairs(volume, column, &failure)),
         })
         .collect();
-    let workspace = workspace_for(volume.meta.row_count, definitions.len());
+    let workspace = workspace_for(volume.meta.row_count, definitions.len(), input);
     let built = build_side_file(&side, next_generation(), columns, workspace);
-    let outcome = match (built, failure.take()) {
-        (Ok(_), None) => Ok(()),
-        (Ok(_), Some(error)) | (Err(error), _) => Err(error),
-    };
-    if let Err(error) = outcome {
+    if let Some(error) = failure.take() {
+        // The volume could not be read: whatever was written is short
+        retire_side_of(volume_path);
+        return Err(error);
+    }
+    if let Err(error) = built {
         if is_refused(&error) {
             eprintln!("Warning: side index {:?} not built: {error}", side);
         } else {
@@ -2199,11 +2243,11 @@ pub fn build_side_for(
             eprintln!("Warning: side index {:?} failed: {error}", side);
             retire_side_of(volume_path);
         }
-        return None;
+        return Ok(None);
     }
     let handle = VolumeFile::shared(&side);
     match IndexFile::open_through(&handle, file_id) {
-        Ok(file) => Some(Arc::new(file)),
+        Ok(file) => Ok(Some(Arc::new(file))),
         Err(error) => {
             BUILDS_FAILED.fetch_add(1, Ordering::Relaxed);
             eprintln!(
@@ -2211,14 +2255,15 @@ pub fn build_side_for(
                 side
             );
             handle.retire();
-            None
+            Ok(None)
         }
     }
 }
 
 /// The side file beside `volume_path` at reopen, if there is one it can
-/// read; one it cannot read is removed and logged, and the volume is
-/// uncovered until a compaction rewrites it
+/// read. One it cannot read stays where it is, logged: a failed open
+/// does not show the file is bad, and the volume is uncovered until the
+/// next compaction rewrites it
 pub fn open_side_for(volume_path: &Path, file_id: u64) -> Option<Arc<IndexFile>> {
     let side = side_path(volume_path);
     if !side.exists() {
@@ -2229,10 +2274,9 @@ pub fn open_side_for(volume_path: &Path, file_id: u64) -> Option<Arc<IndexFile>>
         Ok(file) => Some(Arc::new(file)),
         Err(error) => {
             eprintln!(
-                "Warning: side index {:?} unreadable, removed: {error}",
+                "Warning: side index {:?} unavailable, the volume is uncovered: {error}",
                 side
             );
-            handle.retire();
             None
         }
     }
@@ -3192,6 +3236,146 @@ mod tests {
         // Every open of the same path reads through the one handle
         let again = IndexFile::open(&path, 15).unwrap();
         assert!(Arc::ptr_eq(file.handle(), again.handle()));
+    }
+
+    /// A file-backed volume of `rows` integer rows in two columns, its
+    /// blocks compressed on disk, so the side build decodes its input
+    fn file_backed(dir: &Path, rows: usize) -> (super::super::writer::FrozenVolume, PathBuf) {
+        use crate::core::{DataType, SchemaBuilder};
+        let schema = SchemaBuilder::new("t")
+            .column("id", DataType::Integer, false, true)
+            .column("k", DataType::Integer, false, false)
+            .build();
+        let ids: Vec<i64> = (0..rows as i64).collect();
+        let keys: Vec<i64> = ids.iter().map(|i| (i * 104_729) % 65_521).collect();
+        let nulls = vec![false; rows];
+        let mut writer =
+            super::super::output::VolumeFileWriter::new(dir, "t", 1, &schema, rows, true).unwrap();
+        writer
+            .append_typed(
+                &ids,
+                &[
+                    super::super::writer::TypedCells::Int64 {
+                        values: &ids,
+                        nulls: &nulls,
+                    },
+                    super::super::writer::TypedCells::Int64 {
+                        values: &keys,
+                        nulls: &nulls,
+                    },
+                ],
+            )
+            .unwrap();
+        let (volume, path) = writer.finish().unwrap();
+        assert!(
+            volume.columns.resident(1).is_none(),
+            "the column is on disk"
+        );
+        (volume, path)
+    }
+
+    #[test]
+    fn the_input_s_decode_is_admitted_with_the_build_and_the_allocation_stays_within_it() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (volume, path) = file_backed(dir.path(), 131_072);
+        let definition = definition_of("k", IndexType::BTree, false);
+        let groups = super::super::group_cache::DECODED_GROUPS.budget_bytes();
+        // No group cache: every decode is the build's own allocation
+        super::super::group_cache::DECODED_GROUPS.set_budget_bytes(0);
+        let baseline = INDEX_BUILDS.stats();
+        // A budget under the input's decode: refused before anything is
+        // decoded or written
+        let input = decode_allowance(&volume, 1);
+        assert!(input > 131_072 * 8, "{input} bytes for a group's decode");
+        INDEX_BUILDS.set_budget_bytes((baseline.charged_bytes + input / 2) as u64);
+        let refused = build_side_for(&volume, &path, 1, &[(1, definition)]).unwrap();
+        assert!(refused.is_none());
+        assert_eq!(INDEX_BUILDS.stats().refused, baseline.refused + 1);
+        assert!(!side_path(&path).exists());
+        // A budget of exactly the input's decode and the least workspace:
+        // admitted whole, and the build's allocation stays within it
+        let share = input + MIN_WORKSPACE_BYTES + metadata_allowance(131_072) + COLUMN_SLOT_BYTES;
+        INDEX_BUILDS.set_budget_bytes((baseline.charged_bytes + share) as u64);
+        INDEX_BUILDS.reset_peak();
+        #[cfg(not(feature = "mimalloc"))]
+        let mark = counting::mark();
+        let side = build_side_for(&volume, &path, 1, &[(1, definition)])
+            .unwrap()
+            .expect("built");
+        let admitted = INDEX_BUILDS.stats().peak_bytes - baseline.charged_bytes;
+        #[cfg(not(feature = "mimalloc"))]
+        {
+            let peak = counting::peak_since(mark);
+            assert!(
+                peak <= admitted + side.directory().bytes() + 2 * ALLOC_SLACK,
+                "allocator peak {peak} within the admitted {admitted} plus the directory and slack"
+            );
+        }
+        assert_eq!(
+            admitted, share,
+            "the input's decode and the workspace share the admission"
+        );
+        assert_eq!(
+            side.equal(1, (7 * 104_729) % 65_521)
+                .unwrap()
+                .map(|(s, e)| e - s),
+            Some(3)
+        );
+        assert_eq!(
+            INDEX_BUILDS.stats().charged_bytes,
+            baseline.charged_bytes,
+            "workspace and input released"
+        );
+        drop(side);
+        super::super::group_cache::DECODED_GROUPS.set_budget_bytes(groups);
+        INDEX_BUILDS.set_budget_bytes(DEFAULT_BUILD_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn a_volume_that_cannot_be_read_fails_its_side_build_as_the_caller_s_error() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (volume, path) = file_backed(dir.path(), 1_000);
+        let definition = definition_of("k", IndexType::BTree, false);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let failed_before = BUILDS_FAILED.load(Ordering::Relaxed);
+        let err = match build_side_for(&volume, &path, 1, &[(1, definition)]) {
+            Err(err) => err,
+            Ok(_) => panic!("a volume that cannot be read built a side file"),
+        };
+        assert!(!is_refused(&err), "{err}");
+        assert!(!side_path(&path).exists(), "no short side file is left");
+        assert_eq!(
+            BUILDS_FAILED.load(Ordering::Relaxed),
+            failed_before,
+            "the volume's error is not a side file failure"
+        );
+        assert_eq!(INDEX_BUILDS.stats().charged_bytes, 0);
+    }
+
+    #[test]
+    fn a_side_file_that_does_not_open_at_reopen_is_left_in_place() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let volume_path = dir.path().join("vol_0000000000000001.vol");
+        let side = side_path(&volume_path);
+        build(
+            &side,
+            (0..100u32).map(|p| (p, p as i64)).collect(),
+            WORKSPACE,
+        );
+        let bytes = std::fs::read(&side).unwrap();
+        std::fs::write(&side, &bytes[..bytes.len() - 3]).unwrap();
+        assert!(open_side_for(&volume_path, 1).is_none());
+        assert!(side.exists(), "the file stays for whoever can read it");
+        std::fs::write(&side, &bytes).unwrap();
+        assert!(open_side_for(&volume_path, 1).is_some());
     }
 
     #[test]

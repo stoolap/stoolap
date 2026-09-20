@@ -284,7 +284,7 @@ fn drop_table_truncate_and_rename_take_the_side_files_with_their_volumes() {
 }
 
 #[test]
-fn reopen_attaches_the_side_files_and_removes_one_it_cannot_read() {
+fn reopen_attaches_the_side_files_and_leaves_one_it_cannot_read_in_place() {
     let _serial = serial();
     let dir = tempfile::tempdir().unwrap();
     let db = open(dir.path(), "");
@@ -306,7 +306,9 @@ fn reopen_attaches_the_side_files_and_removes_one_it_cannot_read() {
     db.close().unwrap();
     drop(db);
 
-    // One side file is cut short: it is removed at reopen, the other stays
+    // One side file is cut short: its volume reopens uncovered, the file
+    // stays where it is (a failed open does not show it is bad), the other
+    // is attached
     let broken = sides.iter().next().unwrap().clone();
     let broken_path = dir
         .path()
@@ -316,10 +318,20 @@ fn reopen_attaches_the_side_files_and_removes_one_it_cannot_read() {
     let bytes = std::fs::read(&broken_path).unwrap();
     std::fs::write(&broken_path, &bytes[..bytes.len() - 7]).unwrap();
     let db = open(dir.path(), "");
-    let remaining = files(dir.path(), "t", "sidx");
-    assert_eq!(remaining.len(), 1);
-    assert!(!remaining.contains(&broken));
+    assert_eq!(
+        files(dir.path(), "t", "sidx"),
+        sides,
+        "no side file was removed"
+    );
     assert_eq!(files(dir.path(), "t", "vol").len(), 2, "both volumes stay");
+    let directories = index_stat(&db, "index_directories", "charged_bytes");
+    assert!(directories > 0, "the readable side file is attached");
+    let healthy = sides.iter().nth(1).unwrap();
+    assert_eq!(
+        directories as usize,
+        side_of(dir.path(), "t", healthy).directory().bytes(),
+        "only the readable side file's directory is resident"
+    );
     let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
     assert_eq!(count, 4_000);
     db.close().unwrap();
