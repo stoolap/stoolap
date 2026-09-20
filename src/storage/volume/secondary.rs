@@ -55,10 +55,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use super::writer::VolumeFile;
-use crate::core::types::IndexType;
-
 const MAGIC: [u8; 4] = *b"STSX";
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 const KEY_I64: u8 = 1;
 const HEADER_LEN: u64 = 16;
 const FOOTER_LEN: u64 = 20;
@@ -119,32 +117,6 @@ fn refused(what: &str) -> std::io::Error {
 /// Whether an error is a budget's refusal
 pub fn is_refused(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::WouldBlock
-}
-
-/// The identity of an index definition a side file column is built under:
-/// the column's name, the index type and uniqueness, hashed the same way
-/// in every process. A column whose definition changed is not covered by
-/// a file built under the old one.
-pub fn definition_of(column_name: &str, index_type: IndexType, unique: bool) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    let mut mix = |byte: u8| {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    };
-    for byte in column_name.bytes() {
-        mix(byte.to_ascii_lowercase());
-    }
-    mix(0);
-    mix(match index_type {
-        IndexType::Bitmap => 1,
-        IndexType::BTree => 2,
-        IndexType::Hash => 3,
-        IndexType::MultiColumn => 4,
-        IndexType::PrimaryKey => 5,
-        IndexType::Hnsw => 6,
-    });
-    mix(unique as u8);
-    hash
 }
 
 // =============================================================================
@@ -573,6 +545,20 @@ pub enum PageContent {
     Positions(Vec<u32>),
 }
 
+/// A page's entry count and entries once its length and checksum hold
+fn verified_entries(raw: &[u8]) -> std::io::Result<(usize, &[u8])> {
+    if raw.len() < PAGE_OVERHEAD {
+        return Err(invalid("page shorter than its header"));
+    }
+    let body = &raw[..raw.len() - 4];
+    let stored = u32::from_le_bytes(raw[raw.len() - 4..].try_into().expect("4 bytes"));
+    if crc32fast::hash(body) != stored {
+        return Err(invalid("page checksum mismatch"));
+    }
+    let n = u32::from_le_bytes(body[..4].try_into().expect("4 bytes")) as usize;
+    Ok((n, &body[4..]))
+}
+
 impl Page {
     /// Reads and parses one page: the raw bytes are reserved for the read
     /// and released after the parse; the parsed vectors are reserved at
@@ -582,16 +568,7 @@ impl Page {
             .try_reserve(len as usize)
             .ok_or_else(|| refused("a page's raw bytes"))?;
         let raw = file.read_page(offset, len)?;
-        if raw.len() < PAGE_OVERHEAD {
-            return Err(invalid("page shorter than its header"));
-        }
-        let body = &raw[..raw.len() - 4];
-        let stored = u32::from_le_bytes(raw[raw.len() - 4..].try_into().expect("4 bytes"));
-        if crc32fast::hash(body) != stored {
-            return Err(invalid("page checksum mismatch"));
-        }
-        let n = u32::from_le_bytes(body[..4].try_into().expect("4 bytes")) as usize;
-        let entries = &body[4..];
+        let (n, entries) = verified_entries(&raw)?;
         let (content, bytes, reservation) = match kind {
             PageKind::Keys => {
                 if entries.len() != n * KEY_ENTRY {
@@ -677,8 +654,10 @@ pub struct PosPageMeta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ColumnDirectory {
     pub column: u32,
-    /// The index definition the column was built under, `definition_of`
-    pub definition: u64,
+    /// The identity of the index definition the column was built for:
+    /// the LSN of the catalog record that created the index. Zero is no
+    /// identity, and such a column is never served
+    pub identity: u64,
     pub n_keys: u64,
     pub n_positions: u64,
     pub key_pages: Vec<KeyPageMeta>,
@@ -739,7 +718,7 @@ impl Directory {
         for c in &self.columns {
             out.extend_from_slice(&c.column.to_le_bytes());
             out.push(KEY_I64);
-            out.extend_from_slice(&c.definition.to_le_bytes());
+            out.extend_from_slice(&c.identity.to_le_bytes());
             out.extend_from_slice(&c.n_keys.to_le_bytes());
             out.extend_from_slice(&c.n_positions.to_le_bytes());
             out.extend_from_slice(&(c.key_pages.len() as u32).to_le_bytes());
@@ -782,7 +761,7 @@ impl Directory {
             if tag != KEY_I64 {
                 return Err(invalid("key type unsupported"));
             }
-            let definition = read_u64(data, &mut pos)?;
+            let identity = read_u64(data, &mut pos)?;
             let n_keys = read_u64(data, &mut pos)?;
             let n_positions = read_u64(data, &mut pos)?;
             let key_pages = read_u32(data, &mut pos)? as usize;
@@ -840,7 +819,7 @@ impl Directory {
             }
             columns.push(ColumnDirectory {
                 column,
-                definition,
+                identity,
                 n_keys,
                 n_positions,
                 key_pages: kp,
@@ -967,11 +946,32 @@ impl IndexFile {
         &self.file
     }
 
-    /// Whether the file indexes `column` under `definition`
-    pub fn covers(&self, column: usize, definition: u64) -> bool {
-        self.directory
-            .column(column)
-            .is_some_and(|c| c.definition == definition)
+    /// Whether the file indexes `column` for the index definition with
+    /// `identity`; a column without an identity covers nothing
+    pub fn covers(&self, column: usize, identity: u64) -> bool {
+        identity != 0
+            && self
+                .directory
+                .column(column)
+                .is_some_and(|c| c.identity == identity)
+    }
+
+    /// Reads one page's raw bytes into `buf`, whose capacity the caller
+    /// reserved
+    fn read_page_into(&self, offset: u64, len: u32, buf: &mut Vec<u8>) -> std::io::Result<()> {
+        let file = self.file.open()?;
+        let mut header = [0u8; HEADER_LEN as usize];
+        read_exact_at(&file, &mut header, 0)?;
+        if header[..4] != MAGIC {
+            return Err(invalid("bad magic"));
+        }
+        let generation = u64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
+        if generation != self.directory.generation {
+            return Err(invalid("generation changed"));
+        }
+        buf.clear();
+        buf.resize(len as usize, 0);
+        read_exact_at(&file, buf, offset)
     }
 
     fn read_page(&self, offset: u64, len: u32) -> std::io::Result<Vec<u8>> {
@@ -1118,6 +1118,274 @@ impl IndexFile {
             _reservation: reservation,
         })
     }
+
+    /// A reader of `column` with one working reservation for its whole
+    /// walk: a window of `window` positions, a raw page buffer and a
+    /// parsed page of each kind, taken before its first row. Refused, the
+    /// caller serves the volume through the scan (`is_refused`). Admitted,
+    /// the reader always progresses: a page comes from the cache when the
+    /// cache admits it and through the reader's own buffers when it does
+    /// not, so a cache that admits nothing or a budget lowered afterwards
+    /// never stops it.
+    pub fn reader(&self, column: usize, window: usize) -> std::io::Result<Reader<'_>> {
+        let window = window.max(1);
+        let bytes = window * POS_ENTRY
+            + PAGE_BYTES
+            + KEYS_PER_PAGE * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>())
+            + POSITIONS_PER_PAGE * std::mem::size_of::<u32>();
+        let reservation = INDEX_PAGES
+            .try_reserve(bytes)
+            .ok_or_else(|| refused("a reader's working reservation"))?;
+        Ok(Reader {
+            file: self,
+            column,
+            next: 0,
+            end: 0,
+            window,
+            buffer: Vec::with_capacity(window),
+            raw: Vec::with_capacity(PAGE_BYTES),
+            own_keys: PageContent::Keys {
+                keys: Vec::with_capacity(KEYS_PER_PAGE),
+                ends: Vec::with_capacity(KEYS_PER_PAGE),
+            },
+            own_positions: PageContent::Positions(Vec::with_capacity(POSITIONS_PER_PAGE)),
+            own_pages: 0,
+            _reservation: reservation,
+        })
+    }
+}
+
+/// A reader with its own working space: the cursor window and one page
+/// of each kind, so an admitted walk completes whatever the cache admits.
+pub struct Reader<'a> {
+    file: &'a IndexFile,
+    column: usize,
+    next: u64,
+    end: u64,
+    window: usize,
+    buffer: Vec<u32>,
+    raw: Vec<u8>,
+    own_keys: PageContent,
+    own_positions: PageContent,
+    /// Pages read through the reader's own buffers rather than the cache
+    own_pages: u64,
+    _reservation: Reservation,
+}
+
+impl Reader<'_> {
+    /// Pages this reader read through its own buffers
+    pub fn own_pages(&self) -> u64 {
+        self.own_pages
+    }
+
+    /// Runs `f` on page `kind`/`number` of the column: from the cache when
+    /// it admits the page, else read and parsed into the reader's own
+    /// buffers. A real read or checksum error is the walk's error.
+    fn with_page<R>(
+        &mut self,
+        kind: PageKind,
+        number: usize,
+        f: impl FnOnce(&PageContent) -> R,
+    ) -> std::io::Result<R> {
+        match INDEX_PAGES.load(self.file, self.column, kind, number) {
+            Ok(page) => return Ok(f(page.content())),
+            Err(error) if is_refused(&error) => {}
+            Err(error) => return Err(error),
+        }
+        let (offset, len) = self
+            .file
+            .directory
+            .page_location(self.column, kind, number)?;
+        self.file.read_page_into(offset, len, &mut self.raw)?;
+        let (n, entries) = verified_entries(&self.raw)?;
+        let own = match kind {
+            PageKind::Keys => {
+                if entries.len() != n * KEY_ENTRY {
+                    return Err(invalid("key page length does not match its count"));
+                }
+                let PageContent::Keys { keys, ends } = &mut self.own_keys else {
+                    return Err(invalid("expected a key page"));
+                };
+                keys.clear();
+                ends.clear();
+                for entry in entries.as_chunks::<KEY_ENTRY>().0 {
+                    keys.push(i64::from_le_bytes(entry[..8].try_into().expect("8 bytes")));
+                    ends.push(u32::from_le_bytes(entry[8..].try_into().expect("4 bytes")) as u64);
+                }
+                if keys.windows(2).any(|w| w[0] >= w[1]) || ends.windows(2).any(|w| w[0] >= w[1]) {
+                    return Err(invalid("key page is not in order"));
+                }
+                &self.own_keys
+            }
+            PageKind::Positions => {
+                if entries.len() != n * POS_ENTRY {
+                    return Err(invalid("position page length does not match its count"));
+                }
+                let PageContent::Positions(positions) = &mut self.own_positions else {
+                    return Err(invalid("expected a position page"));
+                };
+                positions.clear();
+                positions.extend(
+                    entries
+                        .as_chunks::<POS_ENTRY>()
+                        .0
+                        .iter()
+                        .map(|e| u32::from_le_bytes(*e)),
+                );
+                &self.own_positions
+            }
+        };
+        self.own_pages += 1;
+        Ok(f(own))
+    }
+
+    /// The position index range `[start, end)` of `key`, or None when the
+    /// key is absent; reads at most one key page.
+    pub fn equal(&mut self, key: i64) -> std::io::Result<Option<(u64, u64)>> {
+        let col = self
+            .file
+            .directory
+            .column(self.column)
+            .ok_or_else(|| invalid("column has no index"))?;
+        let page_no = col.key_pages.partition_point(|p| p.last_key < key);
+        let Some(meta) = col.key_pages.get(page_no) else {
+            return Ok(None);
+        };
+        if key < meta.first_key {
+            return Ok(None);
+        }
+        let pos_start = meta.pos_start;
+        self.with_page(PageKind::Keys, page_no, |content| {
+            let PageContent::Keys { keys, ends } = content else {
+                return Err(invalid("expected a key page"));
+            };
+            let Ok(i) = keys.binary_search(&key) else {
+                return Ok(None);
+            };
+            let start = if i == 0 { pos_start } else { ends[i - 1] };
+            Ok(Some((start, ends[i])))
+        })?
+    }
+
+    /// The exact position index range of keys in `[low, high]`; reads the
+    /// boundary key pages.
+    pub fn range(&mut self, low: i64, high: i64) -> std::io::Result<(u64, u64)> {
+        let col = self
+            .file
+            .directory
+            .column(self.column)
+            .ok_or_else(|| invalid("column has no index"))?;
+        if low > high {
+            return Ok((0, 0));
+        }
+        let first = col.key_pages.partition_point(|p| p.last_key < low);
+        let last = col.key_pages.partition_point(|p| p.first_key <= high);
+        if first >= last {
+            return Ok((0, 0));
+        }
+        let first_meta = col.key_pages[first].clone();
+        let last_meta = col.key_pages[last - 1].clone();
+        let after_last = col
+            .key_pages
+            .get(last)
+            .map_or(col.n_positions, |p| p.pos_start);
+        let start = if low <= first_meta.first_key {
+            first_meta.pos_start
+        } else {
+            self.with_page(PageKind::Keys, first, |content| {
+                let PageContent::Keys { keys, ends } = content else {
+                    return Err(invalid("expected a key page"));
+                };
+                let i = keys.partition_point(|&k| k < low);
+                Ok(if i == 0 {
+                    first_meta.pos_start
+                } else {
+                    ends[i - 1]
+                })
+            })??
+        };
+        let end = if high >= last_meta.last_key {
+            after_last
+        } else {
+            self.with_page(PageKind::Keys, last - 1, |content| {
+                let PageContent::Keys { keys, ends } = content else {
+                    return Err(invalid("expected a key page"));
+                };
+                let i = keys.partition_point(|&k| k <= high);
+                Ok(if i == 0 {
+                    last_meta.pos_start
+                } else {
+                    ends[i - 1]
+                })
+            })??
+        };
+        Ok((start, end.max(start)))
+    }
+
+    /// Starts a walk over the position index range `[start, end)`
+    pub fn walk(&mut self, range: (u64, u64)) {
+        self.next = range.0;
+        self.end = range.1;
+    }
+
+    /// Positions left to yield, including the current window
+    pub fn remaining(&self) -> u64 {
+        self.end.saturating_sub(self.next)
+    }
+
+    /// The next window of the walk, sorted ascending, or None at the end.
+    /// A page that fails to read is not advanced past.
+    pub fn next_window(&mut self) -> std::io::Result<Option<&[u32]>> {
+        if self.next >= self.end {
+            return Ok(None);
+        }
+        // The window is filled inside the page closures, so it is taken
+        // out for the walk and put back after
+        let mut buffer = std::mem::take(&mut self.buffer);
+        buffer.clear();
+        let stop = (self.next + self.window as u64).min(self.end);
+        let file = self.file;
+        let col = file
+            .directory
+            .column(self.column)
+            .ok_or_else(|| invalid("column has no index"))?;
+        let mut result = Ok(());
+        while self.next < stop {
+            let Some(page_no) = col
+                .pos_pages
+                .partition_point(|p| p.pos_start <= self.next)
+                .checked_sub(1)
+            else {
+                result = Err(invalid("position index before the first page"));
+                break;
+            };
+            let page_start = col.pos_pages[page_no].pos_start;
+            let next = self.next;
+            let advanced = self.with_page(PageKind::Positions, page_no, |content| {
+                let PageContent::Positions(positions) = content else {
+                    return Err(invalid("expected a position page"));
+                };
+                let from = (next - page_start) as usize;
+                let to = ((stop - page_start) as usize).min(positions.len());
+                if from >= to {
+                    return Err(invalid("position page does not cover its index"));
+                }
+                buffer.extend_from_slice(&positions[from..to]);
+                Ok(page_start + to as u64)
+            });
+            match advanced {
+                Ok(Ok(advanced)) => self.next = advanced,
+                Ok(Err(error)) | Err(error) => {
+                    result = Err(error);
+                    break;
+                }
+            }
+        }
+        buffer.sort_unstable();
+        self.buffer = buffer;
+        result?;
+        Ok(Some(&self.buffer))
+    }
 }
 
 fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
@@ -1231,8 +1499,8 @@ pub struct BuildReport {
 /// build, and a hint avoids the failure.
 pub struct ColumnInput<'a> {
     pub column: u32,
-    /// The index definition the column is built under, `definition_of`
-    pub definition: u64,
+    /// The identity of the index definition the column is built for
+    pub identity: u64,
     pub pairs: Box<dyn Iterator<Item = (u32, i64)> + 'a>,
 }
 
@@ -1675,7 +1943,7 @@ pub fn build_side_file(
             pairs.push((key, pos));
         }
         pairs.sort_unstable();
-        let mut writer = PageWriter::new(&mut out, offset, input.column, input.definition, &budget);
+        let mut writer = PageWriter::new(&mut out, offset, input.column, input.identity, &budget);
         if runs.live == 0 {
             for &(key, pos) in &pairs {
                 writer.push(key, pos)?;
@@ -1851,7 +2119,7 @@ struct PageWriter<'a, 'b, W: Write> {
     out: &'a mut W,
     offset: u64,
     column: u32,
-    definition: u64,
+    identity: u64,
     key_page: Vec<(i64, u64)>,
     key_page_first_key_index: u64,
     key_page_pos_start: u64,
@@ -1867,12 +2135,12 @@ struct PageWriter<'a, 'b, W: Write> {
 }
 
 impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
-    fn new(out: &'a mut W, offset: u64, column: u32, definition: u64, budget: &'b Budget) -> Self {
+    fn new(out: &'a mut W, offset: u64, column: u32, identity: u64, budget: &'b Budget) -> Self {
         Self {
             out,
             offset,
             column,
-            definition,
+            identity,
             key_page: Vec::with_capacity(KEYS_PER_PAGE),
             key_page_first_key_index: 0,
             key_page_pos_start: 0,
@@ -2006,7 +2274,7 @@ impl<'a, 'b, W: Write> PageWriter<'a, 'b, W> {
         self.flush_key_page()?;
         let column = ColumnDirectory {
             column: self.column,
-            definition: self.definition,
+            identity: self.identity,
             n_keys: self.n_keys,
             n_positions: self.n_positions,
             key_pages: std::mem::take(&mut self.key_pages),
@@ -2188,11 +2456,11 @@ impl Iterator for Bounded<'_> {
     }
 }
 
-/// Builds the side file of the volume at `volume_path` for `definitions`,
-/// each a physical column and the definition it is indexed under, and
+/// Builds the side file of the volume at `volume_path` for `identities`,
+/// each a physical column and the identity of the index it is built for, and
 /// opens it. The build's workspace and the decode of its input are
 /// admitted together against the builds budget. `Ok(None)` leaves the
-/// volume uncovered: no definitions, an admission the budget refused
+/// volume uncovered: no identities, an admission the budget refused
 /// (counted by the ledger), or a side file that could not be written or
 /// read back (counted in `BUILDS_FAILED`); each is logged and leaves no
 /// file. An error reading the volume itself is the caller's failure, not
@@ -2201,13 +2469,13 @@ pub fn build_side_for(
     volume: &super::writer::FrozenVolume,
     volume_path: &Path,
     file_id: u64,
-    definitions: &[(usize, u64)],
+    identities: &[(usize, u64)],
 ) -> std::io::Result<Option<Arc<IndexFile>>> {
-    if definitions.is_empty() {
+    if identities.is_empty() {
         return Ok(None);
     }
     let side = side_path(volume_path);
-    let input = definitions
+    let input = identities
         .iter()
         .map(|&(column, _)| decode_allowance(volume, column))
         .max()
@@ -2220,15 +2488,15 @@ pub fn build_side_for(
         return Ok(None);
     };
     let failure = std::cell::Cell::new(None);
-    let columns = definitions
+    let columns = identities
         .iter()
-        .map(|&(column, definition)| ColumnInput {
+        .map(|&(column, identity)| ColumnInput {
             column: column as u32,
-            definition,
+            identity,
             pairs: Box::new(volume_pairs(volume, column, &failure)),
         })
         .collect();
-    let workspace = workspace_for(volume.meta.row_count, definitions.len(), input);
+    let workspace = workspace_for(volume.meta.row_count, identities.len(), input);
     let built = build_side_file(&side, next_generation(), columns, workspace);
     if let Some(error) = failure.take() {
         // The volume could not be read: whatever was written is short
@@ -2291,6 +2559,14 @@ pub fn retire_side_of(volume_path: &Path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => eprintln!("Warning: side index {:?} not retired: {error}", side),
     }
+}
+
+/// Whether any column of `side` still stands for an index the catalog
+/// has now, `current` being the columns and identities it covers
+pub fn still_covers(side: &IndexFile, current: &[(usize, u64)]) -> bool {
+    current
+        .iter()
+        .any(|&(column, identity)| side.covers(column, identity))
 }
 
 /// Discards a side file built for a volume whose index definitions
@@ -2367,7 +2643,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
-                definition: 0,
+                identity: 0,
                 pairs: Box::new(pairs.into_iter()),
             }],
             workspace,
@@ -2592,7 +2868,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
-                definition: 0,
+                identity: 0,
                 pairs: Box::new(std::iter::empty()),
             }],
             MIN_WORKSPACE_BYTES - 1,
@@ -2619,7 +2895,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
-                definition: 0,
+                identity: 0,
                 pairs: Box::new(scattered(1_200_000, 1_200_001)),
             }],
             workspace,
@@ -2661,7 +2937,7 @@ mod tests {
             (1..=3)
                 .map(|c| ColumnInput {
                     column: c,
-                    definition: 0,
+                    identity: 0,
                     pairs: Box::new(scattered(400_000, 65_521 + c as u64)),
                 })
                 .collect(),
@@ -2700,7 +2976,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
-                definition: 0,
+                identity: 0,
                 pairs: Box::new(Unbounded(scattered(4_194_304, 4_194_301))),
             }],
             MIN_WORKSPACE_BYTES,
@@ -2732,7 +3008,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
-                definition: 0,
+                identity: 0,
                 pairs: Box::new(scattered(4_194_304, 4_194_301)),
             }],
             MIN_WORKSPACE_BYTES + metadata_allowance(4_194_304),
@@ -2763,7 +3039,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
-                definition: 0,
+                identity: 0,
                 pairs: Box::new(scattered(100_000, 100_003)),
             }],
             MIN_WORKSPACE_BYTES + metadata_allowance(100_000),
@@ -2802,7 +3078,7 @@ mod tests {
             generation,
             vec![ColumnInput {
                 column: 1,
-                definition: 0,
+                identity: 0,
                 pairs: Box::new(std::iter::empty()),
             }],
             WORKSPACE,
@@ -2824,7 +3100,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
-                definition: 0,
+                identity: 0,
                 pairs: Box::new(Unbounded(scattered(4_194_304, 4_194_301))),
             }],
             MIN_WORKSPACE_BYTES,
@@ -2859,7 +3135,7 @@ mod tests {
             (1..=2000u32)
                 .map(|c| ColumnInput {
                     column: c,
-                    definition: 0,
+                    identity: 0,
                     pairs: Box::new(std::iter::empty()),
                 })
                 .collect::<Vec<_>>()
@@ -2944,7 +3220,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
-                definition: 0,
+                identity: 0,
                 pairs: Box::new(pairs.clone().into_iter()),
             }],
             MIN_WORKSPACE_BYTES + metadata_allowance(300_000),
@@ -2970,7 +3246,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
-                definition: 0,
+                identity: 0,
                 pairs: Box::new(pairs.into_iter()),
             }],
             WORKSPACE,
@@ -3186,7 +3462,7 @@ mod tests {
             next_generation(),
             vec![ColumnInput {
                 column: 1,
-                definition: 0,
+                identity: 0,
                 pairs: Box::new(scattered(1000, 97)),
             }],
             WORKSPACE,
@@ -3210,32 +3486,49 @@ mod tests {
     }
 
     #[test]
-    fn a_column_records_the_definition_it_was_built_under() {
+    fn a_column_records_the_identity_it_was_built_for() {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("v.sidx");
-        let definition = definition_of("Ts", IndexType::BTree, false);
-        assert_eq!(definition, definition_of("ts", IndexType::BTree, false));
-        assert_ne!(definition, definition_of("ts", IndexType::BTree, true));
-        assert_ne!(definition, definition_of("ts", IndexType::Hash, false));
         build_side_file(
             &path,
             next_generation(),
-            vec![ColumnInput {
-                column: 1,
-                definition,
-                pairs: Box::new(scattered(1000, 97)),
-            }],
+            vec![
+                ColumnInput {
+                    column: 1,
+                    identity: 41,
+                    pairs: Box::new(scattered(1000, 97)),
+                },
+                ColumnInput {
+                    column: 2,
+                    identity: 0,
+                    pairs: Box::new(scattered(1000, 89)),
+                },
+            ],
             WORKSPACE,
         )
         .unwrap();
         let file = IndexFile::open(&path, 15).unwrap();
-        assert!(file.covers(1, definition));
-        assert!(!file.covers(1, definition_of("ts", IndexType::BTree, true)));
-        assert!(!file.covers(2, definition));
+        assert!(file.covers(1, 41));
+        assert!(!file.covers(1, 42), "another index's identity");
+        assert!(!file.covers(3, 41), "a column the file has not");
+        assert!(
+            !file.covers(2, 0),
+            "a column without an identity covers nothing"
+        );
         // Every open of the same path reads through the one handle
         let again = IndexFile::open(&path, 15).unwrap();
         assert!(Arc::ptr_eq(file.handle(), again.handle()));
+        // A file of the previous format is not opened: its columns carry
+        // no identity, and the volume is uncovered until rewritten
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..8].copy_from_slice(&3u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = match IndexFile::open(&path, 15) {
+            Err(err) => err,
+            Ok(_) => panic!("a VERSION 3 side file opened"),
+        };
+        assert!(err.to_string().contains("version"), "{err}");
     }
 
     /// A file-backed volume of `rows` integer rows in two columns, its
@@ -3279,7 +3572,7 @@ mod tests {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let (volume, path) = file_backed(dir.path(), 131_072);
-        let definition = definition_of("k", IndexType::BTree, false);
+        let identity = 41u64;
         // No group cache: every decode is the build's own allocation. The
         // cache is process global; the guard holds its lock and puts the
         // default back, on a panic too
@@ -3290,7 +3583,7 @@ mod tests {
         let input = decode_allowance(&volume, 1);
         assert!(input > 131_072 * 8, "{input} bytes for a group's decode");
         INDEX_BUILDS.set_budget_bytes((baseline.charged_bytes + input / 2) as u64);
-        let refused = build_side_for(&volume, &path, 1, &[(1, definition)]).unwrap();
+        let refused = build_side_for(&volume, &path, 1, &[(1, identity)]).unwrap();
         assert!(refused.is_none());
         assert_eq!(INDEX_BUILDS.stats().refused, baseline.refused + 1);
         assert!(!side_path(&path).exists());
@@ -3301,7 +3594,7 @@ mod tests {
         INDEX_BUILDS.reset_peak();
         #[cfg(not(feature = "mimalloc"))]
         let mark = counting::mark();
-        let side = build_side_for(&volume, &path, 1, &[(1, definition)])
+        let side = build_side_for(&volume, &path, 1, &[(1, identity)])
             .unwrap()
             .expect("built");
         let admitted = INDEX_BUILDS.stats().peak_bytes - baseline.charged_bytes;
@@ -3337,7 +3630,7 @@ mod tests {
         let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let (volume, path) = file_backed(dir.path(), 1_000);
-        let definition = definition_of("k", IndexType::BTree, false);
+        let identity = 41u64;
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)
@@ -3345,7 +3638,7 @@ mod tests {
             .set_len(0)
             .unwrap();
         let failed_before = BUILDS_FAILED.load(Ordering::Relaxed);
-        let err = match build_side_for(&volume, &path, 1, &[(1, definition)]) {
+        let err = match build_side_for(&volume, &path, 1, &[(1, identity)]) {
             Err(err) => err,
             Ok(_) => panic!("a volume that cannot be read built a side file"),
         };
@@ -3376,6 +3669,104 @@ mod tests {
         assert!(side.exists(), "the file stays for whoever can read it");
         std::fs::write(&side, &bytes).unwrap();
         assert!(open_side_for(&volume_path, 1).is_some());
+    }
+
+    #[test]
+    fn a_reader_refused_its_working_reservation_is_refused_before_any_row() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        build(
+            &path,
+            (0..1000u32).map(|p| (p, p as i64)).collect(),
+            WORKSPACE,
+        );
+        INDEX_PAGES.clear();
+        let file = IndexFile::open(&path, 16).unwrap();
+        let refused_before = INDEX_PAGES.stats().refused;
+        INDEX_PAGES.set_budget_bytes(INDEX_PAGES.stats().charged_bytes as u64);
+        let err = match file.reader(1, 64) {
+            Err(err) => err,
+            Ok(_) => panic!("a reader was admitted with no budget"),
+        };
+        assert!(is_refused(&err), "{err}");
+        assert_eq!(INDEX_PAGES.stats().refused, refused_before + 1);
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn an_admitted_reader_completes_through_its_own_buffers_when_the_cache_admits_nothing() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let pairs: Vec<(u32, i64)> = (0..200_000u32).map(|p| (p, (p % 40_000) as i64)).collect();
+        build(&path, pairs.clone(), WORKSPACE);
+        INDEX_PAGES.clear();
+        let file = IndexFile::open(&path, 17).unwrap();
+        // What the cache path answers, with the budget open
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+        let range = file.range(1, 100, 2_100).unwrap();
+        let want = all_positions(&file, range, 512);
+        let want_equal = file.equal(1, 7).unwrap();
+        INDEX_PAGES.clear();
+        // The reader is admitted, then the budget drops to what is held:
+        // every cache load is refused from here on
+        let mut reader = file.reader(1, 512).unwrap();
+        INDEX_PAGES.set_budget_bytes(INDEX_PAGES.stats().charged_bytes as u64);
+        let refused_before = INDEX_PAGES.stats().refused;
+        assert_eq!(reader.equal(7).unwrap(), want_equal);
+        assert_eq!(reader.range(100, 2_100).unwrap(), range);
+        reader.walk(range);
+        let mut got = Vec::new();
+        while let Some(w) = reader.next_window().unwrap() {
+            assert!(w.len() <= 512);
+            got.extend_from_slice(w);
+        }
+        assert_eq!(got, want, "the same positions as the cache path");
+        assert!(
+            reader.own_pages() > 0,
+            "pages were read through the reader's own buffers"
+        );
+        assert!(
+            INDEX_PAGES.stats().refused > refused_before,
+            "the cache refused meanwhile"
+        );
+        drop(reader);
+        drop(file);
+        INDEX_PAGES.clear();
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn a_checksum_failure_mid_walk_is_the_reader_s_error_and_it_does_not_advance_past_it() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        let pairs: Vec<(u32, i64)> = (0..30_000u32).map(|p| (p, (p % 5000) as i64)).collect();
+        build(&path, pairs, WORKSPACE);
+        let good = std::fs::read(&path).unwrap();
+        let file = IndexFile::open(&path, 18).unwrap();
+        let second = file.directory().column(1).unwrap().pos_pages[1].offset as usize + 10;
+        let mut bad = good.clone();
+        bad[second] ^= 0xff;
+        std::fs::write(&path, &bad).unwrap();
+        INDEX_PAGES.clear();
+        // Key 1366 lives in the second position page; a small window puts
+        // the failing page at the head of the walk
+        let mut reader = file.reader(1, 4).unwrap();
+        let range = reader.equal(1366).unwrap().unwrap();
+        reader.walk(range);
+        let remaining = reader.remaining();
+        let err = match reader.next_window() {
+            Err(err) => err,
+            Ok(_) => panic!("a corrupt page was served"),
+        };
+        assert!(err.to_string().contains("checksum"), "{err}");
+        assert!(!is_refused(&err));
+        assert_eq!(reader.remaining(), remaining, "not advanced past the page");
+        std::fs::write(&path, &good).unwrap();
+        INDEX_PAGES.clear();
+        assert_eq!(reader.next_window().unwrap().map(|w| w.len()), Some(4));
     }
 
     #[test]

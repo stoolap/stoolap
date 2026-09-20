@@ -507,6 +507,10 @@ pub struct VersionStore {
     schema: RwLock<CompactArc<Schema>>,
     /// Indexes on this table (FxHashMap for fast string key lookups)
     indexes: RwLock<FxHashMap<String, Arc<dyn Index>>>,
+    /// Each index definition's identity, by index name: the LSN of the
+    /// WAL record that created it. A side file column carries the identity
+    /// it was built for, and is served only while it matches
+    index_identities: RwLock<FxHashMap<String, u64>>,
     /// Whether this store has been closed
     closed: AtomicBool,
     /// Auto-increment counter for tables without explicit PK
@@ -567,6 +571,7 @@ impl VersionStore {
             table_name: table_name.into(),
             schema: RwLock::new(CompactArc::new(schema)),
             indexes: RwLock::new(FxHashMap::default()),
+            index_identities: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: RwLock::new(new_i64_map()),
@@ -596,6 +601,7 @@ impl VersionStore {
             table_name: table_name.into(),
             schema: RwLock::new(CompactArc::new(schema)),
             indexes: RwLock::new(FxHashMap::default()),
+            index_identities: RwLock::new(FxHashMap::default()),
             closed: AtomicBool::new(false),
             auto_increment_counter: AtomicI64::new(0),
             uncommitted_writes: RwLock::new(new_i64_map()),
@@ -3906,7 +3912,28 @@ impl VersionStore {
     /// Remove an index
     pub fn remove_index(&self, name: &str) -> Option<Arc<dyn Index>> {
         let mut indexes = self.indexes.write();
-        indexes.remove(name)
+        let removed = indexes.remove(name);
+        drop(indexes);
+        self.index_identities
+            .write()
+            .remove(name.to_lowercase().as_str());
+        removed
+    }
+
+    /// Records the identity the catalog issued to `name`'s definition
+    pub fn set_index_identity(&self, name: &str, identity: u64) {
+        self.index_identities
+            .write()
+            .insert(name.to_lowercase(), identity);
+    }
+
+    /// The identity of `name`'s definition, None for an index the catalog
+    /// has not issued one to yet
+    pub fn index_identity(&self, name: &str) -> Option<u64> {
+        self.index_identities
+            .read()
+            .get(name.to_lowercase().as_str())
+            .copied()
     }
 
     /// Get an index by name
@@ -4027,17 +4054,22 @@ impl VersionStore {
     /// The columns a volume's side file indexes: each single-column
     /// B-tree index on an INTEGER or TIMESTAMP column other than the
     /// primary key, as the column's index and the index definition's
-    /// identity, in column order
-    pub fn secondary_index_definitions(&self) -> Vec<(usize, u64)> {
+    /// identity, in column order. An index the catalog has not issued an
+    /// identity to is left out: nothing can be built or served for it.
+    pub fn secondary_index_identities(&self) -> Vec<(usize, u64)> {
         use crate::core::types::{DataType, IndexType};
         let schema = self.schema();
         let pk = schema.pk_column_index();
         let indexes = self.indexes.read();
+        let identities = self.index_identities.read();
         let mut result: Vec<(usize, u64)> = Vec::new();
-        for idx in indexes.values() {
+        for (index_name, idx) in indexes.iter() {
             if idx.index_type() != IndexType::BTree || idx.column_names().len() != 1 {
                 continue;
             }
+            let Some(&identity) = identities.get(index_name.to_lowercase().as_str()) else {
+                continue;
+            };
             let name = &idx.column_names()[0];
             let Some(column) = schema
                 .columns
@@ -4054,13 +4086,8 @@ impl VersionStore {
             {
                 continue;
             }
-            let definition = crate::storage::volume::secondary::definition_of(
-                name,
-                IndexType::BTree,
-                idx.is_unique(),
-            );
             if !result.iter().any(|(c, _)| *c == column) {
-                result.push((column, definition));
+                result.push((column, identity));
             }
         }
         result.sort_unstable();

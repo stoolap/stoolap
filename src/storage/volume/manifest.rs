@@ -63,6 +63,26 @@ pub struct ColdSegment {
 }
 
 impl ColdSegment {
+    /// The side file and the physical column that may serve schema column
+    /// `column` for the index definition with `identity`: the column is
+    /// resolved through this segment's captured mapping alone, and the
+    /// attached side file must cover that physical column under that
+    /// identity. None sends the volume through the scan.
+    pub fn side_for(
+        &self,
+        column: usize,
+        identity: u64,
+    ) -> Option<(&Arc<super::secondary::IndexFile>, usize)> {
+        let side = self.side.as_ref()?;
+        let physical = match self.mapping.sources.get(column) {
+            Some(super::writer::ColSource::Volume(physical)) => *physical,
+            Some(super::writer::ColSource::Default(_)) => return None,
+            None if self.mapping.is_identity && column < self.volume.columns.len() => column,
+            None => return None,
+        };
+        side.covers(physical, identity).then_some((side, physical))
+    }
+
     /// Check whether row at position `idx` in this volume is the authoritative
     /// (newest) copy across all overlapping volumes.
     #[inline]
@@ -601,6 +621,40 @@ type Owners = (
     Option<Arc<super::writer::VolumeFile>>,
     Option<Arc<super::secondary::IndexFile>>,
 );
+
+/// A replacement prepared outside the caller's DDL coordination and
+/// committed under it (`SegmentManager::prepare_replacement`,
+/// `commit_replacement`)
+pub struct PreparedReplacement {
+    new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
+    old_segment_ids: Vec<u64>,
+    owners: Vec<Owners>,
+    prepared: PreparedPublication,
+}
+
+impl PreparedReplacement {
+    /// The outputs' side files, by segment id
+    pub fn sides(&self) -> impl Iterator<Item = (u64, &Arc<super::secondary::IndexFile>)> {
+        self.new_volumes
+            .iter()
+            .zip(&self.owners)
+            .filter_map(|((id, _, _), owner)| owner.1.as_ref().map(|side| (*id, side)))
+    }
+
+    /// Takes output `segment_id`'s side file out of the publication: the
+    /// segment is published uncovered, and the file is the caller's to
+    /// discard
+    pub fn uncover(&mut self, segment_id: u64) -> Option<Arc<super::secondary::IndexFile>> {
+        let at = self
+            .new_volumes
+            .iter()
+            .position(|(id, _, _)| *id == segment_id)?;
+        if let Some(segment) = self.prepared.map.get_mut(&segment_id) {
+            segment.side = None;
+        }
+        self.owners[at].1.take()
+    }
+}
 
 /// A publication built outside the locks: the segments it was built on,
 /// their manifest order then, and the map to swap in
@@ -2913,6 +2967,46 @@ impl SegmentManager {
             return;
         }
         self.publish_with(new_volumes, old_segment_ids, schema, sides, |_| {});
+    }
+
+    /// A replacement prepared outside the caller's DDL coordination: the
+    /// outputs' owners taken, every row's visibility decided. The caller
+    /// may take a side file out before it commits (`uncover`), and commits
+    /// with `commit_replacement`.
+    pub fn prepare_replacement(
+        &self,
+        new_volumes: Vec<(u64, Arc<FrozenVolume>, SegmentMeta)>,
+        old_segment_ids: &[u64],
+        sides: Vec<Option<Arc<super::secondary::IndexFile>>>,
+    ) -> PreparedReplacement {
+        let owners = self.output_owners(&new_volumes, sides);
+        let prepared = self.prepare_publication(&new_volumes, old_segment_ids, &owners);
+        PreparedReplacement {
+            new_volumes,
+            old_segment_ids: old_segment_ids.to_vec(),
+            owners,
+            prepared,
+        }
+    }
+
+    /// Commits a prepared replacement; true when the prepared map was used
+    pub fn commit_replacement(
+        &self,
+        replacement: PreparedReplacement,
+        schema: Option<&crate::core::Schema>,
+    ) -> bool {
+        let PreparedReplacement {
+            new_volumes,
+            old_segment_ids,
+            owners,
+            prepared,
+        } = replacement;
+        let fresh =
+            self.commit_publication(prepared, new_volumes, &old_segment_ids, schema, &owners);
+        self.forget_key_order(&old_segment_ids);
+        self.cached_deduped_count
+            .store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        fresh
     }
 
     /// The publication in its two steps, `between` run after the first

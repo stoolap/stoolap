@@ -21,8 +21,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use stoolap::core::types::IndexType;
-use stoolap::storage::volume::secondary::{definition_of, IndexFile};
+use stoolap::storage::volume::secondary::IndexFile;
 use stoolap::Database;
 
 /// The budgets and counters are process-wide, so the tests run one at a
@@ -168,8 +167,13 @@ fn a_seal_writes_a_side_file_of_the_indexed_integer_column_beside_each_volume() 
     for stem in &volumes {
         let side = side_of(dir.path(), "t", stem);
         assert_eq!(side.directory().columns.len(), 1);
-        assert!(side.covers(1, definition_of("k", IndexType::BTree, false)));
-        assert!(!side.covers(2, definition_of("name", IndexType::BTree, false)));
+        let identity = db.engine().index_identity("t", "idx_t_k").unwrap();
+        assert!(side.covers(1, identity));
+        assert!(!side.covers(1, identity + 1), "another index's identity");
+        assert!(
+            !side.covers(2, identity),
+            "the text column has no side entry"
+        );
         let (start, end) = side.equal(1, 3).unwrap().unwrap();
         let in_volume: i64 = 5_000;
         let with_key = (0..in_volume).filter(|i| i % 7 == 3).count();
@@ -442,4 +446,296 @@ fn index_ddl_during_the_preparation_discards_the_prepared_side_file() {
         assert_eq!(count, if compaction { 6_000 } else { 1 });
         db.close().unwrap();
     }
+}
+
+fn identity(db: &Database, index: &str) -> u64 {
+    db.engine()
+        .index_identity("t", index)
+        .unwrap_or_else(|| panic!("{index} has no identity"))
+}
+
+/// An index dropped and created again with the same definition is a new
+/// index: its identity is new, the checkpoint's catalog copy and the
+/// reopen keep it, and the old side file, attached at reopen, does not
+/// cover the column for it.
+#[test]
+fn an_index_recreated_with_the_same_definition_gets_a_new_identity_and_the_old_side_file_is_not_eligible(
+) {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    seal_rows(&db, 1, 2_000);
+    let old = identity(&db, "idx_t_k");
+    let stem = files(dir.path(), "t", "vol").into_iter().next().unwrap();
+    assert!(side_of(dir.path(), "t", &stem).covers(1, old));
+    db.execute("DROP INDEX idx_t_k ON t", ()).unwrap();
+    assert!(db.engine().index_identity("t", "idx_t_k").is_none());
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    let new = identity(&db, "idx_t_k");
+    assert!(new > old, "the identity only grows: {old} then {new}");
+    // The checkpoint truncates the WAL and copies the catalog; the copy
+    // carries the identity issued at creation
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    assert_eq!(identity(&db, "idx_t_k"), new);
+    db.close().unwrap();
+    drop(db);
+    let db = open(dir.path(), "");
+    assert_eq!(identity(&db, "idx_t_k"), new, "the reopen reads the copy");
+    let side = side_of(dir.path(), "t", &stem);
+    assert!(
+        side.covers(1, old),
+        "the old file still stands for the old index"
+    );
+    assert!(
+        !side.covers(1, new),
+        "the old file is not eligible for the recreated index"
+    );
+    // The next seal covers the new index; a compaction rewrites the old
+    // volume for it too
+    seal_rows(&db, 2_001, 2_000);
+    let covered = files(dir.path(), "t", "vol")
+        .into_iter()
+        .filter(|s| side_of(dir.path(), "t", s).covers(1, new))
+        .count();
+    assert_eq!(covered, 1);
+    db.close().unwrap();
+}
+
+/// A memory engine issues distinct identities from its own counter.
+#[test]
+fn a_memory_engine_issues_distinct_identities() {
+    let db = Database::open("memory://secondary_side_file_test_identities").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    db.execute("CREATE INDEX idx_t_v ON t(v)", ()).unwrap();
+    let k = identity(&db, "idx_t_k");
+    let v = identity(&db, "idx_t_v");
+    assert_ne!(k, v);
+    db.execute("DROP INDEX idx_t_k ON t", ()).unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    assert!(identity(&db, "idx_t_k") > v);
+}
+
+/// Records written before identities carry none: each index takes its own
+/// record's LSN at replay, so several legacy indexes stay distinct, and the
+/// next checkpoint's copy keeps what replay resolved. A record's first
+/// write today is the same shape, so the reopen resolves the identity
+/// creation issued.
+#[test]
+fn legacy_records_resolve_distinct_identities_at_replay_and_keep_them_through_a_checkpoint() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    db.execute("CREATE INDEX idx_t_v ON t(v)", ()).unwrap();
+    let (k, v) = (identity(&db, "idx_t_k"), identity(&db, "idx_t_v"));
+    assert_ne!(k, v);
+    // No checkpoint: the reopen replays the two first-write records
+    db.close().unwrap();
+    drop(db);
+    let db = open(dir.path(), "");
+    assert_eq!(
+        identity(&db, "idx_t_k"),
+        k,
+        "replay resolves the record's LSN"
+    );
+    assert_eq!(identity(&db, "idx_t_v"), v);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.close().unwrap();
+    drop(db);
+    let db = open(dir.path(), "");
+    assert_eq!(identity(&db, "idx_t_k"), k, "the catalog copy keeps it");
+    assert_eq!(identity(&db, "idx_t_v"), v);
+    db.close().unwrap();
+}
+
+/// A restore from a snapshot whose DDL file predates identities creates the
+/// indexes without any; each takes its identity from its own catalog copy
+/// after the restore, distinct, and the reopen keeps it.
+#[test]
+fn a_legacy_restore_gives_each_index_its_own_identity() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, v INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1, 1), (2, 2, 2)", ())
+        .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    db.execute("CREATE INDEX idx_t_v ON t(v)", ()).unwrap();
+    db.execute("PRAGMA SNAPSHOT", ()).unwrap();
+    // The snapshot's DDL file is rewritten as a version before identities
+    // wrote it: each index entry loses its trailing identity, and the
+    // checksum is recomputed
+    let snapshot_dir = dir.path().join("snapshots");
+    let ddl_path = std::fs::read_dir(&snapshot_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("ddl-") && n.ends_with(".bin"))
+        })
+        .expect("a ddl file");
+    let data = std::fs::read(&ddl_path).unwrap();
+    let payload = &data[..data.len() - 4];
+    let mut out = payload[..5].to_vec();
+    let mut pos = 5usize;
+    let count = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+    pos += 4;
+    out.extend_from_slice(&(count as u32).to_le_bytes());
+    let mut stripped = 0;
+    for _ in 0..count {
+        let len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let entry = &payload[pos..pos + len];
+        pos += len;
+        let legacy = &entry[..len - 8];
+        stripped += 1;
+        out.extend_from_slice(&(legacy.len() as u32).to_le_bytes());
+        out.extend_from_slice(legacy);
+    }
+    assert_eq!(stripped, 2);
+    out.extend_from_slice(&payload[pos..]);
+    let crc = crc32fast::hash(&out);
+    out.extend_from_slice(&crc.to_le_bytes());
+    std::fs::write(&ddl_path, &out).unwrap();
+    db.execute("PRAGMA RESTORE", ()).unwrap();
+    let (k, v) = (identity(&db, "idx_t_k"), identity(&db, "idx_t_v"));
+    assert_ne!(k, v, "each index took its own catalog copy's LSN");
+    let count: i64 = db
+        .query_one("SELECT COUNT(*) FROM t WHERE k = 2", ())
+        .unwrap();
+    assert_eq!(count, 1);
+    db.close().unwrap();
+    drop(db);
+    let db = open(dir.path(), "");
+    assert_eq!(identity(&db, "idx_t_k"), k);
+    assert_eq!(identity(&db, "idx_t_v"), v);
+    db.close().unwrap();
+}
+
+/// DDL that lands between the comparison and the binding waits for the DDL
+/// guard: the side file attaches for the index it matched, the recreated
+/// index gets a new identity, and the file does not cover the column for
+/// it. On the seal path and on the compaction path.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn index_ddl_between_the_comparison_and_the_binding_does_not_bind_stale_coverage() {
+    let _serial = serial();
+    for compaction in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path(), "&compact_threshold=100");
+        create(&db);
+        if compaction {
+            seal_rows(&db, 1, 2_000);
+            seal_rows(&db, 2_001, 2_000);
+            seal_rows(&db, 4_001, 2_000);
+            db.execute("PRAGMA COMPACT_THRESHOLD = 2", ()).unwrap();
+        } else {
+            db.execute(
+                "INSERT INTO t VALUES (1, 1, 'a', '2026-01-01 00:00:00')",
+                (),
+            )
+            .unwrap();
+        }
+        let old = identity(&db, "idx_t_k");
+        let other = db.clone();
+        let (done, waiter) = std::sync::mpsc::channel();
+        stoolap::test_failpoints::after_side_files_compared(move || {
+            // The DDL runs on its own thread and waits for the guard the
+            // comparison holds; the checkpoint goes on meanwhile
+            std::thread::spawn(move || {
+                other.execute("DROP INDEX idx_t_k ON t", ()).unwrap();
+                other.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+                done.send(()).unwrap();
+            });
+        });
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        waiter
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the DDL completed after the guard was released");
+        let new = identity(&db, "idx_t_k");
+        assert!(new > old, "compaction={compaction}");
+        let volumes = files(dir.path(), "t", "vol");
+        assert_eq!(volumes.len(), 1, "compaction={compaction}");
+        let stem = volumes.into_iter().next().unwrap();
+        let side = side_of(dir.path(), "t", &stem);
+        assert!(
+            side.covers(1, old),
+            "the side file matched the index it was compared against, compaction={compaction}"
+        );
+        assert!(
+            !side.covers(1, new),
+            "the recreated index does not bind to it, compaction={compaction}"
+        );
+        let count: i64 = db.query_one("SELECT COUNT(*) FROM t", ()).unwrap();
+        assert_eq!(count, if compaction { 6_000 } else { 1 });
+        db.close().unwrap();
+    }
+}
+
+/// A CREATE INDEX that arrives while a seal is between its registration and
+/// its hot cleanup waits for the guard: the new index holds no entry for a
+/// sealed row, and answers the rows from the cold side.
+#[cfg(feature = "test-failpoints")]
+#[test]
+fn create_index_racing_the_seal_s_cleanup_holds_no_entry_for_a_sealed_row() {
+    use stoolap::storage::index::BTreeIndex;
+
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, k2 INTEGER)",
+        (),
+    )
+    .unwrap();
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    let mut values = String::new();
+    for id in 1..=5_000i64 {
+        values.push_str(&format!("({id},{},{}),", id % 7, id % 11));
+    }
+    values.pop();
+    db.execute(&format!("INSERT INTO t VALUES {values}"), ())
+        .unwrap();
+    let other = db.clone();
+    let (done, waiter) = std::sync::mpsc::channel();
+    stoolap::test_failpoints::after_side_files_compared(move || {
+        std::thread::spawn(move || {
+            other.execute("CREATE INDEX idx_t_k2 ON t(k2)", ()).unwrap();
+            done.send(()).unwrap();
+        });
+    });
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    waiter
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("the CREATE INDEX completed after the seal");
+    let store = db.engine().get_version_store("t").unwrap();
+    let index = store.get_index("idx_t_k2").expect("the index exists");
+    let entries = index
+        .as_any()
+        .downcast_ref::<BTreeIndex>()
+        .expect("a B-tree index")
+        .entry_count();
+    assert_eq!(entries, 0, "no sealed row is in the new hot index");
+    let count: i64 = db
+        .query_one("SELECT COUNT(*) FROM t WHERE k2 = 3", ())
+        .unwrap();
+    assert_eq!(count, (1..=5_000i64).filter(|i| i % 11 == 3).count() as i64);
+    db.close().unwrap();
 }

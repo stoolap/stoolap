@@ -72,6 +72,11 @@ pub struct IndexMetadata {
     pub hnsw_ef_search: Option<u16>,
     /// HNSW parameter: distance metric (0=L2, 1=Cosine, 2=InnerProduct)
     pub hnsw_distance_metric: Option<u8>,
+    /// The index definition's identity: the LSN of the WAL record that
+    /// created it. Absent on the record's first write, where the identity
+    /// is that record's own LSN; explicit in every later copy of the
+    /// catalog (checkpoint copy, snapshot, restore).
+    pub identity: Option<u64>,
 }
 
 impl IndexMetadata {
@@ -128,6 +133,11 @@ impl IndexMetadata {
             buf.extend_from_slice(&self.hnsw_ef_construction.unwrap_or(200).to_le_bytes());
             buf.extend_from_slice(&self.hnsw_ef_search.unwrap_or(64).to_le_bytes());
             buf.push(self.hnsw_distance_metric.unwrap_or(0)); // 0 = L2
+        }
+
+        // The identity, when resolved, trails everything else
+        if let Some(identity) = self.identity {
+            buf.extend_from_slice(&identity.to_le_bytes());
         }
 
         buf
@@ -260,10 +270,18 @@ impl IndexMetadata {
                 let ef_s = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
                 pos += 2;
                 let metric = data[pos];
+                pos += 1;
                 (Some(m), Some(ef_c), Some(ef_s), Some(metric))
             } else {
                 (None, None, None, None)
             };
+
+        // A record written before identities, or on its first write, ends here
+        let identity = if pos + 8 <= data.len() {
+            Some(u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap()))
+        } else {
+            None
+        };
 
         Ok(Self {
             name,
@@ -277,6 +295,7 @@ impl IndexMetadata {
             hnsw_ef_construction,
             hnsw_ef_search,
             hnsw_distance_metric,
+            identity,
         })
     }
 }
@@ -403,15 +422,16 @@ impl PersistenceManager {
         Ok(())
     }
 
-    /// Record a DDL operation (CREATE TABLE, DROP TABLE, etc.)
+    /// Record a DDL operation (CREATE TABLE, DROP TABLE, etc.); the LSN
+    /// the record was written at, None when persistence is off
     pub fn record_ddl_operation(
         &self,
         table_name: &str,
         op: WALOperationType,
         schema_data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         if !self.is_enabled() {
-            return Ok(());
+            return Ok(None);
         }
 
         let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
@@ -424,7 +444,7 @@ impl PersistenceManager {
             schema_data.to_vec(),
         );
 
-        wal.append_entry(entry)?;
+        let lsn = wal.append_entry(entry)?;
 
         // DDL operations are auto-committed (they don't participate in user transactions)
         // Write a commit marker so two-phase recovery will apply them
@@ -434,7 +454,7 @@ impl PersistenceManager {
         // Failure is non-critical: the commit is already persisted.
         let _ = wal.maybe_rotate();
 
-        Ok(())
+        Ok(Some(lsn))
     }
 
     /// Append a checkpoint's copy of a catalog record with its commit
@@ -445,9 +465,9 @@ impl PersistenceManager {
         table_name: &str,
         op: WALOperationType,
         schema_data: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         if !self.is_enabled() {
-            return Ok(());
+            return Ok(None);
         }
         let wal = self.wal.as_ref().ok_or(Error::WalNotInitialized)?;
         let entry = WALEntry::new(
@@ -457,9 +477,9 @@ impl PersistenceManager {
             op,
             schema_data.to_vec(),
         );
-        wal.append_catalog_entry(entry)?;
+        let lsn = wal.append_catalog_entry(entry)?;
         wal.append_catalog_entry(WALEntry::commit_marker(DDL_TXN_ID))?;
-        Ok(())
+        Ok(Some(lsn))
     }
 
     /// The LSN a checkpoint cuts at; see `WALManager::checkpoint_cut`.
@@ -1119,6 +1139,7 @@ mod tests {
             hnsw_ef_construction: None,
             hnsw_ef_search: None,
             hnsw_distance_metric: None,
+            identity: Some(77),
         };
 
         let serialized = meta.serialize();
@@ -1130,6 +1151,15 @@ mod tests {
         assert_eq!(deserialized.column_ids, vec![0, 1]);
         assert!(deserialized.is_unique);
         assert_eq!(deserialized.index_type, IndexType::Hash);
+        assert_eq!(deserialized.identity, Some(77));
+        // A record without an identity ends where the older format did
+        let first_write = IndexMetadata {
+            identity: None,
+            ..deserialized
+        };
+        let bytes = first_write.serialize();
+        assert_eq!(bytes.len(), serialized.len() - 8);
+        assert_eq!(IndexMetadata::deserialize(&bytes).unwrap().identity, None);
     }
 
     #[test]
@@ -1153,6 +1183,7 @@ mod tests {
                 hnsw_ef_construction: None,
                 hnsw_ef_search: None,
                 hnsw_distance_metric: None,
+                identity: None,
             };
 
             let serialized = meta.serialize();
