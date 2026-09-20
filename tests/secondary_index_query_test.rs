@@ -934,3 +934,52 @@ fn a_residual_limit_keeps_its_order_when_the_budget_changes_between_batches() {
     assert!(calls.load(Ordering::SeqCst) > 1, "more than one batch");
     assert_eq!(rows, vec![904]);
 }
+
+/// The ordered collector's position vector is admitted against the page
+/// budget beside the walk's reader and charged while it lives: refused,
+/// the scan answers in the same order; admitted, the ledger's peak shows
+/// it.
+#[test]
+fn the_ordered_collectors_positions_are_admitted_against_the_budget() {
+    use stoolap::storage::volume::secondary::{reader_bytes, INDEX_PAGES, SIDE_WINDOW};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    insert(&db, 1, ROWS);
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    // A hundred keys, eight hundred candidates: 3,200 bytes of positions
+    let sql = "SELECT id FROM t WHERE k >= 100 AND k <= 199 AND ABS(id + 1) > 0 LIMIT 5";
+    let want = expected_range(100, 199);
+    let positions = 800 * std::mem::size_of::<u32>();
+    INDEX_PAGES.clear();
+    let idle = INDEX_PAGES.stats().charged_bytes;
+    // Room for the walk's reader, not for its positions
+    INDEX_PAGES.set_budget_bytes((idle + reader_bytes(SIDE_WINDOW) + positions / 2) as u64);
+    let before = reads(&db);
+    let rows = ids_db(&db, sql, &[]);
+    let after = reads(&db);
+    INDEX_PAGES.set_budget_bytes(16 * 1024 * 1024);
+    assert_eq!(rows.len(), 5);
+    assert!(rows.iter().all(|id| want.contains(id)));
+    assert_eq!(
+        delta(&after, &before, "refused"),
+        1,
+        "the positions were refused"
+    );
+    // Room for both: the peak carries the reader and the positions
+    INDEX_PAGES.clear();
+    INDEX_PAGES.reset_peak();
+    let idle = INDEX_PAGES.stats().charged_bytes;
+    let before = reads(&db);
+    let rows = ids_db(&db, sql, &[]);
+    let after = reads(&db);
+    assert_eq!(rows.len(), 5);
+    assert_eq!(delta(&after, &before, "refused"), 0);
+    assert!(
+        INDEX_PAGES.stats().peak_bytes >= idle + reader_bytes(SIDE_WINDOW) + positions,
+        "the positions were charged beside the reader: peak {}",
+        INDEX_PAGES.stats().peak_bytes
+    );
+}

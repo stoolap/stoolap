@@ -1105,12 +1105,8 @@ impl IndexFile {
     /// never stops it.
     pub fn reader(self: &Arc<Self>, column: usize, window: usize) -> std::io::Result<Reader> {
         let window = window.max(1);
-        let bytes = window * POS_ENTRY
-            + PAGE_BYTES
-            + KEYS_PER_PAGE * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>())
-            + POSITIONS_PER_PAGE * std::mem::size_of::<u32>();
         let reservation = INDEX_PAGES
-            .try_reserve(bytes)
+            .try_reserve(reader_bytes(window))
             .ok_or_else(|| refused("a reader's working reservation"))?;
         Ok(Reader {
             file: Arc::clone(self),
@@ -2685,6 +2681,15 @@ impl ReadCounters {
 /// Positions a side file walk yields per window
 pub const SIDE_WINDOW: usize = 4096;
 
+/// A reader's working reservation for a window: the window, a raw page and
+/// the parsed key and position pages
+pub fn reader_bytes(window: usize) -> usize {
+    window.max(1) * POS_ENTRY
+        + PAGE_BYTES
+        + KEYS_PER_PAGE * (std::mem::size_of::<i64>() + std::mem::size_of::<u64>())
+        + POSITIONS_PER_PAGE * std::mem::size_of::<u32>()
+}
+
 /// A walk decided for a volume: the side file, the physical column and the
 /// position index range the probe found. The reader and its working
 /// reservation are taken when the walk starts (`walk`), not when the
@@ -2732,12 +2737,17 @@ impl SideWalk {
     /// read is the walk's error and the walk stays where it was
     pub fn next_position(&mut self) -> std::io::Result<Option<usize>> {
         if self.at >= self.reader.window().len() {
-            match self.reader.next_window()? {
-                Some(window) if !window.is_empty() => {
+            match self.reader.next_window() {
+                Ok(Some(window)) if !window.is_empty() => {
                     self.at = 0;
                     READS.count(&READS.windows, 1);
                 }
-                _ => return Ok(None),
+                Ok(_) => return Ok(None),
+                Err(error) => {
+                    // The reader's window is empty now; so is this one
+                    self.at = 0;
+                    return Err(error);
+                }
             }
         }
         let position = self.reader.window()[self.at] as usize;
@@ -3522,6 +3532,54 @@ mod tests {
         let unique: std::collections::BTreeSet<usize> = got.iter().copied().collect();
         assert_eq!(unique.len(), 5904, "every position once");
         assert_eq!(got[0], 4096);
+    }
+
+    /// A refill that fails after a window was served: the walk reports the
+    /// remainder from the window's end and, repaired, yields the rest once
+    #[test]
+    fn a_failed_refill_after_a_served_window_keeps_the_remainder() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v.sidx");
+        build(
+            &path,
+            (0..20_000u32).map(|p| (p, 1i64)).collect(),
+            WORKSPACE,
+        );
+        let file = Arc::new(IndexFile::open(&path, 3).unwrap());
+        let good = std::fs::read(&path).unwrap();
+        let mut bad = good.clone();
+        let second_page = file.directory().column(1).unwrap().pos_pages[1].offset as usize + 10;
+        bad[second_page] ^= 0xff;
+        INDEX_PAGES.clear();
+        let mut walk = SidePlan::new(Arc::clone(&file), 1, (0, 20_000))
+            .walk(4096)
+            .unwrap();
+        let charged = INDEX_PAGES.stats().charged_bytes;
+        INDEX_PAGES.set_budget_bytes(charged as u64);
+        let mut got = Vec::new();
+        for _ in 0..4096 {
+            got.push(walk.next_position().unwrap().unwrap());
+        }
+        assert_eq!(walk.remaining(), 15_904);
+        std::fs::write(&path, &bad).unwrap();
+        let err = walk.next_position().unwrap_err();
+        assert!(err.to_string().contains("checksum"), "{err}");
+        assert_eq!(
+            walk.remaining(),
+            15_904,
+            "the failed refill changed nothing"
+        );
+        std::fs::write(&path, &good).unwrap();
+        while let Some(position) = walk.next_position().unwrap() {
+            got.push(position);
+        }
+        drop(walk);
+        INDEX_PAGES.set_budget_bytes(DEFAULT_BUDGET_BYTES);
+        INDEX_PAGES.clear();
+        assert_eq!(got.len(), 20_000);
+        let unique: std::collections::BTreeSet<usize> = got.iter().copied().collect();
+        assert_eq!(unique.len(), 20_000, "every position once");
     }
 
     #[test]

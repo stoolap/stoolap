@@ -2819,11 +2819,18 @@ impl Table for SegmentedTable {
                 // The executor calls again with a larger offset, so the walk's
                 // positions are sorted first: the order is the scan's whatever
                 // the admission decides per call
-                let candidates: Option<Vec<u32>> =
-                    match self.side_decision(cs, &comparisons, &identities)? {
-                        SideDecision::Empty => continue,
-                        SideDecision::Walk(plan) => match start_walk(&plan)? {
-                            Some(mut walk) => {
+                let candidates: Option<(Vec<u32>, super::secondary::Reservation)> = match self
+                    .side_decision(cs, &comparisons, &identities)?
+                {
+                    SideDecision::Empty => continue,
+                    SideDecision::Walk(plan) => match start_walk(&plan)? {
+                        // The positions are admitted beside the reader and
+                        // charged as long as they live; refused, the scan
+                        // reads the same order
+                        Some(mut walk) => match super::secondary::INDEX_PAGES
+                            .try_reserve(plan.candidates() as usize * std::mem::size_of::<u32>())
+                        {
+                            Some(held) => {
                                 let mut positions = Vec::with_capacity(plan.candidates() as usize);
                                 while let Some(i) = walk.next_position().map_err(|error| {
                                     crate::core::Error::internal(format!(
@@ -2833,12 +2840,17 @@ impl Table for SegmentedTable {
                                     positions.push(i as u32);
                                 }
                                 positions.sort_unstable();
-                                Some(positions)
+                                Some((positions, held))
                             }
-                            None => None,
+                            None => {
+                                super::secondary::READS.count(&super::secondary::READS.refused, 1);
+                                None
+                            }
                         },
-                        SideDecision::Scan => None,
-                    };
+                        None => None,
+                    },
+                    SideDecision::Scan => None,
+                };
 
                 // Load cold volume on demand after pruning.
                 let loaded;
@@ -2863,7 +2875,7 @@ impl Table for SegmentedTable {
                 let mut at = 0usize;
                 let mut next_position = move || -> Option<usize> {
                     let position = match candidates.as_ref() {
-                        Some(positions) => positions.get(at).map(|&p| p as usize),
+                        Some((positions, _)) => positions.get(at).map(|&p| p as usize),
                         None => (at < row_ids.len()).then_some(at),
                     };
                     at += 1;
