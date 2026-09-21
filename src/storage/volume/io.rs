@@ -536,15 +536,8 @@ pub fn delete_all_volumes(dir: &Path, table_name: &str) -> Result<()> {
         super::writer::VolumeFile::retire_path(&path).map_err(|e| {
             crate::core::Error::internal(format!("failed to delete volume {:?}: {}", path, e))
         })?;
-        sides.retire_for(&path);
     }
-    if let Ok(entries) = std::fs::read_dir(&table_dir) {
-        for path in entries.flatten().map(|e| e.path()) {
-            if path.extension().and_then(|e| e.to_str()) == Some(super::secondary::SIDE_EXT) {
-                sides.retire_for(&path.with_extension(VOLUME_EXT));
-            }
-        }
-    }
+    sides.retire_all();
     // Remove the table directory if empty
     let _ = std::fs::remove_dir(&table_dir); // OK if not empty
     Ok(())

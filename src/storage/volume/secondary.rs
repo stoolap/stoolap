@@ -169,6 +169,14 @@ impl SideFiles {
             retire_file(side);
         }
     }
+
+    /// Retires every side file of the directory, whatever volume it stood
+    /// beside: what a table's removal asks
+    pub fn retire_all(&self) {
+        for side in self.by_volume.values().flatten() {
+            retire_file(side);
+        }
+    }
 }
 
 /// The volume id a side file's stem stands for, the generation stripped

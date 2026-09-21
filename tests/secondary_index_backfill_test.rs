@@ -913,3 +913,39 @@ fn a_rename_then_truncate_or_drop_after_the_staging_leaves_nothing() {
         );
     }
 }
+
+/// DROP TABLE takes every generation of every side file with it, a
+/// generation whose volume is already gone included.
+#[test]
+fn dropping_a_table_takes_every_generation_of_its_side_files() {
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    seal_volumes(&db, 1);
+    db.execute("CREATE INDEX idx_t_v ON t(v)", ()).unwrap();
+    let pass = backfill(&db, None);
+    assert_eq!(pass["built"], 1, "{pass:?}");
+    let names = side_names(dir.path(), "t");
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert!(
+        names[0].contains(".g"),
+        "the replacement carries its generation: {names:?}"
+    );
+    // A generation-named file whose volume is gone, beside the live one
+    let table_dir = dir.path().join("volumes").join("t");
+    std::fs::copy(
+        table_dir.join(&names[0]),
+        table_dir.join("vol_0000000000000009.g7.sidx"),
+    )
+    .unwrap();
+    assert_eq!(side_names(dir.path(), "t").len(), 2);
+    db.execute("DROP TABLE t", ()).unwrap();
+    assert!(
+        side_names(dir.path(), "t").is_empty(),
+        "{:?}",
+        side_names(dir.path(), "t")
+    );
+    assert!(files(dir.path(), "t", "vol").is_empty());
+}
