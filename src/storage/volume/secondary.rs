@@ -427,6 +427,37 @@ impl IndexPages {
         }
     }
 
+    /// Whether the pages named are cached, or would fit beside what is
+    /// charged and a reservation of `reserve` bytes without an eviction:
+    /// what a probe of them would cost the cache, before any read
+    pub fn admits(
+        &self,
+        file: &IndexFile,
+        column: usize,
+        pages: impl Iterator<Item = (PageKind, usize)>,
+        reserve: usize,
+    ) -> std::io::Result<bool> {
+        let mut incoming = 0usize;
+        let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        for (kind, number) in pages {
+            let key = PageKey {
+                file_id: file.file_id,
+                generation: file.directory.generation,
+                column: column as u32,
+                kind,
+                number: number as u32,
+            };
+            if !cache.pages.contains_key(&key) {
+                incoming += file.directory.page_location(column, kind, number)?.1 as usize;
+            }
+        }
+        drop(cache);
+        Ok(
+            (self.charged.load(Ordering::Acquire) + incoming + reserve) as u64
+                <= self.budget.load(Ordering::Acquire),
+        )
+    }
+
     fn make_room(&self, incoming: usize) {
         let budget = self.budget.load(Ordering::Acquire);
         loop {
@@ -1063,6 +1094,42 @@ impl IndexFile {
             share_of(first) + interior + share_of(last - 1)
         };
         Ok(Some(estimate.max(1)))
+    }
+
+    /// Whether the pages a probe of `[low, high]` touches (the key pages
+    /// the range spans and the position pages under them) are cached or
+    /// would fit in the cache beside a reader's reservation of `reserve`
+    /// bytes without an eviction
+    pub fn pages_admissible(
+        &self,
+        column: usize,
+        low: i64,
+        high: i64,
+        reserve: usize,
+    ) -> std::io::Result<bool> {
+        let col = self
+            .directory
+            .column(column)
+            .ok_or_else(|| invalid("column has no index"))?;
+        let first = col.key_pages.partition_point(|p| p.last_key < low);
+        let last = col.key_pages.partition_point(|p| p.first_key <= high);
+        if first >= last {
+            return Ok(true);
+        }
+        let start = col.key_pages[first].pos_start;
+        let end = col
+            .key_pages
+            .get(last)
+            .map_or(col.n_positions, |p| p.pos_start);
+        let pos_first = col
+            .pos_pages
+            .partition_point(|p| p.pos_start <= start)
+            .saturating_sub(1);
+        let pos_last = col.pos_pages.partition_point(|p| p.pos_start < end);
+        let pages = (first..last)
+            .map(|n| (PageKind::Keys, n))
+            .chain((pos_first..pos_last).map(|n| (PageKind::Positions, n)));
+        INDEX_PAGES.admits(self, column, pages, reserve)
     }
 
     /// The exact position index range of keys in `[low, high]`; reads the
@@ -2641,6 +2708,9 @@ pub struct ReadCounters {
     pub ineligible: AtomicU64,
     /// Volumes served by the scan because the candidates were too many
     pub cost_scans: AtomicU64,
+    /// Small volumes served by the scan because their pages are not
+    /// resident and the cache has no room for them without an eviction
+    pub page_scans: AtomicU64,
     /// Metadata-only volumes reloaded because a probe had candidates
     pub reloads: AtomicU64,
 }
@@ -2654,6 +2724,7 @@ pub static READS: ReadCounters = ReadCounters {
     refused: AtomicU64::new(0),
     ineligible: AtomicU64::new(0),
     cost_scans: AtomicU64::new(0),
+    page_scans: AtomicU64::new(0),
     reloads: AtomicU64::new(0),
 };
 
@@ -2663,7 +2734,7 @@ impl ReadCounters {
     }
 
     /// The counters by name, in a fixed order
-    pub fn snapshot(&self) -> [(&'static str, u64); 9] {
+    pub fn snapshot(&self) -> [(&'static str, u64); 10] {
         [
             ("probes", self.probes.load(Ordering::Relaxed)),
             ("misses", self.misses.load(Ordering::Relaxed)),
@@ -2673,6 +2744,7 @@ impl ReadCounters {
             ("refused", self.refused.load(Ordering::Relaxed)),
             ("ineligible", self.ineligible.load(Ordering::Relaxed)),
             ("cost_scans", self.cost_scans.load(Ordering::Relaxed)),
+            ("page_scans", self.page_scans.load(Ordering::Relaxed)),
             ("reloads", self.reloads.load(Ordering::Relaxed)),
         ]
     }

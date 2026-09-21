@@ -983,3 +983,45 @@ fn the_ordered_collectors_positions_are_admitted_against_the_budget() {
         INDEX_PAGES.stats().peak_bytes
     );
 }
+
+/// Small volumes are probed from the cache or not at all: under a budget
+/// that cannot hold their pages, they keep the scan's cost instead of a
+/// file read per volume; with room, every one is probed.
+#[test]
+fn small_volumes_are_probed_only_when_their_pages_fit_the_cache() {
+    use stoolap::storage::volume::secondary::{reader_bytes, INDEX_PAGES, SIDE_WINDOW};
+    let _serial = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(dir.path(), "");
+    create(&db);
+    db.execute("CREATE INDEX idx_t_k ON t(k)", ()).unwrap();
+    for batch in 0..16 {
+        insert(&db, batch * (ROWS / 16) + 1, (batch + 1) * (ROWS / 16));
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    }
+    INDEX_PAGES.clear();
+    let idle = INDEX_PAGES.stats().charged_bytes;
+    // Room for a reader and a few volumes' pages, not for sixteen
+    INDEX_PAGES.set_budget_bytes((idle + reader_bytes(SIDE_WINDOW) + 60 * 1024) as u64);
+    let before = reads(&db);
+    assert_eq!(ids_db(&db, RANGE, &[100, 103]), expected_range(100, 103));
+    assert_eq!(ids_db(&db, RANGE, &[100, 103]), expected_range(100, 103));
+    let after = reads(&db);
+    INDEX_PAGES.set_budget_bytes(16 * 1024 * 1024);
+    assert!(
+        delta(&after, &before, "page_scans") >= 16,
+        "the volumes whose pages do not fit are scanned: {}",
+        delta(&after, &before, "page_scans")
+    );
+    assert!(
+        delta(&after, &before, "probes") >= 4,
+        "the volumes whose pages fit are probed: {}",
+        delta(&after, &before, "probes")
+    );
+    assert_eq!(delta(&after, &before, "refused"), 0);
+    let before = reads(&db);
+    assert_eq!(ids_db(&db, RANGE, &[100, 103]), expected_range(100, 103));
+    let after = reads(&db);
+    assert_eq!(delta(&after, &before, "page_scans"), 0);
+    assert_eq!(delta(&after, &before, "probes"), 16);
+}

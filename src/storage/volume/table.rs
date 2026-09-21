@@ -1270,6 +1270,22 @@ impl SegmentedTable {
                 READS.count(&READS.cost_scans, 1);
                 return Ok(SideDecision::Scan);
             }
+            // A volume one position page holds is scanned about as fast as
+            // its pages are read from the file: its probe comes from the
+            // cache or not at all, the walk's reader counted beside the pages
+            if rows <= super::secondary::POSITIONS_PER_PAGE as u64
+                && !side
+                    .pages_admissible(
+                        physical,
+                        low,
+                        high,
+                        super::secondary::reader_bytes(super::secondary::SIDE_WINDOW),
+                    )
+                    .map_err(side_error)?
+            {
+                READS.count(&READS.page_scans, 1);
+                return Ok(SideDecision::Scan);
+            }
             // The probe reads the boundary pages through a reader of its own,
             // let go before the decision is handed on: the walk takes its
             // reservation when it starts

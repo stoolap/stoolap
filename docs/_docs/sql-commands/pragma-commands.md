@@ -198,11 +198,11 @@ PRAGMA index_stats;
 
 #### index_read_stats
 
-Returns one row of counters for the reads that went through side files since the process started: volumes probed, probes with an empty answer (the volume was not read), candidate positions named, rows produced from candidates, windows walked, volumes sent to the scan because the working reservation was refused, because no side file column stands for the index, or because the candidates were too many, and metadata-only volumes reloaded after a probe with candidates.
+Returns one row of counters for the reads that went through side files since the process started: volumes probed, probes with an empty answer (the volume was not read), candidate positions named, rows produced from candidates, windows walked, volumes sent to the scan because the working reservation was refused, because no side file column stands for the index, because the candidates were too many, or because a small volume's pages were neither cached nor admissible without an eviction, and metadata-only volumes reloaded after a probe with candidates.
 
 ```sql
 PRAGMA index_read_stats;
--- probes | misses | candidates | rows | windows | refused | ineligible | cost_scans | reloads
+-- probes | misses | candidates | rows | windows | refused | ineligible | cost_scans | page_scans | reloads
 ```
 
 #### memory_stats
