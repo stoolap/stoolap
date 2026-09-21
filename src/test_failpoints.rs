@@ -147,6 +147,41 @@ pub(crate) fn side_files_compared() {
 }
 
 thread_local! {
+    static BACKFILL_VOLUME_LOADED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread after a backfill loaded a volume and before it
+/// builds the side file, so a test can take the volume away first.
+pub fn after_backfill_volume_loaded(hook: impl FnOnce() + 'static) {
+    BACKFILL_VOLUME_LOADED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn backfill_volume_loaded() {
+    let hook = BACKFILL_VOLUME_LOADED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
+    static SIDE_BACKFILLED_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
+/// Run once on this thread after a backfill built a volume's side file and
+/// before it is published, so a test can change the index, compact the
+/// volume, or abandon the process there.
+pub fn after_side_backfilled(hook: impl FnOnce() + 'static) {
+    SIDE_BACKFILLED_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(crate) fn side_backfilled() {
+    let hook = SIDE_BACKFILLED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+thread_local! {
     static COLD_VOLUMES_HOOK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
 }
 

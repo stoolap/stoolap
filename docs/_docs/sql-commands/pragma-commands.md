@@ -59,6 +59,7 @@ Stoolap currently supports the following PRAGMA commands:
 | `index_build_mb` | Budget of the secondary index side file builds in flight, in MB | 64 |
 | `index_stats` | Show the secondary index ledgers, their refusals and build outcomes | - |
 | `index_read_stats` | Show what the reads through side files did: probes, candidates, rows, refusals, scans | - |
+| `index_backfill` | Build side files for volumes the query path cannot serve yet, all or up to a number | - |
 | `memory_stats` | Show per-table hot and cold memory figures | - |
 
 #### checkpoint_interval
@@ -194,6 +195,16 @@ Returns one row per ledger of the secondary index side files: the page cache, th
 ```sql
 PRAGMA index_stats;
 -- ledger | budget_bytes | charged_bytes | peak_bytes | refused | cached_pages | loads | hits | evictions | over_budget | builds_failed | sides_discarded
+```
+
+#### index_backfill
+
+Builds the secondary index side file of volumes the query path cannot serve although the catalog indexes one of their columns: sealed before the index existed, refused or failed at seal, of the earlier format, or built for an index recreated since. One volume at a time, oldest first, each admitted into half of `index_build_mb` while nothing else builds, and published only when its file covers every current index and its volume is still registered. Returns one row: volumes examined, side files built, builds the budget refused, files discarded at publication, builds that failed, and candidates left for a later pass. Without a value every candidate is tried; with one, at most that many. The engine runs one volume per maintenance cycle on its own, so an older database is covered in the background after it is opened.
+
+```sql
+PRAGMA index_backfill;
+PRAGMA index_backfill = 4;
+-- examined | built | refused | discarded | failed | left
 ```
 
 #### index_read_stats

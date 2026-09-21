@@ -516,6 +516,9 @@ pub struct MVCCEngine {
     /// Background checkpoint skips compaction when set. Forced compaction
     /// (PRAGMA CHECKPOINT, close, restore) waits for it to finish first.
     compaction_running: Arc<AtomicBool>,
+    /// Set while a backfill pass runs, so the periodic one and PRAGMA
+    /// INDEX_BACKFILL never build side files together
+    backfill_running: AtomicBool,
     /// Held across a DDL statement's schema change and its WAL record, so
     /// the log replays in the order the changes were applied
     ddl_serial: parking_lot::Mutex<()>,
@@ -523,6 +526,19 @@ pub struct MVCCEngine {
     /// cycle. Volumes whose last_access_epoch < eviction_epoch are idle.
     #[cfg(not(target_arch = "wasm32"))]
     eviction_epoch: AtomicU64,
+}
+
+/// What a backfill pass did: volumes examined, side files built and
+/// attached, builds the budget refused, files discarded at publication,
+/// builds that failed, and candidates left for a later pass
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BackfillReport {
+    pub examined: usize,
+    pub built: usize,
+    pub refused: usize,
+    pub discarded: usize,
+    pub failed: usize,
+    pub left: usize,
 }
 
 /// RAII guard that clears an AtomicBool on drop. Used to release the
@@ -616,6 +632,7 @@ impl MVCCEngine {
             checkpoint_mutex: Mutex::new(()),
             seal_fence: Arc::new(parking_lot::RwLock::new(())),
             compaction_running: Arc::new(AtomicBool::new(false)),
+            backfill_running: AtomicBool::new(false),
             ddl_serial: parking_lot::Mutex::new(()),
             #[cfg(not(target_arch = "wasm32"))]
             eviction_epoch: AtomicU64::new(0),
@@ -932,6 +949,11 @@ impl MVCCEngine {
                             }
                         }
                     }
+                }
+                // One uncovered volume per cycle gets its side file, so an
+                // old layout is covered in the background after open
+                if engine.persistence.is_some() {
+                    engine.spawn_backfill();
                 }
             }
         });
@@ -5583,6 +5605,180 @@ impl MVCCEngine {
     fn run_compaction_guarded(&self) -> Result<()> {
         let _guard = AtomicBoolGuard(&self.compaction_running);
         self.compact_volumes()
+    }
+
+    /// Builds side files for up to `limit` volumes the query path cannot
+    /// serve although the catalog indexes one of their columns: sealed
+    /// before the index existed, refused or failed at seal, of the earlier
+    /// format, or built for an index recreated since. One volume at a time,
+    /// oldest first, each admitted into half the builds budget when the
+    /// ledger is idle, and published under the DDL guard once its file
+    /// covers every current identity and its segment is still registered.
+    /// A pass already running makes this one a no-op.
+    pub fn backfill_side_files(&self, limit: usize) -> Result<BackfillReport> {
+        use crate::storage::volume::secondary::{
+            build_side_within, covers_all, discard_side, SideBuild, INDEX_BUILDS,
+        };
+        let mut report = BackfillReport::default();
+        if self
+            .backfill_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Ok(report);
+        }
+        let _guard = AtomicBoolGuard(&self.backfill_running);
+        let tables: Vec<_> = {
+            let stores = self.version_stores.read().unwrap();
+            let mgrs = self.segment_managers.read().unwrap();
+            stores
+                .iter()
+                .filter_map(|(name, store)| {
+                    mgrs.get(name)
+                        .map(|mgr| (Arc::clone(store), Arc::clone(mgr)))
+                })
+                .collect()
+        };
+        // The physical columns of `identities` a segment holds, through its
+        // captured mapping: an added column the volume has none of, and a
+        // dropped one, are no business of its side file
+        let wanted_of = |cs: &crate::storage::volume::manifest::ColdSegment,
+                         identities: &[(usize, u64)]|
+         -> Vec<(usize, u64)> {
+            identities
+                .iter()
+                .filter_map(|&(column, identity)| {
+                    let physical = match cs.mapping.sources.get(column) {
+                        Some(crate::storage::volume::writer::ColSource::Volume(p)) => *p,
+                        Some(crate::storage::volume::writer::ColSource::Default(_)) => return None,
+                        None if cs.mapping.is_identity && column < cs.volume.columns.len() => {
+                            column
+                        }
+                        None => return None,
+                    };
+                    Some((physical, identity))
+                })
+                .collect()
+        };
+        for (store, mgr) in tables {
+            if report.built + report.refused + report.discarded + report.failed >= limit {
+                break;
+            }
+            let identities = {
+                let _ddl = self.ddl_guard();
+                store.secondary_index_identities()
+            };
+            if identities.is_empty() {
+                continue;
+            }
+            let snapshot = mgr.cold_snapshot();
+            let mut candidates: Vec<u64> = snapshot
+                .seg_ids
+                .iter()
+                .copied()
+                .filter(|seg_id| {
+                    snapshot.segs.get(seg_id).is_some_and(|cs| {
+                        let wanted = wanted_of(cs, &identities);
+                        !wanted.is_empty()
+                            && !cs
+                                .side
+                                .as_ref()
+                                .is_some_and(|side| covers_all(side, &wanted))
+                    })
+                })
+                .collect();
+            candidates.sort_unstable();
+            for seg_id in candidates {
+                if report.built + report.refused + report.discarded + report.failed >= limit {
+                    report.left += 1;
+                    continue;
+                }
+                report.examined += 1;
+                let Some(cs) = snapshot.segs.get(&seg_id) else {
+                    report.left += 1;
+                    continue;
+                };
+                let wanted = wanted_of(cs, &identities);
+                // Only into an idle ledger, and only into half of it: the
+                // seal keeps the other half
+                let ledger = INDEX_BUILDS.stats();
+                if ledger.charged_bytes != 0 {
+                    report.left += 1;
+                    continue;
+                }
+                let Some(volume) = mgr.ensure_volume(seg_id)? else {
+                    report.left += 1;
+                    continue;
+                };
+                let Some(file) = mgr.file_of(seg_id) else {
+                    report.left += 1;
+                    continue;
+                };
+                let path = file.path();
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::backfill_volume_loaded();
+                let cap = (ledger.budget_bytes / 2) as usize;
+                let side = match build_side_within(&volume, &path, seg_id, &wanted, Some(cap)) {
+                    Ok(SideBuild::Built(side)) => side,
+                    Ok(SideBuild::Refused) => {
+                        report.refused += 1;
+                        continue;
+                    }
+                    Ok(SideBuild::Failed) => {
+                        report.failed += 1;
+                        continue;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "Warning: backfill of volume {seg_id} of {} could not read it: {error}",
+                            store.table_name()
+                        );
+                        report.failed += 1;
+                        continue;
+                    }
+                };
+                drop(volume);
+                #[cfg(feature = "test-failpoints")]
+                crate::test_failpoints::side_backfilled();
+                // Published under the DDL guard: the identities compared
+                // again through the segment's mapping as it is now, and the
+                // segment must still be registered; else the file goes
+                let _ddl = self.ddl_guard();
+                let current = store.secondary_index_identities();
+                let now = mgr.cold_snapshot();
+                let still_wanted = now
+                    .segs
+                    .get(&seg_id)
+                    .map(|cs| wanted_of(cs, &current))
+                    .unwrap_or_default();
+                if still_wanted.is_empty() || !covers_all(&side, &still_wanted) {
+                    discard_side(side);
+                    report.discarded += 1;
+                    continue;
+                }
+                if mgr.attach_side(seg_id, side) {
+                    report.built += 1;
+                } else {
+                    // The segment left meanwhile, and its volume's handle
+                    // takes the side file with it
+                    report.discarded += 1;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// One volume of backfill on its own thread, when no pass is running
+    fn spawn_backfill(self: &Arc<Self>) {
+        if self.backfill_running.load(Ordering::Acquire) {
+            return;
+        }
+        let engine = Arc::clone(self);
+        std::thread::spawn(move || {
+            if let Err(e) = engine.backfill_side_files(1) {
+                eprintln!("Warning: side index backfill failed: {}", e);
+            }
+        });
     }
 
     /// The identity the catalog issued to `index` on `table`, None when

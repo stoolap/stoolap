@@ -166,6 +166,12 @@ impl Ledger {
         }
     }
 
+    /// Counts a refusal decided outside `try_charge`, by a share of the
+    /// budget a caller keeps to
+    pub fn count_refused(&self) {
+        self.refused.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn reset_peak(&self) {
         self.peak
             .store(self.charged.load(Ordering::Acquire), Ordering::Release);
@@ -2597,8 +2603,34 @@ pub fn build_side_for(
     file_id: u64,
     identities: &[(usize, u64)],
 ) -> std::io::Result<Option<Arc<IndexFile>>> {
+    Ok(
+        match build_side_within(volume, volume_path, file_id, identities, None)? {
+            SideBuild::Built(side) => Some(side),
+            SideBuild::Refused | SideBuild::Failed => None,
+        },
+    )
+}
+
+/// What a build came to: the file, or the budget's refusal, or a failure
+/// that was logged and counted
+pub enum SideBuild {
+    Built(Arc<IndexFile>),
+    Refused,
+    Failed,
+}
+
+/// `build_side_for` with the outcome told apart, and admitted only when
+/// the input's decode and the workspace together fit under `cap` bytes: a
+/// backfill takes at most its share of the builds budget
+pub fn build_side_within(
+    volume: &super::writer::FrozenVolume,
+    volume_path: &Path,
+    file_id: u64,
+    identities: &[(usize, u64)],
+    cap: Option<usize>,
+) -> std::io::Result<SideBuild> {
     if identities.is_empty() {
-        return Ok(None);
+        return Ok(SideBuild::Refused);
     }
     let side = side_path(volume_path);
     let input = identities
@@ -2606,12 +2638,17 @@ pub fn build_side_for(
         .map(|&(column, _)| decode_allowance(volume, column))
         .max()
         .unwrap_or(0);
+    let workspace = workspace_for(volume.meta.row_count, identities.len(), input);
+    if cap.is_some_and(|cap| input + workspace > cap) {
+        INDEX_BUILDS.count_refused();
+        return Ok(SideBuild::Refused);
+    }
     let Some(_input_admitted) = INDEX_BUILDS.try_charge(input) else {
         eprintln!(
             "Warning: side index {:?} not built: the budget refused its input's decode",
             side
         );
-        return Ok(None);
+        return Ok(SideBuild::Refused);
     };
     let failure = std::cell::Cell::new(None);
     let columns = identities
@@ -2622,7 +2659,6 @@ pub fn build_side_for(
             pairs: Box::new(volume_pairs(volume, column, &failure)),
         })
         .collect();
-    let workspace = workspace_for(volume.meta.row_count, identities.len(), input);
     let built = build_side_file(&side, next_generation(), columns, workspace);
     if let Some(error) = failure.take() {
         // The volume could not be read: whatever was written is short
@@ -2632,16 +2668,16 @@ pub fn build_side_for(
     if let Err(error) = built {
         if is_refused(&error) {
             eprintln!("Warning: side index {:?} not built: {error}", side);
-        } else {
-            BUILDS_FAILED.fetch_add(1, Ordering::Relaxed);
-            eprintln!("Warning: side index {:?} failed: {error}", side);
-            retire_side_of(volume_path);
+            return Ok(SideBuild::Refused);
         }
-        return Ok(None);
+        BUILDS_FAILED.fetch_add(1, Ordering::Relaxed);
+        eprintln!("Warning: side index {:?} failed: {error}", side);
+        retire_side_of(volume_path);
+        return Ok(SideBuild::Failed);
     }
     let handle = VolumeFile::shared(&side);
     match IndexFile::open_through(&handle, file_id) {
-        Ok(file) => Ok(Some(Arc::new(file))),
+        Ok(file) => Ok(SideBuild::Built(Arc::new(file))),
         Err(error) => {
             BUILDS_FAILED.fetch_add(1, Ordering::Relaxed);
             eprintln!(
@@ -2649,7 +2685,7 @@ pub fn build_side_for(
                 side
             );
             handle.retire();
-            Ok(None)
+            Ok(SideBuild::Failed)
         }
     }
 }
@@ -2693,6 +2729,14 @@ pub fn still_covers(side: &IndexFile, current: &[(usize, u64)]) -> bool {
     current
         .iter()
         .any(|&(column, identity)| side.covers(column, identity))
+}
+
+/// Whether `side` covers every column and identity in `wanted`: what a
+/// backfill asks of a volume's file before leaving it alone
+pub fn covers_all(side: &IndexFile, wanted: &[(usize, u64)]) -> bool {
+    wanted
+        .iter()
+        .all(|&(column, identity)| side.covers(column, identity))
 }
 
 // =============================================================================

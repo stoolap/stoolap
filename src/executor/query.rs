@@ -10064,6 +10064,45 @@ impl Executor {
                 ));
                 Ok(Box::new(ExecutorResult::new(columns, rows)))
             }
+            "INDEX_BACKFILL" => {
+                // PRAGMA INDEX_BACKFILL [= n]: builds side files for up to n
+                // volumes the query path cannot serve, all of them by default
+                let limit = match stmt.value {
+                    Some(ref value) => {
+                        let n = self.extract_pragma_int_value(value)?;
+                        if n < 0 {
+                            return Err(Error::internal("index_backfill must not be negative"));
+                        }
+                        n as usize
+                    }
+                    None => usize::MAX,
+                };
+                let report = self.engine.backfill_side_files(limit)?;
+                let columns: Vec<String> = [
+                    "examined",
+                    "built",
+                    "refused",
+                    "discarded",
+                    "failed",
+                    "left",
+                ]
+                .iter()
+                .map(|c| c.to_string())
+                .collect();
+                let mut rows = RowVec::with_capacity(1);
+                rows.push((
+                    0,
+                    Row::from_values(vec![
+                        Value::Integer(report.examined as i64),
+                        Value::Integer(report.built as i64),
+                        Value::Integer(report.refused as i64),
+                        Value::Integer(report.discarded as i64),
+                        Value::Integer(report.failed as i64),
+                        Value::Integer(report.left as i64),
+                    ]),
+                ));
+                Ok(Box::new(ExecutorResult::new(columns, rows)))
+            }
             "INDEX_READ_STATS" => {
                 // One row: what the reads through side files did since the
                 // process started
