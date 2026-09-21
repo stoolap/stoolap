@@ -2938,8 +2938,10 @@ impl Index for HnswIndex {
             }
         }
 
-        // The rows the batch takes out no longer stand in a newcomer's way
-        let departing: I64Set = leaving.iter().copied().collect();
+        // The rows the batch takes out no longer stand in a newcomer's way;
+        // the set is built only for a unique index with rows leaving
+        let departing: Option<I64Set> =
+            (self.is_unique && !leaving.is_empty()).then(|| leaving.iter().copied().collect());
         if self.is_unique {
             // Pre-validate full batch before mutating the graph so add_batch is atomic.
             let mut seen: ahash::AHashMap<&[u8], i64> =
@@ -2957,8 +2959,13 @@ impl Index for HnswIndex {
                     seen.insert(vec_bytes, row_id);
                 }
 
-                if Self::find_exact_duplicate_in_inner(&inner, vec_bytes, row_id, Some(&departing))
-                    .is_some()
+                if Self::find_exact_duplicate_in_inner(
+                    &inner,
+                    vec_bytes,
+                    row_id,
+                    departing.as_ref(),
+                )
+                .is_some()
                 {
                     return Err(crate::core::Error::unique_constraint(
                         &self.name,
@@ -3019,8 +3026,10 @@ impl Index for HnswIndex {
             }
         }
 
-        // The rows the batch takes out no longer stand in a newcomer's way
-        let departing: I64Set = leaving.iter().copied().collect();
+        // The rows the batch takes out no longer stand in a newcomer's way;
+        // the set is built only for a unique index with rows leaving
+        let departing: Option<I64Set> =
+            (self.is_unique && !leaving.is_empty()).then(|| leaving.iter().copied().collect());
         if self.is_unique {
             // Pre-validate full batch before mutating the graph so add_batch_slice is atomic.
             let mut seen: ahash::AHashMap<&[u8], i64> =
@@ -3038,8 +3047,13 @@ impl Index for HnswIndex {
                     seen.insert(vec_bytes, row_id);
                 }
 
-                if Self::find_exact_duplicate_in_inner(&inner, vec_bytes, row_id, Some(&departing))
-                    .is_some()
+                if Self::find_exact_duplicate_in_inner(
+                    &inner,
+                    vec_bytes,
+                    row_id,
+                    departing.as_ref(),
+                )
+                .is_some()
                 {
                     return Err(crate::core::Error::unique_constraint(
                         &self.name,
