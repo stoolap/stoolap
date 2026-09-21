@@ -247,6 +247,36 @@ fn explain_reports_the_index_join_only_for_a_bounded_join() {
     );
 }
 
+/// The grouped index join takes plain aggregates over plain group columns;
+/// EXPLAIN names it for that shape and not for an aggregate expression the
+/// grouped operator turns away
+#[test]
+fn explain_reports_the_grouped_index_join_only_for_the_shape_it_takes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = file_db(&dir);
+    orders_in(&db);
+    let plan = |sql: &str| -> String {
+        db.query(&format!("EXPLAIN {sql}"), ())
+            .unwrap()
+            .map(|r| r.unwrap().get::<String>(0).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let plain = "SELECT u.id, SUM(o.amount) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id LIMIT 1";
+    assert!(plan(plain).contains("Index Nested Loop"), "{}", plan(plain));
+    let expression = "SELECT u.id, SUM(o.amount + 1) FROM users u INNER JOIN orders o ON u.id = o.user_id GROUP BY u.id LIMIT 1";
+    assert!(
+        !plan(expression).contains("Index Nested Loop"),
+        "an aggregate expression is not the grouped operator's: {}",
+        plan(expression)
+    );
+    let window = "SELECT u.id, SUM(o.amount) OVER () FROM users u INNER JOIN orders o ON u.id = o.user_id LIMIT 1";
+    assert!(
+        !plan(window).contains("Index Nested Loop"),
+        "a window function is not the index join's: {}",
+        plan(window)
+    );
+}
 #[cfg(feature = "test-failpoints")]
 mod hot_index {
     use std::sync::atomic::{AtomicUsize, Ordering};

@@ -205,6 +205,14 @@ fn partition_where_for_join(
     )
 }
 
+/// The index join operator a statement's join runs on, for EXPLAIN
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinIndexUse {
+    None,
+    Streaming { bounded: bool },
+    Grouped,
+}
+
 /// A GROUP BY + LIMIT join whose left side is fetched in a limited chunk
 struct SemijoinReduction {
     cap: usize,
@@ -7216,9 +7224,16 @@ impl Executor {
         cross_filter: Option<&Expression>,
         plan: &SemijoinReduction,
     ) -> Result<Option<SelectOutput>> {
-        // A right-side filter on a LEFT JOIN changes what an unmatched left row
-        // means; the reduction handles that shape
-        if join_type != "INNER" && right_filter.is_some() {
+        let filters_have_subquery = [left_filter, right_filter, cross_filter]
+            .into_iter()
+            .flatten()
+            .any(Self::filter_has_subquery);
+        if !self.grouped_index_join_applies(
+            stmt,
+            join_type,
+            right_filter.is_some(),
+            filters_have_subquery,
+        )? {
             return Ok(None);
         }
         let Some((table_name, lookup_strategy, inner_key_col, outer_key_col)) = self
@@ -7234,25 +7249,6 @@ impl Executor {
             return Ok(None);
         };
         let (aggregations, _) = self.parse_aggregations(stmt)?;
-        if aggregations.iter().any(|agg| {
-            agg.expression.is_some()
-                || agg.filter.is_some()
-                || !agg.order_by.is_empty()
-                || agg.hidden
-                || self.function_registry.get_aggregate(&agg.name).is_none()
-        }) {
-            return Ok(None);
-        }
-        if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None {
-            return Ok(None);
-        }
-        if [left_filter, right_filter, cross_filter]
-            .into_iter()
-            .flatten()
-            .any(Self::filter_has_subquery)
-        {
-            return Ok(None);
-        }
         let group_by = self.parse_group_by(stmt, &[])?;
         let mut group_names = Vec::with_capacity(group_by.len());
         for item in &group_by {
@@ -11069,35 +11065,102 @@ impl Executor {
         }
     }
 
-    /// Whether a join in the FROM clause of `stmt` is bounded by a limit the
-    /// executor pushes into it: the streaming index join takes the limit
-    /// itself, and the grouped index join takes it from the reduction plan.
-    /// EXPLAIN asks this so it reports the strategy execution would choose.
-    pub(crate) fn join_is_bounded(&self, stmt: &SelectStatement) -> bool {
+    /// Whether the grouped index join takes the statement's shape: an INNER
+    /// join, or one whose right side carries no filter; plain aggregates the
+    /// registry knows, without expressions, FILTER, ORDER BY or hidden
+    /// ones; a plain GROUP BY over columns; no subquery in the filters.
+    /// The executor and EXPLAIN ask the same question.
+    fn grouped_index_join_applies(
+        &self,
+        stmt: &SelectStatement,
+        join_type: &str,
+        right_filter_present: bool,
+        filters_have_subquery: bool,
+    ) -> Result<bool> {
+        // A right-side filter on a LEFT JOIN changes what an unmatched left row
+        // means; the reduction handles that shape
+        if join_type != "INNER" && right_filter_present {
+            return Ok(false);
+        }
+        let (aggregations, _) = self.parse_aggregations(stmt)?;
+        if aggregations.iter().any(|agg| {
+            agg.expression.is_some()
+                || agg.filter.is_some()
+                || !agg.order_by.is_empty()
+                || agg.hidden
+                || self.function_registry.get_aggregate(&agg.name).is_none()
+        }) {
+            return Ok(false);
+        }
+        if stmt.group_by.modifier != crate::parser::ast::GroupByModifier::None {
+            return Ok(false);
+        }
+        if filters_have_subquery {
+            return Ok(false);
+        }
+        let group_by = self.parse_group_by(stmt, &[])?;
+        Ok(group_by
+            .iter()
+            .all(|item| matches!(item, crate::executor::aggregation::GroupByItem::Column(_))))
+    }
+
+    /// Which index join operator, if any, a join in the FROM clause of
+    /// `stmt` runs on: the streaming or batch index join when nothing
+    /// aggregates or windows the rows, bounded when the executor pushes the
+    /// limit; the grouped index join when the reduction plan bounds it and
+    /// its shape is the grouped operator's. EXPLAIN asks this so it reports
+    /// the strategy execution would choose.
+    pub(crate) fn join_index_use(&self, stmt: &SelectStatement) -> JoinIndexUse {
         let Some(Expression::JoinSource(join)) = stmt.table_expr.as_deref() else {
-            return false;
+            return JoinIndexUse::None;
         };
         let classification = get_classification(stmt);
         let join_type = join.join_type.to_uppercase();
-        if self
-            .pushed_join_limit(stmt, &ExecutionContext::new(), &classification, &join_type)
-            .is_some()
-        {
-            return true;
+        if !classification.has_aggregation && !classification.has_window_functions {
+            let bounded = self
+                .pushed_join_limit(stmt, &ExecutionContext::new(), &classification, &join_type)
+                .is_some();
+            return JoinIndexUse::Streaming { bounded };
         }
         let left_table = match join.left.as_ref() {
             Expression::TableSource(ts) => Some(ts.name.value.as_str()),
             _ => None,
         };
-        self.get_semijoin_reduction_limit(
-            &join_type,
+        if self
+            .get_semijoin_reduction_limit(
+                &join_type,
+                stmt,
+                get_table_alias_from_expr(&join.left).as_deref(),
+                left_table,
+                &join.condition,
+                &classification,
+            )
+            .is_none()
+        {
+            return JoinIndexUse::None;
+        }
+        let (right_filter_present, filters_have_subquery) = match &stmt.where_clause {
+            Some(where_clause) => {
+                let (_, right, _) = super::explain::partition_where_for_explain(
+                    where_clause,
+                    &join.left,
+                    &join.right,
+                    &join.join_type,
+                    self.engine.as_ref(),
+                );
+                (right.is_some(), Self::filter_has_subquery(where_clause))
+            }
+            None => (false, false),
+        };
+        match self.grouped_index_join_applies(
             stmt,
-            get_table_alias_from_expr(&join.left).as_deref(),
-            left_table,
-            &join.condition,
-            &classification,
-        )
-        .is_some()
+            &join_type,
+            right_filter_present,
+            filters_have_subquery,
+        ) {
+            Ok(true) => JoinIndexUse::Grouped,
+            _ => JoinIndexUse::None,
+        }
     }
 
     pub(crate) fn check_index_nested_loop_opportunity(
