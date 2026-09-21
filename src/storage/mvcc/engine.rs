@@ -8661,11 +8661,6 @@ impl TransactionEngineOperations for EngineOperations {
     }
 
     fn commit_all_tables(&self, txn_id: i64) -> (bool, Option<crate::core::Error>) {
-        // Get the commit_seq for this transaction. start_commit() was called before us,
-        // so the commit_seq is in the registry. Used for versioned tombstones: snapshot
-        // isolation transactions only see tombstones with commit_seq <= their begin_seq.
-        let commit_seq = self.registry.get_committing_sequence(txn_id) as u64;
-
         // Collect table data under the read lock, then drop the lock before WAL I/O.
         // This prevents blocking concurrent get_table_for_transaction (which needs
         // a write lock on txn_version_stores) during potentially slow WAL writes.
@@ -8883,14 +8878,12 @@ impl TransactionEngineOperations for EngineOperations {
                             }
                         }
                     }
+                    // A recorded tombstone stays pending until the commit
+                    // marker is durable; publish_pending_tombstones promotes it
                     if commit_error.is_some() {
                         mgr.rollback_pending_tombstones(txn_id);
-                    } else {
-                        mgr.commit_pending_tombstones(txn_id, commit_seq);
                     }
-                } else if tombstones_wal_recorded.contains(table_name.as_str()) {
-                    mgr.commit_pending_tombstones(txn_id, commit_seq);
-                } else {
+                } else if !tombstones_wal_recorded.contains(table_name.as_str()) {
                     mgr.rollback_pending_tombstones(txn_id);
                 }
                 mgr.clear_txn_seal_generation(txn_id);
@@ -8915,6 +8908,21 @@ impl TransactionEngineOperations for EngineOperations {
             }
         }
         hold
+    }
+
+    fn publish_pending_tombstones(&self, txn_id: i64) {
+        let commit_seq = self.registry.get_committing_sequence(txn_id) as u64;
+        let mgrs = self.segment_managers.read().unwrap();
+        for mgr in mgrs.values() {
+            mgr.commit_pending_tombstones(txn_id, commit_seq);
+        }
+    }
+
+    fn discard_pending_tombstones(&self, txn_id: i64) {
+        let mgrs = self.segment_managers.read().unwrap();
+        for mgr in mgrs.values() {
+            mgr.rollback_pending_tombstones(txn_id);
+        }
     }
 
     fn rollback_all_tables(&self, txn_id: i64) {

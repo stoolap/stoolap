@@ -3641,6 +3641,13 @@ impl Table for MVCCTable {
         self.version_store.secondary_index_identities_into(out)
     }
 
+    fn mark_sealed_original(&mut self, row_id: i64, old_row: Row) -> Result<()> {
+        self.txn_versions
+            .write()
+            .unwrap()
+            .mark_sealed_original(row_id, old_row)
+    }
+
     fn get_index(&self, name: &str) -> Option<std::sync::Arc<dyn Index>> {
         self.version_store.get_index(name)
     }

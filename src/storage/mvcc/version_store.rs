@@ -242,6 +242,9 @@ pub struct WriteSetEntry {
     pub read_version: Option<RowVersion>,
     /// Sequence number when read
     pub read_version_seq: i64,
+    /// The version read is a volume's copy of the row: the indexes that
+    /// keep sealed rows held its keys, the hot indexes never did
+    pub sealed: bool,
 }
 
 // ============================================================================
@@ -453,12 +456,13 @@ impl PublishHold {
         })
     }
 
-    /// Takes back the index updates of a commit that failed after applying
-    /// them, so the indexes describe the rows that stayed visible
-    pub fn undo_index_updates(&self) {
+    /// Takes back what a commit applied before its marker failed: the index
+    /// updates and the versions, so the store and its indexes describe the
+    /// rows that stayed visible
+    pub fn undo_publication(&self) {
         for store in &self.stores {
             if let Ok(store) = store.read() {
-                store.undo_index_updates();
+                store.undo_publication();
             }
         }
     }
@@ -890,9 +894,12 @@ impl VersionStore {
     /// Row arena index updates are batched under a single lock acquisition.
     /// Version data uses Arc-backed storage for O(1) clones on read.
     #[inline]
-    pub fn add_versions_batch(&self, batch: Vec<(i64, RowVersion)>) {
+    /// Applies committed versions at the heads of their rows' chains; the
+    /// rows that did not exist before come back, for an undo to remove
+    pub fn add_versions_batch(&self, batch: Vec<(i64, RowVersion)>) -> Vec<i64> {
+        let mut created = Vec::new();
         if self.closed.load(Ordering::Acquire) || batch.is_empty() {
-            return;
+            return created;
         }
 
         // Use write lock for the entire batch operation (MVCC single-writer semantics)
@@ -1029,6 +1036,7 @@ impl VersionStore {
 
                     // Insert into vacant slot (no additional traversal)
                     vacant.insert(new_entry);
+                    created.push(row_id);
                 }
             }
         }
@@ -1041,15 +1049,18 @@ impl VersionStore {
             self.committed_row_count
                 .fetch_sub((-count_delta) as usize, Ordering::Relaxed);
         }
+        created
     }
 
     /// Add a single version to the store (optimized for auto-commit single-row inserts)
     ///
     /// This avoids Vec allocation for the common single-row commit case.
+    /// True when the row did not exist before, so an undo removes it rather
+    /// than restoring the version before
     #[inline]
-    pub fn add_version_single(&self, row_id: i64, version: RowVersion) {
+    pub fn add_version_single(&self, row_id: i64, version: RowVersion) -> bool {
         if self.closed.load(Ordering::Acquire) {
-            return;
+            return false;
         }
 
         let is_new_version_deleted = version.deleted_at_txn_id != 0;
@@ -1147,6 +1158,7 @@ impl VersionStore {
                 };
 
                 occupied.insert(new_entry);
+                false
             }
             crate::common::cow_btree::Entry::Vacant(vacant) => {
                 let (arena_idx, final_version) = if version.deleted_at_txn_id == 0 {
@@ -1171,8 +1183,66 @@ impl VersionStore {
                 };
 
                 vacant.insert(new_entry);
+                true
             }
         }
+    }
+
+    /// Takes back the version `txn_id` put at the head of `row_id`'s chain
+    /// when its commit failed after the version was applied: the version
+    /// before it is the head again, in the arena too, a row the commit
+    /// created leaves, and the committed row count is what it was. A chain
+    /// whose history the application dropped keeps its head, invisible as
+    /// an aborted transaction's.
+    pub fn unpublish_version(&self, row_id: i64, txn_id: i64, created: bool) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut versions = self.versions.write();
+        let Some(head) = versions.get(row_id) else {
+            return;
+        };
+        if head.version.txn_id != txn_id {
+            return;
+        }
+        let head_deleted = head.version.deleted_at_txn_id != 0;
+        let arena_idx = unpack_arena_idx(head.arena_idx);
+        if created {
+            versions.remove(row_id);
+            if let Some(idx) = arena_idx {
+                self.arena.clear_at(idx);
+            }
+            if !head_deleted {
+                self.committed_row_count.fetch_sub(1, Ordering::Relaxed);
+            }
+            return;
+        }
+        let Some(prev) = head.prev.clone() else {
+            return;
+        };
+        let prev_deleted = prev.version.deleted_at_txn_id != 0;
+        if let Some(idx) = arena_idx {
+            self.arena.update_at(
+                idx,
+                row_id,
+                prev.version.txn_id,
+                prev.version.data.clone().into_arc(),
+            );
+            if prev_deleted {
+                self.arena.mark_deleted(idx, prev.version.deleted_at_txn_id);
+            }
+        }
+        if head_deleted && !prev_deleted {
+            self.committed_row_count.fetch_add(1, Ordering::Relaxed);
+        } else if !head_deleted && prev_deleted {
+            self.committed_row_count.fetch_sub(1, Ordering::Relaxed);
+        }
+        let restored = VersionChainEntry {
+            version: prev.version.clone(),
+            prev: prev.prev.clone(),
+            arena_idx: head.arena_idx,
+        };
+        versions.insert(row_id, restored);
     }
 
     /// Quick check if a row might exist
@@ -5752,6 +5822,9 @@ pub struct TransactionVersionStore {
     write_set: Option<I64Map<WriteSetEntry>>,
     /// Index updates applied by commit, until the commit is visible or undone
     index_undo: Mutex<SmallVec<[IndexUndo; 2]>>,
+    /// The rows commit put a version at the head of, and whether it created
+    /// them, until the commit is visible or undone
+    applied: Mutex<SmallVec<[(i64, bool); 2]>>,
 }
 
 impl TransactionVersionStore {
@@ -5768,6 +5841,19 @@ impl TransactionVersionStore {
             txn_id,
             write_set: None,
             index_undo: Mutex::new(SmallVec::new()),
+            applied: Mutex::new(SmallVec::new()),
+        }
+    }
+
+    /// Takes back everything this transaction's commit applied before its
+    /// marker failed: the index updates in reverse, then the versions, so
+    /// the store describes the rows that stayed visible
+    pub fn undo_publication(&self) {
+        self.undo_index_updates();
+        let applied: SmallVec<[(i64, bool); 2]> = std::mem::take(&mut *self.applied.lock());
+        for &(row_id, created) in applied.iter().rev() {
+            self.parent_store
+                .unpublish_version(row_id, self.txn_id, created);
         }
     }
 
@@ -5896,6 +5982,7 @@ impl TransactionVersionStore {
                     WriteSetEntry {
                         read_version,
                         read_version_seq,
+                        sealed: false,
                     },
                 );
 
@@ -5925,6 +6012,25 @@ impl TransactionVersionStore {
     /// This avoids redundant get_visible_version() calls by accepting the original
     /// version that was already fetched during the read phase.
     /// Used for PK-based UPDATE operations.
+    /// Gives the local version of `row_id` the volume's copy of the row as
+    /// the version it replaces, so the commit removes the old keys from the
+    /// indexes that keep sealed rows and a failed commit puts them back
+    pub fn mark_sealed_original(&mut self, row_id: i64, old_row: Row) -> Result<(), Error> {
+        let Some(entry) = self.write_set.as_mut().and_then(|ws| ws.get_mut(row_id)) else {
+            return Err(Error::internal(
+                "a sealed original needs the row's local version first",
+            ));
+        };
+        entry.read_version = Some(RowVersion {
+            txn_id: 0,
+            deleted_at_txn_id: 0,
+            data: old_row,
+            create_time: 0,
+        });
+        entry.sealed = true;
+        Ok(())
+    }
+
     #[inline]
     pub fn put_with_original(
         &mut self,
@@ -5977,6 +6083,7 @@ impl TransactionVersionStore {
                     WriteSetEntry {
                         read_version: Some(original_version),
                         read_version_seq,
+                        sealed: false,
                     },
                 );
 
@@ -6038,6 +6145,7 @@ impl TransactionVersionStore {
                     WriteSetEntry {
                         read_version: Some(original_version),
                         read_version_seq,
+                        sealed: false,
                     },
                 );
 
@@ -6092,6 +6200,7 @@ impl TransactionVersionStore {
                         WriteSetEntry {
                             read_version,
                             read_version_seq,
+                            sealed: false,
                         },
                     );
 
@@ -6159,6 +6268,7 @@ impl TransactionVersionStore {
                     WriteSetEntry {
                         read_version: Some(original_version),
                         read_version_seq,
+                        sealed: false,
                     },
                 );
 
@@ -6383,7 +6493,8 @@ impl TransactionVersionStore {
                 // Single-row fast path: avoid Vec allocation
                 if let Some((row_id, mut versions)) = local_versions.drain().next() {
                     if let Some(version) = versions.pop() {
-                        self.parent_store.add_version_single(row_id, version);
+                        let created = self.parent_store.add_version_single(row_id, version);
+                        self.applied.lock().push((row_id, created));
                     }
                 }
             } else {
@@ -6396,7 +6507,13 @@ impl TransactionVersionStore {
                 // Sort by row_id to ensure deterministic locking order
                 batch.sort_by_key(|(row_id, _)| *row_id);
 
-                self.parent_store.add_versions_batch(batch);
+                let mut applied = self.applied.lock();
+                applied.extend(batch.iter().map(|(row_id, _)| (*row_id, false)));
+                for row_id in self.parent_store.add_versions_batch(batch) {
+                    if let Some(entry) = applied.iter_mut().find(|(id, _)| *id == row_id) {
+                        entry.1 = true;
+                    }
+                }
             }
         }
 
@@ -6480,18 +6597,24 @@ impl TransactionVersionStore {
             let new_row = &new_version.data;
 
             // Get old version from write_set (if exists)
-            let old_row: Option<&crate::core::Row> = self
-                .write_set
-                .as_ref()
-                .and_then(|ws| ws.get(row_id))
+            let entry = self.write_set.as_ref().and_then(|ws| ws.get(row_id));
+            let old_row: Option<&crate::core::Row> = entry
                 .and_then(|entry| entry.read_version.as_ref())
                 .map(|rv| &rv.data);
+            let sealed = entry.is_some_and(|entry| entry.sealed);
 
             for (idx, index) in indexes.iter().enumerate() {
                 let column_ids = index.column_ids();
                 if column_ids.is_empty() {
                     continue;
                 }
+                // A volume's copy was never in a hot index: to those the row
+                // is new, and its old keys are removed only where they are
+                let old_row = if sealed && index.index_type() != crate::core::IndexType::Hnsw {
+                    None
+                } else {
+                    old_row
+                };
 
                 // OPTIMIZATION: For UPDATEs, check if any indexed column changed
                 // BEFORE allocating Vecs
@@ -6752,12 +6875,11 @@ impl TransactionVersionStore {
         let new_row = &new_version.data;
 
         // Get old version from write_set (if exists)
-        let old_row: Option<&Row> = self
-            .write_set
-            .as_ref()
-            .and_then(|ws| ws.get(row_id))
+        let entry = self.write_set.as_ref().and_then(|ws| ws.get(row_id));
+        let old_row: Option<&Row> = entry
             .and_then(|entry| entry.read_version.as_ref())
             .map(|rv| &rv.data);
+        let sealed = entry.is_some_and(|entry| entry.sealed);
 
         // Every index call made so far, with the key it was made with, for
         // rollback on error and for the undo log on success
@@ -6768,6 +6890,13 @@ impl TransactionVersionStore {
             if column_ids.is_empty() {
                 continue;
             }
+            // A volume's copy was never in a hot index: to those the row is
+            // new, and its old keys are removed only where they are
+            let old_row = if sealed && index.index_type() != crate::core::IndexType::Hnsw {
+                None
+            } else {
+                old_row
+            };
 
             // OPTIMIZATION: For UPDATEs, check if any indexed column changed BEFORE allocating
             if let Some(old_r) = old_row {
@@ -6940,6 +7069,7 @@ impl TransactionVersionStore {
             e.insert(WriteSetEntry {
                 read_version: None,
                 read_version_seq: 0,
+                sealed: false,
             });
         }
     }
@@ -7052,6 +7182,70 @@ mod tests {
         fn needs_snapshot_isolation(&self, _txn_id: i64) -> bool {
             false
         }
+    }
+
+    /// A commit that applied its versions and then failed its marker takes
+    /// them back: a delete leaves the row visible and counted, an update
+    /// leaves the version before, a created row leaves the store
+    #[test]
+    fn a_failed_commit_takes_its_versions_back() {
+        use crate::core::DataType;
+
+        let schema = crate::core::SchemaBuilder::new("undo")
+            .column("id", DataType::Integer, false, true)
+            .column("v", DataType::Integer, true, false)
+            .build();
+        let store = Arc::new(VersionStore::with_visibility_checker(
+            "undo".to_string(),
+            schema,
+            Arc::new(ReadCommittedChecker),
+        ));
+        let mut seed = TransactionVersionStore::new(Arc::clone(&store), 1);
+        for (id, v) in [(1i64, 10i64), (2, 20)] {
+            seed.put(id, Row::from(vec![Value::from(id), Value::from(v)]), false)
+                .unwrap();
+        }
+        seed.commit().unwrap();
+        assert_eq!(store.committed_row_count(), 2);
+
+        // Delete row 1, update row 2, create row 3, then take it all back
+        let mut txn = TransactionVersionStore::new(Arc::clone(&store), 2);
+        txn.put(1, Row::new(), true).unwrap();
+        txn.put(
+            2,
+            Row::from(vec![Value::from(2i64), Value::from(99i64)]),
+            false,
+        )
+        .unwrap();
+        txn.put(
+            3,
+            Row::from(vec![Value::from(3i64), Value::from(30i64)]),
+            false,
+        )
+        .unwrap();
+        txn.commit().unwrap();
+        assert_eq!(store.committed_row_count(), 2, "one deleted, one created");
+        txn.undo_publication();
+
+        assert_eq!(store.committed_row_count(), 2, "the count is what it was");
+        let row = |id: i64| {
+            store
+                .get_visible_version(id, 3)
+                .map(|version| version.data.get(1).cloned())
+        };
+        assert_eq!(
+            row(1),
+            Some(Some(Value::from(10i64))),
+            "the delete is undone"
+        );
+        assert_eq!(
+            row(2),
+            Some(Some(Value::from(20i64))),
+            "the update is undone"
+        );
+        assert_eq!(row(3), None, "the created row is gone");
+        let rows = store.get_all_visible_rows(3);
+        assert_eq!(rows.len(), 2, "the arena agrees");
     }
 
     /// `compute_grouped_aggregates` is public and its signature allows an
@@ -7521,6 +7715,7 @@ mod tests {
         let entry = WriteSetEntry {
             read_version: Some(version),
             read_version_seq: 42,
+            sealed: false,
         };
 
         let cloned = entry.clone();
@@ -7531,6 +7726,7 @@ mod tests {
         let empty_entry = WriteSetEntry {
             read_version: None,
             read_version_seq: 0,
+            sealed: false,
         };
         let cloned_empty = empty_entry.clone();
         assert!(cloned_empty.read_version.is_none());

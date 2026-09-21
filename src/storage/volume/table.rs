@@ -1012,7 +1012,7 @@ impl SegmentedTable {
         // old row (so UPDATE can find it), then update. If any step fails,
         // clean up to avoid phantoms.
         if has_int_pk {
-            match hot.insert_discard(old_row) {
+            match hot.insert_discard(old_row.clone()) {
                 Ok(())
                 | Err(crate::core::Error::PrimaryKeyConstraint { .. })
                 | Err(crate::core::Error::UniqueConstraint { .. }) => {}
@@ -1026,6 +1026,10 @@ impl SegmentedTable {
                 let _ = hot.delete_by_row_ids(&[row_id]);
                 return Err(e);
             }
+            // The volume's copy is the version this one replaces: an index
+            // that keeps sealed rows drops its keys at commit and takes them
+            // back if the commit fails
+            hot.mark_sealed_original(row_id, old_row)?;
         } else {
             hot.insert_discard(new_row)?;
         }
@@ -2084,6 +2088,13 @@ impl SegmentedTable {
         Ok(None)
     }
 
+    /// The row at `idx` of a located volume, read through its mapping
+    fn cold_row_of(cold: &super::manifest::ColdSegment, idx: usize) -> Result<Row> {
+        super::writer::RowReader::new(Arc::clone(&cold.volume))
+            .row(idx, &cold.mapping)
+            .map_err(|e| crate::core::Error::internal(format!("cold row read failed: {e}")))
+    }
+
     /// Deletes a sealed row the caller has already located in the statement
     /// snapshot. Takes the fields it mutates so the seal guard's borrow of
     /// `segment_mgr` can stay alive across the call.
@@ -2093,6 +2104,7 @@ impl SegmentedTable {
         txn_id: i64,
         row_id: i64,
         has_int_pk: bool,
+        old_row: Row,
     ) -> Result<()> {
         // Claim the cold row to prevent concurrent lost deletes.
         hot.try_claim_row(row_id)?;
@@ -2100,6 +2112,10 @@ impl SegmentedTable {
             // A swallowed failure here tombstones the cold row while
             // its hot PK index entry survives, wedging that PK value.
             hot.delete_by_row_ids(&[row_id])?;
+            // The volume's copy is what the delete takes away: an index that
+            // keeps sealed rows drops its keys at commit and takes them back
+            // if the commit fails
+            hot.mark_sealed_original(row_id, old_row)?;
         }
         // Track tombstone for commit. Pending tombstones are applied on commit
         // and discarded on rollback to prevent isolation violations.
@@ -2462,18 +2478,20 @@ impl Table for SegmentedTable {
             .any(|c| c.primary_key && c.data_type == DataType::Integer);
 
         for &row_id in row_ids {
-            let found = match &cold_snapshot {
-                Some(snap) => self.find_segment_row_in(snap, row_id)?.is_some(),
-                None => false,
+            let located = match &cold_snapshot {
+                Some(snap) => self.find_segment_row_in(snap, row_id)?,
+                None => None,
             };
-            if found {
+            if let Some((_, cold, idx)) = located {
                 let txn_id = self.txn_id();
+                let old_row = Self::cold_row_of(&cold, idx)?;
                 Self::delete_located_cold_row(
                     &mut self.hot,
                     &self.segment_mgr,
                     txn_id,
                     row_id,
                     has_int_pk,
+                    old_row,
                 )?;
                 count += 1;
             } else {
@@ -2541,14 +2559,16 @@ impl Table for SegmentedTable {
                     .columns
                     .iter()
                     .any(|c| c.primary_key && c.data_type == DataType::Integer);
-                if self.find_segment_row_in(snap, pk)?.is_some() {
+                if let Some((_, cold, idx)) = self.find_segment_row_in(snap, pk)? {
                     let txn_id = self.txn_id();
+                    let old_row = Self::cold_row_of(&cold, idx)?;
                     Self::delete_located_cold_row(
                         &mut self.hot,
                         &self.segment_mgr,
                         txn_id,
                         pk,
                         has_int_pk,
+                        old_row,
                     )?;
                     count += 1;
                 }

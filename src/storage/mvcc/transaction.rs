@@ -134,6 +134,19 @@ pub trait TransactionEngineOperations: Send + Sync {
     /// This cleans up the transaction's entries in txn_version_stores
     fn rollback_all_tables(&self, txn_id: i64);
 
+    /// Makes the transaction's pending cold tombstones visible, once its
+    /// commit marker is durable; a commit whose marker fails discards them
+    /// instead, so the rows they name stay visible
+    fn publish_pending_tombstones(&self, txn_id: i64) {
+        let _ = txn_id;
+    }
+
+    /// Drops the transaction's pending cold tombstones after its commit
+    /// marker failed
+    fn discard_pending_tombstones(&self, txn_id: i64) {
+        let _ = txn_id;
+    }
+
     /// Marks every table the transaction writes as publishing, from before
     /// its index updates until the transaction is visible or undone
     fn begin_publish(&self, txn_id: i64) -> super::version_store::PublishHold {
@@ -482,6 +495,7 @@ impl Transaction for MvccTransaction {
                         }
                         // Record commit marker so WAL recovery sees committed state
                         ops.record_commit(self.id)?;
+                        ops.publish_pending_tombstones(self.id);
                         self.state = TransactionState::Committed;
                         self.cleanup();
                         return Err(e);
@@ -508,15 +522,22 @@ impl Transaction for MvccTransaction {
                     // but not yet visible (complete_commit hasn't run). Abort so GC
                     // can reclaim the orphaned entries and active_txn_count is correct.
                     // On recovery, WAL has no COMMIT marker → entries are discarded.
-                    // The indexes already describe the aborted rows: take that back
+                    // The store and its indexes already describe the aborted
+                    // rows: take that back
                     if let Some(hold) = &publish {
-                        hold.undo_index_updates();
+                        hold.undo_publication();
                     }
+                    // The cold rows the commit deleted or replaced stay: their
+                    // tombstones were held back for this marker
+                    ops.discard_pending_tombstones(self.id);
                     self.registry.abort_transaction(self.id);
                     self.state = TransactionState::RolledBack;
                     self.cleanup();
                     return Err(e);
                 }
+                // The marker is durable: the cold rows it deleted or replaced
+                // go out of sight with the hot rows it made visible
+                ops.publish_pending_tombstones(self.id);
             }
 
             // Phase 4: Complete commit - make changes visible in registry
