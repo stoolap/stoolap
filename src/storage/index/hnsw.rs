@@ -2922,8 +2922,10 @@ impl Index for HnswIndex {
         let expected_vec_len = self.dims * 4;
 
         // Collect valid entries for parallel path; a value with no graph
-        // entry takes the row's live node out
+        // entry takes the row's live node out, once the whole batch is
+        // validated, so a refused batch leaves the graph as it was
         let mut prepared: Vec<(&[u8], i64)> = Vec::with_capacity(entries.len());
+        let mut leaving: Vec<i64> = Vec::new();
         for (row_id, values) in entries.iter() {
             if values.is_empty() {
                 continue;
@@ -2932,7 +2934,7 @@ impl Index for HnswIndex {
                 Some(vec_bytes) if vec_bytes.len() == expected_vec_len => {
                     prepared.push((vec_bytes, row_id));
                 }
-                _ => inner.tombstone_row(row_id),
+                _ => leaving.push(row_id),
             }
         }
 
@@ -2968,6 +2970,9 @@ impl Index for HnswIndex {
         inner.node_to_row_id.reserve(prepared.len());
         inner.row_id_to_node.reserve(prepared.len());
 
+        for row_id in leaving {
+            inner.tombstone_row(row_id);
+        }
         self.insert_prepared(&mut inner, &prepared);
         Ok(())
     }
@@ -2994,8 +2999,10 @@ impl Index for HnswIndex {
         let expected_vec_len = self.dims * 4;
 
         // Collect valid entries for parallel path; a value with no graph
-        // entry takes the row's live node out
+        // entry takes the row's live node out, once the whole batch is
+        // validated, so a refused batch leaves the graph as it was
         let mut prepared: Vec<(&[u8], i64)> = Vec::with_capacity(entries.len());
+        let mut leaving: Vec<i64> = Vec::new();
         for &(row_id, values) in entries {
             if values.is_empty() {
                 continue;
@@ -3004,7 +3011,7 @@ impl Index for HnswIndex {
                 Some(vec_bytes) if vec_bytes.len() == expected_vec_len => {
                     prepared.push((vec_bytes, row_id));
                 }
-                _ => inner.tombstone_row(row_id),
+                _ => leaving.push(row_id),
             }
         }
 
@@ -3040,6 +3047,9 @@ impl Index for HnswIndex {
         inner.node_to_row_id.reserve(prepared.len());
         inner.row_id_to_node.reserve(prepared.len());
 
+        for row_id in leaving {
+            inner.tombstone_row(row_id);
+        }
         self.insert_prepared(&mut inner, &prepared);
         Ok(())
     }
@@ -3236,6 +3246,67 @@ mod tests {
         match v {
             Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => &data[1..],
             _ => panic!("not a vector value"),
+        }
+    }
+
+    /// A batch the unique check refuses leaves the graph as it was: the
+    /// rows whose value has no graph entry stay, and their vectors stay
+    /// unique, on both batch entry points
+    #[test]
+    fn a_refused_batch_leaves_the_rows_it_would_take_out() {
+        for slice in [false, true] {
+            let mut index = HnswIndex::new(
+                "test_idx".to_string(),
+                "test_table".to_string(),
+                "embedding".to_string(),
+                1,
+                2,
+                16,
+                200,
+                64,
+                HnswDistanceMetric::L2,
+            );
+            index.set_unique(true);
+            index.build().unwrap();
+            index.add(&[make_vector_value(&[1.0, 0.0])], 1, 1).unwrap();
+            index.add(&[make_vector_value(&[2.0, 0.0])], 2, 2).unwrap();
+            // Row 1 leaves, row 3 repeats row 2's vector: refused whole
+            let null = Value::Null(crate::core::DataType::Null);
+            let repeated = make_vector_value(&[2.0, 0.0]);
+            let refused = if slice {
+                index.add_batch_slice(&[
+                    (1, std::slice::from_ref(&null)),
+                    (3, std::slice::from_ref(&repeated)),
+                ])
+            } else {
+                let mut entries: I64Map<Vec<Value>> = I64Map::new();
+                entries.insert(1, vec![null.clone()]);
+                entries.insert(3, vec![repeated.clone()]);
+                index.add_batch(&entries)
+            };
+            assert!(refused.is_err(), "slice {slice}");
+            let query = make_vector_value(&[1.0, 0.0]);
+            let query = HnswIndex::extract_vector_bytes(&query).unwrap();
+            let nearest = index.search_nearest(query, 1, 64);
+            assert_eq!(
+                nearest.first().map(|(id, _)| *id),
+                Some(1),
+                "slice {slice}: row 1 stays"
+            );
+            assert!(
+                index.add(&[make_vector_value(&[1.0, 0.0])], 4, 4).is_err(),
+                "slice {slice}: row 1's vector stays unique"
+            );
+            // An accepted batch does take the row out
+            let mut entries: I64Map<Vec<Value>> = I64Map::new();
+            entries.insert(1, vec![Value::Null(crate::core::DataType::Null)]);
+            index.add_batch(&entries).unwrap();
+            let nearest = index.search_nearest(query, 1, 64);
+            assert_eq!(
+                nearest.first().map(|(id, _)| *id),
+                Some(2),
+                "slice {slice}: row 1 left"
+            );
         }
     }
 
