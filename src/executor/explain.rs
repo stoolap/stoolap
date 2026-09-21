@@ -944,7 +944,8 @@ impl Executor {
             if let Some((_, strategy, _, _)) = inlj_info {
                 let algo_name = match &strategy {
                     IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)".to_string(),
-                    IndexLookupStrategy::SecondaryIndex(_) => "Index Nested Loop".to_string(),
+                    IndexLookupStrategy::SecondaryIndex(_)
+                    | IndexLookupStrategy::TableEquality { .. } => "Index Nested Loop".to_string(),
                 };
                 return (algo_name, Some(strategy));
             }
@@ -961,7 +962,8 @@ impl Executor {
             if let Some((_, strategy, _, _)) = swapped_info {
                 let algo_name = match &strategy {
                     IndexLookupStrategy::PrimaryKey => "Index Nested Loop (PK)".to_string(),
-                    IndexLookupStrategy::SecondaryIndex(_) => "Index Nested Loop".to_string(),
+                    IndexLookupStrategy::SecondaryIndex(_)
+                    | IndexLookupStrategy::TableEquality { .. } => "Index Nested Loop".to_string(),
                 };
                 return (algo_name, Some(strategy));
             }

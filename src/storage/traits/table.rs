@@ -21,7 +21,7 @@ use std::fmt;
 use crate::core::{DataType, Error, IndexType, Result, Row, RowVec, Schema, Value};
 use crate::storage::expression::Expression;
 use crate::storage::mvcc::version_store::{AggregateOp, GroupedAggregateResult};
-use crate::storage::traits::{Index, QueryResult, Scanner};
+use crate::storage::traits::{CappedEqual, Index, QueryResult, Scanner};
 
 /// Describes the access method that will be used for a table scan
 ///
@@ -822,6 +822,24 @@ pub trait Table: Send + Sync {
     /// scans instead.
     fn lookup_index_on_column(&self, column_name: &str) -> Option<std::sync::Arc<dyn Index>> {
         self.get_index_on_column(column_name)
+    }
+
+    /// The row ids the B-tree index on `column` holds for `key`, appended to
+    /// `out` when the index covers every visible row and holds at most `max`
+    /// of them for the key; an absent key is `Copied` with nothing appended.
+    /// None when the table cannot answer this way for this statement: no
+    /// such index, rows outside it, or the index moving while the ids were
+    /// taken. A caller building on earlier answers then joins another way
+    /// from the start.
+    fn equality_candidates(
+        &self,
+        column: &str,
+        key: &Value,
+        max: usize,
+        out: &mut Vec<i64>,
+    ) -> Option<CappedEqual> {
+        let _ = (column, key, max, out);
+        None
     }
 
     /// Gets all unique indexes on the table (for constraint checking).

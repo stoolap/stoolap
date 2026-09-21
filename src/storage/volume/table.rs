@@ -5090,6 +5090,39 @@ impl Table for SegmentedTable {
         None
     }
 
+    /// The hot index answers one key while the table holds no volume, under
+    /// the checks of `walk_btree_groups`: a seal, a destructive publication
+    /// or a commit landing across the probe drops its ids.
+    fn equality_candidates(
+        &self,
+        column: &str,
+        key: &Value,
+        max: usize,
+        out: &mut Vec<i64>,
+    ) -> Option<crate::storage::traits::CappedEqual> {
+        if self.snapshot_seq.is_some() {
+            return None;
+        }
+        let generation = self.segment_mgr.seal_generation();
+        if self.segment_mgr.has_segments() || self.segment_mgr.is_destruction_in_progress() {
+            return None;
+        }
+        let epoch = self.hot.index_view_epoch()?;
+        #[cfg(any(test, feature = "test-failpoints"))]
+        crate::test_failpoints::join_probe_admitted();
+        let start = out.len();
+        let found = self.hot.equality_candidates(column, key, max, out)?;
+        if self.segment_mgr.is_destruction_in_progress()
+            || self.segment_mgr.seal_generation() != generation
+            || self.segment_mgr.has_segments()
+            || self.hot.index_view_epoch() != Some(epoch)
+        {
+            out.truncate(start);
+            return None;
+        }
+        Some(found)
+    }
+
     fn walk_btree_groups(
         &self,
         column: &str,

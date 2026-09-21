@@ -30,7 +30,7 @@ use crate::core::{Result, Row, RowVec, Value};
 use crate::executor::expression::JoinFilter;
 use crate::executor::operator::{ColumnInfo, Operator, RowRef};
 use crate::storage::expression::{ConstBoolExpr, Expression};
-use crate::storage::traits::{Index, Table};
+use crate::storage::traits::{CappedEqual, Index, Table};
 use smallvec::SmallVec;
 
 use super::hash_join::JoinType;
@@ -44,7 +44,15 @@ pub enum IndexLookupStrategy {
     /// Use primary key lookup (direct row_id = value)
     /// In stoolap, PRIMARY KEY INTEGER values ARE the row_ids
     PrimaryKey,
+    /// Ask the inner table for the ids of one key, at most
+    /// `EQUALITY_CANDIDATE_CAP` of them, when it keeps rows its index does
+    /// not cover: the table decides per probe, and a probe it cannot answer
+    /// ends the join, which the executor then runs another way
+    TableEquality { column: String },
 }
+
+/// The most row ids one probe takes from the inner table's index
+pub const EQUALITY_CANDIDATE_CAP: usize = 1024;
 
 /// Specifies which side (outer or inner) a projected column comes from.
 /// A projected value out of a row that is being consumed. A source used
@@ -128,6 +136,12 @@ pub struct IndexNestedLoopJoinOperator {
     outer_exhausted: bool,
     // Outer rows pulled so far; the executor uses it to see a full chunk
     outer_rows_seen: usize,
+    // Set when the inner table could not answer a probe; the rows joined
+    // so far are then no answer either
+    needs_fallback: bool,
+    // The outer row the chunk ended on when it left with its last match,
+    // kept for the executor's continuation
+    ended_on: Option<Row>,
 }
 
 impl IndexNestedLoopJoinOperator {
@@ -185,6 +199,8 @@ impl IndexNestedLoopJoinOperator {
             opened: false,
             outer_exhausted: false,
             outer_rows_seen: 0,
+            needs_fallback: false,
+            ended_on: None,
         }
     }
 
@@ -323,7 +339,13 @@ impl IndexNestedLoopJoinOperator {
 
     /// The outer row the join is on, or ended on
     pub fn last_outer_row(&self) -> Option<&Row> {
-        self.current_outer_row.as_ref()
+        self.current_outer_row.as_ref().or(self.ended_on.as_ref())
+    }
+
+    /// Whether the inner table stopped answering probes, so the join ended
+    /// early and what it produced is to be discarded
+    pub fn needs_fallback(&self) -> bool {
+        self.needs_fallback
     }
 
     /// Look up matching inner rows for the current outer row.
@@ -340,6 +362,19 @@ impl IndexNestedLoopJoinOperator {
                     std::slice::from_ref(key_value),
                     &mut self.row_id_buffer,
                 );
+            }
+            IndexLookupStrategy::TableEquality { column } => {
+                let found = self.inner_table.equality_candidates(
+                    column,
+                    key_value,
+                    EQUALITY_CANDIDATE_CAP,
+                    &mut self.row_id_buffer,
+                );
+                if found != Some(CappedEqual::Copied) {
+                    self.row_id_buffer.clear();
+                    self.needs_fallback = true;
+                    return Ok(());
+                }
             }
             IndexLookupStrategy::PrimaryKey => {
                 match key_value {
@@ -373,8 +408,10 @@ impl IndexNestedLoopJoinOperator {
 
         // An index entry may point at a row whose key has since changed
         // inside the transaction, so the row's own key decides
-        if let (IndexLookupStrategy::SecondaryIndex(_), Some(idx)) =
-            (&self.lookup_strategy, self.inner_key_idx)
+        if let (
+            IndexLookupStrategy::SecondaryIndex(_) | IndexLookupStrategy::TableEquality { .. },
+            Some(idx),
+        ) = (&self.lookup_strategy, self.inner_key_idx)
         {
             self.current_inner_rows
                 .retain(|(_, row)| row.get(idx) == Some(key_value));
@@ -404,6 +441,11 @@ impl IndexNestedLoopJoinOperator {
 
                 // Lookup matching inner rows
                 self.lookup_inner_rows(&key_value)?;
+                if self.needs_fallback {
+                    self.current_outer_row = Some(outer_row);
+                    self.outer_exhausted = true;
+                    return Ok(false);
+                }
 
                 self.current_outer_row = Some(outer_row);
                 // self.current_inner_rows is already populated by lookup_inner_rows
@@ -481,8 +523,11 @@ impl Operator for IndexNestedLoopJoinOperator {
                     if is_last_inner {
                         // No more inner rows - take ownership of outer and move values
                         let outer_row = self.current_outer_row.take().unwrap();
-                        // Pre-advance to next outer for next call
-                        self.advance_outer()?;
+                        // Pre-advance to next outer for next call; a chunk that
+                        // ends here keeps the row it ended on
+                        if !self.advance_outer()? {
+                            self.ended_on = Some(outer_row.clone());
+                        }
                         self.combine_owned_into_buffer(outer_row, inner_row);
                         return Ok(Some(RowRef::Owned(self.take_from_buffer())));
                     } else {
@@ -499,7 +544,9 @@ impl Operator for IndexNestedLoopJoinOperator {
             // Handle LEFT OUTER: emit outer row with NULLs if no match
             if is_left_outer && !self.outer_had_match {
                 let outer_row = self.current_outer_row.take().unwrap();
-                self.advance_outer()?;
+                if !self.advance_outer()? {
+                    self.ended_on = Some(outer_row.clone());
+                }
                 let null_inner = self.null_inner_row();
                 // Use buffer-based combine since we own outer_row
                 self.combine_owned_into_buffer(outer_row, null_inner);
@@ -731,6 +778,12 @@ impl Operator for BatchIndexNestedLoopJoinOperator {
                         std::slice::from_ref(&key_value),
                         &mut self.row_id_buffer,
                     );
+                }
+                // Only the streaming join can end early and be run again
+                IndexLookupStrategy::TableEquality { .. } => {
+                    return Err(crate::core::Error::internal(
+                        "table equality probes need the streaming index join",
+                    ));
                 }
                 IndexLookupStrategy::PrimaryKey => match &key_value {
                     Value::Integer(id) => self.row_id_buffer.push(*id),

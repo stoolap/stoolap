@@ -4494,7 +4494,13 @@ impl Executor {
                 )
             };
 
-            if let Some((table_name, lookup_strategy, inner_col, outer_col)) = index_nl_info {
+            // A join the inner table stops answering leaves through the label
+            // to the hash join below
+            'index_nl: {
+                let Some((table_name, lookup_strategy, inner_col, outer_col)) = index_nl_info
+                else {
+                    break 'index_nl;
+                };
                 // Index Nested Loop path: stream outer side for early termination
                 // When swapped, execute right side as outer (with original right filter, now in nl_left_filter)
                 let outer_expr = if swapped {
@@ -4576,6 +4582,13 @@ impl Executor {
                 } else {
                     None
                 };
+                // Bounded probes serve a bounded join only: without a limit the
+                // batch join below would take the whole outer side first
+                if join_limit.is_none()
+                    && matches!(lookup_strategy, IndexLookupStrategy::TableEquality { .. })
+                {
+                    break 'index_nl;
+                }
 
                 // The outer side is fetched in chunks: the first one is the limit
                 // plus an eighth of slack, so the odd outer row without a match
@@ -4832,6 +4845,12 @@ impl Executor {
                                 cross_row_filter.as_ref(),
                                 &mut result_rows,
                             )?;
+                            // A probe the inner table could not answer: the rows
+                            // joined so far are dropped, and the whole join runs
+                            // once more on the hash path
+                            if op.needs_fallback() {
+                                break 'index_nl;
+                            }
                             let lim = join_limit.unwrap_or(0) as usize;
                             let cap = match outer_limit {
                                 Some(cap) if op.outer_rows_seen() == cap => cap,
@@ -7555,6 +7574,11 @@ impl Executor {
                 }
             }
             op.close()?;
+            // A probe the inner table could not answer: the groups so far are
+            // no answer, and the caller reduces and hashes instead
+            if op.needs_fallback() {
+                return Ok(None);
+            }
             if enough || groups.len() >= want {
                 break;
             }
@@ -11176,6 +11200,22 @@ impl Executor {
             return Some((
                 table_name,
                 IndexLookupStrategy::SecondaryIndex(index),
+                inner_col_unqualified,
+                outer_col,
+            ));
+        }
+
+        // A table that keeps rows outside its index still answers a bounded
+        // probe from it while it can, deciding per probe
+        if table
+            .get_index_on_column(&inner_col_unqualified)
+            .is_some_and(|index| index.index_type() == crate::core::IndexType::BTree)
+        {
+            return Some((
+                table_name,
+                IndexLookupStrategy::TableEquality {
+                    column: inner_col_unqualified.clone(),
+                },
                 inner_col_unqualified,
                 outer_col,
             ));
