@@ -323,6 +323,16 @@ impl HnswInner {
 
     /// Mark a node as deleted in the bitset
     #[inline(always)]
+    /// Takes the row's node out of the answers, if the row has one
+    fn tombstone_row(&mut self, row_id: i64) {
+        if let Some(&node_id) = self.row_id_to_node.get(row_id) {
+            if !self.is_deleted(node_id) {
+                self.unique_map_remove(node_id);
+                self.set_deleted(node_id);
+            }
+        }
+    }
+
     fn set_deleted(&mut self, node: u32) {
         let idx = node as usize;
         // SAFETY: node < nodes.len(), and deleted_bits is sized to cover all nodes via push_node_alive.
@@ -959,9 +969,21 @@ impl HnswInner {
         ef_construction: usize,
         ml: f64,
     ) {
-        // Check for existing mapping (duplicate or tombstoned reinsert)
+        // An existing mapping: the same row again, a changed vector under
+        // a live node, or a tombstoned node coming back
         if let Some(&existing_node) = self.row_id_to_node.get(row_id) {
-            if self.is_deleted(existing_node) {
+            if !self.is_deleted(existing_node) {
+                let offset = existing_node as usize * self.dims_bytes;
+                if self.vectors[offset..offset + self.dims_bytes] == *vector_bytes {
+                    // The same vector again (a snapshot, a WAL replay)
+                    return;
+                }
+                // The row's vector changed: the old one goes and the new
+                // one is connected as a reinsert
+                self.set_deleted(existing_node);
+                self.unique_map_remove(existing_node);
+            }
+            {
                 // Reinsert: update vector data in place and clear tombstone
                 let offset = existing_node as usize * self.dims_bytes;
                 self.vectors[offset..offset + self.dims_bytes].copy_from_slice(vector_bytes);
@@ -1005,8 +1027,6 @@ impl HnswInner {
                 }
                 return;
             }
-            // Not deleted — true duplicate (snapshot + WAL replay), skip
-            return;
         }
         let node_id = self.nodes.len() as u32;
         let level = random_level(ml);
@@ -1231,18 +1251,25 @@ impl HnswInner {
 
         for &(vec_bytes, row_id) in batch {
             if let Some(&existing_node) = self.row_id_to_node.get(row_id) {
-                if self.is_deleted(existing_node) {
-                    // Reinsert: update vector data in place and clear tombstone
-                    let offset = existing_node as usize * self.dims_bytes;
-                    self.vectors[offset..offset + self.dims_bytes].copy_from_slice(vec_bytes);
-                    self.clear_deleted(existing_node);
-                    self.unique_map_insert(existing_node);
-                    let level = self.nodes[existing_node as usize].neighbors.len() - 1;
-                    if self.entry_point.is_some() {
-                        batch_nodes.push((existing_node, level));
+                let offset = existing_node as usize * self.dims_bytes;
+                if !self.is_deleted(existing_node) {
+                    if self.vectors[offset..offset + self.dims_bytes] == *vec_bytes {
+                        // The same vector again
+                        continue;
                     }
+                    // The row's vector changed: the old one goes and the
+                    // new one is connected as a reinsert, as `insert` does
+                    self.set_deleted(existing_node);
+                    self.unique_map_remove(existing_node);
                 }
-                // Not deleted — true duplicate, skip
+                // Reinsert: update vector data in place and clear tombstone
+                self.vectors[offset..offset + self.dims_bytes].copy_from_slice(vec_bytes);
+                self.clear_deleted(existing_node);
+                self.unique_map_insert(existing_node);
+                let level = self.nodes[existing_node as usize].neighbors.len() - 1;
+                if self.entry_point.is_some() {
+                    batch_nodes.push((existing_node, level));
+                }
                 continue;
             }
             let node_id = self.nodes.len() as u32;
@@ -2860,7 +2887,12 @@ impl Index for HnswIndex {
         }
         let vec_bytes = match Self::extract_vector_bytes(&values[0]) {
             Some(b) if b.len() == self.dims * 4 => b,
-            _ => return Ok(()), // Skip non-vector or wrong dimension
+            _ => {
+                // No graph entry for this value: a row whose vector became
+                // NULL, or lost its dimension, leaves the graph
+                self.inner.write().tombstone_row(row_id);
+                return Ok(());
+            }
         };
         let mut inner = self.inner.write();
         // Enforce uniqueness using exact byte equality (metric-independent).
@@ -2889,19 +2921,27 @@ impl Index for HnswIndex {
         let dims_bytes = inner.dims_bytes;
         let expected_vec_len = self.dims * 4;
 
-        // Collect valid entries for parallel path
+        // Collect valid entries for parallel path; a value with no graph
+        // entry takes the row's live node out, once the whole batch is
+        // validated, so a refused batch leaves the graph as it was
         let mut prepared: Vec<(&[u8], i64)> = Vec::with_capacity(entries.len());
+        let mut leaving: Vec<i64> = Vec::new();
         for (row_id, values) in entries.iter() {
             if values.is_empty() {
                 continue;
             }
-            if let Some(vec_bytes) = Self::extract_vector_bytes(&values[0]) {
-                if vec_bytes.len() == expected_vec_len {
+            match Self::extract_vector_bytes(&values[0]) {
+                Some(vec_bytes) if vec_bytes.len() == expected_vec_len => {
                     prepared.push((vec_bytes, row_id));
                 }
+                _ => leaving.push(row_id),
             }
         }
 
+        // The rows the batch takes out no longer stand in a newcomer's way;
+        // the set is built only for a unique index with rows leaving
+        let departing: Option<I64Set> =
+            (self.is_unique && !leaving.is_empty()).then(|| leaving.iter().copied().collect());
         if self.is_unique {
             // Pre-validate full batch before mutating the graph so add_batch is atomic.
             let mut seen: ahash::AHashMap<&[u8], i64> =
@@ -2919,7 +2959,14 @@ impl Index for HnswIndex {
                     seen.insert(vec_bytes, row_id);
                 }
 
-                if Self::find_exact_duplicate_in_inner(&inner, vec_bytes, row_id, None).is_some() {
+                if Self::find_exact_duplicate_in_inner(
+                    &inner,
+                    vec_bytes,
+                    row_id,
+                    departing.as_ref(),
+                )
+                .is_some()
+                {
                     return Err(crate::core::Error::unique_constraint(
                         &self.name,
                         self.column_names.join(", "),
@@ -2934,16 +2981,15 @@ impl Index for HnswIndex {
         inner.node_to_row_id.reserve(prepared.len());
         inner.row_id_to_node.reserve(prepared.len());
 
+        for row_id in leaving {
+            inner.tombstone_row(row_id);
+        }
         self.insert_prepared(&mut inner, &prepared);
         Ok(())
     }
 
     fn remove(&self, _values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
-        let mut inner = self.inner.write();
-        if let Some(&node_id) = inner.row_id_to_node.get(row_id) {
-            inner.unique_map_remove(node_id);
-            inner.set_deleted(node_id);
-        }
+        self.inner.write().tombstone_row(row_id);
         Ok(())
     }
 
@@ -2963,19 +3009,27 @@ impl Index for HnswIndex {
         let dims_bytes = inner.dims_bytes;
         let expected_vec_len = self.dims * 4;
 
-        // Collect valid entries for parallel path
+        // Collect valid entries for parallel path; a value with no graph
+        // entry takes the row's live node out, once the whole batch is
+        // validated, so a refused batch leaves the graph as it was
         let mut prepared: Vec<(&[u8], i64)> = Vec::with_capacity(entries.len());
+        let mut leaving: Vec<i64> = Vec::new();
         for &(row_id, values) in entries {
             if values.is_empty() {
                 continue;
             }
-            if let Some(vec_bytes) = Self::extract_vector_bytes(&values[0]) {
-                if vec_bytes.len() == expected_vec_len {
+            match Self::extract_vector_bytes(&values[0]) {
+                Some(vec_bytes) if vec_bytes.len() == expected_vec_len => {
                     prepared.push((vec_bytes, row_id));
                 }
+                _ => leaving.push(row_id),
             }
         }
 
+        // The rows the batch takes out no longer stand in a newcomer's way;
+        // the set is built only for a unique index with rows leaving
+        let departing: Option<I64Set> =
+            (self.is_unique && !leaving.is_empty()).then(|| leaving.iter().copied().collect());
         if self.is_unique {
             // Pre-validate full batch before mutating the graph so add_batch_slice is atomic.
             let mut seen: ahash::AHashMap<&[u8], i64> =
@@ -2993,7 +3047,14 @@ impl Index for HnswIndex {
                     seen.insert(vec_bytes, row_id);
                 }
 
-                if Self::find_exact_duplicate_in_inner(&inner, vec_bytes, row_id, None).is_some() {
+                if Self::find_exact_duplicate_in_inner(
+                    &inner,
+                    vec_bytes,
+                    row_id,
+                    departing.as_ref(),
+                )
+                .is_some()
+                {
                     return Err(crate::core::Error::unique_constraint(
                         &self.name,
                         self.column_names.join(", "),
@@ -3008,6 +3069,9 @@ impl Index for HnswIndex {
         inner.node_to_row_id.reserve(prepared.len());
         inner.row_id_to_node.reserve(prepared.len());
 
+        for row_id in leaving {
+            inner.tombstone_row(row_id);
+        }
         self.insert_prepared(&mut inner, &prepared);
         Ok(())
     }
@@ -3204,6 +3268,82 @@ mod tests {
         match v {
             Value::Extension(data) if data.first() == Some(&(DataType::Vector as u8)) => &data[1..],
             _ => panic!("not a vector value"),
+        }
+    }
+
+    /// A batch the unique check refuses leaves the graph as it was: the
+    /// rows whose value has no graph entry stay, and their vectors stay
+    /// unique, on both batch entry points
+    #[test]
+    fn a_refused_batch_leaves_the_rows_it_would_take_out() {
+        for slice in [false, true] {
+            let mut index = HnswIndex::new(
+                "test_idx".to_string(),
+                "test_table".to_string(),
+                "embedding".to_string(),
+                1,
+                2,
+                16,
+                200,
+                64,
+                HnswDistanceMetric::L2,
+            );
+            index.set_unique(true);
+            index.build().unwrap();
+            index.add(&[make_vector_value(&[1.0, 0.0])], 1, 1).unwrap();
+            index.add(&[make_vector_value(&[2.0, 0.0])], 2, 2).unwrap();
+            // Row 1 leaves, row 3 repeats row 2's vector: refused whole
+            let null = Value::Null(crate::core::DataType::Null);
+            let repeated = make_vector_value(&[2.0, 0.0]);
+            let refused = if slice {
+                index.add_batch_slice(&[
+                    (1, std::slice::from_ref(&null)),
+                    (3, std::slice::from_ref(&repeated)),
+                ])
+            } else {
+                let mut entries: I64Map<Vec<Value>> = I64Map::new();
+                entries.insert(1, vec![null.clone()]);
+                entries.insert(3, vec![repeated.clone()]);
+                index.add_batch(&entries)
+            };
+            assert!(refused.is_err(), "slice {slice}");
+            let query = make_vector_value(&[1.0, 0.0]);
+            let query = HnswIndex::extract_vector_bytes(&query).unwrap();
+            let nearest = index.search_nearest(query, 1, 64);
+            assert_eq!(
+                nearest.first().map(|(id, _)| *id),
+                Some(1),
+                "slice {slice}: row 1 stays"
+            );
+            assert!(
+                index.add(&[make_vector_value(&[1.0, 0.0])], 4, 4).is_err(),
+                "slice {slice}: row 1's vector stays unique"
+            );
+            // An accepted batch does take the row out, and a newcomer may
+            // take the departing row's vector in the same batch
+            let reused = make_vector_value(&[1.0, 0.0]);
+            let accepted = if slice {
+                index.add_batch_slice(&[
+                    (1, std::slice::from_ref(&null)),
+                    (5, std::slice::from_ref(&reused)),
+                ])
+            } else {
+                let mut entries: I64Map<Vec<Value>> = I64Map::new();
+                entries.insert(1, vec![null.clone()]);
+                entries.insert(5, vec![reused.clone()]);
+                index.add_batch(&entries)
+            };
+            accepted.unwrap_or_else(|e| panic!("slice {slice}: the reuse is accepted: {e}"));
+            let nearest = index.search_nearest(query, 1, 64);
+            assert_eq!(
+                nearest.first().map(|(id, _)| *id),
+                Some(5),
+                "slice {slice}: row 5 took the vector"
+            );
+            assert!(
+                index.add(&[make_vector_value(&[1.0, 0.0])], 6, 6).is_err(),
+                "slice {slice}: the vector is row 5's now"
+            );
         }
     }
 

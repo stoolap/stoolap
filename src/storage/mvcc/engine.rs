@@ -724,6 +724,11 @@ impl MVCCEngine {
                     }
                 }
 
+                // HNSW indexes hold the sealed rows too, read through the
+                // mappings just recomputed, so a column renamed or dropped
+                // before the checkpoint resolves to its volume column
+                self.populate_hnsw_from_segments()?;
+
                 // Sync auto-increment counters from segment data so the next
                 // generated row_id doesn't collide with cold rows.
                 self.sync_auto_increment_from_segments()?;
@@ -1421,10 +1426,6 @@ impl MVCCEngine {
                 // This is O(N + M) instead of O(N * M) when populating each index separately
                 self.populate_all_indexes();
 
-                // HNSW indexes need cold segment data too — vector similarity search
-                // cannot fall back to zone maps like other index types.
-                self.populate_hnsw_from_segments()?;
-
                 Ok(())
             }
             Err(e) => Err(e),
@@ -1466,17 +1467,15 @@ impl MVCCEngine {
             if mgr.has_segments() {
                 // Collect HNSW index info before iterating volumes
                 let indexes = store.get_all_indexes();
-                let hnsw_infos: Vec<(Vec<usize>, std::sync::Arc<dyn Index>)> = indexes
+                let hnsw_infos: Vec<(Vec<String>, std::sync::Arc<dyn Index>)> = indexes
                     .iter()
                     .filter(|idx| idx.index_type() == crate::core::IndexType::Hnsw)
                     .filter_map(|idx| {
-                        let col_ids = idx.column_ids();
-                        if col_ids.is_empty() {
+                        let names = idx.column_names();
+                        if names.is_empty() {
                             return None;
                         }
-                        let col_indices: Vec<usize> =
-                            col_ids.iter().map(|&id| id as usize).collect();
-                        Some((col_indices, std::sync::Arc::clone(idx)))
+                        Some((names.to_vec(), std::sync::Arc::clone(idx)))
                     })
                     .collect();
 
@@ -1498,7 +1497,7 @@ impl MVCCEngine {
                 // Pre-allocate a reusable buffer to avoid per-row Vec allocations.
                 let max_cols = hnsw_infos
                     .iter()
-                    .map(|(cols, _)| cols.len())
+                    .map(|(names, _)| names.len())
                     .max()
                     .unwrap_or(0);
                 let mut batches: Vec<Vec<(i64, Vec<crate::core::Value>)>> =
@@ -1516,25 +1515,35 @@ impl MVCCEngine {
                     }) else {
                         continue;
                     };
+                    // Each column through the volume's mapping: a column
+                    // dropped since the seal shifts the ordinals, not the
+                    // volume
                     let mut columns: smallvec::SmallVec<
                         [Option<&crate::storage::volume::column::ColumnData>; 16],
                     > = smallvec::smallvec![None; vol.columns.len()];
-                    for (col_indices, _) in &hnsw_infos {
-                        for &ci in col_indices {
-                            if ci < columns.len() {
-                                columns[ci] = Some(vol.columns.get(ci)?);
-                            }
+                    let physical: Vec<Vec<Option<usize>>> = hnsw_infos
+                        .iter()
+                        .map(|(names, _)| {
+                            names
+                                .iter()
+                                .map(|name| cs.mapping.volume_column(vol, name))
+                                .collect()
+                        })
+                        .collect();
+                    for ci in physical.iter().flatten().flatten() {
+                        if *ci < columns.len() {
+                            columns[*ci] = Some(vol.columns.get(*ci)?);
                         }
                     }
                     for (i, &row_id) in row_ids.iter().enumerate().skip(start) {
                         if tombstones.contains_key(&row_id) || !seen.insert(row_id) {
                             continue;
                         }
-                        for (batch_idx, (col_indices, _)) in hnsw_infos.iter().enumerate() {
+                        for (batch_idx, _) in hnsw_infos.iter().enumerate() {
                             values_buf.clear();
                             let mut has_null = false;
-                            for &ci in col_indices {
-                                let v = if let Some(Some(col)) = columns.get(ci) {
+                            for ci in &physical[batch_idx] {
+                                let v = if let Some(Some(col)) = ci.and_then(|ci| columns.get(ci)) {
                                     col.get_value(i)
                                 } else {
                                     crate::core::Value::Null(crate::core::DataType::Null)

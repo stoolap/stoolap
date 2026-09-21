@@ -515,6 +515,23 @@ impl SegmentedTable {
         Ok(())
     }
 
+    /// An index the hot store created as HNSW, asked for or inferred from a
+    /// vector column, holds the sealed rows too
+    fn populate_if_hnsw(&self, name: &str, columns: &[&str]) -> Result<()> {
+        let created_hnsw = self
+            .hot
+            .get_index(name)
+            .is_some_and(|index| index.index_type() == IndexType::Hnsw);
+        if created_hnsw && self.segment_mgr.has_segments() {
+            if let Err(e) = self.populate_index_from_cold(name, columns) {
+                // Roll back the hot index on cold population failure
+                let _ = self.hot.drop_index(name);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
     /// Populate an index from cold segment data.
     /// Called after index creation on the hot store.
     /// Propagates errors so unique-constraint violations are not swallowed.
@@ -4728,6 +4745,13 @@ impl Table for SegmentedTable {
         self.hot.has_local_changes() || self.segment_mgr.has_pending_tombstones(self.txn_id())
     }
 
+    fn index_view_epoch(&self) -> Option<u64> {
+        if self.segment_mgr.has_pending_tombstones(self.txn_id()) {
+            return None;
+        }
+        self.hot.index_view_epoch()
+    }
+
     fn get_pending_versions(&self) -> Vec<(i64, Row, bool, i64)> {
         self.hot.get_pending_versions()
     }
@@ -4966,7 +4990,8 @@ impl Table for SegmentedTable {
         if is_unique && self.segment_mgr.has_segments() {
             self.validate_cold_unique(name, columns)?;
         }
-        self.hot.create_index(name, columns, is_unique)
+        self.hot.create_index(name, columns, is_unique)?;
+        self.populate_if_hnsw(name, columns)
     }
 
     fn create_index_with_type(
@@ -4984,17 +5009,7 @@ impl Table for SegmentedTable {
 
         self.hot
             .create_index_with_type(name, columns, is_unique, index_type)?;
-
-        // HNSW indexes store all data (hot + cold). After creating the index
-        // on the hot store, populate it from cold segments.
-        if index_type == Some(IndexType::Hnsw) && self.segment_mgr.has_segments() {
-            if let Err(e) = self.populate_index_from_cold(name, columns) {
-                // Roll back the hot index on cold population failure
-                let _ = self.hot.drop_index(name);
-                return Err(e);
-            }
-        }
-        Ok(())
+        self.populate_if_hnsw(name, columns)
     }
 
     fn create_hnsw_index(
