@@ -984,27 +984,30 @@ impl Executor {
         }
     }
 
-    /// Fetches the rows of `row_ids` in growing batches until `needed`
+    /// Fetches the rows of `row_ids` a batch at a time until `needed`
     /// rows are found or the ids are spent: a member with no row, or with
-    /// a row not visible, costs its own fetch and nothing more, and a
-    /// small LIMIT over a long list reads a few rows
+    /// a row not visible, costs its own fetch and nothing more. A batch
+    /// grows from the rows still needed and is bounded whatever the list
+    /// holds, so a run of members without a row never makes the fetch
+    /// after it read every remaining row
     fn fetch_rows_up_to(
         table: &dyn Table,
         row_ids: &[i64],
         filter: &dyn crate::storage::expression::Expression,
         needed: usize,
     ) -> Result<RowVec> {
+        const FETCH_BATCH_ROWS: usize = 1024;
         if needed == usize::MAX || row_ids.len() <= needed {
             return table.fetch_rows_by_ids(row_ids, filter);
         }
         let mut rows = RowVec::with_capacity(needed);
         let mut at = 0;
-        let mut batch = needed.max(16);
+        let mut batch = needed.clamp(16, FETCH_BATCH_ROWS);
         while at < row_ids.len() && rows.len() < needed {
             let end = at.saturating_add(batch).min(row_ids.len());
             rows.extend(table.fetch_rows_by_ids(&row_ids[at..end], filter)?);
             at = end;
-            batch = batch.saturating_mul(2);
+            batch = batch.saturating_mul(2).min(FETCH_BATCH_ROWS);
         }
         Ok(rows)
     }

@@ -259,3 +259,63 @@ fn a_small_limit_over_a_long_list_reads_a_few_rows() {
         "the first volume's groups alone: {decoded} decoded"
     );
 }
+
+/// A run of members without a row ahead of the ones with: the fetch after
+/// it is still a bounded batch, so a LIMIT 1 reads a few rows, not every
+/// remaining member's.
+#[test]
+fn a_run_of_absent_members_does_not_make_the_next_fetch_read_everything() {
+    let dir = tempfile::tempdir().unwrap();
+    let dsn = format!(
+        "file://{}?sync_mode=none&checkpoint_on_close=off&checkpoint_interval=0&compact_threshold=100",
+        dir.path().display()
+    );
+    {
+        let db = Database::open(&dsn).unwrap();
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, k INTEGER, name TEXT)",
+            (),
+        )
+        .unwrap();
+        for volume in 0..4 {
+            for chunk in 0..5 {
+                let values = (0..1000)
+                    .map(|i| {
+                        let id = volume * 5000 + chunk * 1000 + i + 1;
+                        format!("({id}, {}, '{}')", id * 3, "x".repeat(128))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",");
+                db.execute(&format!("INSERT INTO t VALUES {values}"), ())
+                    .unwrap();
+            }
+            db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        }
+        db.close().unwrap();
+    }
+    let db = Database::open(&dsn).unwrap();
+    // 32,752 members without a row, then every row's
+    let members = (-32_751..=20_000)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let misses = |db: &Database| -> i64 {
+        let rows = db.query("PRAGMA GROUP_CACHE_STATS", ()).unwrap();
+        let columns: Vec<String> = rows.columns().to_vec();
+        let at = columns.iter().position(|c| c == "misses").unwrap();
+        rows.into_iter().next().unwrap().unwrap().get(at).unwrap()
+    };
+    let before = misses(&db);
+    assert_eq!(
+        ids(
+            &db,
+            &format!("SELECT id FROM t WHERE id IN ({members}) LIMIT 1")
+        ),
+        vec![1]
+    );
+    let decoded = misses(&db) - before;
+    assert!(
+        decoded <= 3,
+        "the first volume's groups alone: {decoded} decoded"
+    );
+}
