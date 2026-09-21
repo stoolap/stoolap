@@ -339,3 +339,133 @@ fn the_index_is_found_whatever_the_columns_spelling_in_the_query() {
         );
     }
 }
+
+/// A column renamed after the seal and indexed under its new name: the
+/// graph rebuilt at reopen reads the vector through the volume's mapping
+/// as recovery leaves it, rename history included.
+#[test]
+fn reopening_rebuilds_the_graph_after_a_checkpointed_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = file_db(dir.path());
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(2))", ())
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, '[1,0]'), (2, '[10,0]')", ())
+            .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.execute("ALTER TABLE t RENAME COLUMN v TO vec", ())
+            .unwrap();
+        db.execute("CREATE INDEX idx_v ON t(vec) USING HNSW", ())
+            .unwrap();
+        db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+        db.close().unwrap();
+    }
+    let db = file_db(dir.path());
+    // A hot row keeps the graph non-empty, so a graph missing the sealed
+    // rows would answer with it instead of falling back
+    db.execute("INSERT INTO t VALUES (3, '[50,0]')", ())
+        .unwrap();
+    assert_eq!(
+        distances(
+            &db,
+            "SELECT id, VEC_DISTANCE_L2(vec, '[1,0]') AS d FROM t ORDER BY d LIMIT 1"
+        ),
+        vec![(1, 0.0)]
+    );
+}
+
+/// Sealed vectors updated in bulk, above the parallel batch threshold:
+/// every row's distance is the distance of the vector it returns.
+#[test]
+fn a_bulk_update_of_sealed_vectors_reaches_the_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = file_db(dir.path());
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(2))", ())
+        .unwrap();
+    for chunk in (1..=6000).step_by(1000) {
+        let values = (chunk..chunk + 1000)
+            .map(|id| format!("({id}, '[{id},1]')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        db.execute(&format!("INSERT INTO t VALUES {values}"), ())
+            .unwrap();
+    }
+    db.execute("CREATE INDEX idx_v ON t(v) USING HNSW", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("UPDATE t SET v = '[100000,1]'", ()).unwrap();
+    for probe in ["[1000,1]", "[3000,1]", "[5000,1]"] {
+        let rows = distances(
+            &db,
+            &format!("SELECT id, VEC_DISTANCE_L2(v, '{probe}') AS d FROM t ORDER BY d LIMIT 1"),
+        );
+        assert_eq!(rows.len(), 1, "{probe}");
+        let expected = 100000.0 - probe[1..probe.find(',').unwrap()].parse::<f64>().unwrap();
+        // The vector is stored in f32: exact to a few parts in a million
+        assert!(
+            (rows[0].1 - expected).abs() < 0.01,
+            "{probe}: the distance of the returned vector is {}, not {expected}",
+            rows[0].1
+        );
+    }
+    assert_eq!(
+        distances(
+            &db,
+            "SELECT id, VEC_DISTANCE_L2(v, '[100000,1]') AS d FROM t ORDER BY d LIMIT 1"
+        )[0]
+        .1,
+        0.0
+    );
+}
+
+/// A sealed vector set to NULL leaves the graph: the row is no longer a
+/// candidate, one by one and in bulk.
+#[test]
+fn a_sealed_vector_set_to_null_leaves_the_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = file_db(dir.path());
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(2))", ())
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, '[1,0]'), (2, '[10,0]')", ())
+        .unwrap();
+    db.execute("CREATE INDEX idx_v ON t(v) USING HNSW", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("UPDATE t SET v = NULL WHERE id = 1", ())
+        .unwrap();
+    assert_eq!(
+        distances(
+            &db,
+            "SELECT id, VEC_DISTANCE_L2(v, '[1,0]') AS d FROM t ORDER BY d LIMIT 1"
+        ),
+        vec![(2, 9.0)]
+    );
+    // In bulk, above the parallel batch threshold
+    let dir = tempfile::tempdir().unwrap();
+    let db = file_db(dir.path());
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v VECTOR(2))", ())
+        .unwrap();
+    for chunk in (1..=6000).step_by(1000) {
+        let values = (chunk..chunk + 1000)
+            .map(|id| format!("({id}, '[{id},1]')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        db.execute(&format!("INSERT INTO t VALUES {values}"), ())
+            .unwrap();
+    }
+    db.execute("CREATE INDEX idx_v ON t(v) USING HNSW", ())
+        .unwrap();
+    db.execute("PRAGMA CHECKPOINT", ()).unwrap();
+    db.execute("UPDATE t SET v = NULL WHERE id <= 3000", ())
+        .unwrap();
+    // The answer is a row still holding a vector, at that vector's
+    // distance; which of the nearest the graph lands on is its recall
+    let rows = distances(
+        &db,
+        "SELECT id, VEC_DISTANCE_L2(v, '[1,1]') AS d FROM t ORDER BY d LIMIT 1",
+    );
+    assert_eq!(rows.len(), 1);
+    let (id, d) = rows[0];
+    assert!(id > 3000, "a row whose vector is NULL came back: {id}");
+    assert!((d - (id as f64 - 1.0)).abs() < 0.01, "{id} at {d}");
+}

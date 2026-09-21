@@ -323,6 +323,16 @@ impl HnswInner {
 
     /// Mark a node as deleted in the bitset
     #[inline(always)]
+    /// Takes the row's node out of the answers, if the row has one
+    fn tombstone_row(&mut self, row_id: i64) {
+        if let Some(&node_id) = self.row_id_to_node.get(row_id) {
+            if !self.is_deleted(node_id) {
+                self.unique_map_remove(node_id);
+                self.set_deleted(node_id);
+            }
+        }
+    }
+
     fn set_deleted(&mut self, node: u32) {
         let idx = node as usize;
         // SAFETY: node < nodes.len(), and deleted_bits is sized to cover all nodes via push_node_alive.
@@ -1241,18 +1251,25 @@ impl HnswInner {
 
         for &(vec_bytes, row_id) in batch {
             if let Some(&existing_node) = self.row_id_to_node.get(row_id) {
-                if self.is_deleted(existing_node) {
-                    // Reinsert: update vector data in place and clear tombstone
-                    let offset = existing_node as usize * self.dims_bytes;
-                    self.vectors[offset..offset + self.dims_bytes].copy_from_slice(vec_bytes);
-                    self.clear_deleted(existing_node);
-                    self.unique_map_insert(existing_node);
-                    let level = self.nodes[existing_node as usize].neighbors.len() - 1;
-                    if self.entry_point.is_some() {
-                        batch_nodes.push((existing_node, level));
+                let offset = existing_node as usize * self.dims_bytes;
+                if !self.is_deleted(existing_node) {
+                    if self.vectors[offset..offset + self.dims_bytes] == *vec_bytes {
+                        // The same vector again
+                        continue;
                     }
+                    // The row's vector changed: the old one goes and the
+                    // new one is connected as a reinsert, as `insert` does
+                    self.set_deleted(existing_node);
+                    self.unique_map_remove(existing_node);
                 }
-                // Not deleted — true duplicate, skip
+                // Reinsert: update vector data in place and clear tombstone
+                self.vectors[offset..offset + self.dims_bytes].copy_from_slice(vec_bytes);
+                self.clear_deleted(existing_node);
+                self.unique_map_insert(existing_node);
+                let level = self.nodes[existing_node as usize].neighbors.len() - 1;
+                if self.entry_point.is_some() {
+                    batch_nodes.push((existing_node, level));
+                }
                 continue;
             }
             let node_id = self.nodes.len() as u32;
@@ -2870,7 +2887,12 @@ impl Index for HnswIndex {
         }
         let vec_bytes = match Self::extract_vector_bytes(&values[0]) {
             Some(b) if b.len() == self.dims * 4 => b,
-            _ => return Ok(()), // Skip non-vector or wrong dimension
+            _ => {
+                // No graph entry for this value: a row whose vector became
+                // NULL, or lost its dimension, leaves the graph
+                self.inner.write().tombstone_row(row_id);
+                return Ok(());
+            }
         };
         let mut inner = self.inner.write();
         // Enforce uniqueness using exact byte equality (metric-independent).
@@ -2899,16 +2921,18 @@ impl Index for HnswIndex {
         let dims_bytes = inner.dims_bytes;
         let expected_vec_len = self.dims * 4;
 
-        // Collect valid entries for parallel path
+        // Collect valid entries for parallel path; a value with no graph
+        // entry takes the row's live node out
         let mut prepared: Vec<(&[u8], i64)> = Vec::with_capacity(entries.len());
         for (row_id, values) in entries.iter() {
             if values.is_empty() {
                 continue;
             }
-            if let Some(vec_bytes) = Self::extract_vector_bytes(&values[0]) {
-                if vec_bytes.len() == expected_vec_len {
+            match Self::extract_vector_bytes(&values[0]) {
+                Some(vec_bytes) if vec_bytes.len() == expected_vec_len => {
                     prepared.push((vec_bytes, row_id));
                 }
+                _ => inner.tombstone_row(row_id),
             }
         }
 
@@ -2949,11 +2973,7 @@ impl Index for HnswIndex {
     }
 
     fn remove(&self, _values: &[Value], row_id: i64, _ref_id: i64) -> Result<()> {
-        let mut inner = self.inner.write();
-        if let Some(&node_id) = inner.row_id_to_node.get(row_id) {
-            inner.unique_map_remove(node_id);
-            inner.set_deleted(node_id);
-        }
+        self.inner.write().tombstone_row(row_id);
         Ok(())
     }
 
@@ -2973,16 +2993,18 @@ impl Index for HnswIndex {
         let dims_bytes = inner.dims_bytes;
         let expected_vec_len = self.dims * 4;
 
-        // Collect valid entries for parallel path
+        // Collect valid entries for parallel path; a value with no graph
+        // entry takes the row's live node out
         let mut prepared: Vec<(&[u8], i64)> = Vec::with_capacity(entries.len());
         for &(row_id, values) in entries {
             if values.is_empty() {
                 continue;
             }
-            if let Some(vec_bytes) = Self::extract_vector_bytes(&values[0]) {
-                if vec_bytes.len() == expected_vec_len {
+            match Self::extract_vector_bytes(&values[0]) {
+                Some(vec_bytes) if vec_bytes.len() == expected_vec_len => {
                     prepared.push((vec_bytes, row_id));
                 }
+                _ => inner.tombstone_row(row_id),
             }
         }
 

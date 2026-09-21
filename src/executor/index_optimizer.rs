@@ -2193,7 +2193,11 @@ impl Executor {
         });
         // The graph is the committed table now: an older snapshot or a
         // commit publishing makes it the wrong view, and the rows decide
-        let epoch = table.index_view_epoch();
+        let epoch = if hnsw_index.is_some() {
+            table.index_view_epoch()
+        } else {
+            None
+        };
         let hnsw_index = if epoch.is_some() { hnsw_index } else { None };
 
         // Extract query vector from second argument

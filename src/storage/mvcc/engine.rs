@@ -724,6 +724,11 @@ impl MVCCEngine {
                     }
                 }
 
+                // HNSW indexes hold the sealed rows too, read through the
+                // mappings just recomputed, so a column renamed or dropped
+                // before the checkpoint resolves to its volume column
+                self.populate_hnsw_from_segments()?;
+
                 // Sync auto-increment counters from segment data so the next
                 // generated row_id doesn't collide with cold rows.
                 self.sync_auto_increment_from_segments()?;
@@ -1420,10 +1425,6 @@ impl MVCCEngine {
                 // After WAL replay completes, populate all indexes in a single pass
                 // This is O(N + M) instead of O(N * M) when populating each index separately
                 self.populate_all_indexes();
-
-                // HNSW indexes need cold segment data too — vector similarity search
-                // cannot fall back to zone maps like other index types.
-                self.populate_hnsw_from_segments()?;
 
                 Ok(())
             }
